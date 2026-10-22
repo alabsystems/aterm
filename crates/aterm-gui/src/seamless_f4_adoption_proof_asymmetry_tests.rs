@@ -119,11 +119,9 @@ fn same_build_parent_and_child_layout_digests_agree() {
     );
 }
 
-/// The general lemma both breaks are instances of: the child's digest
-/// equals the parent's IFF the child's parse+reserialize is a byte fixed
-/// point on the parent's wire. Nothing in the protocol establishes that
-/// across a version boundary, and the parent's own pre-flight round-trip
-/// check (`app_input.rs` ~579) runs the PARENT's codec against itself.
+/// The lemma both breaks are instances of: a digest over the child's re-serialization equals the
+/// parent's iff the child's parse and re-serialize is a byte fixed point on the parent's wire,
+/// which nothing establishes across a version boundary.
 #[test]
 fn layout_digest_equality_is_exactly_wire_fixed_pointness() {
     let modern = realistic_layout().to_toml().expect("serialize");
@@ -240,11 +238,8 @@ fn an_over_long_inactive_grid_blob_names_itself() {
     );
 }
 
-/// CONTROL for the screen side. The child never passed `screen_digest`
-/// through verbatim — it RE-DERIVED it from the reconstructed checkpoints,
-/// so the screen half carried the SAME round-trip exposure as the layout
-/// half. It now hashes the carried bytes instead. Same build ⇒ equal either
-/// way, which is what this control pins.
+/// Control for the screen side: same build, so the parent's digest and one over the child's
+/// reconstructed checkpoint agree.
 #[test]
 fn same_build_parent_and_child_screen_digests_agree() {
     let cp = live_checkpoint();
@@ -442,15 +437,11 @@ fn the_prompts_pending_cwd_crosses_the_meta_wire() {
     assert_eq!(adopted.current_working_directory(), Some("/home/me/src"));
 }
 
-/// The parser carry (the round-five plan's item 12) crosses the REAL wire:
-/// a session parked inside `ESC [ 38;5;19` is carried at the Full rung with
-/// its partial CSI in the meta's additive `parser` key; the strict child
-/// parser reads it, the screen digest is a fixed point over it AND covers
-/// it (a different partial state is a different commitment, so the
-/// adoption proof binds the carry like every other meta field); and the
-/// adopted engine finishes the sequence with the queued `6m`. A producer
-/// from before the key — the same meta without it — still parses and
-/// adopts at Ground, which is exactly what it did before.
+/// The parser carry crosses the real wire: a session parked inside `ESC [ 38;5;19` is carried at
+/// the Full rung with its partial CSI in the meta's additive `parser` key; the strict child parser
+/// reads it, the screen digest is a fixed point over it and covers it, and the adopted engine
+/// finishes the sequence with the queued `6m`. A meta without the key still parses and adopts at
+/// Ground.
 #[test]
 fn a_partial_parser_crosses_the_meta_wire_inside_the_digest() {
     let mut t = aterm_core::terminal::Terminal::new(24, 80);
@@ -750,16 +741,11 @@ fn an_unreadable_output_state_costs_only_itself() {
     }
 }
 
-/// CROSS-VERSION BREAK #4 — the HARDER screen failure. `parse_checkpoint_meta`
-/// demands EVERY key in [`CHECKPOINT_META_REQUIRED_KEYS`]. If a newer child
-/// adds an 18th meta field to that list, an older parent's 17-key wire does
-/// not parse. That used to refuse the adoption outright — the child adopted
-/// NOTHING, never wrote a proof, and the parked parent read EOF
-/// (`ChildDied`, the 0.58-era symptom). Since the 2026-09-22/23 audit (plan
-/// P0-2) it costs that session's screen and nothing else: the session is
-/// adopted onto a blank engine at its pane's geometry and repainted. Still a
-/// break worth pinning — every tab repainting on every hop is not seamless —
-/// which is why the list is frozen (next test).
+/// Cross-version break 4: `parse_checkpoint_meta` demands every key in
+/// [`CHECKPOINT_META_REQUIRED_KEYS`], so a wire missing one does not parse. That costs the
+/// session's screen and nothing else: it adopts onto a blank engine at its pane's geometry and
+/// repaints. Still a break (every tab repainting on every hop is not seamless), which is why the
+/// list is frozen (next test).
 #[test]
 fn cross_version_missing_required_meta_key_costs_the_screen_not_the_adoption() {
     let cp = live_checkpoint();

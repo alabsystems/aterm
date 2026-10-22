@@ -486,7 +486,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
             .spawn()
             .expect("start a stand-in launcher")
     };
-    // A stand-in that must die dies by SIGKILL (AGENTS.md).
     let stop = |child: &mut Child| {
         child.kill().unwrap();
         child.wait().unwrap();
@@ -1151,7 +1150,7 @@ fn a_window_confirmation_the_proof_refuses_is_said_once_and_asks_for_no_window()
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// The installed receipt `prepare`'s swap records for `build`'s artifact `digest`.
+/// The installed receipt a swap records for `build`'s artifact `digest`.
 fn receipt_for(s: &Staging, build: u64, digest: &str) {
     crate::manifest::InstalledReceipt::record(
         &s.installed_receipt(),

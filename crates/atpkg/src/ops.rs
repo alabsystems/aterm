@@ -99,10 +99,8 @@ pub fn managed(layout: &Layout, tool: &str) -> Option<Managed> {
     })
 }
 
-/// One listing of `bin/`, resolved once: per entry, the logical [`ToolName`] its file name
-/// spells and the target its shim forwards to. Every reading pass asks those same two
-/// questions of every entry and used to re-list the directory for each; they now share one
-/// photograph.
+/// One listing of `bin/`, resolved once: per entry, the [`ToolName`] its file name spells
+/// and the target its shim forwards to, shared by the reading passes.
 ///
 /// Not for a predicate that deletes: the directory can change between capture and decision,
 /// and a stale target widens a deletion's reach, so every site that removes a file
@@ -561,17 +559,8 @@ mod tests {
         assert_eq!(store_build_of(prefix, Path::new("/p/store/../ay/18")), None);
     }
 
-    /// `active_builds` reports the LIVE build (what the shim points at), even when a newer
-    /// build is staged + marked complete on disk but never activated — so the update decision
-    /// re-flips it instead of mistaking the staged build for the running one (#19).
-    /// A shim whose target is GONE is not a live build.
-    ///
-    /// `resolve_shim` reads the stub's target and `program_build_of_target` parses
-    /// the program/build out of that path — both are pure string work, so a shim
-    /// pointing into a deleted store used to parse cleanly and report `live`. A real
-    /// machine shipped 22 such shims and `atpkg list` called four programs live while
-    /// `doctor` called the same state FAIL
-    /// (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
+    /// A shim whose target is gone is not a live build: `resolve_shim` and
+    /// `program_build_of_target` are pure string work, so the target must be stat'd.
     #[test]
     fn a_shim_pointing_at_a_deleted_build_is_not_live() {
         let l = layout("dangling");
@@ -663,12 +652,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The listing obeys the store's strict recogniser ([`crate::store::parse_build_name`]):
-    /// `u64::from_str` would accept the leading `+` and leading zeros the producer never
-    /// writes, so `+19/` and `019/` are somebody else's directories. Leniency here is not
-    /// cosmetic — the number is parsed off one directory's name and used to address another
-    /// ([`Layout::build_dir`] renders the canonical spelling). See
-    /// `a_marker_bearing_lookalike_cannot_displace_the_rollback_target` in [`crate::gc`].
+    /// The listing takes only the canonical build name ([`crate::store::parse_build_name`]):
+    /// `+19/` and `019/` are not builds, since the number parsed off one directory's name
+    /// addresses another ([`Layout::build_dir`] renders the canonical spelling).
     #[test]
     fn list_installed_reads_only_the_canonical_build_name() {
         let l = layout("canonical-build-names");

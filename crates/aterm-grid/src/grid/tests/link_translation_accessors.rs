@@ -2,8 +2,8 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for the link/search-translation accessors exposed to wasm:
-//! `base_y`, `display_origin_absolute`, `row_is_wrapped`, `row_len`.
+//! The link/search-translation accessors the wasm bindings expose: `base_y`,
+//! `display_origin_absolute`, `row_is_wrapped`, `row_len`.
 
 use super::super::*;
 

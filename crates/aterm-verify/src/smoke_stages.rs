@@ -418,7 +418,7 @@ fn ctl(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) -> String {
     capture_reply(&cmd, ctx.exec_env())
 }
 
-/// `${got:-<no reply>}`
+/// `got`, or `<no reply>` when it is empty.
 fn or_no_reply(got: &str) -> &str {
     if got.is_empty() { "<no reply>" } else { got }
 }

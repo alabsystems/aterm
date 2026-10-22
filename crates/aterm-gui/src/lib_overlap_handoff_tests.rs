@@ -871,7 +871,7 @@ fn a_focus_loss_after_input_was_queued_for_the_window_marks_it_incoherent() {
         "a focus loss with nothing queued ahead of it reorders nothing"
     );
 
-    // Input queued for ANOTHER window: this window's loss reorders none of it.
+    // Input queued for another window: this window's loss reorders none of it.
     app.queue_pre_commit_input(other, WindowEvent::ModifiersChanged(Default::default()));
     app.on_focus(WindowId(0), false);
     assert!(
@@ -1276,9 +1276,8 @@ fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
         return;
     }
 
-    // DUE: raised ONCE, and it costs the band nothing — a row already
-    // there stays the top row, no row is wanted for the question, and a
-    // later tick raises nothing more.
+    // Due: raised once, with no band row (a row already there stays on top, no row is
+    // wanted), and a later tick raises nothing more.
     let mut app = access_card_windowed();
     let other = app.post_message(Message::new(tags::SYSTEM, Severity::Warn, "already here"));
     let id = access_card_posted(&mut app, t0);
@@ -1626,9 +1625,8 @@ fn macos_access_card_stays_inert_off_macos() {
     }
 }
 
-/// An observed dialog's banner names the tab that asked, as every herald
-/// banner does: `<tab title>: <what>`. NEGATIVE CONTROL: a session the
-/// store does not hold keeps the bare body.
+/// An observed dialog's banner names the tab that asked: `<tab title>: <what>`. Negative
+/// control: a session the store does not hold keeps the bare body.
 #[test]
 fn an_observed_dialog_banner_names_the_asking_tab() {
     let app = App::headless_for_test();
@@ -2817,8 +2815,8 @@ fn a_denied_probe_alone_raises_nothing() {
     assert_eq!(app.consent_card_host.needs, 0);
 }
 
-/// OPEN SETTINGS RECORDS `opened_at` (through either surface): the record
-/// is what tells a newer process the owner already acted.
+/// Open Settings records `opened_at` (through either surface), which tells a newer
+/// process the owner already acted.
 #[test]
 #[cfg(target_os = "macos")]
 fn open_settings_records_opened_at_in_the_record() {

@@ -182,9 +182,9 @@ fn a_compiled_zsh_set_is_sourced_from_its_wordcode() {
     );
 }
 
-/// A real zsh sources the BODY ALONE without an error, from inside a function
-/// under `emulate -L zsh` (how the check sources it) and at top level, and the
-/// body defines what the loader's trampoline and wiring name.
+/// A real zsh sources the body alone without an error, from inside a function under
+/// `emulate -L zsh` (as the check sources it) and at top level, and the body defines what
+/// the loader's trampoline and wiring name.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_real_zsh_sources_the_body_alone_cleanly() {
@@ -221,23 +221,40 @@ fn a_real_zsh_sources_the_body_alone_cleanly() {
     }
 }
 
-/// Sourcing the live body (in zsh and bash, as `__aterm_body_check` does on an
-/// adopted shell's next prompt) exports `AGY_CLI_FAST_PROMPT_EDITOR=true` to
-/// child processes when unset, while preserving an explicit user override.
+/// Sourcing the live body (in zsh, bash, and fish, as `__aterm_body_check` does
+/// on an adopted shell's next prompt) exports `AGY_CLI_FAST_PROMPT_EDITOR=true`
+/// to child processes when unset, while preserving an explicit user override.
 #[cfg(unix)]
 #[test]
 fn live_body_exports_agy_fast_prompt_editor_default_without_clobbering_override() {
     let dir = aterm_tempfile::tempdir().unwrap();
     ensure_scripts(dir.path()).unwrap();
-    for (ext, shell, flag) in [("zsh", need_zsh(), "-f"), ("bash", bash_shell(), "--norc")] {
+    let mut cases = vec![
+        (
+            "zsh",
+            need_zsh(),
+            "-f",
+            ". \"$1\" && /usr/bin/printenv AGY_CLI_FAST_PROMPT_EDITOR",
+        ),
+        (
+            "bash",
+            bash_shell(),
+            "--norc",
+            ". \"$1\" && /usr/bin/printenv AGY_CLI_FAST_PROMPT_EDITOR",
+        ),
+    ];
+    if let Some(fish) = fish_shell() {
+        cases.push((
+            "fish",
+            fish,
+            "--no-config",
+            "source \"$argv[2]\"; and /usr/bin/printenv AGY_CLI_FAST_PROMPT_EDITOR",
+        ));
+    }
+    for (ext, shell, flag, snippet) in cases {
         let body = dir.path().join(format!("{BODY_FILE_STEM}.{ext}"));
         let default_out = shell_command(shell)
-            .args([
-                flag,
-                "-c",
-                ". \"$1\" && /usr/bin/printenv AGY_CLI_FAST_PROMPT_EDITOR",
-                ext,
-            ])
+            .args([flag, "-c", snippet, ext])
             .arg(&body)
             .env("HOME", dir.path())
             .output()
@@ -254,12 +271,7 @@ fn live_body_exports_agy_fast_prompt_editor_default_without_clobbering_override(
         );
 
         let override_out = shell_command(shell)
-            .args([
-                flag,
-                "-c",
-                ". \"$1\" && /usr/bin/printenv AGY_CLI_FAST_PROMPT_EDITOR",
-                ext,
-            ])
+            .args([flag, "-c", snippet, ext])
             .arg(&body)
             .env("HOME", dir.path())
             .env("AGY_CLI_FAST_PROMPT_EDITOR", "false")
@@ -278,9 +290,9 @@ fn live_body_exports_agy_fast_prompt_editor_default_without_clobbering_override(
     }
 }
 
-/// The body of this build under a cache root, plus a NEWER build's folder whose
-/// body is this build's with one probe function spliced in: what a running
-/// shell finds under its root after an update.
+/// The body of this build under a cache root, plus a newer build's folder whose body is
+/// this build's with one probe function spliced in: what a running shell finds under its
+/// root after an update.
 #[cfg(unix)]
 struct BodyFixture {
     fx: LiveFixture,

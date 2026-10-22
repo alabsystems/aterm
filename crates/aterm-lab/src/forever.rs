@@ -726,6 +726,26 @@ const SAME_TURN: &str = "now carry on with the parser module and report";
 /// The words its reply is picked by: none (every turn of the chain is
 /// answered with [`WORK`]).
 const SAME_TURN_KEY: &str = "now carry on with the parser module";
+/// `tall-scroll`'s report rows ([`scroll_reply`]): with its head, the work
+/// report's words and each agent's own rows around them, a few rows taller
+/// than the tab's 50, so a few notches bring its opener back.
+pub const SCROLL_LINES: usize = 46;
+/// How long after the first point's back-off was decided the wheel is
+/// turned ([`scroll_step`]).
+const SCROLL_AFTER_MS: i64 = 5_000;
+/// The notches the wheel is turned at the most, one row each, looking for
+/// the opener after each.
+const SCROLL_NOTCHES: u32 = 40;
+/// The notches in a row that moved nothing on the screen before the wheel
+/// stops: nothing it turns brings the history back.
+const SCROLL_STILL: u32 = 3;
+/// When the screen is read again after the last notch: whether the scroll
+/// held ([`Scrolled::held`]).
+const SCROLL_HELD_MS: i64 = 10_000;
+/// How long the chain is watched after the last notch: the loop has read
+/// the scrolled screen (its recheck is 5 s at the most) and decided there,
+/// long before the first point's due.
+pub const SCROLL_WATCH_MS: i64 = 40_000;
 
 /// F3's reply to its tool's result: no words, so the turn ends on the tool's
 /// row ([`read_call`]).
@@ -1162,6 +1182,9 @@ pub enum Chain {
     /// F1 and F2 (a judged turn's opener re-wrapped and revealed by a resize)
     /// and SAME (a new turn answered with the very words of the one before).
     SameWords,
+    /// F1 BY A SCROLL (a judged turn's opener scrolled into sight from the
+    /// history above the screen by a wheel, nothing submitted).
+    TallScroll,
     /// F3 (a first turn ended on a tool's row after a launch).
     ToolEnd,
     /// LADDER (the back-off ladder doubled to its cap, scaled).
@@ -1223,6 +1246,10 @@ pub enum Scenario {
     /// A new turn answered with the very words of the reply before it, under
     /// its own opener: judged as its own point (`b9/resid3`'s submission).
     SameWords,
+    /// A judged turn's opener scrolled into sight from the history above the
+    /// screen by a wheel, nothing submitted: not judged again (F1's other
+    /// path).
+    Scrolled,
     /// A first turn ended on a tool's row after a launch: judged (F3).
     F3,
     /// The back-off ladder doubled to its cap, each act at its due (scaled).
@@ -1270,6 +1297,7 @@ impl Scenario {
             Scenario::F18 => "F18",
             Scenario::Rewrap => "F1F2",
             Scenario::SameWords => "SAME",
+            Scenario::Scrolled => "F1S",
             Scenario::F3 => "F3",
             Scenario::Ladder => "LADDER",
         }
@@ -1320,6 +1348,9 @@ impl Scenario {
             Scenario::F18 => "a person's key into an instant turn: LEFT, theirs, nothing typed",
             Scenario::Rewrap => "a judged opener re-wrapped by a resize: not judged again",
             Scenario::SameWords => "a new turn answered with the same words: its own point",
+            Scenario::Scrolled => {
+                "a judged opener scrolled into sight from the history: not judged again"
+            }
             Scenario::F3 => "a first turn ended on a tool's row after a launch: judged",
             Scenario::Ladder => "the back-off ladder doubled to its cap, each act at its due",
         }
@@ -1393,12 +1424,13 @@ impl Chain {
 
     /// The residuals' chains (`--mode resid`): F18's beside its negative
     /// control, P4C's chain whose person's prompt goes through the control
-    /// socket (judged as a turn of the conversation); F1, F2 and SAME's; F3's;
-    /// and the Off control.
-    pub const RESID: [Chain; 5] = [
+    /// socket (judged as a turn of the conversation); F1, F2 and SAME's; F1's
+    /// by a scroll; F3's; and the Off control.
+    pub const RESID: [Chain; 6] = [
         Chain::InstantCruise,
         Chain::InstantPerson,
         Chain::SameWords,
+        Chain::TallScroll,
         Chain::ToolEnd,
         Chain::Off,
     ];
@@ -1575,6 +1607,7 @@ impl Chain {
             Chain::WallHid => "hid-wall",
             Chain::InstantPerson => "instant-person",
             Chain::SameWords => "same-words",
+            Chain::TallScroll => "tall-scroll",
             Chain::ToolEnd => "tool-end",
             Chain::Ladder => "ladder",
             Chain::WallDay => "day-wall",
@@ -1601,6 +1634,7 @@ impl Chain {
             | Chain::CruiseN
             | Chain::InstantPerson
             | Chain::SameWords
+            | Chain::TallScroll
             | Chain::Ladder
             | Chain::CruiseO => "cruise",
             Chain::Off | Chain::Mgr => "off",
@@ -1640,6 +1674,7 @@ impl Chain {
             Chain::WallHid => &[Scenario::W2],
             Chain::InstantPerson => &[Scenario::F18],
             Chain::SameWords => &[Scenario::Rewrap, Scenario::SameWords],
+            Chain::TallScroll => &[Scenario::Scrolled],
             Chain::ToolEnd => &[Scenario::F3],
             Chain::Ladder => &[Scenario::Ladder],
             Chain::WallDay | Chain::WallClimb => &[Scenario::W1],
@@ -1696,6 +1731,7 @@ impl Chain {
                 | Chain::InstantCruise
                 | Chain::InstantPerson
                 | Chain::SameWords
+                | Chain::TallScroll
                 | Chain::ToolEnd
         )
     }
@@ -1894,6 +1930,9 @@ impl Chain {
             // F1, F2, SAME: every turn answered with the work report, the
             // orchestrator's too — the very words of the reply before it
             Chain::SameWords => vec![rule(SAME_TURN_KEY, WORK), rule("", WORK)],
+            // F1 by a scroll: every turn answered with the tall report, its
+            // opener above the screen once it is over
+            Chain::TallScroll => vec![rule("", &scroll_reply())],
             // F3: the first prompt answered with a tool's call ([`read_call`],
             // filled per harness by [`spec_on`]), its result with no words
             Chain::ToolEnd => vec![
@@ -1951,6 +1990,21 @@ pub fn tall_reply(lines: usize) -> String {
         s.push_str(&format!("- check {i} passed\n"));
     }
     s.push_str(CLEAN);
+    s
+}
+
+/// `tall-scroll`'s reply: a head, [`SCROLL_LINES`] rows of a report, then
+/// the work report's words ([`WORK`]) — taller than the 50 rows of the
+/// window's tab, so once the turn is over its opener stands in the history
+/// above the screen (the agent's own, where it draws its transcript in a
+/// view of its own). No row of it holds the chain's token.
+#[must_use]
+pub fn scroll_reply() -> String {
+    let mut s = String::from("Here is where the parser stands.\n");
+    for i in 1..=SCROLL_LINES {
+        s.push_str(&format!("- part {i} of the parser is written\n"));
+    }
+    s.push_str(WORK);
     s
 }
 
@@ -2165,12 +2219,57 @@ pub struct Cover {
     /// F1, F2: when the lab resized the tab ([`RESIZED`]), and what the
     /// resize and `dims` answered.
     pub resized: Option<(i64, String)>,
+    /// F1 BY A SCROLL: the wheel the lab turned over the tab, and what the
+    /// screen showed ([`scroll_step`]).
+    pub scrolled: Option<Scrolled>,
     /// F3: how many of the conversation's requests carried a tool's result
     /// back (the stub's dumps), read once its watch is over.
     pub tool_results: Option<usize>,
     /// F3: the screen's last rows read once the first point after the prompt
     /// was journaled, and when.
     pub first_screen: Option<(i64, Vec<String>)>,
+}
+
+/// F1 BY A SCROLL, AS DRIVEN ([`scroll_step`]): the wheel turned up over
+/// `tall-scroll`'s tab, a row a notch, until its opener was in sight.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Scrolled {
+    /// When the first notch was turned: F1's law holds from there
+    /// ([`crate::forever_cover`]'s `judge_scrolled`), the harness's reads
+    /// during the notches (the screen the opener first came into sight on
+    /// among them) included.
+    pub from: i64,
+    /// When the last notch was turned.
+    pub at: i64,
+    /// The notches turned (`mouse wheelup … lines=1`).
+    pub notches: u32,
+    /// What `mouse` answered where it did not say `OK`.
+    pub refused: Option<String>,
+    /// The tab's `modes` before the first notch: `alt_screen=` and
+    /// `mouse_mode=`, whether the agent takes the wheel (it scrolls its own
+    /// view) or the tab's viewport moves.
+    pub modes: String,
+    /// The tab's history above its screen before the first notch, as
+    /// `lines` answered (`OK <rows> …`): the rows a viewport can scroll back.
+    pub history: String,
+    /// Whether the opener (the chain's token) was on the screen before the
+    /// first notch.
+    pub before: bool,
+    /// Whether it was in sight after the last notch: on the live screen where
+    /// the agent took the wheel, in the tab's viewport where it did not.
+    pub after: bool,
+    /// Where the agent takes no wheel (`mouse_mode=none`): the tab's viewport
+    /// after the last notch, as `scroll` answered it (`OK <offset> <max>`),
+    /// with where the opener and the live screen were (`search`).
+    pub viewport: Option<String>,
+    /// Whether the live screen (the one the harness reads) changed under the
+    /// wheel at all.
+    pub moved: bool,
+    /// The screen's rows after the last notch, blank rows left out.
+    pub rows: Vec<String>,
+    /// Whether the opener was still on the screen [`SCROLL_HELD_MS`] after
+    /// the last notch; `None` before that read.
+    pub held: Option<bool>,
 }
 
 /// L13's prompt typed through `hwkey` (`forever --window`, [`person_keys`]):
@@ -2576,6 +2675,7 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::W2 => cover::judge_wall_hidden(seen, land, program, t0),
             Scenario::F18 => cover::judge_person_instant(seen, t0),
             Scenario::Rewrap => cover::judge_rewrap(seen, t0),
+            Scenario::Scrolled => cover::judge_scrolled(seen, t0),
             Scenario::SameWords => cover::judge_same_words(seen, t0),
             Scenario::F3 => cover::judge_tool_end(seen, land, t0),
             Scenario::Ladder => cover::judge_ladder(seen, LADDER_SCALE, t0),
@@ -4378,20 +4478,11 @@ fn launcher(
         Harness::Agy => {
             // the provider seeded (never a Google sign-in) and every repository trusted
             crate::gemini::seed(run, Agent::Agy, &crate::gemini::Launch::default())?;
-            let mut trusted: Vec<String> = dirs
-                .iter()
-                .map(|d| d.to_string_lossy().into_owned())
-                .collect();
-            trusted.extend(dirs.iter().filter_map(|d| {
-                d.to_string_lossy()
-                    .strip_prefix("/private")
-                    .map(str::to_string)
-            }));
             let dir = run.w.join("agy-home/.gemini/antigravity-cli");
             put(
                 &dir.join("settings.json"),
                 0o600,
-                &crate::gemini::agy_settings_with(&trusted, &[]),
+                &crate::gemini::agy_settings_with(&agy_trusted(dirs), &[]),
             )?;
             crate::gemini::launcher(run, Agent::Agy, &[], &[])
         }
@@ -4399,6 +4490,120 @@ fn launcher(
     };
     put(&script, 0o755, &text)?;
     Ok(script)
+}
+
+/// Every repository of the run as agy's settings trust it: each path, and
+/// each without its `/private` (agy keys a workspace by the path it was
+/// given).
+fn agy_trusted(dirs: &[PathBuf]) -> Vec<String> {
+    let mut trusted: Vec<String> = dirs
+        .iter()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect();
+    trusted.extend(dirs.iter().filter_map(|d| {
+        d.to_string_lossy()
+            .strip_prefix("/private")
+            .map(str::to_string)
+    }));
+    trusted
+}
+
+/// THE RENDERER THAT TAKES THE WHEEL, for `tall-scroll`'s tab
+/// ([`scroll_launcher`]): the harness reads the tab's LIVE screen (`text
+/// --json`), which a scroll of the tab's own viewport never moves, so only an
+/// agent that scrolls its own view brings a judged opener back into the
+/// harness's sight. Each renderer below draws on the alternate screen and
+/// tracks the mouse (`modes`, measured in the lab 2026-10-22, `r4-m-*`):
+/// Claude Code's fullscreen one (`CLAUDE_CODE_NO_FLICKER=1`:
+/// `mouse_mode=any`), Gemini CLI's alternate buffer (`ui.useAlternateBuffer`
+/// in a system settings file named by `GEMINI_CLI_SYSTEM_SETTINGS_PATH`:
+/// `mouse_mode=button`), and agy's no-flickering one (its `/settings`
+/// Rendering Mode, written `"altScreenMode": "always"` into its settings, in
+/// a home of the tab's own, [`SCROLL_AGY_HOME`]: `mouse_mode=button`). Each
+/// default renderer draws on the main screen with no mouse tracking
+/// (`r4-f2`); Muse Code has no other (no mouse-tracking sequence in its
+/// build), so its tab runs the run's own launcher.
+pub const SCROLL_CLAUDE_ENV: &str = "CLAUDE_CODE_NO_FLICKER=1";
+/// agy's `tall-scroll` home under the run's scratch ([`SCROLL_CLAUDE_ENV`]'s
+/// reason): its settings the run's with `altScreenMode` `always`, and its
+/// onboarding done.
+pub const SCROLL_AGY_HOME: &str = "agy-scroll-home";
+/// The system settings Gemini CLI's `tall-scroll` tab reads
+/// ([`SCROLL_CLAUDE_ENV`]'s reason).
+pub const SCROLL_GEMINI_SETTINGS: &str = "{\"ui\":{\"useAlternateBuffer\":true}}";
+/// Where [`SCROLL_GEMINI_SETTINGS`] is written, under the run's scratch.
+pub const SCROLL_GEMINI_FILE: &str = "gemini-scroll-settings.json";
+
+/// `tall-scroll`'s own launcher on harness `h`, written beside the run's
+/// ([`launcher`], whose repositories `dirs` and `walled` it shares): the
+/// run's with the renderer that takes the wheel ([`SCROLL_CLAUDE_ENV`]);
+/// `None` where the run's own serves it.
+///
+/// # Errors
+/// A file could not be written.
+fn scroll_launcher(
+    run: &Run,
+    h: Harness,
+    dirs: &[PathBuf],
+    walled: bool,
+) -> Result<Option<PathBuf>, Fail> {
+    use crate::gemini::Agent;
+    let put = |p: &Path, mode: u32, text: &str| {
+        crate::sys::put(p, mode, &crate::sys::PutSrc::Bytes(text.as_bytes()))
+            .map_err(|e| could_not(&format!("{}: {e}", p.display())))
+    };
+    let text = match h {
+        Harness::Claude => crate::lab::launcher(
+            run,
+            &crate::lab::Launch {
+                envs: vec![SCROLL_CLAUDE_ENV.to_string()],
+                subscriber: walled,
+                ..crate::lab::Launch::default()
+            },
+        ),
+        Harness::Gemini => {
+            // under the run's scratch, which `down` removes whole, as agy's
+            // home: in the run directory, whose sweep keeps no `.json`, it
+            // outlived the run (`r4-f3-gemini`)
+            let settings = run.w.join(SCROLL_GEMINI_FILE);
+            put(&settings, 0o644, SCROLL_GEMINI_SETTINGS)?;
+            let mut envs = vec![format!(
+                "GEMINI_CLI_SYSTEM_SETTINGS_PATH={}",
+                settings.to_string_lossy()
+            )];
+            if walled {
+                envs.push(format!("TZ={}", foreign_tz(crate::util::now_ms() / 1000)));
+            }
+            crate::gemini::launcher(run, Agent::Gemini, &envs, &[])
+        }
+        Harness::Agy => {
+            let home = run.w.join(SCROLL_AGY_HOME);
+            let dir = home.join(".gemini/antigravity-cli");
+            put(
+                &dir.join("settings.json"),
+                0o600,
+                &crate::gemini::agy_settings_with(
+                    &agy_trusted(dirs),
+                    &[("altScreenMode".to_string(), J::s("always"))],
+                ),
+            )?;
+            put(
+                &dir.join("cache/onboarding.json"),
+                0o600,
+                &crate::gemini::agy_onboarded(),
+            )?;
+            crate::gemini::launcher(
+                run,
+                Agent::Agy,
+                &[format!("HOME={}", home.to_string_lossy())],
+                &[],
+            )
+        }
+        Harness::Muse => return Ok(None),
+    };
+    let script = run.run.join(format!("forever-{}-scroll.sh", h.name()));
+    put(&script, 0o755, &text)?;
+    Ok(Some(script))
 }
 
 /// The zone a walled run's Gemini CLI runs in ([`launcher`]): one whose
@@ -4889,6 +5094,215 @@ fn resize_step(door: &Door<'_>, tab: &mut Tab, now: i64) -> Result<(), Fail> {
     Ok(())
 }
 
+/// The screen of tab `sid` (`text`: what the tab shows, its viewport
+/// where it is scrolled back), its blank rows left out.
+fn shown_rows(door: &Door<'_>, sid: &str) -> Vec<String> {
+    on(door, sid, &["text"])
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.chars().take(150).collect())
+        .collect()
+}
+
+/// F1 BY A SCROLL, ITS DRIVE ([`Cover::scrolled`]): once `tall-scroll`'s
+/// first point's back-off was decided [`SCROLL_AFTER_MS`] ago, with nothing
+/// typed since its prompt, the wheel is turned up over its tab, a row a
+/// notch (`mouse wheelup left <row> <col> lines=1`), as a person reading back
+/// turns it. Where the agent tracks the mouse (`modes`' `mouse_mode=`), the
+/// notch goes to it and it scrolls its own view, which the harness reads as
+/// the screen: the screen is read after each notch until the opener (the
+/// chain's token) is in sight — [`SCROLL_NOTCHES`] at the most, none more
+/// once [`SCROLL_STILL`] in a row moved nothing — and read again
+/// [`SCROLL_HELD_MS`] later ([`Scrolled::held`]). Where it does not, the
+/// notch scrolls the tab's viewport, which the harness never reads (it reads
+/// the live screen, `text --json`): the wheel is turned until the opener's
+/// row (`search`) is in the viewport (`scroll`, `dims`) or the history's top,
+/// and the drive records the viewport and whether the live screen moved
+/// ([`Scrolled::viewport`]). Nothing is typed. Once.
+fn scroll_step(door: &Door<'_>, tab: &mut Tab, now: i64) -> Result<(), Fail> {
+    if tab.chain != Chain::TallScroll {
+        return Ok(());
+    }
+    let token = tab.chain.token();
+    let in_sight = |rows: &[String]| rows.iter().any(|r| r.contains(token.as_str()));
+    if let Some(sc) = tab.seen.cover.scrolled.as_mut() {
+        if sc.viewport.is_none() && sc.held.is_none() && now - sc.at >= SCROLL_HELD_MS {
+            let rows = shown_rows(door, &tab.sid);
+            sc.held = Some(in_sight(&rows));
+            println!(
+                "  [{}] +{} scroll  {} s after the last notch: the opener {}",
+                tab.chain.name(),
+                at(tab.t0, now_ms()),
+                SCROLL_HELD_MS / 1000,
+                if in_sight(&rows) {
+                    "still in sight"
+                } else {
+                    "out of sight"
+                }
+            );
+        }
+        return Ok(());
+    }
+    let Some((tw, _)) = tab
+        .seen
+        .journal
+        .iter()
+        .find(|(t, l)| *t > tab.t0 && backoff_named(l))
+    else {
+        return Ok(());
+    };
+    if now - tw < SCROLL_AFTER_MS || !tab.seen.all_acts().is_empty() {
+        return Ok(());
+    }
+    let who = format!("@{}", tab.sid);
+    let modes: Vec<String> = on(door, &tab.sid, &["modes"])
+        .lines()
+        .filter(|l| l.starts_with("alt_screen=") || l.starts_with("mouse_mode="))
+        .map(str::to_string)
+        .collect();
+    let tracks = !modes.iter().any(|m| m == "mouse_mode=none");
+    let history = crate::util::one_line(on(door, &tab.sid, &["lines"]).trim(), 80);
+    let first = shown_rows(door, &tab.sid);
+    let before = in_sight(&first);
+    let mut rows = first.clone();
+    let (mut notches, mut still, mut refused) = (0, 0, None);
+    let from = now_ms();
+    let mut wheel = |notches: &mut u32| -> Result<bool, Fail> {
+        let r = door.ctl(&[&who, "mouse", "wheelup", "left", "12", "20", "lines=1"])?;
+        *notches += 1;
+        if r.stdout.starts_with("OK") {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            return Ok(true);
+        }
+        refused = Some(crate::util::one_line(
+            &format!("{}{}", r.stdout.trim(), r.stderr.trim()),
+            160,
+        ));
+        Ok(false)
+    };
+    let (after, viewport) = if tracks || before {
+        while !in_sight(&rows) && notches < SCROLL_NOTCHES && still < SCROLL_STILL {
+            if !wheel(&mut notches)? {
+                break;
+            }
+            let next = shown_rows(door, &tab.sid);
+            still = if next == rows { still + 1 } else { 0 };
+            rows = next;
+        }
+        (in_sight(&rows), None)
+    } else {
+        let (opener, screen_first) = opener_row(door, &tab.sid, &token);
+        let height = on(door, &tab.sid, &["dims"])
+            .split_whitespace()
+            .nth(1)
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        let mut place = on(door, &tab.sid, &["scroll"]);
+        loop {
+            let (off, max) = scroll_place(&place);
+            let top = screen_first.saturating_sub(off);
+            let shown = opener.is_some_and(|r| r >= top && r < top + height);
+            if shown || off >= max || notches >= SCROLL_NOTCHES || !wheel(&mut notches)? {
+                rows = shown_rows(door, &tab.sid);
+                let said = format!(
+                    "scroll {}; the opener {}, the viewport rows {top}..{}, the live screen's {screen_first}..{}",
+                    crate::util::one_line(place.trim(), 40),
+                    opener.map_or_else(|| "found nowhere".to_string(), |r| format!("at row {r}")),
+                    top + height,
+                    screen_first + height
+                );
+                break (shown, Some(said));
+            }
+            place = on(door, &tab.sid, &["scroll"]);
+        }
+    };
+    let t = now_ms();
+    let sc = Scrolled {
+        from,
+        at: t,
+        notches,
+        refused,
+        modes: modes.join(" "),
+        history,
+        before,
+        after,
+        moved: rows != first,
+        viewport,
+        rows,
+        held: None,
+    };
+    println!(
+        "  [{}] +{} scroll  {} notch(es) up from +{} ({}; lines {}){}: the opener in sight before {}, after {}{}; the live screen {}:",
+        tab.chain.name(),
+        at(tab.t0, t),
+        sc.notches,
+        at(tab.t0, sc.from),
+        sc.modes,
+        sc.history,
+        sc.refused
+            .as_deref()
+            .map_or_else(String::new, |r| format!(", refused: {r}")),
+        sc.before,
+        sc.after,
+        sc.viewport
+            .as_deref()
+            .map_or_else(String::new, |v| format!(" (the tab's viewport: {v})")),
+        if sc.moved { "moved" } else { "unmoved" }
+    );
+    for l in &sc.rows {
+        println!("    | {l}");
+    }
+    tab.seen.cover.scrolled = Some(sc);
+    Ok(())
+}
+
+/// Where `token` was last found in tab `sid` and where its live screen
+/// begins, both absolute rows (`search`: its header `OK <n> …
+/// screen_first=<row>` on the client's stderr, then a `<row> <col> <len>`
+/// line a match on its stdout): `(None, 0)` where it answered neither.
+fn opener_row(door: &Door<'_>, sid: &str, token: &str) -> (Option<u64>, u64) {
+    door.ctl(&[&format!("@{sid}"), "search", token])
+        .map_or((None, 0), |r| search_rows(&r))
+}
+
+/// [`opener_row`]'s reading of a `search` reply: the client's header
+/// (`aterm-ctl: OK …`), which it writes to its STDERR (measured `r4-f3`:
+/// read off stdout, Muse Code's opener was `found nowhere`), and the match
+/// rows on its stdout.
+fn search_rows(r: &Reply) -> (Option<u64>, u64) {
+    let rows = r.stdout.as_str();
+    let Some(head) = r
+        .stderr
+        .lines()
+        .map(|l| l.strip_prefix("aterm-ctl: ").unwrap_or(l))
+        .find(|l| l.starts_with("OK "))
+    else {
+        return (None, 0);
+    };
+    let first = head
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("screen_first="))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    let row = rows
+        .lines()
+        .filter_map(|l| l.split_whitespace().next()?.parse::<u64>().ok())
+        .max();
+    (row, first)
+}
+
+/// `scroll`'s answer (`OK <offset> <max>`): how far the tab's viewport is
+/// scrolled back and how far it can be; `(0, 0)` for any other answer.
+fn scroll_place(reply: &str) -> (u64, u64) {
+    let mut w = reply.split_whitespace();
+    if w.next() != Some("OK") {
+        return (0, 0);
+    }
+    let mut n = || w.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    let off = n();
+    (off, n())
+}
+
 /// F3's EVIDENCE of the screen ([`Cover::first_screen`]): its last rows, read
 /// once the first point after the prompt was judged (its `point@v1` record),
 /// where a turn ended on a tool's row draws that row last above the composer.
@@ -4923,11 +5337,9 @@ fn first_screen_step(door: &Door<'_>, tab: &mut Tab) {
 /// [`crate::stub::gemini::results_answered`],
 /// [`crate::stub::muse::results_answered`]): F3's call run by its agent.
 fn tool_results_of(run: &Run, token: &str) -> usize {
-    std::fs::read_dir(run.w.join("dump"))
+    crate::stub::turn_dumps(&run.w.join("dump"))
         .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| std::fs::read(e.path()).ok())
+        .filter_map(|(_, p)| std::fs::read(p).ok())
         .filter(|body| String::from_utf8_lossy(body).contains(token))
         .filter(|body| {
             crate::stub::messages_answered(body)
@@ -5060,22 +5472,31 @@ pub fn carries_continuation(body: &[u8], token: &str) -> bool {
             .any(|u| u.contains(CLAUDE_CONTINUES))
 }
 
-/// The stub's request dumps, `(modified ms, body)` each.
+/// The stub's request dumps of the turns, `(modified ms, body)` each
+/// ([`dumps_in`]).
 fn dumps(run: &Run) -> Vec<(i64, Vec<u8>)> {
-    std::fs::read_dir(run.w.join("dump"))
+    dumps_in(&run.w.join("dump"))
+}
+
+/// The stub's dumps of the conversations' TURNS in `dir`, `(modified ms,
+/// body)` each: `req-<n>.json` alone ([`crate::stub::turn_dumps`]), never a
+/// side call's `side-<n>.json`, whose copy of a conversation is no request
+/// of its turns' — Muse Code's reminder observer renders the whole
+/// conversation into one text with line breaks, which C4 read as the owner's
+/// words reaching the agent so (the lab's `r10-cv`, 2026-10-22).
+#[must_use]
+pub fn dumps_in(dir: &Path) -> Vec<(i64, Vec<u8>)> {
+    crate::stub::turn_dumps(dir)
         .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let t = e
-                .metadata()
+        .filter_map(|(_, p)| {
+            let t = std::fs::metadata(&p)
                 .ok()?
                 .modified()
                 .ok()?
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()?;
             let t = i64::try_from(t.as_millis()).ok()?;
-            Some((t, std::fs::read(e.path()).ok()?))
+            Some((t, std::fs::read(&p).ok()?))
         })
         .collect()
 }
@@ -5917,6 +6338,17 @@ fn finished(tab: &Tab, now: i64) -> bool {
             }) || done_since(20_000)
                 || (s.all_acts().is_empty() && now - tab.t0 > 330_000)
         }
+        // F1 by a scroll: watched SCROLL_WATCH_MS past the last notch; an act
+        // first, or nothing judged past the persistence deadline, ends it
+        Chain::TallScroll => {
+            s.cover
+                .scrolled
+                .as_ref()
+                .is_some_and(|sc| now - sc.at >= SCROLL_WATCH_MS)
+                || s.all_acts().first().is_some_and(|(t, _)| now - t >= 10_000)
+                || done_since(20_000)
+                || (s.all_acts().is_empty() && now - tab.t0 > 330_000)
+        }
         // F3: the act at the first point's due typed, and watched 30 s past
         // it; nothing judged past the persistence deadline
         Chain::ToolEnd => {
@@ -5992,15 +6424,13 @@ fn run_check(
         );
         dirs.push(d);
     }
-    let script = launcher(
-        &run,
-        h,
-        &dirs,
-        (
-            chains.iter().any(|c| c.walled()),
-            chains.contains(&Chain::Worker),
-        ),
-    )?;
+    let walled = chains.iter().any(|c| c.walled());
+    let script = launcher(&run, h, &dirs, (walled, chains.contains(&Chain::Worker)))?;
+    let scroll_script = if chains.contains(&Chain::TallScroll) {
+        scroll_launcher(&run, h, &dirs, walled)?
+    } else {
+        None
+    };
     crate::verbs::set_custom_mode(&run, MODE, &spec_on(chains, h, &dirs))?;
     println!(
         "  stub      mode {MODE}: {} rule(s)",
@@ -6082,6 +6512,10 @@ fn run_check(
             format!(", task {}", crate::util::one_line(r.trim(), 120))
         } else {
             String::new()
+        };
+        let script = match &scroll_script {
+            Some(own) if chain == Chain::TallScroll => own,
+            _ => &script,
         };
         let line = format!("sh {}", shell_quote(&script.to_string_lossy()));
         let _ = on(&door, &sid, &["send", &line]);
@@ -6310,6 +6744,7 @@ fn run_check(
             wall_step(&run, h, tab, now)?;
             hide_step(&door, h, tab, now)?;
             resize_step(&door, tab, now)?;
+            scroll_step(&door, tab, now)?;
             first_screen_step(&door, tab);
             if let Some(text) = tab.chain.orchestrated()
                 && orchestrator_due(tab.chain, &tab.seen, now)

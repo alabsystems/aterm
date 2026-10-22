@@ -193,6 +193,9 @@ mod autopilot_menu;
 /// AUTOPILOT'S TIMER, Cruise until a time and then Land (§9.3.6): its index
 /// of armed sessions and the one deadline the App folds. Nothing is armed yet.
 mod autopilot_timers;
+/// WHICH TAB RANG: each session's count of its bells and the last few, for
+/// `status` and the survey (`bells= bells_sounded= last_bell=`).
+mod bell_ledger;
 #[cfg(test)]
 mod capture_after_present_conformance;
 /// The live theme on the control socket: `theme` status and listing, the
@@ -7425,6 +7428,9 @@ pub(crate) struct SessionCtx {
     /// person's keys; read by the tab's hover, the Overview, `status` and the
     /// survey. A leaf lock.
     pub(crate) typed: typed_by::TypedStamp,
+    /// The bells this session's programs rang, as `App::on_bell` recorded
+    /// them ([`bell_ledger`]): read by `status` and the survey. A leaf lock.
+    pub(crate) bells: bell_ledger::BellLedger,
 }
 
 /// One shell session: its PTY master, engine `Terminal`, reader thread, policy
@@ -15850,6 +15856,21 @@ impl App {
                     metrics::DeadlineOwner::DevToolsHandOver,
                 );
             }
+            // A launch-ask offer admitted before the hold armed still owes this
+            // Mac its alert, which the hold does not hold
+            // ([`Self::look_for_debugger_moment`]): its looks keep waking.
+            if self.debugger_launch.offering()
+                && let Some(wake) = self.debugger_launch.next_deadline()
+                && self.devtools_helper.windowed()
+                && self.any_os_window_focused()
+            {
+                fold_owned_deadline(
+                    deadline,
+                    owner,
+                    wake,
+                    metrics::DeadlineOwner::DevToolsHandOver,
+                );
+            }
             if let Some(wake) = self.next_debugger_change_deadline(now) {
                 fold_owned_deadline(
                     deadline,
@@ -16471,10 +16492,30 @@ impl App {
     /// instance never queues it.
     fn look_for_debugger_moment(&mut self, now: Instant, quiet: fn(&Self, Instant) -> bool) {
         use debugger_access::{AskWait, HostAsked, LaunchAsk, LaunchAskFacts, admit_launch_ask};
-        if self.workstation_setup.suppresses_permissions() {
+        if !self.debugger_launch.due(now) {
             return;
         }
-        if !self.debugger_launch.due(now) {
+        // The offer's disk half ([`Self::offer_debugger_access_at_launch`]) may be
+        // writing this Mac into the record: while it is out the look only waits,
+        // so nothing ends the ask with a write still to land. Once it has ended,
+        // its answer is spent before anything is judged again, so the Mac it
+        // recorded gets its alert at this look, never a later one that might
+        // wait or drop first. First-launch setup's hold does not hold it: the
+        // offer was admitted before the hold armed, and an alert held behind a
+        // setup the owner cancels would never come, with this Mac recorded as
+        // asked for good.
+        if self.debugger_launch.preparing() {
+            let why = AskWait::Recording;
+            if self.debugger_launch.wait(why, now + why.look_again()) {
+                aterm_log::debug!("debugger launch ask: waiting ({})", why.as_str());
+            }
+            return;
+        }
+        if let Some((prepared, read)) = self.debugger_launch.take_prepared() {
+            self.spend_debugger_offer_at_launch(now, prepared, &read);
+            return;
+        }
+        if self.workstation_setup.suppresses_permissions() {
             return;
         }
         let config = self.consent_card_config.clone();
@@ -16572,13 +16613,22 @@ impl App {
             }
             (LaunchAsk::Settle(why), config, Some(host)) => {
                 self.debugger_launch.end();
-                match debugger_access::DebuggerChangeLane::forgo(config, host) {
-                    Ok(()) => aterm_log::info!("debugger launch ask: settled {}", why.as_str()),
-                    // Asked again next launch, if it still applies then.
-                    Err(error) => aterm_log::warn!(
-                        "debugger launch ask: settled {}, but this Mac could not be recorded: {error}",
+                let config = config.map(std::path::Path::to_path_buf);
+                let record = move || {
+                    match debugger_access::DebuggerChangeLane::forgo(config.as_deref(), host) {
+                        Ok(()) => aterm_log::info!("debugger launch ask: settled {}", why.as_str()),
+                        // Asked again next launch, if it still applies then.
+                        Err(error) => aterm_log::warn!(
+                            "debugger launch ask: settled {}, but this Mac could not be recorded: {error}",
+                            why.as_str()
+                        ),
+                    }
+                };
+                if !self.launch_ask_disk("aterm-launch-settle", record) {
+                    aterm_log::warn!(
+                        "debugger launch ask: settled {}, but no thread could record this Mac",
                         why.as_str()
-                    ),
+                    );
                 }
             }
             (LaunchAsk::Ask, Some(config), Some(host)) => {
@@ -16620,29 +16670,16 @@ impl App {
                 let answer = move || {
                     let _ = slot.set(debugger_access::read_asked(&config, host));
                 };
-                match read {
-                    debugger_access::RecordRead::Thread => {
-                        let wake = self.devtools_hand_over_wake();
-                        let spawned = crate::qos::spawn_lane_thread(
-                            "aterm-launch-asked",
-                            crate::qos::Role::Background,
-                            move || {
-                                answer();
-                                wake();
-                            },
-                        );
-                        if spawned.is_err() {
-                            // No thread to read it on: fail toward not asking, as
-                            // a record that cannot be read does (the ask drops).
-                            return (HostAsked::Asked, Some(host));
-                        }
-                        // The look that started the read waits for it, however
-                        // fast it ends: its end wakes the window, and the next
-                        // look acts on it.
-                        return (HostAsked::Cold, None);
-                    }
-                    #[cfg(test)]
-                    debugger_access::RecordRead::Inline => answer(),
+                if !self.launch_ask_disk("aterm-launch-asked", answer) {
+                    // No thread to read it on: fail toward not asking, as a
+                    // record that cannot be read does (the ask drops).
+                    return (HostAsked::Asked, Some(host));
+                }
+                if read == debugger_access::RecordRead::Thread {
+                    // The look that started the read waits for it, however fast
+                    // it ends: its end wakes the window, and the next look acts
+                    // on it.
+                    return (HostAsked::Cold, None);
                 }
             }
             return match self.debugger_launch.asked(host) {
@@ -16698,17 +16735,17 @@ impl App {
         self.devtools_helper.reading().is_some()
     }
 
-    /// THE LAUNCH ASK'S ALERT: the Security page's debugger-access alert in its
-    /// launch words ([`native_settings::DebuggerAlertFrom::Launch`]), raised
-    /// through the App's own gesture arms and the shared decline quiet
-    /// ([`native_settings::owner_confirms_with`], the one place a yes is
-    /// minted), after [`debugger_access::DebuggerChangeLane::offer`] has written
-    /// this Mac into the record. A yes starts the change exactly as a press's
-    /// does; a press queued in a Settings view behind the alert does not ask
-    /// again. Refused before anything was written (a change on disk, the lane
-    /// busy): looked at again later, for at most
-    /// [`debugger_access::REFUSED_FOR`]. A change lock that cannot be taken
-    /// at all ends it: no yes could start the worker.
+    /// THE LAUNCH ASK'S OFFER: the press the ask stands for, refused now, ends
+    /// it as a refusal does (looked at again later, for at most
+    /// [`debugger_access::REFUSED_FOR`]); otherwise the offer's disk half —
+    /// [`debugger_access::OfferDisk::prepare`]: the change lock, the marker, the
+    /// record's read and this Mac's durable line — runs on a thread of its own
+    /// ([`Self::launch_ask_disk`]), so a home folder that stopped answering never
+    /// holds the window. The look that starts it waits for it, however fast it
+    /// ends; its end wakes the window, and the next look spends its answer
+    /// before it judges anything else ([`Self::spend_debugger_offer_at_launch`]).
+    /// A test's stand-in runs it here and spends it at once. `read` is the
+    /// reading the alert states.
     fn offer_debugger_access_at_launch(
         &mut self,
         now: Instant,
@@ -16716,19 +16753,132 @@ impl App {
         host: &'static str,
         read: &debugger_access::DebuggerFacts,
     ) {
+        use debugger_access::AskWait;
+        if let Some(why) = self.debugger_change.offer_refusal() {
+            self.launch_offer_ended(now, debugger_access::OfferEnd::Refused(why), false);
+            return;
+        }
+        let Some(slot) = self.debugger_launch.start_prepare(*read) else {
+            // One is out or untaken already: the look spends or waits on it first.
+            return;
+        };
+        let disk = self.debugger_change.offer_disk();
+        let config = config.to_path_buf();
+        let prepare = move || {
+            let _ = slot.set(disk.prepare(&config, host, debugger_access::now_secs()));
+        };
+        if !self.launch_ask_disk("aterm-launch-offer", prepare) {
+            // Nothing written or asked: a later launch judges again.
+            self.debugger_launch.end();
+            aterm_log::warn!("debugger launch ask: dropped: no thread could record this Mac");
+            return;
+        }
+        if self.debugger_launch.record_read() == debugger_access::RecordRead::Thread {
+            let why = AskWait::Recording;
+            if self.debugger_launch.wait(why, now + why.look_again()) {
+                aterm_log::debug!("debugger launch ask: waiting ({})", why.as_str());
+            }
+            return;
+        }
+        if let Some((prepared, read)) = self.debugger_launch.take_prepared() {
+            self.spend_debugger_offer_at_launch(now, prepared, &read);
+        }
+    }
+
+    /// THE LAUNCH ASK'S ALERT: the Security page's debugger-access alert in its
+    /// launch words ([`native_settings::DebuggerAlertFrom::Launch`]), stating
+    /// `read`, raised through the App's own gesture arms and the shared decline
+    /// quiet ([`native_settings::owner_confirms_with`], the one place a yes is
+    /// minted), once the disk half has written this Mac into the record
+    /// (`prepared`). Nothing is asked for a press that would be refused now: the
+    /// lane is judged again here, since the owner's own press may have started a
+    /// change while the disk half ran. Nor once the owner has answered a
+    /// debugger-access alert since it was admitted (a Settings press whose
+    /// change has not started yet): the question is answered on this Mac, as
+    /// admission's [`debugger_access::AskSettle::Answered`] says, and the record
+    /// stands. A recent decline of any Security alert quiets this one too: the
+    /// answer is put back and spent once the quiet has passed. The alert states
+    /// a reading of the rule as fresh as admission's: an older one is retired and
+    /// read again first, the answer kept meanwhile, and a rule on by then is a
+    /// press the lane refuses, which ends the ask, the record standing. A yes
+    /// starts the
+    /// change exactly as a press's does; a press queued in a Settings view
+    /// behind the alert does not ask again. Anything but a recorded Mac ends the
+    /// offer as [`Self::launch_offer_ended`] says.
+    fn spend_debugger_offer_at_launch(
+        &mut self,
+        now: Instant,
+        prepared: debugger_access::OfferPrep,
+        read: &debugger_access::DebuggerFacts,
+    ) {
         use aterm_containment::consent::DebuggerChange;
-        use debugger_access::OfferEnd;
+        use debugger_access::AskWait;
+        let recorded = prepared == debugger_access::OfferPrep::Recorded;
+        let mut read = *read;
+        if recorded {
+            let (answered, quieted) = {
+                let quiet = self.owner_quiet.lock().unwrap_or_else(|p| p.into_inner());
+                (quiet.debugger_answered(), quiet.quiet_now())
+            };
+            if answered {
+                self.debugger_launch.end();
+                aterm_log::info!("debugger launch ask: settled answered after recording this Mac");
+                return;
+            }
+            if quieted {
+                self.debugger_launch.keep_prepared(prepared, read);
+                let why = AskWait::OwnerQuiet;
+                if self.debugger_launch.wait(why, now + why.look_again()) {
+                    aterm_log::debug!("debugger launch ask: waiting ({})", why.as_str());
+                }
+                return;
+            }
+            // The reading the alert states is as fresh as admission's: a kept
+            // answer has waited out a quiet, and a slow disk half any span, while
+            // the owner's own `sudo` may have switched the rule on (it retires no
+            // cached answer). An older one is retired and the rule read again
+            // first. The fresh reading is the lane's observation too, so a rule
+            // on by then is a press the lane refuses: the ask ends, the record
+            // standing.
+            let gate = self.config.privacy_probe_gate();
+            match self.consent.debugger_cached(gate) {
+                Some(row)
+                    if !row.pending()
+                        && row
+                            .probe_age()
+                            .is_none_or(|age| age <= debugger_access::ASK_PROBE_FRESH) =>
+                {
+                    read = self.debugger_access_facts_from(row);
+                }
+                cached => {
+                    // A read already out is waited for, never retired: its
+                    // completion would publish nothing.
+                    if cached.is_some_and(|row| !row.pending()) {
+                        self.consent.invalidate_debugger();
+                    }
+                    let _ = self.debugger_access_facts();
+                    self.debugger_launch.keep_prepared(prepared, read);
+                    let why = AskWait::ProbeStale;
+                    if self.debugger_launch.wait(why, now + why.look_again()) {
+                        aterm_log::debug!("debugger launch ask: waiting ({})", why.as_str());
+                    }
+                    return;
+                }
+            }
+        }
         let (title, body, proceed) = native_settings::debugger_access_alert(
             DebuggerChange::On,
-            read,
+            &read,
             aterm_containment::SpikeEvidence::MEASURED,
             native_settings::DebuggerAlertFrom::Launch,
         );
         let quiet = Arc::clone(&self.owner_quiet);
         let gestures = self.consent_gestures;
-        let offered = self.debugger_change.offer(Some(config), host, || {
-            native_settings::owner_confirms_with(&quiet, &gestures, &title, &body, proceed)
-        });
+        let offered = self
+            .debugger_change
+            .offer(prepared, debugger_access::now_secs(), || {
+                native_settings::owner_confirms_with(&quiet, &gestures, &title, &body, proceed)
+            });
         match offered {
             Ok(ticket) => {
                 self.debugger_launch.end();
@@ -16747,29 +16897,68 @@ impl App {
                     .err();
                 self.debugger_change.note_refusal(refusal);
             }
-            Err(OfferEnd::Refused(why)) => {
-                // Nothing was written or asked: a peer's change, most likely,
-                // which the lane follows or adopts at its next read, and the next
-                // look settles. Bounded, so no disk state holds the folder
-                // warm-up (which waits while the ask is queued) for longer.
+            Err(end) => self.launch_offer_ended(now, end, recorded),
+        }
+    }
+
+    /// How a launch offer that gave no ticket ends. Refused before anything was
+    /// written (`recorded` false): looked at again, for a bounded span. Refused
+    /// after this Mac was recorded — the press became one that would be refused
+    /// while the disk half ran (the owner's own press, say) — the record stands
+    /// and the ask is over: it is never raised for a Mac a record already names.
+    fn launch_offer_ended(&mut self, now: Instant, end: debugger_access::OfferEnd, recorded: bool) {
+        use debugger_access::OfferEnd;
+        match end {
+            OfferEnd::Refused(why) if !recorded => {
+                // A peer's change, most likely: the lane reads the records at once
+                // (`DebuggerChangeLane::offer`), follows or adopts it, and the next
+                // look settles; after a peer's own offer held the lock, the next
+                // offer finds this Mac in the record. Bounded, so no disk state
+                // holds the folder warm-up (which waits while the ask is queued)
+                // for longer.
                 if self.debugger_launch.refused(now) {
                     aterm_log::debug!("debugger launch ask: not yet: {}", why.words());
                 } else {
                     aterm_log::info!("debugger launch ask: dropped refused: {}", why.words());
                 }
             }
-            Err(end @ (OfferEnd::Declined | OfferEnd::NotAsked)) => {
+            OfferEnd::Refused(why) => {
+                self.debugger_launch.end();
+                aterm_log::info!(
+                    "debugger launch ask: dropped refused after recording this Mac: {}",
+                    why.words()
+                );
+            }
+            OfferEnd::Declined | OfferEnd::NotAsked => {
                 self.debugger_launch.end();
                 aterm_log::info!("debugger launch ask: asked; {}", end.as_str());
             }
-            Err(
-                end @ (OfferEnd::NoRecord
-                | OfferEnd::NoLock
-                | OfferEnd::Asked
-                | OfferEnd::NotRecorded),
-            ) => {
+            OfferEnd::NoLock | OfferEnd::Asked | OfferEnd::NotRecorded => {
                 self.debugger_launch.end();
                 aterm_log::info!("debugger launch ask: dropped {}", end.as_str());
+            }
+        }
+    }
+
+    /// Run the launch ask's disk work where its queue says
+    /// ([`debugger_access::RecordRead`]): on a thread of its own, which wakes the
+    /// window when it ends — the record lives in the home folder, which can sit on
+    /// a volume that stopped answering — or, a test's stand-in, here. `false` when
+    /// no thread could be started: nothing ran.
+    fn launch_ask_disk(&self, name: &'static str, work: impl FnOnce() + Send + 'static) -> bool {
+        match self.debugger_launch.record_read() {
+            debugger_access::RecordRead::Thread => {
+                let wake = self.devtools_hand_over_wake();
+                crate::qos::spawn_lane_thread(name, crate::qos::Role::Background, move || {
+                    work();
+                    wake();
+                })
+                .is_ok()
+            }
+            #[cfg(test)]
+            debugger_access::RecordRead::Inline => {
+                work();
+                true
             }
         }
     }
@@ -18470,9 +18659,8 @@ impl App {
     /// repeats what is on screen is the non-actionable alert the owner ruled
     /// out.
     ///
-    /// The gate is what makes this safe to call on every `EPERM`: a denial
-    /// storm is one notification, and the gate stays spent for the rest of the
-    /// process (`AttentionGate`).
+    /// The gate makes this safe on every `EPERM`: a denial storm is one notification, and
+    /// the gate stays spent for the process (`AttentionGate`).
     pub(crate) fn note_consent_attention(&mut self, event: consent_observer::AttentionEvent) {
         let outcome = self
             .consent_attention
@@ -21609,14 +21797,32 @@ impl App {
         // held (2026-10-19 14:49 to 2026-10-20 09:20): of the 71 alert sounds aterm
         // played, 70 came from headless dev instances (labs, live tests, checks)
         // whose programs rang BEL, one from the person's app.
-        if !self.headless
-            && self
-                .serious_mode_policy()
-                .allows(crate::motion::SeriousEffect::TerminalSound)
-            && self.config.bell_sound_or_default()
-            && self.bell_beep.try_fire(now)
+        use crate::bell_ledger::BellSound;
+        let sound = if self.headless {
+            BellSound::Headless
+        } else if !self
+            .serious_mode_policy()
+            .allows(crate::motion::SeriousEffect::TerminalSound)
         {
+            BellSound::Serious
+        } else if !self.config.bell_sound_or_default() {
+            BellSound::Off
+        } else if !self.bell_beep.try_fire(now) {
+            BellSound::Limited
+        } else {
             (self.alert_sound)(self.bell_window(session).as_deref());
+            BellSound::Sounded
+        };
+        // WHICH TAB RANG (2026-10-22): the session keeps the bell — when, the
+        // program in front, what became of its sound — for `status` and the
+        // survey (`crate::bell_ledger`). A record, never an alert: what the
+        // bell does is decided above and below, apart from it.
+        if let Some(pooled) = self.pool.get(session) {
+            pooled.ctx.bells.ring(crate::bell_ledger::Rang {
+                at_unix_ms: aterm_time::unix_millis().unwrap_or(0),
+                program: bell_program(pooled),
+                sound,
+            });
         }
         // Background iff in no visible pane of any window's active tab.
         let background = !self.is_visible_session(session);
@@ -22916,20 +23122,22 @@ impl App {
             .pending
             .retain(|sid| pool.get(*sid).is_some());
         // Timeline first (the order contract above); `record_cwd_change` dedups, so a
-        // title-only drift records nothing.
+        // title-only drift records no `cwd-change` (and `record_title` none for a cwd-only one).
         let cwd_changed = {
             let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
             let before = timeline.high_id();
             timeline.record_cwd_change(live_cwd.as_deref());
-            // The session log's `title` mark (phase 3B), in the same hold: the
-            // informative title as the tab shows it (Git Bash's home read
-            // `~`), a spinner frame's move aside. An owed wake rings the
-            // session's watchers under this lock (`slog_take_wake`).
-            let at = timeline.slog().now();
+            let cwd_moved = timeline.high_id() != before;
+            // The session log's `title` mark (phase 3B) and, since phase 6
+            // (6F-8, ruling U13), the `title-change` row it keeps, in the
+            // same hold: the informative title as the tab shows it (Git
+            // Bash's home read `~`), a spinner frame's move aside. An owed
+            // wake rings the session's watchers under this lock
+            // (`slog_take_wake`).
             let shown = crate::tab_label::informative(&live_title).to_string();
-            timeline.slog_mut().observe_title(&shown, at);
+            let _ = timeline.record_title(&shown);
             let _ = timeline.slog_take_wake();
-            timeline.high_id() != before
+            cwd_moved
         };
         // A new directory spelled with 8.3 short names is spelled long off
         // this thread, so `status disk=` places the tab with no watch's look
@@ -23818,10 +24026,8 @@ impl ApplicationHandler<Wake> for App {
                     metrics::DeadlineOwner::BellFlash,
                 );
             }
-            // SYNC-1: wake at the synchronized-output frame-hold release deadline so a
-            // held frame is released (and its accumulated update presented) even if the
-            // app goes silent after `?2026h` — the safety valve. `None` (not holding)
-            // keeps the loop in pure `Wait` (0% idle).
+            // Wake at the synchronized-output hold's release deadline, so a held frame is
+            // presented even if the app goes silent after `?2026h`.
             if let Some(d) = ws.sync_hold_until {
                 fold_owned_deadline(
                     &mut deadline,
@@ -29831,10 +30037,9 @@ impl crate::spawn::WakeTarget for LaneSink {
 /// `machine-settings:` line lands where a pass's would.
 /// Never joined (`consent_warmup.rs` rule): a wedged `defaults` must not hold a launch.
 ///
-/// NOT UNDER A PRIVATE STATE ROOT (ruling 409, 2026-09-29): a development build given its
-/// own `ATERM_STATE_HOME` shares the owner's prefix and Mac, so the claim stands aside
-/// before it takes the owner's slot ([`atpkg::machine::LaunchApply::PrivateStateRoot`],
-/// read inside the claim), and this logs its one line.
+/// Under a private state root the claim stands aside before it takes the owner's slot
+/// ([`atpkg::machine::LaunchApply::PrivateStateRoot`]): a development build with its own
+/// `ATERM_STATE_HOME` shares the owner's prefix and Mac.
 ///
 /// MACOS ONLY, exactly as the terminal session's twin (`crates/aterm/src/main.rs`,
 /// `cfg!(target_os = "macos")` before its claim): the `[machine]` settings are macOS
@@ -31323,16 +31528,11 @@ fn display_endpoint_answers(endpoint: &DisplayEndpoint) -> bool {
 /// ([`linux_trial_start`]), or only once its display has opened, and whether session 0
 /// forks before the event loop's build ([`loop_before_session0`]).
 ///
-/// Round six counted a windowed launch as a start whenever a display VARIABLE was set
-/// (`display_is_reachable_from`), and the boot apply counts it before the event loop
-/// exists. With a variable set and no server answering — `ssh -X` from a client with
-/// no X server, a tmux or `systemd --user` environment kept after the graphical
-/// session ended — every windowed launch (`aterm </dev/null`, a script's `aterm -e`, a
-/// user timer) was counted, then failed "cannot open a display" and never confirmed,
-/// so the fourth rolled back and refused a healthy build that the previous build fails
-/// in exactly the same way, and every later release after it (round eight of the
-/// update audit, #82). Such a launch is now counted only once its display opens, which
-/// it never does.
+/// A display variable alone is not enough: with one set and no server answering (`ssh -X`
+/// from a client with no X server, a tmux or `systemd --user` environment kept after the
+/// graphical session ended), a launch counted at the boot apply fails "cannot open a
+/// display" and never confirms, and enough of them roll back a healthy build. Such a
+/// launch is counted only once its display opens, which it never does.
 #[cfg(any(target_os = "linux", all(test, unix)))]
 fn a_display_server_answers_from(
     read: impl Fn(&str) -> Option<String>,
@@ -32540,14 +32740,13 @@ fn warm_prologue(
         // TERM_PROGRAM (which a shell may reset). Set for every child, including the
         // `-e <cmd>` path.
         ("ATERM_CHILD".to_string(), "1".to_string()),
-        // Select agy's document-backed prompt editor (`editing.UseDocEditor`): agy 1.4.2's
-        // legacy `visualPositionLegacy` folds non-ASCII `unicode.IsSpace` runes (such as
-        // the U+202F narrow no-break space in macOS screenshot filenames) to ASCII `' '`
-        // during line wrapping and then compares `wrapped[i][j] == line[runeIdx]`, which
-        // fails on U+202F and freezes the terminal cursor on word/line motion and Delete
-        // while keeping the literal path intact on disk.
-        ("AGY_CLI_FAST_PROMPT_EDITOR".to_string(), "true".to_string()),
     ];
+    // Select agy's document-backed prompt editor (`editing.UseDocEditor`) when unset so
+    // non-ASCII `unicode.IsSpace` runes (such as U+202F in macOS screenshot filenames)
+    // do not desynchronize Bubble Tea's legacy `visualPositionLegacy` cursor mapping.
+    if std::env::var_os("AGY_CLI_FAST_PROMPT_EDITOR").is_none() {
+        env_add.push(("AGY_CLI_FAST_PROMPT_EDITOR".to_string(), "true".to_string()));
+    }
     // A UTF-8 LC_CTYPE for the child (the parser is UTF-8-only): the minimal override, empty
     // when the effective locale (LC_ALL > LC_CTYPE > LANG) is already UTF-8. Pinned by the
     // `SpawnLocale` model.
@@ -34495,8 +34694,8 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         // them as an OS notification (`Wake::UpdateHealth`), so a broken update
         // pipeline can never again fail silently for a whole release.
         let health_proxy = event_loop.create_proxy();
-        // Rung 2: when a strictly-newer build stages, surface the persistent
-        // update-ready nudge (`Wake::UpdateStaged` -> `App.relaunch`).
+        // A strictly-newer staged build surfaces the update-ready nudge
+        // (`Wake::UpdateStaged` → `App.relaunch`).
         let staged_proxy = event_loop.create_proxy();
         let checked_proxy = event_loop.create_proxy();
         // A checker can move from Settings (whose conservative watchdog deadline
@@ -34528,11 +34727,9 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
             Some(Box::new(move |build, version| {
                 let _ = staged_proxy.send_event(Wake::UpdateStaged { build, version });
             })),
-            // Linux's cue that a pass changed the copy's update state (round eight
-            // of the update audit, finding 87): it rode the health hook until that
-            // was narrowed to failures that persist, and a healthy pass that
-            // installed a newer executable then left Settings ▸ Software Update as
-            // it was when last opened. macOS never calls it.
+            // Linux's cue that a pass changed the copy's update state, so a healthy pass that
+            // installed a newer executable refreshes Settings ▸ Software Update. macOS never
+            // calls it.
             Some(Box::new(move || {
                 let _ = checked_proxy.send_event(Wake::UpdateCheckCompleted);
             })),
@@ -34547,11 +34744,9 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
                 let _ = dev_proxy.send_event(Wake::DevBuildStanding { lag });
             }),
         );
-        // …and a dev build whose bundle is named aterm.app, which runs the writers of
-        // shared setup only the release runs unattended, says so as it starts. That is
-        // its own bundle and switches, not the channel: it is said offline and with
-        // automatic checks off too, where the watch above reads nothing. Only a
-        // dev-marked copy reads it (a few small file reads, before the loop runs).
+        // …and a dev build whose bundle is named aterm.app runs the writers of shared setup
+        // only the release runs unattended, and says so as it starts, offline and with
+        // automatic checks off too. Only a dev-marked copy reads it.
         if dev_marked && let Some(writes) = dev_build_shared_writes() {
             let _ = event_loop
                 .create_proxy()
@@ -36332,6 +36527,27 @@ pub(crate) fn held_pane_history(
     (history.carry.is_some() || history.dropped > 0).then_some(history)
 }
 
+/// The program in front of `session` as a bell rang there
+/// ([`bell_ledger::program_in_front`]): the sweep's published name, or the
+/// process name of a foreground group it has not named yet.
+fn bell_program(session: &Session) -> Option<String> {
+    let (published, pgid) = {
+        let timeline = session
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let agent = timeline.agent();
+        (agent.program.clone(), agent.program_pgid)
+    };
+    bell_ledger::program_in_front(
+        published,
+        pgid,
+        crate::quit_safety::foreground_pgrp(session.master),
+        &crate::quit_safety::process_name,
+    )
+}
+
 /// A session with no PTY or process answering to `self_id`, `sink` its only egress: the
 /// held pane's shape and, with a blank 24x80 engine, the test stub's.
 fn ptyless_session(id: u64, self_id: SessionId, term: Terminal, sink: Arc<SinkWriter>) -> Session {
@@ -36367,6 +36583,7 @@ fn ptyless_session(id: u64, self_id: SessionId, term: Terminal, sink: Arc<SinkWr
         reset_lane: Default::default(),
         crash_journal: Default::default(),
         typed: Default::default(),
+        bells: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),

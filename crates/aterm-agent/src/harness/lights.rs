@@ -348,9 +348,8 @@ mod tests {
 
     const BYPASS: &str = "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle) \u{00B7} \u{2190} for agents";
 
-    /// The drawn light keeps its mode under a box (no composer) and under a
-    /// menu (no pill row), but a pill this build cannot name — renamed, or cut
-    /// by a narrow pane — turns it Unknown rather than leaving the old mode up.
+    /// The mode shown survives a box (no composer) and a menu (no pill row),
+    /// but a drawn pill this build cannot name turns it Unknown.
     #[test]
     fn a_drawn_pill_this_build_cannot_name_replaces_the_mode_shown() {
         let rule = "\u{2500}".repeat(60);
@@ -425,8 +424,7 @@ mod tests {
         }
     }
 
-    /// A box over the composer: nothing is known, and nothing deviates — so
-    /// nothing is drawn or pressed.
+    /// A box over the composer: nothing is known, so nothing deviates.
     #[test]
     fn no_composer_no_lights_and_no_drive() {
         assert_eq!(read_screen(&["$ ls".to_owned()]), None);
@@ -455,11 +453,8 @@ mod tests {
         }
     }
 
-    /// EVERY RECORDED CLAUDE CODE SCREEN in `aterm-phase`'s fixtures (measured
-    /// sessions and the 2.1.280 box captures): a screen with a composer gives
-    /// a definite state for every light it shows, and one with a box up gives
-    /// no screen at all — so a vendor change that moves the composer shows up
-    /// here as a corpus failure, not as lights that quietly lie.
+    /// Every recorded Claude Code screen in `aterm-phase`'s fixtures reads a
+    /// definite state for every light it shows, or (a box up) no screen at all.
     #[test]
     fn every_recorded_screen_reads_definitely_or_not_at_all() {
         let dir =
@@ -687,11 +682,8 @@ mod tests {
         }
     }
 
-    /// THE CURRENT VENDOR, LIVE: every 2.1.283 capture (measured 2026-09-25,
-    /// `aterm ctl text` of a private headless aterm, the owner's settings)
-    /// reads as the state it was captured in — mode and turn in flight. A
-    /// vendor build that draws any of these differently fails
-    /// HERE, by name, before it can grey a light or press a wrong key.
+    /// Every 2.1.283 capture (`aterm ctl text` of a private headless aterm)
+    /// reads as the mode and turn state it was captured in.
     #[test]
     fn the_2_1_283_screens_read_as_measured() {
         let cases: [(&str, &str, Mode, bool); 8] = [

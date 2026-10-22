@@ -101,9 +101,9 @@ impl ClipboardAuth {
     /// [`super::policy_gates`] compiled from [`probe_osc52_set`] at
     /// [`super::policy_gates::GATE_ORIGIN`]:
     ///
-    /// * a sequence-specific rule with response `Execute` mints;
-    /// * only a universal wildcard `Execute` rule (`response any`) falls back
-    ///   to `write_authorized`, so broad profiles cannot reopen this
+    /// * a sequence-specific `Execute` rule mints;
+    /// * a universal wildcard `Execute` rule (`response any`) falls back to
+    ///   `write_authorized`, so broad profiles cannot reopen this
     ///   deny-by-default sink;
     /// * a rule with any other response refuses, whatever `write_authorized` says;
     /// * no matching rule, or no policy installed

@@ -1,0 +1,13 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (144x50, aterm 0.111.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · launched with --trust-workspace in a project whose README.md holds `the lab's project: a parser module`; `carry on with the task` and Enter, the stub's custom mode answering the turn with the one call `muse.read_memory {"path":"notes.md"}` and its result with a reply holding no words: the turn over on the call's own rows, its run settled (5 s and a quiet screen) (`targo --unverified lab muse-captures --only tool-row`, capture `tool-row-read-memory`) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ carry on with the task
+
+◆ Read memory notes.md — failed
+└ memory file not found
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

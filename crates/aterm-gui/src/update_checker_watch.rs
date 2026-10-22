@@ -732,14 +732,10 @@ mod tests {
         }
     }
 
-    /// THE WATCHDOG'S HEALS END THE DIGEST'S DAY TOO. Announcing a stall or a
-    /// held lock claims a digest line for the day it may last
-    /// (`update.review.stalled`, `update.review.lockheld`); each heal withdrew
-    /// the latch, the row and the record but not that claim, so a stall healed
-    /// in a minute still raised "The update check stopped" in the digest a day
-    /// later. Both heals now go through the one update-health heal
-    /// (`App::heal_update_health_where`), which ends the claim. NEGATIVE
-    /// CONTROL: one kind's heal leaves the other kind's claim.
+    /// The watchdog's heals end the digest's day too: announcing a stall or a held lock claims
+    /// a digest line (`update.review.stalled`, `update.review.lock-held`), and both heals go
+    /// through `App::heal_update_health_where`, which ends the claim. Negative control: one
+    /// kind's heal leaves the other kind's claim.
     #[test]
     fn a_watchdog_heal_withdraws_its_digest_claim() {
         let mut app = App::headless_for_test();

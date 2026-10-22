@@ -81,8 +81,8 @@ pub(crate) fn random_token_hex() -> Option<String> {
     aterm_uds::rand::hex_token::<32>().ok()
 }
 
-/// Filename of the `latest` symlink in the per-user directory, pointing at
-/// the newest instance's `aterm-<pid>.sock`.
+/// Filename of the `latest` alias in the per-user directory, naming the newest instance's
+/// `aterm-<pid>.sock`.
 pub(crate) const SOCK_FILE: &str = control_socket::LATEST_SOCK_FILE;
 
 /// Subdirectory of the socket directory that confines `image`-verb PNG writes.
@@ -3226,10 +3226,8 @@ fn prune_video_dirs(
     prune_video_dirs_with_work(root, fresh, &mut work)
 }
 
-/// Resolve the per-user directory that holds the control socket, token, and
-/// image-confinement subdir, creating it if missing (`0700` on Unix; on
-/// Windows the default per-user ACL is the boundary — see
-/// `control_auth_win.rs`).
+/// Resolve the per-user directory holding the control socket, token and image subdir, and
+/// make it private ([`ensure_private_dir`]: `0700` on Unix, an owner-only DACL on Windows).
 ///
 /// Order of preference (matched exactly by the `aterm-ctl` client):
 /// 1. `$XDG_RUNTIME_DIR/aterm` when `XDG_RUNTIME_DIR` is set (already a

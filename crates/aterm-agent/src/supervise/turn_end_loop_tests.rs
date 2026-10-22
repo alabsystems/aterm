@@ -2259,17 +2259,11 @@ fn the_windows_host_types_the_workers_suggestion_under_its_hand() {
     );
 }
 
-/// A CONTINUATION THE SERVER REFUSED FOR NOW IS TYPED ONCE IT CAN BE (the
-/// sweep of 2026-10-09, Claude Code 2.1.295, `continue`): an idle point's
-/// act meets `ERR halted` (an owner's `hold`) or `ERR busy …` (`ERR rate`
-/// takes the same branch);
-/// the loop parks on the hold (`HALTED`, then `UNHALTED` once `status` reads
-/// `hold=0`) or backs off, and decides the point again and types the act,
-/// though the screen never moves — on the guarded `turn` and on the fenced
-/// `send`. Measured before: after `UNHALTED` nothing was typed for 16 minutes
-/// and nobody was told, since an idle point that stands moves nothing the
-/// loop's wait latches on. The session ends on the fact (the second write),
-/// its stalls a hang detector.
+/// A continuation the server refused for now (`ERR halted` from a `hold`, `ERR busy …`; `ERR
+/// rate` takes the same branch) is typed once it can be: the loop parks on the hold (`HALTED`,
+/// then `UNHALTED` once `status` reads `hold=0`) or backs off, decides the point again and
+/// types, though the screen never moves — on the guarded `turn` and the fenced `send`. The
+/// session ends on the second write; its stalls are a hang detector.
 #[test]
 fn a_continuation_a_refusal_turned_away_is_typed_once_it_can_be() {
     for refusal in ["halted reason=owner origin=local", "busy lease=s-9"] {
@@ -2442,13 +2436,9 @@ fn a_keep_going_continuation_waits_out_an_edit_hold() {
     }
 }
 
-/// A REFUSAL'S EPISODE, by its key and its last meeting
-/// ([`Session::refusal_news`]): the same refusal met again within
-/// [`REFUSAL_QUIET`] of its last meeting is no news, whatever its measures
-/// say (`human_ms=`, `bytes=`, a `…_ms=` wait); met again after that long
-/// unmet — across a wall's wait — it is a new appearance, and said. A new
-/// holder of the session is news: another lease, another turn, another
-/// supervisor, another hold's reason.
+/// A refusal's episode ([`Session::refusal_news`]): met again within [`REFUSAL_QUIET`] it is no
+/// news whatever its measures say (`human_ms=`, `bytes=`, a `…_ms=` wait); met after that long
+/// unmet it is a new appearance; a new holder (lease, turn, supervisor, hold reason) is news.
 #[test]
 fn a_refusals_episode_is_its_holder_and_ends_after_a_quiet_spell() {
     assert_eq!(
@@ -8495,6 +8485,8 @@ fn the_wall_cache_is_dropped_when_the_worker_has_worked() {
         pane_rows: None,
         launch: None,
         submits: None,
+        inputs_before: None,
+        inputs_after: None,
     };
     let wall = of(memory_wall_in("3h"));
     let r = s.turn_end_reading(&wall, None, &opts);
@@ -9289,6 +9281,8 @@ fn read_screen(rows: Vec<String>) -> Screen {
         pane_rows: None,
         launch: None,
         submits: None,
+        inputs_before: None,
+        inputs_after: None,
     }
 }
 
@@ -29562,6 +29556,7 @@ fn a_host_step_that_moved_the_session_spends_the_count_on_the_harness() {
         let mut m = Mock::new(vec![idle_screen()]);
         m.cursor_on_caret = true;
         m.submits_on = [(0, 2)].into_iter().collect();
+        m.inputs_on = [(0, (Some(5), 5))].into_iter().collect();
         let opts = SuperviseOpts {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
             ..hosted(30)
@@ -29570,16 +29565,21 @@ fn a_host_step_that_moved_the_session_spends_the_count_on_the_harness() {
         s.set_clock(TEST_NOW, PDT);
         let screen = s.screen().expect("the point");
         assert_eq!(screen.submits, Some(2), "the host's count");
+        assert_eq!(
+            (screen.inputs_before, screen.inputs_after),
+            (Some(5), Some(5)),
+            "the host's input writes"
+        );
         let point = s.turn_of(screen);
         let _ = s
             .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
             .expect("the decision");
-        let counted = s.turn_end.redrawn_fresh(Some(2));
+        let counted = s.turn_end.redrawn_fresh(Some(2), Some(5));
         host.wanting.store(true, Ordering::SeqCst);
         let stepped = s
             .host_steps_here(&point, &opts, &mut false, &mut Alone)
             .expect("the host's step");
-        (counted, stepped, s.turn_end.redrawn_fresh(Some(2)))
+        (counted, stepped, s.turn_end.redrawn_fresh(Some(2), Some(5)))
     };
     assert_eq!(
         run(true),
@@ -29588,6 +29588,149 @@ fn a_host_step_that_moved_the_session_spends_the_count_on_the_harness() {
     );
     // NEGATIVE CONTROL.
     assert_eq!(run(false), (true, true, true), "a step that moved nothing");
+}
+
+/// THE SECOND RESIDUAL OF TURNS TOLD BY SUBMISSION, THE LOOP: A RESTART
+/// WHOSE NEW PROCESS WAS TAKEN READS THE COUNT AGAIN
+/// ([`super::super::policy::turn_end::TurnEndState::counted_after_harness`]).
+/// The point judged over the host's count 2; the restart's relaunch line,
+/// counted, leaves 3, and once the host answers `adopted` the loop reads the
+/// screen once more and sets the next point against that count, so a
+/// person's prompt before it is told by its submission. FAILS WITHOUT THE
+/// FIX: the baseline stays gone until the next answered point. NEGATIVE
+/// CONTROLS: a line typed with no process found yet (`relaunched`) reads
+/// nothing and leaves it gone; a host that counts none is not read again.
+#[test]
+fn a_restart_whose_process_was_taken_reads_the_count_again() {
+    let run = |answer: &'static str, counts: bool| {
+        let host = AccountHost::scripted(&[None], &[answer]);
+        let mut m = Mock::new(vec![idle_screen(), idle_screen()]);
+        m.cursor_on_caret = true;
+        if counts {
+            m.submits_on = [(0, 2), (1, 3)].into_iter().collect();
+        }
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..hosted(30)
+        };
+        let (judged, after) = {
+            let mut s = session(&mut m, Some("@s-1".to_string()));
+            s.set_clock(TEST_NOW, PDT);
+            let screen = s.screen().expect("the point");
+            let point = s.turn_of(screen);
+            let _ = s
+                .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
+                .expect("the decision");
+            let judged = s.turn_end.counted_from();
+            s.restart_agent(
+                &point,
+                &Restart::Memory,
+                "memory-restart@v1",
+                TurnEndAction::Nothing,
+                &opts,
+                &[],
+                &mut Alone,
+            )
+            .expect("the restart");
+            (judged, s.turn_end.counted_from())
+        };
+        assert_eq!(host.said("restart"), ["restart:memory"], "{answer}");
+        let reads = m.requests.iter().filter(|r| verb_of(r) == "text").count();
+        (judged.0, after.0, after.1.is_some(), reads)
+    };
+    assert_eq!(
+        run("adopted", true),
+        (Some(2), Some(3), true, 2),
+        "read again once its process was taken"
+    );
+    // NEGATIVE CONTROLS.
+    assert_eq!(
+        run("relaunched", true),
+        (Some(2), None, false, 1),
+        "no process found yet: nothing read, the baseline gone"
+    );
+    assert_eq!(
+        run("adopted", false),
+        (None, None, false, 1),
+        "a host that counts none"
+    );
+}
+
+/// THE REVIEW OF `b9/resid4`, E2'S MARK: THE BASELINE A RESTART WHOSE PROCESS
+/// WAS TAKEN SETS IS MARKED AS A READING MARKS ITS CONVERSATION
+/// ([`super::super::policy::turn_end::conversation_mark`]). After `adopted`
+/// the loop reads the count again and sets the next point against it; the
+/// next reading's mark is set against the baseline's
+/// (`TurnEndState::drawn_since`). The same rows read again with one more
+/// submission are a submission not drawn yet: held, no turn folded, the
+/// point's own back-off (`1 short turn(s)`). FAILS WITHOUT THE FIX: the
+/// baseline was marked over the rows up to the last thing said
+/// ([`super::submit_mark`], the review's key), which is another number for
+/// the very same rows, so the screen read as drawn since and the count's
+/// move was folded as a turn of someone else's built from the turn before
+/// the restart (`2 short turn(s)`, the point number moved). NEGATIVE
+/// CONTROL: a person's prompt answered after the restart, its Enter counted
+/// and its rows drawn, is folded as a turn of someone else's (the point
+/// number moves).
+#[test]
+fn a_restarts_count_baseline_is_marked_as_a_reading_marks_its_conversation() {
+    let answered = answered_turn(
+        "fix the failing parser test",
+        "Fixed the parser test.",
+        "✻ Worked for 3s · done 4:24 PM",
+    );
+    let run = |next: Vec<String>| {
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        let mut m = Mock::new(vec![idle_screen(), idle_screen(), next]);
+        m.cursor_on_caret = true;
+        m.submits_on = [(0, 2), (1, 3), (2, 4)].into_iter().collect();
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..hosted(30)
+        };
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        let screen = s.screen().expect("the point");
+        let point = s.turn_of(screen);
+        let _ = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(6)), &opts)
+            .expect("the decision");
+        s.restart_agent(
+            &point,
+            &Restart::Memory,
+            "memory-restart@v1",
+            TurnEndAction::Nothing,
+            &opts,
+            &[],
+            &mut Alone,
+        )
+        .expect("the restart");
+        let rebased = s.turn_end.counted_from();
+        let before = s.turn_end.point_number();
+        let next = s.screen().expect("the next read");
+        let p = s.turn_of(next);
+        let a = s
+            .turn_end_at_point(&p, None, &opts)
+            .expect("the next decision");
+        (rebased, before, s.turn_end.point_number(), a)
+    };
+    let (rebased, before, after, a) = run(idle_screen());
+    assert_eq!(rebased.0, Some(3), "the count read after `adopted`");
+    assert_eq!(
+        after, before,
+        "a submission counted over the rows the baseline stood on folds no turn: {a:?}"
+    );
+    assert!(
+        matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("1 short turn(s)")),
+        "held, the point's own back-off: {a:?}"
+    );
+    // NEGATIVE CONTROL.
+    let (_, before, after, a) = run(answered);
+    assert_eq!(
+        after.map(|n| n - 1),
+        before,
+        "a person's prompt answered since the restart is folded as a turn: {a:?}"
+    );
 }
 
 /// THE REVIEW OF `b9/resid3`, F1/F2 ON GEMINI CLI, THE LOOP: A SCREEN ITS
@@ -29601,8 +29744,14 @@ fn a_host_step_that_moved_the_session_spends_the_count_on_the_harness() {
 /// banner in sight, the screen `fresh`, the reading taskless — and the first
 /// point's back-off was dropped (`Nothing`: no due, a Cruise session idle
 /// for good). FAILS WITHOUT THE FIX: the re-wrapped point decided `Nothing`.
-/// NEGATIVE CONTROL: the same frame over a count moved (a `/clear` typed) is
-/// taskless as read.
+/// NEGATIVE CONTROLS, each taskless as read: the same frame over a count
+/// moved (a `/clear` typed), and over the input count moved with the
+/// submission count not (a key that cleared with nothing composed: the third
+/// residual of turns told by submission, `text --json`'s `"inputs"`; FAILS
+/// WITHOUT ITS FIX, the cleared conversation read as redrawn), over a key
+/// that landed while either screen's rows were read (counted after them, not
+/// before: each side's count pinned, the review of `b9/resid4`), and over a
+/// write in flight at the point's read.
 #[test]
 fn a_rewrapped_band_read_as_a_launch_card_keeps_the_points_back_off() {
     let msg = " > FOREVERLAB-SAME-WORDS. write the parser for this repository under \
@@ -29690,22 +29839,27 @@ fn a_rewrapped_band_read_as_a_launch_card_keeps_the_points_back_off() {
         "the reader takes the re-wrapped frame for a launch card"
     );
     // Each frame as the loop read it: the cursor in the composer, and the
-    // host's count.
-    let read = |rows: &[String], cursor_row: usize, seq: u64, submits: u64| Screen {
-        rows: rows.to_vec(),
-        cursor_row,
-        cursor_col: 3,
-        seq,
-        submits: Some(submits),
-        ..Screen::default()
-    };
-    let run = |cleared: bool| {
+    // host's counts — its submissions, and its input writes before the rows
+    // (`None`: one in flight) and after them.
+    type Inputs = (Option<u64>, u64);
+    let read =
+        |rows: &[String], cursor_row: usize, seq: u64, submits: u64, inputs: Inputs| Screen {
+            rows: rows.to_vec(),
+            cursor_row,
+            cursor_col: 3,
+            seq,
+            submits: Some(submits),
+            inputs_before: inputs.0,
+            inputs_after: Some(inputs.1),
+            ..Screen::default()
+        };
+    let run = |cleared: bool, first_inputs: Inputs, again_inputs: Inputs| {
         let mut m = Mock::new(vec![whole.clone()]);
         m.program = "gemini";
         let opts = hosted(30);
         let mut s = session(&mut m, Some("@s-1".to_string()));
         s.set_clock(TEST_NOW, PDT);
-        let first = s.turn_of(read(&whole, 22, 3614, 2));
+        let first = s.turn_of(read(&whole, 22, 3614, 2, first_inputs));
         let a = s
             .turn_end_at_point(&first, Some(Duration::from_secs(6)), &opts)
             .expect("the first decision");
@@ -29713,15 +29867,57 @@ fn a_rewrapped_band_read_as_a_launch_card_keeps_the_points_back_off() {
             matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("1 short turn(s)")),
             "the first point's back-off: {a:?}"
         );
-        let again = s.turn_of(read(&rewrapped, 28, 4306, if cleared { 3 } else { 2 }));
+        let again = s.turn_of(read(
+            &rewrapped,
+            28,
+            4306,
+            if cleared { 3 } else { 2 },
+            again_inputs,
+        ));
         s.turn_end_at_point(&again, None, &opts)
             .expect("the re-wrapped point's decision")
     };
-    let a = run(false);
+    let settled = (Some(40), 40);
+    let a = run(false, settled, settled);
     assert!(
         matches!(&a, TurnEndAction::WaitUntil { why, .. } if why.contains("1 short turn(s)")),
         "the first point's back-off stands: {a:?}"
     );
-    // NEGATIVE CONTROL.
-    assert_eq!(run(true), TurnEndAction::Nothing, "a /clear: no task");
+    // NEGATIVE CONTROLS.
+    let keyed = (Some(43), 43);
+    assert_eq!(
+        run(true, settled, keyed),
+        TurnEndAction::Nothing,
+        "a /clear: no task"
+    );
+    assert_eq!(
+        run(false, settled, keyed),
+        TurnEndAction::Nothing,
+        "keys with nothing submitted: no task"
+    );
+    // WHICH COUNT EACH SIDE TAKES (the review of `b9/resid4`, R2): the later
+    // screen is set against by its count AFTER its rows, so a key that landed
+    // while they were read (counted after them, not before) is no redraw —
+    // it may be the very key that cleared them. FAILS with the count before
+    // the rows taken there: read as redrawn.
+    assert_eq!(
+        run(false, settled, (Some(40), 41)),
+        TurnEndAction::Nothing,
+        "a key that landed while the re-wrapped rows were read: no task"
+    );
+    // …and the point's baseline is its count BEFORE its rows, so a key that
+    // landed while the point's rows were read (after them, perhaps: the
+    // clear the later screen shows) is a key since the point. FAILS with the
+    // count after the point's rows taken there: read as redrawn.
+    assert_eq!(
+        run(false, (Some(40), 41), (Some(41), 41)),
+        TurnEndAction::Nothing,
+        "a key that landed while the point's rows were read: no task"
+    );
+    // …and a point read with a write in flight has no baseline at all.
+    assert_eq!(
+        run(false, (None, 41), (Some(41), 41)),
+        TurnEndAction::Nothing,
+        "a write in flight at the point's read: no task"
+    );
 }

@@ -40,9 +40,9 @@ struct Publication {
     sync_parent: bool,
 }
 
-/// Whether `name` is ONE ordinary path component that every backend may hand
-/// a handle-relative call: the rule [`validate_component`] enforces, for the
-/// callers that judge a name before it reaches a [`PinnedDir`].
+/// Whether `name` is one ordinary path component that every backend may hand a handle-relative
+/// call: the rule [`validate_component`] enforces, for callers that judge a name before it
+/// reaches a [`PinnedDir`].
 pub(crate) fn is_one_component(name: &OsStr) -> bool {
     validate_component(name).is_ok()
 }
@@ -3127,9 +3127,7 @@ mod shared_backend_contract_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// REGRESSION (FS-1, 2026-10-10): "one ordinary component" is decided on
-    /// the raw name. `Path::components()` normalized a trailing `/`, `/.` and
-    /// `//` away, so `"link/"` passed and the `*at` call resolved `link`.
+    /// "One ordinary component" is decided on the raw name, so `"link/"` and its kin are refused.
     #[test]
     fn one_component_is_decided_on_the_raw_name() {
         use std::ffi::OsStr;
@@ -3718,13 +3716,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// REGRESSION (FS-1, 2026-10-10): `O_NOFOLLOW`, `unlinkat` and `renameat`
-    /// govern only a name's final component, and the kernel resolves `link` in
-    /// `"link/"`, `"link/."` and `"link//"`. Until the name was judged raw,
-    /// each passed as one component, so a pinned directory reached through a
-    /// symlink it holds: `child` opened the outside directory,
-    /// `remove_child_tree` emptied and removed it, `rename` moved it in and
-    /// `create_child` made one through a dangling link.
+    /// `O_NOFOLLOW`, `unlinkat` and `renameat` govern only the final component, so `"link/"`,
+    /// `"link/."` and `"link//"` must be refused as names, never resolved through the symlink.
     #[test]
     fn a_trailing_separator_never_reaches_through_a_symlink() {
         use std::ffi::OsStr;

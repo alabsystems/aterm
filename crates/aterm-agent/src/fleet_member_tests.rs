@@ -660,6 +660,189 @@ fn a_machine_that_takes_a_members_node_id_is_refused() {
     );
 }
 
+/// A JOIN AGAIN OF THE SAME FLEET REACHES ONLY THE ISSUER THIS MAC BINDS:
+/// another holder of the fleet's secret — an issuer of its own holding this
+/// fleet's key — answering at the host and port a code names, proving no
+/// node or a node of its own, is refused before anything is sent it, naming
+/// `aterm fleet leave` as the way to a new issuer; the member's key, book
+/// and `[fleet]` stay, its issuer the one it joined. FAILS WITHOUT THE FIX:
+/// the other machine is recorded as the issuer, its key bound. NEGATIVE
+/// CONTROLS: a join again that reaches the bound issuer is recorded, and
+/// after `leave` a join reaching the other machine binds it.
+#[test]
+fn a_join_again_of_the_same_fleet_reaches_only_the_issuer_it_binds() {
+    let issuer = World::new("bound-issuer");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    ok(init(
+        &issuer.places,
+        &args(&["--host", "127.0.0.1", "--port", &port]),
+    ));
+    let code = std::fs::read_to_string(issuer.places.state.join(CODE_FILE)).unwrap();
+    let _serving = Listener::serve(listener, &issuer.places.state);
+    let member = World::new("bound-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &code));
+    let book = read_peers(&member.places.state).unwrap();
+    let (key, config) = (
+        read_key_file(&member.places.state).unwrap(),
+        member.config(),
+    );
+
+    // The other machine, at a port of its own a code with this fleet's
+    // secret names: first proving no node, then its own.
+    let secret = JoinCode::parse(&code).unwrap().secret;
+    let other = World::new("bound-other");
+    let serve_other = || {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let at = JoinCode {
+            secret,
+            host: "127.0.0.1".to_owned(),
+            port: listener.local_addr().unwrap().port(),
+        };
+        (Listener::serve(listener, &other.places.state), at.text())
+    };
+    ok(init(
+        &other.places,
+        &args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()]),
+    ));
+    member::write_key_file(&other.places.state, &secret).unwrap();
+    member::remove_private(&other.places.state, NODE_KEY_FILE).unwrap();
+    let issuer_node = member::node_id(&issuer.places.state).unwrap();
+    for proves in ["no node", "its own node"] {
+        if proves == "its own node" {
+            member::node_identity(&other.places.state).unwrap();
+        }
+        let (_serving_other, there) = serve_other();
+        let refused = match join(&member.places, &opts, &there) {
+            Err(Failure::Failed(why)) => why,
+            result => panic!("{proves}: {result:?} should be refused"),
+        };
+        assert!(
+            refused.contains(&format!(
+                "for the issuer this Mac binds (node {})",
+                short(&issuer_node)
+            )) && refused.contains("`aterm fleet leave` here, then `aterm fleet join`"),
+            "{proves}: {refused}"
+        );
+        assert_eq!(read_peers(&member.places.state).unwrap(), book, "{proves}");
+        assert_eq!(read_key_file(&member.places.state).unwrap(), key);
+        assert_eq!(member.config(), config);
+        assert_eq!(
+            read_peers(&other.places.state).unwrap(),
+            Vec::new(),
+            "{proves}: nothing was sent it"
+        );
+    }
+
+    let issuer_of = |world: &World| {
+        read_peers(&member.places.state)
+            .unwrap()
+            .into_iter()
+            .filter(|peer| peer.via == Via::Issuer)
+            .map(|peer| (peer.node, peer.key))
+            .collect::<Vec<_>>()
+            == [(
+                Some(member::node_id(&world.places.state).unwrap()),
+                member::read_node_identity(&world.places.state)
+                    .unwrap()
+                    .map(|me| me.key()),
+            )]
+    };
+    ok(join(&member.places, &opts, &code));
+    assert!(issuer_of(&issuer), "the bound issuer, reached again");
+    ok(leave(&member.places, &[]));
+    let (_serving_other, there) = serve_other();
+    ok(join(&member.places, &opts, &there));
+    assert!(issuer_of(&other), "a new issuer, after leave");
+}
+
+/// AN ISSUER THAT LOST ITS NODE KEY IS BOUND AGAIN AS ITS REFUSAL SAYS: a join
+/// again of the same fleet reaching the bound issuer while it proves no node
+/// (its node key gone) is refused, nothing written here, and the refusal
+/// names that issuer's remedy — `aterm fleet init` there, then `peers rm` of
+/// it here — beside `leave`; once `init` there mints a key, the join is
+/// refused as the bound node under another key, and after the `peers rm`
+/// here it binds the new key. FAILS WITHOUT THE FIX: the refusal names
+/// another node and `leave` alone, which would record the issuer bound to
+/// no key.
+#[test]
+fn an_issuer_that_lost_its_node_key_is_bound_again_as_its_refusal_says() {
+    let issuer = World::new("keyless-issuer");
+    ok(init(
+        &issuer.places,
+        &args(&["--host", "127.0.0.1", "--port", &closed_port().to_string()]),
+    ));
+    let secret =
+        JoinCode::parse(&std::fs::read_to_string(issuer.places.state.join(CODE_FILE)).unwrap())
+            .unwrap()
+            .secret;
+    // The issuer served as it is now, at a port a code with its secret names.
+    let serve = || {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let at = JoinCode {
+            secret,
+            host: "127.0.0.1".to_owned(),
+            port: listener.local_addr().unwrap().port(),
+        };
+        (Listener::serve(listener, &issuer.places.state), at.text())
+    };
+    let member = World::new("keyless-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    let (serving, code) = serve();
+    ok(join(&member.places, &opts, &code));
+    drop(serving);
+    let node = member::node_id(&issuer.places.state).unwrap();
+    let book = read_peers(&member.places.state).unwrap();
+
+    member::remove_private(&issuer.places.state, NODE_KEY_FILE).unwrap();
+    let (serving, code) = serve();
+    let refused = match join(&member.places, &opts, &code) {
+        Err(Failure::Failed(why)) => why,
+        other => panic!("{other:?}: the bound issuer proves no node"),
+    };
+    assert!(
+        refused.contains("`aterm fleet init` there")
+            && refused.contains("`aterm fleet peers rm <its node>` here")
+            && refused.contains("`aterm fleet leave` here"),
+        "{refused}"
+    );
+    assert_eq!(read_peers(&member.places.state).unwrap(), book);
+    drop(serving);
+
+    ok(init(&issuer.places, &[]));
+    let minted = member::read_node_identity(&issuer.places.state)
+        .unwrap()
+        .expect("init minted a node key")
+        .key();
+    let (_serving, code) = serve();
+    let refused = match join(&member.places, &opts, &code) {
+        Err(Failure::Failed(why)) => why,
+        other => panic!("{other:?}: the bound node under another key"),
+    };
+    assert!(
+        refused.contains("`aterm fleet peers rm <its node>` here"),
+        "{refused}"
+    );
+    ok(peers(&member.places, &args(&["rm", short(&node)])));
+    ok(join(&member.places, &opts, &code));
+    let issuer_here: Vec<_> = read_peers(&member.places.state)
+        .unwrap()
+        .into_iter()
+        .filter(|peer| peer.via == Via::Issuer)
+        .map(|peer| (peer.node, peer.key))
+        .collect();
+    assert_eq!(issuer_here, [(Some(node), Some(minted))]);
+}
+
 /// A JOIN THE ISSUER RECORDED THAT CANNOT WRITE aterm.toml ([`unfinished`];
 /// the review of fleet.1-m2): a config the edit refuses is refused before
 /// the dial — the issuer's book holds no member and nothing of the fleet is
@@ -890,15 +1073,13 @@ fn a_machine_the_book_holds_is_read_once() {
             addr: "10.0.0.5:7100".parse().unwrap(),
             node: node.map(str::to_owned),
             proven: false,
+            key: None,
             lines: Vec::new(),
         })
     };
-    let target = |node: Option<&str>| Target {
-        host: "lab-mini".to_owned(),
-        addr: None,
-        port: 7100,
+    let entry = |node: Option<&str>| Peer {
         node: node.map(str::to_owned),
-        key: None,
+        ..manual_peer("lab-mini".to_owned(), 7100)
     };
     let (a, b) = ("aa".repeat(16), "bb".repeat(16));
     // A person's entry, then the one that joined (whose node the read
@@ -907,13 +1088,13 @@ fn a_machine_the_book_holds_is_read_once() {
     // answering as `b`, keep the first.
     let read = once_per_node(
         &[
-            target(None),
-            target(None),
-            target(Some(&a)),
-            target(None),
-            target(None),
-            target(None),
-            target(None),
+            entry(None),
+            entry(None),
+            entry(Some(&a)),
+            entry(None),
+            entry(None),
+            entry(None),
+            entry(None),
         ],
         vec![
             answered(Some(&a)),
@@ -927,6 +1108,162 @@ fn a_machine_the_book_holds_is_read_once() {
     );
     let kept: Vec<bool> = read.iter().map(Option::is_some).collect();
     assert_eq!(kept, [false, true, true, true, false, true, true]);
+}
+
+/// AN UNPROVEN CLAIM NEVER COLLAPSES INTO A PROVEN ANSWER: this Mac read
+/// through a place its book names by hand (proven, its own node: the row the
+/// menu bar's glance drops as this Mac) and a Mac at a later place that
+/// claims this Mac's node without its key are two blocks, so the claimant is
+/// listed under its mark and never vanishes with this Mac's row; and so are
+/// a member's checked answer and a claim of its node at a place a person
+/// named. FAILS WITHOUT THE FIX: each claim is taken out as its node's second
+/// answer. NEGATIVE CONTROL: answers alike — both proven, or both claims —
+/// are one block still.
+#[test]
+fn an_unproven_claim_never_collapses_into_a_proven_answer() {
+    let answered = |node: &str, proven: bool| {
+        Ok(member::Surveyed {
+            scope: FleetScope::Facts,
+            addr: "10.0.0.5:7100".parse().unwrap(),
+            node: Some(node.to_owned()),
+            proven,
+            key: None,
+            lines: Vec::new(),
+        })
+    };
+    let entry = |node: Option<&str>| Peer {
+        node: node.map(str::to_owned),
+        ..manual_peer("lab-mini".to_owned(), 7100)
+    };
+    let (mine, a) = ("aa".repeat(16), "bb".repeat(16));
+    let read = once_per_node(
+        &[
+            entry(None),
+            entry(None),
+            entry(None),
+            entry(None),
+            entry(Some(&a)),
+            entry(None),
+        ],
+        vec![
+            answered(&mine, true),
+            answered(&mine, false),
+            answered(&mine, false),
+            answered(&mine, true),
+            answered(&a, true),
+            answered(&a, false),
+        ],
+    );
+    let kept: Vec<bool> = read.iter().map(Option::is_some).collect();
+    assert_eq!(kept, [true, true, false, false, true, true]);
+}
+
+/// A MAC THAT DID NOT ANSWER IS ONE ROW AT ITS PLACE: a person's `lab-mini`
+/// (no node) and the copy of the `lab-mini.local` that joined there, read
+/// side by side and both failing the same way at the address both tried,
+/// are that node's failure once — what the menu bar's "not answering" lists.
+/// NEGATIVE CONTROLS: the person's entry failing where the node answered is
+/// kept, as no failure folds into an answer; two nodes failing at one place
+/// are two rows, as a place never stands for a node; a person's entry at
+/// another port is a place of its own; and a place alone folds no failure,
+/// as a node's place is what its registrant said and its address may be
+/// another Mac's now — a member that registered as `lab-mini.evil` failing
+/// at its own address beside the Mac the person named, one that stalls its
+/// handshake (a deadline, at no address) beside a name that did not
+/// resolve, and another failure at the same address are each kept. FAILS
+/// WITHOUT THE FIX: each of those is folded into the node's row, the Mac
+/// the person named gone from the read.
+#[test]
+fn a_mac_that_did_not_answer_is_one_row_at_its_place() {
+    let by_hand = |port: u16| manual_peer("lab-mini".to_owned(), port);
+    let joined_as = |node: &str, host: &str, addr: [u8; 4]| Peer {
+        node: Some(node.to_owned()),
+        addr: Some(IpAddr::from(addr)),
+        via: Via::IssuerBook,
+        ..manual_peer(host.to_owned(), 7100)
+    };
+    let joined = |node: &str| joined_as(node, "lab-mini.local", [10, 0, 0, 5]);
+    let failed = |at: &str, kind: io::ErrorKind| {
+        Err(Unreached::Connect(
+            at.parse().unwrap(),
+            io::Error::from(kind),
+        ))
+    };
+    let down = || failed("10.0.0.5:7100", io::ErrorKind::TimedOut);
+    let up = |node: &str| {
+        Ok(member::Surveyed {
+            scope: FleetScope::Facts,
+            addr: "10.0.0.5:7100".parse().unwrap(),
+            node: Some(node.to_owned()),
+            proven: true,
+            key: None,
+            lines: Vec::new(),
+        })
+    };
+    let kept = |entries: &[Peer], read: Vec<Result<member::Surveyed, Unreached>>| {
+        once_per_node(entries, read)
+            .iter()
+            .map(Option::is_some)
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = ("aa".repeat(16), "bb".repeat(16));
+    assert_eq!(
+        kept(&[by_hand(7100), joined(&a)], vec![down(), down()]),
+        [false, true],
+        "the Mac asleep, once"
+    );
+    assert_eq!(
+        kept(&[by_hand(7100), joined(&a)], vec![down(), up(&a)]),
+        [true, true],
+        "an answer hides no failure"
+    );
+    assert_eq!(
+        kept(
+            &[joined(&a), joined(&b), by_hand(7100)],
+            vec![down(), down(), down()]
+        ),
+        [true, true, false],
+        "two nodes at one place, two rows"
+    );
+    assert_eq!(
+        kept(&[by_hand(7101), joined(&a)], vec![down(), down()]),
+        [true, true],
+        "another port"
+    );
+    let claimed = joined_as(&a, "lab-mini.evil", [10, 0, 0, 66]);
+    assert_eq!(
+        kept(
+            &[by_hand(7100), claimed.clone()],
+            vec![down(), failed("10.0.0.66:7100", io::ErrorKind::TimedOut)]
+        ),
+        [true, true],
+        "a place its registrant claimed, failing at its own address"
+    );
+    assert_eq!(
+        kept(
+            &[by_hand(7100), claimed],
+            vec![
+                Err(Unreached::Resolve("lab-mini".to_owned())),
+                Err(Unreached::Deadline(
+                    member::Stage::Handshake,
+                    Duration::from_secs(3)
+                )),
+            ]
+        ),
+        [true, true],
+        "a failure at no address"
+    );
+    assert_eq!(
+        kept(
+            &[by_hand(7100), joined(&a)],
+            vec![
+                failed("10.0.0.5:7100", io::ErrorKind::ConnectionRefused),
+                down()
+            ]
+        ),
+        [true, true],
+        "another failure at the same address"
+    );
 }
 
 /// A MEMBER'S `peers` READS ITS ISSUER'S BOOK: a peer the issuer's person
@@ -1340,7 +1677,12 @@ fn a_join_to_an_issuer_past_the_lan_is_refused_by_its_kind() {
         key: None,
     };
     let me = aterm_net::fleet::NodeIdentity::from_seed(&registration.node, &[3; 32]).unwrap();
-    let refused = register_with(&code, (&secret, &me), &Keyring::default(), &registration);
+    let refused = register_with(
+        &code,
+        (&secret, &me),
+        (&Keyring::default(), None),
+        &registration,
+    );
     assert!(
         matches!(&refused, Err(JoinFailed::Dial(Unreached::NotFleet(_)))),
         "{refused:?}"
@@ -1579,8 +1921,10 @@ fn every_reason_a_fleet_read_gives_fits_its_row() {
 /// refused to this process (`EPERM`, `EACCES`: a sandbox, a firewall), no
 /// route to the host (on a Mac, local-network privacy), none to its network
 /// (offline, a VPN), a machine that claims a node this one binds to a key
-/// without proving that key, an issuer that binds this machine's node to
-/// another, an issuer that recorded this machine from another address
+/// without proving that key, another node answering for the issuer a join
+/// again of the same fleet must reach, or a machine proving none there (which
+/// may be that issuer without its key), an issuer that binds this machine's
+/// node to another, an issuer that recorded this machine from another address
 /// before keys came (no key bound: not the advice of one bound to another).
 /// NEGATIVE CONTROLS: a refused port, and an issuer's other refusal, take
 /// the check-the-issuer advice.
@@ -1605,6 +1949,20 @@ fn a_failed_join_is_advised_by_its_kind() {
         (JoinFailed::OtherKey("ab".repeat(16)), Advice::IssuerKey),
         (JoinFailed::Unproved("ab".repeat(16)), Advice::IssuerKey),
         (
+            JoinFailed::OtherIssuer {
+                bound: "ab".repeat(16),
+                proved: Some("cd".repeat(16)),
+            },
+            Advice::BoundIssuer,
+        ),
+        (
+            JoinFailed::OtherIssuer {
+                bound: "ab".repeat(16),
+                proved: None,
+            },
+            Advice::BoundUnproved,
+        ),
+        (
             JoinFailed::Registration(format!("ERR node abababab is bound … {}", member::REBIND)),
             Advice::NodeBound,
         ),
@@ -1628,12 +1986,14 @@ fn a_failed_join_is_advised_by_its_kind() {
     }
 }
 
-/// A PERSON'S ENTRY AT A COPY'S PLACE KEEPS THE COPY'S KEY: a read dials
-/// `[[fleet.peers]] host = "m7"` in place of the copy of the issuer's book at
-/// `m7.local`, and what answers it as that copy's node is held to the
-/// copy's key. NEGATIVE CONTROL: the read's targets alone bind none.
+/// A PERSON'S ENTRY AT A COPY'S PLACE IS READ BESIDE IT: a read dials
+/// `[[fleet.peers]] host = "m7"` and the copy of the issuer's book at
+/// `m7.local` that names a node, both — the place is what that node's
+/// registrant said — and what answers either as that node is held to the
+/// copy's key. NEGATIVE CONTROL: a copy at that place that names no node is
+/// the person's entry, dialled once.
 #[test]
-fn a_persons_entry_at_a_copys_place_keeps_the_copys_key() {
+fn a_persons_entry_at_a_copys_place_is_read_beside_it() {
     let world = World::new("placekey");
     world.write_config("[[fleet.peers]]\nhost = \"m7\"\n");
     member::ensure_private_dir(&world.places.state).unwrap();
@@ -1654,15 +2014,19 @@ fn a_persons_entry_at_a_copys_place_keeps_the_copys_key() {
         via: Via::IssuerBook,
         ..manual_peer("m7.local".to_owned(), member::DEFAULT_PORT)
     };
-    member::write_issuer_book(&world.places.state, &issuer_node, &[copy]).unwrap();
+    let by_hand = Peer {
+        via: Via::IssuerBook,
+        ..manual_peer("m7.local".to_owned(), member::DEFAULT_PORT)
+    };
+    member::write_issuer_book(&world.places.state, &issuer_node, &[copy.clone(), by_hand]).unwrap();
     let known = known_peers(&world.places).unwrap_or_else(|f| panic!("{f:?}"));
     let targets: Vec<Peer> = known.peers.iter().map(|(peer, _)| peer.clone()).collect();
     assert_eq!(
         targets.iter().map(|peer| peer.via).collect::<Vec<_>>(),
-        [Via::Issuer, Via::Manual],
-        "the person's entry stands for the copy"
+        [Via::Issuer, Via::Manual, Via::IssuerBook],
+        "the copy that names a node, beside the person's entry"
     );
-    assert_eq!(Keyring::of(&targets).bound(n.node()), None);
+    assert_eq!(targets[2], copy);
     assert_eq!(known.keys.bound(n.node()), Some(n.key()));
 }
 
@@ -1677,6 +2041,7 @@ fn a_survey_answer_is_unproven_unless_its_node_key_is_bound() {
             addr: std::net::SocketAddr::from(([10, 0, 0, 7], member::DEFAULT_PORT)),
             node: Some("c3".repeat(16)),
             proven,
+            key: None,
             lines: Vec::new(),
         })
     };
@@ -1911,6 +2276,155 @@ fn a_join_of_another_fleet_keeps_no_drive_grant() {
     );
 }
 
+/// A JOIN OF ANOTHER FLEET THAT FAILS AFTER ITS ISSUER RECORDED IT FINISHES
+/// ON A JOIN AGAIN WITH THAT CODE ([`unfinished`]): a member whose book binds
+/// its issuer joins another fleet's code while its book cannot be read (a
+/// directory in its place). The other issuer lists it, and this machine still
+/// holds the old fleet's key — so with the book put back, still binding the
+/// old issuer, the two are one fleet's, never the new key beside an issuer
+/// of the old fleet, which a join again of the new one would have to reach.
+/// The join again the failure names records the new issuer, one member
+/// there still. FAILS WITHOUT THE FIX: the new key is written before the
+/// book, and the join again is refused as another node answering for the
+/// old issuer.
+#[test]
+fn a_join_of_another_fleet_that_fails_after_its_issuer_recorded_it_finishes_on_a_join_again() {
+    let issuer_of = |tag: &str| {
+        let world = World::new(tag);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        ok(init(
+            &world.places,
+            &args(&["--host", "127.0.0.1", "--port", &port]),
+        ));
+        let code = std::fs::read_to_string(world.places.state.join(CODE_FILE)).unwrap();
+        let serving = Listener::serve(listener, &world.places.state);
+        (world, code, serving)
+    };
+    let (first, first_code, _first) = issuer_of("moving-first");
+    let (other, other_code, _other) = issuer_of("moving-other");
+    let member = World::new("moving-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &first_code));
+    let issuer_here = || {
+        read_peers(&member.places.state)
+            .unwrap()
+            .into_iter()
+            .filter(|peer| peer.via == Via::Issuer)
+            .map(|peer| peer.node)
+            .collect::<Vec<_>>()
+    };
+
+    let book = member.places.state.join(PEERS_FILE);
+    let held = std::fs::read(&book).unwrap();
+    std::fs::remove_file(&book).unwrap();
+    std::fs::create_dir(&book).unwrap();
+    let failed = match join(&member.places, &opts, &other_code) {
+        Err(Failure::Failed(why)) => why,
+        other => panic!("{other:?}: its book cannot be read"),
+    };
+    assert!(failed.contains("has recorded this machine"), "{failed}");
+    assert_eq!(read_peers(&other.places.state).unwrap().len(), 1);
+    std::fs::remove_dir(&book).unwrap();
+    member::write_private(&member.places.state, PEERS_FILE, &held).unwrap();
+    assert_eq!(
+        (read_key_file(&member.places.state).unwrap(), issuer_here()),
+        (
+            read_key_file(&first.places.state).unwrap(),
+            vec![Some(member::node_id(&first.places.state).unwrap())]
+        ),
+        "the old fleet's key, beside its issuer"
+    );
+
+    ok(join(&member.places, &opts, &other_code));
+    assert_eq!(
+        (read_key_file(&member.places.state).unwrap(), issuer_here()),
+        (
+            read_key_file(&other.places.state).unwrap(),
+            vec![Some(member::node_id(&other.places.state).unwrap())]
+        ),
+        "the join again finishes it"
+    );
+    assert_eq!(read_peers(&other.places.state).unwrap().len(), 1);
+}
+
+/// A JOIN OF ANOTHER FLEET WHOSE KEY CANNOT BE WRITTEN LEAVES THE BOOK AS IT
+/// WAS ([`unfinished`]): a member whose book binds its issuer joins another
+/// fleet's code while its key cannot be replaced (a directory in its
+/// place). The other issuer lists it; the old fleet, which the join took out
+/// of the book before the key, goes back, its issuer bound beside the key
+/// still held — never that key beside no issuer, whose book no copy then
+/// reads and to which no join again of its fleet is held. With the key put
+/// back, the join again the failure names records the new issuer. FAILS
+/// WITHOUT THE FIX: the book names no issuer.
+#[test]
+fn a_join_of_another_fleet_whose_key_cannot_be_written_leaves_the_book_as_it_was() {
+    let issuer_of = |tag: &str| {
+        let world = World::new(tag);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        ok(init(
+            &world.places,
+            &args(&["--host", "127.0.0.1", "--port", &port]),
+        ));
+        let code = std::fs::read_to_string(world.places.state.join(CODE_FILE)).unwrap();
+        let serving = Listener::serve(listener, &world.places.state);
+        (world, code, serving)
+    };
+    let (_first, first_code, _first_serving) = issuer_of("unkeyed-first");
+    let (other, other_code, _other_serving) = issuer_of("unkeyed-other");
+    let member = World::new("unkeyed-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        host: Some("127.0.0.1".to_owned()),
+        ..Opts::default()
+    };
+    ok(join(&member.places, &opts, &first_code));
+    let book_before = read_peers(&member.places.state).unwrap();
+    assert!(
+        book_before.iter().any(|peer| peer.via == Via::Issuer),
+        "{book_before:?}"
+    );
+
+    let key = member.places.state.join(KEY_FILE);
+    let held = std::fs::read(&key).unwrap();
+    std::fs::remove_file(&key).unwrap();
+    std::fs::create_dir(&key).unwrap();
+    let failed = match join(&member.places, &opts, &other_code) {
+        Err(Failure::Failed(why)) => why,
+        other => panic!("{other:?}: its key cannot be replaced"),
+    };
+    assert!(failed.contains("has recorded this machine"), "{failed}");
+    assert_eq!(read_peers(&other.places.state).unwrap().len(), 1);
+    assert_eq!(
+        read_peers(&member.places.state).unwrap(),
+        book_before,
+        "the old fleet's book, its issuer bound"
+    );
+
+    std::fs::remove_dir(&key).unwrap();
+    member::write_private(&member.places.state, KEY_FILE, &held).unwrap();
+    ok(join(&member.places, &opts, &other_code));
+    let issuers: Vec<_> = read_peers(&member.places.state)
+        .unwrap()
+        .into_iter()
+        .filter(|peer| peer.via == Via::Issuer)
+        .map(|peer| peer.node)
+        .collect();
+    assert_eq!(
+        (read_key_file(&member.places.state).unwrap(), issuers),
+        (
+            read_key_file(&other.places.state).unwrap(),
+            vec![Some(member::node_id(&other.places.state).unwrap())]
+        ),
+        "the join again finishes it"
+    );
+}
+
 /// A MEMBER'S DRIVE GRANT FOLLOWS ITS ISSUER'S BOOK (the step-in): a node the
 /// issuer takes out drives the member no more once the member reads that
 /// book — `peers`, or `survey --fleet` — and a join again under its old key
@@ -2033,17 +2547,20 @@ fn a_members_drive_grant_follows_its_issuers_book() {
 
 /// A PERSON'S ENTRY NEVER HIDES THE NODE A KEY BINDS AT ITS PLACE: on a
 /// member whose aterm.toml names a Mac by hand (`[[fleet.peers]]`) at the
-/// place its copy of the issuer's book holds that Mac's node — the entry a
-/// read dials in the copy's stead — `allow drive --from` grants that node,
+/// place its copy of the issuer's book holds that Mac's node — an entry a
+/// read dials beside the copy — `allow drive --from` grants that node,
 /// named by the place, the copy's host, the node id, or the `host:port` of an
 /// entry that spells the copy's host another way (`lab-mini.invalid:<port>`
 /// for the copy's `lab-mini`: the same machine, and a word only that entry
 /// answers to), with the key its copy binds, as the drive's admission reads
-/// it; and `aterm ctl --host` dials it by its node id or that entry's
-/// `host:port`. FAILS WITHOUT THE FIX: the grant reads the hand entry ("named
-/// by hand") or no peer at all, and the drive is refused before any dial.
-/// NEGATIVE CONTROL: a hand entry no copy stands behind is still refused as
-/// named by hand, and so is one at the copy's host on another port.
+/// it; `aterm ctl --host` dials it by its node id or that entry's
+/// `host:port`; and `aterm ctl survey --host` reads it by the place, the
+/// copy's host or the node id, which the person's entries answer to as well.
+/// FAILS WITHOUT THE FIX: the grant reads the hand entry ("named by hand") or
+/// no peer at all, the drive is refused before any dial, and the survey
+/// refuses the place and the host as naming several peers. NEGATIVE
+/// CONTROL: a hand entry no copy stands behind is still refused as named by
+/// hand, and so is one at the copy's host on another port.
 #[test]
 fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
     let issuer = World::new("shadow-issuer");
@@ -2109,12 +2626,16 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
         assert_eq!(grants(), granted, "{word}");
     }
     let targets = known_peers(&member.places).unwrap_or_else(|f| panic!("{f:?}"));
-    assert!(
-        !targets
-            .peers
-            .iter()
-            .any(|(peer, _)| peer.node.as_deref() == Some(node.as_str())),
-        "a read dials the person's entry in the copy's stead"
+    let at_third: Vec<Option<&str>> = targets
+        .peers
+        .iter()
+        .filter(|(peer, _)| peer.port == third_port)
+        .map(|(peer, _)| peer.node.as_deref())
+        .collect();
+    assert_eq!(
+        at_third,
+        [None, None, Some(node.as_str())],
+        "a read dials the person's entries and the copy beside them"
     );
     // Dialled, not refused before the dial: nothing listens there. The book's
     // `lab-mini` is a bare name, whose lookup after the refused address waits
@@ -2128,6 +2649,16 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
             dialled.why.starts_with(&format!("lab-mini:{third_port}: ")),
             "{word}: {dialled:?}"
         );
+    }
+    for word in [third.as_str(), "lab-mini", node.as_str()] {
+        let ask = aterm_ctl::FleetAsk {
+            host: Some(word),
+            within: Duration::from_millis(100),
+        };
+        let read =
+            survey_fleet_in(&member.places, &ask).unwrap_or_else(|why| panic!("{word}: {why}"));
+        let labels: Vec<&str> = read.peers.iter().map(|peer| peer.label.as_str()).collect();
+        assert_eq!(labels, [format!("lab-mini:{third_port}")], "{word}");
     }
 
     // NEGATIVE CONTROL.

@@ -107,12 +107,10 @@ pub fn check_waits(specs: &[StageSpec]) -> Result<(), String> {
     Ok(())
 }
 
-/// Run every stage under the rule above, calling `on_report` in DECLARED order as
-/// each stage's turn to be printed arrives, and returning all reports in that
-/// same order.
-///
-/// `run` is invoked on a worker thread per stage; it must not assume it is alone
-/// unless its spec says `exclusive`.
+/// Run every stage under the rule above, calling `on_report` in declared order
+/// as each stage's turn to be printed arrives, and return the reports in that
+/// order. `run` runs on a worker thread per stage; it must not assume it is
+/// alone unless its spec says `exclusive`.
 pub fn run_stages<R, P>(specs: &[StageSpec], run: R, mut on_report: P) -> Vec<Report>
 where
     R: Fn(&StageSpec) -> Report + Sync,

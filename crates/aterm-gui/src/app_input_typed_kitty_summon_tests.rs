@@ -208,19 +208,10 @@ fn typing_dog_after_the_gate_pops_the_dog_cameo() {
     );
 }
 
-/// THE WORD ENGINE'S "A HUMAN TYPED" WITNESS IS ACTUALLY WIRED.
-///
-/// Owner, 2026-08-09 ("when the screen draws, new kitties appear; I want
-/// them to just appear once per kitty word"). The engine now refuses to
-/// re-arm a spent cat on caret position alone and demands a committed EDIT
-/// keystroke — a signal that exists ONLY on this input path. If the seam
-/// below were dropped, nothing would fail to compile and no error would be
-/// logged; every genuine retype would just quietly stop replaying its cat.
-/// So the wiring itself is the thing under test.
-///
-/// Both directions are pinned, because "edits only" is half the contract: a
-/// printable key arms the witness, and a NAVIGATION key — which moves the
-/// caret over words without editing anything — must not.
+/// The word engine's "a human typed" witness is wired. A spent cat re-arms only on a committed
+/// edit keystroke, a signal only this input path produces, so a dropped seam would silently stop
+/// every retype replaying its cat. A printable key arms the witness; a navigation key, which
+/// moves the caret over words without editing, does not.
 #[test]
 fn a_committed_edit_key_arms_the_word_engine_typing_witness() {
     use aterm_types::keyboard::Key;

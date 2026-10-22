@@ -5,10 +5,11 @@
 //! §3): this module binds machines items, which take their `System` and context per call,
 //! to it ([`Bound`]), so the sixteen families keep their code.
 
-use crate::items::{Ctx, Item};
+use crate::items::{Activation, Ctx, Item};
 use crate::model::{ItemReport, Mode, Probe};
 use crate::port::System;
 use aterm_converge::{Class, Effect, Explain, Layer, Remedy, Requires, StoodAside};
+use std::sync::Arc;
 
 #[cfg(any(test, debug_assertions))]
 pub use aterm_converge::NoJournal;
@@ -59,8 +60,8 @@ impl Place {
 
 /// A machines [`Item`] with the `System` and context it runs against: an
 /// [`aterm_converge::Item`]. It forwards the item's id, family, title, probe, apply,
-/// refresh, detail, revert, effect and stood-aside line, and takes its layer, class and
-/// precondition from its [`Place`].
+/// refresh, activation, detail, revert, effect and stood-aside line, and takes its layer,
+/// class and precondition from its [`Place`].
 pub struct Bound<'a> {
     item: &'a dyn Item,
     sys: &'a dyn System,
@@ -148,6 +149,16 @@ impl aterm_converge::Item for Bound<'_> {
         self.item.refresh(self.sys, self.ctx)
     }
 
+    fn activation(&self) -> Option<Arc<dyn aterm_converge::Activation + '_>> {
+        self.item.activation().map(|inner| {
+            Arc::new(BoundActivation {
+                inner,
+                sys: self.sys,
+                ctx: self.ctx,
+            }) as Arc<dyn aterm_converge::Activation + '_>
+        })
+    }
+
     fn explain(&self, probe: &Probe) -> Explain {
         let (why, remedy) = match probe {
             Probe::Person { step, how } => (
@@ -190,6 +201,27 @@ impl aterm_converge::Item for Bound<'_> {
 
     fn stood_aside(&self) -> Option<StoodAside> {
         self.item.stood_aside()
+    }
+}
+
+/// A machines [`Activation`] with the `System` and context it runs against.
+struct BoundActivation<'a> {
+    inner: Arc<dyn Activation>,
+    sys: &'a dyn System,
+    ctx: &'a Ctx,
+}
+
+impl aterm_converge::Activation for BoundActivation<'_> {
+    fn id(&self) -> String {
+        self.inner.id()
+    }
+
+    fn pending(&self) -> Result<Option<(String, String)>, String> {
+        self.inner.pending(self.sys, self.ctx)
+    }
+
+    fn activate(&self) -> Result<Vec<(String, String)>, String> {
+        self.inner.activate(self.sys, self.ctx)
     }
 }
 

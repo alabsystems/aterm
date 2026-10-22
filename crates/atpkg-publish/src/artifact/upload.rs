@@ -37,7 +37,7 @@ pub fn token_preflight(ctx: &Ctx) -> Result<()> {
     )))
 }
 
-/// The release tag of one program build (`atpkg-<program>-<build>`), the one spelling.
+/// The release tag of one program build.
 #[must_use]
 pub fn tag(program: &str, build: u64) -> String {
     format!("atpkg-{program}-{build}")

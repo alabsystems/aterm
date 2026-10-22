@@ -924,12 +924,7 @@ mod tests {
         );
     }
 
-    /// Regression, and the reason the ceiling is now relative: [`MAX_BACKOFF`] and the
-    /// interval were BOTH 15 minutes at the time, so the old
-    /// `min(MAX_BACKOFF.max(base))` clamp returned the base for every failure count —
-    /// a client that could not reach GitHub retried at full speed forever. A host that
-    /// is failing deserves a genuine retreat from [`INTERVAL_SECS`], not a clamp back
-    /// to full speed.
+    /// A failing host gets a real retreat from [`INTERVAL_SECS`], not a clamp to its base.
     #[test]
     fn the_interval_genuinely_backs_off_instead_of_clamping_to_its_own_base() {
         let anon = Duration::from_secs(INTERVAL_SECS);

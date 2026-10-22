@@ -105,7 +105,7 @@ fn shift_f10_pops_the_menu_and_bare_f10_does_not() {
     );
 }
 
-/// ↑/↓ walk ENABLED actions only, and the walk is a real cycle.
+/// ↑/↓ walk enabled actions only, and the walk is a cycle.
 #[test]
 fn arrows_step_the_highlight_over_enabled_actions_only() {
     let (mut app, wid) = app_with_strip();

@@ -1023,10 +1023,30 @@ pub fn make_fifo(path: &std::path::Path) -> io::Result<()> {
 /// # Errors
 /// The kernel's refusal.
 pub fn set_blocking(fd: RawFd) -> io::Result<()> {
+    set_nonblocking_mode(fd, false)
+}
+
+/// Set `O_NONBLOCK` on an owned descriptor, retaining its other flags.
+///
+/// # Errors
+/// The kernel's refusal.
+pub fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    set_nonblocking_mode(fd, true)
+}
+
+fn set_nonblocking_mode(fd: RawFd, on: bool) -> io::Result<()> {
     // SAFETY: `fcntl` on a descriptor the caller owns; takes no pointers.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let flags = if on {
+        flags | libc::O_NONBLOCK
+    } else {
+        flags & !libc::O_NONBLOCK
+    };
     // SAFETY: as above.
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

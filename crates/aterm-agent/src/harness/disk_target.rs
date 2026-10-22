@@ -2553,8 +2553,8 @@ mod fd {
                     .to_owned(),
             ));
         }
-        // The caller's own checks, under the locks: the owner still gone,
-        // nothing running from it.
+        // The caller's check under the locks (`super::discover::recheck`): still inside the
+        // owner's folder, the owner still gone.
         check().map_err(refuse)?;
         // The name still names the directory pinned.
         let same = |fd: &OwnedFd| dirfd::fstat(fd).map(|st| (st.st_dev, st.st_ino));

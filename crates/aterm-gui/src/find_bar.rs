@@ -268,8 +268,8 @@ const BUTTON_W: usize = 3;
 /// The toolbar buttons' glyphs, in paint order: previous, next, close.
 const TOOLBAR_BUTTONS: [char; 3] = ['\u{2191}', '\u{2193}', '\u{2715}'];
 
-/// One coloured run on the panel's right side. `bg` overrides the band background
-/// (the reversed ON state of a toggle).
+/// One coloured run on the panel's right side; `bg` overrides the band background (a
+/// toggle's reversed state).
 struct Seg {
     text: String,
     fg: [u8; 3],
@@ -1781,10 +1781,8 @@ mod tests {
         )
     }
 
-    /// THE FIELD MUST NOT MOVE UNDER THE CARET. The well's geometry depends on the
-    /// WINDOW width only — never on how wide the status text happens to be — so typing
-    /// the first character (which turns "nothing to report" into `1/3` or `no matches`)
-    /// cannot yank the field's right edge sideways mid-edit.
+    /// The well's geometry depends on the window width only, never on the status text, so it
+    /// cannot move under the caret mid-edit.
     #[test]
     fn well_geometry_is_independent_of_the_status_text() {
         for cols in [60usize, 80, 100, 132, 200] {
@@ -2228,8 +2226,7 @@ mod tests {
         }
     }
 
-    /// A search that found NOTHING says so where the eye already is — the query itself
-    /// takes the warn tone — not only in a readout at the far side of the row.
+    /// A failed search tints the query itself.
     #[test]
     fn a_failed_search_colours_the_query_itself() {
         let cols = 90;
@@ -2323,11 +2320,7 @@ mod tests {
             chrome_band::band_colors(Theme::default()).seam,
             "the rail's tone is the band's seam"
         );
-        // AND IT IS ONE TONE ON THE DEGRADED PANEL. At 1 or 2 rows the pad is dropped,
-        // so the seam row IS the multi-ink field row; an uncoloured overline falls back
-        // to each cell's own `fg` and the rule would brighten under the prompt, go warn
-        // across a failing query and vanish at the reverse-video caret. At the full
-        // height the pad row hid that, because every cell of it is already `label`.
+        // One tone on the degraded panel too, where the seam row is the multi-ink field row.
         let band = chrome_band::band_colors(Theme::default());
         for height in [1_usize, 2] {
             let short = find_bar_paint(
@@ -2444,12 +2437,8 @@ mod tests {
         }
     }
 
-    /// THE QUERY FIELD ALWAYS HAS AN EDGE. The well is drawn as a FILL — the only
-    /// thing that says "you can type here" — and under every stock Windows
-    /// High-Contrast scheme `COLOR_WINDOW == COLOR_BTNFACE`, so that fill is the same
-    /// tone as the band and the field disappears. HC separates surfaces with borders,
-    /// so a border is stamped instead: unbroken across the whole well, over the text,
-    /// the caret and the edge markers alike.
+    /// Under every stock Windows High-Contrast scheme the well's fill matches the band, so an
+    /// unbroken border is stamped across the whole well instead.
     #[test]
     fn the_query_well_keeps_a_boundary_under_a_forced_palette() {
         use aterm_core::terminal::UnderlineStyle;
@@ -2549,13 +2538,9 @@ mod tests {
         );
     }
 
-    /// THE HISTORY IS AWAY, NOT EMPTY (ruling 237): while a rewrap holds the
-    /// history detached, a search that found nothing on the screen says so in
-    /// words that never read `no matches` — at EVERY width from 40 columns up —
-    /// and the query keeps its ordinary ink (nothing failed; the search runs
-    /// again at the re-attach). The long form where it fits, the plain word
-    /// where it does not; below the narrowest status zone the bar says nothing
-    /// rather than the opposite of the truth.
+    /// While a rewrap holds the history away, a miss never reads `no matches` at any width
+    /// and the query keeps its ordinary ink; below the narrowest status zone the bar says
+    /// nothing.
     #[test]
     fn a_search_while_the_history_is_away_never_says_no_matches() {
         let c = chrome_band::band_colors(Theme::default());

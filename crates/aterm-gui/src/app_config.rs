@@ -2961,7 +2961,7 @@ impl PrivacyWarmup {
 /// #                                      #   and the Developer Tools answer (reads tccd's log)
 /// # notice             = true            # the Full Disk Access question, asked once per real need (Open Settings / Not now),
 /// #                                      #   and the Full Disk Access page brought up at launch while the grant reads off,
-/// #                                      #   and the debugger-access alert aterm raises once per Mac at launch
+/// #                                      #   and the debugger-access alert aterm raises once per Mac and account at launch
 /// # report_attribution = true            # per-session responsible-pid corroboration
 /// # warmup             = "automatic"     # "never" | "on-request" | "automatic" (also asks for each folder at launch while Full Disk Access is off)
 /// # warmup_folders     = ["documents", "desktop", "downloads"]   # "app-data" may be listed, but is not asked for by default
@@ -5441,8 +5441,8 @@ impl Config {
         self.allow_palette_reconfigure.unwrap_or(true)
     }
 
-    /// Per-cell minimum contrast ratio (W5b), default `1.0` (off — xterm
-    /// treats 1 as "do nothing"), clamped to the WCAG 1.0..=21.0 domain.
+    /// Per-cell minimum contrast ratio, default `1.0` (off; xterm treats 1 as "do
+    /// nothing"), clamped to the WCAG 1.0..=21.0 domain.
     pub(crate) fn minimum_contrast_or_default(&self) -> f32 {
         match self.minimum_contrast {
             Some(v) if v.is_finite() => v.clamp(1.0, 21.0),
@@ -5489,7 +5489,7 @@ impl Config {
         self.scrollbar.unwrap_or(DEFAULT_SCROLLBAR)
     }
 
-    /// SGR 2 faint opacity (W5e), default `0.5`, clamped 0.0..=1.0.
+    /// SGR 2 faint opacity, default `0.5`, clamped 0.0..=1.0.
     pub(crate) fn faint_opacity_or_default(&self) -> f32 {
         match self.faint_opacity {
             Some(v) if v.is_finite() => v.clamp(0.0, 1.0),
@@ -6487,9 +6487,9 @@ impl WindowColorspace {
 /// rows or columns on small windows.
 pub(crate) const MAX_WINDOW_PADDING_PX: f32 = 64.0;
 
-/// macOS `NSVisualEffectView` material behind a translucent window, resolved
-/// via [`Config::background_material_or_default`]. Meaningful only with
-/// `background_opacity < 1.0` on the GPU backend; `None` installs no view.
+/// Backdrop material behind a translucent window (macOS `NSVisualEffectView`;
+/// Windows maps it to a DWM backdrop), resolved via
+/// [`Config::background_material_or_default`]. `None` installs no backdrop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum BackgroundMaterial {
     /// No vibrancy view — the background is whatever `background_opacity`
@@ -13057,7 +13057,7 @@ mod decorative_effect_default_tests {
             fresh.cursor_momentum_glow_or_default(),
             DEFAULT_DECORATIVE_EFFECTS
         );
-        // A config that merely EXISTS is still a fresh config for this key.
+        // A config that sets other keys is still fresh for this key.
         assert_eq!(
             cfg("font_px = 14.0").cursor_trail_drawn(),
             DEFAULT_DECORATIVE_EFFECTS
@@ -13126,10 +13126,10 @@ mod decorative_effect_default_tests {
 
 #[cfg(test)]
 mod output_streak_cfg_tests {
-    //! `[output_streak]` resolver tests
-    //! (`docs/DESIGN-output-streak-2026-08-30.md` §5, §7, §10): the table
-    //! defaults on except on Windows, numeric keys clamp at both ends, and
-    //! non-finite scalars fall toward less effect.
+    //! `[output_streak]` resolver tests (`docs/DESIGN-output-streak-2026-08-30.md`
+    //! §5, §7, §10): on by default except on Windows, numeric keys clamp at both
+    //! ends, non-finite scalars fall toward less effect. The `[harness]` table's
+    //! tests share the module.
 
     use super::{Config, DEFAULT_DECORATIVE_EFFECTS};
     use aterm_effects::output_streak::{MAX_COMETS, TAIL_MAX, TAIL_MIN};

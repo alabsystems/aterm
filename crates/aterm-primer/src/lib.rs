@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-primer` — the installer that makes coding agents aterm-aware, behind
-//! `aterm agents` AND behind every session aterm opens.
+//! `aterm-primer`: the installer that makes coding agents aterm-aware, behind
+//! `aterm agents` and the auto-prime the window runs when it spawns a session.
 //!
 //! ## Why this exists (the delivery problem)
 //!
-//! aterm already TELLS an agent everything it needs — `aterm help` inside a session
-//! prints the full agent operating brief — but a coding agent (Claude Code, Codex
-//! CLI, Gemini CLI, ...) never LOOKS unless something puts aterm into its context
-//! first. Nothing on the screen can do that: an agent reads its own stdin and its
-//! context files, never the terminal scrollback, so a banner injected into the PTY
-//! reaches only the human. The one channel every major agent reliably loads in
-//! EVERY project is its global context file (`~/.claude/CLAUDE.md`,
-//! `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`, ...).
+//! [`agents_report`] is the scriptable `aterm agents` surface; [`auto_prime`] is the GUI's
+//! fail-soft, idempotent upsert over every detected agent
+//! (docs/AGENT-EXPERIENCE-2026-08-26.md §3 S1).
 //!
 //! So this crate manages a short, marked, SELF-GATING primer block in those files:
 //! the block itself instructs the agent to detect aterm via
@@ -46,6 +41,10 @@
 //! * Per-agent ADDENDA: an agent whose runtime needs one extra paragraph (Codex's
 //!   sandbox refuses the control socket) gets it inside ITS block only; the
 //!   generic block stays inside its own budget.
+//! * One file, one block: agents whose context files are ONE file (a dotfiles
+//!   link from `~/.codex/AGENTS.md` to `~/.claude/CLAUDE.md`) get one block
+//!   there, written once a pass, and it is the generic one: an addendum true
+//!   for one reader is false for the other ([`Readers`]).
 //!
 //! Pure string transforms ([`upsert_block`] / [`remove_block`] / [`block_state`])
 //! carry the logic so every edge is unit-testable; the two public entry points are
@@ -57,20 +56,16 @@ use std::path::{Path, PathBuf};
 
 mod settings_json;
 
-/// Every marker line any past or future primer version begins with — the search
-/// key for an installed block of ANY version (so an old block is found, reported
-/// stale, and updated in place rather than duplicated).
+/// The prefix of every primer marker line, any version: the search key for an installed
+/// block, so an old block is found and updated in place rather than duplicated.
 const MARK_PREFIX: &str = "<!-- aterm primer";
 
-/// The begin marker of the CURRENT primer version. Bump the version token when
-/// [`PRIMER_BODY`], [`RUST_NOTE`] or an addendum changes meaningfully; every
-/// installer then reports existing blocks as `stale` and rewrites them in place.
-/// The git log holds each version's reason.
+/// The current version's begin marker. Bump the version when [`PRIMER_BODY`],
+/// [`RUST_NOTE`] or an addendum changes meaningfully: every installer then reports existing
+/// blocks `stale` and rewrites them in place.
 ///
-/// Every line states a fact (what happens when, what the tool says), never an
-/// order: an order made agents stop, loop-check or refuse. A person who wants
-/// stricter rules writes them OUTSIDE the managed block, which every install
-/// preserves byte-for-byte.
+/// Every primer line states a fact, never an order: orders made agents stop, loop-check or
+/// refuse. Stricter rules belong outside the managed block, which every install preserves.
 const MARK_BEGIN: &str =
     "<!-- aterm primer v33 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
 
@@ -153,15 +148,12 @@ fn auto_prime_note(xdg: Option<&Path>) -> String {
     )
 }
 
-/// The off switch as ONE phrase — the parenthetical of [`auto_prime_note`] (the
-/// footer `aterm agents status` and `aterm agents remove` print) and, on the pass
-/// summary the GUI logs on every write ([`auto_prime`], logged by aterm-gui
-/// `run_agent_prime`), the phrase between the outcome words and the file list, so
-/// the sentence a user is told when they ask and the one in aterm.log name the
-/// same key in the same file. The file is the one the window reads:
-/// `$XDG_CONFIG_HOME/aterm/aterm.toml` when that is set (shown absolute), else
-/// `~/.config/aterm/aterm.toml` — the rule of
-/// `aterm_types::dirs::resolve_aterm_config_path` on macOS and Linux.
+/// The off switch as one phrase, shared by [`auto_prime_note`] and the pass summary the
+/// GUI logs ([`auto_prime`], via aterm-gui `run_agent_prime`), so what a user is told and
+/// what aterm.log says name the same key in the same file. The file is the one the window
+/// reads: `$XDG_CONFIG_HOME/aterm/aterm.toml` when set (shown absolute), else
+/// `~/.config/aterm/aterm.toml`, as `aterm_types::dirs::resolve_aterm_config_path`
+/// resolves it on macOS and Linux.
 fn off_switch(xdg: Option<&Path>) -> String {
     let file = match xdg {
         Some(x) => x.join("aterm").join("aterm.toml").display().to_string(),
@@ -171,9 +163,11 @@ fn off_switch(xdg: Option<&Path>) -> String {
 }
 
 /// The full managed block (markers + body + the agent's addendum, if any),
-/// newline-terminated — what an install writes and `aterm agents primer [<agent>]`
-/// prints for manual pasting. `None`, or a name the registry does not know, gives
-/// the generic addendum-free block.
+/// newline-terminated — what an install writes into a file only that agent
+/// reads, and what `aterm agents primer [<agent>]` prints for manual pasting.
+/// `None`, or a name the registry does not know, gives the generic
+/// addendum-free block, which is also what a file two agents read carries
+/// ([`Readers::block`]).
 #[must_use]
 pub fn primer_block(agent: Option<&str>) -> String {
     let addendum = agent
@@ -228,31 +222,24 @@ fn block_with(addendum: Option<&str>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Managed SKILL files
+// Managed skill files
 //
-// The primer is a marked BLOCK inside a file the user also owns. A skill is the
-// opposite shape: a WHOLE file that is entirely aterm's, in an agent-specific
-// skills directory. So it gets its own three-state model, and one extra state
-// the primer cannot have — `Foreign`, a file at our path with no marker, which
-// is the user's and is never touched.
-//
-// Compiled in, never artifact-supplied — the same rule as atpkg's shell hooks.
+// A primer is a marked block inside a file the user also owns; a skill is a whole file
+// that is entirely aterm's. So a skill has its own state model with one extra state,
+// `Foreign`: a file at our path with no marker, which is the user's and never touched.
+// Skill bodies are compiled in, never artifact-supplied.
 // ---------------------------------------------------------------------------
 
-/// Every marker line any past or future managed skill begins with — the search
-/// key that identifies a file as OURS regardless of version.
+/// The prefix of every managed skill's marker line, any version: what identifies a file
+/// as ours.
 const SKILL_MARK_PREFIX: &str = "<!-- aterm skill";
 
-/// The `drive-aterm` skill: how one agent drives another aterm session over the
-/// control socket. Compiled in from the crate asset so the shipped binary is the
-/// single source of truth — there is no separate file to forget to update.
+/// The `drive-aterm` skill: how one agent drives another aterm session over the control
+/// socket.
 const DRIVE_SKILL_BODY: &str = include_str!("../assets/drive-aterm-skill.md");
 
-/// The `supervise-agent` skill: the SUPERVISION layer over `drive-aterm` — how an
-/// agent runs the persistent sweep/classify/review/wait loop over a WORKER
-/// session, reviewing each turn against ground truth (not the screen) with a
-/// turn budget, a no-progress breaker, and human-escalation. Compiled in from the
-/// repo asset, same single-source-of-truth rule as the drive skill.
+/// The `supervise-agent` skill: the supervision loop over `drive-aterm`, reviewing each
+/// worker turn against ground truth rather than the screen.
 const SUPERVISE_SKILL_BODY: &str = include_str!("../assets/supervise-agent-skill.md");
 
 /// The Rust-in-aterm skill. A skill costs zero context until its description matches, which is
@@ -274,19 +261,15 @@ const THEMES_SKILL_BODY: &str = include_str!("../assets/aterm-themes-skill.md");
 /// serves: no `aterm:` sentences or folder sizes yet.
 const SYSTEM_STATE_SKILL_BODY: &str = include_str!("../assets/system-state-skill.md");
 
-/// The `aterm-fabric` doc: the DEPTH layer under the primer's inbox line — the header
-/// fields, the two failure tokens that mean opposite things (`queued=1` vs
-/// `no-bridge=1`), the trust rule and the halt. The one bundled doc that is NOT
-/// Claude-only ([`skills_for`]).
-///
-/// ONE body, four wrappers: each agent gets it under the header ITS OWN parser
-/// reads and nothing else (Codex pastes Claude's `name:` frontmatter verbatim
-/// into the prompt; OpenCode has no `name:` key). The body begins with the
-/// managed-marker line, so every wrapper carries the marker.
+/// The `aterm-fabric` doc: the depth under the primer's inbox line, and the one bundled
+/// doc that is not Claude-only ([`skills_for`]). One body, four wrappers: each agent gets
+/// the header its own parser reads and nothing else (Codex pastes Claude's `name:`
+/// frontmatter verbatim into the prompt; OpenCode has no `name:` key). The body begins
+/// with the managed-marker line, so every wrapper carries the marker.
 const FABRIC_BODY: &str = include_str!("../assets/aterm-fabric-body.md");
 
-/// Claude Code: the skills frontmatter (`name:` + `description:`, the trigger
-/// text auto-discovery matches on), then the body.
+/// Claude Code: the skills frontmatter (`name:`, and the `description:` auto-discovery
+/// matches on), then the body.
 const FABRIC_SKILL_BODY: &str = concat!(
     include_str!("../assets/aterm-fabric-frontmatter.md"),
     include_str!("../assets/aterm-fabric-body.md"),
@@ -354,8 +337,8 @@ fn doc_label(path: &str) -> &str {
     stem
 }
 
-/// The managed docs this build ships, per agent `name` — each at the path THAT
-/// agent documents, in the format that agent parses.
+/// The managed docs this build ships for one agent (its registry `name`), each at the path
+/// and in the format that agent documents.
 ///
 /// | agent | path | shape |
 /// |---|---|---|
@@ -446,7 +429,6 @@ enum SkillState {
 }
 
 /// Classify existing `content` at a skill path against the compiled-in `body`.
-/// Pure, so every edge is unit-testable without touching the filesystem.
 #[must_use]
 fn skill_state(content: &str, body: &str) -> SkillState {
     if content == body {
@@ -476,43 +458,32 @@ enum SkillWrite {
     Updated,
 }
 
-/// Write `bytes` to `path` so a reader sees the old file or the new one and
-/// nothing in between: the bytes go to a sibling temp file
-/// (`.<name>.aterm-tmp-<pid>-<n>`, same directory so the rename is one
-/// filesystem), are fsync'd, and the temp file is renamed over the target. A
-/// plain `fs::write` truncates first, so an agent loading its context file in
-/// between — or a crash there — reads an empty or half-written block. A failure anywhere leaves the target as
-/// it was and removes the temp file. The target's existing mode survives the
-/// swap of inodes (a user's `0600` context file must not come back `0644`).
+/// Write `bytes` to `path` so a reader sees the old file or the new one, never a part: the
+/// bytes go to a sibling temp file (`.<name>.aterm-tmp-<pid>-<n>`, in the same directory
+/// so the rename stays on one filesystem), are synced, and the temp is renamed over the
+/// target. A failure leaves the target as it was and removes the temp. The target's mode
+/// survives the inode swap (a `0600` context file must not come back `0644`).
 ///
-/// The temp name is new for every WRITE (`<n>` counts this process's writes),
-/// not for every process: a window's primer and its hook sweep both rewrite
-/// `settings.json` at a cold start, and with a shared name one write's cleanup
-/// takes the other's temp. A write cleans up only a temp it created.
+/// `<n>` counts this process's writes: a window's primer and its hook sweep both rewrite
+/// `settings.json` at a cold start, and with a shared name one write's cleanup would take
+/// the other's temp. A write cleans up only a temp it created.
 ///
-/// Two things a context file is that a bare "temp file plus rename" gets wrong:
-///
-/// * It is often a SYMLINK into a dotfiles checkout. `rename(2)` replaces the
-///   LINK, so the primed bytes would land in a fresh regular file at the link's
-///   path while the file the agent actually loads — the link's target — kept the
-///   old content forever. So the real target is resolved FIRST
-///   ([`std::fs::canonicalize`]), which also puts the temp file beside the real
-///   file and keeps the rename inside one directory. A path that does not
-///   resolve is the fresh-install case: write where the caller asked — unless
-///   the way there ends at a link whose target is not there ([`dangling_link`]).
-/// * It is the user's WHOLE context file, not just our block. The temp file is
-///   therefore born private ([`create_private_temp`]) and only widened to the
-///   target's own mode once the bytes are down; at the process umask (`0644`)
-///   it would be world-readable for the width of the write.
+/// * A context file is often a symlink into a dotfiles checkout, and `rename(2)` replaces
+///   the link, not its target. So the real target is resolved first
+///   ([`std::fs::canonicalize`]), which also puts the temp beside the real file. A path
+///   that does not resolve is a fresh install, written where asked, unless the way there
+///   ends at a dangling link ([`dangling_link`]).
+/// * It is the user's whole context file, so the temp is born private
+///   ([`create_private_temp`]) and widened to the target's mode only once the bytes are
+///   down.
 fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_atomically_if(path, bytes, || Ok(true)).map(|_| ())
 }
 
-/// [`write_atomically`], asking `still` last — once the bytes are down and
-/// synced, just before the rename — whether the file at `path` is still the one
-/// the bytes were made from. `Ok(false)`, with nothing written and the temp file
-/// gone, when it is not. Asked after the fsync, not before it, so what is left
-/// between the answer and the rename is the width of the asking alone.
+/// [`write_atomically`], asking `still` once the bytes are synced, just before the rename,
+/// whether the file at `path` is still the one the bytes were made from. `Ok(false)`, with
+/// nothing written and the temp removed, when it is not. Asking after the sync leaves only
+/// the asking itself between the answer and the rename.
 fn write_atomically_if(
     path: &Path,
     bytes: &[u8],
@@ -573,24 +544,17 @@ fn write_atomically_if(
     written
 }
 
-/// Why a write to `path` is refused when the way to it ends at a SYMLINK whose
-/// target is not there — a dotfiles link into a checkout not cloned or not
-/// mounted yet, either the file itself or a directory it lies under (the whole
-/// `skills/` kept in that checkout) — and `None` for anything else. Renamed
-/// over, the link would become a plain file and the dotfiles copy would be cut
-/// out of the agent's reach for good; written THROUGH, the target would be
-/// created inside a checkout that is not there, where it blocks the clone (`git
-/// clone` refuses a directory that is not empty) or hides under the mount. So
-/// the link is left exactly as it is, and the next pass, once the target is
-/// there, writes through it.
+/// Why a write to `path` is refused when the way to it ends at a symlink whose target is
+/// missing (a dotfiles link into a checkout not cloned or mounted yet, on the file or on a
+/// directory above it), and `None` otherwise. Renaming over the link would cut the
+/// dotfiles copy out for good; writing through it would create the target inside a missing
+/// checkout, where it blocks the clone or hides under the mount. So the link is left alone
+/// and a later pass writes through it once the target exists, or this pass does when the
+/// target is another reader's context file that reader's open way makes ([`Readers::way`]).
 ///
-/// The entry that decides is the NEAREST one on the way up from `path` that is
-/// there at all: `path` itself, or else the directory a write would have to make
-/// it in. Status asks this for a file it cannot find, and an install asks it
-/// before it makes a directory ([`make_room_for`]), so the two give one answer
-/// (asked of the leaf alone, a dangling `skills/` link reads "absent" to status
-/// and "File exists" to `create_dir_all`). The words carry no path: every caller
-/// names the file, and a row's word must stay short in the logged summary.
+/// The deciding entry is the nearest existing one on the way up from `path`, so status
+/// (for a file it cannot find) and an install (before [`make_room_for`] makes a directory)
+/// give one answer. The words carry no path: every caller names the file.
 fn dangling_link(path: &Path) -> Option<String> {
     let nearest = path.ancestors().find(|p| {
         !matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
@@ -650,14 +614,13 @@ fn make_room_for(path: &Path, room: Room<'_>) -> Result<(), String> {
     Ok(())
 }
 
-/// How many reads one [`rewrite`] starts from before it leaves a file that
-/// changed under it at every one as the last save made it, for the next pass.
+/// How many fresh reads one [`rewrite`] tries before it leaves a file that keeps changing
+/// under it to the next pass.
 const REWRITE_TRIES: usize = 3;
 
-/// What one read of a file saw: its text (`None`: there was no file) and, on
-/// unix, WHICH file that was — its device and inode, taken from the open file
-/// the text was read through. A write made from the read goes in only while the
-/// file is still exactly that ([`AsRead::still`]).
+/// What one read of a file saw: its text (`None`: no file) and, on unix, which file it
+/// was (device and inode of the open file the text came through). A write made from the
+/// read goes in only while the file is still exactly that ([`AsRead::still`]).
 struct AsRead {
     text: Option<String>,
     file: Option<FileId>,
@@ -711,9 +674,8 @@ impl AsRead {
         }
     }
 
-    /// Whether `path` is still what this read saw: the same file holding the
-    /// same bytes, or still no file at all. The bytes and not the length and
-    /// time: a save in place can keep both.
+    /// Whether `path` is still what this read saw: the same file with the same bytes, or
+    /// still no file. Bytes, not length and mtime: a save in place can keep both.
     fn still(&self, path: &Path) -> std::io::Result<bool> {
         Ok(match (Self::open(path)?, &self.text) {
             (None, None) => true,
@@ -769,29 +731,23 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// THE read-modify-write of a file a person, or their agent, also saves: a
-/// context file ([`upsert_primer_file`], `aterm agents remove`) and a Claude
-/// settings file ([`edit_settings`]). `edit` makes the new text from the file's
-/// (`None`: no file), with what it did, or says `None` to leave the file as it
-/// is. With `backup`, the bytes the write replaces go beside it first
-/// ([`write_backup`]) — before the write, so a crash in the middle of it still
-/// leaves a copy. The new text goes in only while the file is still what `edit`
-/// was handed ([`AsRead::still`], asked just before the rename); otherwise the
-/// write starts again from a fresh read, at most [`REWRITE_TRIES`] times, past
-/// which the file is left as the last save made it, for the next pass.
+/// The read-modify-write of a file a person or their agent also saves: a context file
+/// ([`upsert_primer_file`], `aterm agents remove`) and a Claude settings file
+/// ([`edit_settings`]). `edit` makes the new text from the file's (`None`: no file), with
+/// what it did, or returns `None` to leave the file alone. With `backup`, the replaced
+/// bytes go beside it first ([`write_backup`]), so a crash mid-write still leaves a copy.
+/// The new text goes in only while the file is still what `edit` was handed
+/// ([`AsRead::still`], asked just before the rename); otherwise it starts again from a
+/// fresh read, at most [`REWRITE_TRIES`] times, then leaves the file for the next pass.
 ///
-/// A write that does not go in takes its backup with it: the file is not what
-/// the write would have replaced, so the copy saves nothing, and a failure that
-/// repeats at every window start (a settings file linked into a read-only
-/// directory, as home-manager lays it out) must not leave one more full copy of
-/// the file each time.
+/// A write that does not go in removes its backup: the copy saves nothing, and a failure
+/// that repeats at every window start (a settings file linked into a read-only directory,
+/// as home-manager lays it out) must not pile up copies.
 ///
-/// Without the check, a save landing between the read and the rename — a
-/// person's editor, Claude Code's `/model` or `/effort`, another aterm — is lost
-/// with no copy (measured: 40 of 40, a window of about 10 ms, two fsyncs). The
-/// check runs after the fsyncs, leaving one small read and the rename: 0.1 ms
-/// median, 0.5 ms max at load 30 on 14 cores. A save inside that is still lost;
-/// only a lock every writer honoured could close it, and editors take none.
+/// Without the check, a save landing between read and rename (an editor, Claude Code's
+/// `/model`, another aterm) is lost with no copy across a window of about 10 ms; the check
+/// narrows that to one small read and the rename, about 0.1 ms. Only a lock every writer
+/// honoured could close it, and editors take none.
 fn rewrite<T>(
     path: &Path,
     backup: bool,
@@ -824,23 +780,18 @@ fn rewrite<T>(
     Err(Unwritten::Changed)
 }
 
-/// The mode the temp file is born with on unix: the owner, nobody else. A
-/// context file the primer CREATES keeps exactly this, because there is no
-/// previous mode to restore.
+/// The mode the temp file is born with on unix: owner only. A context file the primer
+/// creates keeps it, having no previous mode to restore.
 #[cfg(unix)]
 const TEMP_MODE: u32 = 0o600;
 
 /// Create the sibling temp file [`write_atomically`] renames into place.
 ///
-/// `create_new` so a file already sitting at the temp path is never opened:
-/// `File::create` follows a symlink planted there and truncates whatever it
-/// points at, which would write the user's context file wherever the link
-/// aimed. The cost is that a write whose temp name is taken — left behind by a
-/// KILLED process that had the same pid and count — fails, and the next write,
-/// under a new name, succeeds. Priming is fail-soft and idempotent, so a refusal
-/// costs one pass; truncating whatever sits at that path costs the file it
-/// points at. On unix the file is private from its first instant — see
-/// [`TEMP_MODE`].
+/// `create_new`, so a file already at the temp path is never opened: `File::create` follows
+/// a planted symlink and truncates whatever it points at. The cost is that a temp name left
+/// by a killed process with the same pid and count fails one write; the next write takes a
+/// new name, and priming is fail-soft. On unix the file is private from its first instant
+/// ([`TEMP_MODE`]).
 fn create_private_temp(tmp: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -852,13 +803,10 @@ fn create_private_temp(tmp: &Path) -> std::io::Result<std::fs::File> {
     opts.open(tmp)
 }
 
-/// The state of the skill file at `path` against the compiled-in `body` — the
-/// one reader install, status and remove share. Only a MISSING file is
-/// `Absent`. A file that is not UTF-8 is judged by its text all the same (with
-/// no marker it is the user's, and it is never `Current`), and one that cannot
-/// be read is an error. Read as absent, either was written over: a person's
-/// own skill at our path (a Latin-1 byte, a mode-`000` file), gone with no copy
-/// kept.
+/// The state of the skill file at `path` against the compiled-in `body`, the one reader
+/// install, status and remove share. Only a missing file is `Absent`: a non-UTF-8 file is
+/// judged by its lossy text (with no marker it is the user's), and an unreadable one is an
+/// error, so neither is ever written over as if absent.
 fn read_skill(path: &Path, body: &str) -> Result<SkillState, String> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(skill_state(&String::from_utf8_lossy(&bytes), body)),
@@ -888,10 +836,9 @@ fn install_skill_file(path: &Path, body: &str, room: Room<'_>) -> Result<SkillWr
     }
 }
 
-/// One coding agent's global context file. `dir` doubles as the DETECTION signal:
-/// its existence means the agent is installed/in use on this machine, so a bare
-/// install may write there. Paths are `/`-separated segments under `$HOME`,
-/// joined per-platform by [`home_join`].
+/// One coding agent's global context file. `dir` is the detection signal: its existence
+/// means the agent is in use here, so a bare install may write there. Paths are
+/// `/`-separated under `$HOME`, joined per platform by [`home_join`].
 struct AgentFile {
     /// The selector on the command line (`aterm agents install <name>`).
     name: &'static str,
@@ -899,11 +846,11 @@ struct AgentFile {
     product: &'static str,
     /// The agent's config dir under `$HOME` — existence ⇒ detected.
     dir: &'static str,
-    /// The agent's ALWAYS-LOADED global context file under `$HOME`.
+    /// The agent's always-loaded global context file under `$HOME`.
     file: &'static str,
-    /// An agent-specific paragraph appended inside THIS agent's block only —
-    /// for a runtime whose defaults defeat the generic brief. `None` for the
-    /// generic block.
+    /// A paragraph inside this agent's block only, for a runtime whose defaults defeat the
+    /// generic brief. `None` for the generic block. Left out where another agent reads the
+    /// same file ([`Readers::block`]): there it would be read as that agent's fact.
     addendum: Option<&'static str>,
 }
 
@@ -960,7 +907,8 @@ const AGENT_FILES: &[AgentFile] = &[
     },
 ];
 
-/// The block this agent's file should carry.
+/// The block a file only this agent reads should carry ([`Readers::block`]
+/// says which block a file carries).
 fn block_for(agent: &AgentFile) -> String {
     block_with(agent.addendum)
 }
@@ -1138,11 +1086,9 @@ fn upsert_primer_file(path: &Path, block: &str, room: Room<'_>) -> Result<Primer
     .map_err(Unwritten::words)
 }
 
-/// The user's home directory, from the platform's canonical env var. `None` (an
-/// unset/empty var) makes every caller fail with a clear message rather than
-/// writing relative to an arbitrary cwd. Deliberately NOT
-/// `aterm_types::dirs::home_dir`: that one accepts an empty `$HOME` and falls
-/// back to `/etc/passwd`, either of which would defeat the fail-fast here.
+/// The user's home directory from the platform's env var. `None` (unset or empty) makes
+/// every caller fail clearly rather than write relative to the cwd. Not
+/// `aterm_types::dirs::home_dir`, whose `/etc/passwd` fallback would defeat that fail-fast.
 #[must_use]
 pub fn home_dir() -> Option<PathBuf> {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
@@ -1157,20 +1103,18 @@ fn home_join(home: &Path, xdg: Option<&Path>, rel: &str) -> PathBuf {
     join_with_xdg(home, xdg, rel)
 }
 
-/// `$XDG_CONFIG_HOME`, when it is set to something — the one env read, kept out
-/// of the pure join so a test can hand it a value instead of mutating the
-/// process environment.
+/// `$XDG_CONFIG_HOME` when set and non-empty: the one env read, kept out of the pure join
+/// so a test can pass a value instead of mutating the process environment.
 fn xdg_config_home() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
 }
 
-/// Resolve an agent-relative path. A `rel` under `.config/` goes under
-/// `$XDG_CONFIG_HOME` when that is set, exactly as the agent that reads it does
-/// — OpenCode resolves its global config there — and under `$HOME/.config`
-/// otherwise. Written to `~/.config` under a redirected `XDG_CONFIG_HOME`, the
-/// files would read `installed` and never be loaded.
+/// Resolve an agent-relative path. A `rel` under `.config/` goes under `$XDG_CONFIG_HOME`
+/// when set, as the agent that reads it resolves it (OpenCode's global config), else under
+/// `$HOME/.config`; written to `~/.config` under a redirected `XDG_CONFIG_HOME`, the files
+/// would read `installed` and never load.
 fn join_with_xdg(home: &Path, xdg: Option<&Path>, rel: &str) -> PathBuf {
     let (base, rest) = match (rel.strip_prefix(".config/"), xdg) {
         (Some(rest), Some(x)) => (x.to_path_buf(), rest),
@@ -1183,9 +1127,8 @@ fn join_with_xdg(home: &Path, xdg: Option<&Path>, rel: &str) -> PathBuf {
     p
 }
 
-/// How a path is SHOWN: `~/<rel>` in the ordinary case, and the resolved
-/// absolute path when `$XDG_CONFIG_HOME` moved it — so `status` names the file
-/// the agent actually consults, not the one it would have without the override.
+/// How a path is shown: `~/<rel>` ordinarily, and the resolved absolute path when
+/// `$XDG_CONFIG_HOME` moved it, so `status` names the file the agent actually reads.
 fn display_path(home: &Path, xdg: Option<&Path>, rel: &str) -> String {
     match (rel.strip_prefix(".config/"), xdg) {
         (Some(_), Some(_)) => home_join(home, xdg, rel).display().to_string(),
@@ -1196,6 +1139,248 @@ fn display_path(home: &Path, xdg: Option<&Path>, rel: &str) -> String {
 /// Whether the agent's config dir exists — the one detection signal.
 fn detected(home: &Path, xdg: Option<&Path>, agent: &AgentFile) -> bool {
     home_join(home, xdg, agent.dir).is_dir()
+}
+
+/// The file a write to the context file at `path` lands on: the real file a
+/// link leads to, as [`write_atomically`] resolves it, or, for a file not made
+/// yet, the place it will be made — where a link to it points (a dotfiles link
+/// made before the file it leads to), else its name in its folder's place,
+/// found the same way — so two rows whose folders are one folder, or whose
+/// link leads to the other's file, make one file from the first pass. A name
+/// not made yet is folded to one case where its folder ignores case
+/// ([`ignores_case`]), so a link spelled `Claude.md` and the `CLAUDE.md` it
+/// opens there are one file too. It is a key for telling files apart, never
+/// a path to write. A path that does not resolve within [`LINK_HOPS`] links,
+/// or at all, is itself.
+fn lands_on(path: &Path) -> PathBuf {
+    landing(path, LINK_HOPS).unwrap_or_else(|| path.to_path_buf())
+}
+
+/// How many links not live yet [`lands_on`] follows before it takes a path as
+/// it is: the bound macOS puts on one lookup (`MAXSYMLINKS`), so a loop ends.
+const LINK_HOPS: usize = 32;
+
+/// [`lands_on`] within `hops` more links; `None` for a way that does not
+/// resolve.
+fn landing(path: &Path, hops: usize) -> Option<PathBuf> {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return Some(real);
+    }
+    let dir = path.parent()?;
+    // A relative target is read from the folder the link is in, as the
+    // kernel reads it.
+    if let Ok(target) = std::fs::read_link(path) {
+        return landing(&dir.join(target), hops.checked_sub(1)?);
+    }
+    let dir = landing(dir, hops)?;
+    let name = path.file_name()?;
+    Some(match name.to_str() {
+        Some(name) if ignores_case(&dir) => dir.join(name.to_lowercase()),
+        _ => dir.join(name),
+    })
+}
+
+/// Whether the folder `dir` — or, when it is not made yet, the nearest folder
+/// above it that is there — opens a name whatever its case, as macOS's
+/// volumes do by default. Asked of that folder's own name with its case
+/// swapped, which opens the folder itself only there; `false` where no name on
+/// the way up has a case to swap.
+fn ignores_case(dir: &Path) -> bool {
+    let Some(there) = dir.ancestors().find(|p| p.exists()) else {
+        return false;
+    };
+    for at in there.ancestors() {
+        let Some(name) = at.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let upper = name.to_uppercase();
+        let swapped = if upper == name {
+            name.to_lowercase()
+        } else {
+            upper
+        };
+        if swapped != name {
+            return std::fs::canonicalize(at.with_file_name(swapped))
+                .is_ok_and(|real| std::fs::canonicalize(at).is_ok_and(|at| at == real));
+        }
+    }
+    false
+}
+
+/// The agents one pass reads for — every detected agent, any an install or
+/// remove names, and any other whose context file lands on one of theirs — in
+/// registry order, each with the file its context file lands on
+/// ([`lands_on`]).
+///
+/// Two rows can be ONE file: a dotfiles setup that links `~/.codex/AGENTS.md`
+/// to `~/.claude/CLAUDE.md` gives Claude Code and Codex one file to load. Judged
+/// row by row, each row's block read the other's as stale and replaced it, so
+/// the file was rewritten twice on every pass, status always showed one row
+/// stale, and Claude Code could be left reading the Codex sandbox paragraph —
+/// that every `aterm ctl` verb answers `Operation not permitted` — and conclude
+/// its own control socket was dead. So a file two readers share carries one
+/// block, the generic one ([`Readers::block`]), written by the first of them
+/// alone ([`Primed`]), and every row of it reports the same state.
+///
+/// An agent the pass does not prime reads such a file too when its own path
+/// leads there: a folder linked, as dotfiles do, to one the pass makes
+/// (`~/.config/opencode` to a `~/.codex` not made yet, then `aterm agents
+/// install codex`) is live once the pass has made it, and OpenCode loads the
+/// file from then on. Left out, the file got the Codex block, sandbox
+/// paragraph and all, and status straight after read both rows stale.
+struct Readers(Vec<Reader>);
+
+/// One of the [`Readers`].
+struct Reader {
+    agent: &'static AgentFile,
+    /// Its context file, where the agent looks for it.
+    path: PathBuf,
+    /// The file that lands on ([`lands_on`]).
+    file: PathBuf,
+    /// Whether the pass primes it: detected, or named. Only such a reader's
+    /// path is a way a write may go through ([`Readers::way`]); another's
+    /// folder is not the pass's to make.
+    primed: bool,
+}
+
+impl Readers {
+    /// The readers under `home`/`xdg`: every detected agent and every one of
+    /// `named`, and every other agent whose context file lands on one of
+    /// theirs.
+    fn of(home: &Path, xdg: Option<&Path>, named: &[&AgentFile]) -> Self {
+        let all: Vec<Reader> = AGENT_FILES
+            .iter()
+            .map(|agent| {
+                let path = home_join(home, xdg, agent.file);
+                let file = lands_on(&path);
+                let primed =
+                    detected(home, xdg, agent) || named.iter().any(|n| n.name == agent.name);
+                Reader {
+                    agent,
+                    path,
+                    file,
+                    primed,
+                }
+            })
+            .collect();
+        let files: Vec<PathBuf> = all
+            .iter()
+            .filter(|r| r.primed)
+            .map(|r| r.file.clone())
+            .collect();
+        Self(
+            all.into_iter()
+                .filter(|r| r.primed || files.contains(&r.file))
+                .collect(),
+        )
+    }
+
+    /// `agent`'s reader; `None` for no reader.
+    fn reader(&self, agent: &AgentFile) -> Option<&Reader> {
+        self.0.iter().find(|r| r.agent.name == agent.name)
+    }
+
+    /// The file `agent`'s context file lands on; `None` for no reader.
+    fn file(&self, agent: &AgentFile) -> Option<&Path> {
+        self.reader(agent).map(|r| r.file.as_path())
+    }
+
+    /// The other readers of `agent`'s file, in registry order: empty for a file
+    /// it alone reads.
+    fn sharing(&self, agent: &AgentFile) -> Vec<&'static str> {
+        let Some(file) = self.file(agent) else {
+            return Vec::new();
+        };
+        self.0
+            .iter()
+            .filter(|r| r.agent.name != agent.name && r.file == file)
+            .map(|r| r.agent.name)
+            .collect()
+    }
+
+    /// The reader whose path a write of `agent`'s file goes through: `agent`
+    /// itself, unless its way there is a link not live yet ([`dangling_link`]) —
+    /// a dotfiles link made before the file it leads to — and the way of
+    /// another reader the pass primes to the same file is open. Then the first
+    /// such reader's: its write makes the file the link leads to, so the link's
+    /// own row is not refused for the file this pass makes. `None` for no
+    /// reader.
+    fn way(&self, agent: &AgentFile) -> Option<&'static AgentFile> {
+        let own = self.reader(agent)?;
+        if dangling_link(&own.path).is_none() {
+            return Some(own.agent);
+        }
+        let open = self
+            .0
+            .iter()
+            .find(|r| r.primed && r.file == own.file && dangling_link(&r.path).is_none());
+        Some(open.unwrap_or(own).agent)
+    }
+
+    /// The block `agent`'s file carries: the agent's own ([`block_for`]) when it
+    /// alone reads the file, else the generic block — an addendum true for one
+    /// reader is false for another, and the generic block is true for all.
+    fn block(&self, agent: &AgentFile) -> String {
+        if self.sharing(agent).is_empty() {
+            block_for(agent)
+        } else {
+            block_with(None)
+        }
+    }
+
+    /// What a status or install row adds for a file other readers share: who
+    /// they are, or nothing.
+    fn note(&self, agent: &AgentFile) -> String {
+        let sharing = self.sharing(agent);
+        if sharing.is_empty() {
+            String::new()
+        } else {
+            format!(" (shared with {})", sharing.join(", "))
+        }
+    }
+}
+
+/// One pass's primer writes: each file the [`Readers`]' context files land on
+/// is upserted once, by the first row that reaches it (through the path
+/// [`Readers::way`] names), and a later row of the same file takes that
+/// write's result as its own.
+struct Primed<'r> {
+    readers: &'r Readers,
+    /// The files written (or found current) so far, with what that did.
+    done: Vec<(&'r Path, PrimerWrite)>,
+}
+
+impl<'r> Primed<'r> {
+    fn new(readers: &'r Readers) -> Self {
+        Self {
+            readers,
+            done: Vec::new(),
+        }
+    }
+
+    /// Upsert `agent`'s block ([`Readers::block`]) into the file its context
+    /// file lands on, `write`ing it through the path of the reader
+    /// [`Readers::way`] names — unless an earlier row upserted the same file in
+    /// this pass: then that row's result. With the result, the agent whose
+    /// path this row wrote (or tried) through, or `None` for "this row did not
+    /// write it".
+    /// An upsert that failed is not taken: the next row of the file tries it.
+    fn upsert(
+        &mut self,
+        agent: &'static AgentFile,
+        write: impl FnOnce(&AgentFile, &str) -> Result<PrimerWrite, String>,
+    ) -> (Result<PrimerWrite, String>, Option<&'static AgentFile>) {
+        let file = self.readers.file(agent);
+        if let Some((_, done)) = self.done.iter().find(|(f, _)| Some(*f) == file) {
+            return (Ok(*done), None);
+        }
+        let through = self.readers.way(agent).unwrap_or(agent);
+        let primer = write(through, &self.readers.block(agent));
+        if let (Some(file), Ok(done)) = (file, &primer) {
+            self.done.push((file, *done));
+        }
+        (primer, Some(through))
+    }
 }
 
 /// One agent's on-disk situation, resolved read-only for `status` and
@@ -1209,17 +1394,31 @@ enum FileSituation {
     File(Result<BlockState, String>),
 }
 
-fn situation(home: &Path, xdg: Option<&Path>, agent: &AgentFile) -> FileSituation {
+/// `agent`'s situation, its block judged against the one its file carries
+/// among `readers` ([`Readers::block`]).
+fn situation(
+    home: &Path,
+    xdg: Option<&Path>,
+    agent: &AgentFile,
+    readers: &Readers,
+) -> FileSituation {
     if !detected(home, xdg, agent) {
         return FileSituation::NotDetected;
     }
     let path = home_join(home, xdg, agent.file);
     match std::fs::read_to_string(&path) {
-        Ok(content) => FileSituation::File(block_state(&content, &block_for(agent))),
+        Ok(content) => FileSituation::File(block_state(&content, &readers.block(agent))),
         // A link whose target is not there is no missing file: the install
-        // refuses it ([`dangling_link`]), and status says why, in its words.
+        // refuses it ([`dangling_link`]), and status says why, in its words —
+        // unless the install makes that target through another reader's way
+        // ([`Readers::way`]): then it is the file not made yet, as that
+        // reader's row says.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            dangling_link(&path).map_or(FileSituation::NoFile, |why| FileSituation::File(Err(why)))
+            let made_by_another = readers.way(agent).is_some_and(|way| way.name != agent.name);
+            match dangling_link(&path) {
+                Some(why) if !made_by_another => FileSituation::File(Err(why)),
+                _ => FileSituation::NoFile,
+            }
         }
         Err(e) => FileSituation::File(Err(format!("unreadable: {e}"))),
     }
@@ -1248,8 +1447,8 @@ pub enum Outcome {
     /// The primer block was absent (or the file was) and is now installed —
     /// this agent is primed for the first time.
     Installed,
-    /// Something of ours was stale and rewritten in place (a v1 block, an older
-    /// skill), or a skill was added beside an already-current block.
+    /// Something of ours was stale and rewritten in place (an older block or skill), or a
+    /// skill was added beside an already-current block.
     Updated,
     /// The only thing left to do was a skill whose file is the user's own
     /// (no aterm marker); it was left alone. Reported every time, never logged
@@ -1269,24 +1468,23 @@ pub struct AgentOutcome {
     pub product: &'static str,
     /// What happened.
     pub outcome: Outcome,
-    /// Exactly the files THIS pass wrote for the agent (`~/`-relative, as `aterm
-    /// agents status` spells them), in write order: the primer file when it was
-    /// created, appended to, or replaced; each skill file installed or updated.
-    /// Decided from the write results themselves, not from `outcome` — an
-    /// [`Outcome::Error`] row can still have written (its skills are still
-    /// written after its primer file is refused: `upsert_primer_file` diagnoses
-    /// a corrupt block before it writes anything, and [`auto_prime`] does not
-    /// stop there; a created primer can precede a skill write that fails), and
-    /// an `Updated` row names the one stale skill it rewrote, not the primer it
-    /// left alone. What [`AutoPrime::changed`] and the summary's file list read.
+    /// Exactly the files this pass wrote for the agent (`~/`-relative, as `aterm agents
+    /// status` spells them), in write order: the primer file when created, appended to or
+    /// replaced, then each skill file installed or updated. Decided from the write results,
+    /// not from `outcome`: an [`Outcome::Error`] row can still have written (its skills
+    /// are written after a refused primer file, and a created primer can precede a failed
+    /// skill write), and an `Updated` row names only what it rewrote. A context file two
+    /// agents share ([`Readers`]) is written once and named once, by the first of their
+    /// rows, as the path it was written through ([`Readers::way`]); the later row's outcome
+    /// still reads that write. [`AutoPrime::changed`] and the summary's file list read it.
     pub wrote: Vec<String>,
 }
 
 /// The result of one [`auto_prime`] pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoPrime {
-    /// One row per DETECTED agent, in registry order; empty when no agent's
-    /// config dir exists.
+    /// One row per detected agent, in registry order; empty when no agent's config dir
+    /// exists.
     pub agents: Vec<AgentOutcome>,
     /// The one-line human summary (`agent primer: claude installed, codex
     /// unchanged`), ready for a log line.
@@ -1294,11 +1492,9 @@ pub struct AutoPrime {
 }
 
 impl AutoPrime {
-    /// Whether anything was written — the condition for an `info` log line.
-    /// Read from each row's [`AgentOutcome::wrote`], never from its outcome
-    /// word: an [`Outcome::Error`] row whose primer file was refused still
-    /// wrote its skills after that, under the user's home, and the line that
-    /// names them must be logged.
+    /// Whether anything was written, the condition for an `info` log line. Read from each
+    /// row's [`AgentOutcome::wrote`], not its outcome: an [`Outcome::Error`] row whose
+    /// primer file was refused can still have written its skills, and that must be logged.
     #[must_use]
     pub fn changed(&self) -> bool {
         self.agents.iter().any(|a| !a.wrote.is_empty())
@@ -1314,32 +1510,27 @@ impl AutoPrime {
 }
 
 // ---------------------------------------------------------------------------
-// The hook entries an earlier aterm wrote — taken out, once
+// Claude settings: removing the hook entries an earlier aterm wrote, and the defaults
 // ---------------------------------------------------------------------------
 
 /// Where Claude Code keeps its settings (relative to the home).
 const CLAUDE_SETTINGS_FILE: &str = ".claude/settings.json";
 
-/// ONE read-modify-write of a Claude settings file at a time in this process,
-/// held from the read through the rename. A window rewrites `settings.json`
-/// from two threads at a cold start: `aterm-agent-prime` ([`auto_prime`], whose
-/// claude row runs [`remove_aterm_hooks`]) and the hook sweep
-/// ([`remove_aterm_hooks_in`], then [`add_claude_defaults_in`]). Unserialised, a
-/// write built on a read taken before the other's rename replaced that rename
-/// whole: the defaults the sweep had just added and logged were gone again. It
-/// covers this process only. A save from anywhere else — a second aterm (`aterm
-/// agents remove` beside a window), a person's editor, Claude Code itself — is
-/// met by the check every settings write makes before its rename ([`rewrite`]).
-/// Both writers take it in [`edit_settings`]; a poisoned lock is still a good
-/// lock, since a writer that panicked left the file whole (every write is a
-/// rename).
+/// One read-modify-write of a Claude settings file at a time in this process, held from
+/// the read through the rename. A window rewrites `settings.json` from two threads at a
+/// cold start, `aterm-agent-prime` ([`auto_prime`], whose claude row runs
+/// [`remove_aterm_hooks`]) and the hook sweep ([`remove_aterm_hooks_in`], then
+/// [`add_claude_defaults_in`]); unserialised, a write built on a read taken before the
+/// other's rename replaces that rename whole. A save from outside this process is met by
+/// [`rewrite`]'s check before the rename. Both writers take it in [`edit_settings`]; a
+/// poisoned lock is still good, since a panicked writer left the file whole (every write
+/// is a rename).
 static SETTINGS_RMW: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// THE read-modify-write of a Claude settings file ([`remove_aterm_hooks`],
-/// [`add_claude_defaults`]): [`rewrite`], with a backup of the bytes it
-/// replaces, under [`SETTINGS_RMW`]. `edit` makes the document to write from the
-/// file's text (`None`: no file), with what it did, or says `None` to leave the
-/// file as it is.
+/// The read-modify-write of a Claude settings file ([`remove_aterm_hooks`],
+/// [`add_claude_defaults`]): [`rewrite`], with a backup of the bytes it replaces, under
+/// [`SETTINGS_RMW`]. `edit` makes the document to write from the file's text (`None`: no
+/// file), with what it did, or returns `None` to leave the file as it is.
 fn edit_settings<T>(
     path: &Path,
     mut edit: impl FnMut(Option<&str>) -> Result<Option<(settings_json::Json, T)>, String>,
@@ -1357,16 +1548,15 @@ fn edit_settings<T>(
     })
 }
 
-/// The two retired spellings of the fabric's hook verb, as the word AFTER the
+/// The two retired spellings of the fabric's hook verb, as the words after the
 /// executable: `<exe> link hook run <event> …` (the multiplexed `aterm`) and
 /// `<exe> hook run <event> …` (the `aterm-link` argv0 alias); [`is_aterm_hook_command`] keys
 /// on them together with the executable's name.
 const LINK_HOOK_FORMS: [&str; 2] = ["link hook run", "hook run"];
 
-/// The executable names the retired hook verb ran under: the one binary, its
-/// `aterm-link` alias (and the dev `[[bin]]` of that name), and `aterm-cli`, an
-/// alias that routes to the front door, so `aterm-cli link hook install` wrote
-/// `<…>/aterm-cli link hook run …`.
+/// The executable names the retired hook verb ran under: the one binary, its `aterm-link`
+/// alias (and the dev `[[bin]]` of that name), and `aterm-cli`, an alias that routes to
+/// the front door (`aterm-cli link hook install` wrote `<…>/aterm-cli link hook run …`).
 const ATERM_EXE_NAMES: [&str; 3] = ["aterm", "aterm-link", "aterm-cli"];
 
 /// The bytes that end a plain `/bin/sh` word list: a path read up to one of
@@ -1384,22 +1574,18 @@ const RETIRED_INSTALLER_MARK: &str = "# aterm-harness";
 /// `statusLine`, which that install took over, is read back from it.
 const HARNESS_BACKUP_SUFFIX: &str = ".aterm-harness.orig";
 
-/// Whether a hook (or `statusLine`) `command` is one an aterm build wrote into a
-/// Claude settings file:
+/// Whether a hook (or `statusLine`) `command` is one an aterm build wrote into a Claude
+/// settings file:
 ///
-/// * the fabric's retired hook: the first shell word is an executable whose
-///   file name is one of [`ATERM_EXE_NAMES`] (any directory; single-quoted the
-///   way the old writer quoted a path with a space), followed by
-///   `link hook run ` or `hook run `;
-/// * the same, written by a writer that did not quote: an absolute path with a
-///   space in it (`…/Application Support/aterm/pkg/bin/aterm link hook run …`,
-///   the shape that exited 127 before the writer quoted), read up to the first
+/// * the fabric's retired hook: the first shell word is an executable named one of
+///   [`ATERM_EXE_NAMES`] (any directory, single-quoted as the old writer quoted a path with
+///   a space), followed by `link hook run ` or `hook run `;
+/// * the same unquoted: an absolute path with a space in it, read up to the first
 ///   `/<name> ` with no shell metacharacter before it ([`bare_path_hook`]);
-/// * the retired harness bridge: the command ends with the
-///   [`RETIRED_INSTALLER_MARK`] shell comment.
+/// * the retired harness bridge: the command ends with the [`RETIRED_INSTALLER_MARK`]
+///   shell comment.
 ///
-/// Anything else is the owner's, even when it contains `hook run` — a
-/// `mytool hook run x` of theirs survives.
+/// Anything else is the owner's, even when it contains `hook run`.
 #[must_use]
 pub(crate) fn is_aterm_hook_command(command: &str) -> bool {
     let command = command.trim();
@@ -1428,12 +1614,11 @@ fn is_link_hook_form(rest: &str) -> bool {
     })
 }
 
-/// An unquoted absolute path to one of [`ATERM_EXE_NAMES`] that contains a
-/// space, followed by the hook verb: `/…/Application Support/…/aterm link hook
-/// run stop`. The shell splits such a line at the space, so it never ran as
-/// aterm — but aterm wrote it, and it is aterm's to remove. Only a line that
-/// STARTS with `/` and reaches `/<name> ` before any [`SH_META`] byte counts,
-/// so `echo /x/aterm link hook run` and `a | /x/aterm hook run` stay the owner's.
+/// An unquoted absolute path to one of [`ATERM_EXE_NAMES`] that contains a space, followed
+/// by the hook verb: `/…/Application Support/…/aterm link hook run stop`. The shell splits
+/// it at the space, so it never ran, but aterm wrote it and removes it. Only a line that
+/// starts with `/` and reaches `/<name> ` before any [`SH_META`] byte counts, so
+/// `echo /x/aterm link hook run` and `a | /x/aterm hook run` stay the owner's.
 fn bare_path_hook(command: &str) -> bool {
     if !command.starts_with('/') {
         return false;
@@ -1503,11 +1688,10 @@ pub enum HookRemoval {
 /// every throttled spawn writes nothing after the first removal:
 /// nothing wakes an agent for mail — it is typed to.
 ///
-/// A `statusLine` the retired `aterm harness install` wrote (its command ends
-/// with [`RETIRED_INSTALLER_MARK`]) counts as one entry: it is put back to the
-/// user's own `statusLine` in the same position, or removed when that install
-/// kept none (see `restore_harness_statusline` for where the answer is read
-/// from).
+/// A `statusLine` the retired `aterm harness install` wrote (ending with
+/// [`RETIRED_INSTALLER_MARK`]) counts as one entry: it is put back to the user's own
+/// `statusLine` in the same position, or removed when that install kept none
+/// (`restore_harness_statusline`).
 ///
 /// Where it runs: inside [`auto_prime`] (the window's pass at its launch and
 /// at a fresh spawn, at most once a minute, and only while `agents_auto_prime`
@@ -1520,11 +1704,9 @@ pub enum HookRemoval {
 ///
 /// # Errors
 ///
-/// An unreadable or unparseable file, or a shape no removal is safe into
-/// (`hooks` not an object, an event not an array): the file is left as it is.
-/// A failed write, which leaves the file as it was and no backup of it
-/// ([`rewrite`]), and a file saved over at every try of the write, left as that
-/// save made it.
+/// An unreadable or unparseable file, or a shape no removal is safe into (`hooks` not an
+/// object, an event not an array): the file is left as it is. A failed write, which leaves
+/// the file and no backup ([`rewrite`]), and a file saved over at every try.
 pub(crate) fn remove_aterm_hooks(path: &Path) -> Result<HookRemoval, String> {
     let edited = edit_settings(path, |text| {
         let Some(text) = text else {
@@ -1546,20 +1728,15 @@ pub(crate) fn remove_aterm_hooks(path: &Path) -> Result<HookRemoval, String> {
     })
 }
 
-/// Claude Code's settings key for its TOP-EFFORT mode ("xhigh effort plus
-/// standing dynamic-workflow orchestration"): the key of [`CLAUDE_DEFAULTS`] that
-/// turns the mode on, written to `~/.claude/settings.json` and read back from it
-/// exactly as the vendor spells it.
+/// Claude Code's settings key for its top-effort mode ("xhigh effort plus standing
+/// dynamic-workflow orchestration"), as the vendor spells it.
 ///
-/// SPELLED FROM PARTS ON PURPOSE. The publication baseline bans this word, joined,
-/// in every exported file, as the marker of an agent-session artifact, and no
-/// repository can waive a baseline pattern. Here it is the vendor's settings key,
-/// so the source names it ONCE, from parts, and every use — aterm-gui's and atpkg's
-/// doctor's included — goes through this constant, while the export guard keeps
-/// catching a real leak anywhere else. `concat!` makes the same `&'static str` the
-/// joined literal would, so the key written and the key read are the vendor's,
-/// byte for byte — pinned by `the_top_effort_key_is_the_vendors_spelling`, the
-/// one test that spells the key without this constant.
+/// Spelled from parts on purpose: the publication baseline bans this word, joined, in
+/// every exported file as the marker of an agent-session artifact, and no repository can
+/// waive a baseline pattern. So the source names it once, from parts, every use
+/// (aterm-gui's and atpkg's doctor's included) goes through this constant, and the export
+/// guard still catches a real leak elsewhere. `concat!` yields the same `&'static str`;
+/// `the_top_effort_key_is_the_vendors_spelling` pins the bytes.
 pub const CLAUDE_TOP_EFFORT_KEY: &str = concat!("ultra", "code");
 
 /// THE CLAUDE CODE DEFAULTS: the top-effort mode ([`CLAUDE_TOP_EFFORT_KEY`]) on,
@@ -1571,14 +1748,9 @@ pub const CLAUDE_TOP_EFFORT_KEY: &str = concat!("ultra", "code");
 /// person's own effort stands anywhere in the file
 /// ([`claude_efforts_set_by_hand`]).
 ///
-/// What the first three do, read from Claude Code 2.1.283 itself:
-/// * [`CLAUDE_TOP_EFFORT_KEY`] — "xhigh effort plus standing dynamic-workflow
-///   orchestration";
-/// * `effortLevel` — the persisted effort ("Persisted effort level for supported
-///   models"), `xhigh` the level the top-effort mode implies;
-/// * `feedbackSurveyRate` — "Probability (0–1) that the session quality survey
-///   appears when eligible": `0` keeps its rating prompt from drawing under a
-///   supervised session's input.
+/// * `effortLevel` is the persisted effort, `xhigh` the level the top-effort mode implies;
+/// * `feedbackSurveyRate` is the session-quality survey's probability: `0` keeps its rating
+///   prompt from drawing under a supervised session's input.
 ///
 /// Settings, not launch flags: the live upgrade relaunches a session WITHOUT its
 /// launch `--effort`, so a default that lives only in a session is lost at the
@@ -1594,13 +1766,11 @@ pub const CLAUDE_DEFAULTS: [(&str, ClaudeDefault); 6] = [
     (CLAUDE_COMPACT_WINDOW_KEY, ClaudeDefault::Number("400000")),
 ];
 
-/// The setting of Claude Code's drafted-feedback card ("Bug report drafted", with its
-/// `1 to review · 2 to send · 0 to dismiss` hint): `"quiet"` keeps the drafting but never
-/// draws the card, the setting-side twin of a dismissal; `"off"` removes the drafting, the
-/// card and the exit-time question ("You have N unsent feedback drafts"). It is a feedback
-/// prompt, so it is a default beside the rating surveys' switches; the harness does not press
-/// the card (its `0` starts a two-step flow ending in a question only Esc clears). Written
-/// only where unset, like the rest, so an `"off"` a person chose stays.
+/// The setting of Claude Code's drafted-feedback card ("Bug report drafted"): `"quiet"`
+/// keeps the drafting but never draws the card; `"off"` also removes the drafting and the
+/// exit-time question about unsent drafts. A default beside the rating surveys' switches;
+/// the harness does not press the card (its `0` starts a two-step flow ending in a question
+/// only Esc clears). Written only where unset, so a person's `"off"` stays.
 pub const CLAUDE_DRAFTS_KEY: &str = "feedbackDrafts";
 
 /// Claude Code's "Auto-compact window size" in tokens (Claude Code 2.1.302): a conversation
@@ -1714,31 +1884,24 @@ fn read_compact_state(file: std::fs::File) -> std::io::Result<String> {
     Ok(text)
 }
 
-/// THE SWITCH THAT TURNS EVERY RATING SURVEY OFF, as a default's key: the `env` block's
-/// `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY`, written `"1"` (a dotted key is a nested one:
-/// `env` holds it). Claude Code returns before it rolls ANY survey — the session
-/// survey, the long-context, plugin and memory surveys, the plugin-ratings upload and
-/// the VS Code/Desktop survey — when this reads `1`, `true`, `yes` or `on` (trimmed, any
-/// case), and applies it to a RUNNING session when the settings file is saved.
-/// `feedbackSurveyRate: 0` above covers the session survey alone, and only by a
-/// probability of zero. Because the switch overrides ANY probability, it is not added
-/// while a person's own non-zero one stands ([`claude_survey_rate_set_by_hand`]).
+/// The switch that turns every rating survey off, as a default's key: the `env` block's
+/// `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY`, written `"1"` (a dotted key is nested under
+/// `env`). Claude Code rolls no survey of any kind when it reads `1`, `true`, `yes` or
+/// `on` (trimmed, any case), and applies it to a running session when the file is saved;
+/// `feedbackSurveyRate: 0` covers only the session survey. The switch overrides any
+/// probability, so it is not added while a person's own non-zero one stands
+/// ([`claude_survey_rate_set_by_hand`]).
 pub const CLAUDE_SURVEY_SWITCH: &str = "env.CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY";
 
-/// The survey probability key, and the default it holds back: the switch above silences
-/// EVERY survey, so it overrides a probability a person chose (Claude Code returns before it
-/// rolls anything when the switch reads true). The window therefore adds the switch only
-/// where no probability but zero stands ([`claude_survey_rate_set_by_hand`]); the rate
-/// default (`0`) is the person's to keep or change, as before.
+/// The survey probability key. A non-zero value a person set holds back
+/// [`CLAUDE_SURVEY_SWITCH`], which would override it.
 const SURVEY_RATE_KEY: &str = "feedbackSurveyRate";
 
-/// A survey probability a person set BY HAND in the Claude settings text `settings_json`:
-/// the top-level `feedbackSurveyRate` at any value but the number zero, as its JSON text
-/// (`0.3`, `1`, `"0.5"`, `null`) — the last of a duplicate key, as Claude Code reads it.
-/// `None` when it is unset or zero (a probability of zero asks for the same silence the
-/// switch brings), and for text that does not parse as JSON.
-///
-/// Public for atpkg's doctor, which reports by this rule whether the window holds the
+/// A survey probability a person set in the Claude settings text `settings_json`: the
+/// top-level `feedbackSurveyRate` at any value but the number zero, as its JSON text
+/// (`0.3`, `1`, `"0.5"`, `null`), the last of a duplicate key winning as in Claude Code.
+/// `None` when unset or zero (zero asks for the switch's silence anyway) and for text that
+/// does not parse. Public for atpkg's doctor, which reports whether the window holds the
 /// switch back.
 #[must_use]
 pub fn claude_survey_rate_set_by_hand(settings_json: &str) -> Option<String> {
@@ -1759,26 +1922,21 @@ fn survey_rate_set_by_hand(doc: &settings_json::Json) -> Option<String> {
 /// what the defaults would, so it holds nothing back.
 const DEFAULT_EFFORT: &str = "xhigh";
 
-/// The defaults that SET AN EFFORT, which are added only where no person's own
-/// effort stands ([`claude_efforts_set_by_hand`]). Claude Code 2.1.283 resolves
-/// the effort to `xhigh` whenever the top-effort key ([`CLAUDE_TOP_EFFORT_KEY`])
-/// is true, BEFORE it reads the top-level `effortLevel` or the per-model one
-/// `/effort <level>` saves, so adding that key would silently override a `medium`
-/// a person picked; and a top-level `xhigh` beside a per-model `medium` says the
-/// opposite of what they chose. The survey rate is no effort and is added
-/// regardless. atpkg's doctor reads this list.
+/// The defaults that set an effort, added only where no person's own effort stands
+/// ([`claude_efforts_set_by_hand`]). Claude Code resolves the effort to `xhigh` whenever
+/// [`CLAUDE_TOP_EFFORT_KEY`] is true, before it reads the top-level `effortLevel` or the
+/// per-model one `/effort <level>` saves, so adding that key would silently override a
+/// `medium` a person picked, and a top-level `xhigh` beside a per-model `medium`
+/// contradicts their choice. The survey rate is no effort and is added regardless.
+/// atpkg's doctor reads this list.
 pub const CLAUDE_EFFORT_DEFAULTS: [&str; 2] = [CLAUDE_TOP_EFFORT_KEY, "effortLevel"];
 
-/// Every effort a person set BY HAND in the Claude settings text
-/// `settings_json` that is not `xhigh` (the defaults' own effort), as `(path,
-/// value as JSON text)`: the top-level `effortLevel` first, then each
-/// `modelSettings.<model>.effortLevel` (where `/effort <level>` saves the level
-/// for the session's model) in model-name order. A duplicate key reads as
-/// Claude Code reads it, the last one winning. Empty when there is none, and for
-/// text that does not parse as JSON.
-///
-/// Public for atpkg's doctor, which reports by this rule which defaults the
-/// window holds back.
+/// Every effort other than `xhigh` a person set in the Claude settings text
+/// `settings_json`, as `(path, value as JSON text)`: the top-level `effortLevel` first,
+/// then each `modelSettings.<model>.effortLevel` (where `/effort <level>` saves the
+/// session model's level) in model-name order, the last of a duplicate key winning as in
+/// Claude Code. Empty when there is none or the text does not parse. Public for atpkg's
+/// doctor, which reports which defaults the window holds back.
 #[must_use]
 pub fn claude_efforts_set_by_hand(settings_json: &str) -> Vec<(String, String)> {
     settings_json::Json::parse(settings_json)
@@ -1892,8 +2050,8 @@ fn claude_defaults_edit(
     text: Option<&str>,
     hold_window: bool,
 ) -> Result<Option<(settings_json::Json, Vec<&'static str>)>, String> {
-    // No file, read through a link whose target is not there, is no missing
-    // file to create: the write refuses it ([`dangling_link`]).
+    // No settings directory means no Claude Code here. A dangling link gets past this
+    // check; the write refuses it ([`dangling_link`]).
     if text.is_none() && !path.parent().is_some_and(Path::is_dir) {
         return Ok(None);
     }
@@ -2035,24 +2193,17 @@ fn is_harness_statusline(value: &settings_json::Json) -> bool {
         })
 }
 
-/// Put back the user's `statusLine` where the retired harness installer took
-/// the slot, else leave no `statusLine` at all. `true` when the document
-/// changed.
+/// Put back the user's `statusLine` where the retired harness installer took the slot,
+/// else leave no `statusLine` at all. `true` when the document changed.
 ///
-/// The install that took the slot copied the user's command into
-/// `<harness state>/statusline.user`, and that file is the answer whenever the
-/// state is still there: the bridge path in the harness's own command names
-/// the state (`sh '<state>/plugin/hooks/bridge.sh' statusline …`), and an
-/// install always left `<state>/plugin` behind. A non-empty file is the
-/// command to restore; no file means that install found no statusLine of the
-/// user's to keep. The `<file>.aterm-harness.orig` byte copy is NOT that
-/// answer on its own: install wrote it only when none existed, and uninstall
-/// kept it whenever the file had been edited since, so after install → edit →
-/// uninstall → a new statusLine → install it holds an older statusLine, or
-/// none. It is used for its extra keys (`padding`, …) when its command is the
-/// one being restored, and on its own only when the state is gone (looked for
-/// beside `path` and beside the file a symlinked `path` resolves to, where that
-/// installer wrote it).
+/// The answer is `<harness state>/statusline.user` whenever that state is still there (the
+/// bridge path in the harness's command names it, and an install always left
+/// `<state>/plugin`): a non-empty file is the command to restore, no file means the
+/// install found none to keep. The `<file>.aterm-harness.orig` copy is not the answer on
+/// its own: after install, edit, uninstall, a new statusLine and install again, it holds
+/// an older statusLine or none. It supplies the extra keys (`padding`, …) when its command
+/// is the one restored, and stands alone only when the state is gone (looked for beside
+/// `path` and beside the file a symlinked `path` resolves to).
 fn restore_harness_statusline(doc: &mut settings_json::Json, path: &Path) -> bool {
     use settings_json::Json;
     let Some(harness) = doc.get("statusLine").filter(|v| is_harness_statusline(v)) else {
@@ -2118,11 +2269,10 @@ fn harness_state_of(command: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// The previous bytes beside the file as `<file>.bak-<unix>` (`-<n>` on a
-/// same-second collision): created new, never over an existing backup, and never
-/// WIDER than the file it copies — a settings file carries `env` (tokens, keys).
-/// So it is born private ([`create_private_temp`]'s mode) and given the target's
-/// own mode once the bytes are down, as [`write_atomically`] treats the file.
+/// Save the previous bytes beside the file as `<file>.bak-<unix>` (`-<n>` on a same-second
+/// collision): created new, never over an existing backup, and never wider than the file
+/// it copies, since a settings file carries `env` tokens. It is born private
+/// ([`create_private_temp`]) and given the target's mode once the bytes are down.
 fn write_backup(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     write_backup_with(path, |file| {
         file.write_all(bytes)?;
@@ -2136,11 +2286,10 @@ fn write_backup(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     })
 }
 
-/// [`write_backup`], its bytes and mode put down by `fill` into the file it has just
-/// created. A `fill` that FAILS takes that file away again: a copy cut short (a full
-/// disk, a failed sync) is no backup, and left behind it would read as one — and pile
-/// up, one more at every window start the failure repeats. Split out so a test can
-/// fail the fill, which nothing on a working disk does.
+/// [`write_backup`], with `fill` putting the bytes and mode into the file just created. A
+/// failed `fill` removes that file: a cut-short copy is no backup, and left behind it would
+/// read as one and pile up at every window start the failure repeats. Split out so a test
+/// can fail the fill.
 fn write_backup_with(
     path: &Path,
     fill: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
@@ -2169,9 +2318,8 @@ fn write_backup_with(
     Err(format!("{}: no free backup name", path.display()))
 }
 
-/// Fold one agent's primer write and its skill writes into the agent's outcome.
-/// `Installed` means the PRIMER was new (the agent is primed for the first
-/// time); any other write is an update; a foreign skill only shows when nothing
+/// Fold one agent's primer, skill and hook writes into its outcome. `Installed` means the
+/// primer was new; any other write is an update; a foreign skill shows only when nothing
 /// else happened; an error wins outright.
 fn fold_outcome(
     primer: Result<PrimerWrite, String>,
@@ -2224,10 +2372,11 @@ fn outcome_word(o: &Outcome) -> String {
 ///   is not made again ([`Room::Below`]).
 /// * Idempotent: a second call over the same tree reports every row
 ///   `Unchanged` (or `SkippedForeign`, which also writes nothing).
+/// * One write per file: agents whose context files are one file get one
+///   generic block there, written once ([`Readers`]), and their rows one state.
 /// * Fail-soft: no panics; an I/O error or a corrupt block becomes that row's
-///   [`Outcome::Error`] and the other agents still proceed. Every write is a
-///   whole-file atomic replace ([`write_atomically`]), so nothing is ever left
-///   half-edited — not even for the instant of the write.
+///   [`Outcome::Error`] and the other agents proceed. Every write is a whole-file atomic
+///   replace ([`write_atomically`]).
 ///
 /// Whenever anything was written, the summary follows the per-agent outcome
 /// words — exactly the short line an unchanged pass prints — with the off switch
@@ -2244,21 +2393,28 @@ pub fn auto_prime(home: &Path) -> AutoPrime {
     auto_prime_with_xdg(home, xdg_config_home().as_deref())
 }
 
-// Capture the environment at the public boundary. Every operation in one pass
-// uses the same roots; scratch-home tests supply their own complete path context.
+// The environment is read once, at the public boundary, so one pass uses the same roots
+// throughout; scratch-home tests supply their own.
 fn auto_prime_with_xdg(home: &Path, xdg: Option<&Path>) -> AutoPrime {
     auto_prime_in(home, xdg, &off_switch(xdg))
 }
 
 /// One pass over `home`/`xdg`, naming `switch` ([`off_switch`]) on a write.
 fn auto_prime_in(home: &Path, xdg: Option<&Path>, switch: &str) -> AutoPrime {
+    let readers = Readers::of(home, xdg, &[]);
+    let mut primed = Primed::new(&readers);
     let mut agents = Vec::new();
     for a in AGENT_FILES.iter().filter(|a| detected(home, xdg, a)) {
         // The detected dir is the pass's to write under, never to make: one
         // taken mid-pass stays gone (`Room::Below`).
         let agent_dir = home_join(home, xdg, a.dir);
         let room = Room::Below(&agent_dir);
-        let primer = upsert_primer_file(&home_join(home, xdg, a.file), &block_for(a), room);
+        // A file an earlier row shares is that row's write, named there; one
+        // reached through another reader's path is written within its room.
+        let (primer, through) = primed.upsert(a, |r, block| {
+            let dir = home_join(home, xdg, r.dir);
+            upsert_primer_file(&home_join(home, xdg, r.file), block, Room::Below(&dir))
+        });
         let skills: Vec<Result<SkillWrite, String>> = skills_for(a.name)
             .iter()
             .map(|s| install_skill_file(&home_join(home, xdg, s.path), s.body, room))
@@ -2267,15 +2423,16 @@ fn auto_prime_in(home: &Path, xdg: Option<&Path>, switch: &str) -> AutoPrime {
         // once (nothing wakes an agent for mail).
         let hooks = (a.name == "claude")
             .then(|| remove_aterm_hooks(&home_join(home, xdg, CLAUDE_SETTINGS_FILE)));
-        // Exactly the paths THIS pass wrote — decided from the write results
-        // before they are folded into the row's one-word outcome (see
-        // `AgentOutcome::wrote`).
+        // Decided from the write results before they fold into the row's outcome
+        // (`AgentOutcome::wrote`).
         let mut wrote: Vec<String> = Vec::new();
-        if matches!(
-            primer,
-            Ok(PrimerWrite::Created | PrimerWrite::Appended | PrimerWrite::Replaced)
-        ) {
-            wrote.push(format!("~/{}", a.file));
+        if let Some(through) = through
+            && matches!(
+                primer,
+                Ok(PrimerWrite::Created | PrimerWrite::Appended | PrimerWrite::Replaced)
+            )
+        {
+            wrote.push(format!("~/{}", through.file));
         }
         for (skill, write) in skills_for(a.name).iter().zip(&skills) {
             if matches!(write, Ok(SkillWrite::Installed | SkillWrite::Updated)) {
@@ -2311,8 +2468,8 @@ fn auto_prime_in(home: &Path, xdg: Option<&Path>, switch: &str) -> AutoPrime {
             .map(|a| format!("{} {}", a.agent, outcome_word(&a.outcome)))
             .collect();
         let mut s = format!("agent primer: {}", rows.join(", "));
-        // The switch, THEN the files — the log cap's order (see above): only the
-        // file list may lose its tail to aterm-log's 512-byte record cap.
+        // The switch before the files: only the list may lose its tail to the log cap
+        // (see `auto_prime`).
         let wrote: Vec<&str> = agents
             .iter()
             .flat_map(|a| a.wrote.iter().map(String::as_str))
@@ -2337,10 +2494,11 @@ pub fn status_line(home: &Path) -> String {
 }
 
 fn status_line_with_xdg(home: &Path, xdg: Option<&Path>) -> String {
+    let readers = Readers::of(home, xdg, &[]);
     let rows: Vec<String> = AGENT_FILES
         .iter()
         .map(|a| {
-            let state = match situation(home, xdg, a) {
+            let state = match situation(home, xdg, a, &readers) {
                 FileSituation::NotDetected => "not detected".to_string(),
                 FileSituation::NoFile | FileSituation::File(Ok(BlockState::Absent)) => {
                     "absent".to_string()
@@ -2420,10 +2578,8 @@ fn select<'a>(names: &[String]) -> Result<Vec<&'a AgentFile>, String> {
 }
 
 /// The `aterm agents` command: `(report, exit_code)`. The real caller passes
-/// [`home_dir`]; `.config/` entries also honor the current `XDG_CONFIG_HOME`.
-/// Tests inject both roots through the same implementation. Exit codes:
-/// 0 success (status is always 0), 1 an install/remove
-/// failure (corrupt block, I/O error), 2 usage.
+/// [`home_dir`]; `.config/` entries also honor `$XDG_CONFIG_HOME`. Exit codes: 0 success
+/// (status always), 1 an install or remove failure (corrupt block, I/O error), 2 usage.
 #[must_use]
 pub fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
     agents_report_with_xdg(home, args, xdg_config_home().as_deref())
@@ -2450,9 +2606,10 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
             }
         }
         "status" => {
+            let readers = Readers::of(home, xdg, &[]);
             let mut out = String::new();
             for a in AGENT_FILES {
-                let state = match situation(home, xdg, a) {
+                let state = match situation(home, xdg, a, &readers) {
                     FileSituation::NotDetected => {
                         format!("not detected (no {})", display_path(home, xdg, a.dir))
                     }
@@ -2467,12 +2624,12 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                 };
                 let _ = writeln!(
                     out,
-                    "{:<9} {:<30} {state}",
+                    "{:<9} {:<30} {state}{}",
                     a.name,
-                    display_path(home, xdg, a.file)
+                    display_path(home, xdg, a.file),
+                    readers.note(a)
                 );
-                // Skills are whole managed FILES, listed under their agent so the
-                // status view stays one line per artifact.
+                // Skills are whole managed files, one line each under their agent.
                 for s in skills_for(a.name) {
                     let st = match skill_status(home, xdg, s) {
                         Ok(SkillState::Current) => "installed".to_string(),
@@ -2501,6 +2658,11 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                 Err(msg) => return (msg, 2),
             };
             let forced = !names.is_empty();
+            // A named agent reads its file from now on; a detected one, named
+            // or not, already does, so a file it shares gets the shared block.
+            let named: &[&AgentFile] = if forced { &agents } else { &[] };
+            let readers = Readers::of(home, xdg, named);
+            let mut primed = Primed::new(&readers);
             let mut out = String::new();
             let mut failed = false;
             for a in agents {
@@ -2513,16 +2675,13 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                         display_path(home, xdg, a.file),
                         display_path(home, xdg, a.dir)
                     );
-                    // A skipped (undetected, unforced) agent skips its skills as
-                    // well — never create `~/.claude` for someone who does not
-                    // use Claude Code.
+                    // Its skills are skipped too: never create `~/.claude` for someone
+                    // who does not use Claude Code.
                     continue;
                 }
-                let primer = upsert_primer_file(
-                    &home_join(home, xdg, a.file),
-                    &block_for(a),
-                    Room::Anywhere,
-                );
+                let (primer, _) = primed.upsert(a, |r, block| {
+                    upsert_primer_file(&home_join(home, xdg, r.file), block, Room::Anywhere)
+                });
                 let verdict = match primer {
                     Ok(PrimerWrite::Current) => "already installed".to_string(),
                     Ok(PrimerWrite::Created) => "installed (new file)".to_string(),
@@ -2534,13 +2693,13 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                 };
                 let _ = writeln!(
                     out,
-                    "{:<9} {:<30} {verdict}",
+                    "{:<9} {:<30} {verdict}{}",
                     a.name,
-                    display_path(home, xdg, a.file)
+                    display_path(home, xdg, a.file),
+                    readers.note(a)
                 );
 
-                // Bundled skills ride the SAME install: an agent that gets the
-                // primer gets the skills too.
+                // An agent that gets the primer gets the bundled skills too.
                 for s in skills_for(a.name) {
                     let skill =
                         install_skill_file(&home_join(home, xdg, s.path), s.body, Room::Anywhere);
@@ -2572,33 +2731,53 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                 Ok(a) => a,
                 Err(msg) => return (msg, 2),
             };
+            let readers = Readers::of(home, xdg, &agents);
+            // A file two rows share is removed from once, by the first; the
+            // later row says what that removal did.
+            let mut removed: Vec<(&Path, &str)> = Vec::new();
             let mut out = String::new();
             let mut failed = false;
             for a in agents {
                 let path = home_join(home, xdg, a.file);
-                // The person's file: the removal goes in only over the text it
-                // read (rewrite).
-                let removal = rewrite(&path, false, |content| {
-                    content.map_or(Ok(None), |c| Ok(remove_block(c)?.map(|rest| (rest, ()))))
-                });
-                let verdict = match removal {
-                    Ok(None) => "nothing to remove".to_string(),
-                    Ok(Some(_)) => "removed".to_string(),
-                    Err(unwritten) => {
-                        failed = true;
-                        format!("ERROR: {}", unwritten.words())
+                let file = readers.file(a);
+                let verdict = if let Some((_, done)) =
+                    removed.iter().find(|(f, _)| Some(*f) == file)
+                {
+                    (*done).to_string()
+                } else {
+                    // The person's file: the removal goes in only over the text
+                    // it read (rewrite).
+                    let removal = rewrite(&path, false, |content| {
+                        content.map_or(Ok(None), |c| Ok(remove_block(c)?.map(|rest| (rest, ()))))
+                    });
+                    match removal {
+                        Ok(done) => {
+                            let word = if done.is_some() {
+                                "removed"
+                            } else {
+                                "nothing to remove"
+                            };
+                            if let Some(file) = file {
+                                removed.push((file, word));
+                            }
+                            word.to_string()
+                        }
+                        Err(unwritten) => {
+                            failed = true;
+                            format!("ERROR: {}", unwritten.words())
+                        }
                     }
                 };
                 let _ = writeln!(
                     out,
-                    "{:<9} {:<30} {verdict}",
+                    "{:<9} {:<30} {verdict}{}",
                     a.name,
-                    display_path(home, xdg, a.file)
+                    display_path(home, xdg, a.file),
+                    readers.note(a)
                 );
 
-                // Symmetric uninstall: delete only files we still recognise as
-                // OURS. A `Foreign` file (marker removed) is the user's — and a
-                // `Stale` one is ours from an older build, so it does go.
+                // Delete only files still recognised as ours: a `Foreign` file (marker
+                // removed) is the user's; a `Stale` one is ours from an older build.
                 for s in skills_for(a.name) {
                     let sp = home_join(home, xdg, s.path);
                     let verdict = match read_skill(&sp, s.body) {
@@ -2627,8 +2806,8 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                         display_path(home, xdg, s.path)
                     );
                 }
-                // The hook entries an earlier aterm wrote go with the rest,
-                // once; the row shows only when something was there.
+                // The hook entries an earlier aterm wrote go too; the row shows only when
+                // there were some.
                 if a.name == "claude" {
                     let settings = home_join(home, xdg, CLAUDE_SETTINGS_FILE);
                     let verdict = match remove_aterm_hooks(&settings) {
@@ -2653,8 +2832,8 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                     }
                 }
             }
-            // A removal the next session would silently undo is a trap; the
-            // knob that makes it stick rides on the same screen.
+            // The window's next pass would undo the removal: name the switch that makes it
+            // stick.
             let _ = writeln!(out, "\n{}", auto_prime_note(xdg));
             (out, i32::from(failed))
         }
@@ -2671,10 +2850,9 @@ mod tests {
 
     use super::*;
 
-    // A scratch HOME is not sufficient isolation: a caller's XDG_CONFIG_HOME
-    // could otherwise send install/remove into its real OpenCode directory.
-    // These wrappers drive the production implementations with complete fixture
-    // roots, without modifying process-global environment in parallel tests.
+    // A scratch HOME alone is not isolation: an inherited XDG_CONFIG_HOME could send
+    // install or remove into a real OpenCode directory. These wrappers pass complete
+    // fixture roots instead of mutating the process environment.
     fn auto_prime(home: &Path) -> AutoPrime {
         auto_prime_with_xdg(home, None)
     }
@@ -3043,9 +3221,8 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
 
     // ---- auto-prime ---------------------------------------------------------
 
-    /// Every file a first pass writes for `agent`: its primer file, then each
-    /// bundled doc in registry order — the order [`AgentOutcome::wrote`] keeps.
-    /// DERIVED, so shipping another bundled doc updates the expectation.
+    /// Every file a first pass writes for `agent`, derived from the registry: its primer
+    /// file, then each bundled doc in order, as [`AgentOutcome::wrote`] keeps them.
     fn first_pass_files(agent: &str) -> Vec<String> {
         let a = AGENT_FILES
             .iter()
@@ -3209,8 +3386,8 @@ A worker's report ends with `ATERM-TASK-DONE` on a line by itself.
         assert!(!second.changed());
         assert_eq!(std::fs::read_to_string(&skill).unwrap(), theirs);
 
-        // Theirs is no less theirs when it is not UTF-8 (a Latin-1 byte) or
-        // cannot be read at all: neither is an ABSENT file to write over.
+        // Theirs stays theirs when it is not UTF-8 or cannot be read: neither is an
+        // absent file to write over.
         let latin1: &[u8] = b"---\nname: drive-aterm\ndescription: my caf\xe9 notes\n---\n";
         std::fs::write(&skill, latin1).unwrap();
         let third = auto_prime(home.path());
@@ -3318,6 +3495,429 @@ A worker's report ends with `ATERM-TASK-DONE` on a line by itself.
             claude.join("CLAUDE.md").is_file(),
             "a named install makes it"
         );
+    }
+
+    /// One [`auto_prime`] pass, with how many context-file reads its rewrites
+    /// started from ([`rewrite`]): one per file it upserted.
+    fn counted_pass(home: &Path) -> (AutoPrime, usize) {
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = std::rc::Rc::clone(&reads);
+        let pass = saving_after_read(
+            move |path| {
+                if path.extension() == Some("md".as_ref()) {
+                    count.set(count.get() + 1);
+                }
+            },
+            || auto_prime(home),
+        );
+        (pass, reads.get())
+    }
+
+    /// Two agents whose context files are ONE file — a dotfiles setup that
+    /// links `~/.codex/AGENTS.md` to `~/.claude/CLAUDE.md` — get one block
+    /// there, upserted once a pass, with no addendum: the Codex sandbox
+    /// paragraph would tell Claude Code its own control socket is dead. From
+    /// what row-by-row passes left there (the Codex block), one pass
+    /// converges and a second writes nothing; status reads both rows
+    /// installed, a named install of one of them keeps the shared block, and a
+    /// remove takes it out once for both. NEGATIVE CONTROL: once the link is a
+    /// file of its own, Codex's file gets its addendum again.
+    #[cfg(unix)]
+    #[test]
+    fn agents_that_share_one_context_file_get_one_generic_block() {
+        use std::os::unix::fs::MetadataExt as _;
+        let home = aterm_tempfile::tempdir().unwrap();
+        let claude_md = home.path().join(".claude/CLAUDE.md");
+        let codex_md = home.path().join(".codex/AGENTS.md");
+        std::fs::create_dir_all(claude_md.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(codex_md.parent().unwrap()).unwrap();
+        let left = format!("# mine\n\n{}", primer_block(Some("codex")));
+        std::fs::write(&claude_md, left).unwrap();
+        std::os::unix::fs::symlink(&claude_md, &codex_md).unwrap();
+        let shared = format!("# mine\n\n{}", generic());
+
+        let (first, reads) = counted_pass(home.path());
+        assert_eq!(reads, 1, "one upsert of the shared file: {}", first.summary);
+        let rows: Vec<(&str, Outcome)> = first
+            .agents
+            .iter()
+            .map(|a| (a.agent, a.outcome.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            [("claude", Outcome::Updated), ("codex", Outcome::Updated)]
+        );
+        assert_eq!(first.agents[0].wrote, first_pass_files("claude"));
+        assert_eq!(
+            first.agents[1].wrote,
+            first_pass_files("codex")[1..].to_vec(),
+            "the shared file is named once"
+        );
+        assert_eq!(std::fs::read_to_string(&claude_md).unwrap(), shared);
+        assert!(std::fs::symlink_metadata(&codex_md).unwrap().is_symlink());
+        let inode = std::fs::metadata(&claude_md).unwrap().ino();
+
+        let (second, _) = counted_pass(home.path());
+        assert!(
+            second
+                .agents
+                .iter()
+                .all(|a| a.outcome == Outcome::Unchanged),
+            "{:?}",
+            second.agents
+        );
+        assert!(!second.changed());
+        assert_eq!(std::fs::metadata(&claude_md).unwrap().ino(), inode);
+
+        let (status, _) = agents_report(home.path(), &["status".to_string()]);
+        for (agent, other) in [("claude", "codex"), ("codex", "claude")] {
+            let row = status.lines().find(|l| l.starts_with(agent)).unwrap();
+            assert_eq!(row.split_whitespace().nth(2), Some("installed"), "{status}");
+            assert!(row.contains(other), "the row names the sharing: {status}");
+        }
+        assert!(
+            status_line_with_xdg(home.path(), None)
+                .starts_with("claude installed, codex installed,")
+        );
+
+        let (out, code) = agents_report(home.path(), &["install".into(), "codex".into()]);
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(std::fs::read_to_string(&claude_md).unwrap(), shared);
+        assert_eq!(std::fs::metadata(&claude_md).unwrap().ino(), inode, "{out}");
+
+        let (out, code) = agents_report(home.path(), &["remove".into()]);
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(std::fs::read_to_string(&claude_md).unwrap(), "# mine\n");
+        let verdict = |agent: &str| {
+            out.lines()
+                .find(|l| l.starts_with(agent))
+                .and_then(|l| l.split_whitespace().nth(2))
+        };
+        assert_eq!(verdict("claude"), Some("removed"), "{out}");
+        assert_eq!(verdict("codex"), Some("removed"), "{out}");
+
+        std::fs::remove_file(&codex_md).unwrap();
+        std::fs::write(&codex_md, "# codex\n").unwrap();
+        let (apart, reads) = counted_pass(home.path());
+        assert_eq!(reads, 2, "{}", apart.summary);
+        assert_eq!(std::fs::read_to_string(&claude_md).unwrap(), shared);
+        assert_eq!(
+            std::fs::read_to_string(&codex_md).unwrap(),
+            format!("# codex\n\n{}", primer_block(Some("codex")))
+        );
+    }
+
+    /// A context file not made yet is shared too when one agent's folder is a
+    /// link to another's that reads the same name (`~/.codex` linked to
+    /// `~/.config/opencode`, both reading `AGENTS.md`): the first pass makes ONE
+    /// file, with the generic block, and the next writes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_not_made_yet_is_one_file_through_a_linked_folder() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let opencode = home.path().join(".config/opencode");
+        std::fs::create_dir_all(&opencode).unwrap();
+        std::os::unix::fs::symlink(&opencode, home.path().join(".codex")).unwrap();
+
+        let (first, reads) = counted_pass(home.path());
+        assert_eq!(reads, 1, "{}", first.summary);
+        let rows: Vec<(&str, Outcome)> = first
+            .agents
+            .iter()
+            .map(|a| (a.agent, a.outcome.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("codex", Outcome::Installed),
+                ("opencode", Outcome::Installed)
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(opencode.join("AGENTS.md")).unwrap(),
+            generic()
+        );
+        assert!(!counted_pass(home.path()).0.changed());
+    }
+
+    /// A dotfiles link made before the file it leads to is that file from the
+    /// first pass, whichever way it points (`~/.codex/AGENTS.md` linked to a
+    /// `~/.claude/CLAUDE.md` not made yet, or the other way round): the pass
+    /// makes ONE file, with the generic block, not the Codex block written
+    /// through the link the first write made live, and the link's own row is
+    /// installed with the other, not refused. The next pass writes nothing. A
+    /// loop of links is no file: both rows are refused and the links stay.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_made_before_its_file_is_that_file_from_the_first_pass() {
+        for (link, target) in [
+            (".codex/AGENTS.md", ".claude/CLAUDE.md"),
+            (".claude/CLAUDE.md", ".codex/AGENTS.md"),
+        ] {
+            let home = aterm_tempfile::tempdir().unwrap();
+            for dir in [".claude", ".codex"] {
+                std::fs::create_dir_all(home.path().join(dir)).unwrap();
+            }
+            std::os::unix::fs::symlink(home.path().join(target), home.path().join(link)).unwrap();
+
+            let (first, reads) = counted_pass(home.path());
+            assert_eq!(reads, 1, "{link}: {}", first.summary);
+            let rows: Vec<(&str, Outcome)> = first
+                .agents
+                .iter()
+                .map(|a| (a.agent, a.outcome.clone()))
+                .collect();
+            assert_eq!(
+                rows,
+                [
+                    ("claude", Outcome::Installed),
+                    ("codex", Outcome::Installed)
+                ],
+                "{link}"
+            );
+            assert_eq!(first.agents[0].wrote[0], format!("~/{target}"));
+            assert_eq!(
+                first.agents[1].wrote,
+                first_pass_files("codex")[1..].to_vec()
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.path().join(target)).unwrap(),
+                generic(),
+                "{link}"
+            );
+            assert!(!counted_pass(home.path()).0.changed(), "{link}");
+            assert!(
+                status_line_with_xdg(home.path(), None)
+                    .starts_with("claude installed, codex installed,"),
+                "{link}"
+            );
+        }
+
+        let home = aterm_tempfile::tempdir().unwrap();
+        let claude_md = home.path().join(".claude/CLAUDE.md");
+        let codex_md = home.path().join(".codex/AGENTS.md");
+        std::fs::create_dir_all(claude_md.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(codex_md.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&codex_md, &claude_md).unwrap();
+        std::os::unix::fs::symlink(&claude_md, &codex_md).unwrap();
+        let looped = auto_prime(home.path());
+        assert!(
+            looped
+                .agents
+                .iter()
+                .all(|a| matches!(a.outcome, Outcome::Error(_))),
+            "{:?}",
+            looped.agents
+        );
+        for md in [&claude_md, &codex_md] {
+            assert!(std::fs::symlink_metadata(md).unwrap().is_symlink());
+        }
+    }
+
+    /// A named install through a folder link made before the folder it leads
+    /// to (`~/.codex` linked to a `~/.config/opencode` not made yet) makes ONE
+    /// file, with the generic block, whichever agent is named first, and both
+    /// rows say it is installed; the next install finds both already there.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_through_a_folder_link_made_before_its_folder_makes_one_file() {
+        let verdict = |out: &str, agent: &str| {
+            out.lines()
+                .find(|l| l.starts_with(agent))
+                .and_then(|l| l.split_whitespace().nth(2))
+                .map(str::to_string)
+        };
+        for names in [["codex", "opencode"], ["opencode", "codex"]] {
+            let home = aterm_tempfile::tempdir().unwrap();
+            let opencode = home.path().join(".config/opencode");
+            std::os::unix::fs::symlink(&opencode, home.path().join(".codex")).unwrap();
+            let install: Vec<String> = std::iter::once("install")
+                .chain(names)
+                .map(String::from)
+                .collect();
+
+            let (out, code) = agents_report(home.path(), &install);
+            assert_eq!(code, 0, "{out}");
+            for agent in names {
+                assert_eq!(verdict(&out, agent).as_deref(), Some("installed"), "{out}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(opencode.join("AGENTS.md")).unwrap(),
+                generic(),
+                "{out}"
+            );
+            let (again, _) = agents_report(home.path(), &install);
+            for agent in names {
+                assert_eq!(
+                    verdict(&again, agent).as_deref(),
+                    Some("already"),
+                    "{again}"
+                );
+            }
+        }
+    }
+
+    /// A named install of one agent writes the generic block into the file it
+    /// makes when another agent's folder is a link to the folder it makes
+    /// (`~/.config/opencode` or `~/.config/muse` linked to a `~/.codex` not
+    /// made yet, then `install codex`): that agent loads the file from then
+    /// on, so it never reads the Codex sandbox paragraph, and status straight
+    /// after reads both rows installed. The other way round (`~/.codex`
+    /// linked to a `~/.config/opencode` not made yet) the install is refused:
+    /// the folder the link waits for is not one the person named. NEGATIVE
+    /// CONTROL: with no link, the same install writes Codex's own block.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_install_shares_the_file_a_folder_link_waits_for() {
+        let install = ["install".to_string(), "codex".to_string()];
+        for linked in ["opencode", "muse"] {
+            let home = aterm_tempfile::tempdir().unwrap();
+            let codex = home.path().join(".codex");
+            std::fs::create_dir_all(home.path().join(".config")).unwrap();
+            std::os::unix::fs::symlink(&codex, home.path().join(".config").join(linked)).unwrap();
+
+            let (out, code) = agents_report(home.path(), &install);
+            assert_eq!(code, 0, "{linked}: {out}");
+            assert_eq!(
+                std::fs::read_to_string(codex.join("AGENTS.md")).unwrap(),
+                generic(),
+                "{linked}: {out}"
+            );
+            let (status, _) = agents_report(home.path(), &["status".to_string()]);
+            for agent in ["codex", linked] {
+                let row = status.lines().find(|l| l.starts_with(agent)).unwrap();
+                assert_eq!(row.split_whitespace().nth(2), Some("installed"), "{status}");
+            }
+        }
+
+        let home = aterm_tempfile::tempdir().unwrap();
+        let opencode = home.path().join(".config/opencode");
+        std::os::unix::fs::symlink(&opencode, home.path().join(".codex")).unwrap();
+        let (out, code) = agents_report(home.path(), &install);
+        assert_eq!(code, 1, "{out}");
+        assert!(!opencode.exists(), "{out}");
+
+        let home = aterm_tempfile::tempdir().unwrap();
+        let (out, code) = agents_report(home.path(), &install);
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".codex/AGENTS.md")).unwrap(),
+            primer_block(Some("codex"))
+        );
+    }
+
+    /// Status gives a dotfiles link made before the file it leads to
+    /// (`~/.codex/AGENTS.md` linked to a `~/.claude/CLAUDE.md` not made yet)
+    /// the state the install gives it: the file is absent, for both rows, and
+    /// no row is an error the next pass clears without a word. NEGATIVE
+    /// CONTROL: a link no other reader's way reaches is still the install's
+    /// refusal, and status says so.
+    #[cfg(unix)]
+    #[test]
+    fn status_reads_a_link_another_reader_makes_live_as_the_file_not_made_yet() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        for dir in [".claude", ".codex"] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+        }
+        let codex_md = home.path().join(".codex/AGENTS.md");
+        std::os::unix::fs::symlink(home.path().join(".claude/CLAUDE.md"), &codex_md).unwrap();
+
+        let (status, _) = agents_report(home.path(), &["status".to_string()]);
+        for agent in ["claude", "codex"] {
+            let row = status.lines().find(|l| l.starts_with(agent)).unwrap();
+            assert!(row.contains("absent (no context file yet)"), "{status}");
+        }
+        let line = status_line_with_xdg(home.path(), None);
+        assert!(
+            line.starts_with("claude absent ")
+                && line.contains(", codex absent ")
+                && !line.contains("ERROR"),
+            "{line}"
+        );
+        let (out, code) = agents_report(home.path(), &["install".to_string()]);
+        assert_eq!(code, 0, "{out}");
+
+        std::fs::remove_file(&codex_md).unwrap();
+        std::os::unix::fs::symlink(home.path().join("dotfiles/AGENTS.md"), &codex_md).unwrap();
+        let line = status_line_with_xdg(home.path(), None);
+        assert!(
+            line.contains("codex ERROR: a symlink whose target does not exist"),
+            "{line}"
+        );
+        let (out, code) = agents_report(home.path(), &["install".to_string()]);
+        assert_eq!(code, 1, "{out}");
+    }
+
+    /// A dotfiles link spelled in another case than the file it leads to, the
+    /// file not made yet (`~/.codex/AGENTS.md` linked to `~/.claude/Claude.md`,
+    /// or `~/.claude/CLAUDE.md` to `~/.codex/agents.md`), is that file where
+    /// the volume ignores case, as macOS's does by default: the first pass
+    /// makes ONE file, with the generic block, and the next writes nothing.
+    /// Where case counts, the spelling is another file, the one the link waits
+    /// for: the link's row is refused and the other row's file carries its
+    /// agent's own block.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_spelled_in_another_case_is_its_file_where_case_is_ignored() {
+        for (link, spelled, made, other) in [
+            (
+                ".codex/AGENTS.md",
+                ".claude/Claude.md",
+                ".claude/CLAUDE.md",
+                "claude",
+            ),
+            (
+                ".claude/CLAUDE.md",
+                ".codex/agents.md",
+                ".codex/AGENTS.md",
+                "codex",
+            ),
+        ] {
+            let home = aterm_tempfile::tempdir().unwrap();
+            for dir in [".claude", ".codex"] {
+                std::fs::create_dir_all(home.path().join(dir)).unwrap();
+            }
+            std::os::unix::fs::symlink(home.path().join(spelled), home.path().join(link)).unwrap();
+            let ignores_case = home.path().join(".CLAUDE").is_dir();
+
+            let (first, reads) = counted_pass(home.path());
+            let rows: Vec<(&str, Outcome)> = first
+                .agents
+                .iter()
+                .map(|a| (a.agent, a.outcome.clone()))
+                .collect();
+            let made_md = std::fs::read_to_string(home.path().join(made)).unwrap();
+            if ignores_case {
+                assert_eq!(reads, 1, "{link}: {}", first.summary);
+                assert_eq!(
+                    rows,
+                    [
+                        ("claude", Outcome::Installed),
+                        ("codex", Outcome::Installed)
+                    ],
+                    "{link}"
+                );
+                assert_eq!(made_md, generic(), "{link}");
+                assert!(!counted_pass(home.path()).0.changed(), "{link}");
+                assert!(
+                    status_line_with_xdg(home.path(), None)
+                        .starts_with("claude installed, codex installed,"),
+                    "{link}"
+                );
+            } else {
+                let refused = rows
+                    .iter()
+                    .find(|(a, _)| *a != other)
+                    .is_some_and(|(_, o)| matches!(o, Outcome::Error(_)));
+                assert!(refused, "{link}: {rows:?}");
+                assert_eq!(made_md, primer_block(Some(other)), "{link}");
+                assert!(
+                    std::fs::symlink_metadata(home.path().join(link))
+                        .unwrap()
+                        .is_symlink()
+                );
+            }
+        }
     }
 
     /// With `$XDG_CONFIG_HOME` set, the `.config/` agent is detected, primed and
@@ -3432,8 +4032,8 @@ A worker's report ends with `ATERM-TASK-DONE` on a line by itself.
         assert!(!FABRIC_BODY.contains("'''") && !FABRIC_BODY.contains('\\'));
     }
 
-    /// The skill states must be distinguishable — especially `Foreign`, which is
-    /// what stops aterm from clobbering a user's own same-named skill.
+    /// The skill states are distinguishable, `Foreign` above all: it keeps aterm off a
+    /// user's own same-named skill.
     #[test]
     fn skill_state_distinguishes_ours_from_the_users() {
         let body = "---\nname: x\n---\n<!-- aterm skill v1 -->\nbody\n";

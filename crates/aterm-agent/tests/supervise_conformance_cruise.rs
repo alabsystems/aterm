@@ -128,6 +128,7 @@ fn point(
         opened_by: None,
         message_drawn: false,
         submits: None,
+        inputs_before: None,
         screen_mark: None,
         worked,
         rules: None,

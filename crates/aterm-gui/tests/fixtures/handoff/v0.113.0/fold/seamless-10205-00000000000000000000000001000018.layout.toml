@@ -1,0 +1,2468 @@
+schema = 2
+
+[fold]
+windows = 1
+tabs = 0
+front = [0]
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 0
+key = true
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = true
+local_id = 0
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 0
+sid = "s-00000000010000000000"
+log_ep = 1792688256
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 1
+key = false
+
+[[windows.native_tabs]]
+kind = "editor"
+uri = "file:///home/dev/.config/aterm/aterm.toml"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "editor"
+uri = "file:///home/dev/.config/aterm/aterm.toml"
+config_editor = true
+source_anchor = 0
+primary_selection = 1
+viewport_anchor = 6
+durable_seq = 3
+
+[[windows.restored_tabs.root.view.editor_selections]]
+anchor = 120
+head = 134
+
+[[windows.restored_tabs.root.view.editor_selections]]
+anchor = 402
+head = 402
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 2
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-02.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-02.md"
+source_anchor = 128
+primary_selection = 0
+viewport_anchor = 2
+durable_seq = 0
+
+[windows.restored_tabs.root.view.selection]
+anchor = 210
+head = 288
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 3
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-03.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-03.md"
+source_anchor = 192
+primary_selection = 0
+viewport_anchor = 3
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 4
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-04.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-04.md"
+source_anchor = 256
+primary_selection = 0
+viewport_anchor = 4
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 5
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-05.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-05.md"
+source_anchor = 320
+primary_selection = 0
+viewport_anchor = 5
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 6
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-06.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-06.md"
+source_anchor = 384
+primary_selection = 0
+viewport_anchor = 6
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 7
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-07.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-07.md"
+source_anchor = 448
+primary_selection = 0
+viewport_anchor = 7
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 8
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-08.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-08.md"
+source_anchor = 512
+primary_selection = 0
+viewport_anchor = 8
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 9
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-09.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-09.md"
+source_anchor = 576
+primary_selection = 0
+viewport_anchor = 9
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 10
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-10.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-10.md"
+source_anchor = 640
+primary_selection = 0
+viewport_anchor = 10
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 11
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-11.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-11.md"
+source_anchor = 704
+primary_selection = 0
+viewport_anchor = 11
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 12
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-12.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-12.md"
+source_anchor = 768
+primary_selection = 0
+viewport_anchor = 12
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 13
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-13.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-13.md"
+source_anchor = 832
+primary_selection = 0
+viewport_anchor = 13
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 14
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-14.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-14.md"
+source_anchor = 896
+primary_selection = 0
+viewport_anchor = 14
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 15
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-15.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-15.md"
+source_anchor = 960
+primary_selection = 0
+viewport_anchor = 15
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 16
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-16.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-16.md"
+source_anchor = 1024
+primary_selection = 0
+viewport_anchor = 16
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 17
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-17.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-17.md"
+source_anchor = 1088
+primary_selection = 0
+viewport_anchor = 17
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 18
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-18.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-18.md"
+source_anchor = 1152
+primary_selection = 0
+viewport_anchor = 18
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 19
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-19.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-19.md"
+source_anchor = 1216
+primary_selection = 0
+viewport_anchor = 19
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 20
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-20.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-20.md"
+source_anchor = 1280
+primary_selection = 0
+viewport_anchor = 20
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 21
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-21.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-21.md"
+source_anchor = 1344
+primary_selection = 0
+viewport_anchor = 21
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 22
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-22.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-22.md"
+source_anchor = 1408
+primary_selection = 0
+viewport_anchor = 22
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 23
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-23.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-23.md"
+source_anchor = 1472
+primary_selection = 0
+viewport_anchor = 23
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 24
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-24.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-24.md"
+source_anchor = 1536
+primary_selection = 0
+viewport_anchor = 24
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 25
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-25.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-25.md"
+source_anchor = 1600
+primary_selection = 0
+viewport_anchor = 25
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 26
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-26.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-26.md"
+source_anchor = 1664
+primary_selection = 0
+viewport_anchor = 26
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 27
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-27.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-27.md"
+source_anchor = 1728
+primary_selection = 0
+viewport_anchor = 27
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 28
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-28.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-28.md"
+source_anchor = 1792
+primary_selection = 0
+viewport_anchor = 28
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 29
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-29.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-29.md"
+source_anchor = 1856
+primary_selection = 0
+viewport_anchor = 29
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 30
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-30.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-30.md"
+source_anchor = 1920
+primary_selection = 0
+viewport_anchor = 30
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 31
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-31.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-31.md"
+source_anchor = 1984
+primary_selection = 0
+viewport_anchor = 31
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 32
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-32.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-32.md"
+source_anchor = 2048
+primary_selection = 0
+viewport_anchor = 32
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 33
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-33.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-33.md"
+source_anchor = 2112
+primary_selection = 0
+viewport_anchor = 33
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 34
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-34.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-34.md"
+source_anchor = 2176
+primary_selection = 0
+viewport_anchor = 34
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 35
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-35.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-35.md"
+source_anchor = 2240
+primary_selection = 0
+viewport_anchor = 35
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 36
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-36.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-36.md"
+source_anchor = 2304
+primary_selection = 0
+viewport_anchor = 36
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 37
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-37.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-37.md"
+source_anchor = 2368
+primary_selection = 0
+viewport_anchor = 37
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 38
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-38.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-38.md"
+source_anchor = 2432
+primary_selection = 0
+viewport_anchor = 38
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 39
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-39.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-39.md"
+source_anchor = 2496
+primary_selection = 0
+viewport_anchor = 39
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 40
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-40.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-40.md"
+source_anchor = 2560
+primary_selection = 0
+viewport_anchor = 40
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 41
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-41.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-41.md"
+source_anchor = 2624
+primary_selection = 0
+viewport_anchor = 41
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 42
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-42.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-42.md"
+source_anchor = 2688
+primary_selection = 0
+viewport_anchor = 42
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 43
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-43.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-43.md"
+source_anchor = 2752
+primary_selection = 0
+viewport_anchor = 43
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 44
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-44.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-44.md"
+source_anchor = 2816
+primary_selection = 0
+viewport_anchor = 44
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 45
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-45.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-45.md"
+source_anchor = 2880
+primary_selection = 0
+viewport_anchor = 45
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 46
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-46.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-46.md"
+source_anchor = 2944
+primary_selection = 0
+viewport_anchor = 46
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 47
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-47.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-47.md"
+source_anchor = 3008
+primary_selection = 0
+viewport_anchor = 47
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 48
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-48.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-48.md"
+source_anchor = 3072
+primary_selection = 0
+viewport_anchor = 48
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 49
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-49.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-49.md"
+source_anchor = 3136
+primary_selection = 0
+viewport_anchor = 49
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 50
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-50.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-50.md"
+source_anchor = 3200
+primary_selection = 0
+viewport_anchor = 50
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 51
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-51.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-51.md"
+source_anchor = 3264
+primary_selection = 0
+viewport_anchor = 51
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 52
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-52.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-52.md"
+source_anchor = 3328
+primary_selection = 0
+viewport_anchor = 52
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 53
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-53.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-53.md"
+source_anchor = 3392
+primary_selection = 0
+viewport_anchor = 53
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 54
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-54.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-54.md"
+source_anchor = 3456
+primary_selection = 0
+viewport_anchor = 54
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 55
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-55.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-55.md"
+source_anchor = 3520
+primary_selection = 0
+viewport_anchor = 55
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 56
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-56.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-56.md"
+source_anchor = 3584
+primary_selection = 0
+viewport_anchor = 56
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 57
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-57.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-57.md"
+source_anchor = 3648
+primary_selection = 0
+viewport_anchor = 57
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 58
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-58.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-58.md"
+source_anchor = 3712
+primary_selection = 0
+viewport_anchor = 58
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 59
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-59.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-59.md"
+source_anchor = 3776
+primary_selection = 0
+viewport_anchor = 59
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 60
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-60.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-60.md"
+source_anchor = 3840
+primary_selection = 0
+viewport_anchor = 60
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 61
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-61.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-61.md"
+source_anchor = 3904
+primary_selection = 0
+viewport_anchor = 61
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 62
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-62.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-62.md"
+source_anchor = 3968
+primary_selection = 0
+viewport_anchor = 62
+durable_seq = 0
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 63
+key = false
+
+[[windows.native_tabs]]
+kind = "markdown"
+uri = "file:///home/dev/notes/week-63.md"
+
+[[windows.tab_order]]
+kind = "native"
+index = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-63.md"
+source_anchor = 4032
+primary_selection = 0
+viewport_anchor = 63
+durable_seq = 0
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "native"
+restore_tag = "markdown"
+uri = "file:///home/dev/notes/week-64.md"
+source_anchor = 4096
+primary_selection = 0
+viewport_anchor = 64
+durable_seq = 0

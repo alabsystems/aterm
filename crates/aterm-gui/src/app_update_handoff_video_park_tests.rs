@@ -72,7 +72,7 @@ fn a_live_take_holds_the_automatic_park_before_land_and_only_until_its_bound() {
     // The bound comes due inside the hold: the take never stands the
     // successor down.
     assert!(VIDEO_PARK_WAIT_MAX < PRELAUNCH_HOLD_MAX);
-    // CONTROL: no take, no wait.
+    // Control: no take, no wait.
     assert_eq!(
         recording_park_refusal(ApplyMode::Automatic, ApplyPhase::PreferIdle, false, early),
         None
@@ -130,7 +130,7 @@ fn a_landed_park_keeps_a_live_take_until_commit_answers_it() {
         "and its client is told nothing"
     );
 
-    // CONTROL: a park that lands and reaches Commit answers it there.
+    // Control: a park that lands and reaches Commit answers it there.
     let (record, _cancelled, _stood_down, _transferred) =
         prelaunch_record(71, ApplyMode::Immediate);
     app.update_handoff_prelaunch = Some(record);
@@ -432,8 +432,8 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
             prelaunch_record(7, ApplyMode::Immediate);
         let nonce = record.nonce.clone();
         app.update_handoff_prelaunch = Some(record);
-        // A row the park's carry leaves (in flight, not yet revealed), which
-        // ends with this process at its Commit (ruling 441 (d)).
+        // A row the park's carry leaves (in flight, not yet revealed), which ends with this
+        // process at its Commit.
         let uncarried = app.post_message(
             aterm_messages::Message::new(
                 aterm_messages::tags::PACKAGES,
@@ -949,8 +949,7 @@ fn a_slow_commit_flush_restarts_the_dispatch_fence() {
     );
     assert!(!app.commit_flush_refences(), "once per attempt");
 
-    // CONTROL: a hold under one grain keeps the fence it has; one grain
-    // restarts it.
+    // Control: a hold under one grain keeps the fence it has; one grain restarts it.
     let pending = app.pending_update_handoff.as_mut().expect("the attempt");
     pending.commit_drain_started = Some(drain_started);
     let under = super::HANDOFF_INPUT_DRAIN_YIELD - std::time::Duration::from_micros(1);
@@ -962,8 +961,8 @@ fn a_slow_commit_flush_restarts_the_dispatch_fence() {
     let pending = app.pending_update_handoff.as_ref().expect("the attempt");
     assert_eq!(pending.commit_drain_started, None, "one grain restarts it");
 
-    // CONTROL: no writer behind, the flush waits on nothing: answered, and
-    // the fence it has stands.
+    // Control: with no writer behind, the flush waits on nothing: answered, and the fence it
+    // has stands.
     app.messages_log = None;
     let pending = app.pending_update_handoff.as_mut().expect("the attempt");
     pending.commit_flush = None;
@@ -1055,7 +1054,7 @@ fn a_park_that_misses_keeps_a_live_take() {
         "and its client is told nothing — no update happened"
     );
 
-    // CONTROL: the park that lands, then its Commit, answers it.
+    // Control: the park that lands, then its Commit, answers it.
     let parked = app.park_and_transfer_to_prelaunched_successor(std::time::Instant::now());
     assert!(
         matches!(parked, ParkAttempt::Parked),
@@ -1188,8 +1187,7 @@ fn commit_waits_until_every_video_reply_is_written() {
         "ERR video: export failed"
     );
 
-    // BOUNDED: a reply nobody ever writes costs Commit its bound, and is
-    // said, not waited on forever.
+    // Bounded: a reply nobody ever writes costs Commit its bound, and is said.
     let (stuck, _never_released) = crate::control::ReplyWire::new();
     app.video_reply_wires.push(stuck);
     let started = std::time::Instant::now();
@@ -1202,7 +1200,7 @@ fn commit_waits_until_every_video_reply_is_written() {
     assert_eq!(answered.unwritten, 1);
     assert!(!answered.answered);
 
-    // CONTROL: with nothing live the step costs nothing — not its bound.
+    // Control: with nothing live the step costs nothing, not its bound.
     app.video_reply_wires.clear();
     let started = std::time::Instant::now();
     assert_eq!(

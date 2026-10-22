@@ -822,13 +822,9 @@ fn write_world(tmp: &Path) {
          printf '\\033[2J\\033[H'\n"
     );
     place_fake(&claude, &fake);
-    // The measured touch box draws its third option garbled (`3. Nooject`,
-    // aterm-phase's `the_touch_box_is_bash_whatever_its_description_says`),
-    // and decision 1's rules press a one-shot `Yes` only on a box that also
-    // offers a readable `No` (`once_choice`): the read box repairs that row,
-    // so what it tests is the read-only rule, not the garble. (`touch.txt`
-    // keeps it: full power presses it as measured, and the safe rules
-    // escalate it either way.)
+    // The measured touch box draws its third option garbled (`3. Nooject`), and a one-shot
+    // `Yes` is pressed only on a box that also offers a readable `No` (`once_choice`): the
+    // read box repairs that row so it tests the read-only rule. `touch.txt` keeps the garble.
     let read = body(BOX_TOUCH)
         .replace("touch x", "ls -la")
         .replace("Create file x", "List the files")
@@ -883,11 +879,9 @@ fn write_world(tmp: &Path) {
     for (name, text) in screens {
         std::fs::write(sc.join(name), text).expect("write a screen");
     }
-    // 2.1.283 under the question policy: the committed captures (c1-03 and
-    // c1-04 of the single-select, c3-04 … c3-07 of the multi-select, c8-02 of
-    // the short-term case, c2-04 of a person's text), each dialog redrawn
-    // with the text the harness types where one was typed, and the moves
-    // before the free-text row drawn from its capture as measured.
+    // 2.1.283 under the question policy: the committed captures, each dialog redrawn with
+    // the text the harness types where one was typed, and the moves before the free-text row
+    // drawn from its capture.
     let long = QuestionPriority::LongTerm
         .text()
         .expect("the long-term text");
@@ -1100,12 +1094,10 @@ fn start_fake_in(inst: &Instance, sid: &str, keys: &str, screens: &[&str]) {
     ctl_ok(inst, &[&sel, "key", "enter"]);
 }
 
-/// The keys the fake read, one per line, named: `od -c`'s `\r` (or `\n`,
-/// the tty's CR-to-NL) is `enter`, `033[A`/`033OA` (normal or application
-/// cursor keys) `up`, `033[B`/`033OB` `down`; anything else — a `*.type`
-/// read's `text:<bytes>` among it — as read. (An Enter written where a
-/// `*.type` read takes it reads `text:`: the tty's CR-to-NL, and the shell
-/// drops the newline.)
+/// The keys the fake read, one per line, named: `od -c`'s `\r` (or `\n`, the tty's CR-to-NL)
+/// is `enter`, `033[A`/`033OA` (normal or application cursor keys) `up`, `033[B`/`033OB`
+/// `down`; anything else, a `*.type` read's `text:<bytes>` among it, as read. An Enter taken
+/// by a `*.type` read logs `text:`.
 fn keys(inst: &Instance, log: &str) -> Vec<String> {
     std::fs::read_to_string(inst.tmp.join(log))
         .unwrap_or_default()
@@ -1181,17 +1173,12 @@ fn ledger_rows(inst: &Instance, rule: &str, decision: &str) -> Vec<String> {
         .collect()
 }
 
-/// The fake has read exactly `want`, in order. `within` is a HANG DETECTOR for
-/// the host, measured from the last key it read (or the start): a journey of
-/// several keys on a loaded machine is slow, and only a host that has stopped
-/// should fail it. The key log only grows, so a log that is not a prefix of
-/// `want` can never become it and fails at once, naming what was read.
+/// The fake has read exactly `want`, in order. `within` is a hang detector measured from the
+/// last key read (or the start), so only a host that has stopped fails it. The key log only
+/// grows: a log that is not a prefix of `want` fails at once, naming what was read.
 fn keys_until(inst: &Instance, log: &str, want: &[&str], within: Duration) {
-    // The attention rides along in the record, so a timeout says why the
-    // host handed the box over instead of answering it. It is read once, at
-    // the timeout: read at every 20 ms look it was an `aterm ctl meta` spawn
-    // each (6 ms of CPU, measured 2026-10-05) for a value only a failure
-    // prints, 50 a second for every test waiting on a key.
+    // A timeout also prints the attention (why the host handed the box over), read only
+    // then: each read is an `aterm ctl meta` spawn.
     let mut deadline = Instant::now() + within;
     let mut last: Vec<String> = Vec::new();
     while Instant::now() < deadline {
@@ -1360,18 +1347,11 @@ fn a_typo_in_the_harness_table_never_stops_the_answers() {
     });
 }
 
-/// ON A SCREEN TALLER THAN THE 40 ROWS THE WINDOW READS (the validate
-/// drive of 2026-09-24, a private headless aterm at 130x49): the measured
-/// Yes/No question drawn at the top of a 49-row screen reached the reader
-/// cut at `3. Type something.`, and the parser's backwards body slice
-/// panicked the window's main thread — the whole instance died — and a
-/// 43-row Bash box whose title sat on row 3 was read from the supervisor's
-/// last 40 rows as "taller than the pane" and escalated. Now a live-geometry
-/// question drawn at the top of the 49 rows (S1-01 from its rule down: the
-/// last 40 rows start inside its options) is read again whole and answered
-/// with Enter, the column-1 one is handed over as a question with nothing
-/// typed and the instance lives, and the tall box, read again whole, gets
-/// `1`.
+/// A 49-row screen, taller than the 40 rows the window reads, is read again whole and the
+/// instance lives: a live-geometry question drawn from its rule at the top (its last 40 rows
+/// start inside its options) is answered with Enter, the column-1 question is handed over
+/// with nothing typed, and a 43-row Bash box whose title is more than 40 rows above its
+/// footer gets `1`.
 #[test]
 fn a_49_row_screen_is_read_whole_and_the_instance_lives() {
     let mut inst = boot_sized("w", "", 49, None);
@@ -1395,10 +1375,9 @@ fn a_49_row_screen_is_read_whole_and_the_instance_lives() {
     keys_until(&inst, "k2", &["1"], HANG);
 }
 
-/// THE INCIDENT OF 2026-09-25, ANSWERED LIVE: the four-tab dialog (S6-01 …
-/// S6-05) gets Enter on each tab's `(Recommended)` option and on the
-/// review's `Submit answers` — five Enters, never a digit — with no badge,
-/// and the host's ledger holds five `answer-recommended@v1` approvals.
+/// A four-tab dialog (S6-01 … S6-05) gets Enter on each tab's `(Recommended)` option and on
+/// the review's `Submit answers` (five Enters, never a digit), no badge, and five
+/// `answer-recommended@v1` approvals in the ledger.
 #[test]
 fn the_host_answers_a_tabbed_question_with_its_recommended_options() {
     let inst = boot("q", "");
@@ -1437,10 +1416,9 @@ fn the_host_answers_a_tabbed_question_with_its_recommended_options() {
     );
 }
 
-/// The free-text row focused (S1-03): the host moves the focus UP one row a
-/// key — each move seen landing on the next screen — and presses Enter only
-/// once it is on `1. Dark (Recommended)`. Never a digit, never Enter on the
-/// free-text row.
+/// The free-text row focused (S1-03): the host moves the focus up one row a key, each move
+/// seen landing, and presses Enter only on `1. Dark (Recommended)`. Never a digit, never
+/// Enter on the free-text row.
 #[test]
 fn the_host_moves_off_the_free_text_row_before_answering() {
     let inst = boot("f", "");
@@ -1466,9 +1444,8 @@ fn the_host_hands_over_a_question_a_person_typed_into() {
     escalated_and_quiet(&inst, "k1", "claude question");
 }
 
-/// The owner's switch: under `answer_questions = false` every question is
-/// the human's — the incident's first tab is badged naming the switch, and
-/// nothing is typed.
+/// Under `answer_questions = false` every question is the human's: the tabbed dialog's first
+/// tab is badged naming the switch, and nothing is typed.
 #[test]
 fn answer_questions_false_hands_every_question_over() {
     let inst = boot("x", "answer_questions = false\n");
@@ -1476,7 +1453,7 @@ fn answer_questions_false_hands_every_question_over() {
     escalated_and_quiet(&inst, "k1", "claude question");
 }
 
-/// The owner's long-term word, in the one global key.
+/// The global long-term setting.
 const LONG_TERM_ON: &str = "question_priority = \"long-term\"\n";
 
 /// Let the fake whose key log is `log` go on past its `*.until` screen.
@@ -1515,12 +1492,10 @@ fn told_by_the_worker(inst: &Instance, rule: &str, word: &str, approvals: usize)
     );
 }
 
-/// UNDER `question_priority = "long-term"`, A SINGLE-SELECT QUESTION (c1):
-/// the host moves the focus from option 1 down to the pristine free-text row
-/// (each move seen landing), writes the long-term text there in ONE `send` —
-/// the fake reads it whole — reads it back and presses Enter on it: `[down,
-/// down, text, enter]`, never a digit; two `answer-long-term@v1` approvals
-/// (the text, the Enter) and `CHOSE … policy=long-term`.
+/// Under `question_priority = "long-term"`, a single-select question (c1): the host moves the
+/// focus down to the pristine free-text row, writes the long-term text in one `send`, reads
+/// it back and presses Enter on it: `[down, down, text, enter]`, never a digit; two
+/// `answer-long-term@v1` approvals (the text, the Enter) and `CHOSE … policy=long-term`.
 #[test]
 fn under_long_term_the_worker_decides_a_single_select_question() {
     let inst = boot("l", LONG_TERM_ON);
@@ -1541,12 +1516,10 @@ fn under_long_term_the_worker_decides_a_single_select_question() {
     told_by_the_worker(&inst, "answer-long-term@v1", "long-term", 2);
 }
 
-/// UNDER `question_priority = "long-term"`, A MULTI-SELECT QUESTION (c3): the
-/// text written into its free-text row (which ticks itself), then `down` to
-/// `Submit` — NEVER an Enter while the focus is in the field, which unticks
-/// it (c3c), and never a Tab — Enter there, and Enter on the review's
-/// `Submit answers`: `[down×3, text, down, enter, enter]`; three
-/// `answer-long-term@v1` approvals (the text, the button, the review).
+/// Under `question_priority = "long-term"`, a multi-select question (c3): the text written
+/// into its free-text row (which ticks itself), then `down` to `Submit` (never Enter in the
+/// field, which unticks it, and never Tab), Enter there and on the review's `Submit answers`:
+/// `[down×3, text, down, enter, enter]`, three `answer-long-term@v1` approvals.
 #[test]
 fn under_long_term_the_worker_decides_a_multi_select_question() {
     let inst = boot("m", LONG_TERM_ON);
@@ -1575,13 +1548,10 @@ fn under_long_term_the_worker_decides_a_multi_select_question() {
     told_by_the_worker(&inst, "answer-long-term@v1", "long-term", 3);
 }
 
-/// THE SESSION'S WORD OVER THE GLOBAL ONE (c8): the config answers with the
-/// recommended option, and this session says `short-term`
-/// (`meta set questions short-term`): the short-term text is written and
-/// Enter pressed on it — `[down, down, text, enter]` — under
-/// `answer-short-term@v1`, told `policy=short-term`. (Unset, the same dialog
-/// gets Enter on `Red (Recommended)`:
-/// [`the_host_answers_every_box_by_default`] is that path.)
+/// The session's word over the global one (c8): the config answers with the recommended
+/// option, but this session says `meta set questions short-term`, so the short-term text is
+/// written and Enter pressed on it (`[down, down, text, enter]`) under
+/// `answer-short-term@v1`, told `policy=short-term`.
 #[test]
 fn a_session_s_short_term_word_decides_over_the_global_recommended() {
     let inst = boot("s", "");
@@ -1612,10 +1582,9 @@ fn a_session_s_short_term_word_decides_over_the_global_recommended() {
     told_by_the_worker(&inst, "answer-short-term@v1", "short-term", 2);
 }
 
-/// A PERSON'S TEXT IN THE FIELD (c2-04, `go with blue`) under long-term: it
-/// is not the loop's own, so the question is theirs — badged with the reason,
-/// and nothing written (the scene is a `*.type` one: a text or a key written
-/// into it would be logged whole).
+/// A person's text in the field (c2-04, `go with blue`) under long-term is not the loop's
+/// own: the question is badged as theirs and nothing is written (the `*.type` scene would log
+/// any text or key).
 #[test]
 fn under_long_term_a_person_s_text_is_handed_to_them_and_nothing_is_typed() {
     let inst = boot("h", LONG_TERM_ON);
@@ -1623,14 +1592,11 @@ fn under_long_term_a_person_s_text_is_handed_to_them_and_nothing_is_typed() {
     escalated_and_quiet(&inst, "k1", "claude question");
 }
 
-/// NEGATIVE CONTROL: the same single-select dialog under long-term, but the
-/// dialog never takes the text — after the `send` the field still reads
-/// `Type something.`. The host writes that ONE text and nothing more (the
-/// scene after it is a `*.type` one too: a second text or an Enter would be
-/// logged), and hands the question over: `[down, down, text]`, and no
-/// approval. So the Enter of
-/// [`under_long_term_the_worker_decides_a_single_select_question`] is its
-/// read-back's, not the fake's script's.
+/// NEGATIVE CONTROL: the single-select dialog under long-term never takes the text (after the
+/// `send` the field still reads `Type something.`). The host writes that one text and nothing
+/// more (the next scene is a `*.type` too, so a second text or an Enter would be logged) and
+/// hands the question over: `[down, down, text]`, no approval. So the Enter of
+/// [`under_long_term_the_worker_decides_a_single_select_question`] is the read-back's.
 #[test]
 fn a_policy_text_the_dialog_does_not_take_is_written_once_and_handed_over() {
     let inst = boot("c", LONG_TERM_ON);
@@ -1645,10 +1611,8 @@ fn a_policy_text_the_dialog_does_not_take_is_written_once_and_handed_over() {
         ],
     );
     let text = text_read(QuestionPriority::LongTerm);
-    // The attention is clipped to its reason's cells, so its tail ("never
-    // written twice") is not a needle: every reason a written text is handed
-    // over for names the policy text near its start. What this test holds is
-    // the outcome: the text written once, then handed over, never approved.
+    // The attention is clipped to its reason's cells; every reason for handing over a written
+    // text names the policy text near its start.
     let said = escalated_after(&inst, "k1", "policy text", &["down", "down", &text], HANG);
     assert!(said.contains("claude question"), "{said}");
     assert_eq!(
@@ -1701,15 +1665,10 @@ fn the_host_answers_what_the_policy_proves_safe() {
         || status(&inst),
         |s| field(s, "supervisor") == Some("-"),
     );
-    // The fake's exit was its own end (it registered no conversation):
-    // journaled, never relaunched — the tab's shell holds it — and never
-    // said on the attention, with the relaunch at its full-power default.
-    // (An exit whose last frame the server still reads as the agent's is
-    // handed over only once it stops reading so; the last one here is.) A
-    // step that found another sweep on the upgrade state — the host's own
-    // upgrade lane at the same session — is the designed retry
-    // (`relaunch::BUSY`, ten seconds on), never an answer: so the wait is a
-    // hang detector, and every attempt is that retry or the launch's end.
+    // The fake's exit was its own end (it registered no conversation): journaled, not
+    // relaunched and not said, with `relaunch` at its default. A step that met the host's own
+    // upgrade sweep on the session is the designed retry (`relaunch::BUSY`), so every attempt
+    // is that retry or the launch's end.
     let log = until(
         HANG,
         "the exit journaled as the launch's own end",
@@ -1859,27 +1818,18 @@ fn the_host_hands_over_what_it_cannot_prove_and_types_nothing() {
     );
 }
 
-/// THE SILENT LOOP, live (the 0.92.0 host's journal of 2026-09-24:
-/// `ESCALATED seq=9246`, then nothing — its badge stood through the whole
-/// workflow the owner's answer started, because the loop cleared it only at
-/// the next idle point). Under `approve = "none"` (a limit the owner wrote:
-/// every box is his) the owner's own box is escalated; a PERSON answers it
-/// and the worker goes busy — and stays busy until this test has seen the
-/// badge go and the server's `busy` verdict (`busy.gate`), so "while the
-/// worker is still busy" is an order of events, not a race against the ten
-/// seconds of busy frames this once held (a clear later than they lasted read
-/// as the regression, and a run whose worker had not rested yet skipped the
-/// check). NEGATIVE CONTROL: before the answer the badge stands and nothing is
-/// typed.
+/// A box a person answered loses its badge while the worker works, not at its next idle
+/// point. Under `approve = "none"` the box is escalated; a person answers it and the worker
+/// goes busy (`busy.gate`, held until this test has seen the badge go and the server's
+/// `busy` verdict, so "while still busy" is an order of events, not a race). NEGATIVE
+/// CONTROL: before the answer the badge stands and nothing is typed.
 #[test]
 fn a_box_a_person_answered_loses_its_badge_while_the_worker_works() {
     let inst = boot("b", "approve = \"none\"\n");
     run_fake(&inst, "k1", &["owners-box.txt", "busy.gate"]);
     escalated_and_quiet(&inst, "k1", "aterm-auto-target-x.noindex");
-    // The clear and the worker's verdicts are the SERVER's own timeline
-    // records, read once the clear has landed — as
-    // `the_host_answers_what_the_policy_proves_safe` reads its attach; the
-    // polls below only wait for effects.
+    // The clear and the worker's verdicts are judged from the server's timeline records;
+    // the polls below only wait for effects.
     let mark = timeline_since(&inst, 0).last().map_or(0, |e| e.0);
     // The person's answer (this test's own key: the fake reads it as one).
     ctl_ok(&inst, &[&format!("@{}", inst.sid), "key", "1"]);
@@ -1895,12 +1845,9 @@ fn a_box_a_person_answered_loses_its_badge_while_the_worker_works() {
             .iter()
             .position(|e| e.1 == "agent-change" && e.2.starts_with("busy "))
     };
-    // The server's own `busy` verdict is on the timeline before the worker may
-    // rest. The host clears the badge at ITS first busy read, which need not
-    // wait for the window's sweep to publish one; the busy frame stands until
-    // the release, so that sweep reads it however late it looks — released
-    // first, a sweep that looked only after the fake had exited would read the
-    // shell and publish no `busy` at all.
+    // The server's own `busy` verdict lands before the worker may rest: the host clears the
+    // badge at its own first busy read, which need not wait for the sweep to publish one, so
+    // the busy frame stands until the release and the sweep reads it however late it looks.
     let deadline = Instant::now() + HANG;
     while busy_at(&timeline_since(&inst, mark)).is_none() {
         assert!(
@@ -1910,10 +1857,8 @@ fn a_box_a_person_answered_loses_its_badge_while_the_worker_works() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    // Only now may the worker rest: its busy frame stood until here. Its exit
-    // hands the session back to the shell, which the server publishes as `-`
-    // (`presence::agent_verdict`: a group still being named, then `sh`, is no
-    // agent), the verdict after `busy` this waits for.
+    // Only now may the worker rest. Its exit hands the session back to the shell, published
+    // as `-` (`presence::agent_verdict`: no agent), the verdict after `busy` waited for here.
     release_fake(&inst, "k1");
     let rested_after = |events: &[(u64, String, String)]| {
         events[busy_at(events)?..]
@@ -1938,10 +1883,8 @@ fn a_box_a_person_answered_loses_its_badge_while_the_worker_works() {
         .iter()
         .find(|e| e.1 == "meta-change" && e.2 == "field=attention value=-")
         .unwrap_or_else(|| panic!("the badge's clear is not on the timeline: {events:?}"));
-    // THE REGRESSION: the badge stood until the worker's next idle point. So
-    // the clear precedes (in the timeline's own record order) the first
-    // verdict after `busy` that is not `busy` — which cannot come before this
-    // test released the busy frame, after it had seen the badge go.
+    // The clear precedes, in the timeline's record order, the first verdict after `busy`
+    // that is not `busy`, which cannot come before this test released the busy frame.
     assert!(
         cleared.0 < rested.0,
         "the badge cleared only when the worker stopped ({rested:?}): {events:?}"
@@ -2152,12 +2095,9 @@ fn exec_log(inst: &Instance, name: &str) -> Vec<(u32, String)> {
         .collect()
 }
 
-/// The fake's launches once the FIRST one is logged. `program=claude` is the
-/// exec, not the fake's first line: under load the interpreter can reach that
-/// line seconds later (measured 2026-09-26 at a load average of ~80 on 18
-/// cores: nothing logged 2 s after `program=claude`, and an upgrade test's
-/// first launch read the twin that replaced it 3 s later), so a test that
-/// times its next step from `program=claude` races the fake it launched.
+/// The fake's launches once the first one is logged. `program=claude` is the exec, not the
+/// fake's first line, which a loaded machine can reach seconds later, so a step timed from
+/// `program=claude` races the fake.
 fn first_launch(inst: &Instance) -> Vec<(u32, String)> {
     let deadline = Instant::now() + HANG;
     loop {
@@ -2169,12 +2109,10 @@ fn first_launch(inst: &Instance) -> Vec<(u32, String)> {
     }
 }
 
-/// RELAUNCH ON EXIT, live: the tab's shell is bash (a job-control shell the
-/// relaunch line is written for), the fake runs from it with a launch flag,
-/// and dies by SIGKILL with no person at the tab. The host relaunches it in
-/// the same tab — a NEW process, a child of the same shell, `--model opus`
-/// kept and `--resume <its conversation>` appended — and the supervisor is
-/// back on the session.
+/// Relaunch on exit: from a bash tab (the job-control shell the relaunch line is written
+/// for) the fake runs with a launch flag and dies by SIGKILL with no person at the tab. The
+/// host relaunches it in the same tab as a new child of the same shell, `--model opus` kept
+/// and `--resume <its conversation>` appended, and supervises it again.
 #[test]
 fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
     let inst = boot("r", "");
@@ -2199,11 +2137,9 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
         || status(&inst),
         |s| field(s, "supervisor").is_some_and(|v| v.starts_with("aterm-harness")),
     );
-    // Let the worker read the agent it would relaunch — the fake launched
-    // and registered ([`first_launch`]), and the worker's loop at the agent's
-    // first idle point, where it reads the record a relaunch needs — then
-    // crash it. (Waited for as events: a fixed two seconds read an empty
-    // launch log under a loaded machine, the fake's first line not run yet.)
+    // Crash the fake only once it has launched and registered ([`first_launch`]) and the
+    // worker's loop has reached its first idle point, where it reads the record a relaunch
+    // needs.
     let first = first_launch(&inst);
     assert_eq!(
         first.iter().map(|(_, a)| a.as_str()).collect::<Vec<_>>(),
@@ -2240,12 +2176,9 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
         "its flags kept, its conversation resumed"
     );
     program_is(&inst, "claude", HANG);
-    // The relaunch ends at adoption and the new agent is its supervisor's at
-    // once; the continuation is OWED to the tab (its record in flight) until
-    // that supervisor's loop first reaches an idle point, and TYPED there (the
-    // record done, the resumed process named) — the engine hands its host the
-    // idle point (`IdleHost::at_idle`) and the worker takes the carry-on in
-    // the loop.
+    // The relaunch ends at adoption, supervised at once; the continuation stays owed (its
+    // record in flight) until that supervisor's loop first reaches an idle point
+    // (`IdleHost::at_idle`), and is typed there (the record `done`, the resumed pid named).
     until(
         HANG,
         "adopted, and supervised again",
@@ -2293,27 +2226,15 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
 // The live upgrade, a step of the worker.
 // ---------------------------------------------------------------------------
 
-/// Stage the upgrade fake reporting `version` beside the managed twin, as
-/// `agents/claude.<version>`, its first exec paid ([`place_fake`]), and return
-/// its path; [`install`] and [`land`] rename a staged build onto the twin, as
-/// atpkg re-renders the twin, so a running copy keeps the file it started
-/// from. A test stages EVERY build it uses before the session launches any
-/// (asserted), so that once a copy runs nothing it reads is written and no
-/// file is met unchecked (both measured 2026-10-04):
-/// - Its screen files are read as a copy starts — `sc/idle.txt` three times:
-///   the composer's row, its rule, its footer — and `sc/idle.frame` at every
-///   frame it draws. Rewritten while a copy started, a read between
-///   `fs::write`'s truncate and its write found no composer row; the copy's
-///   one frame had no caret on a composer, the verdict stayed `unknown` while
-///   it waited for input, and `await agent idle` timed out (forced with the
-///   writer held between its truncate and its write: `OK timeout`,
-///   `agent=unknown`).
-/// - The system's check of a new file's first exec ([`place_fake`], seconds
-///   under load) is paid before the session starts: not in the running
-///   copy's start-up, not in the host's probe of the twin, and not between
-///   the agent's first idle verdict and the prompt a test sends at it, which
-///   is inside the fresh session's settle
-///   ([`aterm_agent::harness::upgrade::QUIET_S`], counted from that verdict).
+/// Stage the upgrade fake reporting `version` as `agents/claude.<version>` beside the managed
+/// twin, its first exec paid ([`place_fake`]), and return its path; [`install`] and [`land`]
+/// rename it onto the twin as atpkg re-renders it, so a running copy keeps the file it
+/// started from. A test stages every build before the session launches any (asserted), so
+/// that nothing a running copy reads is rewritten (a copy reads `sc/idle.txt` as it starts
+/// and `sc/idle.frame` at every frame; a read between `fs::write`'s truncate and its write
+/// draws no composer and leaves the verdict `unknown`), and no new file's first-exec check
+/// (seconds under load) lands in a copy's start-up, the host's probe of the twin, or the
+/// fresh session's settle.
 ///
 /// The fake registers itself as Claude does
 /// (its status settled a minute ago), draws an idle composer — the clear, the
@@ -2552,16 +2473,10 @@ fn journal(inst: &Instance) -> String {
         .unwrap_or_default()
 }
 
-/// Read `probe` until `done` holds of a reading, for a step of the live
-/// upgrade owed from `from` (the notice, or the prompt the step waits on),
-/// and return the last reading, done or not, for the caller's assertion to
-/// name. The step's own settle ([`aterm_agent::harness::upgrade::QUIET_S`])
-/// and the look after it are inside [`UPGRADE_WITHIN`]; a look whose build
-/// did not answer its `--version` within the product's bound decides nothing
-/// and is looked at again ([`version_waits`]), and a step taken later is the
-/// product working, not a red. The deadline moves to [`UPGRADE_WITHIN`] past
-/// each such look the host journals, never on a guess, and never past
-/// [`UPGRADE_CEILING`].
+/// Read `probe` until `done` holds, for an upgrade step owed from `from` (the notice, or the
+/// prompt the step waits on), and return the last reading either way. The deadline is
+/// [`UPGRADE_WITHIN`] past `from`, moved to [`UPGRADE_WITHIN`] past each look the host
+/// journals as [`version_waits`] (the product's own retry), never past [`UPGRADE_CEILING`].
 #[cfg(target_os = "macos")] // only the macOS-only upgrade tests use it
 fn upgrade_until<T>(
     inst: &Instance,
@@ -2599,6 +2514,10 @@ fn upgrade_until<T>(
 /// flags kept), and tells it to carry on, announcing once. (A session already
 /// on the newest build is passed over, never inspected or announced to:
 /// aterm-agent's `current_claude_skips_process_inspection_but_new_and_in_flight_do_not`.)
+/// The build lands once the wake is armed, and the host must tell the notice
+/// it handed on: the arming is an activation too, so a relaunch alone passed
+/// with the push broken (the review of `b9/resid4`: an arming held 8 s and
+/// the push cut, the test as it was passed, this one fails).
 #[cfg(target_os = "macos")] // atpkg::activation_notice is macOS-only
 #[test]
 fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
@@ -2640,6 +2559,17 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
         ["2.1.281 --model opus"],
         "{first:?}"
     );
+    // The wake armed before the build lands: the marks' baseline is what
+    // stands at the arming, so a build landed ahead of it is no push at all,
+    // and only the arming's own activation (every session attached before it
+    // looks again) would upgrade the session — passing this test with the
+    // push broken.
+    until(
+        HANG,
+        "the activation wake armed",
+        || harness_lines(&inst),
+        |l| l.contains("harness: the activation wake is armed"),
+    );
     // A newer build lands, and atpkg says so.
     land(&inst, &newer);
     let got = upgrade_until(
@@ -2661,6 +2591,16 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
         format!("2.1.282 --model opus --resume {CONVERSATION}"),
         "the new build, its flags kept, its conversation resumed"
     );
+    // …and the push was handed on: the host told atpkg's notice. The
+    // arming's activation may still be what moved the session (its look
+    // comes at the worker's next idle point, which can follow the landing),
+    // so the relaunch alone does not show the push reached the host.
+    until(
+        HANG,
+        "the host handed on atpkg's notice",
+        || harness_lines(&inst),
+        |l| l.contains("harness: an activation notice — "),
+    );
     // ATERM-KI-1016-1 LC-5, live: the upgrade's own first move onto a build
     // never run here probes it once (`<build> --help`), right before the
     // move, so a build that fails at its first start ends no working agent
@@ -2680,9 +2620,7 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
         },
     );
     program_is(&inst, "claude", HANG);
-    // D6 of the live E2E of 2026-09-26: the owner's view is published on a
-    // headless instance too — the tab's `upgrade=` names the finished move
-    // (it read `-` headless, the view handed to no loop).
+    // The tab's `upgrade=` names the finished move on a headless instance too.
     until(
         HANG,
         "the tab's upgrade= column, headless",
@@ -2793,12 +2731,10 @@ fn a_session_nobody_asked_anything_is_restarted_afresh_with_nothing_typed() {
     assert!(typed.is_empty(), "typed into the agent: {typed:?}");
 }
 
-/// A fake Claude Code at 2.1.281 in `shell` (`bash` or `zsh`), its
-/// supervisor attached, nobody having asked it anything — and 2.1.282
-/// installed, atpkg having said so: the upgrade is due before anyone's first
-/// prompt (the D1 E2E's order). `harness` is the instance's `[harness]`
-/// table: `upgrade_ask = true` for a test of the notice-and-READY flow, which
-/// is no longer the default (0b689dfe3). `settle_s` as [`boot_upgrade`].
+/// A fake Claude Code at 2.1.281 in `shell` (`bash` or `zsh`), nobody having asked it
+/// anything, with 2.1.282 landed and announced by atpkg: the upgrade is due before anyone's
+/// first prompt. `harness` is the `[harness]` table (`upgrade_ask = true` for the
+/// notice-and-READY flow); `settle_s` as [`boot_upgrade`].
 #[cfg(target_os = "macos")] // atpkg::activation_notice is macOS-only
 fn a_fresh_session_behind(
     tag: &str,
@@ -2849,21 +2785,14 @@ fn typed_by(inst: &Instance) -> Vec<(u32, String)> {
         .collect()
 }
 
-/// ND1, live: THE RESTART HOLDS THE TAB. A session nobody has asked anything
-/// is restarted afresh; from its last look to the relaunched agent's first
-/// idle — which the test holds back until the orchestrator has met the hold
-/// once (`hold-idle-2.1.282`, the relaunched build's), so the window is the
-/// test's, not a race — the
-/// harness's HARD hand is on the tab
-/// (`hand=lease:aterm-harness@<pid>`) — between the signal and the relaunch
-/// the tab is a bare shell. An orchestrator that sends its first prompt
-/// meanwhile is refused (`ERR busy lease=…`) and retries — as a `turn`, and
-/// as the RAW `send` and `key enter` the first cut's cooperative lease let
-/// through into the bare shell (the review of it) — and the prompt lands in
-/// the RELAUNCHED agent: never run by the shell (its `touch` leaves no
-/// file), never read by the old process. Once at a bash prompt (the line a
-/// raw `send`), once at zsh (the line the harness's own fenced `turn`,
-/// typed under its own hold).
+/// A session nobody has asked anything is restarted afresh, and from its last look to the
+/// relaunched agent's first idle the harness's hand is on the tab
+/// (`hand=lease:aterm-harness@<pid>`); between the signal and the relaunch the tab is a bare
+/// shell. The relaunched build's `hold-idle-2.1.282` keeps that window open until the
+/// orchestrator has met the hand once. Its first prompt meanwhile is refused (`ERR busy
+/// lease=…`), retried, and lands in the relaunched agent: never run by the shell (its
+/// `touch` leaves no file), never read by the old process. Run at bash with the prompt sent
+/// as a `turn`, and at zsh as a raw `send` and `key enter`.
 #[cfg(target_os = "macos")] // atpkg::activation_notice is macOS-only
 #[test]
 fn a_prompt_sent_while_the_restart_holds_the_tab_lands_in_the_new_agent() {
@@ -2878,11 +2807,8 @@ fn a_prompt_sent_while_the_restart_holds_the_tab_lands_in_the_new_agent() {
     });
 }
 
-/// What a failed wait on the restart's hand says: the session's status, its
-/// screen, the host's lines, the journal and the processes under the instance
-/// (a stress run saw this test fail twice in ten rounds, once with a bash
-/// `child setpgid` error as the last line on the pane and no status to say
-/// what had run, 2026-10-10).
+/// What a failed wait on the restart's hand says: the session's status, its screen, the
+/// host's lines, the journal and the processes under the instance.
 #[cfg(target_os = "macos")] // only the macOS-only upgrade tests use it
 fn hand_evidence(inst: &Instance) -> String {
     let look = |args: &[&str]| String::from_utf8_lossy(&ctl(inst, args).stdout).into_owned();
@@ -2921,11 +2847,9 @@ fn prompt_meets_the_hand(tag: &str, shell: &str, turn: bool) {
         hand_evidence(&inst)
     );
 
-    // The orchestrator's retry loop: refused while the hand is on the tab —
-    // `ERR busy lease=aterm-harness@…`, or `ERR busy turn=…` while the
-    // harness's own relaunch line types under it — and typed once it is not,
-    // a turn's submit verified like any other (the fake redraws its composer
-    // at the Enter), so every answer that is not busy is a success.
+    // The orchestrator's retry loop: refused while the hand is on the tab (`ERR busy
+    // lease=aterm-harness@…`, or `ERR busy turn=…` while the harness's relaunch line types),
+    // typed once it is not; every answer that is not busy must succeed.
     let deadline = Instant::now() + HANG;
     let mut held = 0;
     let mut until_taken = |args: &[&str]| loop {
@@ -2986,15 +2910,10 @@ fn prompt_meets_the_hand(tag: &str, shell: &str, turn: bool) {
     );
 }
 
-/// A WALL THE HOST RESUMES IS NO STOP, LIVE. The owner's weekly
-/// wall behind a shell is published as `agent=wall:usage-weekly` (it read `busy`
-/// before), and while aterm's own harness holds the session and will continue it
-/// at the reset, the presence level is no `limited` — no red rim, no filled
-/// diamond saying "Agent can't continue" for the hours the harness spends
-/// resuming it (`note`, or `story` until the human looks). NEGATIVE CONTROL: the
-/// same wall under `resume_limits = false` — nobody will continue it — is
-/// `level=limited`, the stop, as ever. (The two instances share nothing, so
-/// they run side by side.)
+/// A weekly usage wall behind a shell is published as `agent=wall:usage-weekly`, and while
+/// aterm's own harness holds the session (it will resume it at the reset) the presence level
+/// is not `limited`. NEGATIVE CONTROL: under `resume_limits = false` nobody will continue it,
+/// and it is `level=limited`. The two instances share nothing, so they run side by side.
 #[test]
 fn a_wall_the_host_resumes_is_no_stop_and_one_nobody_answers_is() {
     std::thread::scope(|scope| {

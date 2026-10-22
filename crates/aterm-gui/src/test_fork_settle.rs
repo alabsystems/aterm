@@ -12,12 +12,9 @@
 //! strips its child passes the gate first (`InheritStrip::prepare`), but this
 //! binary's test helpers fork on their own.
 //!
-//! Explicit native observer tests still reach NSWorkspace while process tests
-//! fork. Test Apps use inert preference probes; the native runtime tests and
-//! process helpers nevertheless share libnotify's process-global fork state.
-//!
-//! So the gate is passed once, at image load, before the harness has started a
-//! thread; from then on `_notify_fork_child` in any child takes the built
-//! globals.
+//! Here the first headless `App`'s appearance read (`native_appearance_preferences`
+//! → NSWorkspace → CFPreferences → `os_log_create`) is the process's first
+//! libnotify call, made on one test thread while others fork. So the gate is
+//! passed once, at image load, before the harness starts a thread.
 
 aterm_uds::pass_libnotify_gate_at_load!();

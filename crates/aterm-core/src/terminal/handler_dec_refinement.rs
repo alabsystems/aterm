@@ -161,8 +161,7 @@ impl TerminalHandler<'_> {
         self.modes.focus_reporting = false;
     }
 
-    // Another encoding replaces SGR 1006, so in the model's terms this ends the
-    // SGR encoding (a no-op on the fact when SGR was not in force).
+    // Ends the model's SGR encoding (see `enable_utf8_mouse_encoding`).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(

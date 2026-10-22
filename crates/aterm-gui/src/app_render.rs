@@ -11224,8 +11224,23 @@ impl App {
         crate::tab_model::ViewId,
         crate::settings_preview::PreviewAnimation,
     )> {
-        let (_, view) = self.active_native_view(wid)?;
         let viewport = self.native_ui_viewport(wid).ok()?;
+        self.active_native_settings_preview_in(wid, phase_ms, viewport)
+    }
+
+    /// [`Self::active_native_settings_preview`] in a `viewport` the caller
+    /// already resolved: a capture's, from the one visible plan it lays its
+    /// frame out from.
+    pub(crate) fn active_native_settings_preview_in(
+        &self,
+        wid: WindowId,
+        phase_ms: u64,
+        viewport: crate::native_ui::LogicalRect,
+    ) -> Option<(
+        crate::tab_model::ViewId,
+        crate::settings_preview::PreviewAnimation,
+    )> {
+        let (_, view) = self.active_native_view(wid)?;
         match self.native_runtime.view_state(view) {
             Some(crate::native_app::AppViewState::Settings(state)) => {
                 let motion = self.native_view_motion_cx(wid, view);
@@ -11319,7 +11334,23 @@ impl App {
         wid: WindowId,
         phase_ms: u64,
     ) -> bool {
-        let Some((view, _animation)) = self.active_native_settings_preview(wid, phase_ms) else {
+        let Ok(viewport) = self.native_ui_viewport(wid) else {
+            return false;
+        };
+        self.invalidate_active_native_settings_preview_in(wid, phase_ms, viewport)
+    }
+
+    /// [`Self::invalidate_active_native_settings_preview`] in a `viewport` the
+    /// caller already resolved ([`Self::active_native_settings_preview_in`]).
+    pub(crate) fn invalidate_active_native_settings_preview_in(
+        &mut self,
+        wid: WindowId,
+        phase_ms: u64,
+        viewport: crate::native_ui::LogicalRect,
+    ) -> bool {
+        let Some((view, _animation)) =
+            self.active_native_settings_preview_in(wid, phase_ms, viewport)
+        else {
             return false;
         };
         // What can change on this tick: a preview that moves, and one whose
@@ -12948,6 +12979,9 @@ impl App {
         if !matches!(route, SuccessfulPresentRoute::Terminal) {
             self.refresh_native_hover_for_frame(id);
         }
+        // So is the cursor, where this frame's paint moved the harness's
+        // glass hover under a still pointer (a re-grid: `crate::claude_lights`).
+        self.refresh_glass_cursor_for_frame(id);
 
         // A terminal sibling takes the anchor back when focus leaves a native
         // field. Mixed frames bypass the terminal-only reporters, and their

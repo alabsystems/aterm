@@ -156,6 +156,7 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
         reset_lane: Default::default(),
         crash_journal: Default::default(),
         typed: Default::default(),
+        bells: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),

@@ -263,14 +263,9 @@ fn the_scratch_cache_is_reused_without_leaking_state() {
     assert_eq!(ib.count(), 1);
 }
 
-/// A long haystack scanned with `find_iter` — the shape `aterm-search` runs over
-/// scrollback — must be linear in the haystack too, not quadratic.
-///
-/// The largest haystack, 2.8 MB, is what lets a minute's [`HANG_DETECTOR`] tell
-/// the two apart: scanned once it costs milliseconds (this whole file runs in
-/// well under a second), while a rescan per match to the haystack's end is some
-/// 7 x 10^10 bytes of scanning. At the scan's measured rate (about 200 MB/s,
-/// release) that is six minutes, so a faster machine still fails it.
+/// `find_iter` over a long haystack is linear, not quadratic: over 2.8 MB a rescan per
+/// match would be ~7 × 10^10 bytes, minutes even on a fast machine, so the hang detector
+/// tells the two apart.
 #[test]
 fn scanning_a_long_haystack_is_linear() {
     let re = Regex::new(r"\b[0-9a-f]{7,40}\b").expect("compiles");

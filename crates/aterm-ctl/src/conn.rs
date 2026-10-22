@@ -1209,9 +1209,8 @@ mod tests {
         );
     }
 
-    /// The fish completion offers the conn subverbs on the `aterm
-    /// --completions fish` script, gated behind a seen `conn` like the `ctl`
-    /// verbs, and not on the `aterm-ctl` script (which has no `conn` verb).
+    /// `aterm --completions fish` offers the conn subverbs behind a seen `conn`; the
+    /// `aterm-ctl` script, which has no `conn` verb, does not.
     #[test]
     fn fish_completion_offers_the_conn_subverbs() {
         let script = crate::front_door_completion_script("fish", &["ctl", "conn"], &[])

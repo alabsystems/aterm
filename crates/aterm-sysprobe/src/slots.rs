@@ -38,8 +38,10 @@
 //! not held. The lock query, asked after the record is read, has the last
 //! word on not held: a file whose lock someone holds is never empty or not
 //! held ([`Sight::Unproven`]: a winner between its `flock` and its record,
-//! however long it stalls there), and a writer whose descriptors cannot be
-//! read has let go once nobody holds the lock. A [`SlotBook`] pairs two reads
+//! however long it stalls there). A refused lock query proves no absence:
+//! an empty record or a missing holder stays unproven until the query says
+//! unlocked. A writer whose descriptors cannot be read has let go once
+//! nobody holds the lock. A [`SlotBook`] pairs two reads
 //! at least [`MIN_GAP_MS`] apart ([`SlotState`]): held is the same holder
 //! seen on both, free is no holder on both, unknown is a read that could not
 //! be judged, and pending is everything else: a first read, a single
@@ -224,6 +226,18 @@ pub enum Sight {
     Sighted(Holder),
 }
 
+/// A missing holder is proven only by an unlocked file. A refused query
+/// keeps it unproven; positive descriptor evidence still stands.
+#[cfg(any(target_os = "macos", test))]
+fn lock_checked(sight: Sight, lock: Option<bool>) -> Sight {
+    match (lock, sight) {
+        (Some(false), Sight::Unproven) => Sight::NotHeld { gone: None },
+        (Some(false), sight) => sight,
+        (_, Sight::Empty | Sight::NotHeld { .. }) => Sight::Unproven,
+        (_, sight) => sight,
+    }
+}
+
 /// One slot in one read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotObs {
@@ -364,7 +378,11 @@ fn judged(
     let mut candidates = Vec::new();
     for s in &obs.slots {
         let before = prev
-            .and_then(|p| p.slots.iter().find(|q| q.index == s.index))
+            .and_then(|p| {
+                p.slots
+                    .iter()
+                    .find(|q| q.index == s.index && q.file == s.file)
+            })
             .map(|q| &q.sight);
         let tally = match state(before, &s.sight) {
             SlotState::Held(h) => {
@@ -555,7 +573,7 @@ mod live {
 
     use super::{
         BIRTH_SLACK_US, Holder, MAX_ENTRIES, MAX_SLOTS, Observation, RECORD_CAP, Record,
-        RecordRead, Sight, SlotObs, Unread, adopted_in_window, birth_us, slot_index,
+        RecordRead, Sight, SlotObs, Unread, adopted_in_window, birth_us, lock_checked, slot_index,
     };
     use crate::kproc;
 
@@ -670,8 +688,7 @@ mod live {
             file,
             match Record::parse(&bytes) {
                 // A winner between its truncate and its write.
-                RecordRead::Empty if lock == Some(true) => Sight::Unproven,
-                RecordRead::Empty => Sight::Empty,
+                RecordRead::Empty => lock_checked(Sight::Empty, lock),
                 RecordRead::Bad => Sight::Bad,
                 RecordRead::Rec(rec) => holder(rec, file, lock),
             },
@@ -701,16 +718,7 @@ mod live {
     /// Whether `rec`'s writer holds `file` now (module docs), the file's lock
     /// as [`locked`] found it (`lock`) having the last word on not held.
     pub(super) fn holder(rec: Record, file: (u32, u64), lock: Option<bool>) -> Sight {
-        match (lock, by_descriptor(rec, file)) {
-            // Someone holds the lock whom the record does not show holding
-            // the file: a winner between its `flock` and its record, or
-            // `status` probing. Never free.
-            (Some(true), Sight::NotHeld { .. }) => Sight::Unproven,
-            // Nobody holds the lock: a living writer whose descriptors could
-            // not be read has let go.
-            (Some(false), Sight::Unproven) => Sight::NotHeld { gone: None },
-            (_, sight) => sight,
-        }
+        lock_checked(by_descriptor(rec, file), lock)
     }
 
     /// Whether `rec`'s writer holds `file` open now, by its descriptors.

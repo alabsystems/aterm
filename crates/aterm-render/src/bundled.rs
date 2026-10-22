@@ -947,8 +947,8 @@ fn is_iosevka_semibold(bytes: &[u8]) -> bool {
         .any(|id| face_for_id(id).is_some_and(|face| same_face(face, bytes)))
 }
 
-/// The deepest `glyf` box bottom of any Latin LETTER across `ids`' faces, per
-/// em (NEGATIVE below the baseline). `None` when no face parses.
+/// The deepest `glyf` box bottom of any Latin letter across `ids`' faces, per em (negative
+/// below the baseline). `None` when no face parses.
 fn deepest_latin_letter(ids: &[&str; 4]) -> Option<f32> {
     let mut deepest: Option<f32> = None;
     for face in ids
@@ -1150,9 +1150,8 @@ mod tests {
                 "{spelling:?}"
             );
         }
-        // An installed family keeps meaning the installed face — including
-        // `Cascadia Mono`, the system's variable cut, which is not this one,
-        // and `Iosevka` (not Term), whose arrows are wide.
+        // An installed family keeps meaning the installed face, `Cascadia Mono` (the
+        // system's variable cut) and `Iosevka` (not Term) included.
         assert!(face_for_family("Iosevka").is_none());
         assert!(face_for_family("Iosevka Term Medium").is_none());
         assert!(face_for_family("DejaVu Sans Mono").is_none());
@@ -1163,8 +1162,8 @@ mod tests {
         assert!(face_for_family("").is_none());
     }
 
-    /// THE LETTER FLOOR is measured from the family's own outlines, answers
-    /// for each of its four faces, and is a property of the BUNDLED bytes only.
+    /// The letter floor is measured from the family's own outlines, answers for each of its
+    /// four faces, and belongs to the bundled bytes only.
     #[test]
     fn the_letter_floor_is_the_familys_deepest_latin_letter() {
         let per_em = |id: &str| letter_descent_floor(face_for_id(id).unwrap());
@@ -2483,10 +2482,8 @@ mod tests {
         );
     }
 
-    /// The bundled faces lead their tiers but never TAKE what the host's own
-    /// faces own: no emoji-default and no private-use point is ever picked
-    /// from a bundled chain face (the colour face and the Symbols Nerd Font
-    /// own those).
+    /// No emoji-default or private-use point is picked from a bundled chain face: the colour
+    /// face and the Symbols Nerd Font own those.
     #[test]
     #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn a_bundled_chain_face_never_takes_an_emoji_default_or_private_use_point() {

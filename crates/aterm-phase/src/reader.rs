@@ -454,8 +454,7 @@ pub trait ScreenReader: Sync {
     fn housekeeping(&self, _rows: &[String]) -> bool {
         false
     }
-    /// No turn yet: the program's launch card on the screen and, under it,
-    /// no message and nothing said — nobody has asked the session anything.
+    /// No turn yet: the program's launch card on the screen and no message under it.
     fn fresh(&self, _rows: &[String]) -> bool {
         false
     }
@@ -552,12 +551,10 @@ pub trait ScreenReader: Sync {
     fn busy_row_outlives_boxes(&self) -> bool {
         false
     }
-    /// The first row a running turn's busy row can be on — the top of the
-    /// live zone: a wait on [`Self::busy_guard`] is armed over this row and
-    /// the rows under it, never over a busy row above it that another
-    /// process left there ([`crate::phase::busy_zone_start`]). `0` by
-    /// default: the whole screen, for a program whose layout says nothing
-    /// about where a dead process's rows end.
+    /// The first row a running turn's busy row can be on, the top of the live zone: a wait
+    /// on [`Self::busy_guard`] is armed from here down, never over a busy row a dead
+    /// process left above ([`crate::phase::busy_zone_start`]). `0` (the whole screen) by
+    /// default.
     fn busy_zone_start(&self, _rows: &[String]) -> usize {
         0
     }
@@ -1931,13 +1928,10 @@ mod tests {
         }
     }
 
-    /// The 2026-09-24 incident's screen: the spinner still running, so the
-    /// worker reads BUSY — and the reading carries Claude Code's
-    /// critical-memory banner as a memory wall all the same, the one wall a
-    /// hard busy keeps (`ScreenReader::health_wall`). Idle it is the same
-    /// wall. NEGATIVE CONTROLS: the banner row blanked, leaving only the
-    /// draft that quotes it, reads no wall; a box on the screen reads none
-    /// however placed the banner is; and no reader but Claude Code's has one.
+    /// Claude Code's critical-memory banner under a running spinner: busy, with the banner
+    /// as a memory wall, the one wall a hard busy keeps ([`ScreenReader::health_wall`]); idle
+    /// it is the same wall. Negative controls: the banner row blanked (only the draft's
+    /// quote left), a box on the screen, and every reader but Claude Code's read no wall.
     #[test]
     fn the_memory_banner_is_a_wall_even_under_a_busy_spinner() {
         let busy = screen(MEMORY_BANNER_BUSY);

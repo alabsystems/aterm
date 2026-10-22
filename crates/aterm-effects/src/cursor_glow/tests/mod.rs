@@ -248,12 +248,10 @@ fn retina_geom() -> Geom {
     }
 }
 
-/// The shared test compositor: the renderer's painter order, `add_sat`
-/// saturation and opaque caret, used by the on-glass gates. A linear rescale
-/// cannot represent `add_sat` clipping, and the caret is painted last over its
-/// own halo, so gates must composite the real way.
-///
-/// The order, as in `composite_free` and its post-passes:
+/// The shared test compositor for the on-glass gates. A linear rescale cannot
+/// represent `add_sat` clipping, and the caret is painted last over its own
+/// halo, so it composites in the renderer's painter order (`composite_free` and
+/// its post-passes):
 ///
 /// ```text
 ///   ground                                   the theme background
@@ -265,8 +263,8 @@ fn retina_geom() -> Geom {
 ///   the caret         REPLACE, opaque        draw_cursor — LAST
 /// ```
 ///
-/// `add_sat`, `premul_rgb`, `over_rgb`, `halo_row_ny` and `halo_weight` are the
-/// renderer's own exported functions, so this moves with the renderer.
+/// The blend and falloff functions are the renderer's own exports, so this
+/// moves with the renderer.
 struct Glass {
     px: Vec<u32>,
     w: usize,

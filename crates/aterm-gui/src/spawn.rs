@@ -2632,6 +2632,7 @@ pub(crate) fn spawn_session(
         reset_lane: Default::default(),
         crash_journal: Default::default(),
         typed: Default::default(),
+        bells: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),
@@ -6148,14 +6149,11 @@ pub(crate) const MAX_KITTY_MEDIUM_BYTES: u64 = 4 * 1024 * 1024;
 /// engine refuses before asking (a size it does not load, a resolver gone, the
 /// string budget) is left where the program put it.
 ///
-/// Readability is bounded by our uid and size by the cap. The engine never
-/// touches the filesystem or shm itself.
-///
-/// A file read can block (an evicted iCloud file downloading, a stalled network
-/// volume), and the resolver runs inside `process()`, under the terminal lock:
-/// so the reads are done by the reader before the hold that feeds what names them
-/// ([`crate::host_io_prefetch`], through [`read_kitty_medium`]), and the resolver
-/// only takes what was read. A medium the reader did not read is refused.
+/// A file read can block (an evicted iCloud file, a stalled network volume) and
+/// the resolver runs inside `process()`, under the terminal lock, so the reader
+/// does the reads before the hold that feeds what names them
+/// ([`crate::host_io_prefetch`]) and the resolver only takes what was read. A
+/// medium the reader did not read is refused.
 fn configure_kitty_file_transfer(term: &Arc<Mutex<Terminal>>, reach: HostReach) {
     if reach == HostReach::Refused {
         return;

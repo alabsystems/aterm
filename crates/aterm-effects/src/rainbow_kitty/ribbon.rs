@@ -1042,6 +1042,18 @@ impl Cohort {
             .find(|p| p.stamp == stamp)
     }
 
+    /// A partial release whose exact identities this original run still owns.
+    #[inline]
+    fn holds_partial(&self, cell: &Cell) -> bool {
+        !self.abandoned
+            && cell.released_at.is_some_and(|stamp| {
+                self.release_parts
+                    .iter()
+                    .flatten()
+                    .any(|part| part.stamp == stamp)
+            })
+    }
+
     /// The band is leaving at `at`: abandoned by a jump, or inside its swoosh (retracting,
     /// fading, or over). A flowing cohort reads its own clock and schedule
     /// ([`Cohort::idle_s`], [`Cohort::phase_at`]): the fold flow has no grace and no reach, so
@@ -5524,7 +5536,18 @@ impl Ribbon {
     pub fn retire_cells(&mut self, cells: &[(u16, u16, Instant)], at: Instant) -> usize {
         let mut n = 0;
         for cell in &mut self.cells {
-            if cell.leaving() || !cells.contains(&(cell.row, cell.col, cell.born)) {
+            if !cells.contains(&(cell.row, cell.col, cell.born)) {
+                continue;
+            }
+            if cell.leaving() {
+                // Replaced content cannot restore a prior partial release,
+                // even when its visual retract has already finished. Keep
+                // that clock and count, but revoke its redraw custody.
+                if cell.released_at.take().is_some()
+                    && let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == cell.cohort)
+                {
+                    coh.revoke_releases(at);
+                }
                 continue;
             }
             cell.retire_at = Some(at);
@@ -6061,7 +6084,16 @@ impl Ribbon {
             if let Some(at) = cell.retract_at
                 && now.saturating_duration_since(at).as_secs_f32() >= RETRACT_FADE_S
             {
-                return false;
+                // A partial repaint may stay torn beyond its visual release.
+                // Keep its exact identities dark while their original run
+                // still stands, so a same-glyph return can lift the release
+                // without waiting for another key to mend the missing tail.
+                // Normal life, the cohort's phase, and release revocation
+                // still bound custody; an abandoned run keeps none of it.
+                let held = coh.holds_partial(cell);
+                if !held {
+                    return false;
+                }
             }
             if let Some(at) = cell.retire_at
                 && now.saturating_duration_since(at).as_secs_f32() >= RETIRE_MELT_S
@@ -6156,6 +6188,13 @@ impl Ribbon {
         sorted.clear();
         sorted.reserve(self.cells.len());
         for (i, c) in self.cells.iter().enumerate() {
+            // Expired partial releases may remain in content custody, but
+            // own neither field nor geometry until their glyphs return.
+            if c.retract_at.is_some_and(|at| {
+                ctx.now.saturating_duration_since(at).as_secs_f32() >= RETRACT_FADE_S
+            }) {
+                continue;
+            }
             sorted.push((c.row, c.col, u32::try_from(i).unwrap_or(u32::MAX)));
         }
         let now = ctx.now;
@@ -7662,6 +7701,7 @@ impl Ribbon {
         else {
             return 0;
         };
+        let carry_partial = self.partial_custody_follows(ci, lo, hi, true);
         // One cell per column: where part of the run's tail was left behind (a wrap took it
         // off the row), the block lands on columns that tail still holds; those are the light
         // of glyphs that left, so they go. Leaving cells are never in the way: the shift pass
@@ -7695,8 +7735,8 @@ impl Ribbon {
             if c.row != row || c.cohort != cohort {
                 continue;
             }
-            if !c.leaving()
-                && (lo..=hi).contains(&c.col)
+            if ((!c.leaving() && (lo..=hi).contains(&c.col))
+                || (carry_partial && c.col >= lo && walk.holds_partial(c)))
                 && let Some(col) = c.col.checked_add_signed(dc)
             {
                 moved.push((c.row, c.col, c.born));
@@ -7728,6 +7768,22 @@ impl Ribbon {
         self.plan.clear();
         self.runs.clear();
         n
+    }
+
+    /// A proved move of all remaining standing text carries its dark redraw
+    /// claims too. A horizontal insert moves the suffix from the edit point;
+    /// a vertical move must carry the whole standing run. A visible split
+    /// leaves custody where it was rather than guessing which part owns it.
+    fn partial_custody_follows(&self, ci: usize, lo: u16, hi: u16, suffix: bool) -> bool {
+        let Some(cohort) = self.cohorts.get(ci) else {
+            return false;
+        };
+        !cohort.abandoned
+            && self
+                .cells
+                .iter()
+                .filter(|cell| cell.cohort == cohort.id && !cell.leaving())
+                .all(|cell| (suffix && cell.col < lo) || (lo..=hi).contains(&cell.col))
     }
 
     /// The band follows its text across rows: the engine half of the follow pass
@@ -7767,6 +7823,11 @@ impl Ribbon {
         if dr == 0 || lo > hi {
             return 0;
         }
+        let source = self.cohorts[ci];
+        let carry_partial = self.partial_custody_follows(ci, lo, hi, false);
+        let carried = |cell: &Cell| {
+            (lo..=hi).contains(&cell.col) || (carry_partial && source.holds_partial(cell))
+        };
         let mut n = 0usize;
         let mut all = 0usize;
         let (mut c0, mut c1) = (u16::MAX, 0u16);
@@ -7777,7 +7838,7 @@ impl Ribbon {
             .filter(|c| c.row == row && c.cohort == cohort)
         {
             all += 1;
-            if (lo..=hi).contains(&c.col) {
+            if carried(c) {
                 n += 1;
                 c0 = c0.min(c.col);
                 c1 = c1.max(c.col + 1);
@@ -7827,7 +7888,7 @@ impl Ribbon {
             copy.id
         };
         for c in &mut self.cells {
-            if c.row == row && c.cohort == cohort && (lo..=hi).contains(&c.col) {
+            if c.row == row && c.cohort == cohort && carried(c) {
                 moved.push((c.row, c.col, c.born));
                 c.row = new_row;
                 c.cohort = id;

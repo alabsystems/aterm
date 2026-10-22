@@ -55,10 +55,9 @@
 //!
 //! # Arguments and return state their ABI
 //!
-//! `RcBlock::newN` requires [`crate::Encode`] on each argument and the return
-//! type, as [`crate::msg`] does on its return: a block's `invoke` is an ABI
-//! boundary like a send. An ObjC `BOOL` out-parameter spelled as a Rust `bool`
-//! pointer is refused:
+//! A block's `invoke` is an ABI boundary like a send, so `RcBlock::newN`
+//! requires [`crate::Encode`] on each argument and the return type. An ObjC
+//! `BOOL` out-parameter spelled as a Rust `bool` pointer is refused:
 //!
 //! ```compile_fail
 //! # use aterm_objc::{Id, RcBlock};
@@ -68,7 +67,7 @@
 //! let _ = unsafe { RcBlock::new2(|_line: Id, _stop: *mut bool| {}) };
 //! ```
 //!
-//! So is a bare array return, whose x86-64 classification nobody has stated:
+//! So is a bare array return, whose x86-64 classification is unstated:
 //!
 //! ```compile_fail
 //! # use aterm_objc::RcBlock;
@@ -97,11 +96,8 @@
 //! # Not provided
 //!
 //! * `BLOCK_HAS_SIGNATURE`: blocks carry no type-encoding string, so an API
-//!   that introspects one through `NSMethodSignature` would not work. None of
-//!   the call sites does.
-//! * `"^?"` (a bare C function pointer, e.g.
-//!   `-[NSView sortSubviewsUsingFunction:context:]`'s `v32@0:8^?16^v24`):
-//!   no declared method takes one.
+//!   that introspects one through `NSMethodSignature` would not work.
+//! * `"^?"`, a bare C function pointer: no declared method takes one.
 
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -157,8 +153,8 @@ struct BlockDescriptor {
 /// would register `"^v"` and tell every reflective path the argument is an
 /// opaque pointer.
 ///
-/// Borrowed, not an owner: [`RcBlock`] (or whatever the framework copied) owns
-/// the reference, and this is valid while that lives.
+/// Borrowed: [`RcBlock`] (or whatever the framework copied) owns the
+/// reference, and this is valid while that lives.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BlockPtr(*mut c_void);
@@ -248,10 +244,8 @@ unsafe impl crate::encode::Encode for BlockPtr {
 
 /// A reference-counted heap block, ready to hand to an Objective-C API.
 ///
-/// Dropping releases aterm's reference; APIs that keep the handler
-/// (`addLocalMonitorForEventsMatchingMask:`,
-/// `beginSheetModalForWindow:completionHandler:`) copy the block, so dropping
-/// the `RcBlock` before it fires is fine.
+/// Dropping releases aterm's reference; an API that keeps the handler copies
+/// the block, so dropping the `RcBlock` before it fires is fine.
 pub struct RcBlock {
     ptr: NonNull<c_void>,
 }
@@ -313,18 +307,14 @@ macro_rules! block_ctor {
             /// # Safety
             ///
             /// The argument and return types must be exactly what the framework
-            /// calls the block with. The block ABI carries no checkable
-            /// signature, so a wrong prototype silently reinterprets registers
-            /// (the mirror of [`crate::msg`]'s obligation).
+            /// calls the block with: the block ABI carries no checkable
+            /// signature, so a wrong prototype silently reinterprets registers.
             ///
-            /// Every argument and the return type must be [`crate::Encode`],
-            /// refusing a Rust `bool` for an ObjC `BOOL` and unstated packed
-            /// layouts. The return type must be [`crate::InertZero`]: an
-            /// `NSException` raised inside the closure is contained at `invoke`
-            /// (reported against `"block invoke"` through [`crate::exception`])
-            /// and the block returns the all-zero value. A Rust panic aborts
-            /// with a name, since unwinding into framework code is undefined
-            /// behaviour.
+            /// Arguments and return are [`crate::Encode`] (refusing a Rust
+            /// `bool` for an ObjC `BOOL`); the return is [`crate::InertZero`],
+            /// so an `NSException` raised in the closure is contained at
+            /// `invoke` (reported as `"block invoke"`) and the block returns
+            /// zero. A Rust panic aborts with that name.
             #[must_use]
             pub unsafe fn $ctor<$($A,)* R, F>(closure: F) -> Option<Self>
             where
@@ -339,11 +329,9 @@ macro_rules! block_ctor {
                     closure: F,
                 }
 
-                // Same order as `declare_class!`'s trampoline: `catch_unwind`
-                // outside (a Rust panic aborts with a name), the Objective-C
-                // `@try` inside (an `NSException` is contained and answered
-                // with the inert zero). No `Default` bound on `R`: the panic
-                // path is `abort_on_unwind`, which returns `!`.
+                // As in `declare_class!`'s trampoline: `catch_unwind` outside,
+                // the `@try` inside. No `Default` bound on `R`: the panic path
+                // is `abort_on_unwind`, which returns `!`.
                 unsafe extern "C" fn $invoke<$($A,)* R: crate::InertZero, F: Fn($($A),*) -> R>(
                     block: *mut c_void,
                     $($arg: $A),*
@@ -373,10 +361,8 @@ macro_rules! block_ctor {
                 /// the Rust move; there is nothing left to copy.
                 unsafe extern "C" fn copy_helper(_dst: *mut c_void, _src: *const c_void) {}
 
-                /// Guarded like `invoke`, `__tramp` and `__dealloc`, so a
-                /// panicking `Drop` in a capture aborts through
-                /// [`crate::abort_on_unwind`] with a name rather than Rust's
-                /// anonymous non-unwinding-panic message.
+                /// Guarded like `invoke`, so a panicking `Drop` in a capture
+                /// aborts with a name rather than Rust's anonymous message.
                 unsafe extern "C" fn dispose_helper<F>(block: *mut c_void) {
                     let blk = block.cast::<Blk<F>>();
                     let guard = ::std::panic::catch_unwind(

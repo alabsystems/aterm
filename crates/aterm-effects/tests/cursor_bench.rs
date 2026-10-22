@@ -13,14 +13,13 @@ use aterm_effects::cursor_glow::{GlowConfig, GlowStyle};
 pub(crate) fn config(style: GlowStyle) -> GlowConfig {
     GlowConfig {
         classic_mono: false,
-        // Shipping default: the tall body; explicit underline is exercised by
-        // the workload matrix benchmark.
+        // Shipping default: the tall body.
         ribbon_tall: true,
         ribbon_flat: false,
         enabled: true,
         dark_theme: true,
-        // The documented default dark palette — a COHERENT pair, never 0/0
-        // (`fg == bg` reads as a conceal-shaped theme and suppresses the tint).
+        // The default dark palette: a coherent pair, never 0/0 (`fg == bg` reads as a
+        // conceal-shaped theme and suppresses the tint).
         theme_fg: 0x00C8_D3F5,
         theme_bg: 0x001A_1B26,
         style,
@@ -89,11 +88,9 @@ fn cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_share() {
         under > 2_000,
         "fixture must reach the active tall ribbon ({under} quads)"
     );
-    // The ribbon's declared share of `MAX_QUADS` (5/8), restated because a
-    // `tests/` target cannot see `RAINBOW_RIBBON_QUAD_BUDGET`. At retina
-    // metrics a full-width tall line costs ~77 quads per cell, so a smaller
-    // share would shed the tail of long lines. The ribbon stays inside its
-    // share; the frame-wide headroom assert below bounds the companions.
+    // The ribbon's share of `MAX_QUADS` (16,384) is 5/8
+    // (`rainbow_kitty::ribbon::RIBBON_QUAD_BUDGET`); a smaller share would shed the tail of long
+    // lines. The frame-wide headroom assert below bounds the companions.
     assert!(
         under * 8 <= 16_384 * 5,
         "default tall ribbon spent more than its five-eighths normalized share: {under}"

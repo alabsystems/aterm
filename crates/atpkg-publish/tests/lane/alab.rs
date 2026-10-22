@@ -236,7 +236,7 @@ fn the_first_run_packs_both_apple_targets_and_holds_the_rustc_group() {
         rendered(&o, "clean").starts_with("SKIP: not pinned by index-5"),
         "an unpinned program is a human decision"
     );
-    // The packs: ay on both Apple targets, aarch64 fresh and x86_64 merged onto a COPY of
+    // The packs: ay on both Apple targets, aarch64 fresh and x86_64 merged onto a copy of
     // it beside the stage; trust-ir aarch64 only; the bundle never.
     let legs = w.fx.packer.legs();
     let out = w.state().dir.join("out/ay");
@@ -375,7 +375,7 @@ fn an_index_head_below_the_one_processed_refuses_everything() {
     assert_eq!(w.fx.packer.legs().len(), 3, "nothing is packed");
 }
 
-/// Builds 4 of ay: a release past the pin, with one fresh dev commit.
+/// A signed release `tag` of ay past the pin, on one fresh dev commit; its build.
 fn ay_release(w: &World, tag: &str) -> u64 {
     let ay = w.dev("ay");
     fixture::commit(&ay, tag, None);
@@ -624,7 +624,7 @@ fn what_is_built_is_what_was_signed() {
     );
 }
 
-/// A trust world for the gap to main: pin 9 AHEAD of the newest signed release (v0.9.0,
+/// A trust world for the gap to main: pin 9 ahead of the newest signed release (v0.9.0,
 /// build 7), main at build 12, the pin's compiler reporting commit build 9.
 fn gap_world(label: &str) -> World {
     static MADE: Made<(), Vec<String>> = Mutex::new(BTreeMap::new());

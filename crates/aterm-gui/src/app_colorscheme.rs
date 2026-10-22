@@ -426,12 +426,9 @@ impl App {
         )
     }
 
-    /// The windows an OS appearance flip must nudge when the rendered theme is
-    /// UNCHANGED: ALL of them. The `system_dark` repaint-key term moves on every
-    /// window, including background windows presenting native app previews. Split
-    /// from the `request_redraw` loop so
-    /// the headless suite can pin the all-window fan-out (the redraw itself needs
-    /// a live `os_window`): see `appearance_flip_nudges_every_window`.
+    /// The windows an OS appearance flip nudges when the rendered theme is unchanged: all of
+    /// them, since the `system_dark` repaint-key term moves on every window (native app
+    /// previews included). Split out so a headless test can pin the fan-out.
     pub(crate) fn appearance_redraw_targets(&self) -> Vec<WindowId> {
         self.windows.keys().copied().collect()
     }

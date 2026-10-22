@@ -29,7 +29,7 @@ const SAMPLES: &[(&str, &str)] = &[
         "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
     ),
     ("emoji + skin tone", "\u{1f44d}\u{1f3fd}"),
-    // A skin-tone modifier folds only onto a WIDE Emoji_Modifier_Base; after
+    // A skin-tone modifier folds only onto a wide Emoji_Modifier_Base; after
     // anything else the grid draws it as its own 2-cell glyph.
     ("ninja + skin tone", "\u{1f977}\u{1f3fd}"),
     ("non-base emoji + skin tone", "\u{1f680}\u{1f3fd}"),

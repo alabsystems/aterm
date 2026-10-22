@@ -1705,16 +1705,7 @@ impl Engine {
         if !self.engaged || rows.is_empty() {
             return 0;
         }
-        self.witness
-            .restored_runs(self.ribbon.cells(), rows, &mut self.restore_scratch);
-        if !self.restore_scratch.is_empty() {
-            self.ribbon
-                .restore_releases(&self.restore_scratch, &mut self.restored_scratch);
-            if !self.restored_scratch.is_empty() {
-                self.witness
-                    .restored(&self.restored_scratch, self.ribbon.cells());
-            }
-        }
+        self.restore_released_rows(rows);
         let recounted = self.witness.walk(
             self.ribbon.cells(),
             rows,
@@ -1744,6 +1735,21 @@ impl Engine {
             self.status.retired = self.retired;
         }
         n
+    }
+
+    /// Restore exact identities after event replay and before planning their
+    /// geometry. The later content walk may still retire changed glyphs.
+    fn restore_released_rows(&mut self, rows: &[RowSample<'_>]) {
+        self.witness
+            .restored_runs(self.ribbon.cells(), rows, &mut self.restore_scratch);
+        if !self.restore_scratch.is_empty() {
+            self.ribbon
+                .restore_releases(&self.restore_scratch, &mut self.restored_scratch);
+            if !self.restored_scratch.is_empty() {
+                self.witness
+                    .restored(&self.restored_scratch, self.ribbon.cells());
+            }
+        }
     }
 
     /// The laid ribbon, read-only — what the host's witness and the
@@ -1976,8 +1982,13 @@ impl Engine {
         // text (`in` in the `statusline` of the tip a tool step drew there).
         let caret = self.caret_known.then_some(self.caret);
         if self.witness.scroll_carry() == 0 && self.witness.caret_carry() == 0 {
-            self.witness
-                .shift_runs(self.ribbon.cells(), rows, caret, &mut self.shift_scratch);
+            self.witness.shift_runs(
+                self.ribbon.cells(),
+                rows,
+                caret,
+                now,
+                &mut self.shift_scratch,
+            );
         } else {
             self.shift_scratch.clear();
         }
@@ -2403,7 +2414,8 @@ impl Engine {
     /// 1. every clock advances once (spine, bucket, the flare's age);
     /// 2. the ribbon ingests the frame's events (lays, retracts, abandons,
     ///    moves its caret mirror);
-    /// 3. the ribbon plans this frame's geometry and field index (§18), and
+    /// 3. exact sampled text can restore a held release, then the ribbon
+    ///    plans this frame's geometry and field index (§18), and
     ///    [`Ctx::caret_t`] is sampled here, so the caret, the head and a
     ///    star's halo read one value (C2) and the meteor locks to the landing
     ///    cell's field (D4);
@@ -2426,6 +2438,19 @@ impl Engine {
     ///
     /// A disengaged or idle engine writes nothing and leaves `out.fp == 0`.
     pub fn tick(&mut self, now: Instant, geom: Geom, cfg: &Config, out: &mut Frame<'_>) {
+        self.tick_with_restored_rows(now, geom, cfg, out, &[]);
+    }
+
+    /// The host's sampled rows can lift a prior partial release on the very
+    /// frame that shows its text again, after queued edits have replayed.
+    pub(crate) fn tick_with_restored_rows(
+        &mut self,
+        now: Instant,
+        geom: Geom,
+        cfg: &Config,
+        out: &mut Frame<'_>,
+        rows: &[RowSample<'_>],
+    ) {
         out.caret = self.caret_seam;
         out.companion = self.companion;
         out.fp = 0;
@@ -2522,6 +2547,9 @@ impl Engine {
         // Pass 1 — the ribbon ingests, then plans. The field index exists
         // from here on, and the caret's own `t` is this frame's.
         self.replay_events(&ctx);
+        if !rows.is_empty() {
+            self.restore_released_rows(rows);
+        }
         self.ribbon.plan(&ctx);
         ctx.caret_t = self.ribbon.field_at_caret();
 

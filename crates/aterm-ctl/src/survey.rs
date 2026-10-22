@@ -795,6 +795,20 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
     if let Some(n) = s.number("bg").filter(|&n| n > 0) {
         line.push_str(&format!(" bg={n}"));
     }
+    // The bells it rang, and the newest's program, sound and age:
+    // `bells=3 (zsh sounded 4m ago)` ([`newest_bell`]).
+    if let Some(n) = s.number("bells").filter(|&n| n > 0) {
+        line.push_str(&format!(" bells={n}"));
+        if let Some((ms, sound, program)) = newest_bell(s) {
+            let program = checked(program).map(|p| format!("{} ", shown(p, 16)));
+            line.push_str(&format!(
+                " ({}{} {} ago)",
+                program.unwrap_or_default(),
+                shown(checked(Some(sound)).unwrap_or("?"), 8),
+                age(ms)
+            ));
+        }
+    }
     if let Some(n) = s.number("ctx_left_pct") {
         line.push_str(&format!(" ctx_left={n}%"));
     }
@@ -851,6 +865,23 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
         line.push_str(&part);
     }
     fit(&line, LINE_CHARS)
+}
+
+/// The newest bell of a row's `last_bell=<ms>/<sound>/<program>[,…]`: how
+/// long ago it rang, what became of its sound, and the program in front
+/// (`None` where the server named none). `None` for no bell, or an entry
+/// that is not three parts with an age.
+fn newest_bell(s: &Fields) -> Option<(u64, &str, Option<&str>)> {
+    let newest = s.get("last_bell")?.split(',').next()?;
+    let mut parts = newest.splitn(3, '/');
+    let ms = parts.next()?.parse().ok()?;
+    let sound = parts.next().filter(|w| !w.is_empty())?;
+    let program = parts.next()?;
+    Some((
+        ms,
+        sound,
+        Some(program).filter(|p| !p.is_empty() && *p != "-"),
+    ))
 }
 
 /// Whether a shell's terminal `title` says only where it stands, `cwd`: the

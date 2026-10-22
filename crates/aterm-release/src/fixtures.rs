@@ -43,8 +43,7 @@ use crate::ledger::{Error, GitRunner, Result, git_ok, rev_parse};
 /// The generator, compiled into every `aterm-gui` library test build.
 pub const GENERATOR_SOURCE: &str = "crates/aterm-gui/src/seamless_fixture_generator_tests.rs";
 
-/// Its two entry tests: the desks, and the rendezvous record (macOS only, as the
-/// rendezvous is).
+/// Its two entry tests: the desks, and the rendezvous record (macOS only).
 pub const GENERATOR_TESTS: [&str; 2] = ["generate_handoff_fixtures", "generate_rendezvous_fixture"];
 
 /// The mark a complete staging carries, written last: the identity it was written as.

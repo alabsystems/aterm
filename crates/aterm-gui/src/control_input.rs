@@ -18,20 +18,17 @@ use super::post_input_reply;
 use crate::input::{Delivery, InputEvent, InputOutcome, ScrollIntent, Source};
 use crate::{SessionCtx, TabAction, Wake, term_lock};
 
-/// `scroll <up|down|top|bottom|prev-prompt|next-prompt|N>` -> move the viewport and report
-/// the new position as `OK <display_offset> <scrollback_lines>\n`. `up`/`down`
-/// move one screen into/out of history; `top`/`bottom` jump; a signed integer
-/// `N` moves N lines into history (negative = toward the live bottom). With no
-/// argument it just reports the current position. After moving it nudges a
-/// windowed session to repaint (no-op when headless).
+/// `scroll <up|down|top|bottom|prev-prompt|next-prompt|N>` -> move the viewport and
+/// answer `OK <display_offset> <scrollback_lines>`. `up`/`down` move one screen, a signed
+/// `N` moves N lines into history (negative toward the bottom), and no argument just
+/// reports.
 pub(crate) fn cmd_scroll(
     term: &Arc<Mutex<Terminal>>,
     proxy: &EventLoopProxy<Wake>,
     rest: &str,
 ) -> String {
-    // Parse to a tracking-agnostic ScrollIntent; the SEAM is the sole
-    // `scroll_display`/`scroll_to_*` caller. `""` (just report position) maps to a
-    // zero-line `By(0)` so the round-trip still reports the current offset.
+    // The seam is the sole `scroll_display`/`scroll_to_*` caller; `""` is `By(0)`, so
+    // the round trip still reports the position.
     let intent = match rest.trim() {
         "" => ScrollIntent::By(0),
         "top" => ScrollIntent::Top,
@@ -48,9 +45,8 @@ pub(crate) fn cmd_scroll(
             }
         },
     };
-    // Reply-bearing: the reply is sent AFTER the seam applied the scroll on the
-    // main thread, so the position read below is NOT racy with the apply.
-    // `scroll` is read-side view control (display_offset only) — audit class ReadScreen.
+    // The reply comes after the seam applied the scroll on the main thread, so the read
+    // below sees it. `scroll` is read-side view control (display offset only).
     match post_input_reply(proxy, vec![InputEvent::ScrollView(intent)]) {
         Ok(_) => {}
         Err(e) => return e,
@@ -61,15 +57,11 @@ pub(crate) fn cmd_scroll(
     format!("OK {offset} {max}\n")
 }
 
-/// `send <text>` -> write `<text>` to the PTY. The submit form on the line-framed
-/// control protocol is the two-character literal `\n` (a backslash then `n`, e.g.
-/// `aterm-ctl send 'ls\n'`): it is normalized to a single carriage-return `0x0d` —
-/// the byte the Return key sends — so the shell's line editor runs the command. A
-/// *real* trailing LF can't reach here over the socket (the request line is itself
-/// `\n`-terminated, so the framing consumes it before `rest` is parsed); the
-/// `strip_suffix('\n')` arm below is therefore defensive normalization for any
-/// in-process caller, not the socket submit path. Only the trailing newline is
-/// converted; embedded newlines in the body are passed through unchanged.
+/// `send <text>` -> the bytes to write to the PTY. A trailing two-character literal `\n`
+/// (`aterm-ctl send 'ls\n'`) becomes one CR (`0x0d`, the Return key's byte), so the line
+/// editor runs the command. A real trailing LF cannot arrive over the socket (the
+/// framing consumes it); its arm serves in-process callers. Embedded newlines pass
+/// through.
 pub(crate) fn send_bytes(rest: &str) -> Vec<u8> {
     if let Some(head) = rest.strip_suffix("\\n") {
         let mut b = head.as_bytes().to_vec();
@@ -102,16 +94,12 @@ pub(crate) fn take_mods(rest: &str) -> Option<(aterm_types::keyboard::Modifiers,
                     "shift" => Modifiers::SHIFT,
                     "ctrl" | "control" => Modifiers::CTRL,
                     "alt" | "option" => Modifiers::ALT,
-                    // `meta` is its OWN modifier (Kitty CSI-u bit 8), distinct from
-                    // ALT — a controller can now drive a real Meta chord. Legacy /
-                    // xterm encoders ignore META/HYPER so their bytes are unchanged;
-                    // only the Kitty keyboard protocol gains the extra bit.
+                    // Meta and Hyper are their own bits, distinct from ALT; only the
+                    // Kitty keyboard protocol encodes them (legacy encoders ignore them).
                     "meta" => Modifiers::META,
                     "hyper" => Modifiers::HYPER,
                     "super" | "cmd" | "command" => Modifiers::SUPER,
-                    // A bare `mods=` (or a trailing separator) names no
-                    // modifier and asks for none — the empty element the
-                    // hardware-key parser accepts too.
+                    // A bare `mods=` or a trailing separator asks for none.
                     "" => Modifiers::empty(),
                     _ => return None,
                 };
@@ -123,11 +111,9 @@ pub(crate) fn take_mods(rest: &str) -> Option<(aterm_types::keyboard::Modifiers,
     Some((m, kept.join(" ")))
 }
 
-/// Parse the optional trailing `type=<press|repeat|release>` token, returning the
-/// event type (default `Press`) and the body with the token removed. ADDITIVE: a
-/// line without `type=` yields `Press` and the untouched body. An unrecognized
-/// value yields `None` so [`parse_key`] rejects the whole line rather than
-/// silently defaulting. `down`/`up` are accepted aliases for `press`/`release`.
+/// Parse the optional trailing `type=<press|repeat|release>` token (`down`/`up` alias
+/// press/release; default press), returning the type and the body without it. An
+/// unknown value is `None`, so [`parse_key`] rejects the line.
 fn take_event_type(rest: &str) -> Option<(aterm_types::keyboard::KeyEventType, String)> {
     use aterm_types::keyboard::KeyEventType;
     let mut et = KeyEventType::Press;
@@ -147,11 +133,9 @@ fn take_event_type(rest: &str) -> Option<(aterm_types::keyboard::KeyEventType, S
     Some((et, kept.join(" ")))
 }
 
-/// Parse the optional trailing `base=<char>` token — the US-QWERTY base-layout
-/// key fed to Kitty `REPORT_ALTERNATE_KEYS` (the 3rd CSI-u sub-field), so a
-/// controller on a non-US layout can reproduce the byte a human on that layout
-/// emits. ADDITIVE: no `base=` yields `None` (the existing behaviour). A `base=`
-/// whose value is not exactly one char yields the parser `None`.
+/// Parse the optional trailing `base=<char>` token: the US-QWERTY base-layout key for
+/// Kitty `REPORT_ALTERNATE_KEYS` (the 3rd CSI-u sub-field), so a controller on a non-US
+/// layout reproduces a human's bytes. A value that is not exactly one char is `None`.
 fn take_base_layout(rest: &str) -> Option<(Option<char>, String)> {
     let mut base: Option<char> = None;
     let mut kept: Vec<&str> = Vec::new();
@@ -310,20 +294,14 @@ pub(crate) fn parse_key(rest: &str) -> Option<InputEvent> {
     let (mut mods, body) = take_mods(rest)?;
     let (event_type, body) = take_event_type(&body)?;
     let (base_explicit, body) = take_base_layout(&body)?;
-    // Inline modifier prefixes: `ctrl+u`, `alt+x`, `ctrl+shift+a`, ... The
-    // prefixes are ADDITIVE with any trailing `mods=` token, so `ctrl+u` and
-    // `u mods=ctrl` agree. After stripping them, a single residual character
-    // (e.g. `u`) becomes a `Key::Character` event — the SAME (Key, mods) seam
-    // `parse_ctrl` builds, so the encoder derives the control byte itself
-    // (`ctrl+u` -> 0x15) rather than us hand-rolling it.
+    // Inline prefixes (`ctrl+u`, `ctrl+shift+a`) add to `mods=`, so `ctrl+u` and
+    // `u mods=ctrl` agree, and the encoder derives the control byte (0x15) itself.
     let (prefix_mods, body) = take_inline_mods(body.trim());
     mods |= prefix_mods;
     let body = body.trim();
     let Some(named) = named_key_from_token(body) else {
-        // Not a named key: a single residual character (after stripping inline
-        // modifier prefixes) becomes a `Key::Character`. `ctrl+u` lands here as
-        // `u` + CTRL, byte-identical to `parse_ctrl("u")` -> the encoder emits
-        // 0x15. Lower-cased so `ctrl+U` == `ctrl+u`, matching `parse_ctrl`.
+        // A single residual character: lower-cased, so `ctrl+U` == `ctrl+u`, as in
+        // `parse_ctrl`.
         let mut chars = body.chars();
         return match (chars.next(), chars.next()) {
             (Some(c), None) => Some(InputEvent::Key {
@@ -345,12 +323,9 @@ pub(crate) fn parse_key(rest: &str) -> Option<InputEvent> {
     })
 }
 
-/// Strip leading inline modifier prefixes (`ctrl+`, `alt+`, `shift+`, `super+`
-/// and their aliases) from a `key` body, returning the accumulated modifier
-/// mask and the remaining body. Mirrors the `mods=` alias table in
-/// [`take_mods`] so `ctrl+u` and `u mods=ctrl` are equivalent. Only consumes a
-/// prefix when a `+` follows a recognized modifier name, so a bare named key
-/// like `up` (no `+`) is returned untouched.
+/// Strip leading inline modifier prefixes (`ctrl+`, `alt+`, ... with the [`take_mods`]
+/// aliases) from a `key` body, returning their mask and the rest. A prefix is consumed
+/// only when `+` follows a known name, so a bare `up` is untouched.
 fn take_inline_mods(body: &str) -> (aterm_types::keyboard::Modifiers, &str) {
     use aterm_types::keyboard::Modifiers;
     let mut m = Modifiers::empty();
@@ -372,11 +347,9 @@ fn take_inline_mods(body: &str) -> (aterm_types::keyboard::Modifiers, &str) {
     (m, rest)
 }
 
-/// The event a fencing verb's body delivers through the input seam, parsed
-/// with that verb's OWN parser — `key`'s [`parse_key`], `ctrl`'s
-/// [`parse_ctrl`], `paste`'s [`paste_event`] — so the control fence
-/// classifies exactly what the verb sends. `None` for a malformed body, and
-/// for every verb whose body the fence does not read.
+/// The event a fencing verb's body delivers, parsed with that verb's own parser so the
+/// fence classifies exactly what the verb sends. `None` for a malformed body and for
+/// every verb whose body the fence does not read.
 pub(crate) fn control_press(verb: &str, rest: &str) -> Option<InputEvent> {
     match verb {
         "key" => parse_key(rest),
@@ -421,9 +394,8 @@ pub(crate) fn control_fence(
     }
 }
 
-/// The usage line every malformed `key` body answers. One string, so the
-/// grammar — the leading options and the key names — is stated in exactly
-/// one place (the plain, the guarded and both cross-session arms answer it).
+/// The usage line every malformed `key` body answers (the plain, guarded and both
+/// cross-session arms).
 pub(crate) const KEY_USAGE: &str = "ERR usage: key [id=<epoch>:<producer>:<seq>] [if=<re>] \
                                     [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] \
                                     [if-supervisor=<holder>] [unread=ok] <name> — enter tab esc space backspace delete \
@@ -431,14 +403,14 @@ pub(crate) const KEY_USAGE: &str = "ERR usage: key [id=<epoch>:<producer>:<seq>]
                                     +mods, e.g. ctrl+c)\n";
 
 // ---------------------------------------------------------------------------
-// `if=<re>` — the guarded press: ONE check-and-press under the terminal lock
+// `if=<re>`: the guarded press, one check-and-press under the terminal lock
 // ---------------------------------------------------------------------------
 
-/// The leading `k=v` options a `send`/`key`/`turn` line may carry, taken off the
-/// argument tail at the dispatch so every arm parses the SAME tail it always did.
+/// The leading `k=v` options a `send`/`key`/`turn` line may carry, taken off the tail at
+/// the dispatch so every arm parses the tail without them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LeadingInputOptions {
-    /// The A6 idempotency key's raw `<epoch>:<producer>:<seq>` value.
+    /// The idempotency key's raw `<epoch>:<producer>:<seq>` value.
     pub idem: Option<String>,
     /// The `if=<re>` guard's raw pattern — compiled later by [`compile_guard`],
     /// so a bad regex is answered where the halt gate has already been passed.
@@ -452,10 +424,8 @@ pub(crate) struct LeadingInputOptions {
     /// The `if-human=<n>` fence: the person-gesture count the caller last read
     /// (`status human_seq=`, `text --json`'s `"human_seq"`). See [`InputFence`].
     pub if_human: Option<u64>,
-    /// `unread=ok`: write even though the program has left earlier input
-    /// unread — the one override of the unread-input gate
-    /// (`crate::input_stall::admission`: its refusal, and its warning), for a
-    /// driver that means to queue.
+    /// `unread=ok`: write even though the program has left earlier input unread, the one
+    /// override of the unread-input gate (`crate::input_stall::admission`).
     pub unread_ok: bool,
     /// The `if-supervisor=<holder>` fence (the self-claim contract, §2): the
     /// write lands only while `<holder>` holds the session's live supervisor
@@ -809,10 +779,8 @@ fn parse_fp(value: &str) -> Option<u64> {
     u64::from_str_radix(value, 16).ok()
 }
 
-/// Compile a leading `if=<re>` guard, OUTSIDE the terminal lock (the same
-/// bounded `aterm_observe::row_matcher` `await match` compiles with, so a crafted
-/// pattern is refused or bounded before any lock is taken). `None` in, `None`
-/// out; a bad pattern is `ERR badregex`, the `await` spelling.
+/// Compile a leading `if=<re>` guard outside the terminal lock, with the bounded
+/// `aterm_observe::row_matcher` `await match` uses. A bad pattern is `ERR badregex`.
 pub(crate) fn compile_guard(pattern: Option<&str>) -> Result<Option<Arc<dyn RowMatch>>, String> {
     match pattern {
         None => Ok(None),
@@ -823,9 +791,8 @@ pub(crate) fn compile_guard(pattern: Option<&str>) -> Result<Option<Arc<dyn RowM
     }
 }
 
-/// The conditions a fenced write is held to — all checked under the SAME hold of
-/// the terminal lock the write is made under. Every armed condition must hold;
-/// an unarmed one is not consulted.
+/// The conditions a fenced write is held to, all checked under the same hold of the
+/// terminal lock the write is made under. Every armed condition must hold.
 ///
 /// * `generation` (`if-gen=<epoch>.<seq>`): the screen generation
 ///   ([`crate::control::ScreenGen`]) still equals the one the caller read. ANY
@@ -882,8 +849,8 @@ pub(crate) struct InputFence<'a> {
 }
 
 impl InputFence<'_> {
-    /// Whether any condition is armed — the dispatch routes an armed write to
-    /// the fenced arm and leaves an unarmed one on its ordinary path.
+    /// Whether any condition is armed; the dispatch routes only an armed write to the
+    /// fenced arm.
     pub(crate) fn is_armed(&self) -> bool {
         self.guard.is_some()
             || self.generation.is_some()
@@ -941,7 +908,7 @@ impl InputFence<'_> {
     }
 }
 
-/// What a guarded input attempt decided — under ONE hold of the terminal lock.
+/// What a guarded input attempt decided, under one hold of the terminal lock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GuardedInput {
     /// No visible row matched the guard: NOTHING was written.
@@ -999,9 +966,8 @@ pub(crate) fn input_if_fenced_observed(
 ) -> GuardedInput {
     let mut look = ctx.frame.look_frame();
     let terminal = term_lock(term);
-    // A person's hand since the caller's read: asked under the same hold as
-    // the screen fences, ahead of them — "a person keyed" is the more useful
-    // thing to tell a driver than "the screen moved", which it may also have.
+    // A person's hand since the caller's read, asked first under the same hold: "a
+    // person keyed" tells a driver more than "the screen moved".
     if fence.human.is_some_and(|n| ctx.human_input.seq() != n) {
         return GuardedInput::Person;
     }
@@ -1188,8 +1154,8 @@ pub(crate) fn cmd_send_fenced_observed(
     guarded_input_reply(input_if_fenced_observed(term, ctx, ev, fence, completion))
 }
 
-/// `hwkey <char|name> [mods=…] [count=…] [interval=…]` -> inject the key through
-/// the OS EVENT QUEUE instead of the control seam.
+/// `hwkey <char|name> [mods=…] [count=…] [interval=…]` -> inject the key through the OS
+/// event queue instead of the control seam.
 ///
 /// The deliberately different spelling from `key` is the point: the two
 /// verbs are not interchangeable and must never be confused in a measurement.
@@ -1248,10 +1214,8 @@ pub(crate) fn cmd_hwkey(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
 pub(super) const INPUT_QUEUE_FULL: &str =
     "ERR busy input-queue-full: nothing written (the program has not read its queued input)\n";
 
-/// Map a reply-bearing input outcome to a verb reply line. `Ok` (applied) and
-/// `RangeRejected` (out-of-range geometry — not relevant to key/mouse/paste, but
-/// handled for completeness) become OK / ERR; an `Err` (event loop closed / no
-/// window) is already a full `ERR …\n` string.
+/// Map a reply-bearing input outcome to a verb reply line; an `Err` (event loop closed,
+/// no window) is already a full `ERR …\n` line.
 pub(super) fn input_reply_to_str(r: Result<InputOutcome, String>) -> String {
     match r {
         Ok(InputOutcome::Ok) => "OK\n".to_string(),
@@ -1306,21 +1270,15 @@ pub(crate) fn feed_bytes(rest: &str) -> Result<Vec<u8>, &'static str> {
     aterm_codec::hex::decode_vec(hex.as_bytes()).ok_or("ERR bad hex\n")
 }
 
-/// `signal <name> [pid=<n>]` -> deliver a job-control signal to the PTY's
-/// CURRENT foreground process group (via `tcgetpgrp` on the master +
-/// `killpg`). `name` is one of `int`/`c`, `quit`, `tstp`/`z`, `hup`, `term`,
-/// `kill`, `cont`. This makes Ctrl-C/Ctrl-\\/Ctrl-Z effects deliverable and
-/// testable regardless of the line discipline / launch context (which may not
-/// generate them).
+/// `signal <name> [pid=<n>] [quiet=<s>]` -> deliver a job-control signal to the PTY's
+/// foreground process group (`tcgetpgrp` on the master, then `killpg`), whatever the line
+/// discipline would generate. `name` is `int`/`c`, `quit`, `tstp`/`z`, `hup`, `term`,
+/// `kill` or `cont`.
 ///
-/// `pid=<n>` narrows it to ONE process: the signal goes to exactly `n`
-/// (`kill`, not `killpg`), and only while `n` leads the terminal's foreground
-/// process group — otherwise `ERR pid <n> is not the foreground process group`
-/// and nothing is sent. Like every form of the verb it is refused under a
-/// `hold` by the dispatcher, so a caller gets "this exact process, and no
-/// hold" as one server-side decision (the harness's live upgrade concludes a
-/// Claude Code this way; an older server answers the `pid=` form with
-/// `ERR unknown signal`, having sent nothing).
+/// `pid=<n>` sends to exactly `n` (`kill`), and only while `n` leads the foreground group;
+/// otherwise `ERR pid <n> is not the foreground process group` and nothing is sent. Every
+/// form is refused under a `hold` by the dispatcher, so "this exact process, and no hold"
+/// is one server-side decision.
 ///
 /// `quiet=<s>` makes the signal wait for the tab to be left alone, in the
 /// same decision: it is refused `ERR busy person human_ms=<ms>` when a person
@@ -1339,12 +1297,8 @@ pub(crate) fn feed_bytes(rest: &str) -> Result<Vec<u8>, &'static str> {
 /// ([`crate::input_stall::Restart`]) — or, where the act would be carried,
 /// the explicit `restart` ([`crate::restart_act::offered`]).
 ///
-/// POSIX-only: on Windows (no process groups / killpg for a ConPTY) the verb
-/// stays in the table but honestly replies
-/// `ERR signal unsupported on this platform`.
-///
-/// `human_ms` is the session's person stamp at the request (milliseconds since
-/// a person last gave it input; `None`: never), read by the caller.
+/// `human_ms` is the session's person stamp at the request (ms since a person last gave
+/// it input; `None`: never), read by the caller.
 #[cfg(unix)]
 pub(crate) fn cmd_signal(
     master: i32,
@@ -1420,8 +1374,8 @@ pub(crate) fn restart_verb(master: i32, rest: &str, ctx: &std::sync::Arc<Session
     crate::restart_act::restart(master, rest, ctx)
 }
 
-/// PURE parser for `signal <name> [pid=<n>] [quiet=<s>]` → (signal number,
-/// exact pid, quiet seconds).
+/// Pure parser for `signal <name> [pid=<n>] [quiet=<s>]` -> (signal number, exact pid,
+/// quiet seconds).
 #[cfg(unix)]
 pub(crate) fn parse_signal(rest: &str) -> Result<(i32, Option<i32>, Option<u32>), String> {
     let mut words = rest.split_whitespace();
@@ -1456,10 +1410,8 @@ pub(crate) fn parse_signal(rest: &str) -> Result<(i32, Option<i32>, Option<u32>)
     Ok((sig, pid, quiet))
 }
 
-/// Windows arm of the `signal` verb: kept in the verb table so the surface is
-/// total, but job-control signals have no ConPTY analogue — reply with an
-/// honest error (callers wanting Ctrl-C semantics can `feed 03`, which the
-/// ConPTY host cooks into a console Ctrl-C for the foreground app).
+/// Windows arm of the `signal` verb: job-control signals have no ConPTY analogue, so it
+/// refuses (for Ctrl-C, `feed 03`, which the ConPTY host cooks into a console Ctrl-C).
 #[cfg(windows)]
 pub(crate) fn cmd_signal(
     master: i32,
@@ -1473,15 +1425,10 @@ pub(crate) fn cmd_signal(
 
 pub(crate) const MOUSE_USAGE: &str = "ERR usage: mouse <press|release|move|wheelup|wheeldown|wheelleft|wheelright> <left|middle|right|back|forward> <row> <col> [mods=..] [count=N] [side=left|right] [block=0|1] [lines=N]\n";
 
-/// Upper bound on a single `mouse wheelup|wheeldown` verb's `lines=N`. The seam
-/// emits ONE wheel report per line under a tracking app, so an unbounded count
-/// would let one verb line flood the PTY; 512 covers a large flick (many screens)
-/// while keeping the burst bounded. The seam separately clamps `lines >= 1`.
-///
-/// Defined as the seam's own [`crate::input::MAX_WHEEL_BURST`] rather than a second
-/// 512: the seam has a SECOND per-event burst to bound now (the DEC-1007 alt-scroll
-/// arrows, whose count is the platform's lines-per-detent and so is no longer
-/// bounded by `lines` alone), and the two ceilings must not drift apart.
+/// Upper bound on one wheel `mouse` verb's `lines=N`: the seam emits one wheel report per
+/// line under a tracking app, so an unbounded count would flood the PTY. It is the seam's
+/// own [`crate::input::MAX_WHEEL_BURST`], which also bounds the DEC 1007 alt-scroll
+/// arrows, so the two ceilings cannot drift apart.
 const MAX_WHEEL_LINES: i32 = crate::input::MAX_WHEEL_BURST;
 
 /// Pure parser for the `mouse` verb -> an engine-neutral mouse [`InputEvent`].
@@ -1550,9 +1497,8 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
         } else if let Some(b) = tok.strip_prefix("block=") {
             block = matches!(b, "1" | "true" | "yes" | "block");
         } else if let Some(l) = tok.strip_prefix("lines=") {
-            // Wheel-notch count for wheelup/wheeldown. A non-positive or
-            // non-numeric value falls back to 1; the magnitude is clamped so one
-            // verb line cannot flood the PTY with reports.
+            // A non-positive or non-numeric count is 1; clamped so one line cannot
+            // flood the PTY.
             wheel_lines = l.parse::<i32>().unwrap_or(1).clamp(1, MAX_WHEEL_LINES);
         } else if action.is_empty() {
             action = tok;
@@ -1577,8 +1523,8 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
         }
     };
     let ev = match action {
-        // `move` with two positionals = no-button hover (code 3); with three =
-        // `<button> <row> <col>` held-button drag (kills divergence c at the verb).
+        // `move` with two positionals is a no-button hover (code 3); with three, a
+        // held-button drag.
         "move" => match positional.as_slice() {
             [r, c] => {
                 let (row, col) = parse_rc(r, c)?;
@@ -1609,8 +1555,7 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
             let [b, r, c] = positional.as_slice() else {
                 return Err(MOUSE_USAGE.to_string());
             };
-            // `button` is ignored for the wheel actions but still required as a
-            // positional (byte-compatible with the old `<button> <row> <col>` form).
+            // `button` is ignored for the wheel actions but still required.
             let button = parse_btn(b)?;
             let (row, col) = parse_rc(r, c)?;
             match action {
@@ -1642,9 +1587,7 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
                     suppress_copy_on_select: false,
                     px_off: crate::input::PixelOffset::CELL_ORIGIN,
                 },
-                // The wheel's four directions share one arm: only `dir` differs,
-                // and the `_` catch-all is `wheeldown` (the outer match already
-                // fenced the action set, so no other string can reach here).
+                // The outer match fenced the action set, so `_` is `wheeldown`.
                 wheel => InputEvent::Wheel {
                     dir: match wheel {
                         "wheelup" => WheelDir::Up,
@@ -1669,10 +1612,10 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
 }
 
 /// `mouse <action> <button> <row> <col> [mods=..] [count=N] [side=left|right]
-/// [block=0|1]` -> BUILD an engine-neutral mouse [`InputEvent`] (via [`parse_mouse`])
-/// and post it to the seam, which reads the CURRENT mouse mode ONCE and either
-/// emits the `encode_mouse_*` report (tracking ON) or runs the local selection
-/// gesture (tracking OFF).
+/// [block=0|1]` -> post [`parse_mouse`]'s event to the seam, which reads the current
+/// mouse mode once and either emits the `encode_mouse_*` report (tracking on) or runs the
+/// human's local selection gesture (tracking off). Reply-bearing: `OK` once the seam
+/// applied it, `ERR input dispatch failed: …` with no frontmost window.
 ///
 /// PURE control-authority decision: whether a `mouse`-verb gesture from `scope`
 /// must have its copy-on-select CLIPBOARD side-effect suppressed. Only a NON-OWNER
@@ -1749,9 +1692,8 @@ pub(crate) fn paste_event(rest: &str) -> InputEvent {
     InputEvent::Paste(paste_text(rest), crate::input::PasteFraming::AtDrain)
 }
 
-/// The `paste` verb's text transform: a literal trailing `\n` (backslash + n)
-/// becomes a real line break (sent as CR by `format_paste`). Pure, so the
-/// bracketing/sanitize bytes stay unit-testable without an event loop.
+/// The `paste` verb's text: a literal trailing `\n` (backslash + n) becomes a real line
+/// break, which `format_paste` sends as CR.
 pub(crate) fn paste_text(rest: &str) -> String {
     match rest.strip_suffix("\\n") {
         Some(head) => format!("{head}\n"),
@@ -1773,10 +1715,8 @@ pub(crate) fn parse_focus(rest: &str) -> Option<bool> {
     }
 }
 
-/// Parse a `tab <arg>` request into the [`TabAction`] it drives (the PURE part, so
-/// it is unit-testable without an event loop). Grammar: `new` opens a tab, a
-/// 0-based integer `<N>` selects tab N, `next`/`prev` cycle. `None` (an unknown /
-/// missing arg) maps the caller to the usage error.
+/// Parse `tab <arg>` into its [`TabAction`]: `new`, a 0-based `<N>`, `next`/`prev`,
+/// `close [N]`, `move <from> <to>`. `None` is the usage error.
 pub(crate) fn parse_tab(rest: &str) -> Option<TabAction> {
     let rest = rest.trim();
     // Multi-word forms first: `close [N]` and `move <from> <to>`.
@@ -1830,24 +1770,17 @@ pub(crate) fn no_such_tab(index: usize, count: usize) -> String {
     }
 }
 
-/// `tab new | <N> | next | prev | close [N] | move <from> <to>` -> DRIVE the FRONT window's tabs and reply
-/// `OK <active_index> <tab_count>` when the action HAPPENED, or `ERR <why>` when
-/// it did not — an index no tab holds, a host that declined the close, or a
-/// `close` refused by a running foreground job, the `close` verb's guard: `ERR
-/// close refused (a running job armed the last-tab confirm)` for the window's
-/// last tab (the `close` verb's exact words), `ERR close refused (a running
-/// job in that tab)` for a tab among several (`App::tab_cmd_front` runs the
-/// same `WireRefuseBusy` policy; a `--headless` instance never confirms, so it
-/// never answers either).
+/// `tab new | <N> | next | prev | close [N] | move <from> <to>` -> drive the front window's
+/// tabs and reply `OK <active_index> <tab_count>` when the action happened, or `ERR <why>`:
+/// an index no tab holds, a host that declined the close, or a `close` refused by a
+/// running foreground job (`ERR close refused (a running job armed the last-tab confirm)`
+/// for the last tab, `ERR close refused (a running job in that tab)` among several;
+/// `App::tab_cmd_front` runs the same `WireRefuseBusy` policy).
 ///
-/// MAIN-THREAD HOP (mirrors [`cmd_chrome`]): mutating `App` (its tabs) may ONLY
-/// happen on the event loop, but this runs on a background control thread. So we
-/// parse the action, post [`Wake::TabCmd`] with a one-shot reply channel, and BLOCK
-/// on the reply; the main thread resolves `self.frontmost_window`, applies the
-/// action via the SAME command paths the keyboard/menu use (`open_tab` / `switch_tab`
-/// / `cycle_tab`), and sends back the resulting `(active, count)`. `new` reuses the
-/// new-tab path; the native toolbar segments then re-track via `App::sync_window`.
-/// `by` is the caller, the exit ledger's `by=` for a session `close` retires.
+/// `App` is mutated only on the event loop, so this posts [`Wake::TabCmd`] and blocks on
+/// the reply, as `cmd_chrome` does; the main thread applies the action through the
+/// keyboard/menu paths (`open_tab`, `switch_tab`, `cycle_tab`). `by` is the caller, the
+/// exit ledger's `by=` for a session `close` retires.
 pub(crate) fn cmd_tab(
     proxy: &EventLoopProxy<Wake>,
     rest: &str,
@@ -1858,18 +1791,15 @@ pub(crate) fn cmd_tab(
     };
     match super::control_media::call_main(proxy, |reply| Wake::TabCmd { action, by, reply }) {
         Ok(Ok((active, count))) => format!("OK {active} {count}\n"),
-        // A REFUSED action says so, in the same vocabulary the aimed twin
-        // (`cmd_tab_aimed`) and the sibling `@<sid> close` verb already use.
+        // A refused action says so, in the words of `cmd_tab_aimed` and `@<sid> close`.
         Ok(Err(why)) => format!("ERR {why}\n"),
         Err(error) => format!("ERR tab command failed: {error}\n"),
     }
 }
 
-/// `hover <on|off>` — toggle the drag-and-drop drop-target highlight on the
-/// frontmost window. Testing/automation of the drop affordance (a real drag drives
-/// the same flag); also lets `aterm-ctl image` capture the highlight headlessly.
-/// Resolved on the main thread ([`Wake::SetDragHover`]) since it targets the front
-/// window. Replies `OK`, `ERR no window`, or a usage error.
+/// `hover <on|off>` -> toggle the drag-and-drop drop-target highlight on the front window
+/// (the flag a real drag drives) on the main thread ([`Wake::SetDragHover`]), so the drop
+/// affordance can be driven and captured headlessly.
 pub(crate) fn cmd_hover(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let hovering = match rest.trim() {
         "on" | "1" | "true" => true,
@@ -1883,13 +1813,9 @@ pub(crate) fn cmd_hover(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// The `find <sub…>` grammar, PURE so it is unit-testable without an event loop
-/// (the discipline [`parse_tab`] / [`parse_resize`] follow). `Err` is the exact
-/// usage line the verb replies with.
-///
-/// `type`'s payload is the rest of the line VERBATIM after the single separating
-/// space — a find query may legitimately begin or end with one, and `split_once`
-/// keeps it, where a `split_whitespace` rejoin would quietly normalize it away.
+/// Pure parser for `find <sub…>`; `Err` is the usage line the verb replies with. `type`'s
+/// payload is the rest of the line verbatim after the one separating space, so a query
+/// may begin or end with a space.
 pub(crate) fn parse_find(rest: &str) -> Result<crate::app_search::FindAction, String> {
     use crate::app_search::{FindAction, SearchEdit};
     let rest = rest.trim_start();
@@ -1897,9 +1823,8 @@ pub(crate) fn parse_find(rest: &str) -> Result<crate::app_search::FindAction, St
         Some((head, tail)) => (head, Some(tail)),
         None => (rest, None),
     };
-    // Every no-argument form rejects a trailing argument rather than ignoring it:
-    // `find next 3` is a request this verb cannot honour, and answering `OK` to it
-    // would report a single step as though it had been three.
+    // A no-argument form refuses a trailing argument: `OK` to `find next 3` would report
+    // one step as three.
     let bare = |action: FindAction| -> Result<FindAction, String> {
         match tail {
             None | Some("") => Ok(action),
@@ -1950,13 +1875,9 @@ pub(crate) fn parse_find(rest: &str) -> Result<crate::app_search::FindAction, St
     }
 }
 
-/// `find <sub…>` -> drive the FRONT window's find bar and report what it became.
-///
-/// The action is resolved on the MAIN thread ([`Wake::FindCmd`]) because the find
-/// bar is `App` state and every arm of [`crate::App::find_cmd`] is the keystroke
-/// handler's own function. The reply is formatted from the state read back AFTER
-/// the action ran, so it describes the bar as it now is rather than as the request
-/// asked for it to be.
+/// `find <sub…>` -> drive the front window's find bar on the main thread
+/// ([`Wake::FindCmd`]; [`crate::App::find_cmd`]'s arms are the keystroke handler's own
+/// functions) and reply with the bar's state read back after the action.
 pub(crate) fn cmd_find(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let action = match parse_find(rest) {
         Ok(action) => action,
@@ -1969,24 +1890,17 @@ pub(crate) fn cmd_find(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// Format a [`crate::app_search::FindStatus`] as the `find` verb's reply.
-///
-/// PURE, and separated from the RPC so the one property that matters here is
-/// testable without a window: an absent match must print `-` and never a
-/// coordinate. `row`/`col`/`len` and `current` come from `Option`s, so there is no
-/// value the formatter could substitute for a match that does not exist.
+/// Format a [`crate::app_search::FindStatus`] as the `find` reply. An absent match prints
+/// `-`, never a coordinate: `row`/`col`/`len` and `current` come from `Option`s.
 pub(crate) fn find_status_line(status: &crate::app_search::FindStatus) -> String {
     if !status.open {
         return "OK open=0\n".to_string();
     }
     let bit = |b: bool| u8::from(b);
-    // A LENGTH ON THE WIRE, because `search` reports one and a driver comparing the
-    // two verbs must not have to know that one of them silently means something
-    // else. `SearchState::matches` carries `(row, start_col, end_col)` with `end_col`
-    // INCLUSIVE and deliberately unclamped — a hit that straddles a soft wrap runs
-    // past the grid width by exactly the part on the next row — so the length is
-    // `end - start + 1` and it, too, may exceed the width. That is the same
-    // `col + len` overrun `search`'s own help documents as the continuation marker.
+    // A length on the wire, as `search` reports. `SearchState::matches` carries
+    // `(row, start_col, end_col)` with `end_col` inclusive and unclamped (a hit across a
+    // soft wrap runs past the width by the part on the next row), so the length is
+    // `end - start + 1` and may exceed the width, as `search`'s continuation marker does.
     let (row, col, len) = match status.current_match {
         Some((row, start, end)) => (
             row.to_string(),
@@ -1997,9 +1911,7 @@ pub(crate) fn find_status_line(status: &crate::app_search::FindStatus) -> String
     };
     let current = status
         .current
-        // 1-BASED on the wire, because it is the same "3 of 7" the find bar and the
-        // window title show; a driver comparing the two must not have to know that
-        // one of them silently counts from zero.
+        // 1-based, the "3 of 7" the find bar and the window title show.
         .map_or_else(|| "-".to_string(), |i| (i + 1).to_string());
     format!(
         "OK open=1 query={} case={} regex={} regex_error={} matches={} current={current} \
@@ -2010,16 +1922,13 @@ pub(crate) fn find_status_line(status: &crate::app_search::FindStatus) -> String
         bit(status.regex_error),
         status.matches,
         bit(status.truncated),
-        // The same `…` the bar paints: the terminal moved since `matches` was
-        // counted. A driver that reads the pair without it is reading a census
-        // of a screen that no longer exists — and the count is the one thing
-        // this verb exists to report, so it must never be stated unqualified.
+        // The bar's `…`: the terminal moved since `matches` was counted, so the count
+        // is never stated unqualified.
         bit(status.stale),
     )
 }
 
-/// PURE parser for `pane <left|right|up|down>`, split out for the same reason
-/// [`parse_focus`] is: the grammar is testable without an event loop.
+/// Pure parser for `pane <left|right|up|down>`.
 pub(crate) fn parse_pane_dir(rest: &str) -> Option<crate::pane::FocusDir> {
     match rest.trim() {
         "left" => Some(crate::pane::FocusDir::Left),
@@ -2030,14 +1939,10 @@ pub(crate) fn parse_pane_dir(rest: &str) -> Option<crate::pane::FocusDir> {
     }
 }
 
-/// `pane <left|right|up|down>` -> move keyboard focus to the adjacent pane of the
-/// front window's active tab, through the SAME `focus_pane_in` the `focus_pane_*`
-/// key bindings run, and reply `OK moved=<0|1>`.
-///
-/// `moved=0` is not an error: a single-pane tab and an edge pane are both ordinary
-/// answers to "is there a pane that way", and they are the ONLY two ways the walk
-/// declines. What the reply deliberately does not carry is the layout — `panes`
-/// (read-side) owns that, and a write edge has no read authority to spend here.
+/// `pane <left|right|up|down>` -> move keyboard focus to the adjacent pane of the front
+/// window's active tab through `focus_pane_in` (the `focus_pane_*` bindings' path) and
+/// reply `OK moved=<0|1>`. `moved=0` (a single pane, an edge pane) is an answer, not an
+/// error. The layout is `panes`' to report: a write edge has no read authority here.
 pub(crate) fn cmd_pane(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let Some(dir) = parse_pane_dir(rest) else {
         return "ERR usage: pane <left|right|up|down>\n".to_string();
@@ -2291,13 +2196,9 @@ pub(crate) fn cmd_pointer(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// Parse + range-check a `resize <r> <c>` request (the PURE part, so it is unit
-/// testable without an event loop). Returns the validated `(rows, cols)` or the
-/// exact error string the verb replies with.
-///
-/// Requests outside `1..=MAX_GRID_ROWS`/`MAX_GRID_COLS` are rejected with
-/// `ERR out of range` rather than silently clamped, so a caller learns its
-/// requested size was not applied.
+/// Parse and range-check `resize <r> <c>`: the validated `(rows, cols)` or the reply line.
+/// A size outside `1..=MAX_GRID_ROWS`/`MAX_GRID_COLS` is `ERR out of range`, never
+/// clamped.
 pub(crate) fn parse_resize(rest: &str) -> Result<(u16, u16), String> {
     let mut it = rest.split_whitespace();
     let (Some(rs), Some(cs)) = (it.next(), it.next()) else {
@@ -2327,15 +2228,10 @@ pub(crate) fn parse_resize(rest: &str) -> Result<(u16, u16), String> {
 /// interactive winit `Resized` path uses `echo_to_window: false` (the window is
 /// already that size). `echo_to_window` is a transport flag, not a `Source` branch.
 pub(crate) fn cmd_resize(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
-    // `resize px <w> <h>` — resize the WINDOW, in physical pixels, and let the grid
-    // follow from the platform's `Resized` exactly as an edge drag does.
-    //
-    // The cell form below cannot reach the drag path: it applies the grid first and
-    // echoes the pixel size after, so the window event arrives with the columns
-    // already correct and the live-resize throttle sees no reflow. That left the
-    // width-throttle arms — coalescing, the trailing settle, the leading-edge apply
-    // — drivable only by a hand on the window edge, and therefore unmeasurable.
-    // Fire several of these back to back to reproduce a drag's event pressure.
+    // `resize px <w> <h>` resizes the window in physical pixels and the grid follows from
+    // the platform's `Resized`, as an edge drag does. The cell form applies the grid first
+    // and echoes the pixel size after, so the live-resize throttle sees no reflow; the px
+    // form is what drives the throttle. Several back to back reproduce a drag's pressure.
     if let Some(event) = parse_resize_px(rest) {
         return match event {
             Err(usage) => usage,
@@ -2346,10 +2242,8 @@ pub(crate) fn cmd_resize(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
             },
         };
     }
-    // Range-check up front (keeps the precise `ERR out of range` / usage strings),
-    // then post a reply-bearing Resize through the seam. The seam re-clamps and
-    // reports `RangeRejected` if somehow out of range — but a valid request here
-    // returns `Ok`, so the contract is unchanged for existing callers.
+    // Range-check up front for the precise `ERR out of range`/usage replies; the seam
+    // re-clamps and answers `RangeRejected` for anything that slips past.
     let (r, c) = match parse_resize(rest) {
         Ok(rc) => rc,
         Err(e) => return e,
@@ -2368,16 +2262,10 @@ pub(crate) fn cmd_resize(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// Parse the WINDOW form of `resize` — `px <w> <h>` — into the event that posts
-/// it, or `None` when `rest` names the CELL form the caller parses with
-/// [`parse_resize`].
-///
-/// The two forms address different things and therefore route differently: the
-/// px form asks the OS window for a size (no engine state at all), while the
-/// cell form resizes the engine and the PTY. Three routers now have to tell them
-/// apart — [`cmd_resize`], the front-routed cross-session twin, and the
-/// native-front window lane — so the spelling of the px form and the two `ERR`
-/// strings it can produce live here once instead of beside each router.
+/// Parse `resize px <w> <h>` (the window form) into its event, or `None` for the cell form
+/// ([`parse_resize`]). The px form asks the OS window for a size and touches no engine
+/// state; it is spelled here once for its three routers ([`cmd_resize`], the front-routed
+/// cross-session twin, the native-front window lane).
 pub(crate) fn parse_resize_px(rest: &str) -> Option<Result<InputEvent, String>> {
     let px = rest.trim().strip_prefix("px")?;
     let mut it = px.split_whitespace();
@@ -2398,13 +2286,9 @@ pub(crate) fn parse_resize_px(rest: &str) -> Option<Result<InputEvent, String>> 
 pub(crate) const RESIZE_PX_FRONT_ONLY: &str =
     "ERR resize px: only the focused pane of the front window's active tab\n";
 
-/// The reply a cross-session `resize` gives when `rest` is the px form and
-/// the target is NOT the focused pane of the front window's active tab —
-/// `None` when `rest` is the cell form, which the background arm goes on to
-/// apply. Any px
-/// spelling is refused by TARGET before its arguments are read: the form is
-/// unavailable here, so a malformed one is not told a different thing than a
-/// well-formed one.
+/// The reply a cross-session `resize` gives for the px form on a target that is not the
+/// front window's focused pane; `None` for the cell form, which the background arm
+/// applies. Any px spelling is refused by target before its arguments are read.
 pub(crate) fn cross_resize_px_refusal(rest: &str) -> Option<String> {
     parse_resize_px(rest).map(|_| RESIZE_PX_FRONT_ONLY.to_string())
 }
@@ -2431,9 +2315,8 @@ mod tests {
             parse_signal("term quiet=0"),
             Ok((libc::SIGTERM, None, Some(0)))
         );
-        // What an OLDER server answers for the pid= form, having sent
-        // nothing — the harness's fallback detector — stays the answer for
-        // an unknown name.
+        // `ERR unknown signal`, which the harness reads as a server without `pid=`,
+        // stays the answer for an unknown name.
         assert_eq!(
             parse_signal("nope pid=5"),
             Err("ERR unknown signal: nope pid=5\n".to_string())
@@ -2628,13 +2511,13 @@ mod tests {
             take_leading_options(input_of("send"), "id=a:b:c hello there"),
             (opts(Some("a:b:c"), None), "hello there")
         );
-        // NOT the first token ⇒ argument data, byte-identical to before.
+        // Not the first token: argument data.
         assert_eq!(
             take_leading_options(input_of("send"), "hello id=a:b:c"),
             (opts(None, None), "hello id=a:b:c")
         );
-        // A body with no leading option is returned BYTE FOR BYTE — leading
-        // whitespace included, because `send` bodies are raw.
+        // A body with no leading option is returned byte for byte, leading whitespace
+        // included: `send` bodies are raw.
         assert_eq!(
             take_leading_options(input_of("send"), "  two spaces"),
             (opts(None, None), "  two spaces")
@@ -2772,7 +2655,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Remedy {
-        /// A bare `killpg(SIGTERM)`: the remedy as it was, the control.
+        /// A bare `killpg(SIGTERM)`: the negative control.
         BareKillpg,
         /// `signal term`, through the verb.
         Verb,
@@ -2791,10 +2674,9 @@ mod tests {
         ThroughASpill,
     }
 
-    /// One run of the hazard: returns whether the typed line RAN in the
-    /// shell, and the verb's reply for a [`Remedy`] that goes through it. The marker that proves the shell is
-    /// back is written through the sink, as a later key from the window or a
-    /// driver would be.
+    /// One run of the hazard: whether the typed line ran in the shell, and the verb's reply
+    /// for a [`Remedy`] that goes through it. The marker proving the shell is back goes
+    /// through the sink, as a later key would.
     #[cfg(target_os = "macos")]
     fn typeahead_after_restart(remedy: Remedy, typed: Typed) -> (bool, Option<String>) {
         use aterm_uds::spawnfd::InheritNothing as _;
@@ -2872,8 +2754,7 @@ mod tests {
             let seen = seen.lock().expect("seen");
             seen.windows(needle.len()).any(|w| w == needle.as_bytes())
         };
-        // What the shell draws MUST come: a hang detector, never a 10 s budget
-        // an interactive shell's start overruns on a loaded machine.
+        // What the shell draws must come: a hang detector, not a latency budget.
         let wait_for = |what: &str, done: &dyn Fn() -> bool| {
             let drawn = aterm_spec::wait::within(
                 aterm_spec::wait::MUST_HAPPEN,
@@ -2948,10 +2829,9 @@ mod tests {
         let reply = match remedy {
             Remedy::Verb => Some(cmd_signal(master, "term", &sink, None)),
             Remedy::VerbPid => {
-                // `quiet=` (the live upgrade's restart): refused while input
-                // someone wrote sits unread, and while a person's keystroke
-                // is inside the grace — nothing sent, nothing dropped. A
-                // stamp past the grace holds nothing of its own.
+                // `quiet=` refuses while written input sits unread or a person's key is
+                // inside the grace, sending and dropping nothing; a stamp past the grace
+                // holds nothing of its own.
                 let unread = sink.input_backlog().expect("measured").unread();
                 assert_eq!(
                     cmd_signal(master, &format!("term pid={pgrp} quiet=0"), &sink, None),
@@ -3258,10 +3138,9 @@ mod tests {
         assert!(KEY_USAGE.contains("[if-human=<n>]"), "{KEY_USAGE}");
     }
 
-    /// `if-gen=<epoch>.<seq>` parses to the screen generation `status gen=`
-    /// prints, composes with the other options, and refuses any other shape. The
-    /// retired `if-seq=` is taken off the tail and REFUSED — on `send` too, where
-    /// an unrecognized option would have been typed into the agent as text.
+    /// `if-gen=<epoch>.<seq>` parses to the generation `status gen=` prints, composes with
+    /// the other options, and refuses any other shape. A leading `if-seq=` is taken and
+    /// refused, on `send` too, never typed as text.
     #[test]
     fn if_gen_is_the_fence_and_if_seq_is_refused_not_typed() {
         use crate::control::ScreenGen;
@@ -3329,13 +3208,9 @@ mod tests {
             "OK open=1 query=needle case=0 regex=0 regex_error=0 matches=0 current=- \
              row=- col=- len=- truncated=0 stale=0\n"
         );
-        // A match present is reported as itself, 1-based like the find bar's own
-        // "3 of 7" — so the pin above is about ABSENCE, not about a dead formatter.
-        //
-        // The fixture is a REACHABLE match: `current_match` carries `(row, start_col,
-        // end_col)` with `end_col` inclusive, so an end below its own start is a value
-        // the engine cannot produce, and a fixture shaped that way would bless a
-        // formatter that reads the third field as a length.
+        // A present match is reported 1-based, so the pin above is about absence. The
+        // fixture is reachable (`end_col` inclusive, not below the start), so a formatter
+        // that read the third field as a length would fail.
         let line = find_status_line(&crate::app_search::FindStatus {
             open: true,
             query: "needle".to_string(),
@@ -3350,9 +3225,8 @@ mod tests {
         );
     }
 
-    /// A count the terminal has moved past reaches the wire QUALIFIED, exactly as
-    /// it reaches the glass. The pair is still reported — it is the last real
-    /// census and a driver may want it — but never as the present one.
+    /// A count the terminal has moved past is still reported, marked `stale=1` as the bar
+    /// marks it.
     #[test]
     fn a_find_reply_marks_a_count_the_terminal_has_already_moved_past() {
         let counted = crate::app_search::FindStatus {
@@ -3414,9 +3288,7 @@ mod tests {
         );
     }
 
-    /// A bare form REFUSES a trailing argument instead of ignoring it: `find next 3`
-    /// asks for something the verb cannot do, and answering `OK` would report one
-    /// step as though it had been three.
+    /// A bare form refuses a trailing argument instead of ignoring it.
     #[test]
     fn a_bare_find_form_refuses_an_argument_it_cannot_honour() {
         for line in ["next 3", "prev 2", "open now", "cancel please", "case on"] {
@@ -3425,8 +3297,7 @@ mod tests {
                 "find {line:?} must not be accepted"
             );
         }
-        // …and the bare forms themselves still parse, so the guard is not a blanket
-        // rejection of the whole sub-grammar.
+        // …and the bare forms still parse.
         use crate::app_search::FindAction;
         assert_eq!(parse_find("next"), Ok(FindAction::Step { forward: true }));
         assert_eq!(parse_find("prev"), Ok(FindAction::Step { forward: false }));
@@ -3434,9 +3305,7 @@ mod tests {
         assert_eq!(parse_find(""), Ok(FindAction::Status));
     }
 
-    /// `pointer move` REFUSES a cell outside the addressable grid rather than
-    /// clamping it: a clamped move answered `OK` would tell the caller the pointer
-    /// went where it asked when it went somewhere else.
+    /// `pointer move` refuses a cell outside the addressable grid rather than clamping it.
     #[test]
     fn pointer_move_refuses_a_cell_it_cannot_address() {
         use crate::app_mouse::PointerAction;
@@ -3587,10 +3456,8 @@ mod tests {
         }
     }
 
-    /// `lines=N` reaches `InputEvent::Wheel.lines` for the wheel actions: absent it
-    /// defaults to 1 (the pre-existing one-notch behaviour), an explicit count is
-    /// carried through, and the magnitude is clamped to `1..=MAX_WHEEL_LINES` with a
-    /// non-positive / non-numeric value falling back to 1.
+    /// `lines=N` reaches `InputEvent::Wheel.lines`: absent it is 1, and it is clamped to
+    /// `1..=MAX_WHEEL_LINES`, a non-positive or non-numeric value falling back to 1.
     #[test]
     fn parse_mouse_wheel_lines() {
         let Ok(InputEvent::Wheel { lines, dir, .. }) = parse_mouse("wheeldown left 2 4 lines=8")
@@ -3599,7 +3466,7 @@ mod tests {
         };
         assert_eq!(lines, 8);
         assert_eq!(dir, aterm_types::mouse::WheelDir::Down);
-        // No token: the default stays 1 (byte-compatible with the old grammar).
+        // No token: one notch.
         let Ok(InputEvent::Wheel { lines, .. }) = parse_mouse("wheelup left 2 4") else {
             panic!("bare wheelup parses");
         };
@@ -3664,8 +3531,7 @@ mod video_keys_ledger_tests {
     /// seam as `InputEvent::KeySequence`, so `video … keys` logs them.
     #[test]
     fn video_keys_ledger_logs_the_send_and_feed_verbs() {
-        // `send 'ls\n'` — the submit form the recipe documents. The trailing
-        // literal `\n` normalizes to CR, the byte Return sends.
+        // `send 'ls\n'`, the documented submit form: the literal `\n` becomes CR.
         let bytes = send_bytes("ls\\n");
         assert_eq!(bytes, b"ls\r".to_vec(), "the verb's bytes, not a stand-in");
         let mut log = Vec::new();
@@ -3697,8 +3563,8 @@ mod video_keys_ledger_tests {
             "`feed` bytes are attempts on the frame clock too"
         );
 
-        // NON-UTF-8 is still an attempt, never a panic and never a drop: one
-        // replacement per maximal invalid subpart, matching from_utf8_lossy.
+        // Non-UTF-8 is still an attempt, never a panic or a drop: one replacement per
+        // maximal invalid subpart, as from_utf8_lossy does.
         let raw = [b'a', 0xff, 0xfe, b'b'];
         let mut lossy = Vec::new();
         let _ = record_controller_video_attempts(
@@ -3745,7 +3611,7 @@ mod video_keys_ledger_tests {
             ("backspace", VideoInputSample::Named(NamedKey::Backspace)),
             ("f1", VideoInputSample::Named(NamedKey::F1)),
             ("pagedown", VideoInputSample::Named(NamedKey::PageDown)),
-            // The character-bearing three keep their historical shape.
+            // The three with an unambiguous character keep it.
             ("enter", VideoInputSample::Char('\n')),
             ("tab", VideoInputSample::Char('\t')),
             ("space", VideoInputSample::Char(' ')),
@@ -3764,8 +3630,8 @@ mod video_keys_ledger_tests {
         );
         assert_eq!(video_sample_for_key(&Key::Named(NamedKey::CapsLock)), None);
 
-        // index.json shape: `ch` for characters, `key` for named — both valid
-        // JSON fragments, with control characters escaped.
+        // index.json shape: `ch` for characters, `key` for named, control characters
+        // escaped.
         assert_eq!(
             VideoInputSample::Named(NamedKey::ArrowUp).json_field(),
             "\"key\":\"ArrowUp\""
@@ -3782,18 +3648,10 @@ mod video_keys_ledger_tests {
         );
     }
 
-    /// The disclosure must not cry wolf. `unlogged_inputs` is the count of
-    /// attempts the ledger WOULD have recorded, so an event it never records
-    /// anyway must contribute nothing: a cross-session `focus` reaching the same
-    /// control-thread arm as `key` would otherwise push the count above zero and
-    /// make `index.json` announce a MEASUREMENT GAP for a take that had none —
-    /// the silent zero's mistake pointed the other way.
-    ///
-    /// Asserted on the PURE classifier, not on the process-wide counter: that
-    /// counter is shared with every other test in this binary (the sibling
-    /// wiring test above drives fifteen egresses through it), so an exact
-    /// before/after assertion on it is a race, not a proof. This one is exact
-    /// because it shares no state.
+    /// `unlogged_inputs` counts attempts the ledger would have recorded, so an event it
+    /// never records (a cross-session `focus`, a bare modifier) adds nothing and
+    /// `index.json` announces no measurement gap for it. Asserted on the pure classifier:
+    /// the process-wide counter is shared with every test in this binary.
     #[test]
     fn unloggable_counter_ignores_events_the_ledger_never_records() {
         for quiet in [
@@ -3814,8 +3672,7 @@ mod video_keys_ledger_tests {
             );
         }
 
-        // A real attempt on the same arm still counts, so the gate is a
-        // classifier and not an off switch.
+        // A real attempt on the same arm still counts: a classifier, not an off switch.
         assert_eq!(
             crate::video_attempt_count(&InputEvent::Text("ab".into())),
             2,

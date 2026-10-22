@@ -40,8 +40,7 @@ fn selected_text(term: &Terminal) -> String {
         .expect("a live selection must resolve to text")
 }
 
-/// …and the same op must still clear a selection that is inside the region.
-/// Over-clearing is safe; leaving a highlight over replaced content is not.
+/// The same op clears a selection inside the region.
 #[test]
 fn a_region_scroll_clears_a_selection_inside_it() {
     let mut term = Terminal::new(24, 40);
@@ -607,9 +606,9 @@ fn appending_to_the_selected_row_spares_the_highlight() {
     );
 }
 
-/// A fifth band: the accumulator holds eight bands and past that merges the
-/// closest pair rather than collapsing to the hull, so a box border drawn in
-/// pieces and then filled keeps its gaps.
+/// Five disjoint repaints stay five bands: the set holds eight and past that merges the
+/// closest pair rather than collapsing to the hull, so a box border drawn in pieces keeps its
+/// gaps.
 #[test]
 fn a_fifth_disjoint_repaint_still_spares_the_gap_between_them() {
     let mut term = Terminal::new(24, 40);

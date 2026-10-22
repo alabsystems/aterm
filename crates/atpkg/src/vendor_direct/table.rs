@@ -711,10 +711,10 @@ pub fn served_here(program: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// THE WARM NEVER STARTS A TURN: claude's warm is print mode over a stdin
-    /// the warm never writes — never `--bare` or `--init-only`, which skip or race the
-    /// fetches it exists for — with no transcript and no hooks; and no warm argv carries a
-    /// free operand, which print mode would send as a prompt.
+    /// The warm never starts a turn: claude's is print mode over a stdin it never writes —
+    /// never `--bare` or `--init-only`, which skip or race the fetches it exists for — with
+    /// no transcript and no hooks; no warm argv carries a free operand, which print mode
+    /// would send as a prompt.
     #[test]
     fn the_warm_argv_refreshes_caches_and_never_prompts() {
         let claude = spec("claude").unwrap().warm.unwrap().argv;

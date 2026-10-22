@@ -739,23 +739,37 @@ impl App {
 }
 
 fn wait_for_cancellations(receipts: Vec<CancelCompletion>) -> Result<(), &'static str> {
+    wait_for_cancellations_until(receipts, Instant::now() + Duration::from_secs(5))
+}
+
+/// Shutdown gets one short, total grace period for Cancel receipts. A stuck
+/// worker or system prompt must not hold Quit hostage: at the deadline the
+/// unsaved cancel is reported and shutdown proceeds.
+fn wait_for_cancellations_until(
+    receipts: Vec<CancelCompletion>,
+    deadline: Instant,
+) -> Result<(), &'static str> {
     let mut failed = false;
     for receipt in receipts {
         if let Some(complete) = receipt.poll() {
             failed |= !complete;
             continue;
         }
-        loop {
-            match receipt.answer.recv_timeout(Duration::from_secs(60)) {
-                Ok(()) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    aterm_log::info!("Waiting for Cancel to be saved before quitting");
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    failed = true;
-                    break;
-                }
+        let Some(remaining) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            failed = true;
+            break;
+        };
+        match receipt.answer.recv_timeout(remaining) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                aterm_log::warn!("Cancel was not saved before the shutdown deadline; quitting");
+                failed = true;
+                break;
             }
+            Err(mpsc::RecvTimeoutError::Disconnected) => failed = true,
         }
     }
     if failed {
@@ -1648,6 +1662,15 @@ mod tests {
             assert!(app.finish_system_state_shutdown().is_err());
             assert!(worker.join().unwrap().is_ok());
         }
+    }
+
+    #[test]
+    fn cancel_shutdown_refuses_an_unsaved_receipt_after_its_deadline() {
+        let (_send, receive) = mpsc::channel();
+        let deadline = Instant::now();
+        assert!(
+            wait_for_cancellations_until(vec![CancelCompletion::new(receive)], deadline).is_err()
+        );
     }
 
     #[test]

@@ -75,13 +75,9 @@ fn signed_out(labels: &[&str]) -> Entry {
     accounts_signed_out_entry(&labels).expect("a label is an entry")
 }
 
-/// A LABEL CANNOT FAULT THE SIGNED-OUT ENTRY: a label is the owner's own
-/// word, and the entry's lints read words — the reason for a stem anywhere
-/// in it, the action for a snooze that leads it and for a second action.
-/// Labels that are or hold those words build the same title and the same
-/// reason as any other, and an action that ENDS in the label. NEGATIVE
-/// CONTROL: each of those labels, written where its lint reads (into the
-/// reason; leading the action; inside it), faults the entry.
+/// A label cannot fault the signed-out entry, whatever lint words it holds: the title, reason and
+/// action read as for any label. Negative control: each such label, written where its lint
+/// reads, faults the entry.
 #[test]
 fn a_label_cannot_fault_the_signed_out_entry() {
     use aterm_messages::exceptions::EntryFault;
@@ -725,21 +721,10 @@ fn a_tab_held_aside_is_said_by_whose_hand_holds_it() {
     }
 }
 
-/// THE OWNER'S `Upgrade now` IS ANSWERED ON THE GLASS (2026-09-28: "when I
-/// pressed 'update' in the claude version update button, nothing seemed
-/// to happen?"). The press answers its row in place, and `--now` quiets
-/// the stall for `NOW_QUIETS_S`; after that the host posts the tab's
-/// stall again, and a move waiting on the agent's own work — which
-/// `--now` does not waive — was a record posted and folded in the same
-/// millisecond (messages.log, ids 64 and 66), withdrawing the answered
-/// row under the same key. The owner's word still stood; nothing on the
-/// glass said so. While it stands the answer is a calm notice that says
-/// what it waits on and folds after [`ANSWER_MAX`] (the owner's rule: the
-/// answer to their own press, with no action left in it, does not
-/// persist); with no word it stays a record (D5).
-///
-/// FAILS WITHOUT THE FIX: the hurried row is `LogOnly`, as the unasked
-/// one is.
+/// The owner's `Upgrade now` is answered on the glass: once `--now` stops quieting the stall, a
+/// move waiting on the agent's own work is a calm notice that says what it waits on and folds
+/// after [`ANSWER_MAX`], not a record. Negative control: with no word from the owner it stays a
+/// record.
 #[test]
 fn the_owners_upgrade_now_is_answered_on_the_glass() {
     use aterm_agent::harness::upgrade::{Phase, Request};
@@ -754,14 +739,12 @@ fn the_owners_upgrade_now_is_answered_on_the_glass() {
             asks: 3,
         },
         wait: "background".into(),
-        // Inside the move clock (`MOVE_BUDGET_S`): past it the round no
-        // longer "asks on its own" (its words say so), and the answer to
-        // the owner's press is the same (below).
+        // Inside the move clock (`MOVE_BUDGET_S`): past it the round no longer asks on its own,
+        // and the answer to the owner's press is the same.
         behind_since: NOW - 8 * 3_600,
         request,
-        // Pressed longer ago than `--now` quiets a stall
-        // (`NOW_QUIETS_S`, which is `REASK_S`): the stall is back, and so is
-        // the host's row.
+        // Pressed longer ago than `--now` quiets a stall (`NOW_QUIETS_S`, which is `REASK_S`):
+        // the stall, and the host's row, are back.
         request_at: NOW - aterm_agent::harness::upgrade::REASK_S - 60,
         ..Row::default()
     };
@@ -857,8 +840,7 @@ fn every_reporter_message() -> Vec<Message> {
          auto_update = false\nseed_install = true\n",
     );
     let mut all = warns.into_messages();
-    // Every family's title, singular and plural, so a re-word of any of
-    // them meets the attention gate (audit 2026-09-24).
+    // Every family's title, singular and plural, so a re-word of any meets the attention gate.
     for family in [
         ConfigFamily::Keybindings,
         ConfigFamily::IgnoredKeys,
@@ -938,9 +920,8 @@ fn every_reporter_message() -> Vec<Message> {
             }
         }
     }
-    // A pane whose folder no shell could start in (audit #7 finding 48):
-    // the reopened line that counts it, and each fault's row; and a pane
-    // a program held whose folder is not here (audit #8).
+    // A pane whose folder no shell could start in: the reopened line that counts it, and each
+    // fault's row; and a pane a program held whose folder is not here.
     for (gone, unasked) in [(1, 0), (2, 0), (0, 1)] {
         all.push(journal_reopened_message(
             &reopened_fixture(crate::crash_journal::DeathClass::Killed),
@@ -1148,8 +1129,7 @@ fn every_reporter_message() -> Vec<Message> {
     ] {
         all.push(config_lane_error(head));
     }
-    // The live agent upgrade's three (gap audit 2026-09-24): waiting (a
-    // record), stalled (a row), done (a record).
+    // The live agent upgrade's three: waiting, stalled and done.
     all.extend(agent_upgrade_waiting(
         "Claude Code",
         &["2.1.282", "2.1.282"],
@@ -1160,8 +1140,8 @@ fn every_reporter_message() -> Vec<Message> {
         &["2.1.282", "2.1.283"],
     ));
     all.extend(agent_upgrade_waiting("Codex", &["0.157.1"]));
-    // One session's record (ruling 380), by its tab and in a second
-    // window, Claude Code's longer product name included.
+    // One session's record, by its tab and in a second window, Claude Code's longer product name
+    // included.
     for (agent, from, to) in [
         (
             aterm_agent::harness::upgrade::Agent::Codex,
@@ -1208,8 +1188,8 @@ fn every_reporter_message() -> Vec<Message> {
         1_790_311_076,
         "in tab 2",
     ));
-    // A Claude Code behind its own running work (2026-09-26), after a notice
-    // and before one: the sentence guards read both remedy lines.
+    // A Claude Code behind its own running work, after a notice and before one: the sentence
+    // guards read both remedy lines.
     for (phase, wait) in [
         (
             aterm_agent::harness::upgrade::Phase::Announced {
@@ -1234,8 +1214,8 @@ fn every_reporter_message() -> Vec<Message> {
             "in tab 2",
         ));
     }
-    // A record nothing has checked (design record C10): aterm's own
-    // fault, said as such — the sentence guards read its remedy too.
+    // A record nothing has checked: aterm's own fault, said as such; the sentence guards read its
+    // remedy too.
     all.push(agent_upgrade_stalled(
         &aterm_agent::harness::upgrade_drive::Row {
             phase: aterm_agent::harness::upgrade::Phase::Pending,
@@ -1250,10 +1230,9 @@ fn every_reporter_message() -> Vec<Message> {
         "in tab 2",
     ));
     all.push(agent_upgrade_done(&upgrade, "in tab 2"));
-    // THE ROWS THAT STAND (ruling 423: the agent the upgrade ended, a
-    // shutdown that hung, a relaunch that reached no prompt), the answer to
-    // the owner's own `Upgrade now`, and aterm's own fault: every sentence
-    // they say is read by the title, restart and glass-row guards.
+    // The rows that stand (the agent the upgrade ended, a shutdown that hung, a relaunch that
+    // reached no prompt), the answer to the owner's own `Upgrade now`, and aterm's own fault:
+    // every sentence is read by the title, restart and glass-row guards.
     {
         use aterm_agent::harness::upgrade::{Phase, Request};
         const NOW: u64 = 1_790_311_076;
@@ -1298,11 +1277,8 @@ fn every_reporter_message() -> Vec<Message> {
             all.push(agent_upgrade_fault(&unclassified, &need, "in tab 2"));
         }
     }
-    // WHERE THE OWNER HAS MORE THAN ONE WINDOW the place names it (`in
-    // window 2, tab 1`), a word longer: every title that names the tab —
-    // a wait `Upgrade now` moves, one it does not (`… yet`), a stop, and
-    // each refused word — still keeps the glass title rule, at two-digit
-    // windows and tabs too.
+    // Where the owner has more than one window the place names it (`in window 2, tab 1`): every
+    // title that names the tab still keeps the glass title rule, at two-digit windows and tabs.
     for place in [tab_place(Some(2), 1), tab_place(Some(12), 10)] {
         for (phase, wait) in [
             (
@@ -1347,8 +1323,7 @@ fn every_reporter_message() -> Vec<Message> {
         }
         all.push(agent_upgrade_done(&upgrade, &place));
     }
-    // A stall's end, recorded under its row's key once the row was down
-    // (review of 2026-09-27).
+    // A stall's end, recorded under its row's key once the row was down.
     let stalled = agent_upgrade_stalled(&upgrade, 1_790_311_076, "in tab 2");
     for end in [StallEnd::AsksAgain, StallEnd::MovesAgain, StallEnd::Left] {
         all.push(agent_upgrade_stall_over(
@@ -1359,8 +1334,7 @@ fn every_reporter_message() -> Vec<Message> {
             end,
         ));
     }
-    // The owner's word from the band (gap #21): what each word did, and
-    // each kind of refusal.
+    // The owner's word from the band: what each word did, and each kind of refusal.
     all.push(agent_upgrade_worded(
         &upgrade,
         aterm_messages::UpgradeWord::Now,
@@ -1374,8 +1348,8 @@ fn every_reporter_message() -> Vec<Message> {
             "stale:2.1.283",
             "the upgrade in tab s-b5cf2faabac5ce5127bd stopped for good (no-resume): `--now` \
              re-arms only one that gave up",
-            // Ruling 283: a round that stopped between the offer and the
-            // press, as the writer refuses it now (typed).
+            // A round that stopped between the offer and the press, as the writer refuses it
+            // (typed).
             "stopped:1790318276:the upgrade in tab s-b5cf2faabac5ce5127bd stopped \
              (no-resume): `--now` re-arms only one that gave up",
             "stopped:0:the upgrade in tab s-b5cf2faabac5ce5127bd stopped (signal-refused): \
@@ -1434,9 +1408,9 @@ fn every_reporter_message() -> Vec<Message> {
         1_790_311_076,
         "in tab 2",
     ));
-    // A Claude Code move that stopped after its SIGTERM ended the agent
-    // (it names `claude --resume`), and moves under way that do not move
-    // (stuck exiting, exited, relaunched), for both agents (2026-09-27).
+    // A Claude Code move that stopped after its SIGTERM ended the agent (it names
+    // `claude --resume`), and moves under way that do not move (stuck exiting, exited,
+    // relaunched), for both agents.
     all.push(agent_upgrade_stalled(
         &aterm_agent::harness::upgrade_drive::Row {
             session: "0badf00d-1111-2222-3333-444455556666".into(),
@@ -1513,7 +1487,7 @@ fn every_reporter_message() -> Vec<Message> {
     all.push(font_family_rejected(
         "font_family: \"Nope\" is not an admissible font",
     ));
-    // R14–R22, the retired toast's reporters.
+    // The gesture, consent, install and connection reporters.
     all.extend(gesture_failures());
     all.push(file_access_question(
         &crate::consent_card::NeedWords::sample(),
@@ -1655,11 +1629,9 @@ fn the_memory_row_steps_a_long_resume_line_down_whole() {
     assert!(laid.iter().all(|l| !l.contains(&line)), "{laid:?}");
 }
 
-/// A ROW READS BACK AS THE FOLDERS IT NAMES — how a row carried across an
-/// update keeps them when the next folder joins it: one folder, several,
-/// past the line cap (the named ones and the count), a folder with a space
-/// and one longer than a line. The negative control is a row of another
-/// shape.
+/// A folder row reads back as the folders it names, as a carried row must when the next folder
+/// joins it: one, several, past the cap, with a space, longer than a line. Negative control: a
+/// row of another shape.
 #[test]
 fn a_folder_row_reads_back_as_the_folders_it_names() {
     use crate::spawn_folder::{Fault, Named};
@@ -1738,7 +1710,7 @@ fn the_reopened_row_counts_the_panes_that_could_not_open_their_folder() {
     );
 }
 
-/// Every R14 row, from the sentences their sites really pass.
+/// Every gesture-failure row, from the sentences their sites pass.
 fn gesture_failures() -> Vec<Message> {
     vec![
         new_tab_failed("fork: Resource temporarily unavailable (os error 35)"),

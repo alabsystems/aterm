@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! P0 regression test: the daily-driver CLI must run a real shell through the
-//! PROTECTED spawn seam (`aterm_pty::spawn_shell`, NOT raw `forkpty`/`execvp`) and
-//! stay fully functional — given a command it produces the command's OUTPUT and
-//! exits with the shell's status. Complements the static guard `A6` (no
-//! `libc::forkpty` in `aterm-cli/src`) with a behavioral check that the protected
-//! spawn actually works end-to-end.
+//! The daily-driver CLI runs a real shell through the protected spawn seam
+//! (`aterm_pty::spawn_shell_with_pid`, not raw `forkpty`/`execvp`) and stays functional:
+//! given a command it prints the command's output and exits with the shell's status. A
+//! behavioural complement to clippy.toml's `libc::forkpty` ban. It also pins that a session
+//! builds no VT model.
 //!
 //! The unix tests drive a POSIX `/bin/sh` through the binary; the `#[cfg(windows)]`
 //! twin drives the platform's default shell through the ConPTY seam. No fleet host
@@ -32,16 +31,12 @@ use crate::launch_isolation;
 /// red test — the failure would hide inside the harness meant to detect it.
 const CLI_EXIT_DEADLINE: Duration = Duration::from_secs(60);
 
-/// THE ONE WAY THIS FILE SPAWNS `aterm --session` (2026-09-10 review). The session
-/// lane reads the machine's atpkg prefix under `$HOME` and may spawn a DETACHED
-/// `aterm pkg update` against it; run as-is from `cargo test`, that pass rewrote
-/// the owner's REAL `<prefix>/status.toml`. Every launch therefore gets private
-/// HOME/config/data roots whose `aterm.toml` switches the package and native-update
-/// lanes off (`launch_isolation::CONFIG_OFF` — settings, since the environment vetoes
-/// are gone), and `--no-reroute`, so nothing is laid for the upstream Rust names.
-/// `/bin/sh` is the shell on unix, and piped stdio still routes to the SESSION.
-/// The roots go when the returned guard drops: the caller holds it until the
-/// session has exited.
+/// The one way this file spawns `aterm --session`. The session lane reads the atpkg prefix
+/// under `$HOME` and may spawn a detached `aterm pkg update` against it, so every launch
+/// gets private HOME/config/data roots whose `aterm.toml` switches the package and
+/// native-update lanes off (`launch_isolation::CONFIG_OFF`), and `--no-reroute`. `/bin/sh`
+/// is the shell on unix; piped stdio still routes to the session. The roots go when the
+/// returned guard drops, so the caller holds it until the session has exited.
 fn session_command(test: &str) -> (Command, aterm_tempfile::TempDir) {
     let root = launch_isolation::scratch_root(&format!("aterm-protected-spawn-{test}"));
     let mut cmd = Command::new(launch_isolation::aterm_executable());
@@ -50,17 +45,12 @@ fn session_command(test: &str) -> (Command, aterm_tempfile::TempDir) {
     (cmd, root)
 }
 
-/// Bounded replacement for `Child::wait_with_output`, shared by every test in
-/// this file. Dedicated threads drain the child's stdout/stderr pipes into
-/// buffers (so the child can never stall on a full pipe while we wait), and the
-/// main thread polls `try_wait` against `CLI_EXIT_DEADLINE`. On expiry the child
-/// is killed, the drains are joined, and we panic with whatever output was
-/// captured — turning a would-be infinite hang into a diagnosable failure.
+/// Bounded `Child::wait_with_output`: threads drain stdout and stderr (so the child never
+/// stalls on a full pipe) while `try_wait` is polled against [`CLI_EXIT_DEADLINE`]; on
+/// expiry the child is killed and the test panics with what was captured.
 fn wait_with_output_bounded(mut child: Child) -> Output {
-    // One drain thread per pipe. Tests that route a stream to `Stdio::null()`
-    // simply have no handle here and the thread returns an empty buffer. A read
-    // error (e.g. the deadline kill tearing the pipe down mid-read) just ends
-    // the drain — partial output is still worth showing in the panic message.
+    // One drain thread per pipe; a stream routed to `Stdio::null()` drains empty, and a read
+    // error (the kill tearing a pipe down) ends the drain with what it has.
     fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -77,9 +67,8 @@ fn wait_with_output_bounded(mut child: Child) -> Output {
     loop {
         match child.try_wait().expect("poll the aterm CLI child") {
             Some(status) => {
-                // The child is gone, so its pipe write-ends are closed and the
-                // drains run to EOF promptly — these joins cannot hang. (The
-                // grandchild shell lives on the PTY slave, not on these pipes.)
+                // The child is gone, so its pipe write-ends are closed and the drains reach
+                // EOF (the grandchild shell lives on the PTY slave, not these pipes).
                 return Output {
                     status,
                     stdout: stdout.join().expect("join the stdout drain"),
@@ -87,15 +76,9 @@ fn wait_with_output_bounded(mut child: Child) -> Output {
                 };
             }
             None if Instant::now() >= deadline => {
-                // Kill closes the CLI's pipe write-ends, then reap so the process
-                // table stays clean even though we are about to panic. But the
-                // joins here are BOUNDED, unlike the success path: if a hung CLI
-                // regression ALSO leaked the pipe write-end into some descendant
-                // that outlives the kill, an unbounded `join` would block on that
-                // descendant and the panic path itself would hang — the exact
-                // failure shape this harness exists to eliminate. Bounded joins
-                // guarantee we always reach the panic; worst case we report the
-                // drain as still blocked instead of showing that stream.
+                // Kill and reap, then join with a bound: a hung CLI that also leaked a pipe
+                // write-end into a descendant outliving the kill would block an unbounded
+                // join, and the panic path would hang too.
                 let _ = child.kill();
                 let _ = child.wait();
                 fn join_bounded(handle: std::thread::JoinHandle<Vec<u8>>) -> String {
@@ -134,10 +117,8 @@ fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
         .spawn()
         .expect("spawn the aterm CLI binary");
 
-    // Feed a command whose output PROVES the shell evaluated it (the arithmetic
-    // `$((6*7))` becomes 42 only if a real shell ran it — the PTY echo of the input
-    // line still shows the literal `$((6*7))`), then exit. Dropping stdin after the
-    // write delivers EOF so the shell runs to its own exit.
+    // `$((6*7))` prints 42 only if a real shell evaluated it (the PTY echo of the line shows
+    // the literal). Dropping stdin after the write delivers EOF.
     child
         .stdin
         .take()
@@ -158,11 +139,9 @@ fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
     );
 }
 
-/// `--containment containment` wraps the spawn in `sandbox-exec` (deny
-/// network, other processes' task ports, writes outside the temp roots, and
-/// credential/private-data reads). A basic shell command must STILL run
-/// under the sandbox — the OS confinement must not break normal shell operation.
-/// macOS-only (Seatbelt `sandbox-exec` is the actuated path).
+/// `--containment containment` wraps the spawn in `sandbox-exec` (deny network, other
+/// processes' task ports, writes outside the temp roots, and credential/private-data reads),
+/// and a basic shell command still runs under it. macOS only (Seatbelt is the actuated path).
 #[cfg(target_os = "macos")]
 #[test]
 fn cli_runs_under_the_os_sandbox_in_containment_mode() {
@@ -193,14 +172,10 @@ fn cli_runs_under_the_os_sandbox_in_containment_mode() {
     );
 }
 
-/// Security: the `--containment` value may be attacker-influenced. A MALFORMED value
-/// must FAIL CLOSED to Containment (the most restrictive mode) — never silently
-/// fall through to the unconfined `User` default — and it announces the fallback
-/// rather than silently swallowing the garbage. What Containment then does is
-/// the platform's: on macOS the shell runs under the OS sandbox; everywhere else
-/// there is no OS sandbox, so Containment refuses to start (the owner's fail-closed
-/// ruling, 2026-09-25) and the binary exits 1 naming the gap. The harness drives
-/// `/bin/sh`, so it runs on POSIX hosts only.
+/// The `--containment` value may be attacker-influenced: a malformed value fails closed to
+/// Containment (never the unconfined `User` default) and announces the fallback. On macOS the
+/// shell then runs under the OS sandbox; elsewhere there is none, so Containment refuses to
+/// start and the binary exits 1 naming the gap. The harness drives `/bin/sh`: POSIX only.
 #[cfg(unix)]
 #[test]
 fn malformed_containment_mode_fails_closed_not_open() {
@@ -221,7 +196,7 @@ fn malformed_containment_mode_fails_closed_not_open() {
     let out = wait_with_output_bounded(child);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // It announced the fail-closed fallback — did NOT silently accept the garbage.
+    // It announced the fail-closed fallback.
     assert!(
         stderr.contains("using containment"),
         "a malformed mode must announce the fallback to containment; stderr={stderr:?}"
@@ -252,13 +227,12 @@ fn malformed_containment_mode_fails_closed_not_open() {
     }
 }
 
-/// THE WINDOWS TWIN of `cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly`:
-/// the session runs the platform's default shell (`pwsh` → `powershell` →
-/// `%COMSPEC%`, `aterm_pty`'s windows `shell.rs`) through the ConPTY seam, with
-/// stdin a pipe (`driver_windows`' piped pump). Two echo lines, one per shell
-/// family, each of which evaluates to the marker only when a real shell RAN it
-/// (the ConPTY echo of the typed line shows the literal `%OS%` / `$(6*7)`), and
-/// the shell's `exit 7` must come back as the session's own exit status.
+/// The Windows twin of `cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly`:
+/// the session runs the platform's default shell (`pwsh` → `powershell` → `%COMSPEC%`,
+/// `aterm_pty`'s windows `shell.rs`) through ConPTY with stdin a pipe. Two echo lines, one
+/// per shell family, each evaluate to the marker only when a real shell ran them (the ConPTY
+/// echo shows the literal `%OS%` / `$(6*7)`), and the shell's `exit 7` is the session's exit
+/// status.
 #[cfg(windows)]
 #[test]
 fn cli_runs_a_command_through_the_conpty_seam_and_exits_with_the_shells_status() {

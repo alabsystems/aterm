@@ -92,8 +92,8 @@ use super::super::policy::turn_end::{
     ANSWERS_OFF, AccountAnswer, AccountAt, CREDITS_HOLD_MODEL_TOLD, CREDITS_HOLD_TOLD, Composer,
     ComposerRead, Conversation, CreditsCarry, LOGIN_SHARED_LOOK, MENU_DIVERTS, OWN_WORDS_STAND,
     ProbeGate, RULE_ACCOUNT, RULE_LAND, RULE_LEFT, RULE_LIMIT_RESUME, RULE_LOGIN, RULE_USAGE_PROBE,
-    RecordTurn, Restart, TRY_ANSWER_SLACK, WAKE_KEPT, act_turn_work, decide_turn_end,
-    decide_turn_end_traced, done_row_work, reads_conversation,
+    RecordTurn, Restart, TRY_ANSWER_SLACK, WAKE_KEPT, act_turn_work, conversation_mark,
+    decide_turn_end, decide_turn_end_traced, done_row_work, reads_conversation,
 };
 use super::wall_confirm::{Check, LeftRead};
 use super::*;
@@ -150,17 +150,13 @@ const TURN_YIELD: &str = "yield=0.2";
 /// typed text, not a pasted-text placeholder the fence cannot read back.
 pub(super) const RULES_CAP: usize = 400;
 
-/// The longest the loop waits for the worker to react to its own write (the
-/// continuation's echo, [`Session::type_fenced`]; the accept key's fill,
-/// [`Session::accept_suggestion`]) before it reads the composer to judge the
-/// write. The wait ends the moment the screen moves, so a worker that reacts
-/// pays nothing; the bound only says when one that has not reacted at all is
-/// judged anyway. Judged too early, the read sees the composer as it was
-/// before the write, and an accept key not yet read would get its words
-/// typed after it, submitting them doubled. A worker starved past this
-/// bound is still judged on the old composer, and one that stalls mid-draw
-/// is read once the screen is still for [`SETTLE_MS`] or [`SETTLE_CAP`] has
-/// passed (a half-drawn composer is escalated).
+/// The longest the loop waits for the worker to react to its own write (the continuation's echo,
+/// [`Session::type_fenced`]; the accept key's fill, [`Session::accept_suggestion`]) before it
+/// reads the composer to judge the write. The wait ends the moment the screen moves, so a worker
+/// that reacts pays nothing. Judged too early, the read sees the composer as before the write, and
+/// an accept key not yet read would get its words typed after it, submitting them doubled. A
+/// worker that stalls mid-draw is read once the screen is still for [`SETTLE_MS`] or
+/// [`SETTLE_CAP`] has passed (a half-drawn composer is escalated).
 pub(super) const REACTION_WAIT: Duration = Duration::from_secs(10);
 
 /// How long the echo of a fenced write must hold still before its Enter, for
@@ -674,6 +670,25 @@ impl<C: Ctl> Session<'_, C> {
         self.person.max(draft)
     }
 
+    /// THE COUNT A SCREEN WAS READ WITH AND THE MARK OF ITS CONVERSATION, as
+    /// a reading of it marks it ([`conversation_mark`],
+    /// [`TurnEndReading::screen_mark`]): the baseline set once the harness's
+    /// own keys were seen to land ([`TurnEndState::counted_after_harness`]),
+    /// which the next reading's mark is set against. Never the review's mark
+    /// ([`submit_mark`], the rows up to the last thing said): over the very
+    /// same rows it is another number, so every later screen read as drawn
+    /// since, and a submission counted but not drawn yet was folded as a turn
+    /// of someone else's (the review of `b9/resid4`, 2026-10-22). `None` from
+    /// a host that counts none.
+    fn counted_conversation(&self, screen: &Screen) -> Option<(u64, u64)> {
+        let reading = self
+            .reader(&screen.rows)
+            .read(&screen.rows, Some(screen.cursor_col));
+        screen
+            .submits
+            .map(|n| (n, conversation_mark(&reading, &screen.rows)))
+    }
+
     /// The turn-end reading of `screen`: the reader for the session's program, the work since the
     /// last point, the wall's reset, the rules, and how long ago a person typed
     /// ([`Self::person_ago`]). Only at a wall the network answers ([`answered_by_the_network`])
@@ -1073,13 +1088,16 @@ impl<C: Ctl> Session<'_, C> {
             login_method,
             login_shared,
             // The screen's launch card — save the conversation the point
-            // judged last held, redrawn with nothing submitted since
-            // ([`TurnEndState::redrawn_fresh`]: a re-wrap its reader took
+            // judged last held, redrawn with nothing submitted and no key
+            // written since ([`TurnEndState::redrawn_fresh`]: a re-wrap its reader took
             // for a launch card) — or the host's record of whose turns the
             // conversation holds (the harness's own are no task), or a first
             // loop's screen holding nothing since a launch the host saw with
             // nothing keyed since ([`Self::unasked_launch`]).
-            taskless: (r.taskless && !self.turn_end.redrawn_fresh(screen.submits))
+            taskless: (r.taskless
+                && !self
+                    .turn_end
+                    .redrawn_fresh(screen.submits, screen.inputs_after))
                 || host.is_some_and(|h| h.taskless())
                 || self.unasked_launch(&r, host),
             // …and whether that record says the task is finished, read at the
@@ -1099,8 +1117,10 @@ impl<C: Ctl> Session<'_, C> {
             // stands without being drawn ([`Self::note_credits`]).
             credits: self.credits_carry(reader.credits(&screen.rows).as_ref()),
             // The session's submissions as the host counted them after these
-            // rows ([`TurnEndReading::submits`]).
+            // rows ([`TurnEndReading::submits`]), and its input writes before
+            // them ([`TurnEndReading::inputs_before`]).
             submits: screen.submits,
+            inputs_before: screen.inputs_before,
             ..r
         };
         // …and, where it was read, while an act of the policy's stands
@@ -1523,19 +1543,13 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// THE POINT FOLDED IN, THEN THE HOST ASKED ([`Self::observe_point`],
-    /// [`Self::account_advise`]): every decision's order. A tell that waited
-    /// on the act awaited ([`TurnEndState::account_answer_awaited`]: the turn
-    /// typed under the move had no busy read, so the wall the point shows
-    /// said nothing yet) is read again between the two
-    /// ([`Self::account_tells`]): the fold that judges that act makes the
-    /// point the act's, and A LOST LOGIN AFTER A TURN ASKED UNDER THE LOGIN
-    /// THE MOVE CHOSE IS TOLD — STRUCK ON THAT LOGIN — BEFORE ANY ADVICE FOR
-    /// THAT POINT IS ASKED. Asked first, the host advised with the dead login
-    /// unstruck — the next account, or the move back onto it on the `ok` it
-    /// had before — and the tell landed after the relaunch, on the login the
-    /// session was moved to. A fold that judges nothing leaves the act
-    /// awaited, and the tell read again says nothing.
+    /// The point folded in, then the host asked ([`Self::observe_point`],
+    /// [`Self::account_advise`]): every decision's order. A tell that waited on the act awaited
+    /// ([`TurnEndState::account_answer_awaited`]: the turn typed under the move had no busy read)
+    /// is read again between the two ([`Self::account_tells`]), so a lost login after a turn asked
+    /// under the login the move chose is told, struck on that login, before any advice for that
+    /// point is asked; asked first, the host would advise with the dead login unstruck. A fold
+    /// that judges nothing leaves the act awaited, and the tell read again says nothing.
     pub(super) fn fold_point(
         &mut self,
         r: &mut TurnEndReading,
@@ -1818,16 +1832,12 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// THE ACCOUNTS' NEWS, read off the host's stamp
-    /// ([`IdleHost::account_stamp`]): `true`, once, when it has moved since
-    /// this session last read it — and then what the policy remembers of a
-    /// move the host refused is let go ([`TurnEndState::account_news`]), so
-    /// a remedy the owner applied (`accounts login`, `accounts use`) reaches
-    /// a tab whose move was refused. A refusal with no news after it stays
-    /// as it was. THE FIRST READ IS NO NEWS: the stamp counts
-    /// since the host started, and read as news it ended, at the first
-    /// decision of every loop that started later, the latch the loop before
-    /// left in the ledger ([`TurnEndState::seed_account_unmade`]).
+    /// The accounts' news, read off the host's stamp ([`IdleHost::account_stamp`]): `true`, once,
+    /// when it has moved since this session last read it, and then what the policy remembers of a
+    /// move the host refused is let go ([`TurnEndState::account_news`]), so a remedy the owner
+    /// applied (`accounts login`, `accounts use`) reaches a tab whose move was refused. The first
+    /// read is no news: the stamp counts from the host's start, and taking it as news would clear
+    /// the latch an earlier loop left in the ledger ([`TurnEndState::seed_account_unmade`]).
     pub(super) fn account_news(&mut self, host: &dyn IdleHost) -> bool {
         let stamp = host.account_stamp();
         if self
@@ -3095,7 +3105,7 @@ impl<C: Ctl> Session<'_, C> {
     /// decided again after a growing pause, never escalated for the wait. One never made gets the
     /// point's `otherwise`. Nothing while the worker's stall is in hand (`stall.rs`).
     #[allow(clippy::too_many_arguments)]
-    fn restart_agent(
+    pub(super) fn restart_agent(
         &mut self,
         point: &Turn,
         why: &Restart,
@@ -3163,6 +3173,22 @@ impl<C: Ctl> Session<'_, C> {
                 };
                 let now = self.fx.mono();
                 self.turn_end.restarted(why, true, &r, now);
+                // ITS NEW PROCESS FOUND AND TAKEN (`adopted`): the relaunch
+                // line's Enter was counted before the host could find what it
+                // started, so the count read now holds it and is the baseline
+                // again ([`TurnEndState::counted_after_harness`]); a person's
+                // prompt before the next answered point is told by its
+                // submission. A line typed with no process found yet
+                // (`relaunched`), a carry-on typed inside the restart
+                // (`continued`, the harness's turn below) or a last word
+                // (`done`) leaves the baseline gone, and a host that counts
+                // none is not read again. The mark is the conversation's, as
+                // the next reading's is taken ([`Self::counted_conversation`]).
+                if word == Some("adopted") && point.screen.submits.is_some() {
+                    let after = self.read_once().ok().map(|(screen, _)| screen);
+                    let at = after.as_ref().and_then(|s| self.counted_conversation(s));
+                    self.turn_end.counted_after_harness(at);
+                }
                 if matches!(why, Restart::Model { .. }) {
                     self.turn_end.fallback_made_at(asked_unix);
                     // A model's usage credits were the process's left behind
@@ -4002,14 +4028,11 @@ impl<C: Ctl> Session<'_, C> {
         Ok(None)
     }
 
-    /// The worker's own suggestion accepted (module docs): `right`, fenced on
-    /// the judged read's generation and guarded on the suggestion's row; the
-    /// screen read once it has settled; then, when it shows the composer
-    /// holding exactly the suggestion, typed now (the cursor off the
-    /// placeholder's column), Enter, fenced on that read and guarded on that
-    /// row. A host or a read without the generation fence types the
-    /// suggestion's words instead ([`Self::type_guarded`]), as does a
-    /// suggestion the accept key did not fill.
+    /// The worker's own suggestion accepted (module docs): `right`, fenced on the judged read's
+    /// generation and guarded on the suggestion's row; the settled screen read; then, where the
+    /// composer holds exactly the suggestion as typed text, Enter, fenced and guarded on that
+    /// read. A host or a read without the generation fence, or a suggestion the key did not fill,
+    /// gets the suggestion's words typed instead ([`Self::type_text`]).
     ///
     /// THE WINDOW'S HOST TYPES THEM TOO ([`Session::type_under_hand`],
     /// [`Self::type_text`] under its hand): the accept key leaves the server
@@ -4022,16 +4045,11 @@ impl<C: Ctl> Session<'_, C> {
     /// and the vendor counts a submitted text equal to its suggestion as
     /// accepted.
     ///
-    /// A READ TORN MID-REDRAW is not judged. The worker clears its composer
-    /// and draws it again as it takes the key; a read between the two (the
-    /// screen still moving when [`SETTLE_CAP`] ran out) shows no caret row at
-    /// all. That read returned here with the suggestion already FILLED —
-    /// nothing pressed, nothing journaled, nothing escalated — and the fill
-    /// waited out the draft path's grace, minutes on. It is read once more
-    /// after one more settle — a second bounded read on the
-    /// [`REACTION_WAIT`] design, not a loop — and a
-    /// composer still missing then is journaled `SKIPPED` and nothing more is
-    /// pressed (no read showed the fill, so none is claimed).
+    /// A read torn mid-redraw is not judged: the worker clears and redraws its composer as it
+    /// takes the key, and a read between the two (still moving when [`SETTLE_CAP`] ran out) shows
+    /// no caret row. It is read once more after one more settle; a composer still missing then is
+    /// journaled `SKIPPED` and nothing more is pressed (no read showed the fill, so none is
+    /// claimed).
     fn accept_suggestion(
         &mut self,
         point: &Turn,
@@ -4905,11 +4923,9 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// ONE GUARDED ESCAPE AT THE PANEL ON `grid`, and what came of it: `key
-    /// if-human=<the read's person count> if=<the panel's header row> esc`
-    /// ([`Self::guarded_key`]; no `if-gen=`: a panel that refreshes moves
-    /// the generation), then the header row's leaving waited for
-    /// ([`ProbeWaits::close`]) and the grid read again.
+    /// One guarded Escape at the panel on `grid`: `key if-human=<n> if=<the panel's header row>
+    /// esc` ([`Self::guarded_key`]; no `if-gen=`, since a panel that refreshes moves the
+    /// generation), then the header row's leaving waited for and the grid read again.
     ///
     /// * The panel gone and the composer back: closed
     ///   ([`Self::probe_closed`]). Gone with no composer drawn yet: left
@@ -5222,11 +5238,10 @@ pub(super) fn turn_end_outcome(action: &TurnEndAction, at: &dyn Fn(Instant) -> S
     }
 }
 
-/// Whether the table's `action` at a point that asks a question in prose is
-/// one the session's priority word can change ([`Session::decide_to_act`]):
-/// an answer (the word picks its priority), or the escalation
-/// `answer_questions = false` makes ([`ANSWERS_OFF`]). A wait, a cap's or a
-/// wall's escalation is the table's alone, and reads no word.
+/// Whether the table's `action` at a point that asks a question in prose is one the session's
+/// priority word can change ([`Session::decide_to_act`]): an answer, or the escalation
+/// `answer_questions = false` makes ([`ANSWERS_OFF`]). A wait, a cap's or a wall's escalation is
+/// the table's alone.
 fn session_word_can_decide(action: &TurnEndAction) -> bool {
     match action {
         TurnEndAction::Escalate { reason } => reason.ends_with(ANSWERS_OFF),

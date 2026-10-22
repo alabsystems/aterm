@@ -283,6 +283,21 @@ const MAX_SUBMODULE_DEPTH: usize = 8;
 /// (and escalates) rather than read at length.
 const MAX_SUBMODULES: usize = 64;
 
+/// How long one git the check runs may take before it is killed and the read
+/// is refused (the line escalates, as for any read that cannot be made). A
+/// healthy read answers in tens of milliseconds; the bound names a git that
+/// never does.
+///
+/// A test waits the one-minute hang detector instead: the git it reads through
+/// can be a wrapper it just wrote, whose first exec waits on the system, not on
+/// git (macOS assesses each new executable's first exec, one scan at a time
+/// machine-wide: a fresh script took 5.4 s behind 40 queued scans), and under
+/// that queue a ten-second bound refused a read that git answers.
+#[cfg(not(test))]
+const GIT_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+const GIT_READ_WAIT: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+
 /// The worker process as the kernel recorded it at exec
 /// ([`atpkg::caller_shell::process_args`]): its environment, `KEY=value` in
 /// the kernel's order, which every command its Bash tool runs starts from,
@@ -688,7 +703,7 @@ impl Probe<'_> {
         let run = |args: &[&str]| {
             let mut cmd = self.git(dir);
             cmd.args(args);
-            aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(10))
+            aterm_uds::deadline::output_within(&mut cmd, GIT_READ_WAIT)
         };
         let listed = run(&["config", "--list", "-z", "--show-scope"])
             .map_err(|e| format!("cannot read the git config in {}: {e}", dir.display()))?;
@@ -765,7 +780,7 @@ impl Probe<'_> {
     fn gitlinks(&self, top: &Path) -> Result<Vec<String>, String> {
         let mut cmd = self.git(top);
         cmd.args(["ls-files", "-z", "--stage"]);
-        let out = aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(10))
+        let out = aterm_uds::deadline::output_within(&mut cmd, GIT_READ_WAIT)
             .map_err(|e| format!("cannot list the index in {}: {e}", top.display()))?;
         if !out.status.success() {
             return Err(git_failed(
@@ -790,11 +805,10 @@ impl Probe<'_> {
     fn filters_selected(&self, top: &Path) -> Option<Vec<String>> {
         let mut cmd = self.git(top);
         cmd.args(["ls-files", "-z"]);
-        let paths =
-            aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(10))
-                .ok()
-                .filter(|o| o.status.success())?
-                .stdout;
+        let paths = aterm_uds::deadline::output_within(&mut cmd, GIT_READ_WAIT)
+            .ok()
+            .filter(|o| o.status.success())?
+            .stdout;
         let mut child = self
             .git(top)
             .args(["check-attr", "--stdin", "-z", "filter"])

@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(input.scroll_frac_px, 0);
     }
 
-    // ---- wasm-export smoke: the exported surface end to end ----------------
+    // ---- the exported surface end to end ----------------------------------
 
     /// A terminal with scrollback; COULD NOT RUN without a system font
     /// ([`crate::system_font_terminal`]).

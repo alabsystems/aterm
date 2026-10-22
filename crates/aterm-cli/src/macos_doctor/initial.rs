@@ -1005,6 +1005,23 @@ fn resume_vault(
         )
 }
 
+/// The Secrets row when no subscriber could be installed because this aterm runs from
+/// `exe`, a copy that goes away (a disk image, an App Translocation copy, a temporary
+/// directory), which a launchd job must not name: waiting until aterm runs from where it is
+/// installed, where the retry installs it. None for any other program.
+fn fleeting_program_row(exe: &Path) -> Option<Row> {
+    aterm_secrets::service::transient(exe).then(|| {
+        readiness_row(
+            "Secrets vault",
+            false,
+            format!(
+                "this aterm runs from {}, which goes away when it quits, so it cannot keep ~/.secrets in sync; move aterm to Applications and open it from there, and setup finishes this step",
+                exe.display()
+            ),
+        )
+    })
+}
+
 impl LiveInitial {
     fn context(&self) -> Result<aterm_machines::items::Ctx, String> {
         aterm_machines::init::initial_setup_context(&aterm_machines::port::Live::new())
@@ -1139,6 +1156,15 @@ impl InitialHost for LiveInitial {
             )
         };
         let installed = installed.into_inner().unwrap_or_else(install);
+        if installed.is_err()
+            && let Some(row) = std::env::current_exe()
+                .and_then(std::fs::canonicalize)
+                .ok()
+                .as_deref()
+                .and_then(fleeting_program_row)
+        {
+            return Ok(vec![row]);
+        }
         installed?;
         let status = client::status(&paths).map_err(|error| error.to_string())?;
         let Some(expected) = check::selected_vault(plan, &paths.home, &status)? else {
@@ -1775,7 +1801,7 @@ mod tests {
                             .unwrap();
                     }
                     _ => {
-                        crate::macos_doctor::write_atomic(
+                        aterm_machines::port::write_atomic(
                             &root.path().join("first-run.json"),
                             b"invalid decision",
                             0o600,
@@ -3174,6 +3200,22 @@ mod tests {
     fn vault_machine() -> (aterm_secrets::age::Recipient, String) {
         let recipient = aterm_secrets::age::Identity::from_secret_bytes([31; 32]).recipient();
         (recipient, aterm_secrets::client::join_code(&recipient))
+    }
+
+    #[test]
+    fn a_subscriber_refused_for_a_copy_that_goes_away_waits_for_aterm_to_move() {
+        let row = fleeting_program_row(Path::new("/Volumes/aterm/aterm.app/Contents/MacOS/aterm"))
+            .expect("a disk image goes away");
+        assert_eq!(row.status, "blocked");
+        assert!(
+            row.detail.contains("move aterm to Applications") && !row.detail.contains("--program"),
+            "{}",
+            row.detail
+        );
+        assert!(
+            fleeting_program_row(Path::new("/Applications/aterm.app/Contents/MacOS/aterm"))
+                .is_none()
+        );
     }
 
     #[test]

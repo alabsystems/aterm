@@ -5464,6 +5464,39 @@ impl App {
         })
     }
 
+    /// A HEADLESS CAPTURE IS ITS WINDOW'S ONE WATCHER. A window with no glass
+    /// never has its Settings preview ticked by the park
+    /// ([`crate::native_preview_may_tick`]: nothing would see those frames),
+    /// so the retained raster holds whatever frame the page's last change
+    /// compiled. The capture samples the active preview at its own instant,
+    /// exactly as a focused window's tick would have left it (the same
+    /// predicate, with the capture standing in for the glass, and the same
+    /// invalidation): a looping preview is recompiled at the capture's phase,
+    /// a still one is left as it is, and a modal over the page keeps the
+    /// preview parked under it as glass does. The preview's viewport comes
+    /// from the capture's own `plan`, so the capture still lays its frame out
+    /// from one visible plan.
+    fn sample_native_preview_for_capture(
+        &mut self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) {
+        let Some(window) = self.windows.get(&wid) else {
+            return;
+        };
+        if !crate::native_preview_may_tick(true, window.focused, false, window.overlay.is_some()) {
+            return;
+        }
+        let Some((_, view)) = self.active_native_view(wid) else {
+            return;
+        };
+        let Ok(viewport) = self.native_ui_viewport_in_plan(wid, view, plan) else {
+            return;
+        };
+        let phase_ms = u64::try_from(self.lat_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.invalidate_active_native_settings_preview_in(wid, phase_ms, viewport);
+    }
+
     /// Stage a headless capture's frame in this turn from the request layout:
     /// the route's preparation into the window's scratch, then its chrome in
     /// the order the glass layers it ([`crate::route_chrome`]). A staging is a
@@ -5487,6 +5520,7 @@ impl App {
         CaptureDeferral,
     > {
         use crate::app_render::CapturePreparation;
+        self.sample_native_preview_for_capture(wid, &plan);
         let (plan, terminal_grid) = match route {
             crate::VisibleContentRoute::Terminal { .. } => {
                 let capture_now = Instant::now();
@@ -17154,5 +17188,119 @@ mod deferred_gpu_capture_tests {
         }
         assert!(!app.windows[&WindowId(0)].capture_acquire_armed);
         assert!(!app.windows[&WindowId(0)].capture_client_requested);
+    }
+}
+
+#[cfg(test)]
+mod headless_settings_preview_capture_tests {
+    use super::image_req_for_test;
+    use crate::native_settings::SettingsRoute;
+    use crate::settings_preview::{PreviewAnimation, SettingsPreviewSpec};
+    use crate::{App, WindowId, control_auth};
+    use std::time::{Duration, Instant};
+
+    const WID: WindowId = WindowId(0);
+
+    /// The front window's `image`, its PNG bytes, with the instance's clock
+    /// `elapsed_ms` past its epoch at the capture.
+    fn image_at(app: &mut App, elapsed_ms: u64) -> Vec<u8> {
+        app.lat_epoch = Instant::now()
+            .checked_sub(Duration::from_millis(elapsed_ms))
+            .expect("the clock reaches back that far");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = control_auth::ConfinedImage::in_memory();
+        app.render_image(image_req_for_test(target, false, true, None, tx));
+        let (_, _, png) = rx
+            .recv_timeout(crate::app_introspect::WORKER_PATIENCE)
+            .expect("image worker reply")
+            .expect("headless image succeeds")
+            .value;
+        png.expect("PNG bytes")
+    }
+
+    /// The Settings preview the last staged frame painted.
+    fn drawn_preview(app: &App) -> SettingsPreviewSpec {
+        let (_, view) = app.active_native_view(WID).expect("the Settings view");
+        app.windows[&WID].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .expect("a staged native raster")
+            .compiled
+            .paint
+            .iter()
+            .find_map(|paint| match &paint.content {
+                crate::native_ui::UiContent::SettingsPreview(spec) => Some((**spec).clone()),
+                _ => None,
+            })
+            .expect("the page paints its cursor preview")
+    }
+
+    /// A HEADLESS CAPTURE SAMPLES A LIVE SETTINGS PREVIEW AT ITS OWN INSTANT.
+    /// A headless window has no glass, so its park never ticks a Settings
+    /// preview (`native_preview_may_tick`: nothing would see the frames), and
+    /// an `image` staged the page from the retained raster: every capture of
+    /// a cursor page showed the frame the page's last change compiled, still
+    /// for seconds while its header read "Live trail" and motion was full
+    /// (the lab probe of 2026-10-22). A capture is that window's one watcher,
+    /// so the looping preview it encodes is the one a focused window's tick
+    /// leaves at the capture instant. NEGATIVE CONTROLS: the park still never
+    /// ticks the unwatched headless preview, and a preview with nothing to
+    /// play (the window unfocused, so motion is reduced) is not recompiled by
+    /// a capture: two captures of it are the same frame.
+    #[test]
+    fn a_headless_capture_samples_a_live_settings_preview_at_its_instant() {
+        // The specimen's terminal draws in the settled chrome face.
+        let mut renderer = aterm_render::Renderer::from_bytes(
+            aterm_render::embedded_font(),
+            14.0,
+            aterm_render::Theme::default(),
+        )
+        .expect("the embedded face");
+        renderer.set_runtime_font_discovery(false);
+        crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
+        let mut app = App::headless_for_test();
+        {
+            // A window tall enough that the card shows its specimen's rows.
+            let window = app.windows.get_mut(&WID).unwrap();
+            window.focused = true;
+            window.rows = 50;
+            window.cols = 120;
+        }
+        assert!(app.open_settings_tab(SettingsRoute::CursorMotion));
+
+        let early_png = image_at(&mut app, 420);
+        let early = drawn_preview(&app);
+        assert_eq!(
+            early.animation(),
+            PreviewAnimation::Continuous,
+            "the page's cursor preview loops"
+        );
+        assert_eq!(
+            app.native_settings_preview_for_tick(WID, 700, false),
+            None,
+            "the park never ticks an unwatched headless preview"
+        );
+        let late_png = image_at(&mut app, 980);
+        let late = drawn_preview(&app);
+        assert!(
+            late.phase_ms >= early.phase_ms + 500,
+            "the later capture draws the later frame: {} then {}",
+            early.phase_ms,
+            late.phase_ms
+        );
+        assert_ne!(early_png, late_png, "the preview moved between captures");
+
+        // NEGATIVE CONTROL: an unfocused window's preview is still (motion
+        // reduced), so a capture finds nothing to sample.
+        app.windows.get_mut(&WID).unwrap().focused = false;
+        let still_png = image_at(&mut app, 1_400);
+        let still = drawn_preview(&app);
+        assert_ne!(still.animation(), PreviewAnimation::Continuous);
+        assert_eq!(
+            image_at(&mut app, 2_600),
+            still_png,
+            "a still preview is the same frame at every capture"
+        );
+        assert_eq!(drawn_preview(&app).phase_ms, still.phase_ms);
     }
 }

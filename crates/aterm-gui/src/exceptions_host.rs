@@ -1381,11 +1381,9 @@ impl App {
         ));
     }
 
-    /// End the `render.<tab>.unrepaired` lines whose epoch is no longer the
-    /// tab's open, at-risk one (a real resize, a full clear or a screen switch
-    /// healed it) or whose session is gone. A line this window does not hold an
-    /// epoch for (one an earlier process raised and this one adopted: every grid
-    /// is new since) ends at once. Cheap: nothing is open in the common case.
+    /// End the `render.<tab>.unrepaired` lines whose epoch healed (a real resize, a full clear or
+    /// a screen switch) or whose session is gone. A line this window holds no epoch for (an
+    /// earlier process's, adopted: every grid is new since) ends at once.
     pub(crate) fn check_render_repairs(&mut self) {
         // Every turn of the event loop asks: with nothing held and the earlier
         // process's lines swept once, it is one flag and one map length.
@@ -1693,7 +1691,7 @@ fn table_line(text: &str, table: &str) -> Option<u32> {
     u32::try_from(at + 1).ok()
 }
 
-/// The `host_noted` key that says THIS process told of a tab's relaunch line.
+/// The `host_noted` key that says this process told of a tab's relaunch line.
 fn relaunch_told_key(sid: &str) -> String {
     format!("relaunch:{sid}")
 }

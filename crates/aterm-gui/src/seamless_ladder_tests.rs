@@ -188,12 +188,10 @@ fn assert_wire_admits_all(carried: &[(String, TerminalCheckpoint)]) {
     });
 }
 
-/// `n` one-cell OSC 8 links, each with a URL of exactly `url_len` bytes (at
-/// most the engine's 8 KiB `MAX_HYPERLINK_URL_BYTES`, past which it drops the
-/// link): past a small pane's line-record cap once `n * url_len` passes
-/// `16 KiB + cols * 512`, so the line's record cannot take the wire's shape at
-/// any history depth (the finding's reproduction: 8 links of 8 KiB in an
-/// 80-column pane).
+/// `n` one-cell OSC 8 links, each with a URL of exactly `url_len` bytes (at most the
+/// engine's 8 KiB `MAX_HYPERLINK_URL_BYTES`, past which it drops the link). Past
+/// `n * url_len > 16 KiB + cols * 512` the line's record exceeds the line-record cap at
+/// any history depth (8 links of 8 KiB do in an 80-column pane).
 pub(crate) fn link_dense(n: usize, url_len: usize) -> Vec<u8> {
     let mut bytes = Vec::new();
     for link in 0..n {

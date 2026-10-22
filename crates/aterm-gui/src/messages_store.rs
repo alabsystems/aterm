@@ -917,13 +917,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// REVIEW PIN (Lens B, 2026-09-22), now green: the first cut's
-    /// write-it-yourself fallback put a `Retired` line on disk AHEAD of its
-    /// `Posted` line whenever the channel was full, and the engine's replay
-    /// — order-dependent — read the record back as a dead process's open
-    /// row (`Stale`) with its final words lost. Posted/Retired pairs pushed
-    /// past the channel's depth in one append must every one read back
-    /// `Folded`.
+    /// Posted/Retired pairs pushed past the channel's depth all read back `Folded`: a
+    /// `Retired` written ahead of its `Posted` would replay as `Stale`.
     #[test]
     fn a_full_channel_never_puts_a_retired_line_ahead_of_its_posted_line() {
         let dir = scratch("reorder");

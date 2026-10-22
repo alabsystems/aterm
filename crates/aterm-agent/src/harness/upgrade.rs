@@ -1352,10 +1352,11 @@ pub fn prepare_prompt(from: &Version, to: &Version, source: Source, marker: &str
 const READINESS_ANSWER: &str = "Say in ordinary language whether this session is ready to \
     restart now, or explain what must finish first.";
 
-/// What the announcement asks of the agent's own work. Live work is waited
-/// for, never cancelled, but a wait that can never end (a poll loop counting
-/// agents that have died) is not such work, and only the agent can tell. Told
-/// what runs, the agent can stop such loops and answer READY. aterm itself
+/// What the announcement asks of the agent's own work. Live work is waited for, never cancelled,
+/// but a wait that can never end (a poll loop counting agents that have died) is not such work,
+/// and only the agent can tell; told what runs, it can stop such loops and answer READY. A watch
+/// (`while true; …; sleep 120; done`) is not work either: it ends only on an alert, and loses
+/// nothing by stopping and starting again after the resume ([`RESTART_WATCHES`]). aterm itself
 /// ends nothing ([`gate_restart`]).
 pub const STOPPING_POINT: &str = "Please get to a good stopping point first: let \
      background tasks, subagents or workflows you started finish while they are still making \

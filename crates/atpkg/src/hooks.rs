@@ -3663,7 +3663,7 @@ mod tests {
         aterm_spec::host::could_not_run_without(&absent);
     }
 
-    /// AND THE FISH RC LINE TOO: a `$HOME` with a backtick still names the hook verbatim.
+    /// The fish rc line names a `$HOME` with a backtick verbatim.
     #[cfg(unix)]
     #[test]
     fn the_fish_rc_line_carries_a_backtick_home_unescaped() {

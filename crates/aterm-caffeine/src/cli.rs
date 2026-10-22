@@ -31,7 +31,7 @@ USAGE:
     aterm caffeine off
     aterm caffeine status
     aterm caffeine startup [on|off]
-    aterm caffeine quit
+    aterm caffeine quit [own]
     aterm caffeine serve
 
     start      Put the mug in the menu bar (its own launchd job, in this
@@ -49,7 +49,8 @@ USAGE:
     startup    Say whether this build's mug starts at every login; `on` or `off`
                sets it (a plist in ~/Library/LaunchAgents; `off` also removes
                that of a build that is gone). The running mug stays.
-    quit       Turn off and take the mug out of the menu bar.
+    quit       Turn off and take the mug out of the menu bar. `own`: only this
+               build's mug and its job; another build's keeps running, on.
     serve      Run the mug in this process (what its launchd job runs).
 
 A restart of the Mac starts it off. macOS only.
@@ -73,8 +74,11 @@ pub enum Command {
     Status,
     /// `startup [on|off]`: say (`None`) or set Enable at Startup.
     Startup(Option<bool>),
-    /// `quit`: turn off and end the mug.
-    Quit,
+    /// `quit [own]`: turn off and end the mug, or with `own` only this build's.
+    Quit {
+        /// End only this build's mug and job, leaving another build's running.
+        own: bool,
+    },
     /// `serve`: run the mug here.
     Serve,
 }
@@ -117,7 +121,13 @@ pub fn parse(args: &[OsString]) -> Result<Command, String> {
             Some("off") => Some(false),
             Some(word) => return Err(format!("startup takes on or off, not {word:?}")),
         }),
-        Some("quit") => Command::Quit,
+        Some("quit") => Command::Quit {
+            own: match it.next() {
+                None => false,
+                Some("own") => true,
+                Some(word) => return Err(format!("quit takes own, not {word:?}")),
+            },
+        },
         Some("serve") => Command::Serve,
         Some(other) => return Err(format!("unknown command {other:?}")),
     };
@@ -190,6 +200,22 @@ pub fn startup_line(on: bool) -> String {
     format!("startup={}\n", if on { "on" } else { "off" })
 }
 
+/// Whether the mug `quit own` finds is another build's, which it leaves running with its
+/// mode: the running `holder`'s label (none named yet counts as another's) is not `here`,
+/// or, with none running, the label the free lock still names (`named`: a mug between its
+/// runs, which launchd starts again) is another.
+#[must_use]
+pub fn another_builds_mug(
+    holder: Option<&crate::instance::Holder>,
+    named: Option<&str>,
+    here: &str,
+) -> bool {
+    match holder {
+        Some(holder) => holder.label.as_deref() != Some(here),
+        None => named.is_some_and(|label| label != here),
+    }
+}
+
 /// The verb's entry: `args` are the words after `caffeine`, `version` the app version the
 /// about row prints.
 #[must_use]
@@ -222,7 +248,7 @@ fn run(command: Command, version: &str) -> ExitCode {
         Command::Off => mac::off(),
         Command::Status => mac::status(),
         Command::Startup(set) => mac::startup(set),
-        Command::Quit => mac::quit(),
+        Command::Quit { own } => mac::quit(own),
         Command::Serve => mac::serve(version),
     }
 }
@@ -462,33 +488,54 @@ mod mac {
     /// handler, so it ends at once, and this only bounds a hang.
     const QUIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-    pub(super) fn quit() -> ExitCode {
+    pub(super) fn quit(own: bool) -> ExitCode {
         let (here, now) = match here_now() {
             Ok(both) => both,
             Err(why) => return fail(why),
         };
+        let lock = here.paths.lock_file();
+        let holder = running_mug(&here.paths);
+        let named = instance::last_holder(&lock).and_then(|named| named.label);
+        // `quit own` (a scoped uninstall's) ends only this build's mug: one another build
+        // runs (another label in the lock, or none named yet) keeps running, its mode with it,
+        // and only this build's job is booted out. So does one the free lock still names:
+        // between its runs (a restart into an update leaves its label there, and launchd
+        // starts it again), or ended without letting go (a logout's signal).
+        let other =
+            own && super::another_builds_mug(holder.as_ref(), named.as_deref(), &here.label);
+        if other {
+            eprintln!(
+                "{VERB}: {}; it and its mode are left as they are",
+                if holder.is_some() {
+                    "another build's mug is running"
+                } else {
+                    "the lock names another build's mug, between its runs or ended"
+                }
+            );
+        }
+        let holder = holder.filter(|_| !other);
         // Off first, so a mug that comes back anyway comes back empty. A mode that already
         // reads off (no file, an earlier boot's, a span run out) is left as it is: `quit`
         // writes no state file where none was, and the self-uninstall sweep, which lists the
         // mug's files before it asks for `quit`, finds none it did not list.
-        let saved = if state::load(&here.paths.state_file(), now) == Mode::Off {
+        let saved = if other || state::load(&here.paths.state_file(), now) == Mode::Off {
             Ok(())
         } else {
             set_mode(&here.paths, Mode::Off)
         };
-        let lock = here.paths.lock_file();
-        let holder = running_mug(&here.paths);
         // A job's mug is ended by launchd (`bootout`): its KeepAlive restarts one that dies
         // of a signal. The jobs are the one the running mug names (the label it wrote beside
         // its pid), else the one a mug that died without letting go left named in the lock
         // (launchd may be holding it back between crashes), and this build's, whichever
         // build runs `quit`. Each is booted out while loaded, with a process this instant or
-        // not, or it would start again after `quit`. Any other holder (one run by hand) gets
-        // the SIGTERM itself.
+        // not, or it would start again after `quit`; a job whose state cannot be read fails
+        // `quit` as a failed bootout does, never falling through to a signal launchd answers
+        // by starting it again. Any other holder (one run by hand) gets the SIGTERM itself.
         let mut labels: Vec<String> = holder
             .as_ref()
             .and_then(|holder| holder.label.clone())
-            .or_else(|| instance::last_holder(&lock).and_then(|named| named.label))
+            .or(named)
+            .filter(|_| !own)
             .into_iter()
             .collect();
         if !labels.contains(&here.label) {
@@ -496,11 +543,15 @@ mod mac {
         }
         let mut ended: Vec<u32> = Vec::new();
         for label in &labels {
-            if let Ok(JobState::Loaded { pid }) = launchd::job_state(label) {
-                if let Err(e) = launchd::bootout(label) {
-                    return fail(e);
+            match launchd::job_state(label) {
+                Ok(JobState::Loaded { pid }) => {
+                    if let Err(e) = launchd::bootout(label) {
+                        return fail(e);
+                    }
+                    ended.extend(pid);
                 }
-                ended.extend(pid);
+                Ok(JobState::Absent) => {}
+                Err(e) => return fail(format!("launchctl print {label}: {e}")),
             }
         }
         if let Some(pid) = holder
@@ -521,8 +572,11 @@ mod mac {
                 QUIT_WAIT.as_secs()
             ));
         }
-        // Also a copy left by a mug a logout or a restart ended, which removes none itself.
-        if here.paths.code_dir().exists() {
+        // Also a copy left by a mug a logout or a restart ended, which removes none itself;
+        // not beside another build's mug, whose label the free lock keeps until it starts
+        // again (holding the lock to remove the copy would clear it, and the next `quit own`
+        // would take that mug for none). Its next start sweeps its old copy itself.
+        if !other && here.paths.code_dir().exists() {
             discard_copy(&here.paths);
         }
         match saved {
@@ -707,7 +761,9 @@ mod tests {
         assert_eq!(parsed("startup"), Ok(Command::Startup(None)));
         assert_eq!(parsed("startup on"), Ok(Command::Startup(Some(true))));
         assert_eq!(parsed("startup off"), Ok(Command::Startup(Some(false))));
-        assert_eq!(parsed("quit"), Ok(Command::Quit));
+        assert_eq!(parsed("quit"), Ok(Command::Quit { own: false }));
+        assert_eq!(parsed("quit own"), Ok(Command::Quit { own: true }));
+        assert!(parsed("quit all").is_err());
         assert_eq!(parsed("serve"), Ok(Command::Serve));
     }
 
@@ -769,7 +825,7 @@ mod tests {
             "on 1h 2h",
             "status x",
             "startup on off",
-            "quit x",
+            "quit own x",
             "serve x",
         ] {
             let why = parsed(line).expect_err(line);
@@ -777,6 +833,8 @@ mod tests {
         }
         let why = parsed("startup maybe").expect_err("maybe");
         assert!(why.starts_with("startup takes "), "{why}");
+        let why = parsed("quit x").expect_err("x");
+        assert!(why.starts_with("quit takes own"), "{why}");
     }
 
     #[cfg(unix)]
@@ -849,6 +907,38 @@ mod tests {
             status_text(timed, NOW + HOUR, Some(7), false, "l.x"),
             "caffeine=off\nuntil=-\nmenu=running\npid=7\nstartup=off\nlabel=l.x\n"
         );
+    }
+
+    #[test]
+    fn quit_own_leaves_another_builds_mug_running_or_between_runs() {
+        let running = |label: Option<&str>| crate::instance::Holder {
+            pid: 7,
+            label: label.map(str::to_owned),
+        };
+        // Running: its own label is this build's; another's, or none named yet, is not.
+        assert!(!another_builds_mug(
+            Some(&running(Some("l.here"))),
+            None,
+            "l.here"
+        ));
+        assert!(another_builds_mug(
+            Some(&running(Some("l.old"))),
+            None,
+            "l.here"
+        ));
+        assert!(another_builds_mug(Some(&running(None)), None, "l.here"));
+        // The running holder decides, whatever the lock named before it.
+        assert!(!another_builds_mug(
+            Some(&running(Some("l.here"))),
+            Some("l.old"),
+            "l.here"
+        ));
+        // None running: a free lock still naming another build's job is that build's mug
+        // between runs (a restart into an update), so its mode is left as it is.
+        assert!(another_builds_mug(None, Some("l.old"), "l.here"));
+        // NEGATIVE CONTROL: this build's own name, or none, is this build's to quit.
+        assert!(!another_builds_mug(None, Some("l.here"), "l.here"));
+        assert!(!another_builds_mug(None, None, "l.here"));
     }
 
     #[test]

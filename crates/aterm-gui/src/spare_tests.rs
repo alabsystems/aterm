@@ -3415,6 +3415,43 @@ fn a_promotion_runs_only_on_a_fresh_stamp_of_the_gate() {
     assert_eq!(read(), "run\n");
 }
 
+/// A spawned spare that has not said it is parked [`PARKED_DEADLINE`] after
+/// its spawn landed ran past the wrapper's hold, its rc possibly running
+/// unasked: it is retired `no_park` and spares stay off for its script set
+/// and shell. Negative control: one a millisecond younger is kept, its tick
+/// armed for the deadline. On the injected clock, so no load moves either age.
+#[test]
+fn a_spawned_spare_unparked_at_its_deadline_is_retired_and_a_younger_one_kept() {
+    let mut app = App::headless_for_test();
+    let mut slot = parked_slot(&app, 61, None);
+    slot.state = SlotState::Spawned;
+    let (since, key) = (slot.since, parked_key(&slot.inputs));
+    app.spares.slot = Some(slot);
+    app.spares.captured = Some(Vec::new());
+    app.spares.tick_at.set(None);
+
+    app.spare_age(
+        since + PARKED_DEADLINE - Duration::from_millis(1),
+        SpareMode::Auto,
+    );
+    assert_eq!(
+        app.spares.slot.as_ref().map(|s| s.state),
+        Some(SlotState::Spawned),
+        "a millisecond short of the deadline it is still spawning"
+    );
+    assert_eq!(app.spares.parked_failed, None);
+    assert_eq!(
+        app.spares.tick_at.get(),
+        Some(since + PARKED_DEADLINE),
+        "the tick is armed for the deadline"
+    );
+
+    app.spare_age(since + PARKED_DEADLINE, SpareMode::Auto);
+    assert!(app.spares.slot.is_none(), "no parked mark: retired");
+    assert_eq!(app.spares.parked_failed, Some(key), "and spares are off");
+    assert_eq!(app.spares.discards, vec![("no_park", 1)]);
+}
+
 /// A start record the reader saw before the spawn's completion landed (its
 /// note found the slot still Booked): the shell ran past its parked hold, so
 /// the spare goes and spares stay off for this script set and shell, exactly

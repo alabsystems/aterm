@@ -464,6 +464,7 @@ pub(crate) fn caps() -> Caps {
         proc_memory_others: Cap::Yes,
         throttle: Cap::No(Why::Unsupported),
         volume: Cap::Yes,
+        coalitions: Cap::No(Why::Unsupported),
         capacity: CapSource::Host,
     }
 }

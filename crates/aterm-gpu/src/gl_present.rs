@@ -645,6 +645,15 @@ impl GpuRenderer {
             .map_err(|()| "virtual present crop outside the resident frame")?;
         let w = self.clamp_fb_dim(destination.0.max(1));
         let h = self.clamp_fb_dim(destination.1.max(1));
+        // One bind for the whole present, as the window present's.
+        let device = Arc::clone(
+            self.gl_arm
+                .as_ref()
+                .ok_or("the GL arm is not live")?
+                .dev
+                .shared(),
+        );
+        let _bound = device.enter().ok();
         let work_started = aterm_time::Instant::now();
         let (fw, fh) = self.encode_present_frame(win, input);
         if !self.last_frame_arm_gl {
@@ -883,6 +892,23 @@ impl GpuRenderer {
             gl_arm_note("armed present refused: the GL arm is not live");
             return Err(SurfacePresentFailure::Validation);
         }
+        // One bind of the context for the whole present, so every `enter` the
+        // encode, the compose and the post make inside it is a nested guard,
+        // which binds nothing. A top-level `enter` is a `glXMakeContextCurrent`
+        // on the context's pbuffer and its drop a release, and on NVIDIA's GLX
+        // each takes milliseconds, tens while the X server is busy with a
+        // resize: a present made 15 to 36 of them, 78% of its time, and one
+        // after a resize took 100 to 460 ms (the desk, 2026-10-22). A refused
+        // bind is no answer here: the steps meet the refusal again, each on
+        // its own route (a lost frame falls off the arm, its present drops).
+        let device = Arc::clone(
+            self.gl_arm
+                .as_ref()
+                .expect("gl_arm_ready above")
+                .dev
+                .shared(),
+        );
+        let _bound = device.enter().ok();
         // The retained desire (`resize_surface`) is the surface's size.
         gs.resize(surf.neutral.width, surf.neutral.height);
         let work_started = aterm_time::Instant::now();
@@ -925,7 +951,13 @@ impl GpuRenderer {
         let posted = win.measure_surface_acquire(|| gs.present(&live.dev));
         posted.map_err(|e| {
             gl_arm_note(&format!("armed present: the post failed ({e})"));
-            e.kind
+            #[cfg(not(target_arch = "wasm32"))]
+            let kind = e.kind;
+            // A WebGL canvas has no bind to refuse: every failed post keeps the
+            // validation disposition.
+            #[cfg(target_arch = "wasm32")]
+            let kind = SurfacePresentFailure::Validation;
+            kind
         })?;
         self.gl_maybe_inject_loss();
         Ok(())

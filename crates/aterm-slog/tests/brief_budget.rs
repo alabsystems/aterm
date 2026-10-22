@@ -740,7 +740,8 @@ fn brief_reads_an_exact_refinement_and_never_a_strong_one() {
 /// busy agent session's brief, every 3B mark written on every turn, holds
 /// every line it holds without them, at every budget; mail is the `mail in ·
 /// out` line and `act` and `story` one count line, both the first lines shed.
-/// Phase 6's ring kinds (6F-2) are among them: none is a line.
+/// Phase 6's ring kinds (6F-2) are among them: none is a line, and since
+/// 6F-9 (U26) the `shown` marks are one more count line, shed with them.
 /// NEGATIVE CONTROL: the count lines are there when they fit, and a pre-3B
 /// mark (a person's input) still is a line.
 #[test]
@@ -789,7 +790,9 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
                 .word(Key::State, "blocked")
                 .and_then(|f| f.word(Key::Ask, "permission")),
             Kind::MailFetch => f.u(Key::Off, 91),
-            Kind::Shown => f.word(Key::Need, "approval:bash"),
+            Kind::Shown => f
+                .word(Key::Need, "approval")
+                .and_then(|f| f.word(Key::Sev, "decide")),
             _ => Ok(f),
         }
         .expect("fields")
@@ -842,15 +845,15 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
         }
     }
     let body = |t: &str| t.lines().skip(1).map(str::to_string).collect::<Vec<_>>();
-    let counts = ["mail in 12 · out 0", "acts 12 · stories 12"];
+    let counts = ["mail in 12 · out 0", "acts 12 · stories 12", "shown 12"];
     let full = base.brief("s-1", 100_000, now);
     let mut counted = 0;
     for budget in (0..=full.used + 40).rev() {
         let b = body(&base.brief("s-1", budget, now).text);
         let w = body(&with.brief("s-1", budget, now).text);
         let shown = counts.iter().filter(|c| w.iter().any(|l| l == *c)).count();
-        assert!(shown == 0 || shown == 2, "both or neither: {w:?}");
-        if shown == 2 {
+        assert!(shown == 0 || shown == counts.len(), "all or none: {w:?}");
+        if shown == counts.len() {
             counted += 1;
             let without: Vec<String> = w
                 .iter()

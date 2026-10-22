@@ -106,12 +106,11 @@ fn install_default_set(
     )
 }
 
-/// The `--wait-lock <secs>` edge grammar (2026-09-10), mirror of the
-/// `--progress-file` reasoning above: stripped for the three provisioning verbs
-/// wherever it sits, the LAST parsable value wins, and an unparsable value — or a
-/// bare flag at the END of argv — is consumed and means "no wait", never a program
-/// name. (A valueless flag mid-argv eats the next token instead; no spawner
-/// produces that shape — see `take_wait_lock_flag`.)
+/// The `--wait-lock <secs>` edge grammar: stripped for the three provisioning verbs
+/// wherever it sits, the last parsable value wins, and an unparsable value or a bare flag
+/// at the end of argv is consumed and means "no wait", never a program name. (A valueless
+/// flag mid-argv eats the next token; no spawner produces that shape, see
+/// `take_wait_lock_flag`.)
 #[test]
 fn wait_lock_flag_is_stripped_at_the_edge_and_degrades_to_no_wait() {
     let argv = |parts: &[&str]| parts.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -183,10 +182,10 @@ fn a_discovery_guesses_from_every_build_seen_published() {
     assert_eq!(discovery_hint(72, unread, cut, Some(73)), hint(None, 73));
 }
 
-/// THE PACKAGE LOG'S LANES (Phase 4): read off how the pass was spawned — the head
-/// watch's flag, the session's detached spawner, the window's queue-and-report flags,
-/// the intercept's queue without a progress file — else it was typed. And the exit
-/// code an `ExitCode` carries comes back out of it.
+/// The package log's lanes, read off how the pass was spawned: the head watch's flag, the
+/// session's detached spawner, the window's queue-and-report flags, the intercept's queue
+/// without a progress file, else typed. And the exit code an `ExitCode` carries comes back
+/// out of it.
 #[test]
 fn a_pass_names_its_lane_from_how_it_was_spawned() {
     let lane = |hw, wait, progress, detached, verb, operand| {
@@ -974,8 +973,7 @@ fn list_includes_programs_provisioned_only_through_development_links() {
     );
 }
 
-/// `list` with no resolvable prefix exits 1 like every sibling read verb — it used
-/// to print the error and exit 0, a silent green in an already-broken environment.
+/// `list` with no resolvable prefix exits 1, like every sibling read verb.
 #[test]
 fn list_exit_codes() {
     assert_eq!(
@@ -1327,11 +1325,10 @@ fn names(v: &[&str]) -> std::collections::BTreeSet<String> {
     v.iter().map(|s| (*s).to_string()).collect()
 }
 
-// `which <program>` for a bundle whose build exposes no command of its own name
-// (`trust` → trustc/targo, `trust-mc` → trust-mc-driver) answers with the managed
-// store dir and the names it DOES put on PATH; a same-named unrelated binary on PATH
-// (Homebrew's p11-kit `trust`) is named as exactly that, after the truth — never as
-// "the system copy" of a program it is not (2026-09-10 audit).
+// `which <program>` for a bundle whose build exposes no command of its own name (`trust`
+// → trustc/targo, `trust-mc` → trust-mc-driver) answers with the managed store dir and
+// the names it does put on PATH; a same-named unrelated binary on PATH (Homebrew's
+// p11-kit `trust`) is named as exactly that, after the truth, never as "the system copy".
 #[cfg(unix)]
 #[test]
 fn which_for_a_bundle_program_names_the_store_and_its_exposed_tools() {
@@ -1659,9 +1656,9 @@ fn version_from_components_reads_the_last_dotted_digits_component() {
     assert_eq!(v("/x/.hidden/claude"), None, "a dot alone is not a version");
 }
 
-// `machine-settings:` is the contract line the GUI parses for its ledger entries:
-// entries `; `-separated, Universal Control as `universal-control disabled`; nothing
-// printed for an empty pass (the callers check).
+// A failed Universal Control write is reported under `MACHINE_APPLY_FAILED_PREFIX` and
+// mints no `machine-settings:` entry; only the success arm adds
+// `universal-control disabled`, with its revert.
 #[test]
 fn machine_write_failure_is_explicit() {
     use crate::machine::UniversalControlOutcome;
@@ -3204,12 +3201,9 @@ fn a_system_install_satisfies_a_default_set_member_and_retires_the_managed_copy(
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A verdict the AUTHORITY never gave must not become a resident of the record.
-///
-/// `NotReachable` means the signed index resolved, verified, and does not name the
-/// token — a fact about the request, not about this store. Recording it as a program
-/// state invents a program, and `atpkg doctor` reads every such row back as a missing
-/// member of the toolset.
+/// A verdict the authority never gave never becomes a row: `NotReachable` means the signed
+/// index verified and does not name the token, a fact about the request; recording it
+/// would invent a program that `atpkg doctor` reads back as a missing member.
 #[test]
 fn a_name_the_index_does_not_name_is_never_recorded() {
     assert_eq!(
@@ -5110,10 +5104,9 @@ fn a_tools_own_help_flag_is_forwarded_by_run_and_stopped_by_a_separator() {
     assert!(!help_flag_addresses_atpkg("install", &s(&[])));
 }
 
-/// `lane` at the dispatch edge: a stock command line is refused (exit 2), a Trust
-/// one is not (0), and a `--help` AFTER `--` belongs to the command — the edge that
-/// answers `<verb> --help` stops at `--`, so `lane -- cargo --help` is read, not
-/// answered with lane's own usage.
+/// `lane` at the dispatch edge: a stock command line is refused (exit 2), a Trust one is
+/// not (0), and a `--help` after `--` belongs to the command, so `lane -- cargo --help` is
+/// read, not answered with lane's own usage.
 #[test]
 fn lane_refuses_stock_rust_and_reads_the_command_after_the_separator() {
     let run = |argv: &[&str]| main_entry(argv.iter().map(std::ffi::OsString::from).collect());
@@ -5452,15 +5445,10 @@ fn declining_the_toolset_survives_until_an_explicit_install() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE MARKER CONTRACT HAS A POSITIVE TERMINAL, and the ledger knows which half
-/// of the contract each marker keeps.
-///
-/// Until 2026-09-11 every terminal in this contract reported a PROBLEM
-/// (`seed-failed:`, `seed-partial:`, `seed-unusable:`, `net-failed:`) beside the
-/// two install rosters, so a pass that announced itself, ended well and had no
-/// roster to name printed nothing at all — and its only reader, the GUI, had to
-/// infer an outcome from that silence. It inferred "failed", and put "⚠ ALab
-/// toolchain install failed" over a clean run on a healthy machine.
+/// The marker contract has a positive terminal (`seed-done:`), and the ledger knows which
+/// half of the contract each marker keeps. Without it a pass that announced itself, ended
+/// well and had no roster to name printed nothing, and the GUI read that silence as a
+/// failure.
 #[test]
 fn the_marker_table_covers_every_marker_and_names_the_one_that_opens() {
     use super::announcement::MARKERS;
@@ -5790,10 +5778,9 @@ fn an_empty_store_not_completing_the_set_has_no_update_work() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The probe worker outlives a CLI invocation. An adopted but empty store
-/// must start looking for newly published members after the user enables
-/// Automatic updates in the same running window/session. The old one-time
-/// `config::cached()` read kept it ineligible until the process restarted.
+/// The probe worker outlives a CLI invocation: an adopted but empty store starts looking
+/// for newly published members once the user enables Automatic updates in the same running
+/// window or session, without a restart.
 #[test]
 fn near_index_work_check_reads_live_install_consent() {
     let dir = scratch("has-work-live-config");
@@ -6231,8 +6218,7 @@ fn assert_empty_store_retry_success(first_index_link_down: bool) {
     let trust = crate::vendor_direct::lane::world::trust();
     let seams = PassSeams {
         anchor: |_| test_anchor(),
-        // A second past the epoch, not 0: the pass stamps its success at its own clock,
-        // and 0 is the "clock unusable" sentinel that stamps nothing (`rfc3339_at`).
+        // Not 0, the "clock unusable" sentinel that stamps nothing (`rfc3339_at`).
         now: || 1,
         trust: &trust,
         shell_hooks: no_shell_hooks,
@@ -7582,10 +7568,10 @@ fn write_group_registry(dir: &Path, channel: &str, write_tb_pkg: bool) {
     }
 }
 
-// §7 all-or-nothing: a tuple member whose pkg manifest is unpublished aborts the
-// WHOLE group — the sibling that staged fine is neither activated nor left on
-// disk (a complete-but-inactive build would mis-read as active next run), while
-// the ungrouped singleton still installs. Exactly ONE loud failure for the group.
+// §7 all-or-nothing: a tuple member whose pkg manifest is unpublished aborts the whole
+// group. The sibling that staged fine is neither activated nor left on disk (a
+// complete-but-inactive build would read as active next run), the ungrouped singleton
+// still installs, and the group counts one failure.
 #[test]
 fn default_set_bootstrap_never_splits_a_coherence_group() {
     let dir = scratch("group-abort");
@@ -8943,12 +8929,10 @@ fn pending_is_not_delisted_by_a_pass_that_plans_other_work() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// State: SKIPPED — a TERMINAL phase, never a wait. `Sink::finished` has already
-/// retired the program from the queue and counted it done, so nothing later in this
-/// pass installs it, and the reorder-only bump file cannot put it back. The stub says
-/// the RECORDED reason (control-stripped, like every other untrusted echo) and claims
-/// NO bump — it used to answer a member blocked by an unmet requirement with "queued
-/// and now BUMPED to install next", a promise the running pass never kept.
+/// State: skipped, a terminal phase, never a wait. `Sink::finished` has retired the program
+/// from the queue and counted it done, so nothing later in this pass installs it and the
+/// reorder-only bump file cannot put it back. The stub says the recorded reason
+/// (control-stripped) and claims no bump.
 #[test]
 fn pending_skipped_says_the_recorded_reason_and_claims_no_bump() {
     let l = temp_layout("pend-skipped");
@@ -8980,8 +8964,8 @@ fn pending_skipped_says_the_recorded_reason_and_claims_no_bump() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// State: FAILED — the recorded error surfaces WITH its next act, and control
-/// characters in it are stripped before the TTY (escape-sequence injection).
+/// State: failed. The recorded error surfaces with its next act, control characters
+/// stripped before the TTY.
 #[test]
 fn pending_failed_names_the_error_and_strips_escapes() {
     let l = temp_layout("pend-failed");
@@ -11559,8 +11543,8 @@ fn a_landed_agent_build_is_warmed_once_by_every_lane_that_lands_it() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// ONLY AN INSTALL IS A LANDING: a rollback re-activates a build that already ran here,
-/// a tombstone runs nothing, and every other verdict moved nothing — none is warmed.
+/// Only an install is a landing: a rollback re-activates a build that already ran here, a
+/// tombstone runs nothing, and every other verdict moved nothing, so none is warmed.
 #[test]
 fn only_an_installed_verdict_is_a_landing() {
     use crate::vendor_direct::decide::{InstallReason, Installed, KeepReason};
@@ -12663,8 +12647,8 @@ fn a_pass_that_failed_only_for_its_cached_index_is_recorded_and_stood_down_as_th
     );
     assert!(!crate::status::stale_index_only_end(&record()), "offline");
     f.offline.set(false);
-    // CONTROL (the Apple anchor exists on macOS only): the cached index AND a member
-    // refused — a failure the stand-down still says on stderr.
+    // Control (the Apple anchor exists on macOS only): the cached index and a member
+    // refused, a failure the stand-down still says on stderr.
     if cfg!(target_os = "macos") {
         f.index_refused.set(true);
         f.publish_claude("2.1.282", &native_exe("b"));

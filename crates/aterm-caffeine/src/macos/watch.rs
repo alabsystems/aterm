@@ -9,7 +9,7 @@
 //! `Contents/Info.plist` (an update carries a new version, and the updater swaps the whole
 //! bundle), a bare build-tree executable's length and modification time.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::code::code_fingerprint;
 
@@ -25,9 +25,13 @@ pub(super) struct Watch {
 }
 
 impl Watch {
-    /// Watch the code of `origin`, the executable the mug was started as, as it reads now.
-    pub(super) fn start(origin: PathBuf) -> Self {
-        let baseline = code_fingerprint(&origin);
+    /// Watch the code of `origin`, the executable the mug was started as, against the code
+    /// of `running`, the executable this process runs: its copy, whose `Info.plist` is the
+    /// origin's as it was when cloned, or the origin itself. An update that lands between the
+    /// copy and this read (the copy's first exec, which macOS assesses) is then a replaced
+    /// origin, not the baseline.
+    pub(super) fn start(origin: PathBuf, running: &Path) -> Self {
+        let baseline = code_fingerprint(running);
         Self { origin, baseline }
     }
 
@@ -110,7 +114,7 @@ mod tests {
         let exe = app.join("Contents").join("MacOS").join("aterm");
         std::fs::create_dir_all(exe.parent().expect("parent")).expect("mkdir");
         std::fs::write(&exe, b"exe").expect("exe");
-        let mut watch = Watch::start(exe);
+        let mut watch = Watch::start(exe.clone(), &exe);
         assert_eq!(watch.baseline, None, "no Info.plist yet");
         let info = app.join("Contents").join("Info.plist");
         std::fs::write(&info, b"<plist>1</plist>").expect("plist");
@@ -118,5 +122,28 @@ mod tests {
         assert!(!watch.replaced());
         std::fs::write(&info, b"<plist>2</plist>").expect("plist");
         assert!(watch.replaced());
+    }
+
+    /// The baseline is the running copy's code, not the origin's as it reads at the start: an
+    /// update landed while the copy was made and first run is a replaced origin. NEGATIVE
+    /// CONTROL: a watch taking the origin's print at its start never restarts onto it.
+    #[test]
+    fn an_update_during_the_copys_first_exec_is_a_replaced_origin() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let bundle = |name: &str, plist: &[u8]| {
+            let exe = dir.path().join(name).join("Contents/MacOS/aterm");
+            std::fs::create_dir_all(exe.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&exe, b"exe").expect("exe");
+            std::fs::write(dir.path().join(name).join("Contents/Info.plist"), plist)
+                .expect("plist");
+            exe
+        };
+        let copy = bundle("copy/X.app", b"<plist>1</plist>");
+        let origin = bundle("X.app", b"<plist>2</plist>");
+        assert!(Watch::start(origin.clone(), &copy).replaced());
+        assert!(
+            !Watch::start(origin.clone(), &origin).replaced(),
+            "the control"
+        );
     }
 }

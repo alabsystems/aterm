@@ -554,14 +554,10 @@ pub(crate) fn tab_bar(row: &str) -> Option<(Vec<QuestionTab>, bool)> {
     Some((tabs, submit_tab))
 }
 
-/// A row's width in cells when it can be measured: printable ASCII, as
-/// `aterm-agent`'s `cells_are_chars` measures a box's command row, and the
-/// glyphs the dialog itself draws in its own one-cell columns — the pointer
-/// `❯`, the checkbox's `✔` and the gutter `│` (each measured one cell in
-/// the 2.1.282 captures' styles), and the scroll arrows drawn in the
-/// pointer's column. `None` for any other character: the server's text
-/// leaves out a wide character's second cell, so the row cannot be
-/// measured.
+/// A row's width in cells when it can be measured: printable ASCII (as `aterm-agent`'s
+/// `cells_are_chars` measures a box's command row) and the one-cell glyphs the dialog
+/// draws (`❯`, `✔`, `│` and the scroll arrows). `None` for any other character: the
+/// server's text leaves out a wide character's second cell.
 fn measured(row: &str) -> Option<usize> {
     let t = crate::text::trim_end(row);
     t.chars()

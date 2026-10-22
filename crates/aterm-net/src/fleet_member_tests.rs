@@ -978,9 +978,10 @@ fn a_peer_is_proven_only_by_the_key_its_entry_binds() {
     mode(&state.dir().join(PEERS_FILE), 0o644);
     assert_eq!(Keyring::read(state.dir()), Keyring::default());
 
-    // A person's entry at a copy's place is read in the copy's stead, and the
-    // copy's key still binds its node: whatever answers that entry as it is
-    // held to that key.
+    // A person's entry at a copy's place is read beside a copy that names a
+    // node, whose key binds it: whatever answers that entry as the copy's
+    // node is held to that key. NEGATIVE CONTROL: a copy that names no node
+    // at that place is the person's entry, read once.
     let n = identity(&node_of(0xc3), 6);
     let state = State::new("ringplace");
     let issuer = Peer {
@@ -991,23 +992,23 @@ fn a_peer_is_proven_only_by_the_key_its_entry_binds() {
     let at_m7 = copy(keyed(0xc3, n.key(), [10, 0, 0, 7], 7100));
     write_issuer_book(state.dir(), i.node(), std::slice::from_ref(&at_m7)).unwrap();
     let mut read = read_peers(state.dir()).unwrap();
-    with_copies(&mut read, [at_m7.clone()]);
-    assert_eq!(read.len(), 2, "the person's entry stands for the copy");
+    with_copies(&mut read, [at_m7.clone(), copy(manual("m7.local", 7100))]);
     assert_eq!(
-        Keyring::of(&read).bound(n.node()),
-        None,
-        "a read's targets alone have lost the copy's key"
+        read.iter().map(|peer| peer.via).collect::<Vec<_>>(),
+        [Via::Issuer, Via::Manual, Via::IssuerBook],
+        "the copy that names a node, beside the person's entry"
     );
+    assert_eq!(read[2], at_m7);
     let ring = Keyring::read(state.dir());
     assert_eq!(ring.bound(n.node()), Some(n.key()));
     assert_eq!(
         ring,
-        Keyring::of(read.iter().chain([&at_m7])),
-        "the book and its copy, before a read leaves the copy out"
+        Keyring::of(&read),
+        "a read's targets keep the copy's key"
     );
-    // What names a node to grant or drive it finds the node the person's
-    // entry stands for in a read ([`bound_peers`]); a read's targets name
-    // the person's entry, which has none.
+    // What names a node to grant, drive or survey it resolves among the
+    // peers a key binds first ([`bound_peers`]): a read's targets hold the
+    // person's entry and the copy, which both answer to the place's name.
     let bound = bound_peers(state.dir());
     assert_eq!(
         bound
@@ -1020,7 +1021,7 @@ fn a_peer_is_proven_only_by_the_key_its_entry_binds() {
         find(&bound, "m7").map(|at| at.map(|at| bound[at].key)),
         Ok(Some(Some(n.key())))
     );
-    assert_eq!(find(&read, "m7"), Ok(Some(1)));
+    assert!(find(&read, "m7").is_err(), "two peers answer to it");
     assert_eq!(
         ring.proven(Some(&proof(n.node(), b.key()))),
         Err(Unproven::OtherKey(n.node().to_owned()))
@@ -2241,11 +2242,12 @@ fn a_books_keys_are_copied_only_from_a_proven_issuer() {
 }
 
 /// THE COPY IS MERGED WHOLE: the old copy is replaced; this machine, the
-/// issuer itself, a node or place the member's own book holds, a repeat, and
-/// a second-hand entry are left out; an entry on the issuer's loopback is
-/// placed at the address the issuer answered from; a merge twice is the
-/// merge once; and the book never holds more than its cap, the member's own
-/// entries kept first.
+/// issuer itself, a node the member's own book holds, a place it holds for
+/// an entry that names no node, a repeat, and a second-hand entry are left
+/// out, while a member at the place of a person's entry is kept, node and
+/// all; an entry on the issuer's loopback is placed at the address the
+/// issuer answered from; a merge twice is the merge once; and the book never
+/// holds more than its cap, the member's own entries kept first.
 #[test]
 fn a_merge_replaces_the_copy_whole_dedupes_and_is_bounded() {
     let issuer_at = IpAddr::from([10, 0, 0, 7]);
@@ -2295,6 +2297,7 @@ fn a_merge_replaces_the_copy_whole_dedupes_and_is_bounded() {
             own_issuer.clone(),
             manual("lab-mini", 7101),
             copy(joined(0x22, "m2", [10, 0, 0, 2], 7100)),
+            copy(joined(0x33, "lab-mini", [10, 0, 0, 3], 7101)),
             relocated,
             sibling,
         ]
@@ -2351,8 +2354,10 @@ fn a_merge_replaces_the_copy_whole_dedupes_and_is_bounded() {
 /// A COPY IS NEVER EDITED BY HAND: `rm` refuses a peer only the copy holds,
 /// and takes this machine's own entry where both answer; `record` refuses to
 /// write a copy; read beside the book, a person's entry for a copy's place
-/// stands for it, a node the book holds stands for its copy, and the two
-/// together never pass the cap, the book's own entries first and whole.
+/// stands for a copy that names no node, a node the book holds stands for
+/// its copy, a copy that names a node is read beside a person's entry at its
+/// place, and the two together never pass the cap, the book's own entries
+/// first and whole.
 #[test]
 fn a_copy_of_the_issuers_book_yields_to_the_machines_own_entries() {
     let own = vec![issuer_entry(0x11, 7100), manual("LAB-MINI", 7101)];
@@ -2360,6 +2365,7 @@ fn a_copy_of_the_issuers_book_yields_to_the_machines_own_entries() {
         copy(manual("lab-mini", 7101)),
         copy(joined(0x22, "m2", [10, 0, 0, 2], 7100)),
         copy(joined(0x11, "m7-again", [10, 0, 0, 77], 7100)),
+        copy(joined(0x33, "lab-mini.local", [10, 0, 0, 3], 7101)),
     ];
     let mut book = own.clone();
     assert!(remove(&mut book, &copies, &node_of(0x22)).is_err());
@@ -2376,8 +2382,13 @@ fn a_copy_of_the_issuers_book_yields_to_the_machines_own_entries() {
     with_copies(&mut read, copies.clone());
     assert_eq!(
         read,
-        [own[0].clone(), own[1].clone(), copies[1].clone()],
-        "a place or a node of the book's own stands for its copy"
+        [
+            own[0].clone(),
+            own[1].clone(),
+            copies[1].clone(),
+            copies[3].clone()
+        ],
+        "a node of the book's own stands for its copy, a place for one that names none"
     );
 
     let crowd = |n: usize| -> Vec<Peer> {
@@ -2401,6 +2412,71 @@ fn a_copy_of_the_issuers_book_yields_to_the_machines_own_entries() {
         crowd(PEERS_MAX),
         "a full book leaves no room for a copy"
     );
+}
+
+/// A MEMBER THAT NAMES ANOTHER'S PLACE TAKES NEITHER ITS COPY NOR ITS KEY: an
+/// entry's host and port are what its registrant said, so a member that
+/// joined again naming another member's host and port — ahead of it in the
+/// issuer's book, where a join again in place leaves it, or after it — is a
+/// copy beside that member's, never in its stead: the member's copy, the
+/// file that keeps it and the keys it binds still hold the member, proven
+/// by its own key. FAILS WITHOUT THE FIX: the entry first at the place drops
+/// the other's copy, and with it the key that binds its node. NEGATIVE
+/// CONTROL: an entry that names no node at that place is still left out.
+#[test]
+fn a_member_that_names_anothers_place_takes_neither_its_copy_nor_its_key() {
+    let (y, z) = (identity(&node_of(0x5a), 1), identity(&node_of(0x5b), 2));
+    let at_y = |peer: Peer| Peer {
+        host: "y-mac.local".to_owned(),
+        ..peer
+    };
+    let y_entry = at_y(keyed(0x5a, y.key(), [10, 0, 0, 5], 7100));
+    let z_entry = at_y(keyed(0x5b, z.key(), [10, 0, 0, 66], 7100));
+    let i = identity(&node_of(0x11), 3);
+    let own = node_of(0xaa);
+    for (order, members) in [
+        ("ahead", [&z_entry, &y_entry]),
+        ("after", [&y_entry, &z_entry]),
+    ] {
+        let mut peers: Vec<Peer> = members.into_iter().cloned().collect();
+        peers.push(manual("y-mac", 7100));
+        let fetched = Book {
+            node: i.node().to_owned(),
+            proven: true,
+            at: IpAddr::from([10, 0, 0, 7]),
+            peers,
+        };
+        let copies = copies_of(&fetched, Some(&own));
+        assert_eq!(
+            copies,
+            members.map(|member| copy(member.clone())),
+            "{order}: both members, and no entry by hand at their place"
+        );
+        let state = State::new("placekeys");
+        write_book(
+            state.dir(),
+            &[Peer {
+                key: Some(i.key()),
+                ..issuer_entry(0x11, 7100)
+            }],
+        );
+        write_issuer_book(state.dir(), i.node(), &copies).unwrap();
+        for (ring, read) in [
+            (Keyring::read(state.dir()), "the kept copy"),
+            (
+                Keyring::default().with_book(&fetched, Some(&own)),
+                "a fresh book",
+            ),
+        ] {
+            for member in [&y, &z] {
+                assert_eq!(
+                    ring.proven(Some(&proof(member.node(), member.key()))),
+                    Ok(member.node().to_owned()),
+                    "{order}, {read}"
+                );
+            }
+        }
+    }
 }
 
 /// THE COPY HAS A FILE OF ITS OWN, BOUND TO ITS ISSUER: what a read of the
@@ -2750,6 +2826,277 @@ fn a_member_rebound_on_the_issuer_is_read_under_its_new_key() {
         matches!(stale.as_slice(), [(Some(key), Err(Unreached::Impostor { issuer: false, .. }))] if *key == old.key()),
         "{stale:?}"
     );
+}
+
+/// A NODE THE BOOK BINDS ANEW IS PROVEN BY EVERY ENTRY THAT REACHED IT: a
+/// member's copy holds only a place the issuer's person named by hand, where
+/// node M listens, and the book that comes names that place and M there,
+/// bound to the key M proves. The copy's dial, begun before the book's keys
+/// came, read M's answer as M's claim; judged again by the keys the read
+/// ends with, it is proven like the book's entry of M, so the survey never
+/// shows M twice, once `node unproven`. FAILS WITHOUT THE FIX: the copy's
+/// answer stays M's claim. NEGATIVE CONTROL: a book that binds M to another
+/// key proves neither — the copy's answer is never proven, and the book's
+/// entry of M is an impostor.
+#[test]
+fn a_node_the_book_binds_anew_is_proven_by_every_entry_that_reached_it() {
+    let (m_state, issuer_state) = (State::new("anew-m"), State::new("anew-i"));
+    let (proves, other) = (identity(&node_of(0xd5), 1), identity(&node_of(0xd5), 2));
+    let m = Issuing::proving(
+        secret(5),
+        m_state.dir(),
+        Issuer {
+            node: node_of(0xd5),
+            ..issuer(0x11)
+        },
+        proves.clone(),
+    );
+    let issuing_as = identity(&issuer(0x11).node, 9);
+    let read = |bound: NodeKey| {
+        write_book(
+            issuer_state.dir(),
+            &[
+                manual("127.0.0.1", m.port),
+                Peer {
+                    host: "127.0.0.1".to_owned(),
+                    ..keyed(0xd5, bound, [127, 0, 0, 1], m.port)
+                },
+            ],
+        );
+        issue(issuer_state.dir());
+        let issuing = Issuing::proving(
+            secret(5),
+            issuer_state.dir(),
+            issuer(0x11),
+            issuing_as.clone(),
+        );
+        let peers = [
+            Peer {
+                key: Some(issuing_as.key()),
+                ..issuer_entry(0x11, issuing.port)
+            },
+            copy(manual("127.0.0.1", m.port)),
+        ];
+        let (reads, book) = read_whole(
+            &peers,
+            &Keyring::of(&peers),
+            None,
+            (&secret(5), None),
+            HANG,
+            "survey",
+        );
+        assert!(
+            matches!(&book, BookRead::Fetched(book) if book.proven),
+            "{book:?}"
+        );
+        reads
+            .into_iter()
+            .filter(|read| read.peer.port == m.port)
+            .map(|read| (read.peer.node.is_some(), read.read))
+            .collect::<Vec<_>>()
+    };
+
+    let anew = read(proves.key());
+    assert!(
+        matches!(
+            anew.as_slice(),
+            [(false, Ok(by_hand)), (true, Ok(booked))] if by_hand.proven && booked.proven
+        ),
+        "{anew:?}"
+    );
+    let other_key = read(other.key());
+    assert!(
+        matches!(
+            other_key.as_slice(),
+            [(false, by_hand), (true, Err(Unreached::Impostor { issuer: false, .. }))]
+                if !matches!(by_hand, Ok(surveyed) if surveyed.proven)
+        ),
+        "{other_key:?}"
+    );
+}
+
+/// AN ANSWER PROVEN BY A KEY THE BOOK NO LONGER BINDS IS NOT THAT NODE: a
+/// member's copy binds node N to its old key, and a place the member's
+/// person named holds the old key's holder, which proves N under it. The
+/// person's entry, dialled before the book's keys came, took that answer as
+/// N proven; the book that comes binds N to another key (the issuer re-bound
+/// it: `peers rm` and a join again), and judged again by the keys the read
+/// ends with that answer is N's impostor, as a dial begun after the book
+/// finds it — never N's proven block beside, or in place of, the real N's.
+/// A book that takes N out leaves it N's claim. FAILS WITHOUT THE FIX: the
+/// person's entry stays N, proven, in both. NEGATIVE CONTROL: a book that
+/// still binds N to the old key proves both entries.
+#[test]
+fn an_answer_proven_by_a_key_the_book_no_longer_binds_is_not_that_node() {
+    let (m_state, issuer_state) = (State::new("unbound-m"), State::new("unbound-i"));
+    let (old, new) = (identity(&node_of(0xd7), 1), identity(&node_of(0xd7), 2));
+    let m = Issuing::proving(
+        secret(5),
+        m_state.dir(),
+        Issuer {
+            node: node_of(0xd7),
+            ..issuer(0x11)
+        },
+        old.clone(),
+    );
+    let issuing_as = identity(&issuer(0x11).node, 9);
+    // What the book binds N to, or none for a book that holds no N.
+    let read = |bound: Option<NodeKey>| {
+        let booked: Vec<Peer> = bound
+            .map(|key| Peer {
+                host: "127.0.0.1".to_owned(),
+                ..keyed(0xd7, key, [127, 0, 0, 1], m.port)
+            })
+            .into_iter()
+            .collect();
+        write_book(issuer_state.dir(), &booked);
+        issue(issuer_state.dir());
+        let issuing = Issuing::proving(
+            secret(5),
+            issuer_state.dir(),
+            issuer(0x11),
+            issuing_as.clone(),
+        );
+        let peers = [
+            Peer {
+                key: Some(issuing_as.key()),
+                ..issuer_entry(0x11, issuing.port)
+            },
+            manual("127.0.0.1", m.port),
+            copy(Peer {
+                host: "127.0.0.1".to_owned(),
+                ..keyed(0xd7, old.key(), [127, 0, 0, 1], m.port)
+            }),
+        ];
+        let (reads, book) = read_whole(
+            &peers,
+            &Keyring::of(&peers),
+            None,
+            (&secret(5), None),
+            HANG,
+            "survey",
+        );
+        assert!(
+            matches!(&book, BookRead::Fetched(book) if book.proven),
+            "{book:?}"
+        );
+        reads
+            .into_iter()
+            .filter(|read| read.peer.port == m.port)
+            .map(|read| (read.peer.via, read.read))
+            .collect::<Vec<_>>()
+    };
+
+    let rekeyed = read(Some(new.key()));
+    assert!(
+        matches!(
+            rekeyed.as_slice(),
+            [
+                (Via::Manual, Err(Unreached::Impostor { issuer: false, .. })),
+                (
+                    Via::IssuerBook,
+                    Err(Unreached::Impostor { issuer: false, .. })
+                ),
+            ]
+        ),
+        "{rekeyed:?}"
+    );
+    let taken_out = read(None);
+    assert!(
+        matches!(
+            taken_out.as_slice(),
+            [(Via::Manual, Ok(by_hand))] if !by_hand.proven
+                && by_hand.node.as_deref() == Some(old.node())
+        ),
+        "{taken_out:?}"
+    );
+    let kept = read(Some(old.key()));
+    assert!(
+        matches!(
+            kept.as_slice(),
+            [(Via::Manual, Ok(by_hand)), (Via::IssuerBook, Ok(booked))]
+                if by_hand.proven && booked.proven
+        ),
+        "{kept:?}"
+    );
+}
+
+/// A READ HOLDS ONE CONNECTION TO AN ADDRESS AT A TIME: a member's own entry
+/// at a Mac's place (no node, as a person names it) and the copy of the node
+/// that joined there are both read, and the Mac's listener serves one
+/// address a share of proved connections sized for one per reader. While
+/// one dial holds its connection there — its survey unanswered past the
+/// read's deadline — the other waits for it, never a second connection
+/// beside it: the listener never serves this read two surveys at once, and
+/// another reader keeps its share. FAILS WITHOUT THE FIX: both dials hold a
+/// connection there at once.
+#[test]
+fn a_read_holds_one_connection_to_an_address_at_a_time() {
+    let (in_flight, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (gate, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    let (m_state, issuer_state) = (State::new("one-at-m"), State::new("one-at-i"));
+    let n = identity(&node_of(0xd8), 1);
+    let m = Issuing::run(
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        (secret(5), Some(n.clone())),
+        m_state.dir(),
+        Issuer {
+            node: node_of(0xd8),
+            ..issuer(0x11)
+        },
+        EVERY_OP,
+        Arc::new({
+            let (in_flight, most) = (Arc::clone(&in_flight), Arc::clone(&most));
+            move |op| {
+                if op == FleetOp::Survey {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    // Unanswered until the read is over: its deadline cuts it.
+                    let _ = held.lock().unwrap().recv_timeout(HANG);
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
+                None
+            }
+        }),
+    );
+    let joined_there = Peer {
+        host: "127.0.0.1".to_owned(),
+        ..keyed(0xd8, n.key(), [127, 0, 0, 1], m.port)
+    };
+    write_book(issuer_state.dir(), std::slice::from_ref(&joined_there));
+    issue(issuer_state.dir());
+    let issuing_as = identity(&issuer(0x11).node, 9);
+    let issuing = Issuing::proving(
+        secret(5),
+        issuer_state.dir(),
+        issuer(0x11),
+        issuing_as.clone(),
+    );
+    let peers = [
+        Peer {
+            key: Some(issuing_as.key()),
+            ..issuer_entry(0x11, issuing.port)
+        },
+        manual("127.0.0.1", m.port),
+        copy(joined_there),
+    ];
+    let (reads, _) = read_whole(
+        &peers,
+        &Keyring::of(&peers),
+        None,
+        (&secret(5), None),
+        Duration::from_secs(2),
+        "survey",
+    );
+    drop(gate);
+    let at_m: Vec<_> = reads
+        .iter()
+        .filter(|read| read.peer.port == m.port)
+        .map(|read| read.read.as_ref().map(|surveyed| surveyed.addr))
+        .collect();
+    assert_eq!(at_m.len(), 2, "{at_m:?}");
+    assert_eq!(most.load(Ordering::SeqCst), 1, "{at_m:?}");
 }
 
 /// PAST [`AT_ONCE`] DIALS A PEER HAS A DEADLINE OF ITS OWN: the issuer's
@@ -3174,9 +3521,9 @@ enum Answer {
     /// One TLS record of a reply sent a byte at a time, slower than a
     /// per-read timeout notices: only a wall-clock bound ends the read.
     Dribble,
-    /// A one-line reply, held until `want` requests have come to this
-    /// listener (`arrived` counts them) or `released` is set: only a reader
-    /// that asks them all at once gets an answer from any.
+    /// A one-line reply, held until `want` requests have come to the
+    /// listeners its clones serve (`arrived` counts them) or `released` is
+    /// set: only a reader that asks them all at once gets an answer from any.
     Together {
         arrived: Arc<AtomicUsize>,
         want: usize,
@@ -3470,17 +3817,22 @@ fn survey_all_answers_each_peer_within_one_deadline() {
     drop(hang);
 }
 
-/// THIRTY PEERS ARE ASKED AT ONCE, by no clock: each holds its answer until
-/// all thirty have asked, so only a read that asks them side by side gets
-/// thirty answers, and a walk in turn would get none before the hang
-/// detector. NEGATIVE CONTROL: the same peers asked one at a time are
-/// answered by none, each its own deadline's.
+/// THIRTY PEERS ARE ASKED AT ONCE, by no clock: each of thirty listeners
+/// holds its answer until all thirty have asked, so only a read that asks
+/// them side by side gets thirty answers, and a walk in turn would get none
+/// before the hang detector. NEGATIVE CONTROL: the same peers asked one at a
+/// time are answered by none, each its own deadline's.
 #[test]
 fn thirty_peers_are_asked_at_once() {
     const PEERS: usize = 30;
     let answer = Answer::together(PEERS);
-    let together = Answering::start(secret(5), FleetScope::Facts, answer.clone());
-    let read = surveyed(vec![on_loopback(together.port); PEERS], HANG);
+    let together: Vec<Answering> = (0..PEERS)
+        .map(|_| Answering::start(secret(5), FleetScope::Facts, answer.clone()))
+        .collect();
+    let read = surveyed(
+        together.iter().map(|peer| on_loopback(peer.port)).collect(),
+        HANG,
+    );
     assert_eq!(read.len(), PEERS);
     assert!(
         read.iter()
@@ -3499,6 +3851,7 @@ fn thirty_peers_are_asked_at_once() {
             (&secret(5), None),
             Duration::from_millis(300),
             "survey",
+            &Arc::default(),
         );
         assert!(matches!(one, Err(Unreached::Deadline(..))), "{one:?}");
     }
@@ -3527,7 +3880,7 @@ fn a_name_is_looked_up_as_itself_and_a_bare_one_as_dot_local() {
             (&secret(5), None),
             FleetOp::Survey,
             (Instant::now() + HANG, HANG),
-            (&[], resolver),
+            (&[], resolver, None),
         )
     };
     let nowhere: Resolver = |_, _| Vec::new();

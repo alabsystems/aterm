@@ -781,13 +781,8 @@ fn a_carried_excerpt_dates_the_day_from_the_end_of_its_day() {
     }
 }
 
-/// THE SUPERVISOR THAT KEEPS FAILING is a record when it begins (once per
-/// episode, however often it fails again) and a line of the digest once an hour
-/// of failures has gone (`harness.supervisor.<tab>.failing`); steady again — a
-/// run that outlived its pause without failing, or its worker ended — takes the
-/// line away, and before the hour nothing was ever shown. It marks no tab and
-/// re-grids nothing. NEGATIVE CONTROLS: a supervisor that failed and then
-/// held for its pause and half an hour is over, and is never a line.
+/// A failing supervisor is one record per episode and a `harness.supervisor.<tab>.failing` line
+/// after an hour of failures; steady again ends it. No tab mark, no re-grid.
 #[test]
 fn a_supervisor_that_keeps_failing_is_a_record_then_a_line_after_an_hour() {
     let mut app = App::headless_for_test();
@@ -1637,9 +1632,8 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     assert_eq!(step(&mut app, listed(&["work-2"])), [login("work-2")]);
     assert!(step(&mut app, HostNote::Accounts(AccountsSaid::Nothing)).is_empty());
 
-    // WHAT THE OWNER PUT AWAY STAYS AWAY WHILE THE ROSTER CANNOT BE READ: a
-    // refused roster says nothing of who is signed out, so the dismissed line
-    // is still quiet once the file is mended...
+    // A dismissed line stays away while the roster cannot be read: a refused roster says
+    // nothing of who is signed out, so the line is still quiet once the file is mended...
     assert_eq!(step(&mut app, listed(&["work-2"])), [login("work-2")]);
     assert_eq!(app.dismiss_exceptions(), 1);
     assert_eq!(
@@ -1827,14 +1821,9 @@ fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
     assert!(mr::accounts_window_full_entry(&[], false).is_none());
 }
 
-/// THE RESUME LOOP'S EXCEPTIONS REACH THE DIGEST (design-exceptions 9.3, X3d).
-/// A `Later` point a tab's loop found only a person can answer is ONE line per
-/// kind naming its tabs (`harness.resume.<kind>`), filed once whatever the count;
-/// a lost login the supervisor escalated (`Now`) is that escalation's and never
-/// a line; a stall no reader names is a line per tab
-/// (`harness.resume.<tab>.stalled`); and each ends with its fact, ten minutes
-/// after the last look that named it (the digest's clock). NEGATIVE CONTROLS:
-/// `Now` raises no line; a tab whose worker ended takes its lines away with it.
+/// A `Later` point only a person can answer is one `harness.resume.<kind>` line naming its tabs,
+/// a stall one `harness.resume.<tab>.stalled` line per tab; each ends ten minutes after the last
+/// look that named it. Negative control: a `Now` lost login raises no line.
 #[test]
 fn a_resume_exception_is_one_line_per_kind_and_a_stall_one_per_tab_and_each_ends_with_its_fact() {
     let mut app = App::headless_for_test();
@@ -3473,12 +3462,9 @@ fn turning_palette_sets_on_clears_the_refusal_line() {
     assert!(!refused(&app), "allowed again: the line ends");
 }
 
-/// A REPAINT THAT GAVE UP is one line, `render.<tab>.unrepaired`, "Tab N may be
-/// one row off / drag the window edge one row and back" — no tab mark, no band
-/// row, no re-grid — and only while its epoch is the tab's open, at-risk one: a
-/// give-up for an epoch that is not (it healed before the give-up got here)
-/// raises nothing, where it once raised a line the next turn ended. A session
-/// the store does not know raises nothing.
+/// A repaint that gave up is one `render.<tab>.unrepaired` line ("Tab N may be one row off"),
+/// with no tab mark, band row or re-grid, and only while its epoch is the tab's open, at-risk
+/// one: a give-up for a healed epoch, or a session the store does not know, raises nothing.
 #[test]
 fn a_repaint_that_gave_up_is_one_line_and_none_for_a_healed_epoch() {
     let mut app = App::headless_for_test();
@@ -3586,11 +3572,8 @@ fn an_adoption_nudge_that_gave_up_raises_no_digest_line() {
     assert_eq!(app.messages.digest_revision(), rev, "nothing moved");
 }
 
-/// EVERY EVENT FAMILY'S END ACTS ON AN ADOPTED LINE. The log keeps an event
-/// entry open across a restart and an update, and this window adopts it with
-/// none of the in-memory facts (`supervisor_failing`, `host_noted`,
-/// `render_unrepaired`) that the process which raised it held; the cause ending
-/// after the restart must still end the line, or it stands until dismissed.
+/// Every event family's end ends a line an earlier process raised, adopted from the log with
+/// none of the in-memory facts (`supervisor_failing`, `host_noted`, `render_unrepaired`).
 #[test]
 fn the_ends_of_the_event_families_end_lines_an_earlier_process_raised() {
     let mut app = App::headless_for_test();
@@ -4061,13 +4044,8 @@ fn a_lost_login_is_its_tabs_ask_and_the_accounts_say_lines() {
     assert!(keys(&app).is_empty(), "renewed: every line ends");
 }
 
-/// A SILENT USAGE TAP IS ONE LINE FOR THE MACHINE (`HostNote::UsageTap`,
-/// `harness.accounts.no-tap`): raised by the first tab that goes silent,
-/// held while any tab stands silent, ended when the last is heard again or
-/// its worker ends — and raised at most once a day, so a second silent tab
-/// the same day, after the first was heard again, raises nothing. An `Info`
-/// line, never a band row or a tab's mark. NEGATIVE CONTROL: a `silent:
-/// false` for a tab never marked moves nothing.
+/// A silent usage tap is one `harness.accounts.no-tap` line for the machine, held while any tab
+/// is silent and raised at most once a day; never a band row or a tab mark.
 #[test]
 fn a_silent_usage_tap_is_one_line_once_a_day_and_ends_with_the_last_tab() {
     let mut app = App::headless_for_test();

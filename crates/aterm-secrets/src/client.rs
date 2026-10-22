@@ -81,9 +81,12 @@ pub struct Config {
     pub name: String,
     /// The pinned signing key (None for a plain text file at a path).
     pub signer: Option<[u8; 32]>,
-    /// The keys the pin was reached through, oldest first: the handoff chain of the version
-    /// that last moved it, empty while it is the key the join pinned. A build that retires a
-    /// key judges by them whether the pin is a fork the removed admin made (§5).
+    /// The keys the pin was reached through, oldest first: those of the handoff chain of the
+    /// version that last moved it from which every endorsement on to it verifies, empty
+    /// while it is the key the join pinned. A list an older build (v0.110.0 and before)
+    /// wrote holds every key that chain names, verified or not, and is read as written
+    /// until the next re-pin rewrites it. A build that retires a key judges by them
+    /// whether the pin is a fork the removed admin made (§5).
     pub followed: Vec<[u8; 32]>,
     /// The name this machine asked to be called.
     pub host: String,
@@ -91,7 +94,9 @@ pub struct Config {
 
 /// Whether a requested join pin admits this configured authority. An absent
 /// pin retains an admitted source; an explicit pin may name its signer or a
-/// verified predecessor. Retired authority gives way exactly as it does at sync.
+/// predecessor in `followed` (every endorsement from which on to the signer
+/// verified, unless an older build wrote the list: [`Config::followed`]).
+/// Retired authority gives way exactly as it does at sync.
 /// This reads no files and never joins or fetches a vault.
 pub fn pin_admitted(config: &Config, requested: Option<[u8; 32]>) -> bool {
     let Some(signer) = config.signer else {
@@ -258,8 +263,14 @@ fn decode_key32(text: &str) -> Option<[u8; 32]> {
     crate::b64::decode_padded(text).and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
 }
 
-fn read_toml(path: &Path, what: &str) -> crate::Result<Option<aterm_toml::Table>> {
-    let Some(bytes) = fsx::read_private(path, 4 << 20)? else {
+/// The largest state.toml read or written: names and digests, for up to two versions' entries
+/// while a pass is pending. [`save_state`] refuses to write more, so a vault with more entries
+/// than this machine can track stops its pass before any write, and the state it held still
+/// reads (a smaller version applies), rather than every later sync failing on its own state.
+const MAX_STATE: usize = 4 * text::MAX_TEXT;
+
+fn read_toml(path: &Path, what: &str, max: usize) -> crate::Result<Option<aterm_toml::Table>> {
+    let Some(bytes) = fsx::read_private(path, max)? else {
         return Ok(None);
     };
     let text = bytes
@@ -454,7 +465,7 @@ fn install_identity(paths: &Paths, identity: Identity) -> crate::Result<Identity
 
 /// The configured source, if any.
 pub fn config(paths: &Paths) -> crate::Result<Option<Config>> {
-    let Some(table) = read_toml(&paths.source_file(), "source.toml")? else {
+    let Some(table) = read_toml(&paths.source_file(), "source.toml", 4 << 20)? else {
         return Ok(None);
     };
     let get = |key: &str| table.get(key).and_then(aterm_toml::Value::as_str);
@@ -591,7 +602,7 @@ struct State {
 }
 
 fn load_state(paths: &Paths) -> crate::Result<State> {
-    let Some(table) = read_toml(&paths.state_file(), "state.toml")? else {
+    let Some(table) = read_toml(&paths.state_file(), "state.toml", MAX_STATE)? else {
         return Ok(State::default());
     };
     let int = |key: &str| {
@@ -690,6 +701,12 @@ fn save_state(paths: &Paths, state: &State) -> crate::Result<()> {
             text.push_str(&format!("{} = {}\n", toml_str(name), toml_str(digest)));
         }
     }
+    if text.len() > MAX_STATE {
+        return Err(Error::new(format!(
+            "{}: would be larger than {MAX_STATE} bytes: the vault holds more entries than this machine can track",
+            paths.state_file().display()
+        )));
+    }
     fsx::write_atomic(&paths.state_file(), text.as_bytes(), 0o600)
 }
 
@@ -756,6 +773,12 @@ pub fn status(paths: &Paths) -> crate::Result<Status> {
         membership,
         names: state.manifest.files.keys().cloned().collect(),
     })
+}
+
+/// Whether this machine's join request went with a join-password proof: only then can a
+/// mistyped password be why it waits. Reads only local state.
+pub fn asked_with_password(paths: &Paths) -> bool {
+    load_state(paths).is_ok_and(|state| state.proof.is_some())
 }
 
 /// Whether an admitted vault's last sync finished and its tracked files still
@@ -991,14 +1014,15 @@ fn pin_gives_way(config: &Config) -> bool {
         .is_some_and(|pin| Retired::compiled().gives_way(&pin, &config.followed))
 }
 
-/// The keys the cached version's handoff chain passes through, when `pin` signs it.
+/// The keys the cached version's signer was reached from ([`Envelope::reached_from`]), when
+/// `pin` signs it.
 fn cached_chain(paths: &Paths, pin: &[u8; 32]) -> Vec<[u8; 32]> {
     fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
         .ok()
         .flatten()
         .and_then(|bytes| envelope::parse(bytes.as_slice()).ok())
         .filter(|cached| cached.signer == *pin && cached.verify_signature().is_ok())
-        .map(|cached| chain_keys(&cached))
+        .map(|cached| cached.reached_from())
         .unwrap_or_default()
 }
 
@@ -1118,7 +1142,7 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
     if let Pin::Rotated(new) | Pin::Replaced(new) = pinned {
         prepare_materialization(paths, &mut state)?;
         config.signer = Some(new);
-        config.followed = chain_keys(&envelope);
+        config.followed = envelope.reached_from();
         save_config(paths, &config)?;
     }
     if verdict == Verdict::Unchanged
@@ -1461,7 +1485,9 @@ fn approval_here(
 /// password, or (open) what comes from a machine not in the vault. What [`auto_approve`]
 /// judged stays [`Settled`] until the source or version changes, so a queue that holds only
 /// requests already judged (refused, left to a person, or approved and still queued for days)
-/// costs one GET a pass, never another admin open, key derivation or publish.
+/// costs one GET a pass, never another admin open, key derivation or publish. A queue whose
+/// requests keep changing (a host posting new proofs) costs at most one admin open and one key
+/// derivation a pass, whatever it lists: one [`auto_approve`] judges them all.
 fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) {
     let mut settled = Settled::default();
     let mut checked = None;
@@ -1548,7 +1574,8 @@ impl Settled {
     /// lists `listed` runs [`auto_approve`]: some listed request the approver reads (one with
     /// a proof; on an open vault, any) was not judged at that source/version. A different
     /// source or new version forgets every judgment, since it may carry a new password,
-    /// open or close the vault, or have let a machine go.
+    /// open or close the vault, or have let a machine go; so does a request no longer listed,
+    /// which keeps what is remembered to the queue's size however often its requests change.
     pub fn due(
         &mut self,
         config: &Config,
@@ -1561,6 +1588,8 @@ impl Settled {
             self.judged.clear();
             self.version = Some(version);
         }
+        let still: std::collections::BTreeSet<Judged> = listed.iter().map(Judged::of).collect();
+        self.judged.retain(|judged| still.contains(judged));
         listed
             .iter()
             .filter(|request| approval.reads(request))
@@ -1611,7 +1640,7 @@ fn auto_approve_opened(paths: &Paths, admin: &Admin) -> crate::Result<AutoApprov
         .join_password()
         .filter(|_| approval == Approval::Password)
         .map(|password| join::Key::derive(name, password.as_slice()));
-    let members: Vec<String> = admin
+    let mut members: Vec<String> = admin
         .doc
         .machines()
         .into_iter()
@@ -1642,6 +1671,8 @@ fn auto_approve_opened(paths: &Paths, admin: &Admin) -> crate::Result<AutoApprov
                 doc.add_machine(&host, &request.recipient)
                     .map_err(|e| Error::new(e.to_string()))?;
                 done.approved.push(host);
+                // Another address may list the same key: let in once, it is a member.
+                members.push(request.recipient.clone());
             } else if approval == Approval::Password {
                 done.refused.push(request.recipient.clone());
             } else {
@@ -1866,7 +1897,7 @@ pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutco
     let (parsed, checked, _) = envelope::verify_for_reader(&bytes, &name, &pin, &followed, None)?;
     let (pinned, followed) = match checked {
         Pin::Same => (pin, followed),
-        Pin::Rotated(new) | Pin::Replaced(new) => (new, chain_keys(&parsed)),
+        Pin::Rotated(new) | Pin::Replaced(new) => (new, parsed.reached_from()),
     };
     let config = Config {
         source: source.clone(),
@@ -1883,10 +1914,16 @@ pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutco
             // Another vault, or another signing authority (a pin that gave way among them):
             // what the old one wrote stays, but its versions do not carry over. So too with no
             // source.toml at all: a state.toml left beside it holds another vault's seq, which
-            // would read as a rollback.
+            // would read as a rollback. Nor does the join-password proof made for the old one,
+            // which lets whoever sees it test guesses at that vault's password offline: the
+            // subscriber's hourly re-ask would send it to this one, and at once, from a request
+            // months old. The re-ask counts from now, so it never races this join's own request
+            // either (a server refuses a change within seconds of the last).
             state.seq = 0;
             state.digest = None;
             state.membership = Stored::None;
+            state.proof = None;
+            state.requested = now();
             prepare_materialization(paths, &mut state)?;
         } else if previous.as_ref() != Some(&config) {
             prepare_materialization(paths, &mut state)?;
@@ -2177,9 +2214,12 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
     let plain = match age::decrypt(std::slice::from_ref(&identity), locker.armored.as_bytes()) {
         Ok(plain) => plain,
         Err(age::AgeError::NoMatch) => {
+            // By its code, never the name it asked for: that one may be another machine's
+            // (it was admitted under a free name), and `admins add` would reach that key.
             return Err(Error::new(format!(
                 "this machine is not an admin of {}: an admin can run aterm secrets admins add {}",
-                config.name, config.host
+                config.name,
+                join_code(&identity.recipient())
             )));
         }
         Err(error) => return Err(Error::new(format!("admin locker: {error}"))),
@@ -2692,14 +2732,14 @@ fn requests_for(config: &Config, doc: Option<&Document>) -> crate::Result<Vec<Re
 
 /// A machine name not yet in `doc`: `wanted`, else `wanted-2`, `wanted-3`, …, `wanted` cut
 /// short (and never left ending in `-`) where the suffix would take the name past 63
-/// characters. Every candidate is a valid name, so the search ends.
+/// characters. Every candidate is a valid name, so the search ends. Never a name shaped like
+/// a join code (`machine` in its place): a queue's codes are anyone's to read, and a code
+/// typed for a machine names the one whose key has it ([`machine_named`]), so a machine
+/// asking to be called by another's code must not be.
 pub fn free_name(doc: &Document, wanted: &str) -> String {
     let taken: Vec<String> = doc.machines().into_iter().map(|m| m.name).collect();
-    let base = if text::valid_machine_name(wanted) {
-        wanted
-    } else {
-        "machine"
-    };
+    let takeable = |name: &str| text::valid_machine_name(name) && !transport::valid_code(name);
+    let base = if takeable(wanted) { wanted } else { "machine" };
     if !taken.iter().any(|t| t == base) {
         return base.to_string();
     }
@@ -2714,8 +2754,44 @@ pub fn free_name(doc: &Document, wanted: &str) -> String {
             };
             format!("{stem}{suffix}")
         })
-        .find(|name| !taken.contains(name) && text::valid_machine_name(name))
+        .find(|name| !taken.contains(name) && takeable(name))
         .unwrap_or_else(|| "machine".to_string())
+}
+
+/// The machine `word` names in `doc` (`aterm secrets admins add|remove`, `revoke`, `set|unset
+/// --for`): for a join code (any case), the machine whose key has it; else `word` itself, a
+/// name. A machine admitted under a [`free_name`] (the one it asked for was taken) never
+/// learns it, so it names itself by its code ([`admin_open`]'s refusal). A code is never read
+/// as a name, which any machine may ask for and an older approver let a machine in under: a
+/// code that is also another machine's name is refused, naming both, and a code no key has is
+/// refused, naming the code of a machine so named, which reaches it.
+pub fn machine_named(doc: &Document, word: &str) -> crate::Result<String> {
+    let code = word.to_ascii_lowercase();
+    if !transport::valid_code(&code) {
+        return Ok(word.to_string());
+    }
+    let machines = doc.machines();
+    let by_code = machines.iter().find(|machine| {
+        Recipient::parse(&machine.recipient).is_ok_and(|key| join_code(&key) == code)
+    });
+    let by_name = machines.iter().find(|machine| machine.name == code);
+    match (by_code, by_name) {
+        (Some(keyed), Some(named)) if keyed.name != named.name => Err(Error::new(format!(
+            "{code} is the code of machine {} and the name of another machine (key {}): name the one you mean by its name, or rename the other in aterm secrets edit",
+            keyed.name, named.recipient
+        ))),
+        (Some(machine), _) => Ok(machine.name.clone()),
+        (None, Some(named)) => Err(Error::new(format!(
+            "no machine of the vault has code {code}; a machine is named {code} (key {}{}), and its own code names it",
+            named.recipient,
+            Recipient::parse(&named.recipient)
+                .map(|key| format!(", code {}", join_code(&key)))
+                .unwrap_or_default()
+        ))),
+        (None, None) => Err(Error::new(format!(
+            "no machine of the vault has code {code}"
+        ))),
+    }
 }
 
 /// The machines of `current` whose key `base` does not hold: those admitted since `base`.
@@ -2728,19 +2804,52 @@ pub fn admitted_since(base: &Document, current: &Document) -> Vec<text::Machine>
         .collect()
 }
 
-/// Put back into `edited` (the text a person saved in `aterm secrets edit`, which began as
-/// `base`) every machine of `current` (the version the save goes on top of) whose key neither
-/// holds: one the approver or another admin admitted while the person edited. Published over
-/// `current` without it, the text would let that machine go and renew the join password it
-/// was let in with. A machine the person deleted was in `base`, so it stays deleted. So too
-/// every `code-only` line `current` added that `edited` lacks, unless `edited` makes that key
-/// a machine: without it the approver would let in the machine another admin let go. Returns
-/// the names put back.
+/// Bring into `edited` (the text a person saved in `aterm secrets edit`, which began as
+/// `base`) every change `current` (the version the save goes on top of) made since `base` to
+/// who is in, where `edited` left that part as `base` had it. A machine `current` let go
+/// stays gone, its own sections with it; every machine of `current` whose key neither text
+/// holds, one the approver or another admin admitted, is put back; an admin `current` added
+/// or removed is so in `edited`; so is the join password, or the `open` line, `current`
+/// changed; and so is every `code-only` line `current` added, unless `edited` makes that key
+/// a machine. Published over `current` without them, the text would let in again a machine
+/// another admin let go, give a removed admin the new vault key, bring back the join password
+/// a machine let go may know, or let go a machine admitted meanwhile. What the person changed
+/// themselves stands. A machine whose name `current` gave another key is refused, naming it:
+/// that key may be a new machine that took a free name, so whether it gets the sections the
+/// person's text gives that name is theirs to say. Returns the names put back.
 pub fn keep_admitted(
     base: &Document,
     current: &Document,
     edited: &mut Document,
 ) -> crate::Result<Vec<String>> {
+    let refused = |error: text::TextError| Error::new(error.to_string());
+    let known: Vec<String> = base.machines().into_iter().map(|m| m.recipient).collect();
+    let now = current.machines();
+    for gone in base.machines() {
+        if now
+            .iter()
+            .any(|machine| machine.recipient == gone.recipient)
+        {
+            continue;
+        }
+        let Some(held) = edited
+            .machines()
+            .into_iter()
+            .find(|machine| machine.recipient == gone.recipient)
+        else {
+            continue;
+        };
+        if let Some(other) = now
+            .iter()
+            .find(|machine| machine.name == gone.name && !known.contains(&machine.recipient))
+        {
+            return Err(Error::new(format!(
+                "{} has another key since your edit began ({}): put it on {}'s line to give it what your text gives {}, or delete the machine, then save again",
+                gone.name, other.recipient, held.name, held.name
+            )));
+        }
+        edited.remove_machine(&held.name, true).map_err(refused)?;
+    }
     let mut kept = Vec::new();
     for machine in admitted_since(base, current) {
         if edited
@@ -2753,19 +2862,54 @@ pub fn keep_admitted(
         let name = free_name(edited, &machine.name);
         edited
             .add_machine(&name, &machine.recipient)
-            .map_err(|e| Error::new(e.to_string()))?;
+            .map_err(refused)?;
         kept.push(name);
+    }
+    let admins = |doc: &Document| -> Vec<String> {
+        let names = doc.admins();
+        doc.machines()
+            .into_iter()
+            .filter(|machine| names.contains(&machine.name))
+            .map(|machine| machine.recipient)
+            .collect()
+    };
+    let (were, are) = (admins(base), admins(current));
+    // Additions first, so a removal never meets the last-admin rule one of them lifts.
+    for machine in edited.machines() {
+        if are.contains(&machine.recipient) && !were.contains(&machine.recipient) {
+            edited.add_admin(&machine.name).map_err(refused)?;
+        }
+    }
+    for machine in edited.machines() {
+        if were.contains(&machine.recipient) && !are.contains(&machine.recipient) {
+            edited.remove_admin(&machine.name).map_err(refused)?;
+        }
+    }
+    if !same_join(base, current) && same_join(base, edited) {
+        let password = current.join_password();
+        edited
+            .set_join_password(password.as_ref().map(|password| password.as_slice()))
+            .map_err(refused)?;
+        edited.set_open(current.open()).map_err(refused)?;
     }
     let before = base.code_only();
     let members: Vec<String> = edited.machines().into_iter().map(|m| m.recipient).collect();
     for key in current.code_only() {
         if !before.contains(&key) && !members.contains(&key) {
-            edited
-                .add_code_only(&key)
-                .map_err(|e| Error::new(e.to_string()))?;
+            edited.add_code_only(&key).map_err(refused)?;
         }
     }
     Ok(kept)
+}
+
+/// Whether two texts' `[join]` say the same: the same join password or none, and both open
+/// or neither.
+fn same_join(a: &Document, b: &Document) -> bool {
+    a.open() == b.open()
+        && match (a.join_password(), b.join_password()) {
+            (Some(x), Some(y)) => x.as_slice() == y.as_slice(),
+            (x, y) => x.is_none() && y.is_none(),
+        }
 }
 
 // ── Editing ─────────────────────────────────────────────────────────────────
@@ -2878,6 +3022,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_vault_too_large_to_seal_is_refused_saying_why() {
+        let key = Identity::generate().expect("a key").recipient().to_bech32();
+        let mut doc = Document::new_vault("m1", &key);
+        let value = vec![b'x'; text::MAX_VALUE];
+        for n in 1..=5 {
+            doc.set_entry(&Audience::Everyone, &format!("a{n}"), &value)
+                .expect("set");
+        }
+        seal("alab", 1, &[7u8; 32], &doc, &[]).expect("five values of 1 MiB fit");
+        doc.set_entry(&Audience::Everyone, "a6", &value)
+            .expect("the text holds a sixth");
+        let error = seal("alab", 1, &[7u8; 32], &doc, &[]).expect_err("too large");
+        assert!(
+            error.0.contains("too large to publish") && error.0.contains("entries fit"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn a_pass_that_leaves_an_entry_failed_backs_off_and_a_clean_one_starts_again() {
         let url = Source::Url("http://127.0.0.1:7484/v1/alab".to_string());
         let applied = |failed: usize| SyncOutcome::Applied {
@@ -2906,11 +3069,17 @@ mod tests {
         assert_eq!(pause_after(&path, &applied(1), &mut failing).as_secs(), 60);
     }
 
-    /// A server for `store` at `addr` (port 0: any free one).
-    fn serve(store: &Path, addr: &str) -> crate::server::Running {
-        let listener = std::net::TcpListener::bind(addr).expect("bind");
+    /// A loopback socket on a free port, which a test that moves its vault's server keeps:
+    /// each server it starts there listens on a copy ([`serve`]), so the port stays bound
+    /// between servers and no other test is handed it.
+    fn bound() -> std::net::TcpListener {
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind")
+    }
+
+    /// A server for `store` listening on `socket` (a copy of it: the caller keeps its own).
+    fn serve(store: &Path, socket: &std::net::TcpListener) -> crate::server::Running {
         crate::server::start(
-            listener,
+            socket.try_clone().expect("a copy of the socket"),
             &crate::server::Options {
                 listen: "127.0.0.1:0".parse().expect("addr"),
                 store: store.to_path_buf(),
@@ -3101,6 +3270,73 @@ mod tests {
         assert!(!pin_admitted(&unsigned, Some(current)));
         unsigned.source = Source::Url("https://vault.example/v1/team".into());
         assert!(!pin_admitted(&unsigned, None));
+    }
+
+    #[test]
+    fn a_key_the_chain_names_before_a_link_that_does_not_verify_is_no_predecessor() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("team.vault");
+        let admin = Paths::for_home(&root.path().join("admin"));
+        create(&admin, source.to_str().expect("utf-8"), None, Some("admin"))
+            .expect("create scratch vault");
+        let opened = admin_open(&admin).expect("open");
+        let signer = envelope::signer_public(&opened.seed).expect("public");
+        let named = [239; 32];
+        let key = envelope::signer_public(&named).expect("public");
+        let signed = |seq: u64, handoff: Vec<envelope::Link>, seed: &[u8; 32]| {
+            let unsigned = Unsigned {
+                name: "team".to_string(),
+                seq,
+                time: 0,
+                handoff,
+                lockers: Vec::new(),
+            };
+            envelope::sign_unchecked(&unsigned, seed).expect("signed")
+        };
+        // The pin set at join is followed through the chain of the version it signs (the
+        // cache): one naming `key` as handing off to the signer with an endorsement that
+        // does not verify makes `key` no predecessor; with `key`'s own, it is one.
+        let cached = |endorsement: [u8; 64]| {
+            let bytes = signed(opened.seq() + 1, vec![(key, endorsement)], &opened.seed);
+            std::fs::write(admin.cache_file(), bytes).expect("cached");
+            pinned(&admin)
+        };
+        let config = cached([7; 64]);
+        assert_eq!((config.signer, config.followed.len()), (Some(signer), 0));
+        assert!(!pin_admitted(&config, Some(key)));
+        let config = cached(envelope::endorse(&named, "team", &signer).expect("endorsed"));
+        assert_eq!(config.followed, vec![key]);
+        assert!(pin_admitted(&config, Some(key)));
+
+        // A rotation the pin follows records only the keys its endorsements verify from.
+        let next_seed = [241; 32];
+        let next = envelope::signer_public(&next_seed).expect("public");
+        let handoff = vec![
+            (key, [7; 64]),
+            (
+                signer,
+                envelope::endorse(&opened.seed, "team", &next).expect("endorsed"),
+            ),
+        ];
+        std::fs::write(&source, signed(opened.seq() + 2, handoff, &next_seed)).expect("written");
+        sync(&admin, None).expect("synced");
+        let config = pinned(&admin);
+        assert_eq!(
+            (config.signer, config.followed.clone()),
+            (Some(next), vec![signer])
+        );
+        assert!(!pin_admitted(&config, Some(key)));
+        assert!(pin_admitted(&config, Some(signer)));
+        // So does a join whose pin the chain leads on from.
+        let reader = Paths::for_home(&root.path().join("reader"));
+        let pin = crate::b64::encode_padded(&signer);
+        join_pinned(&reader, &format!("{}#{pin}", source.display()), "reader");
+        let config = pinned(&reader);
+        assert_eq!(
+            (config.signer, config.followed.clone()),
+            (Some(next), vec![signer])
+        );
+        assert!(!pin_admitted(&config, Some(key)));
     }
 
     #[test]
@@ -3462,7 +3698,7 @@ mod tests {
 
         // An admin that reaches the vault by loopback, as the server's own Mac does.
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        let running = serve(&root.path().join("store"), "127.0.0.1:0");
+        let running = serve(&root.path().join("store"), &bound());
         let admin = Paths::for_home(&root.path().join("ma"));
         let url = format!("http://{}/v1/alab", running.addr);
         create(&admin, &url, None, Some("ma")).expect("create");
@@ -3493,9 +3729,9 @@ mod tests {
         ] {
             let root = aterm_tempfile::tempdir().expect("tempdir");
             let store = root.path().join("store");
-            let running = serve(&store, "127.0.0.1:0");
-            let addr = running.addr.to_string();
-            let url = format!("http://{addr}/v1/alab");
+            let socket = bound();
+            let running = serve(&store, &socket);
+            let url = format!("http://{}/v1/alab", running.addr);
             let admin = Paths::for_home(&root.path().join("ma"));
             let created = create(&admin, &url, None, Some("ma")).expect("create");
             let reader = Paths::for_home(&root.path().join("mb"));
@@ -3517,7 +3753,7 @@ mod tests {
             // key of its own the old one endorsed, or (b) a version the old key signed, each
             // with a seq no real version reaches.
             running.stop();
-            let spoof = serve(&root.path().join("spoof"), &addr);
+            let spoof = serve(&root.path().join("spoof"), &socket);
             let mut signer = old;
             let mut fed = Unsigned {
                 name: "alab".to_string(),
@@ -3554,7 +3790,7 @@ mod tests {
             // The vault's own server again. A build that does not know the old key is retired
             // keeps the reader off it (the control): (a) pinned to the fork, or (b) under a
             // floor no version passes, which a long-poll waits above for ever.
-            let running = serve(&store, &addr);
+            let running = serve(&store, &socket);
             let error = sync(&reader, None).expect_err("kept off");
             let why = if fork {
                 "endorsed no handoff"
@@ -3594,9 +3830,9 @@ mod tests {
     fn an_admin_gives_the_vault_back_to_a_store_the_removed_admin_fed() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let store = root.path().join("store");
-        let running = serve(&store, "127.0.0.1:0");
-        let addr = running.addr.to_string();
-        let url = format!("http://{addr}/v1/alab");
+        let socket = bound();
+        let running = serve(&store, &socket);
+        let url = format!("http://{}/v1/alab", running.addr);
         let admin = Paths::for_home(&root.path().join("ma"));
         create(&admin, &url, None, Some("ma")).expect("create");
         // Another Mac's store, which still holds the vault's first version.
@@ -3619,13 +3855,13 @@ mod tests {
             lockers: Vec::new(),
         };
         let fed = envelope::sign(&fed, &old).expect("signed");
-        let moved = serve(&stale, &addr);
+        let moved = serve(&stale, &socket);
         transport::publish(&Source::Url(url.clone()), &fed).expect("taken");
         moved.stop();
         // Once the admin's build and the store's retire the old key, the admin's next command
         // puts its copy back (the store's held key gives way), and goes on from it.
         let opened = retiring(vec![old_key], new_key, || {
-            let moved = serve(&stale, &addr);
+            let moved = serve(&stale, &socket);
             let opened = admin_open(&admin);
             moved.stop();
             opened
@@ -4058,6 +4294,37 @@ mod tests {
         assert!(floor(&admin, &state, &config.name, &config).is_some());
     }
 
+    /// A vault of thousands of long names (valid, and far under MAX_TEXT) makes a manifest past
+    /// 4 MiB, which reads back; a state past MAX_STATE is never written, so the one held still
+    /// reads.
+    #[test]
+    fn a_large_manifest_reads_back_and_one_past_the_bound_is_never_written() {
+        let home = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = Paths::for_home(home.path());
+        let digest = materialize::digest_hex(b"v");
+        let names = |count: usize, len: usize| {
+            (0..count)
+                .map(|i| (format!("~/{i:0>len$}"), digest.clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let mut state = State::default();
+        state.manifest.files = names(25_000, 120);
+        state.pending = names(25_000, 120);
+        save_state(&paths, &state).expect("saved");
+        let loaded = load_state(&paths).expect("read back");
+        assert_eq!(loaded.manifest, state.manifest);
+        assert_eq!(loaded.pending, state.pending);
+
+        let mut past = State::default();
+        past.manifest.files = names(MAX_STATE / 1000 + 1, 1000);
+        let error = save_state(&paths, &past).expect_err("past the bound");
+        assert!(error.0.contains("more entries"), "{error}");
+        assert_eq!(
+            load_state(&paths).expect("still reads").manifest,
+            state.manifest
+        );
+    }
+
     /// The subscriber asks again for the vault it read, while a person's join moves the
     /// machine to another: the request for the vault it left changes nothing of the state the
     /// join made for the one it went to.
@@ -4103,7 +4370,7 @@ mod tests {
                 }
             }
         }
-        let server = Stop(Some(serve(&root.path().join("store"), "127.0.0.1:0")));
+        let server = Stop(Some(serve(&root.path().join("store"), &bound())));
         let addr = server.0.as_ref().expect("running").addr;
         let admin = Paths::for_home(&root.path().join("admin"));
         let mut sources = Vec::new();
@@ -4256,6 +4523,77 @@ mod tests {
             ["from-a"]
         );
         assert_eq!(body(&current.source), before_b);
+    }
+
+    /// A join to another vault forgets the join-password proof made for the vault it left:
+    /// sent to the new one, it would let whoever runs or watches that server test guesses at
+    /// the old vault's password offline. The subscriber's pass while the person is asked for
+    /// the new password (or after a Ctrl-C there) sends nothing, however long ago the last
+    /// request went.
+    #[test]
+    fn a_join_to_another_vault_forgets_the_proof_made_for_the_last() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let server = serve(&root.path().join("store"), &bound());
+        let vault = |admin: &str, name: &str| {
+            let paths = Paths::for_home(&root.path().join(admin));
+            let url = format!("http://{}/v1/{name}", server.addr);
+            let created = create(&paths, &url, None, Some(admin)).expect("create");
+            (paths, format!("{url}#{}", created.signer))
+        };
+        let (team_admin, team) = vault("ma", "team");
+        let (other_admin, other) = vault("mz", "other");
+        let password = admin_open(&team_admin)
+            .expect("admin opens")
+            .doc
+            .join_password()
+            .expect("create makes a join password");
+        let reader = Paths::for_home(&root.path().join("mb"));
+        let joined = |source: &str, password: &dyn Fn() -> Option<SecretBytes>| {
+            join(
+                &reader,
+                &JoinOptions {
+                    source: source.to_string(),
+                    host: Some("mb".to_string()),
+                    interactive: false,
+                    wait: Duration::ZERO,
+                    confirm: &|_| false,
+                    password,
+                    requested: &|| {},
+                    say: &|_| {},
+                },
+            )
+        };
+        let asked = joined(&team, &|| Some(password.clone()));
+        assert!(
+            matches!(asked, Ok(JoinOutcome::Pending { .. })),
+            "{asked:?}"
+        );
+        let mut state = load_state(&reader).expect("state");
+        assert!(state.proof.is_some(), "the request carried a proof");
+        // It asked months ago, and still waits.
+        state.requested = state.requested.saturating_sub(90 * 24 * 60 * 60);
+        save_state(&reader, &state).expect("state saved");
+
+        let seen = std::cell::RefCell::new(None);
+        let moved = joined(&other, &|| {
+            // The subscriber's pass while the person types the other vault's password.
+            ask_again_if_due(&reader, &pinned(&reader), &|_| {});
+            let held = load_state(&reader).expect("state").proof.is_some();
+            let queued = requests(&other_admin, None).expect("requests").len();
+            *seen.borrow_mut() = Some((held, queued));
+            None
+        });
+        let (held, queued) = seen.take().expect("asked for the password");
+        assert!(!held, "the proof made for the vault it left is gone");
+        assert_eq!(
+            queued, 0,
+            "nothing reached the other vault before its own request"
+        );
+        assert!(
+            matches!(moved, Ok(JoinOutcome::Pending { .. })),
+            "{moved:?}"
+        );
+        server.stop();
     }
 
     /// A path checks no signature, so a version of the vault's name there that the admin does
@@ -4444,6 +4782,67 @@ mod tests {
         let late = Paths::for_home(&root.path().join("mc"));
         join_pinned(&late, &first, "mc");
         assert_eq!(pinned(&late).signer, Some(next));
+    }
+
+    /// Only a request that carried a password proof can have had its password mistyped.
+    #[test]
+    fn only_a_request_with_a_proof_was_asked_with_a_password() {
+        let home = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = Paths::for_home(home.path());
+        assert!(!asked_with_password(&paths), "no state");
+        let mut state = State {
+            membership: Stored::Pending,
+            ..State::default()
+        };
+        save_state(&paths, &state).expect("saved");
+        assert!(!asked_with_password(&paths), "asked by code alone");
+        state.proof = Some("proof".to_string());
+        save_state(&paths, &state).expect("saved");
+        assert!(asked_with_password(&paths));
+    }
+
+    /// A host that posts a new proof every few seconds makes the approver judge each one, but
+    /// what it remembers stays the listing's size.
+    #[test]
+    fn the_approver_remembers_only_what_is_still_listed() {
+        let key = crate::transport::test_recipient(1);
+        let request = |n: u32| Request {
+            recipient: key.clone(),
+            host: "m9".to_string(),
+            code: "abcd-efgh-ijkm-npqr".to_string(),
+            at: None,
+            proof: Some(format!("proof-{n}")),
+        };
+        let waiting = request(0);
+        let config = Config {
+            source: Source::Url("http://vault.invalid:7484/v1/team".to_string()),
+            name: "team".to_string(),
+            signer: Some([7; 32]),
+            followed: Vec::new(),
+            host: "ma".to_string(),
+        };
+        let mut settled = Settled::default();
+        for n in 1..=100 {
+            let listed = [waiting.clone(), request(n)];
+            assert!(
+                settled.due(&config, 1, &listed, Approval::Password),
+                "proof {n}"
+            );
+            settled.settle(listed.iter().map(Judged::of).collect());
+            assert!(
+                !settled.due(&config, 1, &listed, Approval::Password),
+                "proof {n}"
+            );
+        }
+        assert_eq!(settled.judged.len(), 2);
+        // What is still listed stays judged: the one that waits throughout is not read again.
+        assert!(!settled.due(
+            &config,
+            1,
+            std::slice::from_ref(&waiting),
+            Approval::Password
+        ));
+        assert_eq!(settled.judged.len(), 1);
     }
 }
 

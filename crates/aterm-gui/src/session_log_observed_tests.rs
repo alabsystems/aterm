@@ -1163,17 +1163,22 @@ fn the_supervisors_attention_is_one_escalated_need_by_aterm() {
     );
 }
 
-/// THE SUPERVISOR'S ATTENTION TEXT IS NEVER STORED (the design's tier
-/// table: box commands, question text and the screen's last line are not
-/// stored; ruling S5): an escalation over a Bash box whose command holds a
-/// sentinel, the shape `supervise::escalate` writes, is `mark - meta
-/// field=attention fp=<16 hex>`, the text's fingerprint, and the sentinel
-/// is in no record at the host tier (what `log` prints by default and the
-/// journal writes) or the content tier, in no brief and on no carry line.
-/// NEGATIVE CONTROLS: the sentinel is in the session's meta store, where
-/// the attention belongs; another field's value is kept as it was written.
+/// THE SUPERVISOR'S ATTENTION TEXT NEVER LEAVES RAM (phase 6, 6F-8, ruling
+/// U13, which turned "never stored" into the ring's own exposure; the
+/// design's tier table: box commands, question text and the screen's last
+/// line are never journaled, carried or published): an escalation over a
+/// Bash box whose command holds a sentinel, the shape `supervise::escalate`
+/// writes, is `mark - meta field=attention fp=<16 hex>`, the text's
+/// fingerprint, with the text beside it at `Tier::Content` (`attn_text=`),
+/// so the log's view prints the `meta-change` row as the ring does. The
+/// sentinel is in that record at the content tier and in no line at the
+/// host tier (what `log` prints by default), in no journal line, on no
+/// carry line, in no brief and in no bus mirror body. NEGATIVE CONTROLS:
+/// the sentinel is in the session's meta store, where the attention
+/// belongs; another field's value is kept as it was written; and (by
+/// scratch revert) `attn_text` marked HOST puts it in the journal.
 #[test]
-fn the_supervisors_attention_text_reaches_no_record() {
+fn the_supervisors_attention_text_never_leaves_ram() {
     use crate::session_timeline::{MetaEdit, write_attention_owned};
     let owner = aterm_agent::supervise::run::ATTENTION_OWNER;
     let (h, store) = fabric_rig(34);
@@ -1217,11 +1222,36 @@ fn the_supervisors_attention_text_reaches_no_record() {
         "NEGATIVE CONTROL: {host:?}"
     );
     let content = content_lines(&h.ctx.timeline);
-    let (brief, carry) = {
+    let held = having(&content, " mark - meta field=attention ");
+    assert!(
+        held.len() == 1
+            && held[0].contains(" attn_text=")
+            && held[0].contains("SENTINEL-ATTENTION"),
+        "the text at the content tier, in RAM: {held:?}"
+    );
+    let (journal, mirror, brief, carry) = {
         let mut g = h.ctx.timeline.lock().unwrap();
         let now = g.slog().now();
+        let log = g.slog().log();
+        let sid = aterm_slog::ShortId::new("s1").expect("an id");
+        let take = aterm_slog::journal::take(log, 0, usize::MAX, true);
+        let journal: Vec<String> = aterm_slog::journal::take_frames(sid, &take, true, now.wall_ms)
+            .iter()
+            .filter_map(aterm_slog::journal::encode_frame)
+            .collect();
+        assert!(
+            journal.iter().any(|l| l.contains("field=attention")),
+            "the journal holds the mark: {journal:?}"
+        );
+        let mirror: Vec<String> = log
+            .window()
+            .filter_map(|r| {
+                aterm_slog::encode_mirror(r, aterm_slog::Tier::Content, log.ep(), None, &|_| None)
+                    .ok()
+            })
+            .collect();
         let brief = super::super::render_brief(
-            g.slog().log(),
+            log,
             "s-1",
             aterm_slog::Node::SESSION,
             None,
@@ -1235,29 +1265,31 @@ fn the_supervisors_attention_text_reaches_no_record() {
             .lines
             .join("\n");
         g.slog_mut().lift_read_fence();
-        (brief, carry)
+        (journal.join("\n"), mirror.join("\n"), brief, carry)
     };
-    for (what, got) in [
+    let leaks: Vec<String> = [
         ("host", host.join("\n")),
-        ("content", content.join("\n")),
+        ("journal", journal),
+        ("mirror", mirror),
         ("brief", brief),
         ("carry", carry),
-    ] {
-        assert!(
-            !got.contains("SENTINEL"),
-            "the attention text in the {what}: {got}"
-        );
-    }
+    ]
+    .into_iter()
+    .filter(|(_, got)| got.contains("SENTINEL"))
+    .map(|(what, got)| format!("the attention text in the {what}: {got}"))
+    .collect();
+    assert!(leaks.is_empty(), "{}", leaks.join("\n"));
 }
 
 /// THE META A SUCCESSOR RESTORES IS NO NEWS (ruling S5's `meta_fp`): the
 /// carry's `state` line holds each meta field's value as the log last said
 /// it, a fingerprint, never its text, and a successor that reads it back
-/// writes no mark when it restores the same value (`restore_carried_meta`,
-/// by aterm). NEGATIVE CONTROL: a restore of another value, or of a field
-/// the predecessor never said, is a mark.
+/// and restores the same value (`restore_carried_meta`, by aterm) writes
+/// its row's mark (one a row since phase 6, 6F-8, ruling U13) saying
+/// `carried=1`: no news. NEGATIVE CONTROL: a restore of another value, or
+/// of a field the predecessor never said, is a mark with no `carried=`.
 #[test]
-fn a_successor_restoring_the_same_meta_writes_no_mark() {
+fn a_successor_restoring_the_same_meta_marks_it_carried() {
     use crate::session_timeline::MetaChange;
     let say = |tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
                field: &'static str,
@@ -1295,12 +1327,83 @@ fn a_successor_restoring_the_same_meta_writes_no_mark() {
             .filter(|l| l.contains(" mark - meta "))
             .collect::<Vec<_>>()
     };
-    assert!(metas(&next).is_empty(), "restated: {:?}", metas(&next));
+    let restored = metas(&next);
+    assert_eq!(restored.len(), 3, "a mark a row: {restored:?}");
+    assert!(
+        restored.iter().all(|l| l.contains(" carried=1 ")),
+        "no news: {restored:?}"
+    );
     say(&next, "role", Some("lead"));
     say(&next, "description", Some("new"));
     let got = metas(&next);
+    let moved = &got[restored.len()..];
+    assert_eq!(moved.len(), 2, "{got:?}");
+    assert!(moved[0].contains(" field=role value=lead "), "{moved:?}");
+    assert!(
+        moved.iter().all(|l| !l.contains(" carried=")),
+        "a move is news: {moved:?}"
+    );
+}
+
+/// THE AUTOPILOT TIMER IS A MOVE OF THE PAIR (6F-8; the review of 6F-8):
+/// its fingerprint holds the word and the timer (`land_at=`, whole
+/// seconds), so the word with a timer a minute later is a move (no
+/// `carried=`) and the same pair again is no news (`carried=1`); across a
+/// carry, a successor restoring the word with the timer the log last said
+/// is no news, and with another timer is a move. NEGATIVE CONTROL (by
+/// scratch revert): a fingerprint of the word alone reads the timer-only
+/// move, here and on the successor, as no news.
+#[test]
+fn the_autopilot_timer_is_in_the_meta_fingerprint() {
+    use crate::session_timeline::MetaChange;
+    let say = |tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+               land_at: Option<i64>| {
+        let mut g = tl.lock().unwrap();
+        let at = g.slog().now();
+        let change = MetaChange::written_by("autopilot", Some("cruise"), aterm_slog::Actor::Ctl)
+            .with_land_at(land_at);
+        g.slog_mut().observe_meta(change, false, at);
+    };
+    let metas = |tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>| {
+        lines_of(tl)
+            .into_iter()
+            .filter(|l| l.contains(" mark - meta field=autopilot "))
+            .collect::<Vec<_>>()
+    };
+    let (prev, _hand) = opened();
+    say(&prev, Some(1_900_000_000_500));
+    say(&prev, Some(1_900_000_060_000));
+    say(&prev, Some(1_900_000_060_000));
+    let got = metas(&prev);
+    assert_eq!(got.len(), 3, "a mark a row: {got:?}");
+    assert!(
+        got[1].contains(" land_at=1900000060 ") && !got[1].contains(" carried="),
+        "a timer-only move is a move: {got:?}"
+    );
+    assert!(got[2].contains(" carried=1 "), "the same pair: {got:?}");
+    let tokens = prev.lock().unwrap().slog().observed.carry_tokens();
+    let mut read = Observed::default();
+    read.read_carry(|k| {
+        tokens
+            .split(' ')
+            .filter_map(|t| t.split_once('='))
+            .find(|(key, _)| *key == k)
+            .map(|(_, v)| v.to_string())
+    });
+    let (next, _hand2) = opened();
+    next.lock().unwrap().slog_mut().observed = read;
+    say(&next, Some(1_900_000_060_000));
+    say(&next, Some(1_900_000_120_000));
+    let got = metas(&next);
     assert_eq!(got.len(), 2, "{got:?}");
-    assert!(got[0].contains(" field=role value=lead "), "{got:?}");
+    assert!(
+        got[0].contains(" carried=1 "),
+        "the carried pair is no news: {got:?}"
+    );
+    assert!(
+        !got[1].contains(" carried="),
+        "another timer is a move: {got:?}"
+    );
 }
 
 /// A PROVEN CLAIM THE SWEEP CLEARS (`release_proven_if_gone`, the status

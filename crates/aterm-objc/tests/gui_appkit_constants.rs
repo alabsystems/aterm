@@ -249,7 +249,7 @@ fn probe(invert: Option<&str>) -> String {
     s
 }
 
-/// THE ORACLE, RUN — both arches, and this box cannot execute one of them.
+/// The oracle, on both arches.
 #[test]
 fn every_gui_constant_equals_the_sdk_on_both_arches() {
     let body = probe(None);

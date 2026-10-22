@@ -1125,11 +1125,9 @@ fn only_a_box_and_a_draft_are_a_persons_hold() {
     }
 }
 
-/// A hold stands only while it is sampled: a gap longer than [`HOLD_GAP_S`]
-/// (a system sleep, a driver restart) begins the hold again, so two samples
-/// hours apart are a wait. Negative control: a box sampled once a minute for
-/// [`HOLD_S`] still voids, and a gap of exactly [`HOLD_GAP_S`] carries the
-/// hold on.
+/// A hold stands only while it is sampled: a gap longer than [`HOLD_GAP_S`] (a system sleep, a
+/// driver restart) begins it again. Negative control: a box sampled once a minute for
+/// [`HOLD_S`] voids, and a gap of exactly [`HOLD_GAP_S`] carries it on.
 #[test]
 fn a_hold_stands_only_while_it_is_sampled() {
     let asked = Phase::Announced { at_s: 0, asks: 1 };
@@ -2215,14 +2213,12 @@ fn claudes_status_is_read_against_its_idle_screen_and_the_work_under_it() {
     assert_eq!(wait_word("status-stale", "busy"), "status-stale:busy");
 }
 
-/// The restart's own gate waits at a break: at a break of the agent's own
-/// work ([`Facts::background_point`]) that work runs by definition (a shell
-/// under the agent, or a workflow inside its process that
-/// [`Facts::background`] never names), and the drain never ends the agent's
-/// own work. The gate says what [`next_step`]'s break arm says, including
-/// `background` for a phase the drivers carry instead of stepping (a restart
-/// in flight, a move done). Negative controls: a shut gate says its own word
-/// first, and off a break the same facts are the restart.
+/// The restart's gate waits at a break ([`Facts::background_point`]): the agent's own work
+/// runs there by definition (a shell under the agent, or a workflow in its process that
+/// [`Facts::background`] never names), and the drain never ends it. The gate says what
+/// [`next_step`]'s break arm says, `background` included for a phase the drivers carry instead
+/// of stepping. Negative controls: a shut gate says its own word first; off a break the same
+/// facts are the restart.
 #[test]
 fn the_restarts_gate_waits_at_a_break_whatever_else_lets_it_go() {
     for status in ["idle", "busy", "shell"] {
@@ -4635,18 +4631,13 @@ fn the_copies_of_a_queued_notice_are_counted_until_the_model_takes_one() {
     );
 }
 
-/// Activity delays, never disables, and no rung relaxes a floor: it never
-/// types over a draft, a dialog or running work. At each rung, what the gate
-/// passes that the rung before did not: from Settled a pause that only looks
-/// quiet (the reader's run of idle looks at the same last words, `still_s`,
-/// the screen's own quiet restarted by a repaint); from KeysOnly a person
-/// near the tab who has not typed within KEYS_GAP_S; at Land and under
-/// `--now` the first such pause, its settle waived. Negative controls at
-/// every rung, `--now` included: a hold, the usage limit, the login wall, a
-/// full queue, the agent's own turn (its status, its busy footer), a turn in
-/// a Codex daemon the screen does not show (its own thread's, a goal, or one
-/// the lane cannot place in another session), a box, a draft, and a
-/// keystroke within KEYS_GAP_S each still wait.
+/// Activity delays, never disables, and no rung relaxes a floor. Each rung passes what the
+/// one before did not: from Settled a pause that only looks quiet (`still_s` over a
+/// repainting screen); from KeysOnly a person near the tab not typing within KEYS_GAP_S; at
+/// Land and under `--now` the first such pause, its settle waived. Negative controls at every
+/// rung, `--now` included: every floor (a hold, the limit, the login wall, a full queue, the
+/// agent's own turn, a daemon turn the screen does not show, a box, a draft, a recent
+/// keystroke) still waits.
 #[test]
 fn the_ladder_relaxes_the_settle_and_the_person_near_and_never_a_floor() {
     let at = |rung: Rung, f: Facts| Facts { rung, ..f };

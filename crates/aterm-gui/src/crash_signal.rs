@@ -1279,13 +1279,11 @@ mod marker_tests {
         }
     }
 
-    /// The sweep ANSWERS the corpses it removed: a dead `other` start's empty
-    /// marker is no row, but it is the evidence the crash journal reopens that
-    /// start's layout by, and the sweep that removes it runs before the claim.
-    /// This process's own previous image, a live marker and a crash record are
-    /// not in the answer. NEGATIVE CONTROL: the marker the answer names is gone
-    /// from the directory, so a claim that read only the directory would find
-    /// no evidence at all.
+    /// The sweep answers the dead starts it removed: a dead `other` start's empty marker is no
+    /// row, but it is the evidence the crash journal reopens that start's layout by, and the
+    /// sweep runs before the claim. This process's own previous image, a live marker and a crash
+    /// record are not in the answer. Control: the named marker is gone from the directory, so a
+    /// claim that read only the directory would find no evidence.
     #[test]
     fn the_sweep_answers_the_dead_starts_it_removed() {
         let dir = scratch("marker-swept");
@@ -1394,21 +1392,11 @@ mod marker_tests {
     }
 }
 
-/// The Windows crash lane: an unhandled-exception filter
-/// (`SetUnhandledExceptionFilter`) writing a crash artifact. Native fatal
-/// exceptions dispatched through the OS exception machinery — access violation
-/// `0xC0000005`, illegal instruction, stack overflow, etc. — bypass the Rust
-/// panic hook the way POSIX fatal signals do, and this filter catches them
-/// under the unix module's discipline: everything non-trivial (path
-/// resolution, `open`, allocation) happens ONCE at install time, and the
-/// filter itself does no allocation (stack hex buffers + pre-built banner
-/// bytes + `WriteFile` loops), because it may run with a corrupted heap.
-///
-/// It does NOT mirror the unix `SIGABRT` coverage. Rust's `abort_internal` on
-/// Windows is `__fastfail` (`int 0x29`), which the kernel terminates on
-/// *without* dispatching to any in-process filter — so OOM/`process::abort`/
-/// double-panic never reach here. See [`install_signal_handlers`] for the full
-/// asymmetry and the WER-LocalDumps escape hatch.
+/// The Windows crash lane: an unhandled-exception filter (`SetUnhandledExceptionFilter`) for
+/// native fatal exceptions (access violation `0xC0000005`, illegal instruction, stack overflow),
+/// which bypass the panic hook as POSIX fatal signals do. Path work, `open` and allocation happen
+/// once at install time; the filter allocates nothing, since it may run on a corrupted heap.
+/// Rust's aborts (`__fastfail`) never reach it: see [`super::install_signal_handlers_as`].
 #[cfg(windows)]
 mod imp_windows {
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};

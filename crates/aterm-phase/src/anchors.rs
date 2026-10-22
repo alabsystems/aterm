@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The literal strings a supervisor guards on, in ONE table.
+//! The literal strings a supervisor guards on, in one table.
 //!
-//! A guard (`key if=<regex> 1`, `await match`, `turn … submit=guarded:<re>`) is only as
-//! good as the text it names, and that text is Claude Code's, not ours: the
-//! day a release renames a header or a hint, a guard spelled inline in some
-//! other crate silently stops matching. So the strings live here, each with
-//! an id a caller imports ([`anchor`]) instead of re-typing the words, the
-//! release they were read on, and whether they are one literal in the
-//! vendor's binary or composed at run time from key hints.
+//! A guard (`key if=<regex> 1`, `await match`, `turn … submit=guarded:<re>`) is only as good as
+//! the text it names, and that text is the vendor's: a release that renames a header or hint
+//! silently breaks a guard spelled inline elsewhere. So each string lives here with an id
+//! callers import ([`anchor`]), the release it was read on, and whether it is one literal in
+//! the vendor's binary or composed at run time. Codex's strings are their own table,
+//! [`CODEX_ANCHORS`] (ids `codex.…`); [`anchor`] and [`anchor_text`] read both.
 //!
 //! Each other agent's strings are a table of its own — [`AGY_ANCHORS`]
 //! (ids `agy.…`), [`MUSE_ANCHORS`] (`muse.…`), [`GEMINI_ANCHORS`]
@@ -106,13 +105,10 @@ pub const ANCHORS: &[Anchor] = &[
     composed("prompt.edit", "Do you want to make this edit to", "2.1.280"),
     hint("prompt.cancel", "Esc to cancel", "2.1.267"),
     hint("prompt.amend", "Tab to amend", "2.1.267"),
-    // A permission box's REASON BLOCK when the OWNER's own Claude Code
-    // configuration sends the step to a person (2.1.282, read from its
-    // render code and measured on the S13 capture B, 2026-09-25): an ask
-    // rule (`Permission rule Bash(touch:*) requires confirmation for this
-    // command.`), an ask rule that overrides auto mode, a hook. A box that
-    // carries one is the owner's own review (`PromptV2::owner_review`):
-    // nothing approves it.
+    // A permission box's reason block when the owner's own Claude Code configuration sends the
+    // step to a person: an ask rule (`Permission rule Bash(touch:*) requires confirmation for
+    // this command.`), an ask rule that overrides auto mode, a hook. A box that carries one is
+    // the owner's own review (`PromptV2::owner_review`): nothing approves it.
     lit("box.reason_rule", "Permission rule ", "2.1.282"),
     lit(
         "box.reason_confirm",
@@ -125,36 +121,29 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.282",
     ),
     lit("box.reason_hook", "Hook ", "2.1.282"),
-    // A remote session's hook, as the head and the tail every build shares:
-    // 2.1.282 wrote `A hook configured in the remote workspace requires
-    // confirmation: <reason>`, 2.1.287 `A hook run for this remote session
-    // requires confirmation: <reason>` (read from both binaries' strings).
-    // The old sentence whole matched no 2.1.287 box.
+    // A remote session's hook, as the head and tail every build shares: `A hook configured in
+    // the remote workspace requires confirmation: <reason>` (2.1.282), `A hook run for this
+    // remote session requires confirmation: <reason>` (2.1.287).
     lit("box.reason_remote_hook", "A hook ", "2.1.282"),
     lit(
         "box.reason_remote_confirm",
         "requires confirmation: ",
         "2.1.282",
     ),
-    // The Bash box's `No` under Tab: an input whose placeholder this is,
-    // drawn after the label as `No, and tell Claude what to do differently`
-    // (2.1.282, measured; the same option in 2.1.280 and 2.1.281). The
-    // supervisor's decline types its reason into it.
+    // The Bash box's `No` under Tab: an input with this placeholder, drawn after the label as
+    // `No, and tell Claude what to do differently`. The supervisor's decline types its reason
+    // into it.
     lit(
         "prompt.amend_no",
         "and tell Claude what to do differently",
         "2.1.280",
     ),
     hint("prompt.confirm", "Enter to confirm", "2.1.280"),
-    // The note 2.1.291 appends to the FOOTER of a permission box a SUBAGENT or a
-    // workflow's agent raised (`ZTe()`, for an async agent: every subagent the lab
-    // started drew it, `run_in_background` true, absent or false): the kill-agents
-    // chord and an action joined by one space, where every other hint says ` to `
-    // (`terse`) — `Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop
-    // background agents`, `again` once the first press is in. The chord is the
-    // user's binding (`chat:killAgents`). MEASURED on 2.1.291 and 2.1.292
-    // (`claude-2.1.292-box-bash-background-agent.txt`): before it the footer was
-    // read as no footer at all, and the box as no box.
+    // The note on the footer of a permission box a subagent or a workflow's agent raised: the
+    // kill-agents chord (the user's `chat:killAgents` binding) and an action joined by one
+    // space, where every other hint says ` to ` — `Esc to cancel · Tab to amend · ctrl+x ctrl+k
+    // twice to stop background agents`, `again` once the first press is in
+    // (`claude-2.1.292-box-bash-background-agent.txt`).
     lit(
         "hint.agents_twice",
         "twice to stop background agents",
@@ -171,30 +160,25 @@ pub const ANCHORS: &[Anchor] = &[
     lit("box.create", "Create file", "2.1.267"),
     lit("box.overwrite", "Overwrite file", "2.1.280"),
     lit("box.read", "Read file", "2.1.267"),
-    // The folder grant on a Read box for a folder OUTSIDE Claude Code's working
-    // set (`Yes, allow reading from /etc and /private/etc during this session`;
-    // 2.1.287: `… from this project`): none on a box for a path inside it.
+    // The folder grant on a Read box for a folder outside Claude Code's working set (`Yes, allow
+    // reading from /etc and /private/etc during this session`; 2.1.287: `… from this project`);
+    // a box for a path inside it has none.
     lit("box.read_grant", "allow reading from ", "2.1.282"),
     // A Read box's call, `Read(<path>)` (the tool's name and its argument,
     // joined at draw time): alone under the title in 2.1.284, between two
     // dashed rules from 2.1.287.
     composed("box.read_call", "Read(", "2.1.284"),
     lit("box.workflow", "Run a dynamic workflow?", "2.1.267"),
-    // The rest of the permission boxes' titles (the `title` each dialog hands
-    // its Ei() box, read from the 2.1.282 render code and present in the
-    // 2.1.280, 2.1.281 and 2.1.282 store binaries — 2.1.280 is the earliest
-    // build read, so `since` says no more than that). Every box below is
-    // HAND-BUILT in the fixtures until a live capture replaces it.
-    // `crate::prompt::header_kind` reads a kind from these and nothing else.
+    // The other permission-box titles, from the 2.1.282 render code (2.1.280 is the earliest
+    // build read, hence `since`). `crate::prompt::header_kind` reads a box's kind from these.
     lit("box.powershell", "PowerShell command", "2.1.280"),
     // Two more Edit titles: the notebook edit (no path row; the question
     // names the file) and the IDE diff (`Opened changes in VS Code ⧉`).
     lit("box.edit_notebook", "Edit notebook", "2.1.280"),
     lit("box.ide_diff", "Opened changes in ", "2.1.280"),
     lit("box.ide_diff.mark", "⧉", "2.1.280"),
-    // WebFetch's box (Zpe()), the sandbox's network box (uue()) and the
-    // Chrome extension's (Xme()): drawn with NO key-hint footer, their
-    // refusal the last option, marked ` (esc)`.
+    // WebFetch's box, the sandbox's network box and the Chrome extension's: drawn with no
+    // key-hint footer, their refusal the last option, marked ` (esc)`.
     lit("box.fetch", "Fetch", "2.1.280"),
     lit(
         "box.network",
@@ -204,22 +188,17 @@ pub const ANCHORS: &[Anchor] = &[
     lit("box.browser", "Claude in Chrome wants to ", "2.1.280"),
     lit("box.skill", "Use skill \"", "2.1.280"),
     lit("box.skill_this", "Use this skill?", "2.1.280"),
-    // The Monitor box's title is the Monitor tool's name (`var il =
-    // "Monitor"`, the one export of its chunk, imported by Wpe() — the
-    // permission_monitor dialog — as its Ei() title; 2.1.282).
+    // The Monitor box's title is the Monitor tool's name.
     lit("box.monitor", "Monitor", "2.1.280"),
-    // The generic tool box (y5n(): an MCP tool) when it is titled so; titled
-    // by its card's question or the tool's own name (card mode) it has no
-    // anchor and is read by its shape (`crate::prompt::PromptV2::tool_card`).
+    // The generic tool box (an MCP tool) when it is titled so; titled by its card's question or
+    // the tool's own name (card mode) it has no anchor and is read by its shape
+    // (`crate::prompt::PromptV2::tool_card`).
     lit("box.tool", "Tool use", "2.1.280"),
-    // The header's origin suffix after ` · ` (y7() in 2.1.282): `from the
-    // "<name>" workflow`, `from a workflow`, `from the <name> agent`, `from
-    // a subagent`, `from a remote cloud agent`, `from the <name> plugin`,
-    // `from a plugin` — read by `crate::prompt::parse_header` (the named
-    // forms' `from the ` is plain English, spelled there: a row here is
-    // imported by id everywhere else). And the
-    // title's own parenthetical (f2e(): `Bash command (unsandboxed)`, `Bash
-    // command (runs on <machine>)`; Xo() gives the file boxes the second).
+    // The header's origin suffix after ` · `: `from the "<name>" workflow`, `from a workflow`,
+    // `from the <name> agent`, `from a subagent`, `from a remote cloud agent`, `from the <name>
+    // plugin`, `from a plugin`, read by `crate::prompt::parse_header` (which spells the named
+    // forms' plain-English `from the ` itself). And the title's own parenthetical (`Bash
+    // command (unsandboxed)`, `Bash command (runs on <machine>)`, the second on file boxes too).
     lit("origin.workflow", "from a workflow", "2.1.280"),
     lit("origin.subagent", "from a subagent", "2.1.280"),
     lit("origin.remote", "from a remote cloud agent", "2.1.280"),
@@ -241,12 +220,11 @@ pub const ANCHORS: &[Anchor] = &[
         "Do you want to delete this cell from",
         "2.1.280",
     ),
-    // Dialogs that are NOT tool permissions — a supervisor must see them (a
-    // footerless one read as idle stalled a session silently) and answers
-    // each by its own rule, never as a tool permission's one-shot allow:
-    // plan mode in and out, a held cross-session message, a proposed goal,
-    // a Computer Use grant (session-only), the setting that blocks reads
-    // outside the working directories (persistent).
+    // Dialogs that are not tool permissions: a supervisor must see them (a footerless one read
+    // as idle stalls a session) and answers each by its own rule, never a tool permission's
+    // one-shot allow: plan mode in and out, a held cross-session message, a proposed goal, a
+    // Computer Use grant (session-only), the setting that blocks reads outside the working
+    // directories (persistent).
     lit("plan.enter", "Enter plan mode?", "2.1.280"),
     lit("plan.ready", "Ready to code?", "2.1.280"),
     lit("plan.exit", "Exit plan mode?", "2.1.280"),
@@ -280,13 +258,11 @@ pub const ANCHORS: &[Anchor] = &[
         "Read outside the working directories",
         "2.1.280",
     ),
-    // The cache-miss confirmation Claude Code draws before a `/model` or
-    // `/effort` change a person typed takes effect on a warm conversation
-    // (2.1.283's `$J`, one component for both): its two titles, its confirm
-    // (`Yes, switch to <model or effort>`, a template), its refusal, its
-    // subtitle — the cost warning — and the subtitle that replaces it when the
-    // person's own PreModelSwitch hook asked for the confirmation. MEASURED 2026-09-26 on
-    // 2.1.283 (the model form; the others read from the same render code).
+    // The cache-miss confirmation before a typed `/model` or `/effort` change takes effect on a
+    // warm conversation (one component for both): its two titles, its confirm (`Yes, switch to
+    // <model or effort>`), its refusal, its cost-warning subtitle, and the subtitle that
+    // replaces it when the person's own PreModelSwitch hook asked. The model form is measured
+    // on 2.1.283; the rest read from the same render code.
     lit("model_switch.title", "Switch model?", "2.1.283"),
     lit("effort_switch.title", "Change effort level?", "2.1.283"),
     lit("model_switch.yes", "Yes, switch to", "2.1.283"),
@@ -357,16 +333,12 @@ pub const ANCHORS: &[Anchor] = &[
     lit("question.other", "Type something", "2.1.280"),
     lit("question.chat", "Chat about this", "2.1.280"),
     hint("question.select", "Enter to select", "2.1.280"),
-    // The dialog as 2.1.282 draws it, read whole (`crate::question`; the
-    // live captures of 2026-09-25): the several-question footer item and the
-    // preview form's (`n to add notes`, `Tab to switch questions`), the
-    // preview's notes row (`Notes:` and ` press n to add notes`, two Text
-    // runs, so composed), the label mark the tool's prompt asks for, the tab
-    // bar's Submit chip (the tick figure and ` Submit`), the review tab's
-    // rows, and the AFK countdown row the host may draw under the dialog.
-    // The multi-select button (`Next`/`Submit`) and the review's `Cancel`
-    // are read by POSITION, never by anchor: those words are spelled in
-    // aterm-gui and aterm-search.
+    // The dialog read whole (`crate::question`): the several-question footer item and the
+    // preview form's (`n to add notes`, `Tab to switch questions`), the preview's notes row (two
+    // text runs, so composed), the label mark the tool's prompt asks for, the tab bar's Submit
+    // chip, the review tab's rows, and the AFK countdown row the host may draw under the dialog.
+    // The multi-select button (`Next`/`Submit`) and the review's `Cancel` are read by position,
+    // never by anchor: aterm-gui and aterm-search spell those words too.
     lit(
         "question.navigate_tabs",
         "Tab/Arrow keys to navigate",
@@ -391,20 +363,18 @@ pub const ANCHORS: &[Anchor] = &[
     lit("question.review_submit", "Submit answers", "2.1.281"),
     lit("question.auto_continue", "auto-continue in ", "2.1.282"),
     lit("question.stay", "any key to stay", "2.1.282"),
-    // The tool result's row when a person pressed Esc on the dialog or
-    // `2. Cancel` on its review tab (measured 2026-09-25, S7 and S8): the
-    // model is told to STOP, so the turn it ends is a person's stop
+    // The tool result's row when a person pressed Esc on the dialog or `2. Cancel` on its review
+    // tab: the model is told to stop, so the turn it ends is a person's stop
     // (`crate::turn::interrupted`), never one to continue.
     lit(
         "question.declined",
         "User declined to answer questions",
         "2.1.282",
     ),
-    // A dialog WITHHELD while the composer holds a draft (Ufe()'s reason
-    // `draft`, 2.1.282), drawn dim in its place; its dash is a `\u2014`
-    // escape in the binary, so composed. And the REPL's row while a panel
-    // holds the message queue (Y_(): `Background task update` or `<N>
-    // background task updates`, then this), which may sit under a dialog.
+    // A dialog withheld while the composer holds a draft, drawn dim in its place (its dash is a
+    // `—` escape in the binary, so composed). And the REPL's row while a panel holds the
+    // message queue (`Background task update` or `<N> background task updates`, then this),
+    // which may sit under a dialog.
     composed(
         "dialog.deferred_question",
         "Claude has a question for you — it shows once you send or clear what you're typing.",
@@ -490,10 +460,9 @@ pub const ANCHORS: &[Anchor] = &[
         "some nested commands or function substitutions could not be analyzed",
         "2.1.307",
     ),
-    // 2.1.281: a box in a session read as unattended carries a countdown
-    // row under its notes (`⚠ Claude Code will automatically deny this
-    // request in 1:59, to avoid blocking progress on an unattended
-    // session`), the time ticking — its own row, never a note.
+    // A box in a session read as unattended carries a countdown row under its notes (`⚠ Claude
+    // Code will automatically deny this request in 1:59, to avoid blocking progress on an
+    // unattended session`), the time ticking: its own row, never a note.
     composed(
         "box.auto_deny",
         "Claude Code will automatically deny this request in",
@@ -511,10 +480,9 @@ pub const ANCHORS: &[Anchor] = &[
         "No, continue without these permissions",
         "2.1.280",
     ),
-    // The usage-limit options dialog (the 2.1.282 binary's
-    // `rate_limit_options_menu`): its title, its "stop" row, and the one row
-    // the supervisor may choose — `Wait here, then continue automatically`
-    // followed by ` shortly`, ` at <time>` or ` when the limit resets`.
+    // The usage-limit options dialog (`rate_limit_options_menu`): its title, its stop row, and
+    // the one row the supervisor may choose — `Wait here, then continue automatically` followed
+    // by ` shortly`, ` at <time>` or ` when the limit resets`.
     lit("limit.title", "What do you want to do?", "2.1.282"),
     lit("limit.stop", "Stop and wait for limit to reset", "2.1.282"),
     lit(
@@ -546,16 +514,15 @@ pub const ANCHORS: &[Anchor] = &[
     ),
     // The live zone.
     lit("busy.interrupt", "esc to interrupt", "2.1.267"),
-    // The pill-less footer row's left hint slot under the composer (2.1.283
-    // render code: `? for shortcuts` at rest, the escape key's `clear` hint
-    // with a draft) — a live REPL's own row where no mode pill is drawn
-    // (`aterm_agent::harness::footer::live_repl_row`).
+    // The pill-less footer row's left hint slot under the composer (`? for shortcuts` at rest,
+    // the escape key's `clear` hint with a draft): a live REPL's own row where no mode pill is
+    // drawn (`aterm_agent::harness::footer::live_repl_row`).
     lit("footer.shortcuts", "? for shortcuts", "2.1.283"),
     hint("footer.clear", "esc to clear", "2.1.283"),
-    // The permission-mode pill on that row: a glyph, the mode's indicator and
-    // ` on`, joined at run time (`⏵⏵ bypass permissions on`, `⏸ manual mode
-    // on`), then the cycle key's hint (`(shift+tab to cycle)`). The footer and
-    // the mode light read the mode from it (`aterm_agent::harness::footer`).
+    // The permission-mode pill on that row: a glyph, the mode's indicator and ` on`, joined at
+    // run time (`⏵⏵ bypass permissions on`, `⏸ manual mode on`), then the cycle key's hint
+    // (`(shift+tab to cycle)`). The footer and the mode light read the mode from it
+    // (`aterm_agent::harness::footer`).
     composed("mode.bypass", "bypass permissions on", "2.1.283"),
     composed("mode.auto", "auto mode on", "2.1.283"),
     composed("mode.accept_edits", "accept edits on", "2.1.283"),
@@ -612,14 +579,11 @@ pub const ANCHORS: &[Anchor] = &[
         "How is Claude doing this session",
         "2.1.267",
     ),
-    // The rest of the rating cards, drawn by the same component as the session
-    // survey (`VM` in 2.1.284) in the same slot above the composer, each with the
-    // options row `1: Bad … 0: Dismiss` under its question. Read from the render
-    // code and present in the 2.1.284 store binary; HAND-BUILT in the fixtures until
-    // a capture replaces them (only the session survey has one). `survey.plugin` is
-    // the head both of its spellings share (`How helpful has the <plugin> plugin
-    // been?`, `How helpful has this plugin been?`); the memory card is either of the
-    // two heads, the recollection row being its last message row.
+    // The other rating cards, drawn by the session survey's component in the same slot above
+    // the composer, each with the options row `1: Bad … 0: Dismiss` under its question.
+    // `survey.plugin` is the head both its spellings share (`How helpful has the <plugin>
+    // plugin been?`, `How helpful has this plugin been?`); the memory card is either of the two
+    // heads, the recollection row being its last message row.
     lit(
         "survey.long_context",
         "How well is Claude following the instructions you gave earlier in this conversation",
@@ -637,12 +601,11 @@ pub const ANCHORS: &[Anchor] = &[
         "How was Claude's recollection?",
         "2.1.284",
     ),
-    // The rating's own aftermath, drawn in the card's slot after a person's `1`/`2`/`3`
-    // (`t1e` and `o1e` in 2.1.286, MEASURED on it 2026-10-01): for 3 s `Feedback: <Bad |
-    // Fine | Good | Unsure> · Esc to undo` (the key word is the user's `escape` binding),
-    // then for 5 s `Thanks for the feedback!` over `(Optional) Press [1] to tell us what
-    // went wrong · /feedback` — or, where the follow-up is off, `Use /feedback to share
-    // detailed feedback anytime.` (the render code's other branch, not captured).
+    // The rating's aftermath in the card's slot after a `1`/`2`/`3`: for 3 s `Feedback: <Bad |
+    // Fine | Good | Unsure> · Esc to undo` (the key is the user's `escape` binding), then for 5 s
+    // `Thanks for the feedback!` over `(Optional) Press [1] to tell us what went wrong ·
+    // /feedback`, or, with the follow-up off, `Use /feedback to share detailed feedback
+    // anytime.` (never captured).
     lit("survey.pending", "Feedback: ", "2.1.286"),
     hint("survey.pending_undo", "Esc to undo", "2.1.286"),
     lit("survey.thanks", "Thanks for the feedback!", "2.1.286"),
@@ -652,35 +615,30 @@ pub const ANCHORS: &[Anchor] = &[
         "Use /feedback to share detailed feedback anytime.",
         "2.1.286",
     ),
-    // The Claude-drafted-feedback card (`SendFeedback`, on for accounts whose flag
-    // is): parked in the same slot, NOT a survey — the readers step over it and
-    // nothing presses it. Its head is `<glyph> <Label> drafted: <title>`; its hint
-    // row is composed from key hints.
+    // The Claude-drafted-feedback card (`SendFeedback`, behind an account flag), parked in the
+    // survey slot but no survey: readers step over it and nothing presses it. Its head is
+    // `<glyph> <Label> drafted: <title>`; its hint row is composed from key hints.
     lit("card.drafted", "drafted:", "2.1.284"),
     hint(
         "card.drafts_hint",
         "1 to review · 2 to send · 0 to dismiss",
         "2.1.284",
     ),
-    // The `Don't ask again` choice the transcript-share ask (`y: Yes    n: No     d:
-    // Don't ask again`, `Ele` in 2.1.284) and the web-setup offer share: the label
-    // that tells those prompts from a rating card, whose options row ends `0: Dismiss`.
-    // Read from the render code and present in the 2.1.284 store binary; never pressed.
+    // `Don't ask again`, the choice the transcript-share ask (`y: Yes    n: No     d: Don't ask
+    // again`) and the web-setup offer share: it tells those prompts from a rating card, whose
+    // options row ends `0: Dismiss`. Never pressed.
     lit("card.dont_ask", "Don't ask again", "2.1.284"),
     lit("context.indicator", "until auto-compact", "2.1.267"),
     // The launch card's name row (`▐▛███▜▌   Claude Code v2.1.282`): a
     // session with no turn yet (`turn::fresh`).
     lit("launch.banner", "Claude Code v", "2.1.267"),
-    // What an EXITING Claude Code prints under its last frame, alone on its
-    // row in column 0 (`\nResume this session with:\nclaude --resume <id>`,
-    // the 2.1.283 binary's resume hint; measured after `/exit` and after
-    // Ctrl-C twice, 2026-09-27): every row above it was drawn by a process
-    // that has exited (`phase::busy_zone_start`).
+    // What an exiting Claude Code prints under its last frame, alone on its row at column 0
+    // (`Resume this session with:`, then `claude --resume <id>`), after `/exit` or Ctrl-C twice:
+    // every row above it was drawn by a process that has exited (`phase::busy_zone_start`).
     lit("exit.resume", "Resume this session with:", "2.1.283"),
     lit("goal.active", "/goal active", "2.1.278"),
-    // The model-refusal pause (`refusal_fallback_prompt`, read from the
-    // 2.1.282 render code; both strings in the 2.1.283 binary): its title,
-    // and its second option's head (`Edit prompt and retry with <model>`).
+    // The model-refusal pause (`refusal_fallback_prompt`): its title and its second option's
+    // head (`Edit prompt and retry with <model>`).
     lit("paused.title", "Session paused", "2.1.282"),
     lit("paused.edit", "Edit prompt and retry", "2.1.282"),
     lit(
@@ -711,16 +669,10 @@ pub const ANCHORS: &[Anchor] = &[
         "code.claude.com/docs/en/changelog for details",
         "2.1.282",
     ),
-    // The vendor's OWN `⏺` paragraphs that are nobody's words: drawn as a
-    // message row in the transcript, but no turn's reply, so the readers of
-    // what the worker last said step over them (`phase::vendor_paragraph`).
-    // The auto-mode notice (`getAutoModeDescription` in 2.1.300, its head
-    // `… automatically \u2014 Claude checks each tool call …` read from the
-    // binary): drawn after the first reply of a session relaunched
-    // `--permission-mode auto --resume <id>` (MEASURED on 2.1.300, the
-    // harness sweep of 2026-10-15, ATERM-KI-1015-1 LC-10), and over the
-    // first turn of a session in auto mode (2.1.287's
-    // `claude-2.1.287-box-bash-ask-rule-auto.txt`).
+    // The vendor's own `⏺` paragraphs that are no turn's reply: readers of what the worker last
+    // said step over them (`phase::vendor_paragraph`). The auto-mode notice is drawn over a
+    // session's first turn in auto mode, and after the first reply of one relaunched
+    // `--permission-mode auto --resume <id>`.
     lit(
         "notice.auto_mode",
         "Auto mode lets Claude handle permission prompts automatically",
@@ -731,12 +683,10 @@ pub const ANCHORS: &[Anchor] = &[
         "saved as your default for new sessions",
         "2.1.267",
     ),
-    // The RESULTS of Claude Code's own model and effort commands, as its
-    // transcript records them under `<local-command-stdout>` — what aterm's
-    // footer names the model and effort by the moment they are chosen
-    // (`aterm_agent::harness::footer`). Read from the 2.1.283 binary
-    // (`UEe`/`BEe`, the `/effort` messages, `mrt`/`grt`); `Set model to ` from
-    // the 2.1.201 transcripts on (its ANSI-bold form, then backticks).
+    // The results of Claude Code's model and effort commands as its transcript records them
+    // under `<local-command-stdout>`: what aterm's footer names the model and effort by once
+    // chosen (`aterm_agent::harness::footer`). `Set model to ` is in transcripts from 2.1.201
+    // on (ANSI-bold, later backticks).
     lit("model.set", "Set model to ", "2.1.201"),
     lit("model.kept", "Kept model as ", "2.1.283"),
     lit("effort.set", "Set effort level to ", "2.1.283"),
@@ -771,19 +721,13 @@ pub const ANCHORS: &[Anchor] = &[
     composed("effort.hint_tail", " \u{b7} /effort", "2.1.304"),
     lit("fast.on", "Fast mode ON", "2.1.283"),
     lit("fast.model_set", "model set to ", "2.1.283"),
-    // The Usage tab of the Settings panel (`/usage`), for the accounts probe
-    // (`crate::panel`, `docs/SPEC-claude-accounts-probe-2026-10-01.md`). READ
-    // in the 2.1.287 bundle's plan-limits component: the loading line and
-    // the refresh line (each `…`-ended on the screen; the bundle spells the
-    // `…` as an escape, so the rows carry the words without it), the four
-    // enrich-error lines' heads, the failed load's reason (drawn after
-    // `Error: `), and the result the panel closes with on Escape. MEASURED
-    // on a 2.1.287 screen, 2026-10-01: `Refreshing…` above the cancel hint
-    // (`prompt::fixtures::USAGE_REFRESHING`), and `⎿  Settings dialog
-    // dismissed` under `❯ /usage` after the Escape under the INLINE renderer
-    // (the fullscreen one leaves no row); the rest were not seen.
-    // `usage.refreshing` is one word: a matcher reads it through
-    // `crate::anchor`, never as a quoted copy.
+    // The Settings panel's Usage tab (`crate::panel`,
+    // `docs/SPEC-claude-accounts-probe-2026-10-01.md`), read in the 2.1.287 bundle: the loading
+    // and refresh lines (`…`-ended on screen, an escape in the bundle, so the rows stop before
+    // it), the four enrich-error heads, the failed load's reason (after `Error: `), and the row
+    // Escape leaves under the inline renderer. Only `Refreshing…` and `Settings dialog
+    // dismissed` were seen on a screen. `usage.refreshing` is one word: match it through
+    // `crate::anchor`, never a quoted copy.
     lit("usage.refreshing", "Refreshing", "2.1.287"),
     lit("usage.loading", "Loading usage data", "2.1.287"),
     lit("usage.last_known", "Showing last-known usage", "2.1.287"),
@@ -881,11 +825,9 @@ pub const ANCHORS: &[Anchor] = &[
     // The walls (see `wall::PHRASES` for the whole classification table).
     lit("wall.fable", "You've reached your Fable limit", "2.1.267"),
     lit("wall.auto_continue", "continuing automatically", "2.1.268"),
-    // How that auto-continue ENDED, as the vendor's notice opens
-    // (`wall::auto_continue_end`): it went on — at the reset, or before it
-    // when the usage came back — or it will not go on by itself: Esc on its
-    // countdown (captured on 2.1.296), stopped or turned off, or a reset
-    // that passed with nothing sent.
+    // How that auto-continue ended, as the vendor's notice opens (`wall::auto_continue_end`): it
+    // went on (at the reset, or early when usage came back), or it will not go on by itself (Esc
+    // on its countdown, stopped, turned off, or a reset that passed with nothing sent).
     lit(
         "wall.auto_continue.fired",
         "Usage limit reset · continuing automatically",
@@ -1395,6 +1337,9 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
         "1.4.9-R6297.1",
     ),
     lit("muse.busy.interrupt", "esc to interrupt", "1.4.9-R6297.1"),
+    // The status row's first frame, the verb alone (`◇ Thinking`; the
+    // capture `lab-busy-first-frame`).
+    lit("muse.busy.first", "Thinking", "1.4.10-R6427.1"),
     lit("muse.banner", "Muse Code", "1.4.9-R6297.1"),
     // The sign-in wall: no option of it is ever pressed (its first opens a
     // browser).
@@ -1641,6 +1586,16 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
     // Its read row, two columns in with no `◆` (`  Read README.md`; the
     // captures `box-network-digit-approved`, `lab-end-of-turn-read-row`).
     lit("muse.tool.read", "Read ", "1.4.10-R6427.1"),
+    // Its search row, two columns in too (`  Searched "parser" (1 match)`;
+    // the capture `lab-tool-row-search`), and the heads of its other own
+    // `◆` tool rows the lab measured (`lab-tool-row-read-memory`,
+    // `-add-memory`, `-goal`, `-work-list`). `Used tool` is put together at
+    // run time (no one literal in the binary holds it).
+    lit("muse.tool.searched", "Searched ", "1.4.10-R6427.1"),
+    lit("muse.tool.read_memory", "Read memory", "1.4.10-R6427.1"),
+    lit("muse.tool.saved_memory", "Saved memory", "1.4.10-R6427.1"),
+    lit("muse.tool.read_goal", "Read goal", "1.4.10-R6427.1"),
+    composed("muse.tool.used", "Used tool", "1.4.10-R6427.1"),
     // The walls: the key refused (measured) and its two siblings in the
     // binary; the usage wall's pieces (its URL and its time put between
     // them); a model call that failed, and its status.
@@ -2080,9 +2035,8 @@ pub fn anchor(id: &str) -> &'static str {
     }
 }
 
-/// [`anchor`] at COMPILE time, for a caller that needs the text in a
-/// `const` (`const NOTE: &str = anchor_text("box.rm_breaker");`): an id the
-/// table does not have fails the build, not the first test.
+/// [`anchor`] at compile time, for a caller that needs the text in a `const`
+/// (`const NOTE: &str = anchor_text("box.rm_breaker");`): an unknown id fails the build.
 #[must_use]
 pub const fn anchor_text(id: &str) -> &'static str {
     const fn same(a: &str, b: &str) -> bool {

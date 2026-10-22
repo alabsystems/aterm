@@ -1,17 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-// F11-4 (#7941): production unwrap() is forbidden; tests opt out uniformly at the
-// crate root so a missing per-module allow can't silently slip past clippy.
+// Production code may not unwrap; tests opt out once, at the crate root.
 #![warn(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
-//! VT100/ANSI escape sequence parser.
-//!
-//! ## Design
-//!
-//! Table-driven state machine based on the
-//! [vt100.net DEC ANSI parser](https://vt100.net/emu/dec_ansi_parser).
+//! VT100/ANSI escape sequence parser: a compile-time transition table after the
+//! [vt100.net DEC ANSI parser](https://vt100.net/emu/dec_ansi_parser), SIMD
+//! scanning of printable runs and string payloads with a scalar fallback, and
+//! no allocation while parsing beyond the bounded OSC buffer.
 //!
 //! ## Verification
 //!
@@ -27,7 +24,7 @@
 //!   chunks, raw and shaped like escape sequences, through `advance_fast`
 //!   with state carried across chunks; any panic fails it.
 //!
-//! ## Performance
+//! ## Complexity
 //!
 //! Key techniques:
 //! - Compile-time transition table
@@ -147,45 +144,23 @@ fn take_parser_loop_iterations() -> usize {
     })
 }
 
-/// Maximum number of CSI parameters.
-///
-/// Raised from 16 to 24 to match xterm/ghostty: real applications emit long
-/// SGR sequences — Kakoune emits a 17-parameter SGR (see `parse_csi_kakoune_sgr`
-/// in `tests/csi.rs`) that a 16-cap parser would truncate, dropping styling. 24
-/// carries that real-world case with headroom while keeping the per-sequence
-/// buffer bounded (the `params` `ArrayVec` and the SIMD `[u16; MAX_PARAMS]` are
-/// sized off this constant, so the bound stays a single source of truth).
+/// Maximum number of CSI parameters. Real SGR runs are long: Kakoune emits a
+/// 17-parameter SGR (`tests::csi::parse_csi_kakoune_sgr`) that a cap of 16
+/// would truncate.
 pub const MAX_PARAMS: usize = 24;
 
 /// Maximum number of intermediate bytes
 pub const MAX_INTERMEDIATES: usize = 4;
 
-/// Maximum OSC data size (8 MiB).
-///
-/// Bounds the `osc_data` buffer a single OSC sequence can inflate. The previous
-/// 64 KiB cap truncated the base64 payload of OSC 1337 `File=` inline images at
-/// ~49 KiB of decoded image data — too small for any realistic image (a typical
-/// screenshot PNG is 100 KiB–2 MiB). 8 MiB comfortably carries a full-HD PNG
-/// (~2 MiB raw → ~2.7 MiB base64) with headroom while keeping the per-parser
-/// worst case bounded.
-///
-/// DoS posture is preserved by two existing mechanisms:
-///   - Each parser instance caps at this bound for ONE in-flight sequence.
-///   - After dispatch, `dispatch_osc` shrinks the buffer back to 128 bytes
-///     whenever it grew past 4 KiB (#7272), so 8 MiB is a transient spike,
-///     never permanent per-instance bloat.
-///
-/// Application handlers keep their own, independent payload limits at or below
-/// this (e.g. `MAX_IMAGE_BYTES` for OSC 1337, `MAX_OSC52_QUERY_RESPONSE_BYTES`
-/// for OSC 52) — the parser cap only bounds raw buffering, not command
-/// semantics.
+/// Maximum OSC data size (8 MiB): room for the base64 of a full-HD PNG in an
+/// OSC 1337 `File=` image. It bounds one in-flight sequence, and `dispatch_osc`
+/// shrinks the buffer after a large one, so it is a transient spike. Handlers
+/// keep their own payload limits; this cap bounds only raw buffering.
 pub(crate) const MAX_OSC_DATA: usize = 8 * 1024 * 1024;
 
-/// Maximum number of OSC parameters (semicolon-separated segments).
-/// OSC sequences with semicolons in payload bodies (OSC 66, OSC 777, OSC 1337)
-/// were silently truncated at 8 (#7268). Bounded independently of CSI
-/// `MAX_PARAMS` — OSC payloads do not carry the long SGR runs that drove the
-/// CSI cap to 24.
+/// Maximum number of OSC parameters (`;`-separated segments); the last carries
+/// the remainder verbatim. Independent of `MAX_PARAMS`: OSC payloads carry no
+/// long SGR runs.
 pub(crate) const MAX_OSC_PARAMS: usize = 16;
 
 /// VT parser state machine.
@@ -235,13 +210,11 @@ pub struct Parser {
     pub(crate) params: ArrayVec<u16, MAX_PARAMS>,
     pub(crate) intermediates: ArrayVec<u8, MAX_INTERMEDIATES>,
     pub(crate) osc_data: Vec<u8>,
-    /// The OSC string being collected is DISCARDED at its terminator instead
-    /// of dispatched. Set by [`Parser::restore_carry`] for an OSC whose head
-    /// was over [`OSC_CARRY_CAP`] when a seamless update carried it (the
-    /// successor never saw the head, so dispatching the tail alone would act
-    /// on a truncated payload: a clipped clipboard write, a broken image),
-    /// and by the CAN or SUB that cancels the string, as it ends it.
-    /// Cleared by every OSC exit (`dispatch_osc`) and by [`Parser::reset`].
+    /// Discard the OSC string being collected at its terminator instead of
+    /// dispatching it. Set by [`Parser::restore_carry`] for an OSC whose head
+    /// was over [`OSC_CARRY_CAP`] (the tail alone is a truncated payload: a
+    /// clipped clipboard write, a broken image) and by the CAN or SUB that
+    /// cancels the string. Cleared by every OSC exit and by [`Parser::reset`].
     pub(crate) osc_discard: bool,
     pub(crate) current_param: u32,
     pub(crate) param_started: bool,
@@ -269,25 +242,15 @@ pub struct Parser {
     /// every other state). With C1 controls off a `0x9C` that continues it is
     /// the character's byte, not the 8-bit ST.
     pub(crate) string_utf8: utf8::Utf8Prefix,
-    /// Bitmask tracking which params were preceded by a colon (subparameter separator).
-    /// Bit i is set if param\[i\] is a subparameter of param\[i-1\].
-    /// Used for SGR 4:x underline style subparameters.
-    /// u32 so every index up to `MAX_PARAMS` (24) carries its flag.
+    /// Bit i set: param\[i\] is a colon subparameter of param\[i-1\] (SGR 4:x).
+    /// u32, so every index below `MAX_PARAMS` (24) has a bit.
     pub(crate) subparam_mask: u32,
     /// Tracks if the last separator was a colon (for next param)
     pub(crate) last_was_colon: bool,
-    /// Whether to interpret 8-bit C1 control codes (0x80-0x9F).
-    ///
-    /// When false (default), bytes 0x80-0x9F are treated as invalid UTF-8
-    /// and replaced with the Unicode replacement character. This is the secure
-    /// default for UTF-8 terminals, as C1 controls embedded in UTF-8 text
-    /// can be used for escape sequence injection attacks.
-    ///
-    /// When true, bytes 0x80-0x9F are interpreted as 8-bit C1 control codes
-    /// (the 8-bit equivalents of ESC+char sequences). Only enable this for
-    /// legacy applications that require C1 support.
-    ///
-    /// See: dgl.cx/2023/09/ansi-terminal-security
+    /// Interpret 8-bit C1 controls (0x80-0x9F). Off by default, the secure
+    /// choice for a UTF-8 terminal: the bytes are then invalid UTF-8 (U+FFFD in
+    /// Ground), since C1 controls embedded in text can inject escape sequences
+    /// (dgl.cx/2023/09/ansi-terminal-security). On only for legacy applications.
     pub(crate) c1_controls_enabled: bool,
 }
 
@@ -323,11 +286,7 @@ impl Parser {
         }
     }
 
-    /// Create a new parser with C1 control code interpretation enabled.
-    ///
-    /// This constructor enables 8-bit C1 control code interpretation (0x80-0x9F).
-    /// Only use this for legacy applications that require C1 support. For modern
-    /// UTF-8 terminals, use [`Parser::new()`] which disables C1 by default.
+    /// Create a parser that interprets 8-bit C1 controls (0x80-0x9F).
     #[must_use]
     #[cfg(test)]
     pub fn with_c1_controls() -> Self {

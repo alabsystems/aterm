@@ -950,8 +950,8 @@ impl PetWorld {
                 }
             }
         }
-        // A target must name selected pixels we actually examined. It never
-        // stands in for a live caret and never authorizes occupying selection.
+        // A selection target must name selected cells this scan examined. It never stands in
+        // for a live caret and never authorizes occupying the selection.
         if self.selection_rect.is_none() {
             self.selection_target = None;
         }

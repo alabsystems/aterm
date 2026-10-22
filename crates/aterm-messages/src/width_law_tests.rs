@@ -122,7 +122,7 @@ fn one_intent_reads_one_way_across_the_band() {
         "{:?}",
         labels(&both)
     );
-    // Wide enough for every long form, nothing is forced.
+    // Wide enough for every long form: nothing is forced.
     let wide = band(
         vec![waits(), {
             Message::new(
@@ -258,8 +258,7 @@ fn a_whole_lead_clause_stands_where_the_floor_would_drop_the_excerpt() {
     // A lead that says nothing alone is not offered.
     assert_eq!(excerpt("was: its turn is still running here", 100), None);
     assert_eq!(excerpt("line 3: expected a value after `=`", 100), None);
-    // Narrowing: the words shown are the wider width's or fewer, and once
-    // gone they stay gone.
+    // Narrowing shows the wider width's words or fewer, and once gone they stay gone.
     let bare = |s: &str| s.trim_end_matches('\u{2026}').to_string();
     let mut prev: Option<Option<String>> = None;
     let mut clause_widths = 0;

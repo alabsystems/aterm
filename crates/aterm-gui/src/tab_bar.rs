@@ -1868,8 +1868,8 @@ const STRIP_LEGIBILITY_FLOOR: f64 = 3.0;
 /// 1.4.11's 3:1 for a graphical object, the floor the message band's accent takes.
 const STRIP_ACCENT_FLOOR: f64 = 3.0;
 
-/// The strip tones derived from a theme, computed ONCE per [`paint_strip`]
-/// (hoisted out of the per-cell [`strip_cell`] — the blends are frame-invariant).
+/// The strip tones derived from a theme, computed once per [`paint_strip`] (hoisted
+/// out of the per-cell [`strip_cell`]; the blends are frame-invariant).
 #[derive(Clone, Copy)]
 struct StripColors {
     /// Full-strength foreground (the `+` affordance and, by default, the
@@ -6255,10 +6255,9 @@ pub(crate) mod pixel_band {
         }
     }
 
-    /// The band's resolved metrics — every px the card row is drawn from,
-    /// derived once per raster. All values
-    /// are canvas coordinates (0 = the window's top edge; the canvas carries the
-    /// chrome lip via the image lift).
+    /// The band's resolved metrics: every px the card row is drawn from, derived once
+    /// per raster, in canvas coordinates (0 = the window's top edge; the canvas
+    /// carries the chrome lip via the image lift).
     struct BandDesign {
         /// The labels' baseline: cap-centred in the content region, or on
         /// Windows ink-centred in the tab ([`DESCENDER_EM`]).
@@ -9374,7 +9373,7 @@ pub(crate) mod pixel_band {
                     d.card_top,
                     d.card_bot
                 );
-                // DESCENDER ROOM: the last inked row clears the seam rule.
+                // Descender room: the last inked row clears the seam rule.
                 assert!(
                     y1 < seam_top,
                     "{win:?}: descenders reach {y1}, seam rule at {seam_top}"
@@ -11217,12 +11216,12 @@ mod tests {
         usize::from(layout.title_end.saturating_sub(layout.title_start))
     }
 
-    /// A windowed strip (fifteen tabs, five chips a page, a 7-cell title window)
-    /// with the `aterm-gui\src` and `aterm-cli\src` tabs on different pages. At
-    /// every width and selection: gui and cli chips name `gui`/`cli` wherever four
-    /// cells fit (or carry their position); every path cut is honest; a path chip's
-    /// label is one per (tab, width) across pages and selections; and `System32`
-    /// reads the same when the Temp tab moves to `C:\Users`.
+    /// A windowed strip of fifteen tabs, over every width and selection, where the
+    /// `aterm-gui\src` and `aterm-cli\src` tabs can land on different pages: gui and
+    /// cli chips name `gui`/`cli` wherever four cells fit (or carry their position);
+    /// every path cut is honest; a path chip's label is one per (tab, width) across
+    /// pages and selections; and `System32` reads the same when the Temp tab moves
+    /// to `C:\Users`.
     #[test]
     fn a_windowed_strip_names_each_path_the_same_on_every_page() {
         let gui = "~\\aterm\\crates\\aterm-gui\\src";
@@ -11285,8 +11284,8 @@ mod tests {
                             "{at}: {label:?} lost the name that tells it apart"
                         );
                     }
-                    // A twin's ordinal is its position among twins cut beside
-                    // it — the one label here allowed to turn on its page.
+                    // Whether a twin takes its ordinal depends on the twins cut beside
+                    // it, so an ordinal is the one label allowed to change with the page.
                     if !ordinal {
                         let first = by_width
                             .entry((*tab, avail))
@@ -12422,7 +12421,7 @@ mod tests {
     #[test]
     fn a_wide_char_never_straddles_the_title_boundary() {
         let theme = Theme::default();
-        // Narrow equal shares: 24 cols / 2 tabs → small title spans.
+        // 24 cols / 2 tabs: the two-chip pressure split (12 and 9), small title spans.
         let segs = layout_segments(24, 2, 0, false);
         let titles = ["日本語シェルの長い名前".to_string(), "第二".to_string()];
         let mut row = vec![blank_cell(theme); 24];

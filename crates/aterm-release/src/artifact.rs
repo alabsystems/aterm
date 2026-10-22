@@ -1,27 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE RELEASE'S BUNDLE, BUILT ONCE (2026-10-09).
+//! The release's bundle, built once.
 //!
-//! A release builds its unsigned universal `aterm.app` ONCE — both architecture
-//! slices at once, from the snapshot of the reserved release commit's git objects
-//! (`buildplan::run`, [`crate::snapshot`]) — and keeps it here, in the clone's
-//! release cache: `<clone>-release.noindex/artifacts/<key>/`. `verify release --app
-//! <app>` judges THESE bytes (MEASURE among its checks; the release records the pass
-//! with the executable's SHA-256), and the cut signs, notarizes and packages a byte copy
-//! of them ([`copy_bundle`]): what was verified is what ships. The cut never builds.
+//! A release builds its unsigned universal `aterm.app` once, both slices from the snapshot
+//! of the reserved release commit (`buildplan::run`, [`crate::snapshot`]), and keeps it in
+//! the clone's release cache, `<clone>-release.noindex/artifacts/<key>/`.
+//! `verify release --app <app>` judges these bytes, and the cut signs, notarizes and
+//! packages a byte copy of them ([`copy_bundle`]): what was verified is what ships. The
+//! cut never builds.
 //!
-//! KEYED BY WHAT THE BUNDLE WAS BUILT AS ([`key`]): the version, the build number,
-//! the release commit (which fixes every source byte and, through its lockfile's
-//! checksums, every vendored one) and both compilers' commits. A key the store holds
-//! COMPLETE is never built again: a resumed release re-proves its bytes and reuses
-//! them; a key it does not hold — another build number, another prover — is a build.
+//! Entries are keyed by what the bundle was built as ([`key`]): version, build number,
+//! release commit (which fixes every source byte and, through the lockfile, every vendored
+//! one) and both compilers' commits. A key held complete is never built again.
 //!
-//! COMPLETE IS WRITTEN LAST ([`COMPLETE_FILE`]): a directory without it is a build
-//! that did not finish, removed and built again; one with it is re-proved on every
-//! read — its executable's digest and the whole bundle's ([`bundle_digest`]) against
-//! the record — and bytes that changed after the build are refused, never reused and
-//! never shipped.
+//! [`COMPLETE_FILE`] is written last: a directory without it is an unfinished build,
+//! removed and rebuilt; one with it is re-proved on every read (executable and
+//! [`bundle_digest`] against the record), and changed bytes are refused, never reused or
+//! shipped.
 
 use std::path::{Path, PathBuf};
 
@@ -35,7 +31,7 @@ pub const SCHEMA: &str = "aterm-release-artifact-v1";
 /// The store entry's record, written last.
 pub const COMPLETE_FILE: &str = "COMPLETE";
 
-/// What a bundle is built AS.
+/// What a bundle is built as.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     /// `X.Y.0`.
@@ -63,8 +59,7 @@ pub struct SliceRecord {
     pub peak_bytes: Option<u64>,
 }
 
-/// A COMPLETE build: what it was built as, from, with, and the digests of what it
-/// made.
+/// A complete build: what it was built as, from and with, and the digests of what it made.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Complete {
     pub schema: String,
@@ -228,8 +223,8 @@ pub fn macho_sha256(app: &Path) -> Result<String, String> {
     file_sha256(&app.join("Contents/MacOS/aterm"))
 }
 
-/// The COMPLETE entry `key` holds in `store`, its bytes re-proved: `Ok(None)` when
-/// there is none (no directory, or a build that did not finish).
+/// The complete entry `key` holds in `store`, its bytes re-proved: `Ok(None)` when there
+/// is none (no directory, or a build that did not finish).
 ///
 /// # Errors
 /// A record that does not parse or names another key, and bytes that are not the
@@ -305,10 +300,9 @@ pub(crate) fn host_memory_bytes() -> Option<u64> {
         .filter(|&bytes: &u64| bytes > 0)
 }
 
-/// Whether the two slices may build at once: the peaks the newest COMPLETE build in
-/// `store` recorded for its slices, together, fit in three quarters of `memory`
-/// (physical bytes). No record, or no memory figure, builds them at once — the
-/// measured publishers (128 GiB) always hold both.
+/// Whether the two slices may build at once: the newest complete build's recorded slice
+/// peaks, summed, fit in three quarters of `memory`. With no record or no memory figure
+/// they build at once (the 128 GiB publishers always hold both).
 #[must_use]
 pub fn slices_fit(store: &Path, memory: Option<u64>) -> bool {
     let Some(memory) = memory else {
@@ -334,18 +328,17 @@ pub fn slices_fit(store: &Path, memory: Option<u64>) -> bool {
     peaks <= memory / 4 * 3
 }
 
-/// BUILD THE BUNDLE OF `identity` — the ONE build a release makes — unless the store
-/// already holds it COMPLETE, in which case its re-proved record is returned and
-/// nothing is built. Before building: the universal gate (this builder can build the
-/// x86_64 slice and run it under Rosetta) and the disk floor. Then both slices at once (or one after
-/// the other where the last build's peaks would not fit, [`slices_fit`]) into a fresh
-/// entry, the bundle laid out from the same snapshot, and [`COMPLETE_FILE`] written
-/// last, durably. Every slice must embed the updater pin the committed paper master
-/// fixes (`publish::expected_embedded_update_pin`).
+/// Build the bundle of `identity` (the one build a release makes) unless the store holds
+/// it complete, whose re-proved record is then returned. Before building: the universal
+/// gate (this builder can build the x86_64 slice and run it under Rosetta) and the disk
+/// floor. Then both slices at once (or one after the other where the last build's peaks
+/// would not fit, [`slices_fit`]) into a fresh entry, and [`COMPLETE_FILE`] written last,
+/// durably. Every slice must embed the updater pin the committed paper master fixes
+/// (`publish::expected_embedded_update_pin`).
 ///
-/// An entry whose bytes changed after its build is not reused: before a claim nothing
-/// rests on it, so it is removed and built again (and verified again); after a claim
-/// the cut never calls this — it refuses such bytes ([`read`]).
+/// An entry whose bytes changed after its build is removed and built again: before a claim
+/// nothing rests on it, and after a claim the cut never calls this but refuses such bytes
+/// ([`read`]).
 ///
 /// # Errors
 /// The gate's refusal, the build's, and any write of the entry.
@@ -467,8 +460,8 @@ pub fn compilers() -> Result<Compilers, String> {
     })
 }
 
-/// Write `complete` as `dir`'s record: a temporary, flushed, renamed, the directory
-/// flushed — so a record is whole or absent.
+/// Write `complete` as `dir`'s record (temporary, flushed, renamed, directory flushed), so
+/// a record is whole or absent.
 fn write_complete(dir: &Path, complete: &Complete) -> Result<(), String> {
     let text = aterm_toml::to_string(complete).map_err(|e| format!("serialize the record: {e}"))?;
     let tmp = dir.join(format!(".{COMPLETE_FILE}.tmp"));
@@ -486,10 +479,9 @@ fn write_complete(dir: &Path, complete: &Complete) -> Result<(), String> {
     })
 }
 
-/// A BYTE COPY of the store's bundle at `to` (absent), re-proved against the record
-/// before anything signs it: the copy's executable and whole-bundle digests are the
-/// built ones — so the bytes the cut signs are the bytes `verify release` judged. Files keep
-/// their bytes and modes, links their targets; nothing else is carried.
+/// A byte copy of the store's bundle at `to` (which must not exist), re-proved against the
+/// record before anything signs it, so the cut signs the bytes `verify release` judged.
+/// Files keep their bytes and modes, links their targets; nothing else is carried.
 ///
 /// # Errors
 /// A copy that fails, or bytes that differ from the record.
@@ -504,13 +496,12 @@ pub fn copy_bundle(complete: &Complete, from: &Path, to: &Path) -> Result<(), St
     prove(complete, to)
 }
 
-/// The build's records beside the bundle, copied from the store entry `dir` into
-/// `dist` for the cut that signs it: `aterm.dSYM` (which the provenance record looks
-/// for), the owner's never-published symbolication archive `aterm-<v>-dSYM.zip`, and
-/// the x86_64 slice's execution record `aterm-<v>-x86_64-probe.txt`. Each replaces
-/// what `dist` held under its name; a record the build did not make (dsymutil can
-/// fail, and the dSYM is then skipped, never faked) is removed from `dist`, so a
-/// stale one from an earlier cut never rides along.
+/// Copy the build's records from the store entry `dir` into `dist` for the cut:
+/// `aterm.dSYM` (the provenance record looks for it), the never-published symbolication
+/// archive `aterm-<v>-dSYM.zip`, and the x86_64 slice's execution record
+/// `aterm-<v>-x86_64-probe.txt`. Each replaces what `dist` held under its name; one the
+/// build did not make (a failed dsymutil skips the dSYM) is removed, so no stale record
+/// rides along.
 ///
 /// # Errors
 /// A copy or a removal that fails.
@@ -536,9 +527,8 @@ pub fn place_records(dir: &Path, dist: &Path, version: &str) -> Result<(), Strin
     Ok(())
 }
 
-/// Remove every entry of `store` but those named in `keep`: a release keeps the one
-/// bundle it is building or signing, and nothing older. An entry that cannot be
-/// removed is said and left for the next build.
+/// Remove every entry of `store` but those in `keep`: a release keeps only the bundle it is
+/// building or signing. An entry that cannot be removed is reported and left.
 fn prune(store: &Path, keep: &[&str]) {
     let Ok(entries) = std::fs::read_dir(store) else {
         return;
@@ -559,9 +549,9 @@ fn prune(store: &Path, keep: &[&str]) {
     }
 }
 
-/// The store keys this clone's journals still need: the release journal's bundle
-/// (a release between its build and its cut) and an unfinished cut's (signed from
-/// the store until its `sign` step is journaled).
+/// The store keys this clone's journals still need: the release journal's bundle (between
+/// its build and its cut) and an unfinished cut's (signed from the store until its `sign`
+/// step is journaled).
 fn needed_keys(repo: &Path) -> Vec<String> {
     let mut keys = Vec::new();
     let git = crate::ledger::GitCli::new(repo);
@@ -638,8 +628,8 @@ fn short(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
 }
 
-/// `targo --unverified ship build` — THE ONE BUILD OF A RELEASE BUNDLE, into the
-/// release cache, or the COMPLETE one found there, its bytes re-proved:
+/// `targo --unverified ship build`: the one build of a release bundle into the release
+/// cache, or the complete one found there, its bytes re-proved. It builds:
 ///
 /// * The `ship release` build step, which runs it as its child: the candidate this
 ///   clone's unfinished release journal reserved (`release.toml` [reserved]) — its

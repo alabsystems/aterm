@@ -1635,40 +1635,6 @@ pub fn staging_file<'s>(sys: &'s dyn System, bytes: &[u8]) -> io::Result<Staged<
 /// # Errors
 /// The underlying I/O error.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    write_atomic_flushing(
-        path,
-        bytes,
-        mode,
-        aterm_durable::durable,
-        aterm_durable::durable_dir,
-    )
-}
-
-/// [`write_atomic`] with its two flushes passed in: `file` on the payload before the rename,
-/// `dir` on the destination's directory after it. A caller's test arm passes a plain
-/// `fsync(2)` (`aterm_durable::seam::durable_fsync`) where the drive-cache barrier only holds
-/// up its suite; every other step is [`write_atomic`]'s own.
-///
-/// # Errors
-/// As [`write_atomic`].
-#[cfg(any(test, debug_assertions))]
-pub fn write_atomic_with(
-    path: &Path,
-    bytes: &[u8],
-    mode: u32,
-    file: impl FnOnce(&std::fs::File) -> io::Result<()>,
-    dir: impl FnOnce(&Path) -> io::Result<()>,
-) -> io::Result<()> {
-    write_atomic_flushing(path, bytes, mode, file, dir)
-}
-
-fn write_atomic_flushing(
-    path: &Path,
-    bytes: &[u8],
-    mode: u32,
-    file: impl FnOnce(&std::fs::File) -> io::Result<()>,
-    dir: impl FnOnce(&Path) -> io::Result<()>,
-) -> io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let parent = path
@@ -1690,10 +1656,10 @@ fn write_atomic_flushing(
         .open(&tmp)?;
     f.write_all(bytes)?;
     f.set_permissions(std::fs::Permissions::from_mode(mode))?;
-    file(&f)?;
+    aterm_durable::durable(&f)?;
     drop(f);
     std::fs::rename(&tmp, path)?;
-    dir(parent)
+    aterm_durable::durable_dir(parent)
 }
 
 #[cfg(test)]
@@ -1711,6 +1677,9 @@ mod fake {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
+    /// A tool a test models from its own state ([`Fake::simulate`]).
+    type Model = Arc<dyn Fn(&Fake, &Cmd) -> Option<Ran> + Send + Sync>;
+
     /// The scripted operating system tests run items against.
     ///
     /// A reply is keyed by [`Cmd::display`] (`<user>$ ` prefixed for `as_user`). Replies
@@ -1718,6 +1687,8 @@ mod fake {
     /// reply fails as [`RunFailed::Spawn`], so a test notices a command it did not expect.
     #[derive(Default)]
     pub struct Fake {
+        /// The tools a test models instead of scripting ([`Fake::simulate`]).
+        model: Mutex<Option<Model>>,
         scroll_natural: Mutex<Option<bool>>,
         scroll_set_error: Mutex<Option<String>>,
         scroll_set_readback: Mutex<Option<bool>>,
@@ -2055,6 +2026,25 @@ mod fake {
             self.fed.lock().unwrap().clone()
         }
 
+        /// Answer every command `model` answers (`Some`) from the test's own state, before
+        /// any scripted reply: a desktop whose `defaults`, `pgrep`, `killall` and `sleep` act
+        /// on one another. It is handed this fake, so it can start and end processes
+        /// ([`Fake::alive`], [`Fake::exited`]). Each run is still recorded in
+        /// [`Fake::calls`]; one it leaves (`None`) gets its scripted reply.
+        pub fn simulate(
+            &self,
+            model: impl Fn(&Self, &Cmd) -> Option<Ran> + Send + Sync + 'static,
+        ) -> &Self {
+            *self.model.lock().unwrap() = Some(Arc::new(model));
+            self
+        }
+
+        /// Mark `pid` as a process that has exited.
+        pub fn exited(&self, pid: u32) -> &Self {
+            self.alive.lock().unwrap().retain(|alive| *alive != pid);
+            self
+        }
+
         /// Script `reply` for the command whose display is `key`.
         pub fn on(&self, key: &str, reply: Ran) -> &Self {
             self.replies
@@ -2277,6 +2267,13 @@ mod fake {
         fn run(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
             let key = cmd.display();
             self.calls.lock().unwrap().push(key.clone());
+            let model = self.model.lock().unwrap().clone();
+            if let Some(model) = model
+                && let Some(ran) = model(self, cmd)
+            {
+                self.produce(&key);
+                return Ok(ran);
+            }
             let mut replies = self.replies.lock().unwrap();
             let reply = match replies.get_mut(&key) {
                 Some(list) if list.len() > 1 => Ok(list.remove(0)),

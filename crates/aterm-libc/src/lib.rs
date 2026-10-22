@@ -12,7 +12,7 @@
 //!
 //! A wrong ABI number neither fails to compile nor panics; it passes the wrong
 //! flag to a syscall or hands the kernel an undersized out-parameter. So each
-//! cell is generated per triple (`aterm-libc-oracle regen`) from:
+//! cell is generated per triple (`libc-oracle/gen/regen.sh`) from:
 //!
 //! * `rustdoc --output-format json` of the reference libc built for that
 //!   triple: constant values, signatures, `link_name`s, field names and types,
@@ -28,25 +28,20 @@
 //! inherent method set. The hand-written C-macro bodies and `siginfo_t`
 //! accessors are tested differentially against it.
 //!
-//! Shim and oracle are emitted from ONE name set: the harvested items
-//! (`libc-oracle/union.json`) plus the transitive closure of the types they
-//! reference. Emitting the oracle from the union alone once left closure-only
-//! types (`cmsghdr`, `vm_statistics64`, …) declared but unchecked. The
-//! regeneration fails if any DECLARED name or public field ends without an
-//! assertion.
+//! Shim and oracle are emitted from one name set: the harvested items
+//! (`libc-oracle/gen/union.json`) plus the transitive closure of the types they
+//! reference (`libc-oracle/gen/closure.py`). `build.py` fails if any emitted
+//! name or public field has no assertion.
 //!
 //! ## Divergences from the crates.io package
 //!
-//! * **Only the cells aterm builds.** Any other target hits `compile_error!`
-//!   rather than inheriting another cell's values.
-//! * **Private fields are renamed** `__pad`/`__opaque`, at their measured
-//!   extent. Size, alignment and public offsets match; `Debug` output does not.
-//! * **`extra_traits` derives** `PartialEq`/`Eq`/`Hash` where libc hand-writes
-//!   some.
-//! * **`vm_statistics64` is upstream's Mach rev1** (24 fields, 152 bytes), not
-//!   the SDK's rev3 (36, 248), matching the replaced crate byte-for-byte. The
-//!   reasoning is on the struct in the Darwin cells (from
-//!   `crates/aterm-libc-oracle/src/regen/handwritten.rs`).
+//! * Only the cells aterm builds: a target the gate below does not list hits
+//!   `compile_error!` rather than inheriting another cell's values.
+//! * Private fields are renamed `__pad`/`__opaque` at their measured extent.
+//!   Size, alignment and public offsets match; `Debug` output does not.
+//! * `extra_traits` derives `PartialEq`/`Eq`/`Hash` where libc hand-writes some.
+//! * `vm_statistics64` is upstream's Mach rev1 (24 fields, 152 bytes), not the
+//!   SDK's rev3 (36, 248); the reasoning is on the struct in the Darwin cells.
 //! * `std`, `align`, `const-extern-fn`, `use_std` and `rustc-dep-of-std` are
 //!   accepted and ignored.
 

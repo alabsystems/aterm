@@ -7,9 +7,8 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, UNIX_EPOCH};
 
-/// An orphan, as `instances` names it: orphaned, on a
-/// deleted binary, seven days up, with the `kill` that ends it. The control
-/// is an instance whose launcher still runs: its uptime only, no `kill`.
+/// An orphan is named with its facts and the `kill` that ends it; an instance whose launcher
+/// still runs gets its uptime only.
 #[test]
 fn an_orphan_is_named_with_its_remedy_and_a_live_one_is_not() {
     let orphan = ForeignFacts::Writer {
@@ -110,11 +109,9 @@ fn a_process_that_is_not_aterm_gets_no_facts_and_no_kill() {
     assert!(judge(r).orphaned(), "an aterm-* binary is aterm");
 }
 
-/// "running a deleted binary" is said only on evidence: no path for the SAME
-/// live process, or a path that is `Ok(false)`. A path read that failed
-/// because the process ended (its birth vanished or changed by the last
-/// read) says nothing at all, and a `try_exists` refused (`EPERM`, TCC) is
-/// unknown, never deleted.
+/// "running a deleted binary" needs evidence: no path for the same live process, or a path
+/// that is `Ok(false)`. A process that ended or changed hands mid-read says nothing, and a
+/// refused `try_exists` (`EPERM`, TCC) is unknown, never deleted.
 #[test]
 fn a_deleted_binary_is_claimed_only_on_evidence() {
     let deleted = |facts: &ForeignFacts| {

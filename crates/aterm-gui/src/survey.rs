@@ -502,6 +502,7 @@ pub(crate) fn cmd_survey(
 ///   ctx_left_pct=<n|-> detail=<pct|-> doing=<pct|-> role=<pct|->  (facts: a label only)
 ///   supervisor=<pct|-> attention=<1|->        (facts: whether attention is raised)
 ///   needs=<word|-> hold_by=<word|-> held_from=<32 hex|-> typed_by=<pct|-> typed_ms=<ms|->
+///   bells=<n> bells_sounded=<n> last_bell=<ms>/<sound>/<program>[,…]|-
 ///   [user_title= title= cwd= branch= prompt= said= cmd= rows=]  (content only; each <pct|->)
 /// ```
 ///
@@ -699,7 +700,7 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
          agent_ms={} human_ms={} bg={} task={} task_rev={} task_from={} task_ms={} model={} \
          effort={} ctx_left_pct={} detail={} doing={} role={} supervisor={} \
          attention={attention} needs={needs} hold_by={hold_by} held_from={} typed_by={} \
-         typed_ms={}",
+         typed_ms={} {}",
         h.local_id,
         h.sid.as_str(),
         h.state.as_str(),
@@ -724,6 +725,9 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
         word_token(held_from.as_deref()),
         role_token(typed_by.as_deref(), level),
         number_token(typed.map(|t| now_unix_ms.saturating_sub(t.at_unix_ms))),
+        // The bells it rang, as `status` prints them (`crate::bell_ledger`):
+        // counts, ages, sound words and program names, so facts.
+        h.ctx.bells.wire(now_unix_ms),
     );
     if level == SurveyLevel::Content {
         let cwd = footer.as_ref().and_then(|f| f.path.clone()).or(engine.cwd);

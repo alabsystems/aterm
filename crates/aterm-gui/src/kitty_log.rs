@@ -1466,17 +1466,13 @@ impl KittyLogHost {
         self.favourite
     }
 
-    /// TYPED drain-site entry point (`record_typed_kitty`): dedupe, record,
-    /// and debounce-flush this tick's sightings. A first-ever discovery is
-    /// RETURNED as the Kitty Log's own accounting of the unlock (the caller
-    /// presents nothing with it — the collection book repaints on the
-    /// revision like every sighting) and it never repoints the companion
-    /// (owner ruling, 2026-08-17: the cat is the launch kitty).
-    /// `enabled=false` (`[sparkle_words.feline] log = false`)
-    /// drains-and-drops — the effects-side recorder always runs
-    /// (§F4.7), the host gate is here. `now` is the tick's existing frame
-    /// Instant (no new clock reads on the render path); the RFC3339 stamp is
-    /// taken once per RECORDED sighting (rare), not per tick.
+    /// Typed drain-site entry point (`record_typed_kitty`): dedupe, record and
+    /// debounce-flush this tick's sightings. A first-ever discovery is returned as the
+    /// Kitty Log's accounting of the unlock; it never repoints the companion.
+    /// `enabled = false` (`[sparkle_words.feline] log = false`) drains and drops: the
+    /// effects-side recorder always runs and the host gates here. `now` is the tick's
+    /// frame `Instant` (no new clock read); the RFC3339 stamp is taken once per
+    /// recorded sighting, not per tick.
     pub(crate) fn observe<I>(
         &mut self,
         session: u64,

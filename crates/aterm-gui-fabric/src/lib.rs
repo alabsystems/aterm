@@ -3457,6 +3457,32 @@ const LINK_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
 /// otherwise). Silence is not read as death; an unanswered ASK is.
 const STALE_AFTER: std::time::Duration = LINK_REFRESH.saturating_mul(3);
 
+/// The development seam (`aterm_types::dev_seam!`, so a debug or `dev-seams`
+/// build's only: a shipped instance reads none) that sets the owed-answer
+/// horizon, [`STALE_AFTER`], in whole milliseconds ([`stale_after`]).
+///
+/// FOR A WORLD WHOSE PROOF IS NOT THE HORIZON: `fabric_world`'s instances set
+/// it past every verb's own wait. A loaded machine's live bridge has owed an
+/// answer for six seconds while still moving it (its push wake, outbox peek,
+/// roster read, state writes and commit to the broker, no one exchange past
+/// its own ack deadline), and a `post --wait` cut short there answered `ERR
+/// fabric stale id=<n> queued=1` for a post that landed moments later. Never
+/// for a test whose proof IS the stale verdict: those age the owed clock
+/// (`backdate_work_owed`) and keep the production horizon.
+const STALE_AFTER_SEAM: &str = "ATERM_FABRIC_STALE_AFTER_MS";
+
+/// How long a bridge may owe an answer before `fabric=` reads `stale`:
+/// [`STALE_AFTER`], or [`STALE_AFTER_SEAM`]'s whole milliseconds in a build
+/// that reads seams. Read once.
+fn stale_after() -> std::time::Duration {
+    static AT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        aterm_types::dev_seam!(STALE_AFTER_SEAM)
+            .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
+            .map_or(STALE_AFTER, std::time::Duration::from_millis)
+    })
+}
+
 /// The reason token the link carries between a bridge's attach and its first
 /// report: no dial has been answered yet, one way or the other.
 const LINK_STARTING: &str = "starting";
@@ -3956,7 +3982,7 @@ fn bridge_reachable() -> bool {
     LINK.supervised.load(Ordering::Relaxed) || LINK.state.load(Ordering::Relaxed) != FABRIC_ABSENT
 }
 
-/// Whether the bridge has owed an answer for longer than [`STALE_AFTER`].
+/// Whether the bridge has owed an answer for longer than [`stale_after`].
 ///
 /// Read at call time from [`LinkReport::owed_since`], exactly as the ack's age
 /// is ([`fabric_link_facts`]) — there is no timer and no sweep, because the
@@ -3966,10 +3992,11 @@ fn bridge_reachable() -> bool {
 /// order that exists is `ctx.fabric` → `LINK.link`.
 fn link_is_stale() -> bool {
     let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
-    link.owed_since.is_some_and(|t| t.elapsed() >= STALE_AFTER)
+    link.owed_since
+        .is_some_and(|t| t.elapsed() >= stale_after())
 }
 
-/// How long until an owed answer goes [`STALE_AFTER`]-stale, or `None` when the
+/// How long until an owed answer goes [`stale_after`]-stale, or `None` when the
 /// bridge owes nothing. `Some(0)` means it already is.
 ///
 /// A parked `post --wait` uses this to BOUND ITS SLEEP: the condvar is only
@@ -3981,7 +4008,7 @@ fn link_is_stale() -> bool {
 fn stale_in() -> Option<std::time::Duration> {
     let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
     link.owed_since
-        .map(|t| STALE_AFTER.saturating_sub(t.elapsed()))
+        .map(|t| stale_after().saturating_sub(t.elapsed()))
 }
 
 /// Note that the endpoint has handed the bridge work. The clock starts on the
@@ -4078,7 +4105,7 @@ fn settle_work_owed(store: &Store) {
     link.owed_since = outstanding.then(std::time::Instant::now);
 }
 
-/// Age the owed clock by `by`, so a test reaches [`STALE_AFTER`] without
+/// Age the owed clock by `by`, so a test reaches [`stale_after`] without
 /// sleeping for it. The alternative is a six-second unit test, and a test that
 /// slow is one that gets marked `#[ignore]` and stops holding anything.
 #[cfg(test)]
@@ -8878,15 +8905,17 @@ fn wait_receipt_on_log(
 /// futility check starts returning true. A slice of a served lane asks only
 /// after the caller ([`aterm_control::park`]), so this bound is what brings the look.
 ///
-/// WITH NOTHING OWED, THE BOUND IS [`STALE_AFTER`] FROM NOW. Arming the owed
+/// WITH NOTHING OWED, THE BOUND IS [`stale_after`] FROM NOW. Arming the owed
 /// clock wakes no parked waiter: another session's `post` arms it under that
 /// session's own fabric lock and notifies only its own condvar, and a
 /// bridge's first `link up` with posts queued arms it with a presence wake.
-/// A debt armed after this instant goes stale no sooner than `STALE_AFTER`
+/// A debt armed after this instant goes stale no sooner than `stale_after()`
 /// from now, so a wait that parked debt-free still looks by its horizon, at
-/// one look per `STALE_AFTER`.
+/// one look per `stale_after()`.
 fn park_until(deadline: std::time::Instant) -> std::time::Instant {
-    let horizon = stale_in().filter(|d| !d.is_zero()).unwrap_or(STALE_AFTER);
+    let horizon = stale_in()
+        .filter(|d| !d.is_zero())
+        .unwrap_or_else(stale_after);
     deadline.min(std::time::Instant::now() + horizon)
 }
 
@@ -11056,7 +11085,7 @@ mod inbox_hold {
             // `connected`. Without it this assertion was flaky, which is a
             // harness fact and not a defect in the rule it states.
             settle_work_owed(&store.as_store());
-            backdate_work_owed(STALE_AFTER * 100);
+            backdate_work_owed(stale_after() * 100);
             assert_eq!(
                 fabric_state(),
                 "connected",
@@ -11075,7 +11104,8 @@ mod inbox_hold {
             assert!(!wait_is_futile());
 
             // AND LET IT GO UNANSWERED. No report, no landing, no ack — only
-            // time passing with the post still owed.
+            // time passing with the post still owed: the production horizon,
+            // which `stale_after()` keeps with no seam set.
             backdate_work_owed(STALE_AFTER);
             assert_eq!(fabric_state(), "stale");
             assert!(wait_is_futile());
@@ -11107,7 +11137,7 @@ mod inbox_hold {
                 cmd_post(&ctx, "to=h-andrew kind=note three", None),
                 "OK 3\n"
             );
-            backdate_work_owed(STALE_AFTER);
+            backdate_work_owed(stale_after());
             assert_eq!(fabric_state(), "stale");
             let next = next_bridge_generation();
             bridge_attached(next);
@@ -11160,7 +11190,7 @@ mod inbox_hold {
                 "connected",
                 "a fresh re-stamp is not a stale one"
             );
-            backdate_work_owed(STALE_AFTER);
+            backdate_work_owed(stale_after());
             assert_eq!(
                 fabric_state(),
                 "stale",
@@ -11171,7 +11201,7 @@ mod inbox_hold {
             // AND THE SECOND LANDING CLEARS IT, because nothing is left.
             assert_eq!(cmd_outbox_sent(&store, &format!("{sid} 2 off=8")), "OK\n");
             assert_eq!(fabric_state(), "connected");
-            backdate_work_owed(STALE_AFTER * 100);
+            backdate_work_owed(stale_after() * 100);
             assert_eq!(
                 fabric_state(),
                 "connected",
@@ -11184,7 +11214,7 @@ mod inbox_hold {
                 cmd_post(&ctx, "to=h-andrew kind=note three", None),
                 "OK 3\n"
             );
-            backdate_work_owed(STALE_AFTER);
+            backdate_work_owed(stale_after());
             assert_eq!(fabric_state(), "stale");
             assert_eq!(
                 cmd_outbox_sent(&store, &format!("{sid} 3 off=- reason=undeliverable")),
@@ -11218,7 +11248,7 @@ mod inbox_hold {
             assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note one", None), "OK 1\n");
             assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note two", None), "OK 2\n");
             assert_eq!(cmd_outbox_sent(&store, &format!("{sid} 1 off=7")), "OK\n");
-            backdate_work_owed(STALE_AFTER - std::time::Duration::from_millis(300));
+            backdate_work_owed(stale_after() - std::time::Duration::from_millis(300));
 
             // The longest bound there is (`WAIT_MAX_MS`): a wait that sat it out
             // takes ten minutes, so the minute's hang detector tells it from the
@@ -11261,7 +11291,7 @@ mod inbox_hold {
 
             // A queued post puts the bridge in debt.
             assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note one", None), "OK 1\n");
-            backdate_work_owed(STALE_AFTER - std::time::Duration::from_millis(300));
+            backdate_work_owed(stale_after() - std::time::Duration::from_millis(300));
             let started = std::time::Instant::now();
             assert_eq!(
                 inbox_get_at_within(&ctx, 7, std::time::Duration::from_millis(WAIT_MAX_MS)),
@@ -11330,7 +11360,7 @@ mod inbox_hold {
             // Another session hands the bridge work, and the bridge says
             // nothing: the link goes stale with the fetch still parked.
             assert_eq!(cmd_post(&peer, "to=h-andrew kind=note two", None), "OK 1\n");
-            backdate_work_owed(STALE_AFTER);
+            backdate_work_owed(stale_after());
             assert_eq!(fabric_state(), "stale");
             assert_eq!(
                 reader.join().expect("the reader finished"),
@@ -12136,10 +12166,10 @@ mod inbox_hold {
                 })
             };
             // Inside the wait's own life: an unanswered post turns the link
-            // `stale` at STALE_AFTER, which ends a parked wait — so a wake that
+            // `stale` at `stale_after()`, which ends a parked wait — so a wake that
             // came only after the wait would come only after that.
             assert!(
-                watcher.wait(STALE_AFTER / 2),
+                watcher.wait(stale_after() / 2),
                 "the wake arrives while the post's wait is parked"
             );
             assert!(

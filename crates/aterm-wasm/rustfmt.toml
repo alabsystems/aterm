@@ -3,7 +3,7 @@
 #
 # This crate is not at the workspace edition, and rustfmt reads a file's edition
 # from the nearest rustfmt.toml, never Cargo.toml. Without this file a hand-run
-# `trustfmt`, format-on-save, rust-analyzer or `targo-fmt -- <paths>` formats it
-# at 2024 (and a file using `gen` as an identifier does not parse). `verify fmt`
-# reads the manifest instead, and fails when the two resolutions disagree.
+# `trustfmt`, format-on-save or rust-analyzer formats it at 2024 (and a file
+# using `gen` as an identifier does not parse). `xtask gate lint --fmt-only`
+# fails when the two resolutions disagree.
 edition = "2021"

@@ -68,8 +68,6 @@ impl ImageSpan {
     }
 
     /// Check if a column is within this span.
-    ///
-    /// ENSURES: result == (col >= self.start_col && col < self.end_col)
     #[inline]
     #[must_use]
     pub const fn contains(&self, col: u16) -> bool {

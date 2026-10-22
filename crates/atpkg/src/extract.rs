@@ -1372,10 +1372,9 @@ fn zstd_decoder(
     })
 }
 
-/// The `tar-gz` vendor lane: the SAME tar extraction as [`extract_tar_zst_tree`] behind
-/// a gzip decoder (first-party `aterm_codec::inflate::stream`; multi-member, as `gzip -d`
-/// is, and CRC/length-checked per member). Every vet, cap and fold rule is inherited by
-/// construction — only the decompressor differs.
+/// The `tar-gz` vendor lane: the same tar extraction as [`extract_tar_zst_tree`] behind a
+/// gzip decoder (`aterm_codec::inflate::stream`; multi-member as `gzip -d` is,
+/// CRC/length-checked per member). Only the decompressor differs.
 pub(crate) fn extract_tar_gz_tree(
     archive: &Path,
     dest_root: &Path,
@@ -2078,7 +2077,7 @@ mod tests {
         }
     }
 
-    /// `strip_components` drops leading components AFTER the full path is vetted: `..`
+    /// `strip_components` drops leading components after the full path is vetted: `..`
     /// or an absolute prefix above the strip depth is still a refusal, and an entry with
     /// nothing left is a skip (`None`), never an empty path.
     #[test]
@@ -3282,7 +3281,7 @@ mod tests {
         extract_tar_gz_tree(&gz, &r2, 10_000_000, 10_000, vendor(2)).unwrap();
         assert!(r2.join("bin/gh").is_file());
 
-        // A root-naming member is a no-op ONLY as a directory: as a FILE it still names
+        // A root-naming member is a no-op only as a directory: as a file it still names
         // no target, and the lane still refuses it.
         let bad = tar_bytes(&[("./", b'0', "", b"pwned", 0o644)]);
         let bad_gz = d.join("bad.tar.gz");

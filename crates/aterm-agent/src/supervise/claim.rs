@@ -290,10 +290,9 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Before a request: renew a held claim, or try again for one another
-    /// holder had, when [`CLAIM_RENEW`] has passed; a pending one before
-    /// every request. What changed is kept for the next look to say
-    /// ([`Self::claim_said`]).
+    /// Before a request: once [`CLAIM_RENEW`] has passed, renew a held claim or retry one
+    /// another holder had; retry a pending one before every request. What changed is kept
+    /// for the next look to say ([`Self::claim_said`]).
     pub(super) fn renew_claim_if_due(&mut self) {
         // A stopped loop gives its claim back; it renews nothing.
         if self.stopped() {

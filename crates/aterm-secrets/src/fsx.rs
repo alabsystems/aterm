@@ -13,7 +13,7 @@
 use crate::{Error, SecretBytes};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// Make `dir` (and missing parents) exist, owned by this user; narrow `dir` itself to 0700 if
@@ -300,45 +300,96 @@ fn link_then_unlink(from: &Path, to: &Path) -> Result<(), Moved> {
     Err(Moved::NotUnlinked(e))
 }
 
-/// Overwrite a regular file's bytes with zeros (best effort, synced), then remove it.
-/// Missing is fine; a symlink is removed without touching what it names. The zeros go
-/// through the descriptor, so every other name of the file reads them too: a hard link is
-/// no copy, and another local user who can search the directory (a macOS home folder is
-/// searchable by group `staff`) may have made one to keep the bytes, so a removed secret's
-/// bytes must not outlive the name the vault gave them.
+/// Remove a regular file as [`wipe_if`] does, whatever it holds (one this user cannot read
+/// stays). Missing is fine; a symlink is removed without touching what it names.
 pub fn wipe_and_remove(path: &Path) -> crate::Result<()> {
-    match kind(path)? {
-        Kind::Missing => return Ok(()),
-        Kind::File => {
-            if let Ok(mut file) = OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(path)
-            {
-                // Judged on the descriptor, so a file swapped in after the look is judged.
-                let len = match file.metadata() {
-                    Ok(meta) if meta.file_type().is_file() => meta.len(),
-                    _ => 0,
-                };
-                let zeros = [0u8; 4096];
-                let mut left = len;
-                while left > 0 {
-                    let n = usize::try_from(left.min(4096)).unwrap_or(4096);
-                    if file.write_all(&zeros[..n]).is_err() {
-                        break;
-                    }
-                    left -= n as u64;
-                }
-                let _ = sync(&file);
-            }
-        }
-        Kind::Symlink | Kind::Dir | Kind::Other => {}
+    if kind(path)? == Kind::File {
+        return wipe(path, |_| Ok(true)).map(drop);
     }
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::new(format!("{}: {e}", path.display()))),
     }
+}
+
+/// Remove the regular file at `path` while what it holds (at most `max` bytes) passes `ours`,
+/// then overwrite its bytes with zeros (best effort, synced). `Ok(true)` when it was removed;
+/// `Ok(false)`, with nothing changed, when it is not a regular file, is gone, cannot be read,
+/// fails `ours`, or is no longer at `path` (a tool renamed its own file over it since).
+///
+/// The bytes are judged, and the zeros written, through the one descriptor this opens, so
+/// whatever lands at `path` meanwhile is never zeroed; and the name goes before the bytes, so
+/// a refused unlink, or a pass cut short, leaves the file as it was for the next pass to judge
+/// again. The zeros reach every other name of the file: a hard link is no copy, and another
+/// local user who can search the directory (a macOS home folder is searchable by group
+/// `staff`) may have made one to keep the bytes, so a removed secret's bytes must not outlive
+/// the name the vault gave them. A file its owner may not write (a person's `chmod 0400`) is
+/// the exception: it loses its name and keeps its bytes.
+pub fn wipe_if(path: &Path, max: usize, ours: impl FnOnce(&[u8]) -> bool) -> crate::Result<bool> {
+    wipe(path, |file| {
+        let mut bytes = Vec::new();
+        let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+        // Unreadable: nothing shows it is what `ours` wants.
+        if crate::secret::read_to_end_wiping_on_error(file.take(limit), &mut bytes).is_err() {
+            return Ok(false);
+        }
+        let bytes = SecretBytes::new(bytes);
+        Ok(bytes.len() <= max && ours(bytes.as_slice()))
+    })
+}
+
+/// [`wipe_if`]'s steps, with `judge` reading the file it opened.
+fn wipe(path: &Path, judge: impl FnOnce(&mut File) -> io::Result<bool>) -> crate::Result<bool> {
+    let at = |e: io::Error| Error::new(format!("{}: {e}", path.display()));
+    let open = |write: bool| {
+        OpenOptions::new()
+            .read(true)
+            .write(write)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+    };
+    // A file its owner may not write is judged and removed all the same; its bytes stay.
+    let opened = match open(true) {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => open(false),
+        opened => opened,
+    };
+    let mut file = match opened {
+        Ok(file) => file,
+        // Gone, a link now (ELOOP), or unreadable.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) || e.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            return Ok(false);
+        }
+        Err(e) => return Err(at(e)),
+    };
+    let meta = file.metadata().map_err(at)?;
+    if !meta.file_type().is_file()
+        || !judge(&mut file).map_err(at)?
+        || file_id(path) != Some((meta.dev(), meta.ino()))
+    {
+        return Ok(false);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(at(e)),
+    }
+    let zeros = [0u8; 4096];
+    let mut done = 0;
+    while done < meta.len() {
+        let n = usize::try_from((meta.len() - done).min(4096)).unwrap_or(4096);
+        if file.write_all_at(&zeros[..n], done).is_err() {
+            break;
+        }
+        done += n as u64;
+    }
+    let _ = sync(&file);
+    Ok(true)
 }
 
 fn sync(file: &File) -> io::Result<()> {
@@ -538,6 +589,40 @@ mod tests {
             left, [0u8; 6],
             "a descriptor open before the wipe reads zeros"
         );
+    }
+
+    #[test]
+    fn a_judged_wipe_never_touches_a_file_renamed_over_the_one_it_judged() {
+        let root = scratch();
+        let file = root.path().join("config");
+        write_atomic(&file, b"the vault's", 0o600).expect("write");
+        assert!(!wipe_if(&file, 64, |bytes| bytes == b"other").expect("judged"));
+        assert!(
+            !wipe_if(&file, 4, |_| true).expect("judged"),
+            "past the bound"
+        );
+        assert_eq!(std::fs::read(&file).expect("kept"), b"the vault's");
+
+        // A tool renames its own file over the path (git's config.lock) once the bytes are
+        // judged and before the name goes: it is neither zeroed nor removed.
+        let tools = root.path().join("config.lock");
+        write_atomic(&tools, b"the tool's", 0o600).expect("write");
+        let removed = wipe_if(&file, 64, |bytes| {
+            std::fs::rename(&tools, &file).expect("renamed over");
+            bytes == b"the vault's"
+        })
+        .expect("judged");
+        assert!(!removed);
+        assert_eq!(
+            std::fs::read(&file).expect("the tool's file"),
+            b"the tool's"
+        );
+
+        let kept = root.path().join("kept");
+        std::fs::hard_link(&file, &kept).expect("link");
+        assert!(wipe_if(&file, 64, |bytes| bytes == b"the tool's").expect("wiped"));
+        assert_eq!(kind(&file).expect("kind"), Kind::Missing);
+        assert_eq!(std::fs::read(&kept).expect("the other name"), [0u8; 10]);
     }
 
     /// The names in `dir`, sorted.

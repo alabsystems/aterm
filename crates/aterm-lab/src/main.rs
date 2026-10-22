@@ -518,11 +518,11 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  Claude Code reads the usage-limit headers: `limit`; --debug-log: its debug log into the
                                  scratch, read with `debuglog`)
   codex [tag] [--signed-out|--chatgpt[=PLAN]] [-e K=V]... [--no-wait] [-- codex args]   launch the managed Codex in the
-                                 first tab, by path, with --no-daemon, CODEX_HOME=<scratch>/codex-home: the lab provider (the
+                                 first tab, by path (codex-alab with --no-daemon), CODEX_HOME=<scratch>/codex-home: the lab provider (the
                                  stub's Responses API, a fake env_key); --chatgpt: a COMPOSED fake ChatGPT auth.json
                                  (user@example.com, PLAN plus) and the refresh pointed at the stub; --signed-out: the default
                                  provider, no auth (the last two turn the harness off: their screens offer a browser sign-in)
-  codex-run [tag] [--lab|--chatgpt|--signed-out] -- <args>   a non-interactive Codex command (--no-daemon) in the jail,
+  codex-run [tag] [--lab|--chatgpt|--signed-out] -- <args>   a non-interactive Codex command (codex-alab: --no-daemon) in the jail,
                                  where the egress witness watches it as it does the tab (jailed.pids), on that login's config
                                  (the tab's by default): --help, exec, exactly `login status` or `login --help`, ...; any
                                  other login, logout, app, app-server, cloud, update are refused
@@ -574,7 +574,8 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  failed check
   muse-captures [--only <regex>]  Muse Code's screens on this build, each on a lab of its own (~10 min): the trust box,
                                  idle, a draft, busy, the end of a turn, an interrupt, the slash menu, the exit, the shell,
-                                 write and edit boxes, the question, the 429/401/500 walls, /usage and /status
+                                 write and edit boxes, the question, a turn ended on each tool's own rows
+                                 (tool-row-*), the 429/401/500 walls, /usage and /status
   turn|send|enter|key [tag] ...  type a prompt+Enter | text | Enter | a named key (0, escape, ctrl-c, ...); turn exits 1
                                  unless the composer took the prompt (Enter again, once, while it still stands there)
   mode [tag] [name ['<spec>']]   stub mode: ok long numbered overloaded too-long compact-fails slow rate-limit
@@ -893,7 +894,7 @@ Outside any lab (no jail, no stub):
   trail-gallery [--aterm PATH] [--theme dark|light|both] [--scenario NAME[,NAME]]... [--extra 'key = value']...
                 [--columns N] [--lines N] [--font-px N] [--no-clean] <out_dir> [style ...]
                                  photograph cursor trail styles: one private headless aterm per style x theme x scenario
-                                 (typing context steam enter-bottom idle10 cjk bidi settings, or all), a frame after every
+                                 (typing context steam enter-bottom idle10 redraw-stall cjk bidi settings, or all), a frame after every
                                  key (headless advances effects only when a frame renders), each kept frame with its clean
                                  twin, cursor, text and dims for trail-contrast; no style: every style the Settings picker
                                  offers; <out_dir> outside the repository; exit 0 all taken, 1 a frame or instance failed,
@@ -943,7 +944,7 @@ Outside any lab (no jail, no stub):
                                  a window and presses keys only at an idle desk; --headless runs the press path alone
                                  (`key`); out DIR keeps the logs, takes and a mid-line image; exit 0 held, 1 a wrong
                                  frame or a failed check, 3 not run or not measured
-  codex-alab-proof [--package DIR] [--aterm PATH] [--keep]
+  codex-alab-proof [--package DIR] [--aterm PATH] [--keep] [--policy-only]
                                  the codex-alab native harness end to end on the REAL package (--package, $LAB_CODEX, else
                                  the managed codex when it is an ALab build), linked as the owner links it in a sandboxed
                                  private headless aterm (network denied but a loopback fake model): the proven claim and the
@@ -956,7 +957,10 @@ Outside any lab (no jail, no stub):
                                  given back; a manager's `post kind=task` alone over the lab's own bus) and On, and a
                                  person's own exchange (typed through the debug seam `send|key as=person`: nothing typed
                                  after it, the rule in codex-alab's journal, task=theirs) beside a control write's turn
-                                 (continued); ~11 min; exit 0 pass, 1 a check failed, 3 not run (no codex-alab package)
+                                 (continued); ~11 min. --policy-only runs the focused cybersecurity refusal lane: one
+                                 independent-work continuation, a persistent exclusion on later automatic work, a repeated
+                                 refusal and exhausted-work stop, plus an unsent draft and unchanged access program;
+                                 exit 0 pass, 1 a check failed, 3 not run (no codex-alab package)
   reduce <transcript|rollout> --program claude|codex [--out FILE]
                                  a KEY-ONLY reduction (session log 5H-1, P11 as ruling T7 amends it): keys, row order,
                                  numbers and the closed words a reader reads kept (ruling U7: a word no reading reads
@@ -1140,6 +1144,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "slot-capture" => slot_lane::cmd_slot_capture(args),
         "slot-lane" => slot_lane::cmd_slot_lane(args),
         "trail-gallery" => trail_gallery::cmd_trail_gallery(args),
+        "__trail-redraw-fixture" => trail_gallery::cmd_redraw_fixture(args),
         "trail-contrast" => trail_contrast::cmd_trail_contrast(args),
         "aos-repair" => aos_repair::cmd_aos_repair(args),
         "presence-flap" => presence::cmd_presence_flap(args),

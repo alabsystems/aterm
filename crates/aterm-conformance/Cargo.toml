@@ -24,7 +24,7 @@ aterm-json = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 aterm-uds = { workspace = true }
 libc = { workspace = true }
-# The scratch world each take runs in, made exclusively under /tmp.
+# The scratch world each take runs in, a private directory under /tmp.
 aterm-tempfile = { workspace = true }
 
 [dev-dependencies]

@@ -13,7 +13,8 @@ description = "aterm's credentials vault (`aterm secrets`, docs/DESIGN-secrets-2
 # ChaCha20-Poly1305, HKDF-SHA256, HMAC-SHA256 and Ed25519 sign/verify. No features:
 # none of these is behind `alloc`, and randomness is aterm_uds::rand, not ring's RNG.
 ring = { workspace = true }
-# Wipes every key, file key and plaintext buffer on drop. Already in the KEEP closure
+# Wipes every key, file key and plaintext buffer the crate holds on drop (not the key
+# schedules ring derives from them, which ring never wipes). Already in the KEEP closure
 # through rustls, so no new package.
 zeroize = { version = "1", default-features = false }
 # Padded base64 (armor, envelope fields); the unpadded canonical form age needs is a

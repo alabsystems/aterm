@@ -1030,9 +1030,9 @@ pub fn capacity() -> Capacity {
 
 /// What the running machine's readers can say ([`Caps`]), measured now: a
 /// few file probes on Linux (PSI, zswap, the thermal zones, the DRM cards,
-/// another user's `/proc` entry), one GPU read on macOS and Linux, nothing
-/// else. Not for every tick: the report changes with the machine's
-/// configuration, not its load.
+/// another user's `/proc` entry), one GPU read on macOS and Linux, the
+/// coalitions' self-check on macOS, nothing else. Not for every tick: the
+/// report changes with the machine's configuration, not its load.
 #[must_use]
 pub fn caps() -> Caps {
     #[cfg(target_os = "macos")]

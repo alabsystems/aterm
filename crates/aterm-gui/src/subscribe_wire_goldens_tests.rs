@@ -27,8 +27,8 @@ fn events_text(plant: bool) -> String {
         out.push_str(&format!("> watermark={name} -> {high:?}\n{frames}"));
     }
     // A watcher fallen behind the ring: TIMELINE_CAP rows the digest skips,
-    // then three it carries, each through its production writer (the store's
-    // title, the `meta` verb, the agent sweep's publication, a delivery).
+    // then three it carries, each through its production writer (the drift
+    // flush's title, the `meta` verb, the agent sweep's publication, a delivery).
     let store = new_store();
     let b = test_handle(6);
     store
@@ -36,10 +36,13 @@ fn events_text(plant: bool) -> String {
         .unwrap_or_else(|p| p.into_inner())
         .register(b.clone());
     for i in 0..TIMELINE_CAP {
-        store
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .set_title(6, &format!("t{i}"));
+        assert!(
+            b.ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record_title(&format!("t{i}"))
+        );
     }
     let reply = crate::control::meta_line_for_test(
         &store,

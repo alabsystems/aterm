@@ -120,6 +120,15 @@ pub(crate) struct HumanInputStamp {
     /// that sees it sees which gesture it is, so no order of two loads can
     /// pair a gesture's class with a count from before it ([`Self::counts`]).
     reached: AtomicU64,
+    /// THE NUMBER OF THE LAST GESTURE THAT OPENED A BURST (session log phase
+    /// 6, 6F-8, ruling U13), `0` for none: published after the count and
+    /// before [`Self::reached`], so a reading that holds a reaching
+    /// gesture's number holds whether it opened a burst. A reconciling
+    /// delivery that writes the mail latch's `human` mark over a burst
+    /// whose own call has not run yet writes it as that burst's, not as the
+    /// latch's alone (`why=mail`), so the timeline's `human` row and the
+    /// mark stay one for one ([`Self::counts`]).
+    burst: AtomicU64,
     /// The same moment on the clock that counts through sleep
     /// (`aterm_uds::process::continuous_ms`) plus one, `0` for never or no
     /// such clock: what the survey's `human_ms=` is taken on
@@ -151,6 +160,7 @@ impl Default for HumanInputStamp {
             at: AtomicU64::new(0),
             count: AtomicU64::new(0),
             reached: AtomicU64::new(0),
+            burst: AtomicU64::new(0),
             at_continuous: AtomicU64::new(0),
             last_plain_enter: AtomicU64::new(0),
             carried_ms: AtomicU64::new(0),
@@ -218,6 +228,10 @@ pub(crate) struct PersonCounts {
     pub(crate) seq: u64,
     /// The number of the last gesture that reached the program; `0` for none.
     pub(crate) reached: u64,
+    /// The number of the last gesture that opened a burst; `0` for none.
+    /// Every one at or below [`Self::reached`] that opened one is held here
+    /// ([`HumanInputStamp::burst`]'s order).
+    pub(crate) burst: u64,
 }
 
 /// The person count with what its last gesture was ([`HumanInputStamp::probe`]).
@@ -269,7 +283,16 @@ impl HumanInputStamp {
                 .store(ms.saturating_add(1), Ordering::Relaxed);
         }
         let n = self.count.fetch_add(1, Ordering::Release).wrapping_add(1);
+        let burst = before.checked_sub(1).is_none_or(|at| {
+            now_us.saturating_sub(at) / 1000 >= crate::session_timeline::HUMAN_BURST_GAP_MS
+        });
         between();
+        // THE BURST BEFORE THE CLASS (6F-8): a reader that sees gesture `n`'s
+        // class (`reached`'s Release, its Acquire) sees whether it opened a
+        // burst, so the mail latch's mark over it is written as the burst's.
+        if burst {
+            self.burst.fetch_max(n, Ordering::Release);
+        }
         // THE CLASS AFTER THE COUNT, and as the gesture's number: a reader
         // that sees it knows gesture `n` is counted, whatever it read of the
         // count ([`Self::counts`]). Until 2026-10-18 this was a second count,
@@ -287,9 +310,6 @@ impl HumanInputStamp {
         if gesture == Gesture::PlainEnter {
             self.last_plain_enter.store(n, Ordering::Release);
         }
-        let burst = before.checked_sub(1).is_none_or(|at| {
-            now_us.saturating_sub(at) / 1000 >= crate::session_timeline::HUMAN_BURST_GAP_MS
-        });
         Noted { burst, seq: n }
     }
 
@@ -301,10 +321,12 @@ impl HumanInputStamp {
     /// the two loads a note landed between.
     pub(crate) fn counts(&self) -> PersonCounts {
         let reached = self.reached.load(Ordering::Acquire);
+        let burst = self.burst.load(Ordering::Acquire);
         let seq = self.count.load(Ordering::Acquire);
         PersonCounts {
-            seq: seq.max(reached),
+            seq: seq.max(reached).max(burst),
             reached,
+            burst,
         }
     }
 
@@ -619,9 +641,8 @@ pub(crate) fn reaches_program(
     }
 }
 
-/// Whether `ev` is a person's deliberate gesture toward a session (module
-/// header, "What counts"): everything but a key release, bare pointer motion,
-/// a focus change and a geometry change.
+/// Whether `ev` is a person's deliberate gesture toward a session (see the module doc):
+/// everything but a key release, bare pointer motion, a focus change and a geometry change.
 pub(crate) fn is_person_gesture(ev: &InputEvent) -> bool {
     match ev {
         InputEvent::Key { event_type, .. } => {
@@ -703,17 +724,9 @@ mod tests {
         assert_eq!(HumanInputStamp::default().ms_since(5_000_000), None);
     }
 
-    /// A COUNT NEVER OUTRUNS ITS STAMP: a reader that loads the count and
-    /// then the stamp — the order `status` and `text --json` read them in —
-    /// while a person's gestures land never sees gesture `n` counted beside
-    /// the stamp of an earlier one. A torn pair is a `human_seq` that holds
-    /// the gesture beside a `human_ms` that says the person is quiet: the
-    /// supervisor keys on it, fenced `if-human=` on that very count, and the
-    /// fence passes. Gesture `k` lands at `k` ms, so gesture `n`'s stamp is
-    /// `n * 1000 + 1`, and a later one only larger. (Counted before it was
-    /// stamped, as until 2026-09-29, the pair tore on a plain interleaving,
-    /// whatever the memory model: this reader, spinning beside the writer,
-    /// is how it shows.)
+    /// A reader that loads the count and then the stamp (the order `status` and `text --json`
+    /// use) never sees gesture `n` counted beside an earlier gesture's stamp. Gesture `k` lands
+    /// at `k` ms, so gesture `n`'s stamp is at least `n * 1000 + 1`.
     #[test]
     fn a_read_that_sees_a_gesture_counted_sees_its_stamp() {
         use std::sync::Arc;
@@ -1033,10 +1046,8 @@ mod tests {
         }
     }
 
-    /// An arrow, a digit, Enter and a paste are a person's gesture — the
-    /// keys that navigate a dialog and echo nothing are exactly the ones the
-    /// momentum signal missed — and a release, a hover, a focus change and a
-    /// resize are not.
+    /// An arrow, a digit, Enter, a chord and a paste count; a release, a focus change and a
+    /// resize do not.
     #[test]
     fn navigation_counts_and_releases_hovers_focus_and_geometry_do_not() {
         assert!(is_person_gesture(&key(KeyEventType::Press)));
@@ -1068,10 +1079,12 @@ mod tests {
     /// A reading never names a program-bound gesture its count does not
     /// hold, whichever load a note lands between: `counts` covers the number
     /// `reached` names (a class loaded after a count that missed it, here
-    /// stored by hand). NEGATIVE CONTROL (by scratch revert): the class
-    /// published before the count (the order until 2026-10-18) is read
-    /// inside the note, and without the cover the reading names a class its
-    /// count does not hold.
+    /// stored by hand); and since 6F-8 whether a gesture opened a burst is
+    /// published between its count and its class, so a reading that holds
+    /// its class holds its burst. NEGATIVE CONTROL (by scratch revert): the
+    /// class published before the count (the order until 2026-10-18) is
+    /// read inside the note, and without the cover the reading names a
+    /// class its count does not hold.
     #[test]
     fn a_reading_that_sees_a_gesture_reach_the_program_counts_it() {
         let s = HumanInputStamp::default();
@@ -1079,11 +1092,26 @@ mod tests {
         let mut inside = PersonCounts::default();
         let noted = s.note_reaching_split(2_000, Gesture::Other, true, || inside = s.counts());
         assert_eq!(noted.seq, 2);
-        assert_eq!(inside, PersonCounts { seq: 2, reached: 0 }, "counted first");
-        assert_eq!(s.counts(), PersonCounts { seq: 2, reached: 2 });
+        let counts = |seq, reached, burst| PersonCounts {
+            seq,
+            reached,
+            burst,
+        };
+        assert_eq!(inside, counts(2, 0, 1), "counted first");
+        assert_eq!(s.counts(), counts(2, 2, 1));
         // A class loaded past the count it was read with still is covered.
         s.reached.fetch_max(3, Ordering::Release);
-        assert_eq!(s.counts(), PersonCounts { seq: 3, reached: 3 });
+        assert_eq!(s.counts(), counts(3, 3, 1));
+        // THE BURST BEFORE THE CLASS (6F-8): a gesture that opens a burst is
+        // not one inside its note, and a reading that holds its class holds
+        // its burst.
+        let t = HumanInputStamp::default();
+        t.note_reaching(1_000, Gesture::Other, false);
+        let late = 1_000 + crate::session_timeline::HUMAN_BURST_GAP_MS * 1000;
+        let noted = t.note_reaching_split(late, Gesture::Other, true, || inside = t.counts());
+        assert!(noted.burst, "{noted:?}");
+        assert_eq!(inside, counts(2, 0, 1), "counted, neither published");
+        assert_eq!(t.counts(), counts(2, 2, 2));
     }
 
     /// A DRAG REACHES THE PROGRAM ONLY WHERE ITS MODE REPORTS MOTION (T1,

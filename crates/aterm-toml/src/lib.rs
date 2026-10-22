@@ -23,32 +23,10 @@
 //! document["font_px"] = aterm_toml::edit::Item::Value(18.0.into());
 //! ```
 //!
-//! # What is enforced
-//!
-//! Duplicate keys and every redefinition rule in the spec are errors, not
-//! last-write-wins. A config parser that quietly accepts a key twice makes the
-//! file an operator reads and the file the program obeys two different
-//! documents; which one wins then depends on parser internals. See
-//! [`edit`] for the full list.
-//!
-//! Nesting is bounded ([`edit`]'s `ParseLimits`), so hostile input gets an
-//! error rather than a stack overflow.
-//!
-//! For a type whose `Serialize` and `Deserialize` are inverse (derived ones
-//! are), what [`to_string`] writes [`from_str`] reads back as the same value,
-//! or `to_string` refuses it. A table keyed by integers, `bool`s or newtypes
-//! reads back, each key from the one spelling written for it, whether it is
-//! read straight from the document or through serde's buffer (a flattened
-//! map, an untagged or internally tagged enum). A `None` struct field is left
-//! out, and any other `None` (an array element, a map value, a variant's
-//! payload, `Some(None)`, a newtype over `None`) is an error, not a silently
-//! shorter document. See [`ser`] for why.
-//!
-//! # What is NOT supported
-//!
-//! This crate targets TOML 1.0.0. TOML 1.1 additions — the `\e` and `\x`
-//! escapes, newlines and trailing commas in inline tables, and times without
-//! seconds — are not supported.
+//! Duplicate keys and every other redefinition rule in the spec are errors,
+//! not last-write-wins. Nesting depth is bounded, so hostile input is an error
+//! rather than a stack overflow. TOML 1.1 drafts (the `\e` and `\x` escapes,
+//! newlines in inline tables, seconds-optional times) are not supported.
 
 #![forbid(unsafe_code)]
 

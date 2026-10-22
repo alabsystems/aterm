@@ -205,11 +205,10 @@ impl ActivationWake {
         wake
     }
 
-    /// Also watch `path` FOR A LISTENER OF ITS OWN: when the file there is
-    /// replaced (or first made), `told` is called on the waiting thread and
-    /// the wait GOES ON — it is no newer build and no word on an upgrade, so
-    /// [`Self::wait`] never answers `true` for it. The accounts store's wake
-    /// marker is the one such mark (module header).
+    /// Also watch `path` for a listener of its own: when the file there is
+    /// replaced (or first made), `told` is called on the waiting thread and the
+    /// wait goes on, so [`Self::wait`] never answers `true` for it. The
+    /// accounts store's wake marker is the one such mark.
     ///
     /// Its directory is not made here: the accounts store exists only once the
     /// owner has listed an account. Until it exists the watch sits on the
@@ -1103,11 +1102,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// CLAUDE'S OWN NATIVE UPDATER is a push too: it writes the new build
-    /// under `versions/` and repoints `~/.local/bin/claude`, and the link's
-    /// new target wakes the parked host. Negative controls: a new build written
-    /// beside the link's directory, and another file in `~/.local/bin`, wake
-    /// nobody until the link moves.
+    /// Claude's native updater repointing `~/.local/bin/claude` wakes the parked host.
+    /// Negative controls: a new build under `versions/` and another file in `~/.local/bin`
+    /// wake nobody until the link moves.
     #[test]
     fn a_repointed_native_link_wakes_the_host_and_its_neighbours_do_not() {
         let home = std::env::temp_dir().join(format!("aterm-native-wake-{}", std::process::id()));

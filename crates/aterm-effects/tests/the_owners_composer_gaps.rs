@@ -86,7 +86,7 @@ fn cfg() -> GlowConfig {
 /// into `text`) mapped to (line, col-in-line).
 fn wrap(text: &[char], caret: usize) -> (Vec<Vec<char>>, (usize, usize)) {
     let mut lines: Vec<Vec<char>> = vec![Vec::new()];
-    // map from text index -> (line, col) (for the caret)
+    // Text index -> (line, col).
     let mut pos: Vec<(usize, usize)> = Vec::with_capacity(text.len() + 1);
     let mut i = 0;
     while i < text.len() {

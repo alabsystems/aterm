@@ -173,8 +173,8 @@ fn terminal_blank_tracks_live_defaults_and_decscnm() {
     assert_eq!(reversed.bg, normal.fg, "DECSCNM swaps default bg");
 }
 
-/// `blit_pane_into` places a pane's cells at the given offset and leaves the
-/// surrounding divider cells untouched — the 2x1 composite seam stays a seam.
+/// `blit_pane_into` places a pane's cells at the given offset and leaves the divider column a
+/// seam.
 #[test]
 fn blit_places_pane_and_keeps_seam() {
     let theme = Theme::default();
@@ -182,8 +182,8 @@ fn blit_places_pane_and_keeps_seam() {
     // 1x5 window: [pane A (cols 0..2)] [divider col 2] [pane B (cols 3..5)].
     let mut dst = RenderInput::empty();
     fill_divider_grid(&mut dst, 1, 5, theme, None);
-    let (left, left_blank) = pane_snapshot("AB", 1, 2); // 'A','B'
-    let (right, right_blank) = pane_snapshot("CD", 1, 2); // 'C','D'
+    let (left, left_blank) = pane_snapshot("AB", 1, 2);
+    let (right, right_blank) = pane_snapshot("CD", 1, 2);
     blit_pane_into(&mut dst, &left, 0, 0, left_blank);
     blit_pane_into(&mut dst, &right, 0, 3, right_blank);
     let row = &dst.cells[0];

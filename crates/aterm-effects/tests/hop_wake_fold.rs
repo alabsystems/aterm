@@ -3,13 +3,12 @@
 
 //! A typed key takes the hop wake it lands in, from either side.
 //!
-//! A word hop across the dark stretch a mid-line edit left lays a wake. The key typed at the
-//! landing joins a cohort (`join_cohort`): past the line's old end it meets the wake, inside the
-//! typed cohort's bounds (which never shrink when the witness retires cells under them) the typed
-//! cohort. Either way `Ribbon::fold_wakes_into_band` folds every wake at the key's cell into the
-//! band, so no wake cell expires on the hop's 0.55 s under a typing hand. A band already leaving
-//! is not taken back by a key in a wake beside it, and no column gets two owners of one cohort.
-//! Driven at the host seam through a real [`Terminal`].
+//! The key typed at a word hop's landing joins a cohort (`join_cohort`): past the line's old end
+//! it meets the wake, inside the typed cohort's bounds (which never shrink when the witness
+//! retires cells under them) the typed cohort. Either way `Ribbon::fold_wakes_into_band` folds
+//! every wake at the key's cell into the band, so no wake cell expires on the hop's 0.55 s under
+//! a typing hand. A band already leaving is not taken back by a key in a wake beside it, and no
+//! column gets two owners of one cohort. Driven at the host seam through a real [`Terminal`].
 
 use crate::common::{
     LIT_COV, caret_sample, coverage, holes_of, note_blink, observe_caret_row, observe_ribbon_rows,

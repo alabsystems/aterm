@@ -87,13 +87,9 @@ fn fuzz_random_valid_utf8_has_exact_parity() {
     }
 }
 
-/// THRU-4a regression (whole-vs-bytewise parity for the read-boundary straddle):
-/// a chunk that ends mid-sequence AFTER at least one complete multibyte char must
-/// decode identically whether fed whole or one byte at a time. The bulk lane's
-/// scalar boundary step must NOT double-consume the trailing incomplete lead —
-/// it is buffered for the next chunk's continuation, not replaced with U+FFFD.
-/// (Before the fix, `print_whole(&[E4 B8 AD E4])` emitted `['中','\u{FFFD}']`
-/// while the correct byte-by-byte path emitted `['中']`.)
+/// A chunk that ends mid-sequence after a complete multibyte char decodes as
+/// it does byte by byte: the bulk lane buffers the trailing incomplete lead
+/// for the next chunk instead of replacing it with U+FFFD.
 #[test]
 fn incomplete_trailing_lead_after_complete_char_matches_bytewise() {
     let straddles: &[&[u8]] = &[

@@ -147,21 +147,10 @@ fn an_inherited_display_socket_answers_and_no_other_descriptor_does() {
     assert!(!answers(-1), "no descriptor");
 }
 
-/// ROUND EIGHT OF THE UPDATE AUDIT, THE REVIEW OF #82 — WINIT'S CHOICE OF DISPLAY
-/// DECIDES, NOT ANY DISPLAY THAT ANSWERS. A tmux server started in a Wayland session
-/// is attached from an X11 one: tmux refreshes `DISPLAY`, not `WAYLAND_DISPLAY`, so
-/// `:0` answers and `wayland-0` is stale. winit picks Wayland whenever a Wayland
-/// variable is set and never falls back to X11, so the window fails "cannot open a
-/// display" and its start must not be counted at the boot apply. The same holds
-/// for a relative `WAYLAND_DISPLAY` with no runtime directory, and a
-/// `WAYLAND_SOCKET` that is no number: neither names an endpoint, and `DISPLAY`
-/// does not stand in.
-///
-/// FAILS WITHOUT THE FIX: any endpoint that answered made it a window start, so the
-/// live X server counted a start winit never made.
-///
-/// NEGATIVE CONTROL: with no Wayland variable, the live X server is a window start;
-/// with the compositor live, so is the Wayland one.
+/// winit's choice of display decides, not any display that answers: winit picks Wayland whenever
+/// a Wayland variable is set and never falls back to X11 (a tmux server from a Wayland session,
+/// attached from X11, refreshes only `DISPLAY`). Negative control: with no Wayland variable the
+/// live X server is a window start, and so is a live compositor.
 #[test]
 fn winits_choice_of_display_decides_whether_a_start_is_counted() {
     let root = crate::test_scratch::short_dir("a display server's socket");

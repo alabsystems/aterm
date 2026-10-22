@@ -1450,6 +1450,7 @@ impl Root {
                 runnable_ns: None,
                 peak_footprint: None,
                 read_at,
+                coalition: None,
             });
         }
         Some(Sweep { procs, truncated })
@@ -1509,6 +1510,7 @@ impl Root {
                 Cap::No(Why::Absent)
             },
             volume: Cap::Yes,
+            coalitions: Cap::No(Why::Unsupported),
             capacity: self.capacity().source,
         }
     }

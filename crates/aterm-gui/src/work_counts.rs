@@ -17,8 +17,8 @@ thread_local! {
     static CLIPBOARD_WORKERS: Cell<usize> = const { Cell::new(0) };
     /// Tabs walked by the title-drift gate.
     static TITLE_TAB_TOUCHES: Cell<usize> = const { Cell::new(0) };
-    /// The subscribe idle wake: retained ledger records (shell blocks, turn
-    /// records, timeline events) an `events` digest touched.
+    /// The subscribe idle wake: retained ledger records (shell blocks, turns, timeline events)
+    /// an `events` digest touched.
     static RETAINED_RECORDS_TOUCHED: Cell<usize> = const { Cell::new(0) };
     /// Ring rows (`history`, `timeline`, `exits`) formatted into a reply.
     static RING_ROWS_FORMATTED: Cell<usize> = const { Cell::new(0) };

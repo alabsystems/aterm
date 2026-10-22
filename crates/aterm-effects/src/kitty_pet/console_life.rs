@@ -1242,10 +1242,9 @@ impl PetBrain {
         world.ink_clearance(rect, 0.0) == Some(true)
     }
 
-    /// An examined obstruction under the pet's natural body. `clear` would
-    /// also answer `false` for "outside the coverage window", and this
-    /// predicate authorizes a teleport, so it acts only on a certified
-    /// `Some(false)`.
+    /// An examined obstruction under the pet's natural body. This predicate authorizes a
+    /// teleport, so it acts only on a certified `Some(false)` (`clear` also answers `false`
+    /// outside the coverage window).
     ///
     /// The caret is not an obstruction to its own escort: [`STATION_LEAD`] seats the escort
     /// one cell past the caret, inside its 3x3 keep-off ring. Glyphs are `ink_overlaps`'s to
@@ -3741,7 +3740,10 @@ fn detect_faux_composer_caret(
     pane: PetPane,
 ) -> Option<(u16, u16)> {
     let start_r = pane.rows / 2;
-    let end_r = pane.rows.saturating_sub(1);
+    let end_r = input
+        .cursor_row
+        .saturating_sub(pane.row)
+        .min(pane.rows.saturating_sub(1));
     for local_r in (start_r..end_r).rev() {
         let frame_r = pane.row + local_r;
         let Some(row) = input.cells.get(frame_r) else {
@@ -3811,11 +3813,15 @@ fn detect_faux_composer_caret(
                 }
             }
             let start_c = prompt_c + 1;
+            let mut row_has_ink = false;
             for local_c in start_c..right_limit {
                 let Some(cell) = comp_row.get(pane.col + local_c) else {
                     break;
                 };
                 let inverse_caret = base_bg.is_some_and(|bg| cell.bg != bg)
+                    && comp_row
+                        .get(pane.col + local_c - 1)
+                        .is_none_or(|prev| prev.bg != cell.bg)
                     && comp_row
                         .get(pane.col + local_c + 1)
                         .is_none_or(|next| next.bg != cell.bg);
@@ -3823,8 +3829,12 @@ fn detect_faux_composer_caret(
                     return Some((comp_r as u16, local_c as u16));
                 }
                 if cell.ch != ' ' && cell.ch != '\0' {
+                    row_has_ink = true;
                     last_text = Some((comp_r, local_c, right_limit));
                 }
+            }
+            if !boxed && !row_has_ink {
+                break;
             }
         }
         if boxed {
@@ -6529,9 +6539,9 @@ mod tests {
         assert_eq!(s.pet.console_attention(), PetAttention::Output);
     }
 
-    /// Fixing a typo is still typing the word: `sot`, two backspaces, `it`,
-    /// Space fires with the repair's resident hold standing; the trick latch
-    /// rides it out and plays when the hold lapses.
+    /// Fixing a typo is still typing the word: `rot`, two backspaces, `oll`, Space fires
+    /// with the repair's resident hold standing; the trick latch rides it out and plays
+    /// when the hold lapses.
     #[test]
     fn a_trick_typed_through_a_repair_is_still_performed() {
         let mut s = Scene::new();
@@ -6556,8 +6566,8 @@ mod tests {
         );
     }
 
-    /// The same repair asking for `sit`: the latch rides the repair out, the
-    /// cat looks up when the hand stops, then holds the seat it was asked for
+    /// A repair asking for `sit` (`sot`, two backspaces, `it`): the latch rides the repair
+    /// out, the cat looks up when the hand stops, then holds the seat it was asked for
     /// with no resident reseating it and no typing pose overriding it.
     #[test]
     fn a_seat_typed_through_a_repair_is_taken_and_held() {
@@ -6809,6 +6819,21 @@ mod tests {
             detect_faux_composer_caret(&input, PetPane::full(&input)),
             Some((17, 15)),
             "multiline composer should locate the block cursor on the second composer line"
+        );
+
+        // A multi-cell background pill (`[Image #1]`) before the painted caret must not
+        // have its rightmost cell mistaken for a 1-cell inverse-video cursor.
+        s.term.process(
+            b"\x1b[17;1H\xe2\x94\x82 > \x1b[48;5;24m[Image #1]\x1b[0m hello \x1b[7m \x1b[0m       \xe2\x94\x82\
+              \x1b[18;1H\xe2\x95\xb0\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xaf\
+              \x1b[19;1H                              \
+              \x1b[20;1H  26 files changed\x1b[?25l",
+        );
+        let input = s.term.cell_frame(20, 80);
+        assert_eq!(
+            detect_faux_composer_caret(&input, PetPane::full(&input)),
+            Some((16, 21)),
+            "multi-cell background pill must not be mistaken for the 1-cell inverse caret at col 21"
         );
     }
 

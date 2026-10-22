@@ -21,24 +21,20 @@ use std::process::Command;
 
 use crate::ledger::{Error, Result};
 
-/// The changelog's repo-root-relative path — the single hand-written source
-/// of release notes (there is no generator).
+/// The changelog's repo-root-relative path: the one hand-written source of release notes.
 pub const CHANGELOG_FILE: &str = "CHANGELOG.md";
 
-/// What the pre-claim gate learned about `[Unreleased]` — `entries` (the
-/// count of top-level bullets in the real body) feeds the cut transcript's
-/// "N entries, no '''" line; it is informational, never load-bearing.
+/// What the pre-claim gate learned about a section: `entries`, the count of top-level
+/// bullets in the real body, for the transcript only.
 #[derive(Debug)]
 pub struct GateSummary {
     pub entries: usize,
 }
 
-/// The REAL body of a section — the lines between `## [<name>]` and the next
-/// `## ` heading with HTML comments (multi-line included), `###` scaffold
-/// headings and blank/whitespace lines removed. What survives is actual
-/// release-note prose/bullets; empty output means "no changelog", so a guard
-/// built on it fails a truly-empty section, a whitespace-only one, a
-/// comment-only one, AND a bare `### ` scaffold with no bullets.
+/// The real body of a section: the lines between `## [<name>]` and the next `## `
+/// heading, with HTML comments (multi-line included), `###` scaffold headings and blank
+/// lines removed. Empty means "no changelog", so a guard on it fails an empty,
+/// whitespace-only, comment-only or bare-scaffold section.
 ///
 /// Line-for-line port of `changelog_real_body` (tools/prepare-release.sh) —
 /// including the awk's LEFTMOST-LONGEST `<!--.*-->` match, which strips from
@@ -52,8 +48,7 @@ pub fn real_body(text: &str, section: &str) -> Vec<String> {
     let mut out = Vec::new();
     for raw in text.lines() {
         if !in_section {
-            // Comments cannot carry across the section boundary: the awk
-            // skips pre-section lines before its comment tracking runs.
+            // Comment tracking starts inside the section, so a comment cannot carry in.
             in_section = raw.starts_with(&header);
             continue;
         }
@@ -70,9 +65,8 @@ pub fn real_body(text: &str, section: &str) -> Vec<String> {
                 None => continue,
             }
         }
-        // Greedy same-line comment removal (see the doc comment): first
-        // `<!--` through the last `-->` that still closes it. At most one
-        // effective round, but keep the awk's `while` shape for fidelity.
+        // Greedy same-line removal (see the doc): first `<!--` through the last `-->` that
+        // still closes it.
         while let Some(start) = line.find("<!--") {
             match line.rfind("-->").filter(|&end| end >= start + 4) {
                 Some(end) => line = format!("{}{}", &line[..start], &line[end + 3..]),
@@ -94,26 +88,23 @@ pub fn real_body(text: &str, section: &str) -> Vec<String> {
     out
 }
 
-/// Does the changelog already carry a `## [<version>]` section? Used by the
-/// roll's double-roll guard here and by the claim's "cut elsewhere" abort
-/// (ledger.rs) — one definition so the two can never disagree.
+/// Whether the changelog already carries a `## [<version>]` section: the roll's
+/// double-roll guard and the claim's "cut elsewhere" abort (ledger.rs) share it.
 pub fn has_section(text: &str, version: &str) -> bool {
     let header = format!("## [{version}]");
     text.lines().any(|l| l.starts_with(&header))
 }
 
-/// Pre-claim gates (spec §3), in transcript order: `[Unreleased]` exists, its
-/// real body is non-empty, and the RAW section carries no `'''`. Runs before
-/// the claim so a note-less or manifest-poisoning changelog costs seconds,
-/// not a burned ledger number.
+/// Pre-claim gates, in transcript order: `[Unreleased]` exists, its real body is
+/// non-empty, and the raw section carries no `'''` or raw control character. Before the
+/// claim, so a bad changelog costs seconds, not a burned ledger number.
 pub fn gate_unreleased(text: &str) -> Result<GateSummary> {
     gate_section(text, "Unreleased")
 }
 
-/// The same gate over an arbitrary section — the RECUT path (spec §5) re-cuts
-/// a version whose body was already rolled into `## [X.Y.Z]` by the earlier
-/// wedged cut, so the gate must judge THAT section (the fresh `[Unreleased]`
-/// scaffold above it is legitimately empty then).
+/// The same gate over any section: a recut re-cuts a version whose body an earlier wedged
+/// cut already rolled into `## [X.Y.Z]`, so it judges that section (the fresh
+/// `[Unreleased]` above it is legitimately empty).
 pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
     if !text
         .lines()
@@ -123,9 +114,8 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
             "{CHANGELOG_FILE} has no \"## [{section}]\" section"
         )));
     }
-    // HARD REQUIREMENT (carried from prepare-release.sh): every release ships
-    // a hand-written changelog — the Software Update window and the manifest
-    // surface these notes, and there is no generator to lean on.
+    // Every release ships hand-written notes: the Software Update window and the manifest
+    // show them, and there is no generator.
     let body = real_body(text, section);
     if body.is_empty() {
         return Err(Error::new(format!(
@@ -134,12 +124,9 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
              blank lines and bare ### scaffolds do not count)"
         )));
     }
-    // `'''` scan over the RAW section — raw is what ships verbatim inside the
-    // manifest's `changelog = '''…'''` TOML literal, so a `'''` anywhere in it
-    // (comments included) would terminate the literal early and every fleet
-    // client's Manifest::parse would reject the release. Hard abort with the
-    // file line number — never gen-appcast.sh's silent quote collapse (spec
-    // decision 12).
+    // `'''` scan over the raw section, which ships verbatim inside the manifest's
+    // `changelog = '''…'''` TOML literal: a `'''` anywhere (comments included) would end
+    // the literal early and every client's `Manifest::parse` would reject the release.
     if let Some((start, end)) = section_span(text, section) {
         for (idx, raw) in text.lines().enumerate().take(end).skip(start + 1) {
             if raw.contains("'''") {
@@ -150,13 +137,10 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
                     idx + 1
                 )));
             }
-            // Raw control characters (a stray \r, ESC, DEL, …) are refused by
-            // Manifest::to_toml at emission time — but emission runs in
-            // step_sign, AFTER the claim commit is pushed, so that refusal
-            // alone burns a ledger number.
-            // Mirror the emitter's exact rule here (spec decision 12
-            // sequences representability BEFORE the claim): \t is TOML-legal,
-            // and \n never appears inside a lines() item.
+            // Raw control characters are refused by `Manifest::to_toml`, but that runs in
+            // `step_sign`, after the claim is pushed, and would burn a ledger number. So
+            // the emitter's rule is mirrored here: \t is TOML-legal, and \n never appears
+            // inside a `lines()` item.
             if let Some(bad) = raw.chars().find(|c| c.is_control() && *c != '\t') {
                 return Err(Error::new(format!(
                     "{CHANGELOG_FILE} line {}: [{section}] contains control character \
@@ -183,12 +167,10 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
 /// (`tests/it/changelog_golden.rs` pins its bytes), so historical rolls and
 /// this one are byte-compatible.
 ///
-/// `date` is `YYYY-MM-DD` — pass [`today_la`] for a real cut; injected so
-/// tests are deterministic.
+/// `date` is `YYYY-MM-DD`: [`today_la`] for a real cut, injected for tests.
 pub fn roll(text: &str, version: &str, date: &str) -> Result<String> {
-    // Double-roll guard: a second `## [X.Y.Z]` section would split the release
-    // notes across two headings and desync the recut detection (spec §5
-    // derives "recut" from this section's presence).
+    // Double-roll guard: a second `## [X.Y.Z]` would split the notes across two headings,
+    // and recut detection keys on this section's presence.
     if has_section(text, version) {
         return Err(Error::new(format!(
             "{CHANGELOG_FILE} already has a \"## [{version}]\" section — already \
@@ -213,25 +195,22 @@ pub fn roll(text: &str, version: &str, date: &str) -> Result<String> {
         out.push(line.to_string());
     }
     let mut rolled = out.join("\n");
-    // `lines()` drops the final newline; restore it iff the input had one so
-    // the roll is a pure insertion (byte-identical everywhere else).
+    // `lines()` drops the final newline; restore it iff the input had one, so the roll is
+    // a pure insertion.
     if text.ends_with('\n') {
         rolled.push('\n');
     }
     Ok(rolled)
 }
 
-/// The two changelogs a release claim writes (owner ruling R2), from
-/// the PUBLISHED commit's `source` and main's current `main`:
+/// The two changelogs a release claim writes, from the published commit's `source` and
+/// main's current `main`:
 ///
-/// * the RELEASE commit's — `source` rolled ([`roll`]): its `[Unreleased]` becomes
-///   `## [version] - date`, so the notes that ship are exactly the entries the
-///   published commit carried. A `source` that already has the section (published
-///   after an earlier roll) is taken as it stands.
-/// * MAIN's — [`roll_shipped`]: the same section, carrying the same shipped body,
-///   and main's `[Unreleased]` keeps every entry peers added after the publish,
-///   because those ship in the NEXT release. A `main` that already has the section
-///   (an earlier claim of this version whose cut wedged) is taken as it stands.
+/// * the release commit's: `source` rolled ([`roll`]), so the notes that ship are exactly
+///   the entries the published commit carried (taken as it stands if already rolled);
+/// * main's: [`roll_shipped`], the same section with the same shipped body, while main's
+///   `[Unreleased]` keeps every entry added after the publish, for the next release
+///   (taken as it stands if it already has the section, from an earlier wedged claim).
 pub fn claim_changelogs(
     source: &str,
     main: &str,
@@ -253,10 +232,9 @@ pub fn claim_changelogs(
     Ok((release, landing))
 }
 
-/// The RELEASE commit's changelog — [`claim_changelogs`]' first half, the one
-/// definition the reservation that writes it and the claim that checks it share:
-/// `source` rolled for `version` on `date`, or `source` as it stands when it already
-/// carries the section (published after an earlier roll).
+/// The release commit's changelog ([`claim_changelogs`]' first half, shared by the
+/// reservation that writes it and the claim that checks it): `source` rolled for `version`
+/// on `date`, or `source` as it stands when it already carries the section.
 ///
 /// # Errors
 /// [`roll`]'s.
@@ -278,16 +256,15 @@ pub fn section_date<'a>(text: &'a str, version: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
-/// Roll `main` for a release whose notes are `source`'s `[Unreleased]` body — the
-/// published commit's — rather than main's own.
+/// Roll `main` for a release whose notes are `source`'s (the published commit's)
+/// `[Unreleased]` body rather than main's own.
 ///
-/// The result is `main` with `## [version] - date` inserted below `[Unreleased]`,
-/// carrying `source`'s `[Unreleased]` body verbatim, and main's `[Unreleased]`
-/// reduced to the entries that body does not contain (compared as whole entries —
-/// a bullet with its continuation lines — each shipped entry matching at most one),
-/// each under its own `###` heading. When main's `[Unreleased]` IS `source`'s, the
-/// result is byte-identical to [`roll`]`(main, …)`. An entry a peer EDITED after the
-/// publish is a different entry: its new text stays unreleased, its old text ships.
+/// The result is `main` with `## [version] - date` inserted below `[Unreleased]`, carrying
+/// `source`'s body verbatim, and main's `[Unreleased]` reduced to the entries that body
+/// does not contain (whole entries, a bullet with its continuation lines, each shipped
+/// entry matching at most one), each under its own `###` heading. When main's
+/// `[Unreleased]` is `source`'s, the result is byte-identical to [`roll`]`(main, …)`. An
+/// entry edited after the publish is a different entry: its new text stays unreleased.
 pub fn roll_shipped(main: &str, source: &str, version: &str, date: &str) -> Result<String> {
     if has_section(main, version) {
         return Err(Error::new(format!(
@@ -420,13 +397,10 @@ fn unshipped_entries(main_body: &[&str], shipped: &[&str]) -> Vec<String> {
     out
 }
 
-/// Extract a rolled section's body VERBATIM (spec §3: used once, verbatim,
-/// for manifest + the release body the channel draft-create posts + the in-app notes): the
-/// raw lines between `## [<version>]` and the next `## [` heading, trimmed of
-/// leading/trailing blank lines only. Behavioral port of
-/// tools/extract-changelog.sh — minus its fall-back-to-Unreleased lane, which
-/// existed to mask a missing section; here a missing or empty section is a
-/// hard error because the gate + roll already guaranteed real notes.
+/// Extract a rolled section's body verbatim, for the manifest, the release body and the
+/// in-app notes: the raw lines between `## [<version>]` and the next `## [` heading,
+/// trimmed of leading and trailing blank lines only. A missing or empty section is a hard
+/// error: the gate and roll already guaranteed real notes.
 pub fn rolled_body(text: &str, version: &str) -> Result<String> {
     let header = format!("## [{version}]");
     let mut grab = false;
@@ -461,30 +435,19 @@ pub fn rolled_body(text: &str, version: &str) -> Result<String> {
     Ok(lines.join("\n"))
 }
 
-/// The GitHub release BODY: a standing newcomer preamble, then this release's
-/// changelog verbatim.
+/// The GitHub release body: a standing newcomer preamble, then this release's changelog
+/// verbatim.
 ///
-/// The changelog alone addresses people who already run aterm; the /releases
-/// page is also the front door for people who have never heard of it and land
-/// on a wall of unexplained assets (a DMG next to a zip next to TOML nobody
-/// should open). The preamble is part of the TEMPLATE, not prose written per
-/// cut, so every future release carries it without anyone remembering to.
-///
-/// Only the release body gets the preamble. The manifest's `changelog` and the
-/// in-app Software Update notes stay the rolled section verbatim (spec §3) —
-/// an installed copy already knows what aterm is.
-///
-/// ONE macOS download: the guide names exactly the lean DMG, the zip, the
-/// evergreen aliases and the sidecars — nothing this release does not carry.
+/// The /releases page is also the front door for people who have never heard of aterm,
+/// so the preamble explains the assets; it is part of the template, so every release
+/// carries it. Only the release body gets it: the manifest's `changelog` and the in-app
+/// notes stay the rolled section verbatim. The guide names exactly this release's assets:
+/// the lean DMG, the zip, the evergreen aliases and the sidecars.
 pub fn release_notes_document(version: &str, changelog_body: &str) -> String {
-    // No sizes: GitHub lists each asset's real size beside it, and a label here
-    // goes stale as the app grows.
+    // No sizes: GitHub lists each asset's real size, and a label here goes stale.
     //
-    // THE BOUND IS TAKEN ON THE WHOLE DOCUMENT, not on `changelog_body` alone:
-    // the preamble is ~1.3 KB that the POST carries too, so bounding the body
-    // and then prefixing the preamble yields a document OVER the limit by the
-    // preamble's length — which is what the POST would then have to cut a
-    // second time. One bound, over exactly the bytes that get posted.
+    // The bound is taken on the whole document, which is what gets posted: bounding the
+    // body and then prefixing the ~1.3 KB preamble would overshoot by the preamble.
     bound_release_body(&format!(
         "**aterm** is the terminal for AI. New here? What each file is:\n\
          \n\
@@ -508,47 +471,25 @@ pub fn release_notes_document(version: &str, changelog_body: &str) -> String {
     ))
 }
 
-/// **GITHUB REFUSES A RELEASE BODY OVER THIS**, in characters, and says so only
-/// as an opaque `422` on the create POST.
-///
-/// MEASURED: a 225,061-byte body failed the draft POST with `curl: (22) … 422`
-/// while the identical request with a short body succeeded. The rolled section
-/// is pasted verbatim and grows every release.
-///
-/// COMPARED AGAINST [`github_length`], which counts UTF-16 code units — the
-/// safe reading of "characters" for an API that speaks JSON. `publish.rs` reads
-/// this too: the bound is taken at the POST as well as at the write, and a 422
-/// is diagnosed against it.
+/// GitHub refuses a release body over this many characters ([`github_length`]), as an
+/// opaque `422` on the create POST; the rolled section grows every release. `publish.rs`
+/// bounds at the POST too and diagnoses a 422 against it.
 pub const GITHUB_RELEASE_BODY_LIMIT: usize = 125_000;
 
-/// What GitHub is counting when it says "maximum is 125000 characters".
-///
-/// NOT bytes: `str::len()` cuts notes GitHub would have taken, and a raw byte budget cannot be used
-/// as a slice index at all: `&body[..124_767]` PANICS when that byte is in the middle of an em
-/// dash, which this repo's changelog is full of.
-///
-/// UTF-16 code units are the safe reading of "characters" for an API that
-/// speaks JSON: it equals the scalar count for everything in the BMP and
-/// counts an astral scalar (an emoji) as the surrogate pair a UTF-16 counter
-/// sees. Where the two readings differ this one is the larger, so a body that
-/// passes here passes under either.
+/// What GitHub counts against "maximum is 125000 characters": UTF-16 code units, the safe
+/// reading for a JSON API. It equals the scalar count in the BMP and counts an astral
+/// scalar as two, so it is never the smaller reading. Not bytes: those cut notes GitHub
+/// would take, and a byte budget is no slice index (it can land inside an em dash).
 fn github_length(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }
 
-/// The changelog body as GitHub will accept it: verbatim when it fits, and
-/// otherwise cut at the last SECTION BOUNDARY that does, with a pointer to the
-/// full text in the repository.
+/// The changelog body as GitHub will accept it: verbatim when it fits, otherwise cut at the
+/// last section boundary that does, with a tail naming what was dropped and where to read
+/// it (a body ending mid-sentence reads as corruption).
 ///
-/// Cutting at a boundary rather than a character count is the point — a release
-/// body that ends mid-sentence reads as corruption, and a reader cannot tell a
-/// truncation from a bug. The tail names what was dropped and where to read it,
-/// so the body is honest about being partial.
-///
-/// IDEMPOTENT, and that is load-bearing: `publish.rs` bounds again at the POST,
-/// over a file this function already wrote. A body within the limit is returned
-/// verbatim, so the second application changes nothing — otherwise every
-/// resumed cut would saw another section off its own notes.
+/// Idempotent, which is load-bearing: `publish.rs` bounds again at the POST over a file
+/// this already wrote, so a body within the limit passes through unchanged.
 #[must_use]
 pub fn bound_release_body(body: &str) -> String {
     if github_length(body) <= GITHUB_RELEASE_BODY_LIMIT {
@@ -559,9 +500,8 @@ pub fn bound_release_body(body: &str) -> String {
                 rest of this release's changelog is in `CHANGELOG.md` in the source tree at \
                 this tag.*\n";
     let budget_units = GITHUB_RELEASE_BODY_LIMIT.saturating_sub(github_length(tail));
-    // Walk to the byte index that spends the budget. `char_indices` only ever
-    // yields a boundary, so every index below is a legal slice point — the
-    // panic the byte budget could reach is unreachable by construction.
+    // Walk to the byte index that spends the budget: `char_indices` yields only
+    // boundaries, so every index below is a legal slice point.
     let mut budget = body.len();
     let mut spent = 0usize;
     for (at, ch) in body.char_indices() {
@@ -571,8 +511,8 @@ pub fn bound_release_body(body: &str) -> String {
         }
         spent += ch.len_utf16();
     }
-    // The last section heading that still fits, so the body ends on a whole
-    // entry. `rfind` returns the index OF the newline, itself a boundary.
+    // The last section heading that still fits, so the body ends on a whole entry; `rfind`
+    // returns the newline's index, itself a boundary.
     let head = &body[..budget];
     let cut = head
         .rfind("\n### ")
@@ -585,11 +525,7 @@ pub fn bound_release_body(body: &str) -> String {
 mod release_body_bound_tests {
     use super::{GITHUB_RELEASE_BODY_LIMIT, bound_release_body, release_notes_document};
 
-    /// **AND ONE THAT DOES NOT FIT ENDS ON A WHOLE ENTRY**, under the limit,
-    /// saying so.
-    ///
-    /// THE TWIN: return `body.to_string()` unconditionally and the length
-    /// assertion goes red (the opaque `422` on an oversized draft POST).
+    /// One that does not fit ends on a whole entry, under the limit, saying so.
     #[test]
     fn an_oversized_body_is_cut_at_a_section_and_says_it_was() {
         let entry = "### Section\n\n- an entry long enough to matter, repeated to overflow\n\n";
@@ -616,22 +552,13 @@ mod release_body_bound_tests {
         );
     }
 
-    /// **THE BUDGET INDEX LANDS INSIDE A CHARACTER AND NOTHING PANICS.**
-    ///
-    /// The first cut of this bound sliced `&body[..budget]` at a raw byte
-    /// count. `&str` indexing panics off a char boundary, so a release whose
-    /// notes happened to carry a multi-byte character across that one index
-    /// would have aborted the cut — in the POST path, after the claim.
-    ///
-    /// THE TWIN: restore the byte slice and this goes from green to a panic,
-    /// which is why the fixture pads with a single ASCII run and then lays em
-    /// dashes across the whole budget neighbourhood rather than trusting one
-    /// guessed offset.
+    /// A budget that lands inside a multi-byte character does not panic: em dashes cover
+    /// the whole budget neighbourhood across several pads, rather than one guessed offset.
     #[test]
     fn a_cut_that_falls_inside_a_character_does_not_panic() {
         for pad in 0..8usize {
-            // Em dashes are 3 bytes and 1 UTF-16 unit, so the byte index the
-            // old code computed drifts off a boundary for most `pad` values.
+            // Em dashes are 3 bytes and 1 UTF-16 unit, so a byte index would fall off a
+            // char boundary for most `pad` values.
             let body = format!(
                 "### Section\n\n{}{}\n",
                 "a".repeat(pad),
@@ -646,9 +573,7 @@ mod release_body_bound_tests {
         }
     }
 
-    /// **THE LIMIT IS COUNTED THE WAY GITHUB COUNTS IT.** A body of em dashes
-    /// is three times its character count in bytes; bounding on bytes would
-    /// throw away roughly two thirds of notes GitHub would have accepted.
+    /// The limit counts characters, not bytes: em dashes are three bytes each.
     #[test]
     fn the_limit_counts_characters_not_bytes() {
         let body = "—".repeat(GITHUB_RELEASE_BODY_LIMIT - 1);
@@ -664,11 +589,8 @@ mod release_body_bound_tests {
         );
     }
 
-    /// The WHOLE document — preamble plus body — also lands under the limit,
-    /// because the preamble is what the POST carries too.
-    ///
-    /// EXACTLY the limit, with no slack: GitHub counts the document, not the
-    /// section inside it.
+    /// The whole document, preamble plus body, lands under the limit: GitHub counts the
+    /// document, not the section inside it.
     #[test]
     fn the_assembled_document_fits_what_github_accepts() {
         let body = "### Section\n\n- entry\n\n".repeat(6000);
@@ -681,12 +603,8 @@ mod release_body_bound_tests {
         );
     }
 
-    /// **BOUNDING AN ALREADY-BOUNDED BODY IS A NO-OP**, byte for byte.
-    ///
-    /// This is what lets the guard sit at the POST as well as at the write
-    /// without the two fighting: the POST re-bounds whatever it reads off disk
-    /// — a file written by an older binary, a resumed cut, a hand-edited one —
-    /// and a file this binary wrote passes through untouched.
+    /// Bounding an already-bounded body is a no-op, byte for byte, so the POST can re-bound
+    /// whatever it reads off disk.
     #[test]
     fn bounding_an_already_bounded_body_changes_nothing() {
         let overflowing = "### Section\n\n- an entry long enough to matter\n\n".repeat(5000);
@@ -694,16 +612,14 @@ mod release_body_bound_tests {
         let once = bound_release_body(&overflowing);
         let twice = bound_release_body(&once);
         assert_eq!(once, twice, "the bound is not idempotent");
-        // And the same for the assembled document, which is what dist/notes-*.md holds.
+        // And for the assembled document (what `dist/notes-*.md` holds).
         let doc = release_notes_document("0.87.0", &overflowing);
         assert_eq!(doc, bound_release_body(&doc));
     }
 }
 
-/// Today's date in America/Los_Angeles as `YYYY-MM-DD` — exact parity with
-/// prepare-release.sh (`TZ=America/Los_Angeles date +%Y-%m-%d`). Shelling out
-/// to `date(1)` is deliberate: the alternative is hand-rolling US DST rules
-/// in-process, a whole failure class for one cosmetic heading date.
+/// Today's date in America/Los_Angeles as `YYYY-MM-DD`. Shells out to `date(1)` on purpose:
+/// the alternative is hand-rolled US DST rules for one heading date.
 pub fn today_la() -> Result<String> {
     let out = Command::new("/bin/date")
         .env("TZ", "America/Los_Angeles")
@@ -731,11 +647,9 @@ pub fn today_la() -> Result<String> {
     Ok(date)
 }
 
-/// 0-based (start, end) line indices of a section: `start` is the `## [name]`
-/// header line, `end` the next `## [` heading (or one past the last line).
-/// The `'''` gate uses it to attribute file line numbers; the span matches
-/// [`rolled_body`]'s extraction span — the scan must cover exactly the bytes
-/// that would ship.
+/// 0-based (start, end) line indices of a section: `start` is the `## [name]` header, `end`
+/// the next `## [` heading (or one past the last line). The same span as [`rolled_body`]'s,
+/// so the `'''` scan covers exactly the bytes that would ship.
 fn section_span(text: &str, section: &str) -> Option<(usize, usize)> {
     let header = format!("## [{section}]");
     let lines: Vec<&str> = text.lines().collect();
@@ -762,9 +676,9 @@ mod tests {
         );
     }
 
-    /// Main moved after the publish: what the published commit carried ships,
-    /// what peers added stays unreleased under its own heading — an entry whose
-    /// text a peer EDITED is a new entry, so its new text stays and its old ships.
+    /// Main moved after the publish: what the published commit carried ships, what was
+    /// added after stays unreleased, and an edited entry's new text stays while its old
+    /// text ships.
     #[test]
     fn roll_shipped_keeps_what_peers_added_after_the_publish_unreleased() {
         let main = SOURCE
@@ -782,7 +696,7 @@ mod tests {
              ## [0.92.0] - 2026-09-23\n\n### Fixed\n\n- **One** — shipped.\n  A continuation line.\n\n\
              - **Two** — shipped.\n\n## [0.91.0] - 2026-09-22\n\n- older.\n"
         );
-        // NEGATIVE CONTROL: the plain roll of main would ship the peers' entries.
+        // Negative control: the plain roll of main would ship the peers' entries.
         let plain = roll(&main, "0.92.0", "2026-09-23").unwrap();
         assert!(
             rolled_body(&plain, "0.92.0").unwrap().contains("a peer's"),

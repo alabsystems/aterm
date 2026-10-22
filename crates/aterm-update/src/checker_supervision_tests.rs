@@ -896,8 +896,7 @@ fn a_holder_still_checking_is_never_called_stopped() {
         vec![crate::checker_watch::CHECKER_LOCK_WAIT; usize::try_from(cycles).unwrap()],
         "every cycle waits the loop's bound at the gate"
     );
-    // Said once the holder stops, and not before: the one line that calls it
-    // stopped comes after the cycles it was seen working.
+    // Said once, after the cycles the holder was seen working.
     let said: Vec<_> = lines
         .iter()
         .filter(|(_, line)| line.starts_with("update check without the checker lock"))

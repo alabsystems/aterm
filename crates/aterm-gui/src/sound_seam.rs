@@ -250,11 +250,9 @@ mod tests {
         assert_eq!(seam_field(sound_seam(&engine_and_knob)), "closed:trail-off");
     }
 
-    /// THE VERB AND THE KEY PATH SHARE ONE TABLE. `keystroke_click_audible`
-    /// is the same function with the host, trail, focus and engine terms
-    /// PINNED OPEN — and this pins that the rewrite did not change what the
-    /// key path decides, by checking it against the legacy five-term AND over
-    /// the whole cartesian product.
+    /// The verb and the key path share one table: `keystroke_click_audible` is
+    /// [`sound_seam`] with the trail, focus and engine terms pinned open and the host read
+    /// only as inert or not, checked against that five-term AND over the whole product.
     #[test]
     fn the_push_decision_is_the_seam_with_host_and_engine_pinned_open() {
         for sounds_on in [false, true] {

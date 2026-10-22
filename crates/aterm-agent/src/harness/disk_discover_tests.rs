@@ -1134,14 +1134,9 @@ fn at_low_an_ended_sessions_build_goes_whole_and_no_recent_profile_is_a_row() {
     );
 }
 
-/// WHAT KEEPS A WHOLE DIRECTORY: a live session, a session whose build ran
-/// two hours ago (its profile's clock is a write of the session's), a build
-/// holding a lock — each is judged as any other build directory then (its
-/// idle and least-recently-used caches only), and of a gone owner's the
-/// report says why it does not go whole. And at the REMOVAL: a build that
-/// took a lock since the survey and a session resumed since (its registry
-/// record back) each refuse it, nothing deleted; NEGATIVE CONTROL, with the
-/// record gone again the same row goes.
+/// A live session, a recent build or a held lock keeps the whole directory (it is judged as
+/// any other, and the report says why); at the removal a lock taken or a session resumed
+/// since refuses it. Negative control: with the record gone again the row goes.
 #[test]
 fn a_live_owner_a_held_lock_or_a_recent_build_keeps_the_whole_directory() {
     let tmp = Tmp::new("discover-keep");

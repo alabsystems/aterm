@@ -4,21 +4,18 @@
 //! The sparkle-words genome (docs/sparkle-words-v2-design.md §3): the
 //! deterministic (word form, surrounding words) → effect-parameters channel.
 //!
-//! * **`simhash_ctx`** (§3.2): a weighted SimHash over the ±4 reading-order
-//!   neighbour tokens plus the word's own `form_hash`. Editing one nearby word
-//!   flips only the bits where that voter was pivotal, so similar sentences
-//!   give similar genomes. Allocation-free (the caller passes resident scratch:
-//!   [`VoteScratch`] and two `String`s); runs only on a persist-map miss, never
-//!   per frame.
-//! * **`gray_decode` / `field`** (§3.3): features are disjoint bit fields of
-//!   `gkey = seed ^ ctx_fp`, each Gray-decoded, so a context edit never crosses
-//!   a field boundary and a bit-0 flip moves a feature exactly ±1 step (pinned
-//!   by `gray_decode_locality`).
-//! * **cat / nova features** (§3.4): decoded on demand, never stored; the
-//!   decoders return indices and scalars, the palettes live elsewhere.
+//! * **`simhash_ctx`** (§3.2): a weighted SimHash over the ±4 reading-order neighbour tokens
+//!   plus the word's own `form_hash`. Editing one nearby word flips only the bits where that
+//!   voter was pivotal, so similar sentences give similar genomes. Allocation-free (the caller
+//!   passes resident scratch); runs only on a persist-map miss, never per frame.
+//! * **`gray_decode` / `field`** (§3.3): features are disjoint Gray-decoded bit fields of
+//!   `gkey = seed ^ ctx_fp`, so a context edit never crosses a field boundary and a bit-0 flip
+//!   moves a feature exactly ±1 step.
+//! * **cat / nova features** (§3.4): decoded on demand, never stored; the decoders return
+//!   indices and scalars, the palettes live elsewhere.
 //! * **`cat_magic` / `nova_magic`** (§3.5): the rare-variant channel,
-//!   `magic = mix(ctx_fp ^ form_hash ^ SALT)`, with no indent, column or row
-//!   folded in, so the same sentence gives the same outcome at any indentation.
+//!   `magic = mix(ctx_fp ^ form_hash ^ SALT)`, with no indent, column or row folded in, so the
+//!   same sentence gives the same outcome at any indentation.
 
 use aterm_lexicon::{Class, fold_into, is_interior_joiner, is_token_char};
 
@@ -36,7 +33,7 @@ pub struct Genome {
     pub magic: u64,
 }
 
-/// §3.5 magic-channel salt (`0x5EED_CA71_5EED_CA71` — "seed cat, seed cat").
+/// §3.5 magic-channel salt ("seed cat, seed cat").
 pub const MAGIC_SALT: u64 = 0x5EED_CA71_5EED_CA71;
 
 /// splitmix64 finalizer — decorrelates adjacent seeds and never returns 0.
@@ -80,11 +77,9 @@ pub const SIMHASH_KERNEL: SimhashKernel = SimhashKernel::BitSliced;
 /// §3.2 kernel selector — see [`SIMHASH_KERNEL`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SimhashKernel {
-    /// The §3.2 vote loop (`votes: [i32; 64]`) — the oracle. Selected only if
-    /// [`SIMHASH_KERNEL`] is flipped back (certificate-red fallback).
+    /// The §3.2 vote loop (`votes: [i32; 64]`): the oracle and the certificate-red fallback.
     Reference,
-    /// The v2.1 carry-save-adder network (§3.2 bit-sliced note) — shipped
-    /// under its green §7.5 equivalence certificate.
+    /// The carry-save-adder network, shipped under its §7.5 equivalence certificate.
     BitSliced,
 }
 
@@ -110,11 +105,10 @@ pub fn simhash_ctx(
     }
 }
 
-/// Context fingerprint, reference kernel: weighted SimHash over up to 4 tokens
-/// each side of the match span `[start, end)` (char indices into `chars`, one
-/// physical row) plus the match's `form_hash` at weight 3. `tok`/`folded` are
-/// resident scratch, so nothing allocates after warmup. Runs only on a
-/// persist-map miss.
+/// Context fingerprint, reference kernel: weighted SimHash over up to 4 tokens each side of the
+/// match span `[start, end)` (char indices into `chars`, one physical row) plus the match's
+/// `form_hash` at weight 3. `tok`/`folded` are resident scratch, so nothing allocates after
+/// warmup.
 pub fn simhash_ctx_reference(
     chars: &[char],
     start: usize,
@@ -127,7 +121,7 @@ pub fn simhash_ctx_reference(
     let votes = &mut votes.0;
     votes.fill(0);
     cast_vote(votes, form_hash, FORM_WEIGHT);
-    // Right side: d = 1..=4 counts COLLECTED tokens; the alphabetic/length
+    // Right side: d = 1..=4 counts collected tokens; the alphabetic/length
     // filter then decides which of them actually vote (§3.2 order of clauses).
     let mut pos = end;
     for w in CTX_WEIGHTS {
@@ -259,20 +253,15 @@ fn token_left(chars: &[char], mut pos: usize) -> Option<(usize, usize)> {
 
 // ──────────── Bit-sliced kernel (certificate-gated) ────────────
 //
-// The reference vote loop as a carry-save-adder network over u64 lanes: lane i
-// of every word is bit i of the fingerprint, so all 64 majority columns are
-// computed at once. Weights {4, 3, 2, 1} split into three bit-planes (≤ 3 / ≤ 5
-// / ≤ 2 inputs feeding a 5-bit-per-lane CSA), and the signed majority
-// `vote[i] >= 0` is taken as the unsigned threshold `2·S ≥ W` (S = per-lane sum
-// of present set-bit weights, W = present weight total; ties → 1, as in the
-// reference).
+// The reference vote loop as a carry-save-adder network over u64 lanes: lane i of every word is
+// bit i of the fingerprint, so all 64 majority columns are computed at once. Weights {4, 3, 2, 1}
+// split into three bit-planes, and the signed majority `vote[i] >= 0` becomes the unsigned
+// threshold `2·S ≥ W` (S = per-lane sum of present set-bit weights, W = present weight total).
 //
-// Lane independence: every op on voter data is lane-wise bitwise (XOR/AND/OR/
-// NOT); no add, sub or shift touches voter words, so no carry crosses lanes and
-// the single-column certificate
-// (`proofs/ay/sparkle_v2/simhash_column_lemma.smt2`) lifts to all 64 lanes.
-// `W`/`T` are scalars from the presence mask; threshold bits enter the lanes as
-// broadcast masks.
+// Lane independence: every op on voter data is lane-wise bitwise; no add, sub or shift touches
+// voter words, so no carry crosses lanes and the single-column certificate
+// (`crates/aterm-spec-models/proofs/ay/sparkle_v2/simhash_column_lemma.smt2`) lifts to all 64
+// lanes. `W`/`T` are scalars from the presence mask, broadcast into the lanes as masks.
 
 /// The §3.2 voter slots in fixed order: `[form(3), right d1..4 (4,2,2,1),
 /// left d1..4 (4,2,2,1)]`.
@@ -357,7 +346,6 @@ pub fn simhash_majority_bitsliced(v: &VoterSet) -> u64 {
     }
     let t = (w_total + 1) >> 1; // 0..=11
     // Lane-wise "S ≥ T" comparator, LSB→MSB: ge = (s_k ∧ ¬t_k) ∨ (¬(s_k ⊕ t_k) ∧ ge).
-    // The threshold bits are broadcast constant masks — no cross-lane carries.
     let mut ge = !0u64;
     for (k, s_k) in [s0, s1, s2, s3, s4].into_iter().enumerate() {
         let t_k = if (t >> k) & 1 == 1 { !0u64 } else { 0u64 };
@@ -453,7 +441,7 @@ pub fn gray_encode(b: u64) -> u64 {
 
 // ───────────────────── §3.4 feature tables (authoritative) ────────────────────
 
-/// Cat age band (§3.4 bits 10–11); `scale()` is the §3.4 body-scale column.
+/// Cat age band (v4 bits 13–14, [`cat_age_v4`]); `scale()` is the body scale.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CatAge {
     Kitten,
@@ -524,11 +512,8 @@ pub const fn nova_features(g: u64) -> NovaFeatures {
     }
 }
 
-/// Single-field nova decodes for per-frame sites that read one feature of a
-/// genome fixed for its episode: the burst-mutex predicate and residual-fade
-/// windows read `duration_ms`, the ember/ink tints `palette`, the ignition-grant
-/// radius `radius`, instead of the full [`nova_features`] decode. The
-/// expressions match the rows above and are pinned bit-for-bit by
+/// Single-field nova decodes for per-frame sites that read one feature of an episode's fixed
+/// genome, instead of the full [`nova_features`] decode. Pinned bit-for-bit to its rows by
 /// `nova_single_field_accessors_match_full_decode`.
 #[inline]
 pub const fn nova_duration_ms(g: u64) -> u32 {
@@ -566,11 +551,11 @@ pub enum CatMagic {
     Fortune,
     /// `magic % 4096 ∈ 8..12` — 1/1024.
     Nebula,
-    /// `magic % 4096 ∈ 12..=54` — 43/4096 ≈ 1/95 (v2.2). A COMPANION, not a
-    /// coat build: the genome coat AND pattern survive (§5.4 carve-out).
+    /// `magic % 4096 ∈ 12..=54` — 43/4096 ≈ 1/95. A companion, not a coat build: the genome's
+    /// coat and pattern survive (§5.4).
     Butterfly,
-    /// `magic % 4096 ∈ 55..=62` — 8/4096 = 1/512 (v2.2): pale-pink coat,
-    /// Solid, baked drifting petal specks.
+    /// `magic % 4096 ∈ 55..=62` — 8/4096 = 1/512: pale-pink coat, Solid, baked drifting petal
+    /// specks.
     Sakura,
 }
 
@@ -590,8 +575,7 @@ pub const fn cat_magic(magic: u64) -> Option<CatMagic> {
     match magic % 4096 {
         0..=7 => Some(CatMagic::Fortune),
         8..=11 => Some(CatMagic::Nebula),
-        // v2.2 windows, retuned against the usage model documented in §3.5
-        // (5–20 distinct rolls/day): butterfly ≈ 1/95, sakura = 1/512.
+        // Tuned against §3.5's usage model (5–20 distinct rolls/day).
         12..=54 => Some(CatMagic::Butterfly),
         55..=62 => Some(CatMagic::Sakura),
         _ => None,
@@ -642,14 +626,11 @@ pub fn cat_accessory(magic: u64) -> Option<Accessory> {
 
 // ──────────────────── Cat-art v4 genome selectors ────────────────────
 //
-// The v4 gkey layout (docs/cat-art-v4-design.md §3) maps the low bits onto the
-// authored-glyph roster: a variant picks a head, the coat/iris ramps recolour
-// the `Recolor::Coat`/`Recolor::Iris` layers, and the age band scales the body.
-// Same `field`/Gray decode:
+// The v4 gkey layout (docs/cat-art-v4-design.md §3), Gray-decoded by `field`:
 //
 //   | bits  | field   | maps to                                   |
 //   |-------|---------|-------------------------------------------|
-//   | 0–5   | variant | index into HEADS (25 authored heads)      |
+//   | 0–5   | variant | HEADS ticket                              |
 //   | 6–9   | coat    | COAT_RAMP index (Recolor::Coat layers)    |
 //   | 10–12 | iris    | EYE_RAMP index  (Recolor::Iris layers)    |
 //   | 13–14 | age     | body scale (0.82/0.93/1.04/1.15)          |
@@ -804,8 +785,8 @@ mod tests {
         simhash_ctx(&chars, s, e, form_hash, &mut votes, &mut tok, &mut folded)
     }
 
-    /// §13 `simhash_locality`: identical contexts ⇒ equal; editing one FAR
-    /// token ⇒ small Hamming distance; disjoint contexts ⇒ ~32 bits.
+    /// Identical contexts fingerprint equal, one far-token edit moves few bits, and disjoint
+    /// contexts differ by ~32.
     #[test]
     fn simhash_locality() {
         let form = mix(0xF0F0_1234);
@@ -822,8 +803,8 @@ mod tests {
             "one far-token edit must move few bits, moved {near}"
         );
 
-        // A fully disjoint context (different neighbors AND different form)
-        // decorrelates toward the 32-bit expectation.
+        // A fully disjoint context (different neighbours and form) decorrelates toward the
+        // 32-bit expectation.
         let d = fp_of(
             "crimson harbor lantern kitty velvet orchid thunder",
             "kitty",
@@ -852,9 +833,8 @@ mod tests {
         assert_eq!(a, b, "digit/punct churn must not move a single bit");
     }
 
-    /// `gray_decode_locality`: flipping bit 0 of a field moves it exactly ±1
-    /// step; flipping bit k is a bounded block reflection (mean |Δstep| under
-    /// the bound); no flip leaves its field.
+    /// Flipping bit 0 of a field moves it exactly ±1 step, flipping bit k a bounded mean
+    /// distance, and no flip leaves its field.
     #[test]
     fn gray_decode_locality() {
         let fields = all_fields();
@@ -893,7 +873,7 @@ mod tests {
                 mean <= bound,
                 "mean |Δstep| {mean:.3} exceeds pinned bound {bound:.3} at lo={lo} n={n}"
             );
-            // (c) no flip escapes its field: every OTHER field decodes unchanged.
+            // (c) no flip escapes its field: every other field decodes unchanged.
             for &g in &gkeys[..64] {
                 for k in 0..n {
                     let flipped = g ^ (1 << (lo + k));
@@ -973,7 +953,6 @@ mod tests {
         check("nebula", nebula, 4.0 / 4096.0);
         check("quasar", quasar, 8.0 / 4096.0);
         check("singularity", singularity, 4.0 / 4096.0);
-        // v2.2 windows (§3.5): butterfly 43/4096 ≈ 1/95, sakura 8/4096 = 1/512.
         check("butterfly", butterfly, 43.0 / 4096.0);
         check("sakura", sakura, 8.0 / 4096.0);
 
@@ -1205,9 +1184,7 @@ mod tests {
         assert_eq!(rays, (5, 8), "rays span 5..=8");
     }
 
-    /// The single-field nova accessors equal the matching rows of
-    /// [`nova_features`] bit-for-bit over the range test's `mix` stream
-    /// (`to_bits` on the radius).
+    /// The single-field nova accessors equal the matching [`nova_features`] rows bit-for-bit.
     #[test]
     fn nova_single_field_accessors_match_full_decode() {
         for i in 0..8192u64 {
@@ -1233,10 +1210,8 @@ mod tests {
         v
     }
 
-    /// The bit-sliced CSA kernel equals the reference over 10k random voter sets
-    /// plus edge cases: 0/1/9 voters, all-equal hashes, and tie patterns (where
-    /// a threshold off-by-one would hide). The ay QF_BV column lemma
-    /// (proofs/ay/sparkle_v2/) is the full-domain half.
+    /// The bit-sliced kernel equals the reference over 10k random voter sets plus edge cases:
+    /// 0/1/9 voters, all-equal hashes, and ties (where a threshold off-by-one would hide).
     #[test]
     fn simhash_bitsliced_equals_reference_over_voter_sets() {
         let eq = |v: &VoterSet, label: &str| {
@@ -1262,7 +1237,7 @@ mod tests {
             eq(&v, "1 voter");
             assert_eq!(simhash_majority_bitsliced(&v), v.hash[usize::from(s)]);
         }
-        // 9 voters, distinct hashes; and 9 voters, ALL-EQUAL hashes.
+        // 9 voters, distinct hashes; and 9 voters, all-equal hashes.
         for i in 0..64u64 {
             eq(&voter_set(0x1000 + i, 0x1FF), "9 voters");
             let mut v = voter_set(0, 0x1FF);
@@ -1290,8 +1265,8 @@ mod tests {
                 );
             }
         }
-        // Four-voter tie: form(3) + d4(1) against d1(4) with the form pair
-        // opposed — W = 8, per-bit sums hit exactly 2S = W where hashes align.
+        // A random four-voter set, and a weighted tie: form(3) + right d4(1) against right
+        // d1(4), W = 8, so every bit sums to exactly 2S = W.
         for i in 0..256u64 {
             let p = mix(0x4B1D ^ i);
             let mut v = VoterSet {

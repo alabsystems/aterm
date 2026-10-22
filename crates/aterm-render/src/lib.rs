@@ -29111,22 +29111,12 @@ mod tests {
         );
     }
 
-    /// **A CACHED FRAME HAS NO PAYLOAD, SO THE PAYLOAD IS NOT WHAT DECIDES.**
-    ///
-    /// `scroll_blit_plan` asks BOTH frames whether they are pure grid, and one
-    /// of the two is always the CACHED previous frame.
-    /// [`RenderInput::clone_damage_cache_from`] drops the payload of the four
-    /// cursor-effect streams and keeps only their compact metadata — that is
-    /// the whole point of the cache. So a predicate spelled
-    /// `prev.cursor_glow_add.is_empty()` answers "pure grid" for a previous
-    /// frame that was covered in glow, and the blit rigidly shifts a band of
-    /// pixels carrying an overlay it does not relocate: the glow rides the
-    /// scroll instead of staying with the cursor, and nothing re-rasters it
-    /// because those rows were declared retained.
-    ///
-    /// The fix is to ask [`EffectStreamDamage::was_empty`], which is what
-    /// survives the cache. This pins both arms so the cheap spelling cannot
-    /// come back.
+    /// `scroll_blit_plan` asks both frames whether they are pure grid, and one is
+    /// always the cached previous frame, whose cursor-effect payloads
+    /// [`RenderInput::clone_damage_cache_from`] drops. A predicate on
+    /// `prev.cursor_glow_add.is_empty()` would call a glow-covered frame pure
+    /// grid, and the blit would shift the glow with the scroll. The question is
+    /// [`EffectStreamDamage::was_empty`], which survives the cache.
     #[test]
     fn a_cached_frame_that_carried_a_glow_is_not_scroll_blittable() {
         let mut term = Terminal::new(6, 12);
@@ -30062,16 +30052,13 @@ mod tests {
         assert_eq!(ic.entries.len(), ImageCache::MAX_ENTRIES);
     }
 
-    /// THE FRAME KEEPS WHAT IT USES, as a bounded model of [`ImageCache`]'s use
+    /// The frame keeps what it uses, as a bounded model of [`ImageCache`]'s use
     /// order: the tick, the frame's first tick, and for two entries their
-    /// residency, last-use tick and a ghost flag for "the frame in progress
-    /// used it". `put`'s eviction is modelled as a permission — it may evict
-    /// any entry last used before the frame began — so the invariant holds for
-    /// every eviction order the budgets could choose. `Buggy` replays the frame
-    /// boundary this cache was first written with: `begin_frame` took no tick of
-    /// its own, so the entry the last frame used last kept its old tick through
-    /// its first use in the next frame and was evictable while that frame drew
-    /// it.
+    /// residency, last-use tick and a ghost flag for "the frame in progress used
+    /// it". `put`'s eviction is a permission (any entry last used before the
+    /// frame began), so the invariant holds for every eviction order. `Buggy`
+    /// is a `begin_frame` that takes no tick, which leaves the last frame's
+    /// last-used entry evictable while the next frame draws it.
     fn decode_cache_frame_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             DecodeCacheFrameWorkingSet {
@@ -30508,11 +30495,9 @@ mod tests {
         })
     }
 
-    /// The chain's per-script promise, MEASURED against the faces this host
-    /// actually has. Each script is checked only when the face that is supposed
-    /// to carry it is installed, so this never fails for a missing optional
-    /// font — it fails when a face IS present and the chain still cannot reach
-    /// it, i.e. when the scan stopped early.
+    /// Each script is checked only when the face meant to carry it is
+    /// installed, and fails when the face is there and the chain cannot reach
+    /// it.
     #[test]
     #[cfg(windows)]
     fn windows_fallback_chain_covers_the_scripts_it_claims() {
@@ -31361,15 +31346,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // ---- The SYMBOL tier is a CHAIN, and its backstop must be reachable ------
-    //
-    // `SYMBOL_FALLBACK_CANDIDATES` is a sequence: a dedicated symbol face, then
-    // a broad-symbol backstop. On a Linux desktop with `fonts-noto-core`,
-    // `NotoSansSymbols2-Regular.ttf` takes the first slot, so a loader that
-    // reads only the first entry never reaches DejaVu Sans. MEASURED through
-    // the renderer (two sealed generations, differenced over U+2000..U+2BFF,
-    // against every face a sealed renderer reaches): reaching the backstop
-    // resolves 309 more code points, 290 of them with real ink (⊨ ⋈ ⋱ ⩽ ⟹ ⨁).
+    // The symbol tier is a chain whose backstop must be reachable: on a Linux
+    // desktop with `fonts-noto-core`, `NotoSansSymbols2-Regular.ttf` takes the
+    // first slot, and reaching the DejaVu Sans backstop resolves 309 more code
+    // points in U+2000..U+2BFF (⊨ ⋈ ⋱ ⩽ ⟹ ⨁).
 
     // ---- Built-in Linux candidates mean the FACE, not Debian's path to it ----
     //
@@ -31817,20 +31797,12 @@ mod tests {
         );
     }
 
-    /// THE SAME DEFECT, REACHED THROUGH CONFIG. `fallback_fonts` is documented
-    /// as an ORDERED CHAIN ("most-preferred first",
-    /// `fallback_fonts = ["Sarasa Mono J", "Apple Symbols"]`), and
-    /// [`fallback_chain_order`] duly puts every config entry ahead of every
-    /// built-in one. But `build_fallback_chain` ended its scan at the first face
-    /// that was not an additive tier entry, and a CONFIG path is never in
-    /// [`NATIVE_SCRIPT_FALLBACK_CANDIDATES`] — so the FIRST config entry ended
-    /// the scan and everything behind it was orphaned: the user's own second
-    /// entry, and the whole built-in per-script chain with it.
-    ///
-    /// On Windows that is the Hangul tofu again, resurrected by one config line,
-    /// because Windows has no broad backstop to catch what the config face
-    /// misses. Here Arial is the config face: it covers Latin/Greek/Cyrillic/
-    /// Hebrew/Arabic but not one Hangul syllable.
+    /// `fallback_fonts` is an ordered chain, and [`fallback_chain_order`] puts
+    /// every config entry ahead of the built-ins. A config path is never in
+    /// [`NATIVE_SCRIPT_FALLBACK_CANDIDATES`], so `build_fallback_chain` must not
+    /// end its scan at it, or the user's later entries and the whole built-in
+    /// per-script chain are orphaned. Windows has no broad backstop, so that is
+    /// Hangul tofu: here the config face is Arial, which covers no Hangul.
     #[test]
     #[cfg(windows)]
     fn a_config_fallback_font_does_not_orphan_the_rest_of_the_chain() {
@@ -33447,7 +33419,7 @@ mod tests {
                 crate::font::FontSettings::default(),
             )
             .expect("the face parses");
-            // Latin-1 codepoints where fontdue's char lookup disagrees with Unicode.
+            // Latin-1 code points where the char lookup disagrees with Unicode.
             let mut diverged: Vec<(char, u16, u16)> = Vec::new();
             for cp in 0xA0u32..=0xFF {
                 let c = char::from_u32(cp).unwrap();
@@ -33968,13 +33940,10 @@ mod tests {
         );
     }
 
-    /// Emoji grapheme clusters (ZWJ family, skin-tone, keycap, flag) the colour
-    /// face ligates shape to ONE colour glyph (`RgbaGid`). Apple and Noto ligate
-    /// all four. Segoe UI Emoji ligates the keycap and the skin tone; it shaped
-    /// the family and a flag to several glyphs (measured 2026-09-27: 👨‍👩‍👧 drew
-    /// one man, 🇯🇵 a lone J), and what they resolve to there since the composite
-    /// is unmeasured, so the Windows arm holds the two it ligates. A non-emoji
-    /// cluster declines.
+    /// Emoji grapheme clusters (ZWJ family, skin tone, keycap, flag) the colour
+    /// face ligates shape to one colour glyph (`RgbaGid`). Apple and Noto ligate
+    /// all four; Segoe UI Emoji only the keycap and the skin tone, so the Windows
+    /// arm holds those two. A non-emoji cluster declines.
     #[test]
     fn emoji_clusters_shape_to_colour_glyphs() {
         require_host_colour_emoji();
@@ -37328,13 +37297,11 @@ mod tests {
         );
     }
 
-    /// `row_pixel_band` extends BOTH grid-edge bands over the chrome strips,
-    /// mirroring the GPU scissor + `stamp_free_sprites`: row 0 opens to the
-    /// window top (`y0 = 0`, over pad + head) and the LAST row runs to the
-    /// frame bottom (`y1 = h`, over the bottom pad strip — the strip the CPU
-    /// partial-copy presenter must ship when a free sprite spills below the
-    /// grid). Interior rows keep the exact cell band, and the identity layout
-    /// (pad 0, head 0) reproduces the historical bands byte-for-byte.
+    /// `row_pixel_band` extends both grid-edge bands over the chrome strips, as
+    /// the GPU scissor and `stamp_free_sprites` do: row 0 opens to the window top
+    /// and the last row runs to the frame bottom (the strip the CPU partial-copy
+    /// presenter ships when a free sprite spills below the grid). Interior rows
+    /// keep their cell band.
     #[test]
     fn row_pixel_band_extends_both_grid_edges() {
         let mut r = renderer();
@@ -37775,23 +37742,20 @@ mod tests {
     }
 
     /// The decision cache is bounded: once it would exceed `MAX_DECISIONS` it is
-    /// cleared wholesale, so an adversarial stream of distinct (uncovered)
-    /// noncharacter code points cannot grow it without bound. Drives only a few
-    /// past the cap (the bound logic is the same at any size) by temporarily
-    /// pre-filling the map.
+    /// cleared wholesale, so a stream of distinct uncovered code points cannot
+    /// grow it without bound.
     #[test]
     fn runtime_fallback_decision_cache_is_bounded() {
         let mut rf = RuntimeFallback::default();
-        // Pre-fill to exactly the cap with cheap dummy entries, then prove the next
-        // distinct lookup clears + re-seeds rather than growing past the cap.
+        // Pre-fill to the cap with dummy entries.
         for i in 0..RuntimeFallback::MAX_DECISIONS as u32 {
             if let Some(c) = char::from_u32(0xE000 + i) {
                 rf.decisions.insert(c, None);
             }
         }
         assert!(rf.decisions.len() >= RuntimeFallback::MAX_DECISIONS);
-        // A fresh noncharacter lookup trips the bound: the map is cleared and only
-        // this new decision remains.
+        // The next lookup trips the bound: the map is cleared and only the new
+        // decision remains.
         let ctx = FallbackProbeCtx {
             use_ct: false,
             primary_weight: 400,
@@ -39737,11 +39701,9 @@ mod comet_beam_tests {
         );
     }
 
-    /// EQUIVALENCE (the layered_beam_quads pre-simplify safety net):
-    /// [`rdp_keep_indices`] must keep EXACTLY the samples [`rdp_simplify`] keeps
-    /// when run on the same geometry — so simplifying the path ONCE and feeding
-    /// each bloom layer the pre-simplified verts is bit-identical to the old
-    /// per-layer RDP. Checked across paths, tolerances, and degenerate lengths.
+    /// [`rdp_keep_indices`] keeps exactly the samples [`rdp_simplify`] keeps on
+    /// the same geometry, so simplifying once for every bloom layer matches
+    /// per-layer RDP. Checked across paths, tolerances and degenerate lengths.
     #[test]
     fn rdp_keep_indices_matches_rdp_simplify() {
         let paths: &[Vec<(f32, f32)>] = &[

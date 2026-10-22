@@ -261,8 +261,8 @@ mod tests {
         }
     }
 
-    /// REPLACE — however the table spells it — must reach Metal as blending
-    /// DISABLED, and nothing else may.
+    /// REPLACE, however the table spells it, reaches Metal as blending
+    /// disabled, and nothing else does.
     #[test]
     fn only_replace_rows_disable_blending() {
         for row in ALL_PIPELINES {

@@ -777,9 +777,9 @@ impl App {
         self.palette_repaint_front();
     }
 
-    /// Activate the selected typed target. Menu rows retain the native-menu relay. Native
-    /// rows synchronously revalidate exact lifecycle identity and current enabled metadata;
-    /// a tab switch, detach, generation advance, or disabled command makes activation inert.
+    /// Activate the selected target. Menu rows take the native-menu relay; native rows
+    /// revalidate their identity and enabled state first, so a tab switch, detach, generation
+    /// advance or disabled command makes activation inert.
     pub(crate) fn palette_activate(&mut self) {
         let Some(target) = self
             .front()
@@ -1615,11 +1615,8 @@ mod tests {
         assert!(app.windows.get(&wid).unwrap().palette().is_none(), "closed");
     }
 
-    /// The join covers the find-again rows too: `find_next`/`find_prev` ship
-    /// UNSEEDED (F3 is owed to the program on the other side of the PTY), so
-    /// their rows are blank by default — and the moment a user binds them, the
-    /// palette says so. This is the new-vocabulary half of the F11 work: a
-    /// command that used to be menu-only now round-trips config → chord → row.
+    /// `find_next`/`find_prev` ship unseeded (F3 belongs to the program behind the PTY), so
+    /// their rows are blank until a user binds them, then show the chord.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn find_again_rows_show_a_user_bound_chord() {
@@ -2044,11 +2041,9 @@ mod tests {
         assert_eq!(card.scrim, None, "Choose Theme… previews undimmed");
     }
 
-    /// A theme change that is NOT an OS appearance flip — a colour-only config
-    /// reload, a theme-catalog reload, or a program's OSC 11 background — reaches
-    /// an OPEN overlay card: the palette's model fingerprint and the geometry are
-    /// unchanged, so the card cache must key on the theme it paints with, or it
-    /// keeps compositing the previous colours until the next keystroke.
+    /// A theme change that is not an OS appearance flip (a colour-only reload, a program's
+    /// OSC 11 background) repaints an open card: its cache keys on the theme it paints with,
+    /// since the palette model and geometry do not change.
     #[test]
     fn open_palette_card_re_rasterizes_on_a_live_theme_swap() {
         let mut app = App::headless_for_test();

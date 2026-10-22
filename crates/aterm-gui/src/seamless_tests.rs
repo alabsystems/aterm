@@ -236,21 +236,10 @@ pub(crate) fn run_in_children(marker: &str, children: usize) -> Vec<String> {
         .collect()
 }
 
-/// A REFUSED TARGET SAYS "A MOMENT" WITH ITS STATUS ONLY WHEN IT WAS ONE
-/// (round four of the 2026-09 update robustness work, plan item 2). The
-/// successor exits [`EXIT_SUCCESSOR_PASSING`] only for a refused target that
-/// is not this build, a boot apply that passed no verdict on the stage, and
-/// a parent that reads the status; every other combination — a verdict
-/// deferral, a rolled-back exec, an admitted target, the target naming this
-/// very build, a parent that never declared it reads 75 — keeps the
-/// ordinary refusal's `0`, which the parent files structural as before.
-///
-/// Round eight, #75, is the last three rows of the first loop: a swap that
-/// had nothing it may do now (`NoUpdate`: a sibling swapped the same build
-/// in while this launch waited for the lock; `NotApplicable`: the running
-/// build's own trial is still armed) and another install's trial holding
-/// the install (the boot apply's own refusal, passing-marked in
-/// `aterm-update`). RED before: all three exited `0` (`left: None`).
+/// Exit 75 needs all four facts [`passing_refusal_exit`] names, for each boot apply that
+/// passed no verdict on the stage (a passing deferral, `NoUpdate`, `NotApplicable`,
+/// another install's trial); a verdict on the stage, or `ReExecFailed`, keeps the
+/// ordinary refusal's `0`.
 #[cfg(unix)]
 #[test]
 fn a_target_refused_after_a_passing_deferral_exits_75() {
@@ -300,15 +289,11 @@ fn a_target_refused_after_a_passing_deferral_exits_75() {
     }
 }
 
-/// A SUCCESSOR WHOSE INTAKE REFUSED EVERY SESSION EXITS (round six of the
-/// update audit, item 18). The claim was granted, so the descriptor list and
-/// both overlap channels are in the environment; the manifest then names a
-/// different attempt, `take_incoming` refuses the whole handoff, and the
-/// readiness channel is refused for want of its nonce. With nothing adopted
-/// the boot used to take the cold path over the parked parent's sessions.
-///
-/// RED before the fix: the exit guard was `overlap_degraded &&
-/// !seamless_adopt.is_empty()`, false for exactly this boot.
+/// A successor whose intake refused every session exits rather than booting fresh over
+/// the parked parent's sessions. The claim was granted, so the descriptor list and both
+/// overlap channels are in the environment; `take_incoming` then refuses the whole
+/// handoff (here, a missing manifest), and the readiness channel is refused for want of
+/// its nonce.
 #[test]
 #[cfg(unix)]
 fn a_refused_intake_of_an_offered_handoff_exits_instead_of_booting_fresh() {
@@ -332,7 +317,7 @@ fn a_refused_intake_of_an_offered_handoff_exits_instead_of_booting_fresh() {
         overlap_intake_exits(true, incoming.adopted.len(), offered),
         "an offered handoff the intake refused must exit, not boot fresh"
     );
-    // Unchanged: adopted sessions under incomplete authority exit…
+    // Adopted sessions under incomplete authority exit…
     assert!(overlap_intake_exits(true, 3, false));
     // …an admitted overlap boots its adoption…
     assert!(!overlap_intake_exits(false, 3, true));
@@ -344,12 +329,9 @@ fn a_refused_intake_of_an_offered_handoff_exits_instead_of_booting_fresh() {
     assert_eq!(incoming.refusal, Some(WholeRefusal::Producer));
 }
 
-/// 0.98.0's reading of a candidate's death — the newest parent that exists,
-/// and so the only one that will ever hand off to the next release — copied
-/// from its source (`git show v0.98.0:crates/aterm-gui/src/app_native.rs`,
-/// `PhysicalFailureShape::of_child_death`): NO exit code is read. Its reject
-/// path keeps the counted trial launch exactly for a `Structural` death
-/// (`app_update_handoff.rs`, `forgives_the_counted_trial_launch`).
+/// 0.98.0's reading of a candidate's death, transcribed from its
+/// `PhysicalFailureShape::of_child_death`: it declares no exit capability and reads no
+/// exit code. Its reject path keeps the counted trial launch only for a `Structural` death.
 #[cfg(unix)]
 fn shipped_parent_reads(
     death: crate::ChildDeathEvidence,
@@ -378,10 +360,9 @@ fn shipped_parent_reads(
     }
 }
 
-/// The death a parent observes of a candidate that leaves as `leave` says:
-/// its own exit status, or — for a candidate that waits to be ended — the
-/// parent's own `SIGKILL` of a live process, which no parent (shipped or
-/// this build) can tell from anyone else's and records as `Unobserved`
+/// The death a parent observes of a candidate that leaves as `leave` says: its own exit
+/// status, or, for a candidate that waits to be ended, the parent's own `SIGKILL` of a
+/// live process, which no parent can tell from anyone else's and records as `Unobserved`
 /// (`app_update_handoff::handoff_child_death`).
 #[cfg(unix)]
 fn death_a_parent_observes(leave: RefusedIntakeLeave) -> crate::ChildDeathEvidence {
@@ -394,21 +375,12 @@ fn death_a_parent_observes(leave: RefusedIntakeLeave) -> crate::ChildDeathEviden
     }
 }
 
-/// NO SHIPPED PARENT IS SENT 75, AND NONE BLAMES THE BUILD FOR ITS OWN
-/// CONTENT (round eight of the update audit, finding 0). With nothing
-/// adopted and no declared capability — every launch a shipped parent makes
-/// — the candidate never exits with a status of its own, whatever the
-/// refusal: it leaves the ending to the parent, which 0.98.0 files
-/// `Unexplained` and forgives, exactly as it filed this refusal before round
-/// six made it exit. To a parent that declared the capability the round-six
-/// answers stand: 75 (transient in this build's reader) for the producer's
-/// content, the ordinary `0` for this build's own verdict. Adopted sessions
-/// leave as every build always has.
-///
-/// NEGATIVE CONTROL: the answer that shipped before this fix — 75 for the
-/// producer's content to any parent — is STRUCTURAL in 0.98.0's reader,
-/// which kept the counted launch: two retries latched the build and the next
-/// cold launch reverted it.
+/// No parent that did not declare the exit capability is sent 75, and none blames the build
+/// for its own content: with nothing adopted and no declared capability the candidate
+/// leaves the ending to the parent, which 0.98.0 files `Unexplained` and forgives. A
+/// declaring parent gets 75 (transient) for the producer's content and `0` for this
+/// build's own verdict. Negative control: 0.98.0 reads 75 as structural and keeps the
+/// counted launch.
 #[cfg(unix)]
 #[test]
 fn no_shipped_parent_is_sent_75_for_a_refused_intake() {
@@ -458,7 +430,7 @@ fn no_shipped_parent_is_sent_75_for_a_refused_intake() {
             );
         }
     }
-    // NEGATIVE CONTROL: the pre-fix answer, 75 to any parent.
+    // Negative control: 75 to any parent.
     assert_eq!(
         shipped_parent_reads(crate::ChildDeathEvidence::Exited {
             code: EXIT_SUCCESSOR_PASSING
@@ -527,16 +499,14 @@ fn the_exit_capability_is_declared_on_both_lanes_and_taken_by_the_successor() {
     }
 }
 
-/// THE REFUSING CANDIDATE WAITS FOR ITS PARENT, BOUNDED (round eight,
-/// finding 0). A parent that is gone — or none attested — ends the wait at
-/// once; a live one holds it to the bound and no longer. (macOS: the
-/// attestations are minted by the birth record, which is macOS's.)
+/// The refusing candidate waits for its parent, bounded: a gone or unattested parent
+/// ends the wait at once, a live one holds it to the bound and no longer. (macOS: the
+/// attestations come from the birth record.)
 #[cfg(target_os = "macos")]
 #[test]
 fn awaiting_the_parents_end_is_bounded_and_ends_with_the_parent() {
-    // The product's own bound, three minutes: a wait that sat it out instead
-    // of ending at once fails the hang detector (a minute) below, which is
-    // never a latency budget.
+    // The product's bound is three minutes: a wait that sat it out instead of ending
+    // at once fails the one-minute hang detector below.
     let started = std::time::Instant::now();
     assert_eq!(
         await_parents_end(None, PARENTS_END_BOUND),
@@ -562,17 +532,10 @@ fn awaiting_the_parents_end_is_bounded_and_ends_with_the_parent() {
     );
 }
 
-/// A REFUSED INTAKE OF THE PRODUCER'S CONTENT GIVES BACK ITS COUNTED TRIAL
-/// LAUNCH (round eight of the update audit, finding 0). The manifest's
-/// nonce line names another attempt — the outgoing build's content — so the
-/// real intake refuses it whole as the producer's; the boot sentinel,
-/// armed for the candidate's build in the suite's scratch update root, has
-/// counted this process's launch, as `check_boot_health` does at boot. On
-/// either leave that is no verdict on the bytes — the parent that reads 75,
-/// and the shipped parent that is left to end the candidate — the same
-/// give-back `main_entry` makes puts the count back where it was before the
-/// boot. RED before the fix: the refused-intake arm went straight to its
-/// exit, the count stayed advanced, and a shipped parent kept it too.
+/// A refused intake of the producer's content gives back its counted trial launch. The
+/// manifest's nonce line names another attempt, so the real intake refuses it whole as
+/// the producer's; on either leave that is no verdict on the bytes (`Passing`,
+/// `ParentEndsIt`) the give-back restores the boot sentinel's pre-boot count.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_refused_intake_of_the_producers_content_gives_back_its_counted_trial_launch() {
@@ -652,17 +615,12 @@ fn a_refused_intake_of_the_producers_content_gives_back_its_counted_trial_launch
     staged.teardown();
 }
 
-/// A pipe whose BOTH ends are close-on-exec from birth, as `(read, write)`.
+/// A pipe whose both ends are close-on-exec from birth, as `(read, write)`.
 ///
-/// The flag has to be carried by the syscall that creates the descriptors.
-/// A `pipe` + `F_SETFD` pair leaves a window in which a `posix_spawn` on
-/// another test thread — this binary launches copies of itself constantly —
-/// forks a child that inherits duplicates of both ends, and a duplicate
-/// WRITER is exactly what keeps a read end from ever reaching EOF, which is
-/// the witness every handoff-close test here rests on. `pipe2` closes the
-/// window where the platform has it; the two-step is the only spelling
-/// available elsewhere, and [`assert_peer_reaches_eof`]'s bound is sized to
-/// outlive an inherited duplicate rather than trip over one.
+/// The flag must come from the creating syscall: with `pipe` + `F_SETFD`, a `posix_spawn`
+/// on another test thread can inherit both ends, and a duplicate writer keeps the read end
+/// from ever reaching EOF, the witness every handoff-close test here rests on. Where
+/// `pipe2` is missing, [`assert_peer_reaches_eof`]'s bound outlives an inherited duplicate.
 #[cfg(unix)]
 fn cloexec_pipe() -> (i32, i32) {
     let mut fds = [-1i32; 2];
@@ -690,32 +648,16 @@ fn cloexec_pipe() -> (i32, i32) {
     (fds[0], fds[1])
 }
 
-/// Park a descriptor at a number no sibling test thread can be handed, and
-/// answer with that number. The kernel hands out the LOWEST free
-/// descriptor, so a slot claimed above the suite's whole working set is the
-/// caller's for as long as it holds it — the only way a handoff's fd-REUSE
-/// behaviour can be stated as a property at all in a binary that runs
-/// thousands of tests on parallel threads and spawns copies of itself,
-/// every one of those events opening and closing descriptors.
+/// Park a descriptor at a number no sibling test thread can be handed, and answer with
+/// that number: the kernel hands out the lowest free descriptor, so a slot above the
+/// suite's working set is the caller's while it holds it.
 ///
-/// The floor is read from the live `RLIMIT_NOFILE` rather than fixed,
-/// because the two facts that make a number unreachable differ by host. A
-/// slot just under the ceiling is unreachable BY CONSTRUCTION — a sibling
-/// only gets it once every lower number is taken, and then the caller's own
-/// `pipe` would already be failing. [`ISOLATED_FD_FLOOR`] caps the claim
-/// where the ceiling is enormous, so this never inflates the process fd
-/// table to half a million entries; there the reachability argument is the
-/// working set instead. Measured, this binary peaks at 589 open descriptors
-/// (highest number 592) across repeated full-suite runs, so the 4096 floor
-/// clears the working set by about sevenfold — headroom, and worth knowing
-/// as a number, because a future fd-hungry test spends it.
-///
-/// The claim is `F_DUPFD_CLOEXEC`, never `dup2`: it takes the lowest free
-/// number AT OR ABOVE the floor, so it can never silently replace a
-/// descriptor a neighbour is using, and the copy cannot leak through a
-/// concurrent spawn. `None` leaves the caller on an unisolated number, and
-/// every caller stays sound there because the assertions it guards are
-/// identity assertions, not number assertions.
+/// The floor is the live `RLIMIT_NOFILE` less headroom, capped at [`ISOLATED_FD_FLOOR`]. A
+/// slot just under the ceiling is unreachable by construction: a sibling gets it only once
+/// every lower number is taken, when the caller's own `pipe` would already fail.
+/// The claim is `F_DUPFD_CLOEXEC`, never `dup2`, so it never replaces a neighbour's
+/// descriptor. `None` leaves the caller on an unisolated number, which stays sound
+/// because the assertions it guards are about identity.
 #[cfg(unix)]
 fn claim_isolated_fd_slot(fd: i32) -> Option<i32> {
     let mut limit = libc::rlimit {
@@ -743,16 +685,15 @@ fn claim_isolated_fd_slot(fd: i32) -> Option<i32> {
     (claimed >= floor).then_some(claimed)
 }
 
-/// The cap on [`claim_isolated_fd_slot`]'s floor: high enough that no
-/// concurrent test in this binary reaches it, low enough that claiming it
-/// leaves the process fd table small.
+/// The cap on [`claim_isolated_fd_slot`]'s floor: high enough that no concurrent test in
+/// this binary reaches it (the full suite peaks under 600 open descriptors), low enough
+/// that claiming it leaves the process fd table small.
 #[cfg(unix)]
 const ISOLATED_FD_FLOOR: i32 = 4096;
 
-/// Arm a pipe read endpoint as the witness for its writer's close, and
-/// prove the witness can still say NO: while the named writer is live the
-/// empty peer is merely pending, so an EOF observed later can only be the
-/// close under test.
+/// Arm a pipe read endpoint as the witness for its writer's close, and prove the witness
+/// can still say no: while the named writer is live the empty peer is merely pending, so
+/// an EOF observed later can only be the close under test.
 #[cfg(unix)]
 fn arm_peer_eof_witness(peer: i32) {
     // SAFETY: `peer` is a live descriptor; F_GETFL only reads status flags.
@@ -777,21 +718,14 @@ fn arm_peer_eof_witness(peer: i32) {
     ));
 }
 
-/// The one sound witness that a handoff endpoint was CLOSED: its pipe peer
-/// reaches EOF. A numeric `F_GETFD` probe cannot say it — the number is
-/// free the instant the close lands, and in this threaded binary a
-/// neighbour can be holding it before the next instruction runs, so the
-/// number answers a question about a stranger's descriptor rather than
-/// about the open file description the handoff owned.
+/// The one sound witness that a handoff endpoint was closed: its pipe peer reaches EOF.
+/// A numeric `F_GETFD` probe cannot say it, since a neighbour thread can take the number
+/// the instant the close lands.
 ///
-/// The wait is generous rather than instantaneous to cover the platforms
-/// [`cloexec_pipe`] cannot arm atomically: a child forked in the window
-/// between the pipe and its `F_SETFD` inherits a duplicate writer and keeps
-/// it for its WHOLE life — `exec` closes only what is ALREADY marked
-/// close-on-exec — and this binary's spawned copies of itself live for
-/// seconds. POLLHUP is still the exact open-file-description witness, so
-/// the bound decides nothing but how long a genuinely missing close takes
-/// to report.
+/// The 30 s wait covers platforms where [`cloexec_pipe`] is not atomic: a child forked
+/// between the pipe and its `F_SETFD` holds a duplicate writer for its life, and this
+/// binary's spawned copies of itself live for seconds. The bound only decides how long a
+/// genuinely missing close takes to report.
 #[cfg(unix)]
 fn assert_peer_reaches_eof(peer: i32, subject: &str) {
     let mut pfd = libc::pollfd {
@@ -1012,11 +946,9 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
     }])
 }
 
-/// EXHAUSTIVE over all 256 env-presence combinations, because the cost of a
-/// wrong answer here is not a refused handoff: a successor that accepts a
-/// MIXED shape would read an fd NUMBER out of an environment whose process
-/// inherited no descriptors, and adopt whatever LaunchServices left at that
-/// index as a terminal master.
+/// Exhaustive over all 256 env-presence combinations: a successor that accepted a mixed
+/// shape would read an fd number from an environment that inherited no descriptors and
+/// adopt whatever LaunchServices left at that index as a terminal master.
 #[test]
 fn protocol_shape_table_accepts_exactly_the_two_legal_forms() {
     let shape = |bits: u16| HandoffEnvPresence {
@@ -1045,8 +977,7 @@ fn protocol_shape_table_accepts_exactly_the_two_legal_forms() {
             cfg!(target_os = "macos") && base && rendezvous && claim && !fds && !ready && !commit;
         assert_eq!(got, inherited || out_of_band, "shape bits {bits:08b}");
     }
-    // The two forms are disjoint and neither is empty, so the disjunction
-    // above is not quietly satisfied by one of them being unreachable.
+    // Each form is reachable (out-of-band on macOS), so the disjunction is not vacuous.
     assert!(handoff_is_modern_overlap(shape(0b0011_1111)));
     assert_eq!(
         handoff_is_modern_overlap(shape(0b1100_1101)),
@@ -1057,18 +988,6 @@ fn protocol_shape_table_accepts_exactly_the_two_legal_forms() {
         "a MIXED shape is a forgery or a bug, never a handoff"
     );
 }
-
-// Immutable bytes emitted by v0.52's `serialize_lines`. Plain lines use its
-// v3 record form: version, flags, LE content length, content, no attrs, zero
-// links. Screen metadata in that release had no `schema` field.
-// Actual v0.52 producer semantics at display_offset=1: it first serialized
-// all history, then `Grid::row(r)` appended the scrolled viewport
-// (`history-1`, `visible-0`) instead of the live (`visible-0`, `visible-1`).
-// Captured from v0.52's CheckpointMeta serializer for a terminal widened to
-// 24 columns, given a custom stop at column 22, then narrowed to 20 before
-// `visible-v052`. It has neither later saved-cursor field; the enclosing
-// ScreenCarry also had no schema key. The four retained off-width entries
-// are the real resize semantics the compatibility parser must preserve.
 
 #[test]
 fn a_carried_checkpoint_round_trips_its_scrollback_and_bounds_it() {
@@ -1097,8 +1016,7 @@ fn a_carried_checkpoint_round_trips_its_scrollback_and_bounds_it() {
         ),
         "the consumer must accept the shape the producer emits"
     );
-    // ...and rejects it when told the wrong history count, so the declared
-    // length is genuinely load-bearing rather than decorative.
+    // ...and rejects it under the wrong history count: the declared length is load-bearing.
     assert!(!checkpoint_grid_is_canonical(
         &carried.grid,
         carried.rows,
@@ -1112,7 +1030,7 @@ fn a_carried_checkpoint_round_trips_its_scrollback_and_bounds_it() {
         "history beyond the ceiling is refused before any decode"
     );
 
-    // THE POINT: restoring a carried checkpoint really does bring history back.
+    // Restoring a carried checkpoint brings the history back.
     let restored = Terminal::from_checkpoint(&carried);
     assert_eq!(
         restored.grid().scrollback_lines(),
@@ -1121,15 +1039,10 @@ fn a_carried_checkpoint_round_trips_its_scrollback_and_bounds_it() {
     );
 }
 
-/// The 2026-09-22 wedge's content trigger, end to end through this
-/// build's own wire predicate: a bold row filling all 149 columns of a
-/// 55x149 park with an NFD `e` + U+0301 (or a ZWJ `👨‍💻`) is 149 cells but
-/// 150 characters, and the strict line decoder compared the per-CHARACTER
-/// attrs RLE to the CELL cap, so the grid was "not canonical" and every
-/// in-session update refused while the row was on screen — for an
-/// alt-screen app's whole lifetime when it sat on the saved primary.
-/// Checked as the main grid and as the saved primary under 1049. Fails
-/// before the aterm-scrollback fix.
+/// A bold row filling all 149 columns of a 55x149 pane with an NFD `e` + U+0301 (or a ZWJ
+/// `👨‍💻`) is 149 cells but 150 characters. The strict line decoder must not compare the
+/// per-character attrs RLE to the cell cap, or every in-session update is refused while
+/// the row is on screen. Checked as the main grid and as the saved primary under 1049.
 #[test]
 fn a_full_styled_row_with_a_combining_mark_or_zwj_is_canonical_on_both_grids() {
     use aterm_core::terminal::Terminal;
@@ -1156,7 +1069,7 @@ fn a_full_styled_row_with_a_combining_mark_or_zwj_is_canonical_on_both_grids() {
         let restored = Terminal::from_checkpoint(&main);
         assert_eq!(restored.row_text(0), Some(row.clone()), "{cluster:?}");
 
-        // The same row on the SAVED PRIMARY while an alt-screen app runs.
+        // The same row on the saved primary while an alt-screen app runs.
         t.process(b"\x1b[?1049h");
         let under_alt = t.checkpoint_carry(0).expect("Ground");
         let saved = under_alt.alt_grid.as_ref().expect("saved primary");
@@ -1171,13 +1084,9 @@ fn a_full_styled_row_with_a_combining_mark_or_zwj_is_canonical_on_both_grids() {
     }
 }
 
-/// A session parked mid-sequence (`printf '\e]0;x'`, no terminator) once
-/// had no Ground carry at all, which refused every in-session update. It
-/// is carried WHOLE since the parser carry (the round-five plan's item
-/// 12), and admitted by this build's own wire predicate, including its
-/// `ParserNotGround` arm, which refuses only a parser left mid-sequence
-/// with nothing carried. A hooked DCS query — the one partial sequence no
-/// carry holds — is admitted through the abandoning carry, which records
+/// A session parked mid-OSC (`printf '\e]0;x'`) is carried whole by the parser carry and
+/// admitted: `ParserNotGround` refuses only a parser mid-sequence with nothing carried. A
+/// hooked DCS query, which no carry holds, is admitted through the abandoning carry with
 /// the cancelled (Ground) parser it restores into.
 #[test]
 fn a_session_parked_mid_osc_is_admitted_through_the_abandoning_carry() {
@@ -1201,8 +1110,8 @@ fn a_session_parked_mid_osc_is_admitted_through_the_abandoning_carry() {
     assert!(checkpoint_shape_refusal(0, &carry).is_none());
     assert!(screen_digest(&[(0, carry.clone())]).is_ok());
 
-    // NEGATIVE CONTROL: a parser left mid-sequence with nothing carried is
-    // still refused by name.
+    // Negative control: a parser left mid-sequence with nothing carried is still
+    // refused by name.
     let mut uncarried = carry;
     uncarried.parser_ground = false;
     assert_eq!(
@@ -1407,10 +1316,9 @@ fn a_meta_out_of_bounds_names_the_field_the_value_and_the_bound() {
     }
 }
 
-/// The per-grid ceiling is exact at half the aggregate (the 2026-09-22/23
-/// update audit, plan P0-4a: it was 256x128, and a full-screen 5K window is
-/// 99x338), a refusal names the ceiling that bound, and a refused admission
-/// leaves the aggregate untouched.
+/// The per-grid ceiling is exactly half the aggregate, a refusal names the ceiling that
+/// bound, and a refused admission leaves the aggregate untouched; the legacy ceiling
+/// refuses a full-screen 5K window (99x338) that the current one admits.
 #[test]
 fn decoded_cell_budget_accepts_exact_max_and_rejects_max_plus_one() {
     let (rows, cols) = (512_u16, 4096_u16);
@@ -1560,13 +1468,11 @@ fn a_rollback_to_a_relaxed_consumer_carries_the_exact_screen_and_history() {
     assert!(exports_for_target(running, running) && exports_held_for_target(running, running));
 }
 
-/// v0.91.0's strict line decoder, transcribed (`git show
-/// v0.91.0:crates/aterm-scrollback/src/line_codec_block.rs`,
-/// `decode_line_strict`): every record of a blob that this build decodes,
-/// with its attrs run lengths summed and compared against the COLUMN count.
-/// Written out here rather than borrowed from `WireCaps` so the rollback
-/// test below checks the carry against the older consumer's arithmetic,
-/// not against the function it is testing.
+/// v0.91.0's strict line decoder (`decode_line_strict` in its
+/// `aterm-scrollback/src/line_codec_block.rs`), transcribed: every record of a blob this
+/// build decodes, its attrs run lengths summed and compared against the column count.
+/// Written out rather than borrowed from `WireCaps` so the rollback test checks the
+/// carry against the older consumer's arithmetic, not the function under test.
 fn v0_91_line_decoder_admits(blob: &[u8], rows: u16, cols: u16, history: u32) -> bool {
     strict_grid_lines(blob, rows, cols, history).is_some_and(|lines| {
         lines.iter().all(|line| {
@@ -1595,18 +1501,10 @@ pub(super) fn v0_91_consumer_decodes(checkpoint: &TerminalCheckpoint) -> bool {
         .is_none_or(|alt| v0_91_line_decoder_admits(alt, checkpoint.rows, checkpoint.cols, 0))
 }
 
-/// THE ROLLBACK PROTECTION COVERS THE LINE DECODER TOO (the 2026-09-24
-/// review). This branch relaxed the strict line decoder (a line's attrs
-/// are bounded by its character count, not its columns) on the consumer
-/// side, and the producer judges a carry's shape with that same relaxed
-/// decoder. `WireCaps::legacy` changed only the per-grid cap, so on a
-/// rollback hop a full-width styled row holding `e` + U+0301 or a ZWJ
-/// cluster was carried at the Full rung to a v0.91.0 consumer that finds
-/// it non-canonical and refuses the WHOLE adoption — the "send a grid its
-/// consumer refuses" case the legacy caps exist to prevent.
-///
-/// RED on the code before the fix: every `legacy` assertion below came
-/// back `Full`, and the carry failed `v0_91_consumer_decodes`.
+/// This build's strict line decoder bounds a line's attrs by its character count; a
+/// v0.91.0 consumer bounds them by columns. So on a rollback hop a full-width styled row
+/// holding `e` + U+0301 or a ZWJ cluster must not go at Full: that consumer would refuse
+/// the whole adoption.
 #[test]
 fn a_rollback_never_sends_a_row_the_older_line_decoder_refuses() {
     use aterm_core::terminal::Terminal;
@@ -1615,8 +1513,8 @@ fn a_rollback_never_sends_a_row_the_older_line_decoder_refuses() {
         let fill = 149 - if cluster.starts_with('e') { 1 } else { 2 };
         let row = format!("\x1b[1m{}{cluster}\x1b[0m", "a".repeat(fill));
 
-        // On the VISIBLE grid: the forward hop carries it exactly; the
-        // rollback hop cannot carry it exactly at all.
+        // On the visible grid: the forward hop carries it exactly; the rollback
+        // hop cannot carry it exactly at all.
         let mut visible = Terminal::new(55, 149);
         visible.process(row.as_bytes());
         let (forward, rung, _) = carry_for_wire(&visible, 0, 0, &mut 0, WireCaps::current());
@@ -1630,14 +1528,14 @@ fn a_rollback_never_sends_a_row_the_older_line_decoder_refuses() {
         assert!(v0_91_consumer_decodes(&rollback), "{cluster:?}");
         assert!(screen_digest(&[(0, rollback)]).is_ok(), "{cluster:?}");
 
-        // On the SAVED PRIMARY under an alt-screen app: the same.
+        // On the saved primary under an alt-screen app: the same.
         visible.process(b"\x1b[?1049h");
         let (under_alt, rung, _) = carry_for_wire(&visible, 0, 0, &mut 0, WireCaps::legacy());
         assert_eq!(rung, CarryRung::Repaint, "{cluster:?}: saved primary");
         assert!(v0_91_consumer_decodes(&under_alt), "{cluster:?}");
 
-        // In SCROLLBACK only: the rollback hop drops the history and
-        // keeps the screen exact, one rung down, not a blank tab.
+        // In scrollback only: the rollback hop drops the history and keeps the
+        // screen exact, one rung down, not a blank tab.
         let mut scrolled = Terminal::new(4, 149);
         scrolled.process(row.as_bytes());
         scrolled.process(b"\r\n1\r\n2\r\n3\r\n4");
@@ -1649,15 +1547,11 @@ fn a_rollback_never_sends_a_row_the_older_line_decoder_refuses() {
     }
 }
 
-/// THE EXACT RUNGS ARE PRICED AS THE CONSUMER PRICES THEM (the 2026-09-24
-/// review). `carry_for_wire` charged every exact carry for an inactive
-/// grid whether or not the engine had one, while its Repaint rung,
-/// `screen_digest` and the successor all charge the real one. With the
-/// aggregate nearly spent that inverted the ladder: the exact visible
-/// screen (which both later checks admit) was refused, and the SAME
-/// session was carried blank at the SAME geometry and cost.
-///
-/// RED on the code before the fix: the first carry came back `Repaint`.
+/// The exact rungs are priced as the consumer prices them: the inactive grid is charged
+/// only when the engine has one, as the Repaint rung, `screen_digest` and the successor
+/// charge it. Charging it always would invert the ladder with the aggregate nearly
+/// spent: the exact visible screen refused, and the same session carried blank at the
+/// same geometry and cost.
 #[test]
 fn an_exact_carry_is_priced_as_the_consumer_prices_it() {
     use aterm_core::terminal::Terminal;
@@ -1688,9 +1582,8 @@ fn an_exact_carry_is_priced_as_the_consumer_prices_it() {
         "and the consumer's admission agrees"
     );
 
-    // With a real inactive grid the exact carry costs two screens, which
-    // does not fit — and the blank carry prices that grid too, so it
-    // shrinks rather than taking the same cost the exact one was refused.
+    // With an inactive grid the exact carry costs two screens and does not fit; the
+    // blank carry prices that grid too, so it shrinks.
     let mut on_alt = Terminal::new(100, 200);
     on_alt.process(b"\x1b[?1049h");
     let mut charged = spent;
@@ -1704,8 +1597,7 @@ fn an_exact_carry_is_priced_as_the_consumer_prices_it() {
     assert_eq!(charged - spent, wire_cells(&blank));
 }
 
-/// The pool `settle_wire_carries` is handed for `terminals`, as `Full`
-/// carries, and the metas' cost.
+/// The pool `settle_wire_carries` is handed for `terminals`, as `Full` carries.
 fn meta_pool(terminals: Vec<aterm_core::terminal::Terminal>) -> Vec<WireCarry> {
     terminals
         .into_iter()
@@ -1828,13 +1720,10 @@ fn colour_stacks_tab_stops_and_osc_payloads_are_shed_not_refused() {
     }
 }
 
-/// WITH NOTHING LEFT TO SHED, SCREENS ARE LOWERED, NOT THE UPDATE REFUSED
-/// (round eight, finding 51). Sixty-two one-row panes 4,096 columns wide on
-/// their alternate screens need a stop per column per cursor — no stop is
-/// past the width, so no shed applies — and together they are past the
-/// budget. The panes whose metas cost the most are carried blank at a
-/// smaller geometry (whose stops the shed then cuts); the rest keep their
-/// screens exactly.
+/// With nothing left to shed, screens are lowered rather than the update refused: 62
+/// one-row panes 4,096 columns wide on their alternate screens need a stop per column per
+/// cursor and together are past the budget. The costliest are carried blank at a smaller
+/// geometry; the rest keep their screens exactly.
 #[test]
 fn metas_past_every_shed_lower_screens_instead_of_refusing() {
     let terminals = (0..62)
@@ -2014,14 +1903,10 @@ fn an_oversized_manifest_degrades_sessions_instead_of_being_written() {
     );
 }
 
-/// A REFUSED WRITE SAYS WHY (the 2026-09-22/23 update audit, plan P1-2).
-/// The grid sidecar's name is occupied by a directory, so the filesystem
-/// refuses the write; the writer must hand that `io::ErrorKind` out as a
-/// typed [`WriteOutgoingFailure::Io`] — this process's failure, which the
-/// caller files `ProducerFailed` (Transient) — and leave no manifest behind.
-/// Before, every failure here was a bare `None` that became
-/// `PreparationFailed` (Structural), so a full boot volume latched the
-/// artifact manual-only after two attempts.
+/// A refused write says why: with the grid sidecar's name occupied by a directory, the
+/// writer hands the `io::ErrorKind` out as a typed [`WriteOutgoingFailure::Io`] (filed
+/// `ProducerFailed`, transient) and leaves no manifest. An untyped failure would be filed
+/// structural, so a full boot volume would latch the artifact manual-only.
 #[test]
 #[cfg(unix)]
 fn a_refused_grid_write_carries_its_io_error_kind_out() {
@@ -2209,19 +2094,10 @@ fn connections_give_way_before_held_panes_and_the_mailbox() {
     );
 }
 
-/// A HELD PANE THAT FITS THE EXCESS GOES BEFORE CONNECTIONS THAT DO NOT
-/// (the final review of U23's order, #908). Whether the connections alone
-/// can cover what is over is MEASURED, the manifest written with none of
-/// them: the per-row bound they are ranked by counts a row's framing a
-/// fifth high (64 bytes where the writer writes 43). One tab, one `--hold`
-/// pane whose entry alone outweighs the excess, and connection rows whose
-/// bound covers the excess and whose bytes do not: the pane goes, its
-/// placeholder shows, and every connection crosses. RED before (the
-/// decision read the bound): every row was left out, the manifest was
-/// still over, and the pane was dropped as well.
-///
-/// CONTROL, the same desk over by exactly the rows' measured bytes: the
-/// connections alone bring it under, so they go and the pane crosses.
+/// A held pane that covers the excess goes before connections that cannot. Whether they
+/// can is measured by writing the manifest without them, since their ranking bound
+/// overcounts a row's framing (64 bytes where the writer writes 43). Control: over by
+/// exactly the rows' measured bytes, the rows go and the pane crosses.
 #[test]
 #[cfg(unix)]
 fn connections_that_cannot_cover_the_excess_measured_are_kept() {
@@ -2292,8 +2168,8 @@ fn connections_that_cannot_cover_the_excess_measured_are_kept() {
         (outgoing, body.len() as u64, read)
     };
 
-    // MEASURED on a desk that fits: what the pane's entry weighs, and then
-    // what rows whose bound is half of it weigh.
+    // Measured on a desk that fits: what the pane's entry weighs, then what rows
+    // whose bound is half of it weigh.
     let (_, whole, read) = write(&manifest_with(Vec::new(), 0));
     assert_eq!(read.held.len(), 1, "PRECONDITION — the pane is carried");
     let pane = whole
@@ -2317,8 +2193,8 @@ fn connections_that_cannot_cover_the_excess_measured_are_kept() {
             ..read
         });
     let bound: u64 = rows.iter().map(connection_row_cost).sum();
-    // THE BAND: past what the rows weigh, within their bound, and within
-    // what the pane's entry frees.
+    // The band: past what the rows weigh, within their bound, and within what the
+    // pane's entry frees.
     let excess = real + (bound - real) / 2;
     assert!(
         real < excess && excess <= bound && excess <= pane,
@@ -2340,7 +2216,7 @@ fn connections_that_cannot_cover_the_excess_measured_are_kept() {
         "no connection is left out that the pane's going made unneeded"
     );
 
-    // CONTROL: over by exactly what the rows weigh.
+    // Control: over by exactly what the rows weigh.
     let (outgoing, written, read) = write(&manifest_with(
         rows.clone(),
         MAX_HANDOFF_MANIFEST_BYTES + real - whole,
@@ -2378,10 +2254,9 @@ fn malformed_named_fd_is_closed_on_authority_rejection() {
     let _restore_fds = RestoreVar::new(ENV_FDS);
     let _restore_manifest = RestoreVar::new(ENV_MANIFEST);
     let _restore_nonce = RestoreVar::new(ENV_NONCE);
-    // Keep the read endpoint and name the write endpoint. Observing the
-    // pipe peer proves that exact open-file description was closed; checking
-    // the numeric descriptor after close is racy because another parallel
-    // test may immediately reuse the number.
+    // Keep the read endpoint and name the write endpoint: the peer's EOF proves that
+    // open file description was closed, where a numeric check after the close races
+    // with parallel tests reusing the number.
     let (peer, named) = cloexec_pipe();
     assert!(
         peer >= 3 && named >= 3,
@@ -2409,15 +2284,12 @@ fn invalid_prearm_alias_closes_once_clears_authority_and_cannot_close_reused_fd(
     let _restore_ready = RestoreVar::new(ENV_READY_FD);
     let _restore_commit = RestoreVar::new(ENV_COMMIT_FD);
 
-    // Keep the read endpoint and hand over the WRITE endpoint: the peer's
-    // EOF is what proves the aliased open file description was closed.
+    // Keep the read endpoint and hand over the write endpoint: the peer's EOF is what
+    // proves the aliased open file description was closed.
     let (peer, writer) = cloexec_pipe();
-    // Everything this test says after the prearm is a statement about the
-    // NUMBER it handed over — that the close freed it, and that a resource
-    // put back at it survives — so the number has to be one no sibling
-    // thread can be handed while the test is running. The claim inherits
-    // close-on-exec from `F_DUPFD_CLOEXEC`, so the parked writer is no more
-    // inheritable than the pipe end it copies.
+    // Everything after the prearm is about the number handed over (the close freed
+    // it; a resource put back at it survives), so it must be one no sibling thread can
+    // be handed. The claim inherits close-on-exec from `F_DUPFD_CLOEXEC`.
     let isolated = claim_isolated_fd_slot(writer);
     let aliased = isolated.map_or(writer, |slot| {
         aterm_pty::close_fd(writer);
@@ -2429,8 +2301,8 @@ fn invalid_prearm_alias_closes_once_clears_authority_and_cannot_close_reused_fd(
     );
     arm_peer_eof_witness(peer);
 
-    // This is an otherwise recognizable v0.52 overlap shape, but READY
-    // aliases the PTY authority. A single fd cannot have two owners.
+    // An otherwise recognizable overlap shape, but READY aliases the PTY authority:
+    // a single fd cannot have two owners.
     aterm_log::env::set(ENV_MANIFEST, "/tmp/not-consumed-by-prearm");
     aterm_log::env::set(ENV_FDS, format!("7={aliased}:4242"));
     aterm_log::env::set(ENV_NONCE, "0123456789abcdef0123456789abcdef");
@@ -2453,19 +2325,13 @@ fn invalid_prearm_alias_closes_once_clears_authority_and_cannot_close_reused_fd(
         assert!(std::env::var_os(key).is_none(), "{key} cleared");
     }
 
-    // Reuse the exact numeric slot for an unrelated resource. A later
-    // authority parse sees no stale environment and therefore cannot close
-    // the replacement (the double-close/fd-reuse regression). The
-    // replacement is a pipe rather than an anonymous handle because its own
-    // peer is what turns "still open" into "still OURS".
+    // Reuse the numeric slot for an unrelated resource: a later authority parse sees
+    // no stale environment and so cannot close the replacement (the double-close /
+    // fd-reuse case). A pipe, because its own peer turns "still open" into "still ours".
     let (replacement_peer, replacement_writer) = cloexec_pipe();
-    // Reclaim with `F_DUPFD_CLOEXEC` at the freed number, never `dup2`:
-    // `dup2` installs unconditionally, so on a number this test does not own
-    // it would silently replace a descriptor a sibling is using — corrupting
-    // a neighbour in order to stage this one. `F_DUPFD` can only land on a
-    // FREE number, so an isolated slot is always reclaimed, while a
-    // fallback slot that lost its number simply reports a different one and
-    // leaves the identity arm below unrun rather than aimed at a stranger.
+    // Reclaim with `F_DUPFD_CLOEXEC`, never `dup2` (which would replace a sibling's
+    // descriptor). It lands only on a free number, so an isolated slot is always
+    // reclaimed and a fallback slot that lost its number skips the identity arm below.
     let reclaimed = unsafe { libc::fcntl(replacement_writer, libc::F_DUPFD_CLOEXEC, aliased) };
     aterm_pty::close_fd(replacement_writer);
     assert!(
@@ -2476,10 +2342,9 @@ fn invalid_prearm_alias_closes_once_clears_authority_and_cannot_close_reused_fd(
     assert!(take_incoming().adopted.is_empty());
 
     if reclaimed == aliased {
-        // IDENTITY, not liveness: the byte written through the reclaimed
-        // NUMBER has to arrive on the pipe kept here. A descriptor a stale
-        // handoff had closed — and the kernel then re-handed to a
-        // neighbour — passes an `F_GETFD` probe and fails this.
+        // Identity, not liveness: the byte written through the reclaimed number
+        // must arrive on the pipe kept here. A descriptor a stale handoff closed and
+        // the kernel re-handed to a neighbour passes an `F_GETFD` probe and fails this.
         assert_eq!(
             unsafe { libc::write(aliased, b"R".as_ptr().cast(), 1) },
             1,
@@ -2498,10 +2363,9 @@ fn invalid_prearm_alias_closes_once_clears_authority_and_cannot_close_reused_fd(
     aterm_pty::close_fd(peer);
 }
 
-/// `final_exec_env` is authority-gated exactly like `final_exec_fds`: only
-/// a VALID prearm with a validated parent yields the restoration pair, so
-/// a malformed handoff can never smuggle a parent-authority variable onto
-/// the exec image.
+/// `final_exec_env` is authority-gated like `final_exec_fds`: only a valid prearm with a
+/// validated parent yields the restoration pair, so a malformed handoff cannot smuggle a
+/// parent-authority variable onto the exec image.
 #[test]
 #[cfg(unix)]
 fn final_exec_env_requires_valid_parent_authority() {
@@ -2542,11 +2406,10 @@ fn final_exec_env_requires_valid_parent_authority() {
     assert!(prearm(false, true, None).is_empty());
 }
 
-/// The birth record crosses a process boundary as text, so its encoding is
-/// protocol. A value that does not round-trip would silently demote every
-/// modern handoff to the legacy witness; a malformed one must be refused
-/// outright rather than read as "absent" (see the `birth_present` arm of
-/// `prearm_incoming_fds`).
+/// The birth record crosses a process boundary as text, so its encoding is protocol: a
+/// value that did not round-trip would demote every modern handoff to the legacy witness,
+/// and a malformed one is refused outright, never read as absent (`prearm_incoming_fds`'s
+/// `birth_present` arm).
 #[test]
 #[cfg(unix)]
 fn process_birth_wire_round_trips_and_rejects_malformed_values() {
@@ -2881,20 +2744,13 @@ fn valid_overlap_prearm_scrubs_ambient_parent_but_restores_it_for_exec() {
     }
 }
 
-/// The readiness fd's fail-closed gauntlet: absent, garbage, stdio, and a
-/// TTY all yield `None` (the parked parent just times out + resumes — a
-/// spoof can only LOSE the signal), and the env var is cleared on read so
-/// it never leaks into shell children.
+/// The readiness fd's fail-closed gauntlet: absent, garbage, stdio and a TTY all yield
+/// `None` (the parked parent times out and resumes, so a spoof can only lose the
+/// signal), and the variable is cleared on read so it never leaks into shell children.
 ///
-/// `take_ready_fd` OWNS a live non-stdio descriptor before it judges it, so
-/// the tty it refuses is closed by the refusal itself, and this test never
-/// closes the number it hands over. It used to close that number once more
-/// after the refusal. The refusal had already freed it, the kernel hands
-/// the lowest free number to the next `pipe` or `open` on any thread, and
-/// so the second close shut whatever descriptor a concurrent test had just
-/// been given: an observer pipe in `app_input`'s PTY-silence tests then
-/// read EOF (0) where only EAGAIN (-1) is silence, from a pipe its own test
-/// had never closed.
+/// `take_ready_fd` owns a live non-stdio descriptor before it judges it, so the refused
+/// tty is closed by the refusal itself and this test never closes the number it hands
+/// over: a second close would shut whatever descriptor a concurrent test was just given.
 #[test]
 #[cfg(unix)]
 fn take_ready_fd_fails_closed() {
@@ -2928,10 +2784,9 @@ fn take_ready_fd_fails_closed() {
     // A real PTY master: the is_tty backstop must refuse it (a confused
     // wire must never let the readiness byte land in a shell's input).
     let (m, s) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-    // The refusal closes the number it is handed. Parked at a slot no
-    // sibling thread can be handed, that close is a fact about the number
-    // and is asserted below; without a slot the master's own number is
-    // handed over and the close goes unasserted rather than guessed at.
+    // The refusal closes the number it is handed. Parked at an isolated slot, that
+    // close is asserted below; without one the master's own number is handed over and
+    // the close goes unasserted.
     let isolated = claim_isolated_fd_slot(m);
     let named = isolated.map_or(m, |slot| {
         aterm_pty::close_fd(m);
@@ -2953,22 +2808,13 @@ fn take_ready_fd_fails_closed() {
     aterm_pty::close_fd(s);
 }
 
-/// THE FIELD FAILURE, pinned end to end (2026-08-25). A successor whose boot
-/// apply could not swap stays the OLD build, so `take_target_identity`
-/// returns `None` — and THIS is what the parked parent actually observes:
-/// `take_ready_fd` has already taken ownership of the readiness write end by
-/// the time it refuses, so refusing DROPS it, the pipe's last write end
-/// closes, and the parent's `wait_handoff_ready` reads EOF and books
-/// `ChildDied` against a build that never even started. (What `ChildDied`
-/// COSTS such a build is no longer decided by the outcome alone — see
-/// `crate::ChildDeathEvidence` — but the EOF this test pins is unchanged, and
-/// it is still the only thing the parent sees.)
-///
-/// The close is CORRECT and stays (a refused candidate must not sit on a
-/// live channel it will never write). What was wrong is that it was the only
-/// evidence produced anywhere: the refusal itself was `eprintln!`-only, and a
-/// LaunchServices-launched successor has no stderr. This test pins the
-/// mechanism so the next reader of a `ChildDied` verdict knows to look for a
+/// A successor whose boot apply could not swap stays the old build, so
+/// `take_target_identity` returns `None`. `take_ready_fd` already owns the readiness
+/// write end when it refuses, so the refusal drops it, the pipe's last write end closes,
+/// and the parent's `wait_handoff_ready` reads EOF and books `ChildDied` against a build
+/// that never started (what that costs the build is `crate::ChildDeathEvidence`'s
+/// business). The close is correct: a refused candidate must not sit on a live channel
+/// it will never write. Pinned so a reader of a `ChildDied` verdict knows to look for a
 /// wrong-build successor, not a crash.
 #[test]
 #[cfg(unix)]
@@ -2995,9 +2841,8 @@ fn a_refused_target_identity_closes_the_readiness_channel_as_child_death() {
         .is_none(),
         "a successor that is not the authorized build refuses the readiness channel"
     );
-    // The parent's side: no write end survives anywhere, so the read end is
-    // at EOF immediately — a 0-byte read, which `wait_handoff_ready` types as
-    // `ChildDied`.
+    // The parent's side: no write end survives anywhere, so the read end is at EOF
+    // at once, a 0-byte read that `wait_handoff_ready` types as `ChildDied`.
     let mut byte = [0u8; 1];
     // SAFETY: bounded read into a stack local on an fd this test owns.
     let read = unsafe { libc::read(rd, byte.as_mut_ptr().cast(), 1) };
@@ -3046,9 +2891,9 @@ fn take_ready_fd_adopts_a_pipe_and_rearms_cloexec() {
     aterm_pty::close_fd(rd);
 }
 
-/// Rollback hygiene: `discard_outgoing` retires exactly THIS attempt's
-/// artifacts (manifest + sidecars named by our pid + the nonce) and leaves
-/// every other file — another attempt's manifest, unrelated files — alone.
+/// Rollback hygiene: `discard_outgoing` retires exactly this attempt's artifacts
+/// (manifest and sidecars named by our pid and the nonce) and leaves every other file,
+/// another attempt's manifest included, alone.
 #[test]
 fn discard_outgoing_removes_only_this_attempts_artifacts() {
     let Some(_env) = env_alone() else { return };

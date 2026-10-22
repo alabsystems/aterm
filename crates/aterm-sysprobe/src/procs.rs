@@ -19,7 +19,9 @@
 //!   absolute-time ticks, not nanoseconds, on Apple Silicon (the timebase is
 //!   125/3 there and 1/1 on Intel), so they are scaled by the kernel's
 //!   timebase ([`kernel_timebase`]), which a process Rosetta translates does
-//!   not see as its own.
+//!   not see as its own. A sweep asked for coalitions
+//!   ([`SweepOpts::coalitions`]) reads each process's resource coalition too
+//!   (`proc_pidinfo(PROC_PIDCOALITIONINFO)`, [`crate::coalitions`]).
 //! * **Linux** — `/proc/<pid>/stat` (parent, `comm`, state, group, session,
 //!   terminal, `utime + stime` in clock ticks), `/proc/<pid>/status`
 //!   (`RssAnon + VmSwap`: anonymous memory, resident or swapped, the nearest
@@ -101,6 +103,18 @@ pub struct ProcessReading {
     /// early in one sweep and late in the next; two of these give each
     /// process its own window.
     pub read_at: Option<std::time::Instant>,
+    /// Its resource coalition's id (macOS), read only by a sweep asked for
+    /// it ([`SweepOpts::coalitions`]); `None` otherwise, for a zombie, and
+    /// off macOS.
+    pub coalition: Option<u64>,
+}
+
+/// What a sweep reads beyond each process's row ([`processes_with`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SweepOpts {
+    /// Each process's resource coalition ([`ProcessReading::coalition`]):
+    /// one more `proc_pidinfo` a process on macOS, nothing elsewhere.
+    pub coalitions: bool,
 }
 
 /// One sweep of the process table.
@@ -115,7 +129,14 @@ pub struct Sweep {
 /// Sweep every process; `None` where the platform has no reader.
 #[must_use]
 pub fn processes() -> Option<Sweep> {
-    imp::processes()
+    processes_with(SweepOpts::default())
+}
+
+/// Sweep every process, reading what `opts` asks for too; `None` where the
+/// platform has no reader.
+#[must_use]
+pub fn processes_with(opts: SweepOpts) -> Option<Sweep> {
+    imp::processes(opts)
 }
 
 /// `/proc/<pid>/statm`'s resident pages (its second field).
@@ -186,7 +207,7 @@ pub fn kernel_timebase() -> Option<(u32, u32)> {
 pub(crate) mod imp {
     use std::ffi::c_int;
 
-    use super::{MAX_PROCESSES, ProcessReading, Sweep, ticks_to_ns};
+    use super::{MAX_PROCESSES, ProcessReading, Sweep, SweepOpts, ticks_to_ns};
     use crate::jobs::RunState;
     use crate::jobs::darwin::PROC_FLAG_CONTROLT;
 
@@ -249,7 +270,7 @@ pub(crate) mod imp {
         (rc == 0).then_some(info)
     }
 
-    pub(super) fn processes() -> Option<Sweep> {
+    pub(super) fn processes(opts: SweepOpts) -> Option<Sweep> {
         // SAFETY: a null buffer asks for the count only.
         let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
         let count = usize::try_from(count).ok()?;
@@ -290,6 +311,12 @@ pub(crate) mod imp {
                 }
                 continue;
             };
+            // Read between the two usage reads, so where they answer, their
+            // start-time check below holds it to the same process.
+            let coalition = opts
+                .coalitions
+                .then(|| crate::coalitions::coalition_of(pid as u32))
+                .flatten();
             let after = rusage(pid);
             let usage = match (before, after) {
                 (Some(before), Some(after))
@@ -333,6 +360,7 @@ pub(crate) mod imp {
                 runnable_ns: usage.map(|u| ticks_to_ns(u.ri_runnable_time, numer, denom)),
                 peak_footprint: usage.map(|u| u.ri_lifetime_max_phys_footprint),
                 read_at,
+                coalition,
             });
         }
         Some(Sweep { procs, truncated })
@@ -341,7 +369,7 @@ pub(crate) mod imp {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    pub(super) fn processes() -> Option<super::Sweep> {
+    pub(super) fn processes(_opts: super::SweepOpts) -> Option<super::Sweep> {
         // SAFETY: `sysconf` reads a constant.
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
         let hz = u64::try_from(hz).ok().filter(|h| *h > 0).unwrap_or(100);
@@ -354,7 +382,7 @@ mod imp {
 
 #[cfg(all(windows, target_pointer_width = "64"))]
 mod imp {
-    pub(super) fn processes() -> Option<super::Sweep> {
+    pub(super) fn processes(_opts: super::SweepOpts) -> Option<super::Sweep> {
         crate::win::processes()
     }
 }
@@ -365,7 +393,7 @@ mod imp {
     all(windows, target_pointer_width = "64")
 )))]
 mod imp {
-    pub(super) fn processes() -> Option<super::Sweep> {
+    pub(super) fn processes(_opts: super::SweepOpts) -> Option<super::Sweep> {
         None
     }
 }
@@ -563,6 +591,27 @@ mod tests {
             "the sweep read {swept_ns} ns; the reap's rusage for the same stopped child is \
              {kernel} ns (timebase {:?})",
             kernel_timebase()
+        );
+    }
+
+    /// A sweep asked for coalitions reads each process's, as the one-process
+    /// reader does, another user's too (launchd's, root's); a plain sweep
+    /// reads none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sweep_reads_coalitions_only_when_asked() {
+        let sweep = processes_with(SweepOpts { coalitions: true }).expect("a sweep");
+        for pid in [std::process::id(), 1] {
+            let row = sweep.procs.iter().find(|p| p.pid == pid).expect("swept");
+            let own = crate::coalitions::coalition_of(pid).expect("its coalition");
+            assert_eq!(row.coalition, Some(own), "{pid}");
+        }
+        assert!(
+            processes()
+                .expect("a sweep")
+                .procs
+                .iter()
+                .all(|p| p.coalition.is_none())
         );
     }
 

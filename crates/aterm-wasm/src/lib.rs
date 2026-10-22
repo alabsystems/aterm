@@ -357,8 +357,7 @@ impl AtermTerminal {
         // Theme is appearance-only (selection band / idle cursor / padding / default
         // cells) — not tracked by the row-diff — so force one full repaint next frame.
         self.force_full_repaint = true;
-        // Keep the effects' derive-from-theme default in sync (glow/trail colours
-        // passed as `None` follow the cursor colour, like the native app).
+        // Glow/trail colours passed as `None` follow the theme cursor.
         self.theme_cursor = cursor & 0x00FF_FFFF;
         self.theme_fg = fg & 0x00FF_FFFF;
         self.theme_bg = bg & 0x00FF_FFFF;
@@ -368,7 +367,7 @@ impl AtermTerminal {
         // against; a new theme retires it (the native palette-authority edge)
         // while the cat's behaviour, position and breed carry on.
         self.effects.invalidate_companion_colors();
-        // The band's inks derive from the theme (the next frame repaints it).
+        // The band's inks derive from the theme.
         self.band.set_theme(fg, bg, cursor);
         self.renderer.set_theme(Theme::from(parts));
     }
@@ -438,8 +437,8 @@ impl AtermTerminal {
         let mut term = scrollback_tiers_api::tiered_terminal(rows, cols);
         let budget_share = scrollback_tiers_api::register_budget_share(&term);
         apply_terminal_theme_colors(&mut term, fg, bg, cursor, selection);
-        // Poll-drain surface for OSC 9/99/777 (a web host has no callback
-        // thread); authorization keeps the engine's fail-closed default.
+        // Poll-drain queue for OSC 9/99/777; notifications stay unauthorized
+        // until the host opts in.
         let notifications = notifications_api::wire_notification_queue(&mut term);
         let web_theme = theme_api::WebThemeState::new(term.color_scheme());
         let rows = term.grid().rows() as usize;
@@ -655,8 +654,8 @@ impl AtermTerminal {
         self.renderer.set_cursor_blink_phase(on);
     }
 
-    /// Force a hollow (unfocused) cursor when `true`, or restore the terminal's
-    /// DECSCUSR style when `false` — the standard focused/unfocused affordance.
+    /// Force a hollow (unfocused) cursor when `true`, or restore the DECSCUSR
+    /// style when `false`.
     pub fn set_cursor_hollow(&mut self, hollow: bool) {
         // Frame gate: a renderer-held override, invisible to the damage epoch.
         if self.hollow_shadow != Some(hollow) {
@@ -824,8 +823,7 @@ impl AtermTerminal {
         // sizes the framebuffer from these fields.
         self.rows = self.term.grid().rows() as usize;
         self.cols = self.term.grid().cols() as usize;
-        // The prediction coordinate space just changed: drop in-flight guesses
-        // rather than ghost-paint them at stale coords (the native resize rule).
+        // The prediction coordinate space changed: drop in-flight guesses.
         self.predict.reset();
         Ok(())
     }
@@ -1379,7 +1377,7 @@ impl AtermTerminal {
         let budget_share = scrollback_tiers_api::register_budget_share(&term);
         let theme = Theme::default();
         apply_terminal_theme_colors(&mut term, theme.fg, theme.bg, theme.cursor, theme.selection);
-        // Same notification wiring as `new` (fail-closed until authorized).
+        // Same notification wiring as `new`.
         let notifications = notifications_api::wire_notification_queue(&mut term);
         let web_theme = theme_api::WebThemeState::new(term.color_scheme());
         let rows = term.grid().rows() as usize;
@@ -2558,12 +2556,9 @@ mod tests {
 
     // --- The resident pet through the binding (design 2026-08-30, Phase 1) --
 
-    /// Drive the pet onto the glass through the binding alone: the glow
-    /// style that names it, the seed door, then witnessed keystrokes at
-    /// 33 ms, until `cursor_pet_alpha` goes positive. Returns the frame it
-    /// took, or `None` when the budget ran out. Every character is typed
-    /// through `note_typed_char` + echo exactly as a JS keydown handler
-    /// would, so the caret the pet chases is a witnessed one.
+    /// Drive the pet onto the glass through the binding alone (the naming glow style,
+    /// the seed, witnessed keystrokes at 33 ms) until `cursor_pet_alpha` goes positive.
+    /// Returns the frame it took, or `None` when the budget ran out.
     fn wake_the_pet(t: &mut AtermTerminal, seed: u64) -> Option<u32> {
         t.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
         t.set_cursor_pet(true, seed);
@@ -2600,11 +2595,8 @@ mod tests {
         false
     }
 
-    /// The seed door is the ONLY entropy: two instances fed the same seed,
-    /// the same bytes and the same `dt` stream are pixel-identical at every
-    /// step (the engine is clockless and dieless — nothing in-wasm rolls a
-    /// die), and a different seed dresses a visibly different cat (the
-    /// non-vacuity half: the seed actually reaches the coat).
+    /// The seed is the only entropy: same seed, bytes and `dt` stream give identical
+    /// pixels at every step, and a different seed dresses a visibly different cat.
     #[test]
     fn cursor_pet_is_deterministic_for_one_seed() {
         let mut a = crate::system_font_terminal(24, 80, 16.0);

@@ -20,19 +20,13 @@ default-run = "aterm"
 name = "aterm"
 path = "src/main.rs"
 
-# The WINDOWED image of the same front door, for Windows: the PE subsystem is a
-# per-file header field the shell keys on (it waits for a console-subsystem
-# child and not for a GUI one), so `aterm.exe` above is CONSOLE subsystem and
-# this second file object — `src/windowed.rs`, which `#[path]`-includes
-# `src/main.rs` and adds only `windows_subsystem = "windows"` — is what the Start
-# Menu, the Explorer verb and a pinned tile launch without a console flash.
-# `apps/aterm-win/build.ps1` ships it renamed to `aterm-gui.exe` (crate
-# `aterm-gui` already owns the bin name `aterm-gui`, so the target cannot be
-# called that). A `[[bin]]` cannot be made target-conditional, so on macOS and
-# Linux it still builds — as a std-only stub that says to run `aterm` and exits
-# 2, never a second link of the whole front door (with `lto = true` that would
-# double the slowest step of every release build) — and it is on no bundle or
-# release list there.
+# The windowed image of the same front door, for Windows. The PE subsystem is a per-file header
+# field a shell keys on (it waits for a console-subsystem child, not a GUI one), so `aterm.exe` is
+# console subsystem and this bin (`src/windowed.rs`: `src/main.rs` plus
+# `windows_subsystem = "windows"`) is what the Start Menu, Explorer and a pinned tile launch
+# without a console flash. `apps/aterm-win/build.ps1` ships it as `aterm-gui.exe` (crate
+# aterm-gui owns that bin name). A `[[bin]]` cannot be target-conditional, so elsewhere it builds
+# as a std-only stub that exits 2, not a second LTO link of the front door, and ships nowhere.
 [[bin]]
 name = "aterm-windowed"
 path = "src/windowed.rs"
@@ -42,10 +36,9 @@ path = "src/windowed.rs"
 aterm-cli = { path = "../aterm-cli" }     # the SESSION (PTY passthrough) + parser/diag/manual
 aterm-gui = { path = "../aterm-gui" }     # the WINDOW (winit/wgpu) + headless engine
 aterm-ctl = { path = "../aterm-ctl" }     # `aterm ctl`  — control-socket client
-# `aterm ctl cast drift` computed client-side (a server that predates the verb,
-# or saved files): the replay audit is aterm-control's, the code the server
-# runs, handed to the dependency-free aterm-ctl as a plain fn (`CTL_LOCAL`).
-# Already in the graph through aterm-gui; no new crate reaches the binary.
+# `aterm ctl cast drift` computed client-side (an older server, or saved files): the replay audit
+# is aterm-control's, the code the server runs, handed to the dependency-free aterm-ctl as a plain
+# fn (`CTL_LOCAL`). Already in the graph through aterm-gui.
 aterm-control = { path = "../aterm-control" }
 atpkg = { path = "../atpkg" }             # `aterm pkg`  — toolchain package manager
 agh = { path = "../agh" }               # `aterm agh`  — the GitHub client
@@ -79,19 +72,14 @@ aterm-caffeine = { workspace = true }
 # background check/stage loop (round-11 — a terminal-only Mac used to run NONE
 # of the updater, while install.sh promised automatic updates).
 aterm-update = { path = "../aterm-update" }
-# The atpkg "never checked" read (R3/R4, 2026-09-10): one tiny shared reader of
-# `<prefix>/status.toml` so the session lane says on stderr that packages cannot
-# be updated yet, and spawns the one-shot pass, without reaching into atpkg's
-# internals beyond the file.
+# `pkg_check` (when the session lane spawns the detached `aterm pkg update` pass, read from
+# atpkg's `<prefix>/status.toml`) and the `[update]` settings.
 aterm-update-core = { path = "../aterm-update-core" }
 aterm-log = { path = "../aterm-log" }    # the log facade (the update verb records to aterm.log)
-# `aterm_uds::spawnfd::command` for the windowed front door's launch (Windows: no
-# descriptor to strip there, and one spelling of a spawn everywhere,
-# clippy.toml: one child constructor), with its console flag (`Console::Detached`)
-# from `aterm_uds::spawn::set_gui_image_flags`. Every
-# live-headless test arms its instance with this crate's lifeline too
-# (`tests/support/launch_isolation.rs::lifeline`), so a killed test run takes its
-# instances with it. A dependency-free leaf the binary links already.
+# `aterm_uds::spawnfd::command` and `spawn::set_gui_image_flags` for the windowed front door's
+# launch. Every live-headless test arms its instance with this crate's lifeline
+# (`tests/support/launch_isolation.rs::lifeline`), so a killed test run takes its instances with
+# it.
 aterm-uds = { workspace = true }
 
 # `aterm link` — the fabric bridge. A LIBRARY like every other verb, so the one
@@ -101,21 +89,12 @@ aterm-uds = { workspace = true }
 # Its astream crates come from the vendor/astream submodule (see
 # vendor/README-astream.md), and none of them carries a cipher tree.
 #
-# UNIX ONLY, on purpose: the bridge is Unix-domain sockets and
-# descriptors inherited at fixed numbers (`aterm_uds::spawnfd`: `dup2` between
-# fork and exec) end to end — `std::os::unix` and `std::os::fd` at module
-# level in ctl.rs, and a Unix-socket dial and owner-only permission bits in
-# transport.rs — and astream has that face only on unix too (`Broker::serve` is
-# `cfg(unix)`, and `connect` refuses `Transport::Unix` elsewhere; the broker
-# itself serves TCP on Windows); on macOS the broker is kept alive by launchd.
-# Unconditional, it would make the Windows binary unbuildable: `verify cells`
-# type-checks `-p aterm` for x86_64-pc-windows-msvc and fails on the
-# `std::os::unix` imports. The x86_64-pc-windows-gnu cfg-validation lane
-# (.cargo/config.toml's `[target.x86_64-pc-windows-gnu]` linker/ar pair) needs
-# crates/aterm-libc's windows-gnu cell, or it dies on a `compile_error!` at the
-# BOTTOM of the graph before one line of `cfg(windows)` code is read. On non-unix targets the
-# `link` verb stays on the roster and refuses by name (src/main.rs
-# `link_unavailable`) instead of failing to exist.
+# Unix only: the bridge is Unix-domain sockets and descriptors inherited at fixed numbers
+# (`aterm_uds::spawnfd`) end to end, and astream has that face only on unix (`Broker::serve` is
+# `cfg(unix)`; `connect` refuses `Transport::Unix` elsewhere). `verify cells` type-checks
+# `-p aterm` for x86_64-pc-windows-msvc, where an unconditional dependency fails on the
+# `std::os::unix` imports. Off unix the `link` verb stays on the roster and refuses by name
+# (src/main.rs `link_unavailable`).
 [target.'cfg(unix)'.dependencies]
 aterm-link = { path = "../aterm-link" }
 # `aterm secrets` — one credentials file for every machine
@@ -157,7 +136,8 @@ dev-seams = [
 ]
 
 [dev-dependencies]
-# The live tests' raw process and descriptor calls (signals, waits, process groups, fd flags, rlimits).
+# The live tests' raw process and descriptor calls (signals, waits, process groups, fd flags,
+# rlimits).
 libc = { workspace = true }
 # Private scratch directories removed on drop, and `stand_in` programs.
 aterm-tempfile = { workspace = true }
@@ -194,17 +174,11 @@ astream-broker = { path = "../../vendor/astream/crates/astream-broker", features
 astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
 
 [build-dependencies]
-# Windows only: compile + link the icon, the side-by-side manifest and
-# VS_VERSION_INFO into THE shipped exe (build.rs → OUT_DIR/aterm.rc). It has to
-# live HERE and not in aterm-gui: the step emits `cargo:rustc-link-arg-bins`,
-# which reaches only its own package's bins, so aterm-gui's copy only ever
-# decorated `aterm-gui.exe` — never the binary install.ps1 actually ships.
-# First-party (crates/aterm-winres) since 2026-09-14: the `embed-resource` it
-# replaces pulled `vswhom` into the msvc graph, which reaches `libc::wchar_t`
-# and `libc::wcslen` — items crates/aterm-libc deliberately does not declare on
-# Windows — so the native msvc build failed closed. The step is a documented
-# no-op when the target is not Windows, and build.rs returns before calling it
-# anyway.
+# Windows only: compiles and links the icon, the side-by-side manifest and VS_VERSION_INFO into
+# the shipped exe (build.rs → OUT_DIR/aterm.rc). It lives here, not in aterm-gui, because the
+# step's `cargo:rustc-link-arg-bins` reaches only its own package's bins. First-party because
+# `embed-resource` pulls `vswhom`, which needs `libc::wchar_t`/`wcslen`, items crates/aterm-libc
+# does not declare on Windows.
 aterm-winres = { workspace = true }
 
 [lints]
@@ -239,12 +213,13 @@ harness = false
 name = "control_lanes_live_headless"
 path = "tests/control_lanes_live_headless.rs"
 
-# Alone: inheritable pty descriptors a sibling's child could hold open.
+# Alone: a sibling test's child could inherit its descriptors and hold them open.
 [[test]]
 name = "front_door_verbs"
 path = "tests/front_door_verbs.rs"
 
-# Alone: inheritable pty descriptors a sibling's child could hold open.
+# Alone: a sibling test's child could inherit its descriptors (std makes a pipe close-on-exec
+# non-atomically on macOS) and hold them open.
 [[test]]
 name = "session_launch_silence"
 path = "tests/session_launch_silence.rs"

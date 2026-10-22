@@ -1055,8 +1055,8 @@ struct Shaped {
     above: Option<Vec<String>>,
 }
 
-/// Whether a `tail=` read cannot stand for the screen and is taken again whole.
-/// The grid must be taller than the tail (`first > 0`), and then either:
+/// Whether a `tail=` read cannot stand for the screen and is taken again whole. The grid must be
+/// taller than the tail (`first > 0`), and then either:
 ///
 /// * the box `reader` (the session program's) finds has its title row off the
 ///   rows read ([`aterm_phase::prompt::PromptV2::head_off_screen`]), so a box
@@ -1491,6 +1491,11 @@ pub(crate) fn places_resets_on_print(p: Program) -> bool {
 }
 
 /// Whether one wait saw the content move past a seq ([`Session::moved_past`]).
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one Past lives on the stack per wait and is matched at once; boxing the \
+              screen would put a heap allocation on every wait's read to save nothing"
+)]
 enum Past {
     Moved,
     /// The step ran out with the content unchanged: the screen the check read
@@ -4644,17 +4649,10 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.turn_of(screen)
     }
 
-    /// What makes `turn` the point it is ([`point_key`]), read by
-    /// [`Self::reader`] — the ONE grammar every read of the loop goes
-    /// through, the one [`Self::turn_of`] read its phase by and [`box_anchor`]
-    /// its box by — never the reader the screen alone names, which may differ
-    /// from the session's program. Every comparison of two points is of these
-    /// keys: the badge's close ([`Self::close_box`]), the point already handed
-    /// over ([`Self::look`]), the escalation's once per point
-    /// ([`Self::escalate_point`]), the box settle, and the hold's look at the
-    /// point still showing. The wait's look under a box's first row compares
-    /// LESS: what a file box asks, never how anyone is answering it
-    /// ([`Self::file_request`]).
+    /// What makes `turn` the point it is ([`point_key`]), read by [`Self::reader`], never by the
+    /// reader the screen alone names (which may differ from the session's program). Every
+    /// comparison of two points is of these keys, except the wait's look under a box's first
+    /// row, which compares what a file box asks ([`Self::file_request`]).
     pub(super) fn review_key(&self, turn: &Turn) -> String {
         point_key(self.reader(&turn.screen.rows), turn)
     }
@@ -7506,14 +7504,13 @@ impl<'a, C: Ctl> Session<'a, C> {
         Ok(())
     }
 
-    /// Ride out an outage: a request the server did not serve
-    /// ([`Self::unserved`]), as when a self-update hands every session to a new
-    /// instance under the same `@sid`. Reads the screen of the same selector
-    /// after a pause starting at 0.5 s and doubling up to 8 s across the
-    /// outage, until a read answers (`Rode::Back`) or the window runs out. The
-    /// client resolves its socket afresh each request: unnamed, that is the
-    /// instance hosting the caller's terminal, else the newest (`aterm.sock`);
-    /// a named per-instance socket (`aterm-<pid>.sock`) goes with its instance.
+    /// Ride out an outage: a request the server did not serve ([`Self::unserved`]), as when a
+    /// self-update hands every session to a new instance under the same `@sid`. Reads the screen
+    /// of the same selector after a pause starting at 0.5 s and doubling up to 8 s across the
+    /// outage, until a read answers (`Rode::Back`) or the window runs out. The client resolves
+    /// its socket afresh each request: unnamed, the instance hosting the caller's terminal, else
+    /// the newest (`aterm.sock`); a named per-instance socket (`aterm-<pid>.sock`) goes with its
+    /// instance.
     ///
     /// The window is the outage's, from the first unserved request until the loop gets past it;
     /// a probe answering only says the session answers a read, so a later unserved request is
@@ -7744,26 +7741,19 @@ impl<C: Ctl> Session<'_, C> {
 
     /// [`Self::reset_unix`] for a wall read on `rows`.
     ///
-    /// A session window (`session_window`: the notice says `session limit` or
-    /// `5-hour`; a `Usage limit reached · …` that names no window may be a
-    /// weekly one) resets within five hours, so a bare clock time on one is
-    /// [`limit::reset_at`]'s: today's, or tomorrow's only when that is
-    /// under five hours off. Every other wall's bare clock time is the vendor's
-    /// own doing: its formatter prints one only for a reset within 24 hours of
-    /// the print and the date beyond that (`nu(resetsAt, …)` in the 2.1.284
-    /// binary: `m > 24 ? month day hour : hour`), so the reset is the FIRST
-    /// OCCURRENCE OF THAT CLOCK AFTER THE PRINT ([`limit::place_reset`]), and
-    /// the print is what the screen says of it: the done row's clock (`done
-    /// 12:19 PM`, Claude Code's own stamp of when the turn ended on the wall)
-    /// — its last occurrence within a day, at the start of its minute — else,
-    /// for a wall the loop saw ARRIVE (`live`), [`PRINT_LAG_S`] ago, less
-    /// [`CLOCK_SLACK_S`] either way. A wall
-    /// FOUND sitting with no done row (a relaunch redraws the conversation
-    /// without one) has no evidence of its print: the session rule places it
-    /// (`None`), and a wrong guess costs one try — the wall answers it,
-    /// reprinted after a turn or standing with the line held and no turn, and
-    /// either is a print the loop sees ([`Self::wall_reset_at`],
-    /// [`TurnEndState::untaken_act`]).
+    /// A session window (`session_window`: the notice says `session limit` or `5-hour`; a
+    /// `Usage limit reached · …` naming no window may be weekly) resets within five hours, so a
+    /// bare clock time on one is [`limit::reset_at`]'s: today's, or tomorrow's only when that
+    /// is under five hours off. Any other wall's bare clock time is printed only for a reset
+    /// within 24 hours of the print (the date beyond that), so the reset is the first
+    /// occurrence of that clock after the print ([`limit::place_reset`]). The print is what the
+    /// screen says: the done row's clock (`done 12:19 PM`, its last occurrence within a day, at
+    /// the start of its minute), else, for a wall the loop saw arrive (`live`),
+    /// [`limit::PRINT_LAG_S`] ago, less [`limit::CLOCK_SLACK_S`] either way. A wall found
+    /// sitting with no done row has no evidence of its print: the session rule places it, and a
+    /// wrong guess costs one try, since the wall answers it and that is a print the loop sees
+    /// ([`Self::wall_reset_at`]). Either way a bare clock time is then read against the agent's
+    /// transcript ([`Self::transcript_day`]).
     ///
     /// `answered`: the wall stands where an act of the loop's went untaken
     /// ([`TurnEndState::untaken_act`]), so the print is no earlier than [`limit::PRINT_LAG_S`]
@@ -7921,16 +7911,13 @@ impl<C: Ctl> Session<'_, C> {
             || (self.resume_limits && reset_unix.is_some_and(|at| at - self.now_unix() <= horizon))
     }
 
-    /// A busy read inside the wait for a turn ([`Self::await_turn_from`]) with
-    /// an episode open whose notice said Claude Code would go on by itself
-    /// ([`Episode::resumes_itself`]): the episode closes now (`CLEARED seq=<n>
-    /// … the worker works again`, attention unset), not at the next review
-    /// point, which the resumed turn may keep hours off; the notice row still
-    /// on screen changes nothing. An episode whose notice named a reset is
-    /// untouched. The closed episode is kept ([`Retry`]) until the worker
-    /// answers on a point that is not the notice, so a retry that hits the wall
-    /// again reopens the same episode with no second mail
-    /// ([`Self::open_episode`]).
+    /// A busy read inside the wait for a turn ([`Self::await_turn_from`]) with an episode open
+    /// whose notice said Claude Code would go on by itself ([`Episode::resumes_itself`]): the
+    /// episode closes now (`CLEARED seq=<n> … the worker works again`, attention unset), not at
+    /// the next review point, which the resumed turn may keep hours off. An episode whose notice
+    /// named a reset is untouched. The closed episode is kept ([`Retry`]) until the worker
+    /// answers on a point that is not the notice, so a retry that hits the wall again reopens it
+    /// with no second mail ([`Self::open_episode`]).
     fn limit_on_busy(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
         let Some(ep) = self.limit.as_ref().filter(|ep| ep.resumes_itself) else {
             return Ok(());
@@ -9166,17 +9153,14 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
-    /// A usage limit left on screen past its reset is an idle point: `true`
-    /// once the reset is [`crate::harness::upgrade_drive::LIMIT_GRACE_S`]
-    /// behind now, by the episode's reset ([`Episode::reset_unix`]) or else the
-    /// transcript's ([`IdleHost::limit_until`], asked only then). Claude Code
-    /// leaves its notice up past the reset until something is typed, which
-    /// would otherwise withhold every point for good. Past the grace neither
-    /// the wall ([`Guard::Wall`]) nor the episode ([`Guard::LimitEpisode`])
-    /// withholds a point (the episode stays open until the worker works), so
-    /// the host steps as at any idle point and the policy continues the agent
-    /// by the wall's rule. Before the grace, or with no reset read, everything
-    /// withholds: a reset is never guessed.
+    /// A usage limit left on screen past its reset is an idle point: `true` once the reset is
+    /// [`crate::harness::upgrade_drive::LIMIT_GRACE_S`] behind now, by the episode's reset
+    /// ([`Episode::reset_unix`]) or else the transcript's ([`IdleHost::limit_until`], asked only
+    /// then). Claude Code leaves its notice up past the reset until something is typed, which
+    /// would otherwise withhold every point for good. Past the grace neither [`Guard::Wall`] nor
+    /// [`Guard::LimitEpisode`] withholds a point, so the host steps as at any idle point and the
+    /// policy continues the agent by the wall's rule. Before the grace, or with no reset read,
+    /// everything withholds: a reset is never guessed.
     ///
     /// `notice` is the usage-limit notice on screen now by its reset (`Some(None)`: naming
     /// none; `None`: no notice). The episode's reset counts only for the notice it was read from
@@ -9698,11 +9682,9 @@ fn submitted_over(then: Option<(u64, u64)>, now: &Screen) -> bool {
     matches!((then, submit_mark(now)), (Some((n0, m0)), Some((n, m))) if n > n0 && m != m0)
 }
 
-/// What makes two review points the same one — never the seq, which any
-/// footer tick moves — read by `reader`, the loop's ONE grammar
-/// ([`Session::review_key`] passes [`Session::reader`]: the reader
-/// [`box_anchor`] and [`Session::turn_of`] read the same rows by, never the
-/// screen's guess alone, which may name another program than the session's).
+/// What makes two review points the same one (never the seq, which any footer tick moves),
+/// read by `reader`, the loop's one grammar ([`Session::review_key`] passes
+/// [`Session::reader`]).
 ///
 /// A box `reader` reads is the request it makes ([`box_key`]). Any other point, and a prompt
 /// whose box `reader` does not read, is the phase, what it says ([`said_summary`]), the status

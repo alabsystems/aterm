@@ -88,7 +88,8 @@ pub const ICON_RUN: usize = 2 + ICON_CELLS as usize;
 pub enum CliMark {
     /// Claude Code: its whole mascot, in its terracotta.
     Claude,
-    /// Codex (and codex-alab): the OpenAI knot, in OpenAI blue.
+    /// Codex (and codex-alab, whose lockup names it apart): the OpenAI
+    /// knot, in OpenAI blue.
     Codex,
     /// Google's Antigravity CLI: its own launch banner, in the colours it
     /// paints it.
@@ -121,19 +122,51 @@ impl CliMark {
         Self::ALL.into_iter().find(|m| m.word() == app_id)
     }
 
-    /// The word the lockup prints: the CLI's own lowercase name.
+    /// The CLI's own lowercase word: its canonical app id, and the name a
+    /// vendor build's lockup prints.
     #[must_use]
     pub const fn word(self) -> &'static str {
         brand(self).word
     }
 
-    /// The cells the whole lockup takes: [`ICON_RUN`], the name, a trailing
-    /// pad. The same with or without a sprite drawn ([`fit`] refusing one
-    /// leaves blank cells), so the layout never moves.
+    /// The name the lockup prints for `build`: the ALab build's own word
+    /// where the brand table names one apart ([`Brand::alab_word`]:
+    /// `codex-alab`), else the CLI's [`word`](Self::word).
     #[must_use]
-    pub const fn lockup_cells(self) -> usize {
-        ICON_RUN + self.word().len() + 1
+    pub const fn name(self, build: Build) -> &'static str {
+        match (build, brand(self).alab_word) {
+            (Build::Alab, Some(word)) => word,
+            _ => self.word(),
+        }
     }
+
+    /// The cells the whole lockup takes for `build`: [`ICON_RUN`], the
+    /// [`name`](Self::name), a trailing pad. The same with or without a
+    /// sprite drawn ([`fit`] refusing one leaves blank cells), so the layout
+    /// never moves.
+    #[must_use]
+    pub const fn lockup_cells(self, build: Build) -> usize {
+        ICON_RUN + self.name(build).len() + 1
+    }
+}
+
+/// Which build of a CLI a pane runs, as the host proves it: the vendor's, or
+/// ALab's own (codex-alab: a Codex the host admits, by its proven
+/// self-claim, aterm's copy of its record or its ALab image). The icon and
+/// the inks are the CLI's either way; only the name the lockup prints may
+/// differ ([`CliMark::name`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Build {
+    /// The vendor's build, or one the host has not proven ALab's.
+    #[default]
+    Vendor,
+    /// ALab's build, proven.
+    Alab,
+}
+
+impl Build {
+    /// Both builds, the vendor's first.
+    pub const ALL: [Build; 2] = [Build::Vendor, Build::Alab];
 }
 
 /// How a master's character paints: the palette entry its texel names.
@@ -197,8 +230,12 @@ impl Master {
 /// One row of the brand table.
 #[derive(Debug, Clone, Copy)]
 pub struct Brand {
-    /// The word the lockup prints.
+    /// The CLI's word: the name a vendor build's lockup prints.
     pub word: &'static str,
+    /// The name an ALab build's lockup prints, where aterm tells that build
+    /// apart (the owner calls aterm's Codex build "codex-alab"); `None`: the
+    /// [`word`](Self::word) for every build.
+    pub alab_word: Option<&'static str>,
     /// The name's inks before the floor: one for the whole word, or one a
     /// letter.
     pub name: Inks,
@@ -243,6 +280,7 @@ pub const fn brand(mark: CliMark) -> &'static Brand {
 /// `48;2;0;0;0` (2.1.304), on every ground.
 const CLAUDE: Brand = Brand {
     word: "claude",
+    alab_word: None,
     name: Inks::both(&[0xD7_7757]),
     icon: Inks::both(&[0xD7_7757]),
     chars: b"Ck",
@@ -252,9 +290,11 @@ const CLAUDE: Brand = Brand {
 };
 
 /// Codex: the owner's "OpenAI blue". Codex itself draws no brand colour
-/// (`>_ OpenAI Codex` in bold, `/model` in ANSI cyan, 0.154).
+/// (`>_ OpenAI Codex` in bold, `/model` in ANSI cyan, 0.154). ALab's build
+/// prints the owner's name for it, `codex-alab`, in the same ink.
 const CODEX: Brand = Brand {
     word: "codex",
+    alab_word: Some("codex-alab"),
     name: Inks::both(&[0x3B_82F6]),
     icon: Inks::both(&[0x3B_82F6]),
     chars: b"Oo",
@@ -277,6 +317,7 @@ const CODEX: Brand = Brand {
 /// banner draws.
 const AGY: Brand = Brand {
     word: "agy",
+    alab_word: None,
     name: Inks {
         dark: &[0x5C_5CFF],
         paper: &[0x00_4DA3],
@@ -315,6 +356,7 @@ const AGY_TEXELS: [Texel; 49] = {
 /// the outline at half alpha.
 const MUSE: Brand = Brand {
     word: "muse",
+    alab_word: None,
     name: Inks::both(&[0x00_82FB]),
     icon: Inks::both(&[0x00_82FB, 0x5A_A0FF]),
     chars: b"Mmn",
@@ -329,6 +371,7 @@ const MUSE: Brand = Brand {
 /// band of columns left to right; `a`–`h` are stops 1–8 at half alpha.
 const GEMINI: Brand = Brand {
     word: "gemini",
+    alab_word: None,
     name: Inks::both(&[
         0x47_96E4, 0x5F_8BDB, 0x78_80D2, 0x91_76BE, 0xAA_6F9F, 0xC3_677F,
     ]),
@@ -362,6 +405,7 @@ const GEMINI: Brand = Brand {
 /// Grok's own screen confirms the ink before a program maps onto it.
 const GROK: Brand = Brand {
     word: "grok",
+    alab_word: None,
     name: Inks {
         dark: &[0xF2_F2F2],
         paper: &[0x1F_1F1F],
@@ -397,6 +441,14 @@ const _: () = {
         assert!(w > 0);
         assert!(b.name.dark.len() == 1 || b.name.dark.len() == w);
         assert!(b.name.paper.len() == 1 || b.name.paper.len() == w);
+        // An ALab build's name has letters, and inks for them: one for the
+        // whole name, or one a letter of it.
+        if let Some(alab) = b.alab_word {
+            let a = alab.len();
+            assert!(a > 0);
+            assert!(b.name.dark.len() == 1 || b.name.dark.len() == a);
+            assert!(b.name.paper.len() == 1 || b.name.paper.len() == a);
+        }
         m += 1;
     }
 };
@@ -925,35 +977,41 @@ mod tests {
     }
 
     /// NAMES READ AT 4.5:1 ON EVERY GROUND (spec §3.2, WCAG 1.4.3): every
-    /// letter of every mark's name, on every built-in theme's ground and on
+    /// letter of every name a lockup prints — each mark's word, and
+    /// codex-alab's longer name — on every built-in theme's ground and on
     /// Codex's slab, is drawn in an ink that reads at 4.5:1 or better, its
     /// HSV hue within 2° of the brand's own; on Default each is the brand's
     /// exact bytes wherever those already read.
-    /// NEGATIVE CONTROL: Claude's raw `#d77757` on Default Light reads under
-    /// 4.5:1 (2.94), so there the floor does the work.
+    /// NEGATIVE CONTROLS: Claude's raw `#d77757` on Default Light reads under
+    /// 4.5:1 (2.94), so there the floor does the work; and codex-alab's
+    /// last letter, past the vendor's word, reads under 4.5:1 in Codex's raw
+    /// blue on Codex's slab (3.65), so there too.
     #[test]
     fn names_read_at_4_5_on_every_ground() {
         let default = ground("Default");
         let mut moved = 0;
-        for mark in CliMark::ALL {
-            for k in 0..mark.word().chars().count() {
+        let names = CliMark::ALL
+            .into_iter()
+            .flat_map(|mark| Build::ALL.map(|build| (mark, mark.name(build))));
+        for (mark, word) in names {
+            for k in 0..word.chars().count() {
                 for &(name, g) in &grounds() {
                     let raw = name_ink(mark, k, dark_ground(g));
                     let fg = name_fg(mark, k, g);
                     let ratio = contrast_ratio(fg, g);
                     assert!(
                         ratio >= NAME_CONTRAST,
-                        "{mark:?} letter {k} on {name}: {fg:06x} reads {ratio:.2}"
+                        "{word} letter {k} on {name}: {fg:06x} reads {ratio:.2}"
                     );
                     if rgb2hsv(raw).1 > 0.1 {
                         let gap = hue_gap(fg, raw);
                         assert!(
                             gap <= 2.0,
-                            "{mark:?} letter {k} on {name}: hue moved {gap:.1}°"
+                            "{word} letter {k} on {name}: hue moved {gap:.1}°"
                         );
                     }
                     if g == default && contrast_ratio(raw, g) >= NAME_CONTRAST {
-                        assert_eq!(fg, raw, "{mark:?} letter {k}: the brand's bytes");
+                        assert_eq!(fg, raw, "{word} letter {k}: the brand's bytes");
                     }
                     moved += usize::from(fg != raw);
                 }
@@ -969,6 +1027,65 @@ mod tests {
         let floored = name_fg(CliMark::Claude, 0, paper);
         assert_ne!(floored, ink, "CONTROL: the floor moved it");
         assert!(contrast_ratio(floored, paper) >= NAME_CONTRAST, "CONTROL");
+        let alab = CliMark::Codex.name(Build::Alab);
+        assert_eq!(alab, "codex-alab", "the owner's name for the ALab build");
+        let last = alab.len() - 1;
+        assert!(
+            last >= CliMark::Codex.word().len(),
+            "past the vendor's word"
+        );
+        let raw = name_ink(CliMark::Codex, last, true);
+        let reads = contrast_ratio(raw, CODEX_SLAB);
+        assert!(
+            reads < NAME_CONTRAST && (reads - 3.65).abs() < 0.01,
+            "CONTROL: codex-alab's raw last letter reads {reads:.2} on the slab"
+        );
+        let floored = name_fg(CliMark::Codex, last, CODEX_SLAB);
+        assert_ne!(floored, raw, "CONTROL: the floor moved it");
+        assert!(
+            contrast_ratio(floored, CODEX_SLAB) >= NAME_CONTRAST,
+            "CONTROL"
+        );
+    }
+
+    /// EVERY BUILD'S NAME IS ITS OWN (the owner calls aterm's Codex build
+    /// "codex-alab"): codex-alab's lockup prints `codex-alab`, five cells
+    /// wider than vendor `codex`'s, and every other mark prints its word for
+    /// either build — none names an ALab build apart.
+    /// NEGATIVE CONTROL: the vendor build of Codex prints `codex`.
+    #[test]
+    fn every_build_prints_its_own_name() {
+        for mark in CliMark::ALL {
+            let want = if mark == CliMark::Codex {
+                "codex-alab"
+            } else {
+                mark.word()
+            };
+            assert_eq!(mark.name(Build::Alab), want, "{mark:?}");
+            assert_eq!(mark.name(Build::Vendor), mark.word(), "{mark:?}");
+            for build in Build::ALL {
+                assert_eq!(
+                    mark.lockup_cells(build),
+                    ICON_RUN + mark.name(build).len() + 1,
+                    "{mark:?} {build:?}"
+                );
+            }
+        }
+        assert_eq!(
+            CliMark::Codex.lockup_cells(Build::Alab) - CliMark::Codex.lockup_cells(Build::Vendor),
+            5,
+            "`-alab`"
+        );
+        assert_eq!(
+            CliMark::Codex.name(Build::Vendor),
+            "codex",
+            "CONTROL: vendor codex keeps its word"
+        );
+        assert_eq!(
+            CliMark::for_app("codex-alab"),
+            None,
+            "the app id stays the CLI's word"
+        );
     }
 
     /// The shape of a master: ink or not, a row a vector.
@@ -1134,7 +1251,7 @@ mod tests {
                 assert_eq!(f, None, "CONTROL: {mark:?} has no room at 6×12");
             }
             assert_eq!(
-                mark.lockup_cells(),
+                mark.lockup_cells(Build::Vendor),
                 4 + mark.word().len() + 1,
                 "CONTROL: {mark:?}"
             );

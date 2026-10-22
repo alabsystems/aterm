@@ -111,14 +111,14 @@ impl Realm {
 /// churning producer ids cannot evict the bridge's settled mark.
 const PRODUCER_CAP: usize = 64;
 
-/// The state of the sequence AT a producer's high-water mark.
+/// The state of the sequence at a producer's high-water mark.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tip {
     /// Claimed and still running on some connection.
     Running,
     /// It ran and answered `OK` — a replay is a duplicate.
     Applied,
-    /// It ran and did NOT answer `OK`. It may or may not have reached the PTY,
+    /// It ran and did not answer `OK`. It may or may not have reached the PTY,
     /// so a replay is refused rather than guessed at.
     Unknown,
 }

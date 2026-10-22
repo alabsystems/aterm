@@ -71,8 +71,16 @@ impl Key {
         crate::b64::encode_padded(tag.as_ref())
     }
 
-    /// Whether `proof` is this key's for the request, compared in constant time.
+    /// Whether `proof` is this key's for the request, compared in constant time. A field
+    /// holding a LF verifies nothing: the message joins the fields with LF, so such a field
+    /// would let a proof made for one request pass for another.
     pub fn verify(&self, vault: &str, recipient: &str, host: &str, proof: &str) -> bool {
+        if [vault, recipient, host]
+            .iter()
+            .any(|field| field.contains('\n'))
+        {
+            return false;
+        }
         let Some(tag) = crate::b64::decode_padded(proof) else {
             return false;
         };
@@ -148,6 +156,17 @@ mod tests {
         );
         assert!(!key.verify("alab", RECIPIENT, "m9", "not base64"));
         assert!(!key.verify("alab", RECIPIENT, "m9", ""));
+    }
+
+    #[test]
+    fn a_line_break_inside_a_field_never_moves_a_proof_to_another_request() {
+        let key = Key::derive("alab", b"correct horse battery");
+        // Both spell `alab-vault/1 join\nalab\nage1x\nm9\nz\n` once the fields are joined.
+        let proof = key.prove("alab", "age1x\nm9", "z");
+        assert!(!key.verify("alab", "age1x", "m9\nz", &proof));
+        assert!(!key.verify("alab", "age1x\nm9", "z", &proof));
+        let proof = key.prove("a\nb", RECIPIENT, "m9");
+        assert!(!key.verify("a", &format!("b\n{RECIPIENT}"), "m9", &proof));
     }
 
     #[test]

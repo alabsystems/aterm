@@ -34,14 +34,12 @@ fn fast_invalid_utf8_prefix_replays_escape_across_chunks() {
     }
 }
 
-/// `Utf8Prefix::after` (how the DCS and APC bulk paths bring a string's UTF-8
-/// head up to date over a run, in O(1)) is `Utf8Prefix::step` over each byte
-/// of the run, from every prefix a stream can end in, over every run of up to
-/// four bytes drawn from one byte of each class Table 3-7 tells apart (ASCII,
-/// the continuation sub-ranges the second-byte rules split, every kind of
-/// lead, and the bytes that begin nothing). And every such prefix is the one
+/// `Utf8Prefix::after` (the DCS and APC bulk paths' O(1) update of a string's
+/// UTF-8 head over a run) equals `Utf8Prefix::step` over each byte, from every
+/// prefix a stream can end in, over every run of up to four bytes drawn from
+/// one byte of each class Table 3-7 tells apart. Every such prefix is what
 /// `Utf8Prefix::from_bytes` reads back from its bytes (how a carry restores
-/// it), while a whole character, a broken prefix and a stray byte are not.
+/// it); a whole character, a broken prefix and a stray byte are not prefixes.
 #[test]
 fn a_prefix_after_a_run_is_the_prefix_after_each_byte() {
     use crate::utf8::Utf8Prefix;

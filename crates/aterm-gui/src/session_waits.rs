@@ -63,7 +63,7 @@ pub(crate) struct RewrapJob {
     end: WaitEnd,
 }
 
-/// A stopped paste's record: its words, as one entry.
+/// The title of a stopped paste's record.
 const PASTE_STOPPED: &str = "Paste stopped";
 
 impl RewrapJob {
@@ -1035,8 +1035,6 @@ mod tests {
         }
         let cell_h = app.win_cell_size(wid).1.max(1) as f64;
         let swipe = |dy: f64| MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, dy));
-        // A sub-row delta while the history is away is nothing to do, and
-        // costs the engine nothing: no route probe, no band landing.
         let before = crate::term_lock_acquisitions_on_this_thread();
         app.on_mouse_wheel_phased(wid, swipe(cell_h * 0.3), TouchPhase::Moved);
         assert_eq!(

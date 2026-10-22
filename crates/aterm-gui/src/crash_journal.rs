@@ -2250,10 +2250,9 @@ impl Durable {
     }
 }
 
-/// THE WRITER'S LANE on the App: when to capture, whether a capture is worth a
-/// write, the brake's probation, and the writer thread that does the I/O. The
-/// main thread only captures and compares; every file operation is the
-/// thread's.
+/// The writer's lane on the App: when to capture, whether a capture is worth a write, the
+/// brake's probation, and the writer thread that does the I/O. The main thread only captures
+/// and compares; every file operation is the thread's.
 #[derive(Debug)]
 pub(crate) struct Lane {
     /// The journal directory, or `None` for an inert lane (headless, tests, no
@@ -5515,13 +5514,11 @@ pub(crate) mod tests {
         assert!(!Runs::Agent(Program::Gemini).may_be(&record("gemini")));
     }
 
-    /// ROUND SEVEN, FINDING 5'S REVIEW: the take-over takes only the parent
-    /// RUN's journal. An older crashed run that had the parent's pid left a
-    /// journal no cold boot has claimed yet; the parent itself left none (it
-    /// never published). The successor, told when its parent started, takes
-    /// nothing, and the older desk is still offered to the next claim.
-    /// NEGATIVE CONTROL: told the pid alone (the defect, and a fork-link
-    /// attestation's case), it takes the older desk as its own image.
+    /// The take-over takes only the parent run's journal: an older crashed run with the
+    /// parent's pid left an unclaimed journal, and the parent itself left none. Told when its
+    /// parent started, the successor takes nothing and the older desk is still offered to the
+    /// next claim. Control: told the pid alone (a fork-link attestation's case), it takes the
+    /// older desk as its own image.
     #[test]
     fn a_take_over_never_takes_an_older_run_of_the_parents_pid() {
         let setup = || {

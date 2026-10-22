@@ -229,12 +229,10 @@ impl Terminal {
                     .extend(row.iter().map(|c| aterm_bidi::bidi_class(c.ch)));
                 scratch.wide.extend(row.iter().map(|c| c.wide));
             }
-            // Pure-LTR (no R/AL/an) → identity permutation; nothing to reorder.
             if !aterm_bidi::has_bidi_classes(&scratch.classes) {
                 continue;
             }
             let base = base_direction_from_classes(dir, autodetect, &scratch.classes);
-            // Bracket properties only for the rows that reorder (N0 pairs them).
             scratch.brackets.clear();
             scratch
                 .brackets
@@ -251,7 +249,7 @@ impl Terminal {
             if scratch.cell_order.iter().enumerate().all(|(v, &l)| v == l) {
                 continue;
             }
-            // Inverse permutation: inv[logical] = visual column (reused buffer).
+            // inv[logical] = visual column.
             scratch.inv.clear();
             scratch.inv.resize(scratch.cell_order.len(), 0usize);
             for (v, &l) in scratch.cell_order.iter().enumerate() {
@@ -275,7 +273,6 @@ impl Terminal {
                 cell
             }));
             std::mem::swap(&mut frame.cells[r], &mut scratch.row_tmp);
-            // Sparse, column-indexed arrays: remap each logical col to visual.
             fn remap_cols<T>(entries: &mut [(usize, T)], inv: &[usize]) {
                 for (c, _) in entries.iter_mut() {
                     if *c < inv.len() {
@@ -452,7 +449,6 @@ fn base_direction_from_classes(
     classes: &[aterm_bidi::BidiClass],
 ) -> aterm_bidi::BaseDirection {
     use aterm_bidi::{BaseDirection, BidiClass};
-    // The terminal's default: first-strong detection only while 2501 is set.
     let default_ltr = if autodetect {
         BaseDirection::Auto
     } else {
@@ -475,8 +471,6 @@ fn base_direction_from_classes(
                 BaseDirection::Rtl
             }
         }
-        // `ParagraphDirection` is #[non_exhaustive]; any future variant behaves
-        // as `Auto`, the terminal's default.
         _ => default_ltr,
     }
 }
@@ -641,10 +635,8 @@ mod tests {
         );
     }
 
-    /// The introspection read's display order is the renderer's: the map from
-    /// `row_display_order` equals `bidi_visual_order_cells` over the same row's
-    /// render cells, and the text follows that order (Hebrew reads right to
-    /// left, a wide glyph stays whole, an LTR row is the identity).
+    /// `row_display_order`'s map is the renderer's permutation and its text
+    /// follows it (Hebrew right to left, a wide glyph whole, LTR the identity).
     #[test]
     fn row_display_order_is_the_renderers_permutation() {
         let mut t = Terminal::new(2, 10);
@@ -882,10 +874,9 @@ mod tests {
         logical.into_iter().map(|(_, ch)| ch).collect()
     }
 
-    /// What is highlighted is what is copied on a BiDi row: the selection is a
-    /// logical range, and the frame records each permuted row's map so the
-    /// renderer predicate lights the cells that hold it, wherever the reorder
-    /// painted them. A pure-LTR row has no map and paints its own columns.
+    /// On a BiDi row the highlight lights the cells the copy reads: the
+    /// selection is a logical range and the frame's map places it. A pure-LTR
+    /// row has no map and paints its own columns.
     #[test]
     fn a_logical_selection_lights_the_cells_it_copies_on_a_reordered_row() {
         let mut term = Terminal::new(4, 30);

@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `win_scripts`: this checkout carries the Windows install scripts
-//! (`apps/aterm-win/build.ps1` and `install.ps1`). The development checkout
-//! does; the public source snapshot does not (publish/manifest.txt exports no
-//! `apps/`). `WINDOWS_UPDATE_LANE` and `aterm help update` name those scripts
-//! only where they exist, and otherwise a `targo` rebuild plus the README's
-//! fact that Trust for Windows is not published yet.
+//! Sets `win_scripts` when the checkout carries the Windows install scripts
+//! (`apps/aterm-win/`); the public source snapshot exports no `apps/`.
+//! `WINDOWS_UPDATE_LANE` names the scripts only where they exist.
 
 use std::path::PathBuf;
 

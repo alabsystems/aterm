@@ -295,9 +295,7 @@ impl RgbColorRing {
         (self.ring_row(row) as usize) * (self.stride as usize) + (col as usize)
     }
 
-    /// Read `plane`'s RGB at (row, col), if any.
-    ///
-    /// Returns `None` if `col >= stride` (stale dimensions after resize).
+    /// Read `plane`'s RGB at (row, col); `None` if `col >= stride`.
     #[inline]
     fn read(&self, plane: Option<&[u32]>, row: u16, col: u16) -> Option<[u8; 3]> {
         if col >= self.stride {
@@ -794,11 +792,8 @@ pub struct CellExtras {
     any_image: bool,
 }
 
-/// The empty entry a writer's new cell takes at internal key `key`: the one
-/// rule [`CellExtras::fresh`] and [`CellExtras::set_range_uniform`]'s map path
-/// write a cell's map extras by, so such a write never adopts an orphan's mark
-/// or link (the ring path writes no entry; see `set_range_uniform`).
-///
+/// Reset or insert the empty entry at internal key `key` for a writer's new cell:
+/// the rule [`CellExtras::fresh`] and `set_range_uniform`'s map path share.
 /// Returns the entry and whether the one it replaced carried a link, which the
 /// caller refunds. Only an occupied slot is reset; a vacant slot is a plain
 /// insert (resetting every slot cost +8% instructions on densely linked text).

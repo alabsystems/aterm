@@ -27,7 +27,8 @@
 //! the session down to one line. Every line after the header starts with a node id (a
 //! mark's id is its seq) until the trailer: `need` lines for the needs the
 //! session line does not name, the counts of `mail` and of `act` and `story`
-//! marks (`acts 2 · stories 1`, phase 3B; both shed before anything else),
+//! marks (`acts 2 · stories 1`, phase 3B) and of `shown` marks (`shown 3`,
+//! phase 6, 6F-9; all shed before anything else),
 //! then one
 //! `claim` line per live claim (a verdict, a label, a need raised by a
 //! mark). `more=` names what was left out. A suffix gives the source's reliability: `!` exact, `+`
@@ -210,12 +211,22 @@ impl TurnInfo<'_> {
 }
 
 /// The window, sorted into turns, their steps and the marks worth a line;
-/// and the `act` and `story` marks, counted (ruling S15).
+/// and the `act` and `story` marks, counted (ruling S15), and the `shown`
+/// marks (phase 6, 6F-9, ruling U26).
 struct Scan<'a> {
     turns: BTreeMap<u32, TurnInfo<'a>>,
     marks: Vec<&'a Rec>,
     acts: usize,
     stories: usize,
+    shown: usize,
+}
+
+impl Scan<'_> {
+    /// Whether any count line has something to count ([`render`]'s
+    /// `counts`): mail in `totals`, acts or stories, or shown marks.
+    fn counts_any(&self, totals: &crate::fold::Totals) -> bool {
+        self.acts + self.stories + self.shown > 0 || totals.mail_in > 0 || totals.mail_out > 0
+    }
 }
 
 /// Marks a brief never gives a line: the raw signals the tree is built from,
@@ -229,7 +240,8 @@ struct Scan<'a> {
 /// `task` mark (phase 5, 5C-1) is bookkeeping too: `task` is its reader. So
 /// are Phase 6's ring facts (6F-2): a session's state, a policy's
 /// generation, a topic, an advisory, the program's own report (ruling U17),
-/// a mail fetch and what the person was shown.
+/// a mail fetch and what the person was shown (6F-9: `shown`, one count
+/// line, [`Scan::shown`], shed with the others).
 fn mark_worth_a_line(k: Kind) -> bool {
     !matches!(
         k,
@@ -353,7 +365,7 @@ fn scan<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> Scan<'a> {
     let mut turns: BTreeMap<u32, TurnInfo<'a>> = BTreeMap::new();
     let mut step_turn: BTreeMap<u32, u32> = BTreeMap::new();
     let mut marks = Vec::new();
-    let (mut acts, mut stories) = (0, 0);
+    let (mut acts, mut stories, mut shown) = (0, 0, 0);
     for r in window.iter().copied().chain(seeds) {
         let turn_of = |node: Node, step_turn: &BTreeMap<u32, u32>| match node.lvl {
             Lvl::Turn => Some(node.n),
@@ -404,6 +416,7 @@ fn scan<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> Scan<'a> {
             (Op::Mark, _) if mark_worth_a_line(r.k) => marks.push(r),
             (Op::Mark, _) if r.k == Kind::Act => acts += 1,
             (Op::Mark, _) if r.k == Kind::Story => stories += 1,
+            (Op::Mark, _) if r.k == Kind::Shown => shown += 1,
             _ => {}
         }
     }
@@ -413,6 +426,7 @@ fn scan<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> Scan<'a> {
         marks,
         acts,
         stories,
+        shown,
     }
 }
 
@@ -767,8 +781,8 @@ fn gap_line(g: &Gap) -> String {
 /// Render at shedding `level`, dropping the `drop` oldest turn units at
 /// level 3 (the newest is always kept): the body lines and the `more=`
 /// items. `counts`: with the count lines — `mail in · out` and `acts ·
-/// stories` (S15, A23) — which a rendering that does not fit sheds before
-/// anything else.
+/// stories` (S15, A23), and `shown` (6F-9, U26) — which a rendering that
+/// does not fit sheds before anything else.
 fn render(
     scan: &Scan<'_>,
     gap: Option<&Gap>,
@@ -863,6 +877,9 @@ fn render(
         }
         if counts && scan.acts + scan.stories > 0 {
             lines.push(format!("acts {} · stories {}", scan.acts, scan.stories));
+        }
+        if counts && scan.shown > 0 {
+            lines.push(format!("shown {}", scan.shown));
         }
         lines.extend(claims);
     } else {
@@ -1062,9 +1079,8 @@ impl Briefing<'_> {
     pub fn fit(&self, sid: &str, budget: usize, now_wall: u64) -> Brief {
         let whole = (sid, budget, now_wall);
         // The count lines first, shed before any other (S15): the mail a 3B
-        // producer counts and the acts and stories.
-        let totals = &self.st.totals;
-        if self.scan.acts + self.scan.stories > 0 || totals.mail_in > 0 || totals.mail_out > 0 {
+        // producer counts, the acts and stories, and the shown marks (6F-9).
+        if self.scan.counts_any(&self.st.totals) {
             let (b, _) = self.at_with(whole, (0, 0), true, TxShed::Full);
             if b.used <= budget {
                 return b;

@@ -486,10 +486,9 @@ fn the_retired_hook_verbs_drain_a_pipe_and_never_wait_on_a_terminal() {
 // usage
 // ---------------------------------------------------------------------------
 
-/// A relative `CLAUDE_CONFIG_DIR` is relative to Claude Code's working
-/// directory, which this command cannot know: `usage` folds nothing and says
-/// why rather than folding another configuration's transcript. Control: unset,
-/// the `~/.claude` transcript folds.
+/// A `CLAUDE_CONFIG_DIR` this command cannot resolve (a relative one whose base, Claude Code's
+/// working directory, it cannot read): `usage` folds nothing and says why rather than folding
+/// another configuration's transcript. Control: unset, the `~/.claude` transcript folds.
 #[test]
 fn usage_with_a_relative_claude_config_dir_folds_nothing_and_says_so() {
     let tmp = tmp_dir("usage-relative-config");
@@ -3717,9 +3716,8 @@ fn every_file(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     found
 }
 
-/// THE PACKAGED STATE: no roster. The report says no account is listed,
-/// names the file it read and the one line that lists one — and writes
-/// nothing: no state directory, no roster file.
+/// With no roster (the packaged state) the report says no account is listed, names the file it
+/// read and the line that lists one, and writes nothing.
 #[test]
 fn with_no_roster_the_report_names_the_file_and_the_add_line_and_writes_nothing() {
     let tmp = tmp_dir("accounts-none");
@@ -4367,12 +4365,9 @@ fn a_flow_that_ends_signed_out_is_recorded_so_and_exits_1() {
     assert_eq!(wake_id(&store), woken, "nobody is woken");
 }
 
-/// WHERE NO LOGIN CAN BE ASKED, THE FLOW IS NOT STARTED: with neither USER
-/// nor LOGNAME set the login could not be asked afterwards (and would read
-/// signed out), so the owner is not sent through a browser sign-in that
-/// records nothing. Said with its reason, exit 1; the line is still printed.
-///
-/// NEGATIVE CONTROL: the same host, able to ask, runs the flow.
+/// Where no login can be asked (neither USER nor LOGNAME set) the flow is not started: it would
+/// cost a browser sign-in that records nothing. Said with its reason, exit 1; the line is still
+/// printed. Negative control: able to ask, the same host runs the flow.
 #[test]
 fn a_login_nobody_could_ask_afterwards_is_not_started() {
     let tmp = tmp_dir("accounts-login-unaskable");
@@ -5637,11 +5632,10 @@ fn the_accounts_report_shows_the_record_of_usage() {
 // The usage tap
 // ---------------------------------------------------------------------------
 
-/// `usage` SHOWS THE TAP'S LAST READING of its own process: the file this
-/// tab and `CLAUDE_PID` name, written since that process started — the HUD's
-/// figures and the reading's age, the JSON's `windows`. NEGATIVE CONTROLS:
-/// another tab's file, and a file older than the process (a reused pid's),
-/// leave the windows unknown.
+/// `usage` shows the tap's last reading of its own process: the file this tab and
+/// `CLAUDE_PID` name, written since that process started (the HUD's figures and the reading's
+/// age, the JSON's `windows`). Negative controls: another tab's file, and a file older than the
+/// process (a reused pid's), leave the windows unknown.
 #[test]
 fn usage_shows_the_tap_reading_of_its_own_process() {
     let tmp = tmp_dir("usage-tap");

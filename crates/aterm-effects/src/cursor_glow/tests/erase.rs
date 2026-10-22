@@ -312,10 +312,8 @@ fn ctrl_k_shrink_poofs_once() {
     assert!(!glow.is_active());
 }
 
-/// On the default style (rainbow kitty, dark theme,
-/// `prefs::DEFAULT_CURSOR_TRAIL_STYLE`) every delete shape a shell user uses
-/// puffs smoke: `vapor` is non-empty alongside the particles, for the four
-/// shapes below.
+/// On the default style (rainbow kitty, dark theme) every shell delete shape
+/// puffs a neutral smoke cloud.
 #[test]
 fn the_shipping_default_puffs_a_cloud_on_every_delete_shape() {
     let g = geom();

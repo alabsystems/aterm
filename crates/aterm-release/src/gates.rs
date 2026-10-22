@@ -3972,9 +3972,8 @@ mod handoff_policy_gate_tests {
             .expect("the checked-in policy is one producers can follow");
     }
 
-    /// Everything a producer would silently IGNORE refuses the cut instead, by
-    /// name, before a build number is claimed: a missing file, a typo'd key,
-    /// the reserved `seamless`, a value v1 does not define, a missing schema.
+    /// Everything a producer would silently ignore refuses the cut instead, by name, before
+    /// a build number is claimed.
     #[test]
     fn a_policy_producers_could_not_follow_refuses_the_cut() {
         for (label, text, why) in [

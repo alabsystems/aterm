@@ -62,11 +62,10 @@ pub enum EndClass {
     Clean,
     /// It handed its sessions to an update successor: the successor's own row says so.
     Handoff,
-    /// No crash signal was caught and no exit path ran: SIGKILL (Force Quit, jetsam,
-    /// a harness), a kernel kill, power loss — and SIGTERM, SIGINT or SIGHUP, whose
-    /// handler (aterm-gui's `owned_endpoint`) takes only the control socket, token
-    /// and alias away before re-raising the default action. Its empty marker
-    /// outlived it.
+    /// No crash signal was caught and no exit path ran: SIGKILL (Force Quit, jetsam, a
+    /// harness), a kernel kill, power loss, or SIGTERM/SIGINT/SIGHUP, whose handler
+    /// (aterm-gui's `owned_endpoint`) only removes the control socket, token and alias before
+    /// re-raising. Its empty marker outlived it.
     Killed,
     /// A fatal signal the handler caught (SIGSEGV 11, SIGABRT 6, SIGBUS 10, SIGILL 4,
     /// SIGFPE 8); the number is what the handler wrote into the marker.
@@ -769,12 +768,11 @@ fn open_for_read(path: &Path) -> std::io::Result<std::fs::File> {
 /// Append `row` to the ledger at `path` (created `0600`), then trim it to the newest
 /// [`KEEP_ROWS`] when it has passed [`TRIM_AT_BYTES`].
 ///
-/// Two launches can race here (an update successor and a manual start), so the append
-/// and the trim run under an `flock` on the ledger itself, taken without waiting and
-/// retried for about a second; an append that cannot get it still writes its one line
-/// with a single `O_APPEND` write (whole on a local volume) and skips the trim. A
-/// trim replaces the file by rename, so a writer that locked the old inode re-opens
-/// the path before it writes.
+/// Two launches can race (an update successor and a manual start), so the append and the
+/// trim run under an `flock` on the ledger, tried without waiting for about a second; an
+/// append that cannot get it still writes its line with one `O_APPEND` write (whole on a
+/// local volume) and skips the trim. A trim replaces the file by rename, so a writer that
+/// locked the old inode re-opens the path.
 ///
 /// # Errors
 /// The open or the write failed.

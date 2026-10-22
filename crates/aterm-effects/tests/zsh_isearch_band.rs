@@ -1747,8 +1747,8 @@ fn match_row_kept(h: &Host) -> Vec<String> {
     kept
 }
 
-/// Every owner take with a present after every piece of every read, on the
-/// 120 Hz train and on the host's wake: what `law` finds, per replay.
+/// Each of [`OWNER_TAKES`] with a present after every piece of every read, on the 120 Hz train
+/// and on the host's wake: what `law` finds, per replay.
 fn every_tear(law: fn(&Host) -> Vec<String>) -> String {
     let mut bad = String::new();
     for take in OWNER_TAKES {

@@ -824,9 +824,7 @@ impl Grid {
             return;
         }
 
-        // DECERA / DECFRA / DECSERA replace cells in place, so a highlight over
-        // the rectangle is damaged. Row-granular: the band is the rect's rows,
-        // wider than the rectangle, which is the safe direction.
+        // Row-granular selection damage, as in `fill_rect`.
         self.damage_selection_visible_rows(top, bottom);
 
         let end_col = right.saturating_add(1);

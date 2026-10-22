@@ -637,7 +637,7 @@ fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
     let _ = gui.kill();
     let _ = gui.wait();
     let gui = w.gui.insert(World::relaunch_gui(&w));
-    w.token = World::wait_for_token_of(&w.ctl_sock, gui, &w.gui_log);
+    w.token = World::wait_for_owned_token_of(&w.ctl_sock, gui, &w.gui_log);
     let seen = until("the successor's bridge to stand by or attach", || {
         let fs = w.verb("fabric status").header().to_string();
         match (kv(&fs, "state"), kv(&fs, "reason")) {

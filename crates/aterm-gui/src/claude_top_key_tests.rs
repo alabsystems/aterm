@@ -692,3 +692,55 @@ fn a_readers_press_on_the_key_is_its_click() {
     app.press_claude_chip_for_reader(wid, session, HarnessChip::TopEffort);
     assert_eq!(pty(&mut reader, 1), b"/", "the click's probe");
 }
+
+/// THE KEY'S MARK READS ON A TAB'S OWN THEME (design §8; `session_theme`):
+/// the `◐` a press of the key stands under, in the `─` left of Claude's tag,
+/// is the instance theme's accent, and a tab drawn in a theme of its own
+/// keeps the instance's (the window's chrome follows the instance) — so on
+/// an instance in Dracula a Claude Code tab in Default Light drew Dracula's
+/// light accent on Default Light's paper at 1.0:1. The accent is floored
+/// along its hue on the rule's own ground, as on Codex's slab, so the mark
+/// reads at 4.5:1 there.
+///
+/// NEGATIVE CONTROL: the instance's accent as chosen reads under 1.5:1 on
+/// the tab's ground.
+#[test]
+fn the_keys_mark_reads_on_a_tab_theme_the_instance_did_not_choose() {
+    use aterm_effects::color_math::contrast_ratio;
+    let (mut app, wid, session, mut reader) = idle();
+    let dracula = aterm_types::scheme::builtin("Dracula").expect("a built-in");
+    app.theme = aterm_render::Theme::from(&dracula);
+    app.set_session_theme(
+        session,
+        Some(crate::session_theme::SessionTheme {
+            selector: "Default Light".into(),
+            origin: crate::session_theme::SessionThemeOrigin::Ctl,
+        }),
+    );
+    answered(&app, session, TOP, true);
+    frame(&mut app, wid);
+    let tag = key_hit(&app, wid).expect("the tag");
+    click_at(&mut app, wid, (tag.frame_row, tag.cols.0));
+    assert_eq!(pty(&mut reader, 1), b"/");
+    frame(&mut app, wid);
+    let mark = top_cells(&app, wid)[tag.cols.0 - 2];
+    assert_eq!(mark.ch, '\u{25d0}', "◐ before the tag");
+    let paper = aterm_types::scheme::builtin("Default Light")
+        .expect("a built-in")
+        .background;
+    let ground = [paper.r, paper.g, paper.b];
+    assert_eq!(mark.bg, ground, "the tab's own paper is the rule's ground");
+    let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+    let reads = |a: [u8; 3], b: [u8; 3]| contrast_ratio(pack(a), pack(b));
+    let accent = crate::chrome_band::band_colors(app.theme).accent;
+    assert!(
+        reads(accent, ground) < 1.5,
+        "CONTROL: the instance's accent reads {:.2} on the tab's paper",
+        reads(accent, ground)
+    );
+    assert!(
+        reads(mark.fg, ground) >= aterm_effects::cli_marks::NAME_CONTRAST,
+        "the mark reads {:.2} on the tab's paper",
+        reads(mark.fg, ground)
+    );
+}

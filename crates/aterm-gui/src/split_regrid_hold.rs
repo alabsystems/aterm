@@ -4,25 +4,21 @@
 //! The split's take-back hold: a pane a split shrank does not grow back to its
 //! pre-split grid until the shrink has stood [`SPLIT_REGRID_QUIET`].
 //!
-//! The incident (2026-09-29, two independent skeptics): an agent runs
-//! `@<claude> spawn split=h`, which answers only after `install_split_session`
-//! re-gridded the Claude pane N -> ~N/2 (engine and PTY), then `@<new> close`
-//! straight away — a probe that opens a scratch pane and tears it down, or a
-//! split whose shell exits at once. `apply_close_outcome` grew the sibling back
-//! to N in the same few milliseconds. Claude Code repaints only when its
-//! `SIGWINCH` handler reads a CHANGED size: after the net-zero pair it read N,
-//! the size it last drew, and never repainted, while the alternate screen's
-//! shrink had already demoted about half its rows. The engine's resize undo
-//! repairs the pair only when no output lands between its halves, and any byte
-//! the program wrote meanwhile left ~N/2 rows stale.
+//! A split that closes at once (a probe that opens a scratch pane and tears it
+//! down, a shell that exits at once) would re-grid its sibling N -> ~N/2 -> N
+//! within milliseconds. Claude Code repaints only when its `SIGWINCH` handler
+//! reads a changed size, so after the net-zero pair it never repaints, while the
+//! alternate screen's shrink has already demoted about half its rows (the
+//! engine's resize undo repairs the pair only when no output lands between its
+//! halves).
 //!
-//! The coalescing sits at the source of the transient: the split's shrink
-//! stays IMMEDIATE (the new pane needs the room at once), and only the
-//! TAKE-BACK waits — the COLLAPSE of a pane the split made
-//! (`apply_close_outcome`, a Cmd-W, a control `close`, an exited shell)
-//! growing that very pane back to exactly the grid it had before the split —
-//! until the shrink has stood [`SPLIT_REGRID_QUIET`], so the program has read
-//! the shrunk size and the grow is a second, distinct `SIGWINCH`.
+//! The split's shrink stays immediate (the new pane needs the room at once);
+//! only the take-back waits: the collapse of a pane the split made
+//! (`apply_close_outcome`: Cmd-W, a control `close`, an exited shell) growing a
+//! pane back to exactly its pre-split grid, until the shrink has stood the
+//! quiet, so the grow is a second, distinct `SIGWINCH`. Only panes that existed
+//! before the split are held: the newborn is spawned at a size its program never
+//! drew, so closing the original pane grows it at once.
 //!
 //! Who is held: only the panes that existed BEFORE the split. The newborn
 //! pane is spawned at the window's full grid, a size its program never drew

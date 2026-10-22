@@ -496,14 +496,11 @@ impl CursorGlow {
 
     /// The licence: did a human touch the keyboard just now?
     ///
-    /// See `docs/design/EFFECTS-LICENSE-REDESIGN.md`. This is the question the
-    /// effects engine asks before minting light, answered by the key-hint
-    /// stamps the host arms at the input boundary, each under its own
-    /// freshness constant (the 0.25 s class).
-    ///
-    /// Peeks, never consumes: `spawn`'s classifier owns hint consumption (one
-    /// hint, one echo). Class-blind: which choreography fires is
-    /// [`Self::classify_move`]'s job.
+    /// Answered by the key-hint stamps the host arms at the input boundary,
+    /// each under its own freshness constant
+    /// (`docs/design/EFFECTS-LICENSE-REDESIGN.md`). Peeks, never consumes:
+    /// `spawn`'s classifier owns hint consumption (one hint, one echo).
+    /// Class-blind: which choreography fires is [`Self::classify_move`]'s job.
     ///
     /// Not licence terms, though live stamps:
     /// * `reflow_hint` / `blink_hint`: a resize and a TUI's repaint blink are
@@ -2768,15 +2765,13 @@ impl CursorGlow {
         // The delivered insert (Rainbow Kitty only; `move_licensed` stays the
         // classic trail's lockstep contract). A file drop, ⌘V, the `paste`
         // verb, a Tab completion or ⌃V is the user's gesture, but its echo is
-        // program output to the PTY stream, and its gesture stamp is revoked at
-        // enqueue. The witness is the host's completed write
-        // (`note_insert_delivered`): a same-row forward hop no wider than the
-        // insert plus the typed credits behind it, on its own row
-        // (`insert_row_identity`), unexplained by a fresher press class, is laid
-        // as one sweep joining the cohort and nothing else (an insert is not
-        // typing). Judged before the licence gate, whose classes cannot
-        // describe it, and before `classify_move`, which would read a long hop
-        // beside a typed stamp as a re-anchor.
+        // program output and its gesture stamp is revoked at enqueue. The
+        // witness is the host's completed write (`note_insert_delivered`): a
+        // same-row forward hop no wider than the insert plus the typed credits
+        // behind it, on its own row, unexplained by a fresher press class, is
+        // laid as one sweep joining the cohort. Judged before the licence gate,
+        // whose classes cannot describe it, and before `classify_move`, which
+        // would read a long hop beside a typed stamp as a re-anchor.
         let insert = match lane {
             SpawnLane::Visible => self.visible_insert_echo(pr, pc, cr, cc, now, cfg),
             SpawnLane::Anchored { insert_ok } => {
@@ -2799,23 +2794,18 @@ impl CursorGlow {
         }
         // The licence seam (see [`Self::move_licensed`]). An unlicensed move
         // (program output nobody asked for) returns here, before
-        // `classify_move` and before any state moves:
-        //
-        // Mint nothing: no thermal, sound cue, birth, glide sample or crown.
-        //
-        // Clear nothing: earned light is never destroyed by someone else's
-        // output; retention is decay, `note_scroll` translation and reset.
+        // `classify_move` and before any state moves. It mints nothing (no
+        // thermal, sound cue, birth, glide sample or crown) and clears nothing:
+        // earned light is never destroyed by someone else's output.
         //
         // The unpaid press is a licence too (Rainbow Kitty only): a debounced
         // app repaints when it likes, often after the key stamps expire.
-        // `move_licensed` is a public lockstep contract with the classic trail
-        // (`app_render.rs`), so the extension lives at this seam, on the echo
-        // shape. Program output banks no credits, so keyless caret walks still
-        // decline.
+        // `move_licensed` is a public lockstep contract with the classic trail,
+        // so the extension lives at this seam, on the echo shape. Program
+        // output banks no credits, so keyless caret walks still decline.
         //
-        // The park ([`HeldPark`]): a same-row backward move a stamp or the
-        // in-flight pool stands behind is held for its return, in both
-        // branches, before anything is consumed or scored; it is scored when
+        // The park ([`HeldPark`], [`Self::park_candidate`]) is held for its
+        // return before anything is consumed or scored; it is scored when
         // judged (flush or return).
         let exact_run = (call == SpawnCall::Live && lane == SpawnLane::Visible)
             .then(|| self.exact_repaint_run((pr, pc), (cr, cc), now, cfg))
@@ -3342,28 +3332,24 @@ impl CursorGlow {
             && re_anchor
             && !lays_typed_cells
             && self.typed_credits_within(now) >= 1;
-        // The landing is the key's own glyph. The landing law is for hops whose
+        // The landing is the key's own glyph: the landing law is for hops whose
         // landing cell is the typed glyph (box-growth wrap, flushed park, a
         // refused coalesce). zle's incremental search is the counter-shape: it
         // echoes keys on the status row below and walks the visible caret along
         // the match row, one credit per hop, so laying landings would draw a
         // band on history text. On the visible lane (the anchored lane has its
         // own gate in [`Self::echo_anchor_pass`]) the landing is laid only
-        // where this frame's caret-row probe ([`Self::probe_glyph_before`])
-        // holds a live press's own glyph. A foreign landing forgets the presses
-        // and [`Self::spawn_judged`] declines the move `program-row`. Unknown
-        // (no probe this frame, a glyph-less press, an empty pool) keeps the
-        // landing law.
+        // where this frame's probe ([`Self::probe_glyph_before`]) holds a live
+        // press's own glyph; a foreign landing forgets the presses and
+        // [`Self::spawn_judged`] declines the move `program-row`. Unknown (no
+        // probe, a glyph-less press, an empty pool) keeps the landing law.
         //
-        // The witness reads the cell the re-anchor lays. Two composer verdicts
-        // move that cell off `(cr, cc − 1)` and are read first:
+        // Two composer verdicts move the witnessed cell off `(cr, cc − 1)`:
         // * a soft-wrapped caret ([`Self::soft_wrapped_caret`]) lays its one
-        //   cell at the origin `(pr, pc)`, where the key's glyph stands, so the
-        //   witness is the origin's glyph in the probed row above (a glyph no
-        //   press typed is still refused);
+        //   cell at the origin `(pr, pc)`, so the witness is the origin's glyph
+        //   in the probed row above;
         // * a lifted word ([`Self::lifted_word`]) lays no landing, so the gate
-        //   stands down with the sweep and the move reaches v2 with its `Lift`;
-        //   zle's hops never rewrite the row above.
+        //   stands down and the move reaches v2 with its `Lift`.
         // The typed fold never reaches the gate; a key that pushed text down
         // ([`Self::key_pushed_text_down`]) and a reflowed soft-wrapped word
         // ([`Self::carried_word_left`]) land right of the key's glyph and pass.

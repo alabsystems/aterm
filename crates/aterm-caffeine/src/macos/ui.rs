@@ -136,14 +136,22 @@ pub(super) fn install(
 
 impl StatusUi {
     /// Show the full mug when `lit`, else the empty one, with `tip` as the hover; each is
-    /// sent only when it differs from what the button shows.
+    /// sent only when it differs from what the button shows. The accessibility label says
+    /// which ([`state_text`]): a label set on the button hides its image's description, so
+    /// without it a VoiceOver user would hear the same thing on and off.
     pub(super) fn show(&mut self, lit: bool, tip: &str) {
         autoreleasepool(|_| {
             if self.shown_lit != Some(lit) {
                 let image = &self.images[usize::from(lit)];
-                // SAFETY: `-setImage:` is `v24@0:8@16` on the live button, handed a live
-                // image this holds (the button retains it too).
-                unsafe { send_v_id(self.button.id(), sel!(setImage:), image.id()) };
+                // SAFETY: `-setImage:` and `-setAccessibilityLabel:` are `v24@0:8@16` on the
+                // live button, handed a live image this holds (the button retains it too) and
+                // a live string it copies.
+                unsafe {
+                    send_v_id(self.button.id(), sel!(setImage:), image.id());
+                    if let Some(label) = aterm_objc::ns_string(state_text(lit)) {
+                        send_v_id(self.button.id(), sel!(setAccessibilityLabel:), label.id());
+                    }
+                }
                 self.shown_lit = Some(lit);
             }
             if self.shown_tip.as_deref() != Some(tip)
@@ -266,6 +274,12 @@ pub(super) fn changed_rows(shown: &[Row], now: &[Row]) -> Option<Vec<usize>> {
     )
 }
 
+/// What the mug says it is, lit or not: its image's description and the button's
+/// accessibility label once it shows one ([`StatusUi::show`]).
+pub(super) fn state_text(lit: bool) -> &'static str {
+    if lit { "Caffeine on" } else { "Caffeine off" }
+}
+
 /// A template image of the mug, lit or not, from the icon's 1x and 2x PNGs: an `NSImage`
 /// (+1) of [`icon::SIZE_POINTS`] holding one bitmap per scale, marked as a template so the
 /// menu bar tints it for its appearance and for the highlighted state.
@@ -293,12 +307,11 @@ fn template_image(lit: bool) -> Option<Obj> {
             send_v_id(image.id(), sel!(addRepresentation:), rep.id());
         }
     }
-    let description = if lit { "Caffeine on" } else { "Caffeine off" };
     // SAFETY: `-setTemplate:` is `v20@0:8B16` and `-setAccessibilityDescription:`
     // `v24@0:8@16`, on the live image.
     unsafe {
         send_v_bool(image.id(), sel!(setTemplate:), true);
-        if let Some(text) = aterm_objc::ns_string(description) {
+        if let Some(text) = aterm_objc::ns_string(state_text(lit)) {
             send_v_id(image.id(), sel!(setAccessibilityDescription:), text.id());
         }
     }

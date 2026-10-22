@@ -3,8 +3,8 @@
 //
 // Inline-image (iTerm2 OSC 1337 / Kitty) pixel and precedence parity. Both
 // renderers composite the real image pixels: Kitty z<0 tiles sit after
-// backgrounds/underlayers but before base+combining glyphs, while z>=0 tiles
-// retain the traditional over-text slot before line decorations.
+// backgrounds/underlayers but before base+combining glyphs; z>=0 tiles draw
+// over text, before line decorations.
 //
 // No GPU or no font: COULD NOT RUN.
 

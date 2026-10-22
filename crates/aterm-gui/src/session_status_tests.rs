@@ -372,13 +372,9 @@ fn alt_screen_transition_is_a_resync_not_activity() {
     );
 }
 
-/// THE `Executing` ARM NAMES THE CLOCK THAT IS ALIVE
-/// (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md` item 21). On a
-/// shell-integrated session, output that mutates nothing must read
-/// `output_activity` — the same `movement_reason` the foreground-job arm
-/// uses — or `ctl status` cannot say whether the movement clock has gone
-/// stale (the in-band witness the spin gate's fixture relies on). RED
-/// before: the arm hardcoded `ContentActivity` whenever anything moved.
+/// On a shell-integrated session, output that moves nothing reads `output_activity` (the
+/// `movement_reason` the foreground-job arm uses), so `ctl status` shows whether the movement
+/// clock is stale (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md` item 21).
 #[test]
 fn executing_names_output_only_movement_as_output_activity() {
     let t0 = Instant::now();
@@ -521,9 +517,8 @@ fn indicators_map_work_and_failure_without_claiming_unsaved_state() {
     }
 }
 
-/// End to end on the real fan-out: a BACKGROUND pane's transition must reach
-/// the tab its window renders. The status path is leaf-addressed precisely
-/// because a focus-addressed one would see nothing here.
+/// End to end on the real fan-out: a background pane's transition reaches the tab its window
+/// renders, which a focus-addressed status path would miss.
 #[test]
 fn a_background_pane_going_busy_marks_its_tab() {
     use crate::tab_model::TabIndicators;
@@ -1213,7 +1208,7 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
         record.contains(
             " flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- end=- end_seen=- \
              end_cheered=- task_state=- task_rev=0 log_seq=1 log_ep=1 run=- \
-             turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 gen="
+             turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
     );
@@ -1778,7 +1773,8 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              journal journal_off integration_rev born render \
              resizes flaps land_at task pause land_held land_nudges land_since end end_seen \
              end_cheered task_state task_rev \
-             log_seq log_ep run turn step need need_since_ms rollout rollout_asks editing gen seq hash"
+             log_seq log_ep run turn step need need_since_ms rollout rollout_asks editing bells \
+             bells_sounded last_bell gen seq hash"
         ),
         "{observed}"
     );
@@ -1812,10 +1808,9 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
     );
 }
 
-/// `consent_at_risk` is emitted on the CONJUNCTION and on nothing else: it
-/// is silent while the cwd is unknown (every session without shell
-/// integration), and it appears the moment a reported cwd lands under a
-/// protected root. It is not a claim that a dialog is showing.
+/// `consent_at_risk` is emitted on the conjunction and nothing else: silent while the cwd is
+/// unknown (every session without shell integration), present once a reported cwd lands under
+/// a protected root. It is not a claim that a dialog is showing.
 #[test]
 fn consent_at_risk_rides_the_reasons_token_only_on_the_conjunction() {
     assert_eq!(Reason::ConsentPrompt.as_str(), "consent_at_risk");
@@ -2358,9 +2353,8 @@ fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
     }
 }
 
-/// `executing_detail` is the one producer: a block that is EXECUTING names
-/// its (sanitized) command; a prompt, an entering block and a completed
-/// block name nothing, whatever text they carry.
+/// `executing_detail` is the one producer: an executing block names its (sanitized)
+/// command; a prompt, an entering block and a completed block name nothing.
 #[test]
 fn executing_detail_reads_only_an_executing_block() {
     let mut term = aterm_core::terminal::Terminal::new(24, 80);
@@ -2435,13 +2429,10 @@ fn a_full_clear_while_the_command_runs_never_names_what_the_program_drew() {
     }
 }
 
-/// The `status` record's `detail=`: the sanitized running command while the
-/// block executes, `-` otherwise; the engine's fact, so it is answered
-/// before the classifier's first publish, under a pin, and never by
-/// waiting on a contended terminal. The subject ladder under the same
-/// contention: a contended terminal reports `unavailable` rather than
-/// silently falling to a lower rung (which a poller would read as a real
-/// title change), and a pin is answered from the metadata LEAF lock.
+/// The `status` record's `detail=`: the sanitized running command while the block executes, `-`
+/// otherwise; answered before the classifier's first publish and never by waiting on a contended
+/// terminal. Under contention the subject reads `unavailable` rather than a lower rung (which a
+/// poller would read as a title change), and a pin answers from the metadata leaf lock.
 #[test]
 fn the_status_record_details_the_executing_block_and_nothing_else() {
     let mut app = crate::App::headless_for_test();
@@ -2512,11 +2503,8 @@ fn the_status_record_details_the_executing_block_and_nothing_else() {
     assert!(record.contains(" detail=- "), "complete: {record}");
 }
 
-/// The chrome's `detail` was seeded `None` and never written, so every tab
-/// read plain `running` while the wire named the program. The sweep now
-/// folds `executing_detail` onto the published status through
-/// [`StatusObserver::set_detail`]: an Executing block publishes the
-/// sanitized program, and idle (prompt, complete, no integration) clears it.
+/// The sweep folds `executing_detail` onto the published status ([`StatusObserver::set_detail`]):
+/// an Executing block publishes the sanitized program, and idle clears it.
 #[test]
 fn the_sweep_publishes_the_running_detail_onto_the_chrome_status() {
     let mut app = crate::App::headless_for_test();

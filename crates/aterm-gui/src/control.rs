@@ -3,12 +3,9 @@
 
 //! Live introspection control socket (aterm introspection control protocol v1).
 //!
-//! A background thread binds a Unix domain socket and serves newline-delimited
-//! text requests so an out-of-process client can read the live screen
-//! (text/cursor/cell/search), drive the shell (send/key), snapshot pixels
-//! (image), drive selection (plain ranges and `word`/`line`/`block`/`extend`
-//! gestures, selection/copy), and resize the engine and PTY, all against the
-//! running terminal the window presents.
+//! Serves newline-delimited text requests on a Unix domain socket so an
+//! out-of-process client can read the live screen, drive the shell, snapshot
+//! pixels, drive selection and resize the engine and PTY of the running terminal.
 //!
 //! Threading: text/cursor/cell/search read the shared [`Terminal`] directly;
 //! send/key/resize write the PTY master fd. `image` needs the renderer on the

@@ -298,25 +298,20 @@ fn drain_master(master: libc::c_int, buf: &mut [u8], pass: &mut impl FnMut(&[u8]
     }
 }
 
-/// Test seam: run at the one point of every loop turn between the signal flag
-/// checks and the `poll(2)` that waits, where a flag-only signal would be lost.
+/// Test seam: runs each loop turn between the signal-flag checks and the `poll(2)`, the
+/// point where a flag-only handler would lose a signal.
 #[cfg(test)]
 static BEFORE_POLL: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
-/// Raw mode, the passthrough `poll(2)` loop, resize forwarding, restore, reap:
-/// returns the shell's exit status (non-exit or a failed wait → 1). Nothing
-/// here models the screen; the PTY is the one thing told the geometry.
+/// Raw mode, the passthrough `poll(2)` loop, resize forwarding, restore, reap: returns the
+/// shell's exit status (non-exit or a failed wait → 1). Nothing here models the screen.
 ///
-/// The session ends with the shell, and the master's EOF is not that: it
-/// comes when the last holder of the slave lets go, and a job the shell leaves
-/// behind (a `nohup`ed `cmd &`, a `setsid` daemon) can hold it past the
-/// shell's `exit`. Linux does not hang up a PTY session at its leader's exit
-/// at all; macOS revokes the slave then, but a job that opens it again by path
-/// before this loop has read the EOF holds the master open again. So the loop
-/// reaps the shell on SIGCHLD, passes through what the master still holds and
-/// ends; closing the master then hangs up whatever still holds the slave. An
-/// EOF while the shell lives (it closed its terminal) still ends the loop, and
-/// the shell is waited for after it.
+/// The session ends with the shell, not at the master's EOF: a job the shell leaves behind
+/// (`nohup cmd &`, a `setsid` daemon) can hold the slave past the shell's `exit` (Linux does
+/// not hang up a PTY at its leader's exit; on macOS a job can reopen the slave by path
+/// before the loop reads the EOF). So the loop reaps the shell on SIGCHLD, passes through
+/// what the master still holds and ends; closing the master hangs up the rest. An EOF
+/// while the shell lives still ends the loop, and the shell is waited for after it.
 pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     let master = shell.master;
     let shell_pid = shell.pid;
@@ -331,12 +326,9 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     catch(libc::SIGWINCH, 0);
     // A child that stops or continues has not exited.
     catch(libc::SIGCHLD, libc::SA_NOCLDSTOP);
-    // Until the lines above, `SIGWINCH` was at its default — ignored — so a
-    // resize since the spawn read the host's size (containment, the PATH dirs,
-    // the fork and exec all ran in between) was dropped. Now that the handler
-    // sees every later one, catch up once: when the host's grid is no longer
-    // the PTY's, the first turn of the loop applies it. An unmoved grid sends
-    // the program nothing.
+    // Until now `SIGWINCH` was at its default (ignored), so a resize since the spawn read
+    // the host's size was dropped. Catch up once: when the host's grid is no longer the
+    // PTY's, the first turn applies it.
     if aterm_pty::size(master) != Some(host_winsize()) {
         GOT_WINCH.store(true, Ordering::Release);
     }
@@ -359,16 +351,12 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
         }
     };
 
-    // Input waits HERE, never in `write(2)`. A program that is not reading
-    // (busy printing, `sleep`, a stopped job) leaves its tty input queue full,
-    // and a write into a full queue parks until it reads; a loop parked there
-    // stops reading the program's OUTPUT, so a program that is printing parks
-    // too and neither ever moves again: no output, no resize, no keystroke
-    // read. So the master is non-blocking, the input it has no room for is
-    // held in `pending` while the output keeps flowing, and stdin is not read
-    // while `pending` holds [`INPUT_BACKLOG_MAX`]: the rest waits in the host's
-    // own terminal, never in this process's memory. Should the fcntl fail (it
-    // cannot on a live master), writes block.
+    // Input waits here, never in `write(2)`. A program that is not reading leaves its tty
+    // input queue full; a write into it parks the loop, which then stops reading the
+    // program's output, so a printing program parks too and neither moves again. So the
+    // master is non-blocking, unaccepted input is held in `pending` while output flows, and
+    // stdin is not read while `pending` holds [`INPUT_BACKLOG_MAX`]: the rest waits in the
+    // host's terminal. Should the fcntl fail (it cannot on a live master), writes park.
     let _ = aterm_pty::set_nonblocking(master, true);
     let mut pending: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
     let mut stdin_open = true;
@@ -660,14 +648,9 @@ mod tests {
         assert_eq!(RAN.load(Ordering::SeqCst), 1, "once, however much it said");
     }
 
-    /// Input the program is not reading never stops its output. The session
-    /// is handed far more typed-ahead input than a tty input queue holds while
-    /// the program it runs writes thousands of lines and never reads: the
-    /// driver must keep passing the output through and return the program's
-    /// own exit status. A driver that parks writing input into the full queue
-    /// stops reading the output, so the program parks writing it and neither
-    /// ever moves. Runs in a re-exec of this test binary whose stdin is a pipe
-    /// holding the input; a minute is the hang detector.
+    /// Input the program never reads does not stop its output: far more typed-ahead input
+    /// than a tty queue holds, while the program writes thousands of lines, must not park
+    /// the driver. Stdin is a pipe holding the input; a minute is the hang detector.
     #[test]
     fn input_the_program_never_reads_does_not_stop_its_output() {
         const CHILD: &str = "ATERM_TEST_DRIVER_UNREAD_INPUT";
@@ -775,16 +758,10 @@ mod tests {
         );
     }
 
-    /// A resize of the host terminal that lands before the driver is
-    /// listening still reaches the program. The session reads the host size
-    /// for the spawn, then sets up for tens of milliseconds (containment, the
-    /// PATH dirs, the fork and exec) with `SIGWINCH` at its default, ignored —
-    /// so a window manager laying out a just-opened terminal resizes it inside
-    /// that window, the signal is dropped, and the program keeps the stale size
-    /// until the next resize. Here the host terminal is a PTY this re-exec puts
-    /// on its stdout, resized after the program is up and before [`run`]; the
-    /// program waits for a `SIGWINCH` and prints the size it then reads. Its
-    /// wait is bounded at a minute, the hang detector.
+    /// A host resize between the spawn's size read and the `SIGWINCH` handler's install
+    /// reaches the program. The host terminal is a PTY on this re-exec's stdout, resized
+    /// after the program is up and before [`run`]; the program waits (a minute, the hang
+    /// detector) for `SIGWINCH` and prints the size it then reads.
     #[test]
     fn a_resize_before_the_driver_listens_reaches_the_program() {
         const CHILD: &str = "ATERM_TEST_DRIVER_EARLY_RESIZE";
@@ -951,13 +928,10 @@ mod tests {
         r == 0 && unsafe { info.si_pid() } == pid
     }
 
-    /// A resize that lands between the loop's signal check and its `poll(2)`
-    /// reaches the program with nothing else to wake the loop. The seam
-    /// [`BEFORE_POLL`] resizes the host terminal and raises `SIGWINCH` there,
-    /// once, while the program waits silently for the resize and stdin is a
-    /// pipe that stays open and empty. A flag-only handler leaves the resize
-    /// unapplied until the next I/O, here the program giving up its wait after
-    /// a minute, the hang detector.
+    /// A resize that lands between the loop's signal check and its `poll(2)` reaches the
+    /// program with nothing else to wake the loop: [`BEFORE_POLL`] resizes the host and
+    /// raises `SIGWINCH` there once, while the program waits silently and stdin stays open
+    /// and empty. A minute is the hang detector.
     #[test]
     fn a_resize_between_the_signal_check_and_the_poll_reaches_the_program() {
         const CHILD: &str = "ATERM_TEST_DRIVER_RESIZE_BEFORE_POLL";
@@ -1075,17 +1049,11 @@ mod tests {
         assert_eq!(code, 0, "the program saw the resize: {text:?}");
     }
 
-    /// The session ends when the shell exits, though a job it left behind
-    /// still holds the terminal. The job ignores `SIGHUP` (as under `nohup`),
-    /// drops its inherited copies of the terminal and, once the shell is gone,
-    /// opens it again by path. On Linux any such holder keeps the master from
-    /// EOF, since a PTY session is not hung up at its leader's exit; macOS
-    /// revokes the slave then, so here the job must open it again before the
-    /// loop reads the EOF, which the seam [`BEFORE_POLL`] arranges: once the
-    /// job ignores `SIGHUP` it lets the shell exit, waits for that and for the
-    /// job's open, then lets the loop poll. The job holds the terminal until told to let go, at most a
-    /// minute, the hang detector; a session that ends only at the master's EOF
-    /// ends only when that minute is up.
+    /// The session ends when the shell exits, though a job it left behind (ignoring `SIGHUP`,
+    /// as under `nohup`) opens the terminal again by path once the shell is gone. Linux never
+    /// hangs up the PTY at the leader's exit; on macOS the job must reopen it before the loop
+    /// reads the EOF, which [`BEFORE_POLL`] arranges. The job holds the terminal until
+    /// released, at most a minute (the hang detector).
     #[test]
     fn the_session_ends_with_the_shell_while_a_job_holds_its_terminal() {
         const CHILD: &str = "ATERM_TEST_DRIVER_JOB_HOLDS_THE_SLAVE";
@@ -1151,9 +1119,8 @@ mod tests {
                         return;
                     }
                     let dir = DIR.get().expect("scratch dir");
-                    // The shell's exit hangs up the job unless it already
-                    // ignores SIGHUP: a job forked just before the exit can
-                    // be cut before its `trap` (seen on a loaded machine).
+                    // The shell's exit hangs up a job that does not ignore SIGHUP yet:
+                    // a job forked just before the exit can be cut before its `trap`.
                     wait_until("the job does not ignore SIGHUP yet", || {
                         dir.join("armed").exists()
                     });

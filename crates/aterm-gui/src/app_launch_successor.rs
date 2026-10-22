@@ -448,23 +448,13 @@ pub(crate) fn own_launch_record() -> OwnLaunchRecord {
     })
 }
 
-/// A launch LaunchServices has been asked for, whose answer may still be in
-/// flight. [`Self::wait`] blocks for it within a budget; a caller that has
-/// already met the successor another way (its rendezvous dial) polls with a
-/// short budget purely to corroborate the pid.
-/// Bring the successor to the front at COMMIT (2026-09-19). The launch itself
-/// never activates (`begin_launch(.., false)`): activation at launch time pulled
-/// focus while the outgoing window was still the one on glass — a live screen
-/// with a dead keyboard — and under the late park the successor exists for as
-/// long as the parent waits for a quiet moment. So at Commit, immediately before
-/// its own `_exit`, the parent reads whether an aterm window has focus and, if
-/// one has, asks AppKit to activate the successor: `NSRunningApplication
-/// runningApplicationWithProcessIdentifier:`, then `-[NSApp
-/// yieldActivationToApplication:]` where AppKit answers to it (macOS 14+, the
-/// cooperative half — an app may only take activation the front app yields),
-/// then `-[NSRunningApplication activateWithOptions:]` ignoring other apps.
-/// `true` when AppKit accepted the request. Refuses `pid <= 1`. Main-thread
-/// callable, unlike `begin_launch`: Commit runs on the main thread.
+/// Bring the successor to the front at the Commit's write (`App::activate_successor_at_write`,
+/// only when an aterm window has focus). The launch never activates (`begin_launch(.., false)`):
+/// activating then pulled focus while the outgoing window was still on glass, a live screen with
+/// a dead keyboard. Where AppKit answers `yieldActivationToApplication:` (macOS 14+: an app may
+/// take only the activation the front app yields) this process yields first, then the successor
+/// is activated ignoring other apps. `true` when AppKit accepted. Refuses `pid <= 1`.
+/// Main-thread callable, unlike [`begin_launch`]: Commit runs on the main thread.
 #[cfg(target_os = "macos")]
 pub(crate) fn activate_running(pid: i32) -> bool {
     use aterm_objc::{Bool, Id, Sel, autoreleasepool, class, sel};

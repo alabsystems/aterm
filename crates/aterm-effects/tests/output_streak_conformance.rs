@@ -56,10 +56,9 @@ fn assert_transition(model: &Model, action: &str, before: &State, after: &State)
     );
 }
 
-/// Uses `Lumen`, not `RainbowKitty`: the human-gap control needs a palette that
-/// goes through the shared `MIN_GAP` governor. The rainbow kitty music box
-/// (`rainbow_kitty_v2`) forks out of `push_meta` before `MIN_GAP` and never
-/// thins a keystroke, so the control would not discriminate there.
+/// `Lumen`, not `RainbowKitty`: the human-gap control needs a palette that goes through
+/// the shared `MIN_GAP` governor; the music box (`rainbow_kitty_v2`) forks out of
+/// `push_meta` before it and never thins a keystroke.
 fn sound(kind: SoundGesture) -> SoundEvent {
     SoundEvent {
         style: GlowStyle::Lumen,

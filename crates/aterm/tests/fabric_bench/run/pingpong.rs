@@ -51,6 +51,19 @@
 //!    aterm-0, pipelined acks since), in count and time.
 //!    The bench takes no time of its own for it: it reads two tallies the
 //!    bridge wrote and divides their difference by the window.
+//! 4. WHERE THE REST WENT (the tally's v=2 rows, B10): the loop's verb-lane
+//!    round trips by verb, its state-dir writes by kind and by call, each
+//!    mailbox item's wait from its push to its take (a wake when the loop was
+//!    parked), a post's path from its event to its publish, the loop's park
+//!    and the tally's own writes, with the bridge's own clock: so the window
+//!    is partitioned, largest first, into the steps that took it and the rest
+//!    of the loop's wall time ([`attribution`]), each a share of the round
+//!    trip; and the same for a PACED sub-phase whose rounds find the loop
+//!    idle ([`PACE`]). The bridge's clock also holds what lies outside every
+//!    round trip — the bench's own work between rounds (A's listing after
+//!    each pong, [`woke_with`]) and the window's edges — and the rows hold
+//!    whatever the loop did then, so the shares sum past 100%; the report
+//!    says by how much.
 //!
 //! EVERY TIER ARM RUNS IT, on aterm's own options for the arm's tier, as the
 //! latency, burst and attach worlds do ([`super::boot_world`]): so the arm says
@@ -92,13 +105,13 @@ use std::time::Duration;
 use astream_broker::{Broker, FlushCounts};
 use aterm_json::{Value, json};
 use aterm_link::ctl::Ctl;
-use aterm_link::wait_tally::{self, Tally};
+use aterm_link::wait_tally::{self, Hist, Row as TallyRow, Tally, Unit};
 
 use super::{
-    DEADLINE, FLEET, Row, Ruler, Ticks, World, await_durable, await_note, boot_world, calibrate,
-    flushes_between, flushes_json, fmt_x, list_since, ms, ms_opt, newest_id, per_unit, post,
-    sampled, served_line, stop_and_read, ticks, ticks_between, ticks_json, ticks_line, wait_live,
-    yardstick, yardstick_json, yardstick_rows,
+    DEADLINE, FLEET, Row, Ruler, Ticks, World, await_durable, await_note, boot_world, bystanders,
+    calibrate, flushes_between, flushes_json, fmt_x, list_since, ms, ms_opt, newest_id, per_unit,
+    post, sampled, served_line, stop_and_read, ticks, ticks_between, ticks_json, ticks_line,
+    wait_live, yardstick, yardstick_json, yardstick_rows,
 };
 use crate::census;
 use crate::clock::Clock;
@@ -108,6 +121,14 @@ use crate::stats;
 /// How often the tally file is read while the bench waits for the bridge's
 /// idle write. A file read in the bench process: it asks the broker nothing.
 const TALLY_POLL: Duration = Duration::from_millis(1);
+
+/// THE PACED SUB-PHASE'S GAP between one round's reply and the next round's
+/// post ([`Spec::paced`]): past the bridge's idle backstop (5 ms,
+/// `IDLE_ACK_GRACE`), so each round finds the loop parked on its mailbox with
+/// nothing owed — a request and its reply on an idle node, where the
+/// back-to-back rounds measure a busy one. NOT A SYNCHRONISATION SLEEP: what
+/// it precedes waits on nothing it lets pass, it is the measured scenario.
+const PACE: Duration = Duration::from_millis(20);
 
 /// One round, as the bench saw it.
 #[derive(Debug, Clone)]
@@ -141,6 +162,42 @@ struct Raw {
     flushes: FlushCounts,
     /// The broker's retention ticks between the same two tallies ([`Ticks`]).
     ticks: Ticks,
+    /// THE PACED SUB-PHASE, after the back-to-back rounds' last tally
+    /// ([`Spec::paced`], [`PACE`] apart): its rounds, and the tally past its
+    /// last reply (its window runs from `end`).
+    paced: Vec<Round>,
+    paced_end: Option<Tally>,
+}
+
+/// One round on `ctl`: A posts `ping-<i>` to B, B's wait answers, B posts
+/// `pong-<i>` back, A's wait answers.
+fn one_round(
+    ctl: &mut Ctl,
+    clock: Clock,
+    a: &str,
+    b: &str,
+    i: usize,
+    a_since: &mut u64,
+    b_since: &mut u64,
+) -> Round {
+    let ping = format!("ping-{i}");
+    let pong = format!("pong-{i}");
+    let (t_call, t_ret) = post(ctl, clock, a, b, &ping);
+    let (ping_row, t_b_seen) = woke_with(ctl, clock, b, b_since, &ping);
+    let (t_b_call, t_b_ret) = post(ctl, clock, b, a, &pong);
+    let (pong_row, t_a_seen) = woke_with(ctl, clock, a, a_since, &pong);
+    Round {
+        ping,
+        pong,
+        t_call,
+        t_ret,
+        t_b_seen,
+        t_b_call,
+        t_b_ret,
+        t_a_seen,
+        ping_off: ping_row.off,
+        pong_off: pong_row.off,
+    }
 }
 
 /// The tally in `text` (the file's contents, if it could be read) when it is
@@ -226,24 +283,7 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
     });
     let mut measured = Vec::with_capacity(spec.pingpong);
     for i in 0..spec.warmup + spec.pingpong {
-        let ping = format!("ping-{i}");
-        let pong = format!("pong-{i}");
-        let (t_call, t_ret) = post(&mut ctl, clock, a, b, &ping);
-        let (ping_row, t_b_seen) = woke_with(&mut ctl, clock, b, &mut b_since, &ping);
-        let (t_b_call, t_b_ret) = post(&mut ctl, clock, b, a, &pong);
-        let (pong_row, t_a_seen) = woke_with(&mut ctl, clock, a, &mut a_since, &pong);
-        let round = Round {
-            ping,
-            pong,
-            t_call,
-            t_ret,
-            t_b_seen,
-            t_b_call,
-            t_b_ret,
-            t_a_seen,
-            ping_off: ping_row.off,
-            pong_off: pong_row.off,
-        };
+        let round = one_round(&mut ctl, clock, a, b, i, &mut a_since, &mut b_since);
         if i + 1 == spec.warmup {
             start = Some((
                 await_tally(&path, pid, round.pong_off, "ping-pong, after the warm-up"),
@@ -260,12 +300,31 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
     let flushes_end = broker.flush_counts();
     let ticks_end = ticks(broker);
     let (start, flushes_start, ticks_start) = start.expect("taken before the first measured round");
+    // THE PACED SUB-PHASE: the same request and reply, each round [`PACE`]
+    // after the last one's reply, so each finds the loop idle and parked.
+    let first = spec.warmup + spec.pingpong;
+    let paced: Vec<Round> = (first..first + spec.paced)
+        .map(|i| {
+            std::thread::sleep(PACE);
+            one_round(&mut ctl, clock, a, b, i, &mut a_since, &mut b_since)
+        })
+        .collect();
+    let paced_end = paced.last().map(|last| {
+        await_tally(
+            &path,
+            pid,
+            last.pong_off,
+            "ping-pong, after the last paced round",
+        )
+    });
     Raw {
         rounds: measured,
         start,
         end,
         flushes: flushes_between(flushes_start, flushes_end),
         ticks: ticks_between(ticks_start, ticks_end),
+        paced,
+        paced_end,
     }
 }
 
@@ -441,26 +500,218 @@ fn waits_rows(d: &Tally, n: usize) -> Vec<String> {
             per(ns_ms(ns))
         )
     };
+    let r = |row: TallyRow| d.row(row);
     vec![
         "| the loop waited on | count | per round trip | ms | ms per round trip |".to_string(),
         "|---|---:|---:|---:|---:|".to_string(),
         row(
             "requests that read their own reply",
-            Some(d.requests),
-            d.request_ns,
+            Some(r(TallyRow::Request).count),
+            r(TallyRow::Request).total,
         ),
         row(
             "pipelined acks (publishes', and since aterm-0 the group commits')",
-            Some(d.acks),
-            d.ack_ns,
+            Some(r(TallyRow::Ack).count),
+            r(TallyRow::Ack).total,
         ),
         row(
             "of both: the inbox group's commits",
-            Some(d.commits),
-            d.commit_ns,
+            Some(r(TallyRow::Commit).count),
+            r(TallyRow::Commit).total,
         ),
         row("**all: the loop held by the broker**", None, d.blocked_ns()),
     ]
+}
+
+/// The band at and past which a span is counted as a TAIL in the v=2 table:
+/// 2^20 ns (1.05 ms), past any quiet verb-lane round trip or state-dir write
+/// this bench has seen, and 2^23 ns (8.39 ms), past a quiet volume's whole
+/// horizon full flush (5-7 ms, `docs/measured/flush-wait-2026-10-21.md`), so
+/// what is counted there met one under load or waited out more than one.
+const TAIL_1MS: usize = 11;
+const TAIL_8MS: usize = 14;
+
+/// What a v=2 row counts, for the table. Pure.
+fn describe(row: TallyRow) -> &'static str {
+    match row {
+        TallyRow::Request => "broker: requests that read their own reply",
+        TallyRow::Ack => "broker: pipelined acks read (publishes', the group commits')",
+        TallyRow::Commit => "broker: of those, the inbox group's commits",
+        TallyRow::LaneOutbox => "verb lane: the outbox peek",
+        TallyRow::LaneSessions => "verb lane: a drain's roster read (`sessions bridge`)",
+        TallyRow::LaneSent => "verb lane: a post's retirement (`outbox sent`)",
+        TallyRow::LaneDeliver => "verb lane: deliveries (`deliver`)",
+        TallyRow::LaneOther => "verb lane: every other verb",
+        TallyRow::DirReplace => "state dir: replaces (temp + rename)",
+        TallyRow::DirUnlink => "state dir: unlinks",
+        TallyRow::DirAppend => "state dir: appends",
+        TallyRow::DirFlush => "state dir: flushes, of a file in place or a directory",
+        TallyRow::SetPostPin => "of the dir's: a post's reservation (`set_post_pin`)",
+        TallyRow::SetInFlight => "of the dir's: a self-lane post's entry (`set_in_flight`)",
+        TallyRow::ClearInFlight => "of the dir's: the entry's removal (`clear_in_flight`)",
+        TallyRow::ClearPostSeq => "of the dir's: the reservation forgotten (`clear_post_seq`)",
+        TallyRow::AppendSelfAcked => "of the dir's: the landed offset (`append_self_acked`)",
+        TallyRow::WakeEvent => "wake: an aterm event queued while the loop was parked",
+        TallyRow::WakeRecord => "wake: a broker record queued while the loop was parked",
+        TallyRow::QueuedEvent => "queued: an aterm event queued while the loop worked",
+        TallyRow::QueuedRecord => "queued: a broker record queued while the loop worked",
+        TallyRow::PostPublish => "a post's path: its `post` event taken to its publish written",
+        TallyRow::DrainPosts => "posts each outbox peek listed (a count)",
+        TallyRow::Park => "the loop parked on its mailbox",
+        TallyRow::TallyWrite => "the tally's own idle writes",
+    }
+}
+
+/// A row's largest in a window, in ms: exact when the window saw the
+/// process's largest, else bounded by its top band ([`Hist::top`]). Pure.
+fn largest(h: &Hist) -> String {
+    if h.max > 0 {
+        return format!("{:.3}", ns_ms(h.max));
+    }
+    match h.top(Unit::Ns) {
+        None => "–".to_string(),
+        Some((_, Some(bound))) => format!("< {:.3}", ns_ms(bound)),
+        Some((floor, None)) => format!("≥ {:.3}", ns_ms(floor)),
+    }
+}
+
+/// THE V=2 TABLE: every timed row of the window's tally difference `d` over
+/// `n` round trips — count and time, in all and per round trip, the tail
+/// past 1.05 and 8.39 ms ([`TAIL_1MS`], [`TAIL_8MS`]) and the largest — the
+/// rows that partition the loop's time marked, and the outbox peeks' post
+/// counts as a sentence of their own. Pure (unit-tested).
+fn tally_rows(d: &Tally, n: usize) -> Vec<String> {
+    let per = |v: f64| {
+        if n == 0 {
+            "–".to_string()
+        } else {
+            format!("{:.3}", v / n as f64)
+        }
+    };
+    let mut rows = vec![
+        "| the loop's step (wait tally v=2) | partitions | count | per round trip | ms | ms per \
+         round trip | ≥ 1.05 ms | ≥ 8.39 ms | largest (ms) |"
+            .to_string(),
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|".to_string(),
+    ];
+    for row in TallyRow::ALL {
+        if row.unit() != Unit::Ns {
+            continue;
+        }
+        let h = d.row(row);
+        rows.push(format!(
+            "| {} | {} | {} | {} | {:.2} | {} | {} | {} | {} |",
+            describe(row),
+            if row.partitions() { "yes" } else { "" },
+            h.count,
+            per(h.count as f64),
+            ns_ms(h.total),
+            per(ns_ms(h.total)),
+            h.at_least(TAIL_1MS),
+            h.at_least(TAIL_8MS),
+            largest(h),
+        ));
+    }
+    let peeks = d.row(TallyRow::DrainPosts);
+    rows.push(String::new());
+    rows.push(format!(
+        "Outbox peeks: {} ({} per round trip), listing {} posts; {} listed none.{}\n",
+        peeks.count,
+        per(peeks.count as f64),
+        peeks.total,
+        peeks.buckets[0],
+        if d.dir {
+            ""
+        } else {
+            " The state dir's rows were not counted: a build without debug assertions."
+        }
+    ));
+    rows
+}
+
+/// WHERE THE LOOP'S TIME WENT over the window `d`, per round trip and
+/// largest first: each row that partitions it ([`TallyRow::partitions`]) but
+/// the park, then THE REST of its working time — the bridge's own clock
+/// between the two tallies ([`Tally::at_ns`]) less the park and those rows:
+/// wall time outside the measured spans, including scheduling delays and
+/// instrumentation overhead — and last the park. No CPU clock is sampled.
+/// Each in ms per round trip. Pure (unit-tested).
+fn attribution(d: &Tally, n: usize) -> Vec<(String, f64)> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let per = |ns: u64| ns_ms(ns) / n as f64;
+    let mut parts: Vec<(String, f64)> = TallyRow::ALL
+        .iter()
+        .filter(|r| r.partitions() && **r != TallyRow::Park)
+        .map(|r| (describe(*r).to_string(), per(d.row(*r).total)))
+        .collect();
+    let park = d.row(TallyRow::Park).total;
+    let rest = d.at_ns.saturating_sub(d.partitioned_ns());
+    parts.push(("the rest of the loop's wall time".to_string(), per(rest)));
+    parts.sort_by(|a, b| b.1.total_cmp(&a.1));
+    parts.push(("the loop parked on its mailbox".to_string(), per(park)));
+    parts
+}
+
+/// [`attribution`] as a table, each share of the round trip's mean `rt`.
+/// Pure (unit-tested).
+fn attribution_rows(d: &Tally, n: usize, rt: Option<f64>) -> Vec<String> {
+    let mut rows = vec![
+        "| where the bridge's loop spent a round trip | ms | share of the round trip |".to_string(),
+        "|---|---:|---:|".to_string(),
+    ];
+    for (what, ms) in attribution(d, n) {
+        rows.push(format!(
+            "| {what} | {ms:.3} | {} |",
+            rt.and_then(|rt| share(ms, rt))
+                .map_or("–".to_string(), |s| format!("{:.1}%", s * 100.0))
+        ));
+    }
+    rows
+}
+
+/// The window's v=2 rows for the report's JSON: each timed row's count, ms,
+/// per round trip, its bands and its largest; the peeks' counts; the bridge's
+/// own clock; and the attribution with its shares of `rt`.
+fn tally_json(d: &Tally, n: usize, rt: Option<f64>) -> Value {
+    let per = |v: f64| (n > 0).then(|| stats::round3(v / n as f64));
+    let mut rows = aterm_json::Map::new();
+    for row in TallyRow::ALL {
+        let h = d.row(row);
+        rows.insert(
+            row.name().to_string(),
+            json!({
+                "unit": if row.unit() == Unit::Ns { "ns" } else { "count" },
+                "partitions": row.partitions(),
+                "count": h.count,
+                "total": h.total,
+                "count_per_round_trip": per(h.count as f64),
+                "ms_per_round_trip": (row.unit() == Unit::Ns).then(|| per(ns_ms(h.total))).flatten(),
+                "max": h.max,
+                "bands": h.buckets.to_vec(),
+            }),
+        );
+    }
+    let attribution: Vec<Value> = attribution(d, n)
+        .into_iter()
+        .map(|(what, ms)| {
+            json!({
+                "what": what,
+                "ms_per_round_trip": stats::round3(ms),
+                "share_of_round_trip": rt.and_then(|rt| share(ms, rt)),
+            })
+        })
+        .collect();
+    json!({
+        "format": "wait-tally v=2",
+        "bands": "log2: band 0 under 1024 ns, band i from 1 [2^(i+9), 2^(i+10)) ns, the last from 2^26 ns; a count's band 0 is 0, band i [2^(i-1), 2^i)",
+        "dir_counted": d.dir,
+        "bridge_wall_ms": stats::round3(ns_ms(d.at_ns)),
+        "bridge_wall_ms_per_round_trip": per(ns_ms(d.at_ns)),
+        "rows": Value::Object(rows),
+        "attribution": attribution,
+    })
 }
 
 /// The table of the broker's flushes over the window, `n` round trips (two
@@ -506,6 +757,71 @@ fn flushes_rt_json(f: FlushCounts, n: usize) -> Value {
     out
 }
 
+/// THE PACED SUB-PHASE'S REPORT ([`Spec::paced`]): its round trips and legs,
+/// and the loop's v=2 rows over its window, from the back-to-back rounds'
+/// last tally to the tally past its last reply. Each round's park holds the
+/// [`PACE`] gap before it, so read the working rows per round trip beside the
+/// back-to-back ones; the attribution's park is mostly the gap. Nothing when
+/// the run takes no paced round.
+fn paced_report(raw: &Raw) -> (Value, Vec<String>) {
+    let Some(end) = raw.paced_end else {
+        return (Value::Null, Vec::new());
+    };
+    let n = raw.paced.len();
+    let leg = |f: fn(&Round) -> (u64, u64)| -> Vec<f64> {
+        raw.paced
+            .iter()
+            .map(|r| {
+                let (a, b) = f(r);
+                ms(a, b)
+            })
+            .collect()
+    };
+    let round_trip = leg(|r| (r.t_call, r.t_a_seen));
+    let ping_leg = leg(|r| (r.t_ret, r.t_b_seen));
+    let pong_leg = leg(|r| (r.t_b_ret, r.t_a_seen));
+    let turnaround = leg(|r| (r.t_b_seen, r.t_b_call));
+    let d = end
+        .since(&raw.end)
+        .unwrap_or_else(|e| panic!("ping-pong, paced: the bridge's wait tallies do not pair: {e}"));
+    let rt_mean = stats::summarize(&round_trip).map(|s| s.mean);
+    let pace_ms = u64::try_from(PACE.as_millis()).unwrap_or(u64::MAX);
+    let json = json!({
+        "rounds": n,
+        "pace_ms": pace_ms,
+        "round_trip_ms": stats::to_json(&round_trip),
+        "ping_post_to_visible_ms": stats::to_json(&ping_leg),
+        "pong_post_to_visible_ms": stats::to_json(&pong_leg),
+        "turnaround_ms": stats::to_json(&turnaround),
+        "wait_tally_v2": tally_json(&d, n, rt_mean),
+    });
+    let mut md = vec![
+        String::new(),
+        "### Paced: the same request and reply on an idle node\n".to_string(),
+        format!(
+            "{n} more round trips after the back-to-back ones, each {pace_ms} ms after the last \
+             one's reply, past the bridge's 5 ms idle backstop: each round finds the loop parked \
+             on its mailbox with nothing owed.\n"
+        ),
+        "| measure (ms) | n | mean | p50 | p95 | p99 |".to_string(),
+        "|---|---:|---:|---:|---:|---:|".to_string(),
+        stats::row("**round trip, paced**", &round_trip),
+        stats::row("ping: A's post `OK` -> visible to B", &ping_leg),
+        stats::row("pong: B's post `OK` -> visible to A", &pong_leg),
+        stats::row("B's turnaround (the bench: wake, list, post)", &turnaround),
+        String::new(),
+        format!(
+            "The wait tally's rows over the paced window (the bridge's own clock: {:.1} ms, the \
+             {pace_ms} ms gaps included; the park holds them):\n",
+            ns_ms(d.at_ns)
+        ),
+    ];
+    md.extend(tally_rows(&d, n));
+    md.extend(attribution_rows(&d, n, rt_mean));
+    md.push(String::new());
+    (json, md)
+}
+
 /// The ping-pong world: boot with the tally on, on aterm's options for the
 /// arm's tier ([`boot_world`]), measure, read the log.
 pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
@@ -514,11 +830,13 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     w.wait_ready();
     let served = served_line(&w, spec);
     let (a, b) = w.two_sessions();
+    let mut live = vec![a.clone(), b.clone()];
+    live.extend(bystanders(&w, spec.bystanders));
     wait_live(
         &w,
-        &[a.clone(), b.clone()],
+        &live,
         0,
-        "both ping-pong sessions' presence rows to say live",
+        "both ping-pong sessions' presence rows, and every bystander's, to say live",
     );
     let ruler = Ruler::for_world(&w);
     let mut cal_seq = 0;
@@ -627,6 +945,8 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let p50 = |v: &[f64]| stats::summarize(v).map(|s| s.p50);
     let round_trip_x = per_unit(p50(&round_trip), unit);
     let per_rt = |v: f64| (n > 0).then(|| stats::round3(v / n as f64));
+    let rt_mean = stats::summarize(&round_trip).map(|s| s.mean);
+    let (paced_json, paced_md) = paced_report(&raw);
 
     let json = json!({
         "node": w.node.clone(),
@@ -668,21 +988,24 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "bridge_waits": {
             "what": "the bridge loop's waits on broker replies over the window, counted inside the bridge (aterm_link::wait_tally): requests that read their own reply, pipelined acks, and of both the inbox group's commits (a request each before aterm-0, a pipelined ack since)",
             "pid": waits.pid,
-            "requests": waits.requests,
-            "request_ms": stats::round3(ns_ms(waits.request_ns)),
-            "commits": waits.commits,
-            "commit_ms": stats::round3(ns_ms(waits.commit_ns)),
-            "acks": waits.acks,
-            "ack_ms": stats::round3(ns_ms(waits.ack_ns)),
+            "requests": waits.row(TallyRow::Request).count,
+            "request_ms": stats::round3(ns_ms(waits.row(TallyRow::Request).total)),
+            "commits": waits.row(TallyRow::Commit).count,
+            "commit_ms": stats::round3(ns_ms(waits.row(TallyRow::Commit).total)),
+            "acks": waits.row(TallyRow::Ack).count,
+            "ack_ms": stats::round3(ns_ms(waits.row(TallyRow::Ack).total)),
             "blocked_ms": stats::round3(blocked_ms),
             "blocked_share_of_window": blocked_share,
             "per_round_trip": {
                 "blocked_ms": per_rt(blocked_ms),
-                "requests": per_rt(waits.requests as f64),
-                "commits": per_rt(waits.commits as f64),
-                "acks": per_rt(waits.acks as f64),
+                "requests": per_rt(waits.row(TallyRow::Request).count as f64),
+                "commits": per_rt(waits.row(TallyRow::Commit).count as f64),
+                "acks": per_rt(waits.row(TallyRow::Ack).count as f64),
             },
         },
+        "wait_tally_v2": tally_json(&waits, n, rt_mean),
+        "bystanders": spec.bystanders,
+        "paced": paced_json,
         "census": census::to_json(&pp_census, 2 * n, (lo, hi)),
     });
 
@@ -750,6 +1073,24 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             fmt_x(per_rt(blocked_ms)),
             fmt_x(stats::summarize(&round_trip).map(|s| s.mean)),
         ),
+        format!(
+            "Where the loop's time went, the wait tally's v=2 rows over the same window \
+             (`aterm_link::wait_tally`; the bridge's own clock: {} ms, {} ms per round trip, \
+             {} ms a round trip of it outside every round trip — the bench's own work between \
+             rounds, A's listing after each pong, and the window's edges — whose time the rows \
+             below hold too, so their shares of the round trip sum past 100%; {} idle \
+             bystander session(s) on the node):\n",
+            stats::round3(ns_ms(waits.at_ns)),
+            fmt_x(per_rt(ns_ms(waits.at_ns))),
+            per_rt(ns_ms(waits.at_ns) - round_trip.iter().sum::<f64>())
+                .map_or("–".to_string(), |v| format!("{v:.3}")),
+            spec.bystanders,
+        ),
+    ]);
+    md.extend(tally_rows(&waits, n));
+    md.extend(attribution_rows(&waits, n, rt_mean));
+    md.extend([
+        String::new(),
         "The broker's flushes over the same window, read at its two tallies:\n".to_string(),
     ]);
     md.extend(flushes_rows(raw.flushes, n));
@@ -774,6 +1115,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             fmt_x(round_trip_x)
         ),
     ]);
+    md.extend(paced_md);
     (json, md)
 }
 
@@ -784,22 +1126,25 @@ mod tests {
         use super::*;
 
         fn tally(pid: u32, committed: u64) -> String {
-            Tally {
+            let mut t = Tally {
                 pid,
-                requests: 4,
-                request_ns: 9_000_000,
-                commits: 2,
-                commit_ns: 7_000_000,
-                acks: 2,
-                ack_ns: 1_000_000,
                 committed,
-            }
-            .render()
+                ..Tally::default()
+            };
+            t.rows[TallyRow::Request.index()] = Hist {
+                count: 4,
+                total: 9_000_000,
+                ..Hist::default()
+            };
+            t.render()
         }
 
         let line = tally(77, 120);
         let t = covering(Some(&line), 77, 120).expect("through 120");
-        assert_eq!((t.pid, t.committed, t.requests), (77, 120, 4));
+        assert_eq!(
+            (t.pid, t.committed, t.row(TallyRow::Request).count),
+            (77, 120, 4)
+        );
         assert!(covering(Some(&line), 77, 100).is_ok(), "past it counts");
         // NEGATIVE CONTROLS: not written yet, not yet through the message,
         // another process's, and a line a write was racing.
@@ -963,16 +1308,29 @@ mod tests {
     fn the_waits_table_reads_per_round_trip_and_the_share_needs_a_window() {
         use super::*;
 
-        let d = Tally {
-            pid: 1,
-            requests: 400,
-            request_ns: 1_200_000_000,
-            commits: 400,
-            commit_ns: 1_100_000_000,
-            acks: 400,
-            ack_ns: 800_000_000,
-            committed: 9,
-        };
+        /// A v=2 window: each row a count and a total.
+        fn with(rows: &[(super::TallyRow, u64, u64)]) -> super::Tally {
+            let mut t = super::Tally {
+                pid: 1,
+                committed: 9,
+                dir: true,
+                ..super::Tally::default()
+            };
+            for &(row, count, total) in rows {
+                t.rows[row.index()] = super::Hist {
+                    count,
+                    total,
+                    ..super::Hist::default()
+                };
+            }
+            t
+        }
+
+        let d = with(&[
+            (TallyRow::Request, 400, 1_200_000_000),
+            (TallyRow::Commit, 400, 1_100_000_000),
+            (TallyRow::Ack, 400, 800_000_000),
+        ]);
         let rows = waits_rows(&d, 200);
         assert_eq!(rows.len(), 6);
         assert_eq!(
@@ -986,11 +1344,9 @@ mod tests {
         // ONE FOLDED COMMIT is visible per round trip: 399 commits over 200
         // round trips (`2026-10-17-fabric-36`) reads 1.995, where two decimals
         // printed the 2.00 of a run with no fold.
-        let folded = Tally {
-            requests: 399,
-            commits: 399,
-            ..d
-        };
+        let mut folded = d;
+        folded.rows[TallyRow::Request.index()].count = 399;
+        folded.rows[TallyRow::Commit.index()].count = 399;
         let rows = waits_rows(&folded, 200);
         assert!(
             rows[4].starts_with("| of both: the inbox group's commits | 399 | 1.995 |"),
@@ -1008,6 +1364,174 @@ mod tests {
         // is no share, never a division by zero.
         assert_eq!(share(2000.0, 0.0), None);
         assert!(waits_rows(&d, 0)[2].ends_with("| 400 | – | 1200.00 | – |"));
+    }
+
+    /// THE V=2 TABLE: a row per timed step, its tail past 1.05 and 8.39 ms
+    /// from its bands, its largest exact when the window saw it and bounded by
+    /// its top band otherwise; the peeks' posts as a sentence, its empty peeks
+    /// counted from band 0.
+    #[test]
+    fn the_v2_table_reads_each_step_per_round_trip_with_its_tail() {
+        use super::*;
+
+        /// A v=2 window: each row a count and a total.
+        fn with(rows: &[(super::TallyRow, u64, u64)]) -> super::Tally {
+            let mut t = super::Tally {
+                pid: 1,
+                committed: 9,
+                dir: true,
+                ..super::Tally::default()
+            };
+            for &(row, count, total) in rows {
+                t.rows[row.index()] = super::Hist {
+                    count,
+                    total,
+                    ..super::Hist::default()
+                };
+            }
+            t
+        }
+
+        let mut d = with(&[(TallyRow::LaneDeliver, 400, 80_000_000)]);
+        let deliver = &mut d.rows[TallyRow::LaneDeliver.index()];
+        deliver.buckets[Hist::band(150_000, Unit::Ns)] = 397;
+        deliver.buckets[Hist::band(2_000_000, Unit::Ns)] = 2;
+        deliver.buckets[Hist::band(9_000_000, Unit::Ns)] = 1;
+        deliver.max = 9_000_000;
+        d.rows[TallyRow::DirReplace.index()] = Hist {
+            count: 400,
+            total: 40_000_000,
+            max: 0,
+            buckets: {
+                let mut b = [0; wait_tally::BUCKETS];
+                b[Hist::band(100_000, Unit::Ns)] = 400;
+                b
+            },
+        };
+        d.rows[TallyRow::DrainPosts.index()] = Hist {
+            count: 220,
+            total: 200,
+            max: 1,
+            buckets: {
+                let mut b = [0; wait_tally::BUCKETS];
+                b[0] = 20;
+                b[1] = 200;
+                b
+            },
+        };
+        let rows = tally_rows(&d, 200);
+        let line = |what: &str| -> String {
+            rows.iter()
+                .find(|r| r.starts_with(&format!("| {what} |")))
+                .unwrap_or_else(|| panic!("no `{what}` row in {rows:?}"))
+                .clone()
+        };
+        assert_eq!(
+            line(describe(TallyRow::LaneDeliver)),
+            "| verb lane: deliveries (`deliver`) | yes | 400 | 2.000 | 80.00 | 0.400 | 3 | 1 | 9.000 |"
+        );
+        assert_eq!(
+            line(describe(TallyRow::DirReplace)),
+            "| state dir: replaces (temp + rename) | yes | 400 | 2.000 | 40.00 | 0.200 | 0 | 0 | < 0.131 |",
+            "no new largest in the window: bounded by its top band"
+        );
+        assert!(
+            line(describe(TallyRow::Commit))
+                .starts_with("| broker: of those, the inbox group's commits |  | 0 |"),
+            "an overlapping row is not marked as partitioning"
+        );
+        assert!(
+            rows.iter().all(|r| !r.contains("posts each outbox peek")),
+            "the count row is a sentence, not a time row"
+        );
+        assert!(
+            rows.iter().any(|r| r
+                == "Outbox peeks: 220 (1.100 per round trip), listing 200 posts; 20 listed none.\n"),
+            "{rows:?}"
+        );
+        // NEGATIVE CONTROL: a line whose dir rows were not counted says so.
+        let undir = super::Tally { dir: false, ..d };
+        assert!(
+            tally_rows(&undir, 200)
+                .last()
+                .is_some_and(|r| r.contains("were not counted"))
+        );
+    }
+
+    /// THE ATTRIBUTION: the partitioning rows but the park, largest first,
+    /// then the REST of the loop's working time (its clock less the park and
+    /// those rows), then the park — per round trip, each a share of the round
+    /// trip's mean. Overlapping rows (a commit, a call row, a wake) are not
+    /// in it; a window whose rows outrun its clock leaves no negative rest.
+    #[test]
+    fn the_attribution_partitions_the_loops_clock_largest_first() {
+        use super::*;
+
+        /// A v=2 window: each row a count and a total.
+        fn with(rows: &[(super::TallyRow, u64, u64)]) -> super::Tally {
+            let mut t = super::Tally {
+                pid: 1,
+                committed: 9,
+                dir: true,
+                ..super::Tally::default()
+            };
+            for &(row, count, total) in rows {
+                t.rows[row.index()] = super::Hist {
+                    count,
+                    total,
+                    ..super::Hist::default()
+                };
+            }
+            t
+        }
+
+        let mut d = with(&[
+            (TallyRow::Ack, 200, 100_000_000),
+            (TallyRow::Commit, 200, 90_000_000),
+            (TallyRow::LaneDeliver, 400, 160_000_000),
+            (TallyRow::DirReplace, 400, 30_000_000),
+            (TallyRow::SetPostPin, 200, 20_000_000),
+            (TallyRow::WakeRecord, 300, 30_000_000),
+            (TallyRow::Park, 600, 60_000_000),
+        ]);
+        d.at_ns = 400_000_000;
+        let a = attribution(&d, 200);
+        let names: Vec<&str> = a.iter().map(|(w, _)| w.as_str()).collect();
+        assert_eq!(names[0], describe(TallyRow::LaneDeliver));
+        assert_eq!(names[1], describe(TallyRow::Ack));
+        assert_eq!(names[3], describe(TallyRow::DirReplace));
+        assert_eq!(*names.last().unwrap(), "the loop parked on its mailbox");
+        for overlapping in [TallyRow::Commit, TallyRow::SetPostPin, TallyRow::WakeRecord] {
+            assert!(!names.contains(&describe(overlapping)), "{overlapping:?}");
+        }
+        let ms = |what: &str| a.iter().find(|(w, _)| w == what).unwrap().1;
+        assert!((ms(describe(TallyRow::LaneDeliver)) - 0.8).abs() < 1e-9);
+        // 400 ms of clock less 60 park, 100 ack, 160 deliver, 30 replace.
+        assert!((ms("the rest of the loop's wall time") - 0.25).abs() < 1e-9);
+        let sum: f64 = a.iter().map(|(_, ms)| ms).sum();
+        assert!(
+            (sum - 2.0).abs() < 1e-9,
+            "the parts sum to the clock: {sum}"
+        );
+        let rows = attribution_rows(&d, 200, Some(2.0));
+        assert!(
+            rows.contains(&"| verb lane: deliveries (`deliver`) | 0.800 | 40.0% |".to_string()),
+            "{rows:?}"
+        );
+        // NEGATIVE CONTROL: rows past the clock leave a rest of zero, never a
+        // negative share; no round trip is no attribution.
+        let over = super::Tally {
+            at_ns: 100_000_000,
+            ..d
+        };
+        assert_eq!(
+            attribution(&over, 200)
+                .iter()
+                .find(|(w, _)| w.starts_with("the rest"))
+                .map(|(_, ms)| *ms),
+            Some(0.0)
+        );
+        assert!(attribution(&d, 0).is_empty());
     }
 
     /// THE FLUSHES READ PER MESSAGE AND PER ROUND TRIP, the message column

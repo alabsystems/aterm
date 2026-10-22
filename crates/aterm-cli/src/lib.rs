@@ -65,11 +65,9 @@ pub use windowing::{
 /// `--help` text: synopsis, description, OPTIONS, ENVIRONMENT, EXAMPLES, scoped
 /// to the transparent passthrough.
 const HELP_TITLE: &str = "aterm — a transparent, introspecting terminal\n";
-/// What a plain `aterm` session runs, per platform, shared by `--help`
-/// ([`HELP_SESSION_LINE`]) and the `aterm help aterm` page. Unix: `$SHELL`.
-/// Windows reads no `$SHELL` and no aterm.toml; it spawns `aterm-pty`'s
-/// platform default (`shell_override` `None` in [`session_main`]). A macro
-/// because both sites are `concat!`-built.
+/// What a plain `aterm` session runs, per platform, for `--help` ([`HELP_SESSION_LINE`]) and
+/// `aterm help aterm`. Windows reads no `$SHELL` or aterm.toml: it spawns `aterm-pty`'s
+/// platform default. A macro because both sites are `concat!`-built.
 #[cfg(not(windows))]
 macro_rules! session_shell {
     () => {
@@ -322,13 +320,9 @@ impl Verb {
         }
     }
 
-    /// Whether this verb is one of the windowing verbs that
-    /// [`parse_window_request`] parses and [`route_launch`] routes.
-    ///
-    /// Owned by the roster so alias dispatch and the verb match agree. On
-    /// Windows the install is several identical copies of this binary under
-    /// sibling names (the Start-Menu shortcut targets `aterm-gui.exe`), so a
-    /// windowing verb can arrive under an argv0 alias and must be routed there.
+    /// Whether this is a windowing verb ([`parse_window_request`] parses it, [`route_launch`]
+    /// routes it). On Windows the install is several copies of this binary under sibling
+    /// names, so a windowing verb can arrive under an argv0 alias.
     #[must_use]
     pub const fn is_windowing(self) -> bool {
         match self {
@@ -554,17 +548,9 @@ const HELP_TAIL: &str = concat!(
     "    aterm --containment safety         Capped limits, no OS sandbox.\n",
 );
 
-/// Diagnostic subcommands: `aterm <name>` prints introspection about aterm's
-/// own configuration/environment and exits without spawning a shell.
-///
-/// `list-keybinds` is absent because the passthrough binary has no keymap.
-/// `list-kitty-commands` is present: it prints the cursor cat's vocabulary,
-/// pure data compiled into the binary (aterm-lexicon's `tricks` table), true
-/// with no window running.
-///
-/// Single source of truth: [`diag_report`] handles every entry and
-/// [`help_text`] advertises every entry, both enforced by
-/// `diag_commands_advertised_and_dispatchable`.
+/// Diagnostic subcommands: `aterm <name>` prints introspection and exits without spawning a
+/// shell (no `list-keybinds`: the passthrough has no keymap). [`diag_report`] handles and
+/// [`help_text`] advertises every entry (`diag_commands_advertised_and_dispatchable`).
 pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     (
         "show-config",
@@ -609,13 +595,10 @@ fn diag_usage(cmd: &str) -> String {
 const SHOW_FACE_NEEDS_FAMILY: &str =
     "aterm show-face: needs a font family — usage: aterm show-face <family>";
 
-/// Build the `(report, exit_code)` for diagnostic subcommand `cmd` (with an
-/// optional positional `arg`, e.g. the family for `show-face`), or `None` if
-/// `cmd` is not a registry command. Never actuates containment or spawns a
-/// shell; `doctor` alone acts, and only on what it reports (stale copies of
-/// aterm to the Trash, the Developer Tools pane opened for the owner) unless
-/// given `--read-only`. A non-zero code (`doctor`/`show-face` on bad input)
-/// makes them scriptable.
+/// The `(report, exit_code)` for diagnostic subcommand `cmd` (with an optional positional
+/// `arg`), or `None` if `cmd` is not one. Never actuates containment or spawns a shell; only
+/// `doctor` acts (stale copies to the Trash, the Developer Tools pane opened), and not with
+/// `--read-only`.
 fn diag_report(cmd: &str, arg: Option<&str>) -> Option<(String, i32)> {
     match cmd {
         "show-config" => Some((show_config_report(), 0)),
@@ -634,12 +617,9 @@ fn diag_report(cmd: &str, arg: Option<&str>) -> Option<(String, i32)> {
     }
 }
 
-/// `aterm show-config` — this session's shell, TERM, size and containment
-/// default as stable `key=value` lines (one per line, scriptable). Reports the containment DEFAULT a
-/// launch with no containment flag takes, NOT an actuated mode — `show-config`
-/// never actuates or spawns. `shell=` is `$SHELL` on Unix and, on Windows, the
-/// shell this tab runs when typed in an aterm tab, else the one a new window's
-/// tab spawns (with `shell_origin=` naming the input that chose it).
+/// `aterm show-config`: this session's shell, TERM, size and containment default as
+/// `key=value` lines. The containment value is what a flagless launch takes, not an actuated
+/// mode: `show-config` never actuates or spawns.
 fn show_config_report() -> String {
     let (rows, cols) = driver::host_winsize();
     let env = |k: &str| std::env::var(k).unwrap_or_default();
@@ -649,11 +629,8 @@ fn show_config_report() -> String {
         "version={}\n",
         aterm_types::version::app_version()
     ));
-    // Shell: `$SHELL` on Unix. On Windows the spawn reads neither `$SHELL` nor
-    // `%COMSPEC%`, so the row is this tab's shell when there is one
-    // (`shell_origin=tab`), else the one a new window's tab spawns, from the
-    // spawn's own resolver; `shell_origin=` is tab | aterm.toml |
-    // default:<arm>.
+    // Unix: `$SHELL`. Windows: the spawn's own resolver (this tab's shell, else a new
+    // window's), with `shell_origin=` tab | aterm.toml | default:<arm>.
     #[cfg(not(windows))]
     out.push_str(&format!("shell={}\n", or(env("SHELL"), "(unset)")));
     #[cfg(windows)]
@@ -796,9 +773,9 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         Messages with an Open Settings button. At most once a week; a\n\
      \x20                         window started before you pressed Open Settings waits 14 days;\n\
      \x20                         Dismiss all files it for 30 days, then 90. Off, it also keeps\n\
-     \x20                         aterm from asking, once per Mac after those pages, whether to\n\
-     \x20                         allow debugger access (macOS's developer mode) in its own\n\
-     \x20                         alert; no key makes aterm ask it.\n\
+     \x20                         aterm from asking, once per Mac and account after those\n\
+     \x20                         pages, whether to allow debugger access (macOS's developer\n\
+     \x20                         mode) in its own alert; no key makes aterm ask it.\n\
      \x20 report_attribution      per-session corroboration of the app macOS holds responsible for\n\
      \x20                         each session. It only corroborates: aterm's own adoption record\n\
      \x20                         decides whether a session reads `live` or `adopted`.\n\
@@ -890,10 +867,9 @@ fn show_face_report(family: Option<&str>) -> (String, i32) {
     }
 }
 
-/// How much of `messages.log`'s tail the reader takes: the window's own launch load
-/// (`aterm-gui`'s `messages_store::TAIL_BYTES`), across the file and its rotated
-/// `.1`, so the reader sees what the window would replay. About 150 days at the
-/// measured 7 KB a day.
+/// How much of `messages.log`'s tail the reader takes, across the file and its rotated `.1`:
+/// the window's launch load (`aterm-gui`'s `messages_store::TAIL_BYTES`), about 150 days at
+/// the measured 7 KB a day.
 const EXCEPTIONS_TAIL_BYTES: u64 = 1024 * 1024;
 
 /// What the reader found in `messages.log`.
@@ -904,8 +880,8 @@ struct ExceptionsRead {
     skipped: usize,
     /// Whether any of the two files was there to read.
     found: bool,
-    /// `messages.log` is there but was not read, or nothing was read and only its
-    /// rotated `.1` is there: that path.
+    /// The path that is there but unread: `messages.log`, or its rotated `.1` when nothing
+    /// was read.
     unreadable: Option<Unreadable>,
 }
 
@@ -1077,10 +1053,9 @@ fn parse_zone_offset(z: &str) -> Option<i64> {
     (h < 24 && m < 60).then_some(sign * (h * 3600 + m * 60))
 }
 
-/// `aterm exceptions [--all]` — what needs a look but not now, and what was filed,
-/// read from `messages.log` with NO window running. The open entries are what was
-/// waiting when aterm last wrote the log; the filed ones say when and how each was
-/// put away. `--all` lists every filed entry in the tail instead of the newest ten.
+/// `aterm exceptions [--all]`: what needs a look but not now, and what was filed, read from
+/// `messages.log` with no window running. `--all` lists every filed entry in the tail instead
+/// of the newest ten.
 fn exceptions_report(all: bool) -> String {
     let Some(path) = exceptions_log_path() else {
         return "exceptions: none to read (no log folder)\n".to_string();
@@ -1186,10 +1161,9 @@ pub enum Mark {
     /// A fact worth reporting that is not a failure — nothing to fix, or
     /// nothing aterm can fix, and never a reason to refuse to launch.
     Note,
-    /// A measured cost the person is paying now, with a fix only they can
-    /// make (atpkg's `warn`): said louder than a note and counted on the
-    /// health line, and still never a reason to refuse to launch, so it does
-    /// not move the exit code either.
+    /// A measured cost the person is paying now, with a fix only they can make (atpkg's
+    /// `warn`): louder than a note and counted on the health line, but it does not move the
+    /// exit code.
     Warn,
     /// The check failed: `health: FAIL` and exit 1.
     Fail,
@@ -1232,16 +1206,14 @@ struct DoctorRow {
     unmeasured: bool,
 }
 
-/// The macOS consent facts behind the `privacy:` row, gathered by
-/// [`privacy_facts`] and consumed by the pure [`doctor_checks_with_origin`] — passed
-/// in exactly as the shell check is, so the report stays a
-/// deterministic function of its inputs.
+/// The macOS consent facts behind the `privacy:` row, gathered by [`privacy_facts`] and
+/// passed into the pure [`doctor_checks_with_origin`] like the shell check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PrivacyFacts {
     /// The instance's Full Disk Access state, from one prompt-free probe.
     fda: FdaState,
-    /// Why `fda` reads as it does. `label.refused()` means NO syscall ran, so
-    /// the row names the configuration rather than implying a denial.
+    /// Why `fda` reads as it does. `label.refused()` means no syscall ran, so the row names
+    /// the configuration rather than implying a denial.
     fda_label: ProbeLabel,
     /// The class of this build's designated requirement — whether a grant made
     /// today survives the next build. [`DrClass::Unknown`] asserts nothing.
@@ -1499,10 +1471,9 @@ fn debugger_row(facts: &DebuggerFacts) -> (Mark, String) {
     }
 }
 
-/// The Developer Tools list as `doctor` reads it ([`atpkg::devtools::facts`]:
-/// the switch's row in the system TCC.db and tccd's own answers, joined), read
-/// AFTER anything this run did about it, and what this run did toward the
-/// switch. `facts` is `None` where there is no such list (off macOS): no row.
+/// The Developer Tools list as `doctor` reads it ([`atpkg::devtools::facts`]), read after
+/// anything this run did about it, and what this run did toward the switch. `facts` is
+/// `None` off macOS: no row.
 struct DevtoolsFacts {
     facts: Option<atpkg::devtools::Facts>,
     did: Option<String>,
@@ -2621,18 +2592,11 @@ enum CliAction {
     },
 }
 
-/// Pure argument-decision core: takes the argv tail and returns a
-/// [`CliAction`]; [`parse_args`] is the effectful wrapper.
-///
-/// Recognizes `-h`/`--help`, `-V`/`--version`, `--containment <MODE>` /
-/// `--containment=<MODE>`, `--sandbox` (= containment) and `--no-sandbox`
-/// (= user). `aterm` takes no positional operands, so any operand (including
-/// one after `--`) is rejected.
-///
-/// An explicit flag beats the default `User` (no environment variable selects
-/// the mode), and among conflicting flags the last one wins. An invalid
-/// `--containment` value is passed through verbatim so `init_mode_from_flag`
-/// fails it closed to Containment.
+/// Pure argument-decision core: the argv tail to a [`CliAction`]; [`parse_args`] is the
+/// effectful wrapper. `aterm` takes no positional operands, so any operand (including one
+/// after `--`) is rejected. Among conflicting containment flags the last wins; an invalid
+/// `--containment` value passes through verbatim so `init_mode_from_flag` fails it closed
+/// to Containment.
 fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
     let mut args = args.peekable();
     // `aterm help [topic]` dispatches first, git-style. The word `help` is the
@@ -2983,10 +2947,9 @@ fn front_door_bin_dir() -> Option<String> {
     dir.to_str().map(str::to_owned)
 }
 
-/// `atpkg::reroute::REROUTE_DIR_ENV` and `PASSTHROUGH_ENV`, restated (this
-/// crate links `atpkg` for tests only); `reroute_env_names_match_atpkg` pins
-/// both. `PASSTHROUGH_ENV` is internal protocol: the marker the front door sets
-/// for `aterm --no-reroute` and clears otherwise.
+/// `atpkg::reroute::REROUTE_DIR_ENV` and `PASSTHROUGH_ENV`, restated;
+/// `reroute_env_names_match_atpkg` pins both. `PASSTHROUGH_ENV` is internal protocol: the
+/// marker the front door sets for `aterm --no-reroute` and clears otherwise.
 const REROUTE_DIR_ENV: &str = "ATERM_REROUTE_DIR";
 const PASSTHROUGH_ENV: &str = "__ATERM_REROUTE_PASSTHROUGH";
 
@@ -3286,7 +3249,9 @@ pub fn session_main(quiet: bool) -> ! {
         env_add.push((AGENTS_DIR_ENV.to_string(), String::new()));
     }
     // `ATERM_CHILD` is omitted here so `fleet_listen`'s root-only nesting guard stays clear.
-    env_add.push(("AGY_CLI_FAST_PROMPT_EDITOR".to_string(), "true".to_string()));
+    if std::env::var_os("AGY_CLI_FAST_PROMPT_EDITOR").is_none() {
+        env_add.push(("AGY_CLI_FAST_PROMPT_EDITOR".to_string(), "true".to_string()));
+    }
 
     let shell = aterm_pty::spawn_shell_with_pid(
         rows,
@@ -3729,9 +3694,8 @@ mod tests {
         );
 
         let lines = exception_lines();
-        // The rotated pair holds the older lines (both posts and the batch's
-        // dismissals sit in the current file: a `posted` in `.1` meets its
-        // `retired` in the current one); a torn line sits between.
+        // The rotated `.1` holds the first two posts; the current file a torn line, the
+        // retirements and the third post, so a `posted` in `.1` meets its `retired` here.
         let posted: Vec<&String> = lines.iter().filter(|l| l.contains("kind=posted")).collect();
         let rest: Vec<&String> = lines
             .iter()
@@ -3810,7 +3774,7 @@ mod tests {
         let out = exceptions_report_at(&other.log(), false, 1, 0);
         assert!(out.contains("is a symlink or folder, not the log"), "{out}");
         assert!(read_exceptions_log(&other.log()).unreadable.is_some());
-        // Only the rotated copy there, as a folder: the report names IT, not the
+        // Only the rotated copy there, as a folder: the report names it, not the
         // missing current file.
         let rotated = Scratch::new();
         let older = rotated.0.join("messages.log.1");
@@ -3839,9 +3803,8 @@ mod tests {
         assert!(unreadable.not_a_file);
     }
 
-    /// The `exceptions:` row: OK with nothing open, a NOTE (never a FAIL, so a waiting
-    /// entry cannot make `aterm doctor && aterm` refuse to launch) naming the command
-    /// when something is, and "not measured" with no log folder.
+    /// The `exceptions:` row: ok with nothing open, a note naming the command when something
+    /// is (never a fail), and "not measured" with no log folder.
     #[test]
     fn the_doctor_exceptions_row_counts_the_open_entries_and_never_fails() {
         let row = |facts: ExceptionsFacts| {
@@ -4983,8 +4946,8 @@ mod tests {
         );
     }
 
-    /// The four `privacy:` states (§3.8): a `note` never moves the exit code,
-    /// while a real `Fail` elsewhere still exits 1.
+    /// The four `privacy:` states: a `note` never moves the exit code, while a real `Fail`
+    /// elsewhere still exits 1.
     #[test]
     fn the_privacy_row_is_a_note_and_never_moves_the_exit_code() {
         let ok = |privacy: &PrivacyFacts| {
@@ -5036,9 +4999,8 @@ mod tests {
         assert_eq!(mark_of(&r, "privacy:"), "note", "{r}");
     }
 
-    /// The `recovery:` row: an empty ledger is OK and says where the record will
-    /// write; a recorded kill is a NOTE that names it — never a FAIL, so a past crash
-    /// does not make `aterm doctor && aterm` refuse to launch; no log directory is
+    /// The `recovery:` row: an empty ledger is ok and says where the record will write; a
+    /// recorded kill is a note that names it, never a fail; no log directory is
     /// "not measured", never "none". Unix only: Windows records no ledger.
     #[cfg(unix)]
     #[test]
@@ -5399,10 +5361,9 @@ mod tests {
         assert!(unmeasured);
     }
 
-    /// The `devtools:` and `copies:` rows: aterm not on the Developer Tools list
-    /// is a counted `warn` (the health line names it; the exit stays 0) that
-    /// says the cost and the owner's fix, followed by what this run did; on the
-    /// list is `ok`; a copy moved to the Trash is named.
+    /// The `devtools:` and `copies:` rows: aterm not on the Developer Tools list is a counted
+    /// `warn` (exit stays 0) that says the cost and the owner's fix, then what this run did;
+    /// on the list is `ok`; a copy moved to the Trash is named.
     #[test]
     fn the_devtools_row_is_a_counted_warning_and_says_what_doctor_did() {
         use aterm_containment::consent::{
@@ -5978,10 +5939,8 @@ mod tests {
         );
     }
 
-    /// §4.6 of the debugger-access design: the `debugger:` row shares
-    /// `privacy:`'s property — it is never a `FAIL`, so `aterm doctor && aterm`
-    /// launches whatever the rule says — and the one command it prints is the
-    /// undo, from the consent module's constant, only once the rule is on.
+    /// The `debugger:` row is never a `FAIL`, and the one command it prints is the undo
+    /// (the consent module's constant), only once the rule is on.
     #[test]
     fn the_debugger_row_never_fails_and_prints_the_undo_only_when_on() {
         use DebuggerMember::{Admin, Developer, NotMember};

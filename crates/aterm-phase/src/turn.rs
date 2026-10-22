@@ -95,17 +95,13 @@ pub struct LaunchCardRead {
     pub status: Option<usize>,
 }
 
-/// The launch card above the composer, read ONLY when it is the newest card
-/// on the screen and nothing a person said sits between it and the
-/// composer's frame: no user message (`❯`) — a system notice (`⏺ agents-md:
-/// …`, which the owner's fresh screen always carries) is not one, so this is
-/// not [`fresh`]. A newer card BELOW the frame (the inline renderer
-/// relaunched in the same tab, its predecessor's box still above) means the
-/// frame is not the newest process's, and nothing is read. A model row the
-/// vendor split or cut for a narrow pane (no ` · ` after the model, or a
-/// `…` in it) is refused rather than half-read. Whether the frame is a LIVE
-/// REPL's, and whether the card's build is the running one, are the caller's
-/// to check.
+/// The launch card above the composer, read only when it is the newest card on the
+/// screen and no user message (`❯`) sits between it and the composer's frame. A system
+/// notice (`⏺ agents-md: …`) may sit there, so this is not [`fresh`]. A newer card below
+/// the frame (the inline renderer relaunched in the same tab) means the frame is a
+/// predecessor's: `None`. A model row split or cut for a narrow pane (no ` · ` after the
+/// model, or a `…`) is refused. Whether the frame is a live REPL's, and the card's build
+/// the running one, are the caller's to check.
 #[must_use]
 pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {
     launch_card_read(rows).map(|read| read.card)
@@ -919,11 +915,10 @@ fn card_row(row: &str, text_col: usize) -> Option<(usize, usize)> {
     Some((mascot_end, crate::text::trim_end(row).chars().count()))
 }
 
-/// Claude Code's own suggestion for the next message: the DIM placeholder
-/// in an empty composer ([`is_placeholder`]: the caret row reads `❯ keep
-/// going` but the cursor sits at column 2, where typing would have pushed
-/// it). Measured 2026-09-21 on a live session
-/// ([`crate::prompt::fixtures::GOAL_ACTIVE_SUGGESTION`]). `None` without the
+/// Claude Code's own suggestion for the next message: the dim placeholder in
+/// an empty composer ([`is_placeholder`]: the caret row reads `❯ keep going`
+/// but the cursor sits at column 2; see
+/// [`crate::prompt::fixtures::GOAL_ACTIVE_SUGGESTION`]). `None` without the
 /// composer frame (the caret-looking row is then a user row or an option),
 /// with a box up, or when the composer holds typed text.
 #[must_use]
@@ -1550,12 +1545,9 @@ mod tests {
         }
     }
 
-    /// A message taller than the screen: its `⏺` row scrolled off, every
-    /// visible row indented. The tail is the visible rows — the question the
-    /// worker ended on is read. The
-    /// measured goal fixture (row 0 `  with zero hooks installed…`) reads
-    /// its last words too. Negative control: a column-0 user row above
-    /// still ends the message there.
+    /// A message taller than the screen (its `⏺` row scrolled off) has the
+    /// visible rows as its tail, as does the goal fixture, whose row 0 is
+    /// indented. Negative control: a column-0 user row above ends the message.
     #[test]
     fn a_message_whose_head_scrolled_off_still_has_a_tail() {
         let mut body: Vec<String> = (0..30)
@@ -1854,11 +1846,8 @@ mod tests {
         }
     }
 
-    /// A brand-new session is FRESH: the launch card over the composer, no
-    /// message and nothing said (the E2E probe of 2026-09-25: it was
-    /// continued). NEGATIVE CONTROLS: the same launch after a first message
-    /// (in its first turn), after an answer, and a screen with no card (the
-    /// card scrolled away) are not.
+    /// A brand-new session is fresh. Negative controls: the same launch after
+    /// a first message, after an answer, and a screen whose card scrolled away.
     #[test]
     fn a_launch_with_no_turn_is_fresh() {
         use crate::prompt::fixtures::{first_turn_under_a_table, launch_under_a_table};

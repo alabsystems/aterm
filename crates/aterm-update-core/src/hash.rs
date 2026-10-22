@@ -49,9 +49,8 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        // Output shape: a header line, the digest line, a status line. Older
-        // Windows builds print the digest as spaced hex pairs — strip spaces
-        // and take the first line that is exactly 64 hex digits.
+        // A header line, the digest line, a status line. Older Windows builds space the hex
+        // pairs, so strip spaces and take the first line of exactly 64 hex digits.
         let stdout = String::from_utf8_lossy(&out.stdout);
         stdout
             .lines()

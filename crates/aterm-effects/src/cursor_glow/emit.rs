@@ -2293,12 +2293,9 @@ impl CursorGlow {
         }
     }
 
-    /// Claim one water cell for this frame's newest-visible-owner pass.
-    ///
-    /// The table is independent of grid dimensions: work is bounded by
-    /// [`Self::MAX_SPARKS`]. At 50% maximum load linear probing is short and
-    /// deterministic; `0` is free because the 32-bit coordinate is stored as
-    /// `key + 1` in a `u64`.
+    /// Claim one water cell for this frame's newest-visible-owner pass. Work is
+    /// bounded by [`Self::MAX_SPARKS`], not the grid; `0` is free because a
+    /// coordinate is stored as `key + 1`.
     #[inline]
     pub(super) fn claim_water_cell(seen: &mut [u64], row: u16, col: u16) -> bool {
         debug_assert!(seen.len().is_power_of_two());
@@ -2803,11 +2800,9 @@ impl CursorGlow {
             let tx = m.x0 + (m.x1 - m.x0) * u;
             let ty = m.y0 + (m.y1 - m.y0) * u;
             let (dx, dy) = (m.x1 - tx, m.y1 - ty);
-            // Steep dive for a near-horizontal hop: clamp the drawn horizontal
-            // reach to ≤1.6× the vertical drop, so a one-row jump dives into its
-            // landing instead of skimming the inter-line gap. Only the
-            // horizontal draw locals are shadowed; the vertical drop and its
-            // retraction are untouched.
+            // Steep dive: clamp the drawn horizontal reach to ≤1.6× the vertical
+            // drop, so a one-row jump dives into its landing instead of skimming
+            // the inter-line gap.
             let (tx, dx) = if dy.abs() > 0.5 && dx.abs() > 1.6 * dy.abs() {
                 let ndx = dx.signum() * 1.6 * dy.abs();
                 (m.x1 - ndx, ndx)
@@ -2947,9 +2942,8 @@ impl CursorGlow {
         }
         let Some(t0) = self.last_move else { return };
         let age_ms = now.saturating_duration_since(t0).as_millis() as u64;
-        // The last move's window: 350 ms for a typing advance (chains across
-        // inter-key gaps), 200 ms for a jump. `.max(1)` guards the zeroed
-        // default.
+        // `CROWN_TYPING_MS` for a typing advance, `CROWN_MS` for a jump;
+        // `.max(1)` guards the zeroed default.
         let window = self.crown_window_ms.max(1);
         if age_ms >= window {
             return;
@@ -3031,10 +3025,8 @@ impl CursorGlow {
             // nucleus cursor draws the bright inner coma.
             GlowStyle::Comet => (44.0, lerp_rgb(cfg.color, 0x00FF_FFFF, 0.30)),
         };
-        // The crown follows typing heat: faint at rest, full only under
-        // sustained fast typing. Laser and fire also ride the jump flare, so
-        // the landing cell erupts the instant a jump connects, then cools on
-        // the flare tau.
+        // The crown follows typing heat; Laser and Fire also ride the jump flare,
+        // so the landing cell erupts the instant a jump connects.
         let boost = if matches!(cfg.style, GlowStyle::Laser) {
             self.typing_boost().max(1.3 * self.blaze())
         } else if matches!(cfg.style, GlowStyle::Fire) {
@@ -3712,11 +3704,9 @@ impl CursorGlow {
                         } else {
                             0x00A9_8BFF // bright nebula violet
                         };
-                        // Stardust rule: the wake's body is round motes and a
-                        // dealt 1-in-8 keeps the 4-point twinkle. The mote is
-                        // priced at the plus's composited centre
-                        // ([`push_dust_halo`]) so the body matches the accent's
-                        // brightness.
+                        // Stardust rule: round motes, with a dealt 1-in-16 keeping
+                        // the 4-point twinkle; a mote is priced at the plus's
+                        // composited centre ([`push_dust_halo`]).
                         if !star_accent((p.hue * 4096.0) as u32) {
                             let r = dust_r(ch, p.hue) * (0.6 + 0.4 * fade);
                             push_dust_halo(halos, geom, x, y, r, tint, scov);
@@ -3919,11 +3909,9 @@ impl CursorGlow {
                     };
                     let cov = (f32::from(cov) * lift).min(255.0) as u8;
                     match seed % 8 {
-                        // The star bucket is re-dealt through the family's
-                        // [`star_accent`]: `seed % 16 == 0` is a strict subset of
-                        // `seed % 8 == 0`, so the pour's plus share is 1-in-16
-                        // ([`STAR_ACCENT_DEN`]) and the rest of bucket 0 joins
-                        // the dust arm with count and brightness unchanged.
+                        // Bucket 0 is re-dealt through [`star_accent`]
+                        // (`seed % 16 == 0` ⊂ `seed % 8 == 0`): 1-in-16 grains are
+                        // plus stars, the rest join the dust arm.
                         0 if star_accent(seed) => {
                             // Four-point star, twinkling on its own seeded phase.
                             let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
@@ -3987,11 +3975,9 @@ impl CursorGlow {
                             continue;
                         }
                         0..=3 => {
-                            // Stardust: buckets 1-3 and the undealt half of bucket
-                            // 0 are round celestial dust with the same twinkle,
-                            // drawn at the plus's composited light
-                            // ([`push_dust_halo`]) so a re-dealt grain is not
-                            // dimmer than the plus it replaces.
+                            // Buckets 1-3 and bucket 0's undealt half: round dust
+                            // with the same twinkle, priced at the plus's
+                            // composited light ([`push_dust_halo`]).
                             let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
                             let scov = ((cov as f32) * twinkle).clamp(0.0, 255.0) as u8;
                             if scov > 0 {
@@ -4297,10 +4283,8 @@ impl CursorGlow {
         if matches!(cfg.style, GlowStyle::Water) && self.heat > 0.0 {
             return lerp_rgb(base, water_ramp(1.0), 0.5 * self.heat * pos);
         }
-        // Smolder → blaze: at rest the wake glows deep ember-orange, climbing
-        // toward the hot head as the eased temperature builds and cooling as it
-        // decays. The head is capped at 0.92 on the ramp (never cream), so it
-        // does not wash fresh glyphs. Live animator only.
+        // Fire: the wake climbs from ember-orange toward the hot head with the
+        // eased temperature, capped at 0.92 on the ramp so it never washes glyphs.
         if matches!(cfg.style, GlowStyle::Fire) {
             return fire_ramp((pos * (0.50 + 0.45 * self.fire_t())).min(0.92));
         }

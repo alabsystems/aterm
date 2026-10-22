@@ -4,16 +4,27 @@
 //! The local `aterm init` desktop preferences. Persistent modifier mappings use the
 //! same items as machine baselines; a separate HID item updates attached keyboards now.
 //! No login agent or background process is installed.
+//!
+//! The widget, desktop and Dock items of one pass share one [`DesktopActivation`]: each
+//! writes its keys, and the Dock, Finder and Notification Center that read them relaunch
+//! once, after every write, before any of the three is read back. A Dock relaunched for
+//! the desktop keys a second before the Dock's own write wrote the pins it had just read
+//! back over that write, on about 187 unattended passes in a row (2026-10-21).
 
 use crate::items::defaults::{self, Target};
-use crate::items::{Ctx, Item, keyboard};
+use crate::items::{Activation, Ctx, Item, keyboard};
 use crate::model::{Effect, PValue, Probe, Read, User};
+use crate::plist::Entries;
 use crate::port::{Cmd, System};
 use aterm_types::macos_setup::{Selection, Setting};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 const SRC: &str = "HIDKeyboardModifierMappingSrc";
+const WINDOW_MANAGER: &str = "com.apple.WindowManager";
+const NOTIFICATION_CENTER: &str = "com.apple.notificationcenterui";
+const FINDER: &str = "com.apple.finder";
+const DOCK: &str = "com.apple.dock";
 const DST: &str = "HIDKeyboardModifierMappingDst";
 const HIDUTIL: &str = "/usr/bin/hidutil";
 const DOCK_APPS: [(&str, &str, &str); 3] = [
@@ -59,17 +70,15 @@ pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
         )?);
         items.extend(attached_keyboard_items(ctx)?);
     }
+    // One relaunch of what the selected desktop items' writes are read by, after them all.
+    let activation = Arc::new(DesktopActivation::new(user));
     for (setting, kind) in [
         (Setting::Widgets, DesktopKind::Widgets),
         (Setting::Desktop, DesktopKind::Desktop),
         (Setting::Dock, DesktopKind::Dock),
     ] {
         if selected.contains(setting) {
-            items.push(Box::new(Desktop {
-                user: user.clone(),
-                kind,
-                before: Mutex::new(Vec::new()),
-            }));
+            items.push(Box::new(Desktop::new(user, kind, &activation)));
         }
     }
     Ok(items)
@@ -328,11 +337,96 @@ fn parse_mapping(value: &str) -> Result<Vec<(i64, i64)>, String> {
     Ok(mappings)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DesktopKind {
     Widgets,
     Desktop,
     Dock,
+}
+
+/// What a desktop key should hold.
+#[derive(Debug, Clone, Copy)]
+enum Wanted {
+    Bool(bool),
+    /// An empty array: no stack, no recent app.
+    Empty,
+    /// The [`DOCK_APPS`] pins, as the Dock rewrites them ([`same_apps`]).
+    DockApps,
+    /// Notification Center's widget list with no widget ([`cleared_widgets`]).
+    NoWidgets,
+}
+
+impl DesktopKind {
+    /// The family's marker and journal name.
+    const fn family(self) -> &'static str {
+        match self {
+            Self::Widgets => "widgets",
+            Self::Desktop => "desktop",
+            Self::Dock => "dock",
+        }
+    }
+
+    /// The id of `user`'s item of this family.
+    fn id(self, user: &User) -> String {
+        format!("init.{}@{}", self.family(), user.name)
+    }
+
+    /// The processes that read the family's keys, in relaunch order: those of each domain
+    /// its keys are in ([`crate::init_activation::readers`]).
+    fn readers(self) -> Vec<&'static str> {
+        crate::init_activation::RELAUNCHED
+            .into_iter()
+            .filter(|process| {
+                self.keys()
+                    .iter()
+                    .any(|(domain, _, _)| crate::init_activation::readers(domain).contains(process))
+            })
+            .collect()
+    }
+
+    /// Every key the family writes, in the order it reads them, and what each should hold:
+    /// what its item changes and what its activation waits to read the same.
+    const fn keys(self) -> &'static [(&'static str, &'static str, Wanted)] {
+        match self {
+            Self::Widgets => &[
+                (WINDOW_MANAGER, "StandardHideWidgets", Wanted::Bool(true)),
+                (
+                    WINDOW_MANAGER,
+                    "StageManagerHideWidgets",
+                    Wanted::Bool(true),
+                ),
+                (NOTIFICATION_CENTER, "widgets", Wanted::NoWidgets),
+            ],
+            Self::Desktop => &[
+                (
+                    WINDOW_MANAGER,
+                    "EnableStandardClickToShowDesktop",
+                    Wanted::Bool(false),
+                ),
+                (
+                    WINDOW_MANAGER,
+                    "StandardHideDesktopIcons",
+                    Wanted::Bool(false),
+                ),
+                (
+                    WINDOW_MANAGER,
+                    "StageManagerHideDesktopIcons",
+                    Wanted::Bool(false),
+                ),
+                (FINDER, "CreateDesktop", Wanted::Bool(true)),
+            ],
+            Self::Dock => &[
+                (DOCK, "persistent-apps", Wanted::DockApps),
+                (DOCK, "persistent-others", Wanted::Empty),
+                (DOCK, "static-apps", Wanted::Empty),
+                (DOCK, "static-others", Wanted::Empty),
+                (DOCK, "recent-apps", Wanted::Empty),
+                (DOCK, "show-recents", Wanted::Bool(false)),
+                (DOCK, "static-only", Wanted::Bool(false)),
+                (DOCK, "minimize-to-application", Wanted::Bool(true)),
+            ],
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -340,95 +434,249 @@ struct Desktop {
     user: User,
     kind: DesktopKind,
     before: Mutex<Vec<(Target, Read<PValue>)>>,
+    /// The pass's one relaunch of what the desktop items write ([`DesktopActivation`]).
+    activation: Arc<DesktopActivation>,
 }
 
 type Changes = Vec<(Target, Read<PValue>, PValue)>;
 
 impl Desktop {
+    fn new(user: &User, kind: DesktopKind, activation: &Arc<DesktopActivation>) -> Self {
+        Self {
+            user: user.clone(),
+            kind,
+            before: Mutex::new(Vec::new()),
+            activation: Arc::clone(activation),
+        }
+    }
+
     fn target(&self, domain: &str, key: &str) -> Target {
         Target::user(domain, key, &self.user)
     }
 
     fn changes(&self, sys: &dyn System) -> Result<Changes, String> {
+        if self.kind == DesktopKind::Dock {
+            dock_apps_available(sys, &self.user)?;
+        }
         let mut changes = Vec::new();
-        let mut consider =
-            |target: Target, want: PValue, semantic: &dyn Fn(&PValue, &PValue) -> bool| {
-                let read = target.read(sys);
-                match &read {
-                    Read::Unusable(why) => return Err(why.clone()),
-                    Read::Value(now) if semantic(now, &want) => return Ok(()),
-                    Read::Absent | Read::Value(_) => {}
+        for &(domain, key, wanted) in self.kind.keys() {
+            let target = self.target(domain, key);
+            let read = target.read(sys);
+            let want = match wanted {
+                Wanted::NoWidgets => cleared_widgets(sys, &self.user, &read)?,
+                Wanted::DockApps => {
+                    unmet(&read, dock_apps(), |now, want| same_apps(sys, now, want))?
                 }
-                changes.push((target, read, want));
-                Ok(())
+                Wanted::Empty => unmet(&read, PValue::Array(Vec::new()), equivalent)?,
+                Wanted::Bool(value) => unmet(&read, PValue::Bool(value), equivalent)?,
             };
-        match self.kind {
-            DesktopKind::Widgets => {
-                for key in ["StandardHideWidgets", "StageManagerHideWidgets"] {
-                    consider(
-                        self.target("com.apple.WindowManager", key),
-                        PValue::Bool(true),
-                        &equivalent,
-                    )?;
-                }
-                let target = self.target("com.apple.notificationcenterui", "widgets");
-                let read = target.read(sys);
-                let want = cleared_widgets(sys, &self.user, &read)?;
-                if let Some(want) = want {
-                    changes.push((target, read, want));
-                }
-            }
-            DesktopKind::Desktop => {
-                for key in [
-                    "EnableStandardClickToShowDesktop",
-                    "StandardHideDesktopIcons",
-                    "StageManagerHideDesktopIcons",
-                ] {
-                    consider(
-                        self.target("com.apple.WindowManager", key),
-                        PValue::Bool(false),
-                        &equivalent,
-                    )?;
-                }
-                consider(
-                    self.target("com.apple.finder", "CreateDesktop"),
-                    PValue::Bool(true),
-                    &equivalent,
-                )?;
-            }
-            DesktopKind::Dock => {
-                dock_apps_available(sys, &self.user)?;
-                consider(
-                    self.target("com.apple.dock", "persistent-apps"),
-                    dock_apps(),
-                    &|now, want| same_apps(sys, now, want),
-                )?;
-                for key in [
-                    "persistent-others",
-                    "static-apps",
-                    "static-others",
-                    "recent-apps",
-                ] {
-                    consider(
-                        self.target("com.apple.dock", key),
-                        PValue::Array(Vec::new()),
-                        &equivalent,
-                    )?;
-                }
-                for (key, value) in [
-                    ("show-recents", false),
-                    ("static-only", false),
-                    ("minimize-to-application", true),
-                ] {
-                    consider(
-                        self.target("com.apple.dock", key),
-                        PValue::Bool(value),
-                        &equivalent,
-                    )?;
-                }
+            if let Some(want) = want {
+                changes.push((target, read, want));
             }
         }
         Ok(changes)
+    }
+}
+
+/// `want`, unless `read` already holds it by `same`.
+fn unmet(
+    read: &Read<PValue>,
+    want: PValue,
+    same: impl Fn(&PValue, &PValue) -> bool,
+) -> Result<Option<PValue>, String> {
+    match read {
+        Read::Unusable(why) => Err(why.clone()),
+        Read::Value(now) if same(now, &want) => Ok(None),
+        Read::Absent | Read::Value(_) => Ok(Some(want)),
+    }
+}
+
+/// The one relaunch, per pass, of the desktop processes that read what that pass's
+/// widget, desktop and Dock items wrote: the Dock, the Finder and Notification Center each
+/// relaunch once, after the last of those writes, and the items are read back only once
+/// each is up again and past its start ([`crate::init_activation::relaunch_settled`]).
+/// Each family settles alone: it is activated once every process that reads its keys
+/// ([`DesktopKind::readers`]) is, so a reader that does not start again fails only the
+/// families it reads, and the others are read back (and their changes kept).
+/// Each family's durable marker (written before its first write) is cleared only after
+/// that, so a pass that ends between the writes and the relaunch relaunches on the next.
+#[derive(Debug)]
+struct DesktopActivation {
+    user: User,
+    /// The families whose items started writing in this pass, in run order.
+    owed: Mutex<Vec<DesktopKind>>,
+}
+
+/// The Dock's keys whose tiles it gives a GUID as it loads them ([`dock_apps`] writes none).
+const TILE_KEYS: [&str; 2] = ["persistent-apps", "persistent-others"];
+
+impl DesktopActivation {
+    fn new(user: &User) -> Self {
+        Self {
+            user: user.clone(),
+            owed: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// `kind`'s marker is written and its writes begin: this pass relaunches its readers.
+    fn owe(&self, kind: DesktopKind) {
+        let mut owed = self.owed.lock().unwrap_or_else(PoisonError::into_inner);
+        if !owed.contains(&kind) {
+            owed.push(kind);
+        }
+    }
+
+    /// The families this pass owes a relaunch whose marker is still pending.
+    fn families(&self, sys: &dyn System) -> Result<Vec<DesktopKind>, String> {
+        let owed = self
+            .owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mut families = Vec::new();
+        for kind in owed {
+            if crate::init_activation::pending(sys, &self.user, kind.family())? {
+                families.push(kind);
+            }
+        }
+        Ok(families)
+    }
+
+    /// The processes that read `families`' keys, each once, in relaunch order.
+    fn consumers(families: &[DesktopKind]) -> Vec<&'static str> {
+        crate::init_activation::RELAUNCHED
+            .into_iter()
+            .filter(|process| families.iter().any(|kind| kind.readers().contains(process)))
+            .collect()
+    }
+
+    /// What `process` reads of what `families` wrote, as it now holds it, each domain read
+    /// once; `Err` while it is the Dock and has not yet loaded the tiles it was handed: a
+    /// Dock gives each tile it loads a GUID, and a write of [`dock_apps`] carries none.
+    fn look(
+        &self,
+        sys: &dyn System,
+        families: &[DesktopKind],
+        process: &str,
+    ) -> Result<Vec<Result<Entries, String>>, String> {
+        let keys: Vec<(&str, &str)> = families
+            .iter()
+            .flat_map(|kind| kind.keys().iter())
+            .filter(|(domain, _, _)| crate::init_activation::readers(domain).contains(&process))
+            .map(|&(domain, key, _)| (domain, key))
+            .collect();
+        let mut domains: Vec<&str> = Vec::new();
+        for &(domain, _) in &keys {
+            if !domains.contains(&domain) {
+                domains.push(domain);
+            }
+        }
+        let mut seen = Vec::with_capacity(domains.len());
+        for domain in domains {
+            let entries =
+                Target::user(domain, "", &self.user)
+                    .entries(sys)
+                    .map(|entries| -> Entries {
+                        entries
+                            .into_iter()
+                            .filter(|(key, _)| keys.contains(&(domain, key.as_str())))
+                            .collect()
+                    });
+            if domain == DOCK
+                && let Ok(entries) = &entries
+                && entries.iter().any(|(key, value)| {
+                    TILE_KEYS.contains(&key.as_str())
+                        && value.as_ref().is_ok_and(|tiles| !loaded(tiles))
+                })
+            {
+                return Err("the Dock has not yet loaded the tiles it was given".into());
+            }
+            seen.push(entries);
+        }
+        Ok(seen)
+    }
+}
+
+/// Whether every tile of `tiles` carries the GUID a Dock gives a tile it loads.
+fn loaded(tiles: &PValue) -> bool {
+    let PValue::Array(tiles) = tiles else {
+        return true;
+    };
+    tiles.iter().all(|tile| field(tile, "GUID").is_some())
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn listed(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+impl Activation for DesktopActivation {
+    fn id(&self) -> String {
+        format!("init.relaunch@{}", self.user.name)
+    }
+
+    fn pending(&self, sys: &dyn System, _ctx: &Ctx) -> Result<Option<(String, String)>, String> {
+        let families = self.families(sys)?;
+        if families.is_empty() {
+            return Ok(None);
+        }
+        let processes: Vec<String> = Self::consumers(&families)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let writers: Vec<String> = families.iter().map(|kind| kind.id(&self.user)).collect();
+        let one = processes.len() == 1;
+        Ok(Some((
+            format!(
+                "{} running with the preferences {} read at {} start",
+                listed(&processes),
+                if one { "it" } else { "they" },
+                if one { "its" } else { "their" },
+            ),
+            format!(
+                "{} relaunched once, after {} wrote, and up again",
+                listed(&processes),
+                listed(&writers),
+            ),
+        )))
+    }
+
+    /// Relaunch the readers of every family owed, once each, and wait for each; then
+    /// clear the marker of each family all of whose readers are up, and name the items of
+    /// the others, each with why its readers are not.
+    fn activate(&self, sys: &dyn System, _ctx: &Ctx) -> Result<Vec<(String, String)>, String> {
+        let families = self.families(sys)?;
+        let processes = Self::consumers(&families);
+        let answers =
+            crate::init_activation::relaunch_settled(sys, &self.user, &processes, |process| {
+                self.look(sys, &families, process)
+            });
+        let mut failed = Vec::new();
+        for kind in &families {
+            let why: Vec<&str> = processes
+                .iter()
+                .zip(&answers)
+                .filter(|(process, _)| kind.readers().contains(process))
+                .filter_map(|(_, answer)| answer.as_ref().err().map(String::as_str))
+                .collect();
+            let finished = if why.is_empty() {
+                crate::init_activation::finish(sys, &self.user, kind.family())
+            } else {
+                Err(why.join("; "))
+            };
+            if let Err(why) = finished {
+                failed.push((kind.id(&self.user), why));
+            }
+        }
+        self.owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|kind| !families.contains(kind));
+        Ok(failed)
     }
 }
 
@@ -445,15 +693,11 @@ impl Item for Desktop {
             .collect())
     }
     fn id(&self) -> String {
-        format!("init.{}@{}", self.family(), self.user.name)
+        self.kind.id(&self.user)
     }
 
     fn family(&self) -> &'static str {
-        match self.kind {
-            DesktopKind::Widgets => "widgets",
-            DesktopKind::Desktop => "desktop",
-            DesktopKind::Dock => "dock",
-        }
+        self.kind.family()
     }
 
     fn title(&self) -> String {
@@ -504,6 +748,9 @@ impl Item for Desktop {
         }
     }
 
+    /// Write the family's keys, after its durable marker. Its readers relaunch in the
+    /// pass's one [`DesktopActivation`], after every desktop item's writes, which the
+    /// engine runs before it reads this item back.
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         let changes = self.changes(sys)?;
         let pending = crate::init_activation::pending(sys, &self.user, self.family())?;
@@ -511,11 +758,16 @@ impl Item for Desktop {
             return Ok(());
         }
         crate::init_activation::begin(sys, &self.user, self.family())?;
+        // Owed from here: a write below that fails part way has still been made.
+        self.activation.owe(self.kind);
         for (target, _, want) in changes {
             run(sys, &target.write_cmd(&want))?;
         }
-        crate::init_activation::activate(sys, &self.user, self.family())?;
-        crate::init_activation::finish(sys, &self.user, self.family())
+        Ok(())
+    }
+
+    fn activation(&self) -> Option<Arc<dyn Activation>> {
+        Some(Arc::clone(&self.activation) as Arc<dyn Activation>)
     }
 
     fn effect(&self) -> Effect {
@@ -740,8 +992,15 @@ fn dock_app_path(pin: &PValue) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::init::Workstation;
     use crate::items::defaults::tests::{ctx, export, user};
+    use crate::model::{Mode, Outcome};
     use crate::port::{Fake, Ran, Stat};
+
+    /// A desktop item of its own pass.
+    fn desktop(who: &User, kind: DesktopKind) -> Desktop {
+        Desktop::new(who, kind, &Arc::new(DesktopActivation::new(who)))
+    }
 
     fn installed_dock_apps(sys: &Fake, who: &User) {
         for (path, bundle, _) in DOCK_APPS {
@@ -1010,11 +1269,7 @@ mod tests {
                 sys.on(&cmd.display(), Ran::ok("com.example.another-app"));
                 installed_dock_apps(&sys, &who);
             }
-            let item = Desktop {
-                user: who.clone(),
-                kind: DesktopKind::Dock,
-                before: Mutex::new(Vec::new()),
-            };
+            let item = desktop(&who, DesktopKind::Dock);
             let rows = crate::engine::run(
                 &[Box::new(item)],
                 crate::model::Mode::Apply,
@@ -1034,11 +1289,7 @@ mod tests {
     #[test]
     fn dock_plan_is_read_only_and_covers_every_persistent_static_and_recent_section() {
         let who = user("alice", 501);
-        let item = Desktop {
-            user: who.clone(),
-            kind: DesktopKind::Dock,
-            before: Mutex::new(Vec::new()),
-        };
+        let item = desktop(&who, DesktopKind::Dock);
         let sys = Fake::root();
         installed_dock_apps(&sys, &who);
         sys.on(
@@ -1077,86 +1328,11 @@ mod tests {
     }
 
     #[test]
-    fn written_preferences_do_not_hide_failed_activation_and_rerun_recovers_without_rewriting_them()
-    {
+    fn a_failed_namespace_flush_allows_no_write_and_a_retry_flushes_the_whole_chain() {
         let who = user("alice", 501);
-        let mut sys = Fake::root();
-        sys.euid = who.uid;
         let windowmanager = "alice$ /usr/bin/defaults export com.apple.WindowManager -";
         let notificationcenter = "alice$ /usr/bin/defaults export com.apple.notificationcenterui -";
-        for _ in 0..4 {
-            sys.on(windowmanager, export("<dict><key>StandardHideWidgets</key><false/><key>StageManagerHideWidgets</key><false/></dict>"));
-        }
-        sys.on(windowmanager, export("<dict><key>StandardHideWidgets</key><true/><key>StageManagerHideWidgets</key><true/></dict>"));
-        for _ in 0..2 {
-            sys.on(notificationcenter, export("<dict><key>widgets</key><dict><key>vers</key><integer>1</integer><key>instances</key><array><integer>42</integer></array></dict></dict>"));
-        }
-        sys.on(notificationcenter, export("<dict><key>widgets</key><dict><key>vers</key><integer>1</integer><key>instances</key><array/></dict></dict>"));
-        for key in ["StandardHideWidgets", "StageManagerHideWidgets"] {
-            let cmd =
-                Target::user("com.apple.WindowManager", key, &who).write_cmd(&PValue::Bool(true));
-            sys.on(&cmd.display(), Ran::ok(""));
-        }
-        let cmd = Target::user("com.apple.notificationcenterui", "widgets", &who).write_cmd(
-            &PValue::Dict(vec![
-                ("vers".into(), PValue::Int(1)),
-                ("instances".into(), PValue::Array(Vec::new())),
-            ]),
-        );
-        sys.on(&cmd.display(), Ran::ok(""));
-        sys.on(
-            "alice$ /usr/bin/pgrep -u 501 -x NotificationCenter",
-            Ran::ok("123\n"),
-        );
-        sys.on(
-            "/bin/launchctl print gui/501",
-            Ran::exit(2, "injected session lookup failure"),
-        );
-        sys.on("/bin/launchctl print gui/501", Ran::ok(""));
-        sys.on(
-            "alice@gui$ /usr/bin/killall -u alice NotificationCenter",
-            Ran::ok(""),
-        );
-        let items: Vec<Box<dyn Item>> = vec![Box::new(Desktop {
-            user: who.clone(),
-            kind: DesktopKind::Widgets,
-            before: Mutex::new(Vec::new()),
-        })];
         let c = ctx(std::slice::from_ref(&who));
-        let run = |mode| crate::engine::run(&items, mode, &sys, &c, &mut crate::engine::NoJournal);
-        let first = run(crate::model::Mode::Apply);
-        assert_eq!(first[0].outcome, crate::model::Outcome::Failed);
-        assert!(crate::init_activation::pending(&sys, &who, "widgets").unwrap());
-        let calls = sys.calls();
-        let marker = calls.iter().position(|call| call.contains("write /Users//alice/Library/Application Support/aterm/init-activation/widgets.pending")).unwrap();
-        let write = calls
-            .iter()
-            .position(|call| call.contains("/usr/bin/defaults write"))
-            .unwrap();
-        assert!(marker < write);
-        let preference_writes = calls
-            .iter()
-            .filter(|call| call.contains("/usr/bin/defaults write"))
-            .count();
-        assert_eq!(preference_writes, 3);
-        let checked = run(crate::model::Mode::Plan);
-        assert_eq!(checked[0].outcome, crate::model::Outcome::Planned);
-        let recovered = run(crate::model::Mode::Apply);
-        assert_eq!(recovered[0].outcome, crate::model::Outcome::Changed);
-        assert!(!crate::init_activation::pending(&sys, &who, "widgets").unwrap());
-        let calls = sys.calls();
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|call| call.contains("/usr/bin/defaults write"))
-                .count(),
-            preference_writes
-        );
-        assert_eq!(
-            calls.iter().filter(|call| call.contains("killall")).count(),
-            1
-        );
-
         // A failed namespace flush cannot allow any preference write or activation.
         // Retry must flush the whole chain even though its directories now exist.
         let directories = [
@@ -1181,16 +1357,8 @@ mod tests {
                     .write_cmd(&PValue::Bool(true));
                 sys.on(&cmd.display(), Ran::ok(""));
             }
-            sys.on(
-                "alice$ /usr/bin/pgrep -u 501 -x NotificationCenter",
-                Ran::exit(1, ""),
-            );
             sys.durable_dir_fails(Path::new(directory), Some(std::io::ErrorKind::Other));
-            let item = Desktop {
-                user: who.clone(),
-                kind: DesktopKind::Widgets,
-                before: Mutex::new(Vec::new()),
-            };
+            let item = desktop(&who, DesktopKind::Widgets);
             assert!(item.apply(&sys, &c).is_err());
             assert!(crate::init_activation::pending(&sys, &who, "widgets").unwrap());
             let calls = sys.calls();
@@ -1214,7 +1382,8 @@ mod tests {
             sys.durable_dir_fails(Path::new(directory), None);
             let retry = calls.len();
             item.apply(&sys, &c).unwrap();
-            assert!(!crate::init_activation::pending(&sys, &who, "widgets").unwrap());
+            // Written, and its relaunch owed to the pass's activation, which runs after it.
+            assert!(crate::init_activation::pending(&sys, &who, "widgets").unwrap());
             let calls = sys.calls();
             let retry_calls = &calls[retry..];
             let first_write = retry_calls
@@ -1235,5 +1404,784 @@ mod tests {
                 2
             );
         }
+    }
+
+    /// The tiles a Dock reads as it starts and writes back.
+    const TILES: [&str; 3] = ["persistent-apps", "persistent-others", "recent-apps"];
+
+    /// The tiles a starting Dock read, each by its key.
+    type Loaded = Vec<(&'static str, PValue)>;
+
+    /// A starting process's tiles and the sleeps left until its start is past.
+    type Starting = Option<(Loaded, u32)>;
+
+    /// A desktop the [`Fake`] runs ([`Fake::simulate`]): `defaults` reads and writes one
+    /// store, and `pgrep`, `killall` and `sleep` act on its Dock, Finder and Notification
+    /// Center, each started again at once when it is killed, as launchd does. A Dock reads
+    /// its tiles ([`TILES`]) as it starts and is past its start `start` sleeps later, when
+    /// it writes them back with the GUIDs it adds (a managed one, the pins it is made to
+    /// show). Killed before that, it writes what it read back as it exits: the pins of a
+    /// Dock relaunched between two writes it reads come back over the second, as on the
+    /// owner's Mac on 2026-10-21.
+    struct Desk {
+        prefs: Vec<(String, String, PValue)>,
+        /// Each running process, its pid, and, while it is starting, the tiles it read and
+        /// the sleeps left until its start is past.
+        running: Vec<(&'static str, u32, Starting)>,
+        next_pid: u32,
+        /// How many sleeps a Dock takes to get past its start.
+        start: u32,
+        /// The pins a managed Dock shows once it is past its start, whatever was written.
+        managed: Option<PValue>,
+        /// A process launchd does not start again once it is killed.
+        stays_down: Option<&'static str>,
+        /// A process whose `killall` fails (exit 2) and signals nothing.
+        unkillable: Option<&'static str>,
+        /// A `defaults write` of this domain and key fails, writing nothing.
+        unwritable: Option<(&'static str, &'static str)>,
+        /// How many `launchctl print` session checks fail before one answers.
+        session_failures: u32,
+        /// What happened, in order: `write <domain> <key>`, `kill <process>`, `<process>
+        /// <pid> wrote back what it read at its start`, `Dock <pid> past its start`.
+        events: Vec<String>,
+    }
+
+    fn pin(label: &str) -> PValue {
+        PValue::Dict(vec![(
+            "tile-data".into(),
+            PValue::Dict(vec![("file-label".into(), PValue::Str(label.into()))]),
+        )])
+    }
+
+    impl Desk {
+        /// A desktop before setup: other pins, a stack, a recent app, a widget, hidden
+        /// desktop icons; the Dock, Finder and Notification Center running, past their start.
+        fn before() -> Self {
+            Self {
+                prefs: vec![
+                    (
+                        DOCK.into(),
+                        "persistent-apps".into(),
+                        PValue::Array(vec![pin("Mail"), pin("Music")]),
+                    ),
+                    (
+                        DOCK.into(),
+                        "persistent-others".into(),
+                        PValue::Array(vec![pin("Downloads")]),
+                    ),
+                    (
+                        DOCK.into(),
+                        "recent-apps".into(),
+                        PValue::Array(vec![pin("Notes")]),
+                    ),
+                    (DOCK.into(), "show-recents".into(), PValue::Bool(true)),
+                    (
+                        WINDOW_MANAGER.into(),
+                        "StandardHideDesktopIcons".into(),
+                        PValue::Bool(true),
+                    ),
+                    (
+                        NOTIFICATION_CENTER.into(),
+                        "widgets".into(),
+                        PValue::Dict(vec![
+                            ("vers".into(), PValue::Int(1)),
+                            (
+                                "instances".into(),
+                                PValue::Array(vec![PValue::Data(vec![42])]),
+                            ),
+                        ]),
+                    ),
+                ],
+                running: vec![
+                    ("Dock", 100, None),
+                    ("Finder", 200, None),
+                    ("NotificationCenter", 300, None),
+                ],
+                next_pid: 1000,
+                start: 1,
+                managed: None,
+                stays_down: None,
+                unkillable: None,
+                unwritable: None,
+                session_failures: 0,
+                events: Vec::new(),
+            }
+        }
+
+        fn read(&self, domain: &str, key: &str) -> Option<&PValue> {
+            self.prefs
+                .iter()
+                .find(|(d, k, _)| d == domain && k == key)
+                .map(|(_, _, value)| value)
+        }
+
+        fn write(&mut self, domain: &str, key: &str, value: PValue) {
+            self.prefs.retain(|(d, k, _)| !(d == domain && k == key));
+            self.prefs.push((domain.into(), key.into(), value));
+        }
+
+        fn count(&self, event: &str) -> usize {
+            self.events.iter().filter(|e| *e == event).count()
+        }
+
+        /// Each process still starting, by name and pid.
+        fn starting(&self) -> Vec<(&'static str, u32)> {
+            self.running
+                .iter()
+                .filter(|(_, _, starting)| starting.is_some())
+                .map(|(name, pid, _)| (*name, *pid))
+                .collect()
+        }
+
+        fn answer(&mut self, fake: &Fake, cmd: &Cmd) -> Option<Ran> {
+            let args: Vec<String> = cmd
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            match (cmd.program.to_str()?, args.as_slice()) {
+                ("/usr/bin/defaults", ["export", domain, "-"]) => {
+                    let entries = self
+                        .prefs
+                        .iter()
+                        .filter(|(d, _, _)| d == domain)
+                        .map(|(_, key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    Some(Ran::ok(&crate::plist::document(&PValue::Dict(entries))))
+                }
+                ("/usr/bin/defaults", ["write", domain, key, value @ ..]) => {
+                    let value = match value {
+                        ["-bool", b] => PValue::Bool(*b == "true"),
+                        ["-int", i] => PValue::Int(i.parse().ok()?),
+                        ["-string", text] => PValue::Str((*text).into()),
+                        [fragment] => crate::plist::parse(fragment.as_bytes()).ok()?,
+                        _ => return None,
+                    };
+                    if self.unwritable == Some((domain, key)) {
+                        return Some(Ran::exit(1, "injected write failure"));
+                    }
+                    self.events.push(format!("write {domain} {key}"));
+                    self.write(domain, key, value);
+                    Some(Ran::ok(""))
+                }
+                ("/usr/bin/pgrep", ["-u", _, "-x", process]) => {
+                    let pids: String = self
+                        .running
+                        .iter()
+                        .filter(|(name, _, _)| name == process)
+                        .map(|(_, pid, _)| format!("{pid}\n"))
+                        .collect();
+                    Some(if pids.is_empty() {
+                        Ran {
+                            status: Some(1),
+                            stdout: Vec::new(),
+                            stderr: Vec::new(),
+                        }
+                    } else {
+                        Ran::ok(&pids)
+                    })
+                }
+                ("/bin/launchctl", ["print", _]) => Some(if self.session_failures > 0 {
+                    self.session_failures -= 1;
+                    Ran::exit(2, "injected session lookup failure")
+                } else {
+                    Ran::ok("")
+                }),
+                ("/usr/bin/killall", ["-u", _, process]) => {
+                    if self.unkillable == Some(*process) {
+                        return Some(Ran::exit(2, "injected killall failure"));
+                    }
+                    self.kill(fake, process);
+                    Some(Ran::ok(""))
+                }
+                ("/bin/sleep", ["1"]) => {
+                    self.tick();
+                    Some(Ran::ok(""))
+                }
+                _ => None,
+            }
+        }
+
+        fn kill(&mut self, fake: &Fake, process: &str) {
+            let dying: Vec<_> = self
+                .running
+                .iter()
+                .filter(|(name, _, _)| *name == process)
+                .cloned()
+                .collect();
+            self.running.retain(|(name, _, _)| *name != process);
+            for (name, pid, starting) in dying {
+                if let Some((tiles, _)) = starting {
+                    for (key, value) in tiles {
+                        self.write(DOCK, key, value);
+                    }
+                    self.events
+                        .push(format!("{name} {pid} wrote back what it read at its start"));
+                }
+                fake.exited(pid);
+                self.events.push(format!("kill {name}"));
+                if self.stays_down == Some(name) {
+                    continue;
+                }
+                let pid = self.next_pid;
+                self.next_pid += 1;
+                let starting = (name == "Dock").then(|| {
+                    let tiles = TILES
+                        .iter()
+                        .filter_map(|key| self.read(DOCK, key).map(|value| (*key, value.clone())))
+                        .collect();
+                    (tiles, self.start)
+                });
+                self.running.push((name, pid, starting));
+                fake.alive(pid);
+            }
+        }
+
+        /// A second passes: each starting Dock is a second further, and one past its start
+        /// writes its tiles back, each with a GUID.
+        fn tick(&mut self) {
+            let mut started = Vec::new();
+            for (name, pid, starting) in &mut self.running {
+                if let Some((_, left)) = starting {
+                    *left = left.saturating_sub(1);
+                    if *left == 0
+                        && let Some((tiles, _)) = starting.take()
+                    {
+                        started.push((*name, *pid, tiles));
+                    }
+                }
+            }
+            for (name, pid, tiles) in started {
+                for (key, value) in tiles {
+                    let value = match (&self.managed, key) {
+                        (Some(managed), "persistent-apps") => managed.clone(),
+                        _ => value,
+                    };
+                    self.write(DOCK, key, with_guids(value, i64::from(pid)));
+                }
+                self.events.push(format!("{name} {pid} past its start"));
+            }
+        }
+    }
+
+    /// `tiles` as a Dock rewrites them: each pin with a GUID.
+    fn with_guids(tiles: PValue, guid: i64) -> PValue {
+        let PValue::Array(pins) = tiles else {
+            return tiles;
+        };
+        PValue::Array(
+            pins.into_iter()
+                .map(|pin| match pin {
+                    PValue::Dict(mut fields) => {
+                        if !fields.iter().any(|(key, _)| key == "GUID") {
+                            fields.push(("GUID".into(), PValue::Int(guid)));
+                        }
+                        PValue::Dict(fields)
+                    }
+                    other => other,
+                })
+                .collect(),
+        )
+    }
+
+    /// `desk`, run by a fake acting as `who`, with the Dock's three apps installed.
+    fn desktop_of(who: &User, desk: Desk) -> (Fake, Arc<Mutex<Desk>>) {
+        let mut sys = Fake::root();
+        sys.euid = who.uid;
+        installed_dock_apps(&sys, who);
+        for (_, pid, _) in &desk.running {
+            sys.alive(*pid);
+        }
+        let desk = Arc::new(Mutex::new(desk));
+        let model = Arc::clone(&desk);
+        sys.simulate(move |fake, cmd| model.lock().unwrap().answer(fake, cmd));
+        (sys, desk)
+    }
+
+    /// The widget, desktop and Dock items of one pass, as setup selects them.
+    fn desktop_items(who: &User) -> Vec<Box<dyn Item>> {
+        selected_desktop_items(who, &[Setting::Widgets, Setting::Desktop, Setting::Dock])
+    }
+
+    /// The items of `settings` of one pass, as setup selects them.
+    fn selected_desktop_items(who: &User, settings: &[Setting]) -> Vec<Box<dyn Item>> {
+        let mut selected = Selection::none();
+        for &setting in settings {
+            selected.set(setting, true);
+        }
+        selected_items(&ctx(std::slice::from_ref(who)), selected).unwrap()
+    }
+
+    /// The pass's journal lines, each as its id and `to`.
+    fn journaled(sys: &Fake) -> Vec<(String, String)> {
+        String::from_utf8(sys.written(Fake::JOURNAL).unwrap())
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let line: aterm_json::Value = aterm_json::from_str(line).unwrap();
+                (
+                    line["id"].as_str().unwrap().to_owned(),
+                    line["to"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn verified(pass: &crate::init::WorkstationRun) -> Vec<(&str, bool)> {
+        pass.attempts
+            .iter()
+            .map(|attempt| (attempt.id.as_str(), attempt.verified))
+            .collect()
+    }
+
+    /// One pass of `items`, as doctor and init run them (through the snapshot guard).
+    fn pass(sys: &Fake, items: Vec<Box<dyn Item>>, mode: Mode) -> crate::init::WorkstationRun {
+        Workstation::of(items).run_recording(sys, mode).unwrap()
+    }
+
+    fn outcomes(pass: &crate::init::WorkstationRun) -> Vec<(&str, Outcome)> {
+        pass.rows
+            .iter()
+            .map(|row| (row.id.as_str(), row.outcome))
+            .collect()
+    }
+
+    const DESKTOP_IDS: [&str; 3] = [
+        "init.widgets@alice",
+        "init.desktop@alice",
+        "init.dock@alice",
+    ];
+
+    /// The owner's Mac, 2026-10-21 23:01 to 02:24: each unattended pass wrote the desktop
+    /// keys and relaunched the Dock and Finder, wrote the Dock's pins a second later and
+    /// relaunched the Dock again. The Dock it killed was still starting and wrote back the
+    /// pins it had read, so pass after pass read "applied, but it still reads
+    /// com.apple.dock persistent-apps, com.apple.dock persistent-others, com.apple.dock
+    /// recent-apps". Now every desktop write of the pass lands first; the Dock, Finder and
+    /// Notification Center relaunch once each, journaled after the items' own lines; and
+    /// each item is read back once those are up and past their start. Control: the same
+    /// desktop driven in the old order gets its old pins back. Negative control: the code
+    /// before this change fails this test with exactly the owner's read-back.
+    #[test]
+    fn one_pass_writes_every_desktop_key_before_it_relaunches_each_reader_once() {
+        let who = user("alice", 501);
+        let (sys, desk) = desktop_of(&who, Desk::before());
+        let run = pass(&sys, desktop_items(&who), Mode::Apply);
+        assert_eq!(
+            outcomes(&run),
+            DESKTOP_IDS.map(|id| (id, Outcome::Changed)),
+            "{:?}",
+            run.rows
+        );
+        assert!(run.attempts.iter().all(|attempt| attempt.verified));
+        let desk = desk.lock().unwrap();
+        assert_eq!(
+            (
+                desk.count("kill Dock"),
+                desk.count("kill Finder"),
+                desk.count("kill NotificationCenter")
+            ),
+            (1, 1, 1),
+            "{:?}",
+            desk.events
+        );
+        let first_kill = desk
+            .events
+            .iter()
+            .position(|e| e.starts_with("kill "))
+            .unwrap();
+        let last_write = desk
+            .events
+            .iter()
+            .rposition(|e| e.starts_with("write "))
+            .unwrap();
+        assert!(last_write < first_kill, "{:?}", desk.events);
+        // The read-back waited for the one new Dock to be past its start.
+        assert_eq!(
+            desk.events
+                .iter()
+                .filter(|e| e.starts_with("Dock ") && e.ends_with(" past its start"))
+                .count(),
+            1,
+            "{:#?}",
+            desk.events
+        );
+        assert!(same_apps(
+            &sys,
+            desk.read(DOCK, "persistent-apps").unwrap(),
+            &dock_apps()
+        ));
+        let ids: Vec<String> = journaled(&sys).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            ids,
+            [
+                "init.widgets@alice",
+                "init.desktop@alice",
+                "init.dock@alice",
+                "init.relaunch@alice"
+            ]
+        );
+        for family in ["widgets", "desktop", "dock"] {
+            assert!(!crate::init_activation::pending(&sys, &who, family).unwrap());
+        }
+        drop(desk);
+
+        // Control: the old order, the desktop's relaunch a moment before the Dock's write.
+        let (sys, desk) = desktop_of(&who, Desk::before());
+        let pins = Target::user(DOCK, "persistent-apps", &who);
+        defaults::relaunch(&sys, &who, "Dock").unwrap();
+        sys.run(&pins.write_cmd(&dock_apps())).unwrap();
+        defaults::relaunch(&sys, &who, "Dock").unwrap();
+        let desk = desk.lock().unwrap();
+        assert_eq!(
+            desk.read(DOCK, "persistent-apps"),
+            Some(&PValue::Array(vec![pin("Mail"), pin("Music")])),
+            "{:?}",
+            desk.events
+        );
+    }
+
+    /// A read-back is what the relaunched reader settled on, not what was written: a
+    /// managed Dock that shows its own pins once it is past its start reads back as not
+    /// changed (and is put back by the doctor), while the items whose readers kept what was
+    /// written read back changed. Negative control: `relaunch_settled` returning once the old
+    /// processes exited reads the Dock back before its start is past, and calls it changed.
+    /// A Dock slower to start than a second apart is waited on until it has loaded the
+    /// tiles it was handed (each gets a GUID): two equal reads of a Dock that has not yet
+    /// rewritten them say nothing. Negative control: a look that ignores the tiles' GUIDs
+    /// reads the slow managed Dock back changed.
+    #[test]
+    fn the_read_back_waits_until_the_relaunched_dock_is_past_its_start() {
+        let who = user("alice", 501);
+        let mut managed = Desk::before();
+        managed.managed = Some(PValue::Array(vec![pin("Mail")]));
+        let (sys, _desk) = desktop_of(&who, managed);
+        let run = pass(&sys, desktop_items(&who), Mode::Apply);
+        assert_eq!(
+            outcomes(&run),
+            [
+                ("init.widgets@alice", Outcome::Changed),
+                ("init.desktop@alice", Outcome::Changed),
+                ("init.dock@alice", Outcome::Failed),
+            ]
+        );
+        assert_eq!(
+            run.rows[2].why.as_deref(),
+            Some("applied, but it still reads com.apple.dock persistent-apps")
+        );
+        assert_eq!(
+            verified(&run),
+            [
+                ("init.widgets@alice", true),
+                ("init.desktop@alice", true),
+                ("init.dock@alice", false)
+            ]
+        );
+        // The same Dock, three seconds past its relaunch before it shows its pins.
+        let mut slow = Desk::before();
+        slow.managed = Some(PValue::Array(vec![pin("Mail")]));
+        slow.start = 3;
+        let (sys, desk) = desktop_of(&who, slow);
+        let run = pass(&sys, desktop_items(&who), Mode::Apply);
+        assert_eq!(
+            outcomes(&run),
+            [
+                ("init.widgets@alice", Outcome::Changed),
+                ("init.desktop@alice", Outcome::Changed),
+                ("init.dock@alice", Outcome::Failed),
+            ],
+            "{:#?}",
+            desk.lock().unwrap().events
+        );
+        assert!(desk.lock().unwrap().starting().is_empty());
+    }
+
+    /// A pass that ends after its writes and before the relaunch (the process quit, the
+    /// Mac slept) leaves every family's marker. The next pass writes nothing again,
+    /// relaunches each reader once, and clears them.
+    #[test]
+    fn a_pass_that_ends_between_its_writes_and_the_relaunch_relaunches_on_the_next() {
+        let who = user("alice", 501);
+        let (sys, desk) = desktop_of(&who, Desk::before());
+        let c = ctx(std::slice::from_ref(&who));
+        // What the engine does before it reaches the activation; the process ends there.
+        for item in desktop_items(&who) {
+            item.apply(&sys, &c).unwrap();
+        }
+        for family in ["widgets", "desktop", "dock"] {
+            assert!(crate::init_activation::pending(&sys, &who, family).unwrap());
+        }
+        let writes = {
+            let desk = desk.lock().unwrap();
+            assert!(!desk.events.iter().any(|e| e.starts_with("kill ")));
+            desk.events
+                .iter()
+                .filter(|e| e.starts_with("write "))
+                .count()
+        };
+        let checked = pass(&sys, desktop_items(&who), Mode::Plan);
+        assert_eq!(
+            outcomes(&checked),
+            DESKTOP_IDS.map(|id| (id, Outcome::Planned))
+        );
+        let next = pass(&sys, desktop_items(&who), Mode::Apply);
+        assert_eq!(
+            outcomes(&next),
+            DESKTOP_IDS.map(|id| (id, Outcome::Changed))
+        );
+        let desk = desk.lock().unwrap();
+        assert_eq!(
+            desk.events
+                .iter()
+                .filter(|e| e.starts_with("write "))
+                .count(),
+            writes
+        );
+        assert_eq!(
+            (
+                desk.count("kill Dock"),
+                desk.count("kill Finder"),
+                desk.count("kill NotificationCenter")
+            ),
+            (1, 1, 1)
+        );
+        for family in ["widgets", "desktop", "dock"] {
+            assert!(!crate::init_activation::pending(&sys, &who, family).unwrap());
+        }
+    }
+
+    /// A relaunch that cannot be made (the GUI session lookup for the Dock failed) fails
+    /// every family the Dock reads, here all three, and keeps the written preferences and
+    /// their markers, while the readers that could relaunch were (each once) and were
+    /// waited on: a plan still plans them, and the next pass relaunches each reader once
+    /// without writing again.
+    #[test]
+    fn a_relaunch_that_fails_keeps_the_writes_pending_for_the_next_pass() {
+        let who = user("alice", 501);
+        let mut failing = Desk::before();
+        failing.session_failures = 1;
+        let (sys, desk) = desktop_of(&who, failing);
+        let first = pass(&sys, desktop_items(&who), Mode::Apply);
+        assert_eq!(
+            outcomes(&first),
+            DESKTOP_IDS.map(|id| (id, Outcome::Failed))
+        );
+        for row in &first.rows {
+            let why = row.why.as_deref().unwrap();
+            assert!(
+                why.starts_with(
+                    "applied, but not activated: written, but /bin/launchctl print gui/501"
+                ),
+                "{why}"
+            );
+        }
+        for family in ["widgets", "desktop", "dock"] {
+            assert!(crate::init_activation::pending(&sys, &who, family).unwrap());
+        }
+        let (writes, kills) = {
+            let desk = desk.lock().unwrap();
+            let kills = (
+                desk.count("kill Dock"),
+                desk.count("kill Finder"),
+                desk.count("kill NotificationCenter"),
+            );
+            assert_eq!(kills, (0, 1, 1), "{:?}", desk.events);
+            assert_eq!(desk.starting(), []);
+            let writes = desk
+                .events
+                .iter()
+                .filter(|e| e.starts_with("write "))
+                .count();
+            (writes, kills)
+        };
+        assert!(writes > 0);
+        let checked = pass(&sys, desktop_items(&who), Mode::Plan);
+        assert_eq!(
+            outcomes(&checked),
+            DESKTOP_IDS.map(|id| (id, Outcome::Planned))
+        );
+        let recovered = pass(&sys, desktop_items(&who), Mode::Apply);
+        assert_eq!(
+            outcomes(&recovered),
+            DESKTOP_IDS.map(|id| (id, Outcome::Changed))
+        );
+        let desk = desk.lock().unwrap();
+        assert_eq!(
+            desk.events
+                .iter()
+                .filter(|e| e.starts_with("write "))
+                .count(),
+            writes
+        );
+        assert_eq!(
+            (
+                desk.count("kill Dock") - kills.0,
+                desk.count("kill Finder") - kills.1,
+                desk.count("kill NotificationCenter") - kills.2
+            ),
+            (1, 1, 1)
+        );
+    }
+
+    /// Each family settles alone: a reader that does not start again (Notification Center,
+    /// here never started again by launchd) fails the families whose keys it reads and
+    /// keeps their markers, while the families all of whose readers are up are read back,
+    /// verified, and cleared; the doctor then rolls back only the widgets, and leaves the
+    /// Dock's change that took. Negative control: failing every family on any reader's
+    /// failure fails the desktop and Dock rows too.
+    #[test]
+    fn a_reader_that_does_not_start_again_fails_only_the_families_whose_keys_it_reads() {
+        let who = user("alice", 501);
+        let mut down = Desk::before();
+        down.stays_down = Some("NotificationCenter");
+        let (sys, desk) = desktop_of(&who, down);
+        let run = pass(&sys, desktop_items(&who), Mode::Apply);
+        assert_eq!(
+            outcomes(&run),
+            [
+                ("init.widgets@alice", Outcome::Failed),
+                ("init.desktop@alice", Outcome::Changed),
+                ("init.dock@alice", Outcome::Changed),
+            ],
+            "{:?}",
+            run.rows
+        );
+        assert_eq!(
+            run.rows[0].why.as_deref(),
+            Some(
+                "applied, but not activated: NotificationCenter has not started again a \
+                 minute after its relaunch; activation remains pending"
+            )
+        );
+        assert_eq!(
+            verified(&run),
+            [
+                ("init.widgets@alice", false),
+                ("init.desktop@alice", true),
+                ("init.dock@alice", true)
+            ]
+        );
+        for (family, pending) in [("widgets", true), ("desktop", false), ("dock", false)] {
+            assert_eq!(
+                crate::init_activation::pending(&sys, &who, family).unwrap(),
+                pending,
+                "{family}"
+            );
+        }
+        let desk = desk.lock().unwrap();
+        assert!(same_apps(
+            &sys,
+            desk.read(DOCK, "persistent-apps").unwrap(),
+            &dock_apps()
+        ));
+        assert_eq!(desk.count("kill Dock"), 1, "{:?}", desk.events);
+    }
+
+    /// A relaunch that cannot be made (Finder's `killall` fails, signalling nothing) fails
+    /// the family it reads, and the wait for the readers already relaunched goes on: the
+    /// Dock, slow to start, is past its start before the pass ends, so the doctor's
+    /// rollback of the desktop keys and its relaunch of their readers kill a Dock that is
+    /// up, which writes nothing back. Negative control: returning at the failed relaunch
+    /// leaves the Dock starting.
+    #[test]
+    fn a_relaunch_that_cannot_be_made_still_waits_for_the_readers_already_relaunched() {
+        let who = user("alice", 501);
+        let mut stuck = Desk::before();
+        stuck.unkillable = Some("Finder");
+        stuck.start = 2;
+        let (sys, desk) = desktop_of(&who, stuck);
+        let run = pass(&sys, desktop_items(&who), Mode::Apply);
+        assert_eq!(
+            outcomes(&run),
+            [
+                ("init.widgets@alice", Outcome::Changed),
+                ("init.desktop@alice", Outcome::Failed),
+                ("init.dock@alice", Outcome::Changed),
+            ],
+            "{:?}",
+            run.rows
+        );
+        let why = run.rows[1].why.as_deref().unwrap();
+        assert!(
+            why.starts_with("applied, but not activated: written, but ")
+                && why.contains("killall -u alice Finder"),
+            "{why}"
+        );
+        assert!(crate::init_activation::pending(&sys, &who, "desktop").unwrap());
+        assert_eq!(desk.lock().unwrap().starting(), []);
+        // The doctor puts back what did not verify, then relaunches what reads it.
+        let icons = Target::user(WINDOW_MANAGER, "StandardHideDesktopIcons", &who);
+        sys.run(&icons.write_cmd(&PValue::Bool(true))).unwrap();
+        defaults::relaunch(&sys, &who, "Dock").unwrap();
+        let desk = desk.lock().unwrap();
+        assert_eq!(
+            desk.read(WINDOW_MANAGER, "StandardHideDesktopIcons"),
+            Some(&PValue::Bool(true))
+        );
+        assert!(
+            !desk
+                .events
+                .iter()
+                .any(|e| e.ends_with("wrote back what it read at its start")),
+            "{:#?}",
+            desk.events
+        );
+        assert!(same_apps(
+            &sys,
+            desk.read(DOCK, "persistent-apps").unwrap(),
+            &dock_apps()
+        ));
+    }
+
+    /// A family is owed its relaunch from its first write: one whose write fails part way
+    /// has still made the writes before it, so its readers relaunch after them with the
+    /// pass's other families, its marker is cleared, and the relaunch's line names it.
+    /// The rest it did not write are written on the next pass. Negative control: owing the
+    /// family only after its last write leaves its marker pending and its item unnamed.
+    #[test]
+    fn a_family_whose_write_fails_part_way_is_relaunched_for_what_it_wrote() {
+        let who = user("alice", 501);
+        let mut partial = Desk::before();
+        partial.unwritable = Some((DOCK, "static-apps"));
+        let (sys, desk) = desktop_of(&who, partial);
+        let run = pass(
+            &sys,
+            selected_desktop_items(&who, &[Setting::Widgets, Setting::Dock]),
+            Mode::Apply,
+        );
+        assert_eq!(
+            outcomes(&run),
+            [
+                ("init.widgets@alice", Outcome::Changed),
+                ("init.dock@alice", Outcome::Failed),
+            ],
+            "{:?}",
+            run.rows
+        );
+        assert!(
+            run.rows[1]
+                .why
+                .as_deref()
+                .is_some_and(|why| why.contains("static-apps")),
+            "{:?}",
+            run.rows[1]
+        );
+        {
+            let desk = desk.lock().unwrap();
+            let wrote = desk
+                .events
+                .iter()
+                .position(|e| e == "write com.apple.dock persistent-apps")
+                .unwrap();
+            let killed = desk.events.iter().position(|e| e == "kill Dock").unwrap();
+            assert!(wrote < killed, "{:?}", desk.events);
+        }
+        assert!(!crate::init_activation::pending(&sys, &who, "dock").unwrap());
+        let relaunch = journaled(&sys)
+            .into_iter()
+            .find(|(id, _)| id == "init.relaunch@alice")
+            .unwrap();
+        assert!(relaunch.1.contains("init.dock@alice"), "{relaunch:?}");
     }
 }

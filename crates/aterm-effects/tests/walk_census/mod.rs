@@ -938,9 +938,8 @@ pub fn dump(snaps: &[Snap], from: usize, to: usize) -> String {
     s
 }
 
-/// The temporal reading: every text cell lit again in a different colour while
-/// the text up to it stayed the same on every frame between (the band's
-/// colours moving under unchanged text): `(text index, snap, t before, t after)`.
+/// Every text cell lit again in another colour while the text up to it stayed the same on every
+/// frame between: `(text index, snap, t before, t after)`.
 pub fn recolours(snaps: &[Snap]) -> Vec<(usize, usize, f32, f32)> {
     let n = snaps.iter().map(|s| s.pos.len()).max().unwrap_or(0);
     // Text index `i` stays under unchanged text only while every snap's first `i + 1` chars

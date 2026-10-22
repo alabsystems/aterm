@@ -60,7 +60,7 @@ fn the_deadline_is_none_when_idle_and_the_holds_freeze_under_a_handoff() {
         !app.sync_message_band_rows(Instant::now()),
         "and none will be, mid-handoff"
     );
-    // A LIVE row's staleness cap still wakes the loop mid-freeze.
+    // A live row's staleness cap still wakes the loop mid-freeze.
     let live = app.post_message(
         Message::new(tags::UPDATE, Severity::Info, "downloading").hold(Hold::Live {
             stale_after: std::time::Duration::from_secs(30),

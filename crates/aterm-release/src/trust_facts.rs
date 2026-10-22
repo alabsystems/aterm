@@ -48,14 +48,10 @@
 //! not determine — a passed variable read at all, or a value neither cargo, a
 //! build script nor a lane pin supplied.
 //!
-//! A record from another key is never read: the assembler computes the key of
-//! the commit it judges and opens that file, and a record whose own lines name
-//! another key is refused. A floors-only commit has the same key, so its
-//! verdict needs no new run; a change to any other file, or another prover, is
-//! another key. What a floors-only commit may do to the floors is the ratchet's
-//! up-only rule, held here against the floors of the commit the facts were
-//! measured on ([`floors_lowered`]): reused facts never judge a floor lowered,
-//! or re-labelled to another prover, that the rule would refuse.
+//! A record is read only under its own key: the assembler computes the key of the commit it
+//! judges, and a record whose lines name another key is refused. Reused facts are held to
+//! the ratchet's up-only rule against the floors of the commit they were measured on
+//! ([`floors_lowered`]).
 //!
 //! No floor excuses (no report-only path). A
 //! library below its floor is a finding or it is undecided — never a pass:
@@ -151,8 +147,7 @@ const KEY_SCHEMA: &str = "aterm-trust facts key 5";
 /// required by stored-facts verdicts.
 pub const LANE_WHOLE_TREE: &str = "whole-tree";
 
-/// Why nothing below reads a clock: a record is a function of its key, and
-/// the key has no time in it. The date a record carries is informational.
+/// The first nine characters of a sha.
 fn short(sha: &str) -> &str {
     sha.get(..9).unwrap_or(sha)
 }
@@ -172,7 +167,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// WHAT ONE CHECK MEASURED, read from its log
+// What one check measured, read from its log
 // ---------------------------------------------------------------------------
 
 /// A proof check its caller cancelled: ay's words when the
@@ -241,15 +236,15 @@ pub struct Measured {
     pub held: String,
     /// … and what the probe said of it.
     pub held_what: String,
-    /// THE BUDGET (the lane's): the per-crate wall budget, in seconds, at which
-    /// the lane ended this check (its `<log>.budget` mark), `?` for a mark that
-    /// names none; empty when the lane did not end it.
+    /// The per-crate wall budget, in seconds, at which the lane ended this check (its
+    /// `<log>.budget` mark), `?` for a mark that names none; empty when the lane did not
+    /// end it.
     pub wall_budget: String,
-    /// WHY THE CHECK DID NOT FINISH, as its own record says it, `; `-separated:
-    /// a targo-trust `transport:*` row other than `missing-json` (which is
-    /// [`Measured::transport`]), a compiler cargo saw end by a signal, the
-    /// check's own exit by one (128+N), or — for a check that reported a
-    /// Summary — no [`COVERAGE_COMPLETE`] line. Empty when it finished.
+    /// Why the check did not finish, in its own record's words, `; `-separated: a
+    /// targo-trust `transport:*` row other than `missing-json` (which is
+    /// [`Measured::transport`]), a compiler cargo saw end by a signal, the check's own exit
+    /// by one (128+N), or, for a check that reported a Summary, no [`COVERAGE_COMPLETE`]
+    /// line. Empty when it finished.
     pub ended: String,
     /// A PATH TARGO REFUSED (the module docs): each path the log names targo or
     /// trustd refusing to execute through ([`path_refusals`]), once, sorted.
@@ -604,9 +599,9 @@ fn path_refusals(line: &str) -> Vec<PathRefusal> {
 /// ([`COVERAGE_ACCOUNTED`]): just as whole, so it is read as this line is.
 pub const COVERAGE_COMPLETE: &str = "eligible function bodies verified (complete)";
 
-/// The start of the words a later targo-trust gives a complete coverage line
-/// whose crate had bodies excluded, not verified ([`COVERAGE_COMPLETE`]); the
-/// line ends `) (complete)`.
+/// The start of targo-trust's complete coverage line for a crate with bodies excluded, not
+/// verified: `Coverage: <n>/<n> eligible function bodies accounted for (<v> verified, <x>
+/// excluded: <tag>) (complete)`. The line ends `) (complete)`.
 pub const COVERAGE_ACCOUNTED: &str = "eligible function bodies accounted for (";
 
 /// targo's words when it will not start a check beside a trustd it cannot
@@ -614,7 +609,7 @@ pub const COVERAGE_ACCOUNTED: &str = "eligible function bodies accounted for (";
 pub const TRUSTD_REFUSED: &str =
     "could not establish the selected same-sysroot trustd memory authority";
 
-/// targo's words for a trustd crash epoch left DIRTY (the lane's `TRUSTD_DIRTY`).
+/// targo's words for a trustd crash epoch left DIRTY.
 pub const TRUSTD_DIRTY: &str = "crash epoch is not CLEAN";
 
 /// Every start index of `needle` in `hay`.
@@ -645,10 +640,8 @@ fn digits_start_before(s: &str, end: usize) -> usize {
     i
 }
 
-/// `sed -nE 's/.*Summary: ([0-9]+) proved.*/\1/p'` and
-/// `sed -nE 's/.*\(([0-9]+) total\).*/\1/p'` over one Summary line: the
-/// rightmost `Summary: <n> proved` and the rightmost `(<n> total)`. `None`
-/// for either that is absent or does not fit a count.
+/// The rightmost `Summary: <n> proved` and the rightmost `(<n> total)` on one Summary
+/// line; `None` for either that is absent or does not fit a count.
 #[must_use]
 pub fn parse_summary(line: &str) -> (Option<u64>, Option<u64>) {
     let proved = find_all(line, "Summary: ").into_iter().rev().find_map(|i| {
@@ -871,12 +864,10 @@ impl Measured {
         let (mut listed, mut named): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
         let mut ceiling_bytes: Option<u64> = None;
         let mut peak_gib: Option<f64> = None;
-        // What a check targo would not start said (the lane's
-        // `launch_refusal_cause`, in its order).
+        // Why targo would not start the check ([`Measured::launch`]).
         let (mut launch_refused, mut dirty, mut owned, mut unready) = (false, false, false, false);
-        // Whether it finished ("A CHECK THAT DID NOT FINISH"): targo-trust's
-        // transport rows by kind (the first message of each), cargo's first
-        // compiler-ended-by-a-signal line, and the last Coverage line.
+        // Whether it finished: targo-trust's transport rows by kind (the first message of
+        // each), cargo's first compiler-ended-by-a-signal line, and the last Coverage line.
         let mut cut: BTreeMap<String, String> = BTreeMap::new();
         let mut signalled: Option<(String, u32, String)> = None;
         let mut coverage: Option<String> = None;
@@ -917,10 +908,9 @@ impl Measured {
             }
             refused_paths.extend(path_refusals(line));
             if let Some(a) = line.find(ADMISSION) {
-                // `grep -o 'memory admission failed.*'`: from the first mention on.
+                // The text from the first mention on.
                 let said = line[a..].to_string();
-                // `\[UNKNOWN\].*memory admission failed`: a mention after the
-                // first `[UNKNOWN]`.
+                // A mention after the first `[UNKNOWN]` is a listed refusal.
                 let last = line.rfind(ADMISSION).unwrap_or(a);
                 if line
                     .find("[UNKNOWN]")
@@ -950,7 +940,7 @@ impl Measured {
                 m.ceiling = c;
             }
             if let Some(p) = census_figure(line, " peak ") {
-                // The largest peak, compared as the lane compares figures.
+                // The largest peak, compared in GiB.
                 if peak_gib.is_none_or(|was| gib_of(&p).is_some_and(|now| now > was)) {
                     peak_gib = gib_of(&p);
                     m.peak = p;
@@ -988,7 +978,7 @@ impl Measured {
             }
             .into();
         }
-        // A CHECK THAT DID NOT FINISH: what its own record says, in its words.
+        // Why the check did not finish, in its own record's words.
         let mut ended: Vec<String> = cut
             .iter()
             .map(|(kind, msg)| {
@@ -1118,7 +1108,7 @@ impl Measured {
 }
 
 // ---------------------------------------------------------------------------
-// MEMORY: WHAT A HOST CAN VERIFY (the lane's header, "MEMORY")
+// Memory: what a host can verify
 // ---------------------------------------------------------------------------
 //
 // `targo trust` gives each verified library a memory ceiling of one eighth of
@@ -1141,7 +1131,7 @@ pub const MEMORY: &str = "crates/aterm-release/trust/memory.tsv";
 /// The header of this host's memory observations, as the lane writes it.
 const HOST_OBS_HEADER: &str = "# trust lane host memory observations: <name@version> <held|cap-bound> <run ceiling GiB> <verifier peak GiB> <proved> <floor> <prover> <when>, one row per library whose last check here ran out of the verifier's memory ceiling. While its version, floor and prover stand, a cap-bound row is refused up front on this host and a held one is gated; --try-refused runs a refused one again. Local to this machine, never committed.";
 
-/// Four decimals, as the lane's `to_gib … 4` printed a figure it compared.
+/// Rounded to four decimals, the precision a log's figures are compared at.
 fn four(x: f64) -> f64 {
     format!("{x:.4}").parse().unwrap_or(x)
 }
@@ -1278,12 +1268,11 @@ impl Host {
     }
 }
 
-/// One row of the memory record, as a run read it: the ceiling the library's
-/// floor was set at; the RAM of the host its need was measured on and the
-/// verifier ceiling of the run that measured it; the verifier's need, that
-/// need's bound (`=` measured with room, `>` measured by a run that ran out, so
-/// more) and when. `-` each when the record has no row; a row that records no
-/// need has `-` for all four of its measurement's fields.
+/// One row of the memory record: the ceiling the library's floor was set at; the RAM of
+/// the host its need was measured on and the verifier ceiling of that run; the need, its
+/// bound (`=` measured with room, `>` by a run that ran out, so more) and when. Each is `-`
+/// when the record has no row; a row that records no need has `-` for its RAM, run
+/// ceiling, need and bound.
 ///
 /// The need is the host's. The census's peak is a resident size,
 /// and memory pressure lowers it (for example, aterm-cli peaked at 2.1 GiB
@@ -1295,11 +1284,11 @@ impl Host {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemRow {
     pub f: String,
-    /// The RAM, GiB, of the host the need was measured on — the machine's own,
-    /// never a faked figure: the memory pressure its resident peak reflects.
+    /// The RAM, GiB, of the host the need was measured on: the machine's real RAM, never a
+    /// faked figure, since its memory pressure is what the resident peak reflects.
     pub ram: String,
-    /// The verifier ceiling, GiB, of the run that measured the need: RAM / 8 as
-    /// targo read it (a faked RAM included, said in the row's `measured`).
+    /// The verifier ceiling, GiB, of the run that measured the need: RAM / 8 as targo read
+    /// it (a faked RAM included, said in the row's `measured`).
     pub at: String,
     pub need: String,
     pub bound: String,
@@ -1354,10 +1343,9 @@ fn same_ram(a: &str, b: &str) -> bool {
     matches!((gib(a), gib(b)), (Some(a), Some(b)) if (a - b).abs() < 0.05)
 }
 
-/// How a host reads a need measured on some host's RAM (MemRow, "THE NEED IS
-/// THE HOST'S"). Memory pressure only lowers the resident peak the census
-/// reads, so a need measured where MORE RAM was free is at least this host's,
-/// and one measured where LESS was free is at most it.
+/// How a host reads a need measured on some host's RAM ([`MemRow`]). Memory pressure only
+/// lowers the resident peak the census reads, so a need measured where more RAM was free
+/// is at least this host's, and one measured where less was free is at most it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reading {
     /// Measured on this host's RAM: the need itself.
@@ -1436,9 +1424,8 @@ fn fits(row: &MemRow, host: &Host, c: &str) -> bool {
         }
 }
 
-/// The fields of a tab-separated line as bash's `IFS=$'\t' read` gives them:
-/// runs of tabs are one separator (a tab is IFS whitespace), and the last of
-/// `n` names takes the rest of the line.
+/// The fields of a tab-separated line as bash's `IFS=$'\t' read` splits them: a run of
+/// tabs is one separator, and the last of `n` fields takes the rest of the line.
 fn tab_fields(line: &str, n: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut rest = line.trim_matches('\t');
@@ -1453,14 +1440,8 @@ fn tab_fields(line: &str, n: usize) -> Vec<String> {
     out
 }
 
-/// THE MEMORY RECORD, read and held to its shape: `<name> <floor ceiling>
-/// <host RAM> <run ceiling> <need> <bound> <measured>`. A figure that is not
-/// GiB or `-`, a bound that is not `=`, `>` or `-`, a need without its bound or
-/// its host RAM (or either without a need), a run ceiling with no need, two
-/// rows of a library measured on one RAM, a row with no need beside another,
-/// or two floor ceilings for one library is an error naming the row — a typo
-/// must not silently refuse or admit a library. Each library's rows, in the
-/// record's order.
+/// Parse the memory record (`<name> <floor ceiling> <host RAM> <run ceiling> <need>
+/// <bound> <measured>`) into each library's rows, in the record's order.
 ///
 /// # Errors
 /// The row that does not parse, in the lane's words.
@@ -1539,8 +1520,8 @@ pub fn parse_memory(
     Ok(out)
 }
 
-/// One row of what this host learned (the lane's host observations): a
-/// library's last check here that ran out of the verifier's ceiling.
+/// One row of this host's memory observations: a library's last check here that ran
+/// out of the verifier's ceiling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostObs {
     /// `name@version`.
@@ -1643,11 +1624,10 @@ pub struct Refusal {
     pub sure: Option<u64>,
 }
 
-/// REFUSE UP FRONT (the lane's `memory_refusal`): does this host refuse the
-/// library whose floor exists (`has_floor`), whose memory row — the one this
-/// host reads ([`row_for`]) — is `row` and whose observation here — under this
-/// floor and prover — is `obs`? With C this host's ceiling and F the floor's,
-/// the first rule that matches decides:
+/// Whether this host refuses up front the library whose floor exists (`has_floor`), whose
+/// memory row (the one this host reads, [`row_for`]) is `row` and whose observation here,
+/// under this floor and prover, is `obs`. With C this host's ceiling and F the floor's, the
+/// first rule that matches decides:
 ///   0. C unknown, or no floor (NO-FLOOR is the ratchet's finding): gate it;
 ///   1. F <= C, or a `held` observation here at a ceiling <= C: gate it;
 ///   2. the row says it FITS C ([`fits`]): gate it;
@@ -1656,12 +1636,10 @@ pub struct Refusal {
 ///      a need `=` above C, or a lower bound (`>`) at or above C: refuse;
 ///   5. anything else: gate it, and the rule after the run decides.
 ///
-/// A refusal names the RAM that verifies it, the least of: the floor's; the RAM
-/// whose ceiling its need was measured with room at; and a RAM whose ceiling is
-/// above the need, when that is no more than the RAM the need was measured on.
-/// Above that RAM, a ceiling above the need only MAY verify it: with less
-/// memory pressure the need may be larger (aterm-cli: 3.0 with room on 24 GiB,
-/// so 32 GiB verifies it and 25 may).
+/// A refusal names the least RAM that surely verifies it: the floor's; the RAM whose
+/// ceiling the need was measured with room at; or a RAM whose ceiling is above the need,
+/// when that is no more than the RAM the need was measured on. Above that RAM a ceiling
+/// above the need only may verify it: with less memory pressure the need may be larger.
 pub(crate) fn memory_refusal(
     host: &Host,
     name: &str,
@@ -1700,12 +1678,7 @@ pub(crate) fn memory_refusal(
     }
     let reading = Reading::of(row, host);
     if row.bound == "=" && (reading == Reading::Here || !gib_le(&row.need, &c)) {
-        // What verifies it: the floor's RAM; the RAM whose ceiling the need was
-        // measured with room at; or a RAM whose ceiling is above the need and
-        // which is no more than the RAM it was measured on (more memory
-        // pressure, so no larger a need) — the least of them. A RAM above the
-        // need but more than the one that measured it only may: there the need
-        // may be larger.
+        // `sure`: the least RAM that verifies it; `may`: one above the need, which only may.
         let room = gib(&row.at).map(ram_for);
         let above = gib(&row.need).map(ram_above);
         let under = above.filter(|r| gib_le(&r.to_string(), &row.ram));
@@ -1752,14 +1725,12 @@ pub(crate) fn memory_refusal(
     None
 }
 
-/// THE MEMORY CENSUS of one check (the lane's `census_of`): its peak and
-/// ceiling (GiB, four decimals, and as printed), bodies skipped at the ceiling
-/// and budget rows, and whether it surely ran out (EXHAUSTED: bodies skipped,
-/// or budget rows with the peak ABOVE the ceiling, compared unrounded) or sat
-/// at the ceiling (ATCEIL: budget rows with the two printed equal, which never
-/// excuses a drop and never lets a need be called measured with room). Budget
-/// rows alone prove nothing about memory: that budget also trips on time and
-/// steps.
+/// The memory census of one check: its peak and ceiling as printed (GiB, one decimal),
+/// bodies skipped at the ceiling, budget rows, and whether it surely ran out (`exhausted`:
+/// bodies skipped, or budget rows with the peak above the ceiling at four decimals) or sat
+/// at the ceiling (`atceil`: budget rows with the two equal, which never excuses a drop
+/// and never lets a need be called measured with room). Budget rows alone prove nothing
+/// about memory: that budget also trips on time and steps.
 #[derive(Clone, Debug, Default)]
 struct Census {
     peak: Option<String>,
@@ -1795,16 +1766,14 @@ impl Census {
     }
 }
 
-/// KEEP THE MEMORY RECORD CURRENT (the lane's `mem_learn`, under
-/// `--update-ratchet`): what a run on `host` learned, written to the row of its
-/// own RAM — `row`, the one it read, when that is measured there, else a new
-/// one; a row measured on another RAM is read, never rewritten. A run with room
-/// writes its census peak, `=`; a run that ran out, or whose peak sat at its
-/// ceiling with budget rows, writes `>` the larger of its peak and its ceiling —
-/// but only over a row that knows less. Either names the run's ceiling. The
-/// floor ceiling `f` is the caller's, and every row of the library takes it
-/// ([`memory_rewritten`]); a host whose RAM is unknown files no need. `None`
-/// when nothing would change.
+/// What a run on `host` learned, for `--update-ratchet` to write to the row of its own
+/// RAM: `row` (the one it read) when measured there, else a new one; a row measured on
+/// another RAM is read, never rewritten. A run with room writes its census peak, `=`; a run
+/// that ran out, or whose peak sat at its ceiling with budget rows, writes `>` the larger of
+/// its peak and ceiling, but only over a row that knows less. Either names the run's
+/// ceiling. Every row of the library takes the caller's floor ceiling `f`
+/// ([`memory_rewritten`]); a host whose RAM is unknown files no need. `None` when nothing
+/// would change.
 fn mem_learn(row: &MemRow, f: &str, c: &Census, today: &str, host: &Host) -> Option<MemRow> {
     let ram = host.ram_class().filter(|_| c.peak.is_some());
     let base = match &ram {
@@ -1903,7 +1872,7 @@ pub fn memory_rewritten(text: &str, rows: &[(String, MemRow)]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// THE FACTS OF ONE RUN
+// The facts of one run
 // ---------------------------------------------------------------------------
 
 /// What the lane decided about one selected library before anything ran —
@@ -1926,9 +1895,8 @@ pub enum Decision {
     Queued(String),
     /// Another selected package shares its name (see [`Facts::ambiguous`]).
     Ambiguous,
-    /// This host could not reproduce its floor, so it was never run (MEMORY):
-    /// what the refusal read of this host's own observation of it, when one
-    /// decided.
+    /// Refused up front: this host cannot reproduce its floor's memory. Holds what the
+    /// refusal read of this host's own observation of it, when one decided.
     Memory(Option<Seen>),
 }
 
@@ -1961,10 +1929,9 @@ impl Decision {
 pub struct Crate {
     pub name: String,
     pub decision: Decision,
-    /// Its row of the memory record as the run read it — the one this host
-    /// reads ([`row_for`]), `-` each when the record has none: what decided a
-    /// memory refusal, and what the judge holds a drop that ran out of memory
-    /// to.
+    /// Its row of the memory record as the run read it ([`row_for`]; `-` each when the
+    /// record has none): what decided a memory refusal, and what the judge holds a drop
+    /// that ran out of memory to.
     pub memory: MemRow,
 }
 
@@ -1980,8 +1947,8 @@ impl Crate {
     }
 }
 
-/// Where a FILED record came from: its key and each input the key covers,
-/// and what the run was on. Absent for a run that filed nothing.
+/// Where a filed record came from: its key and each input the key covers, and what the
+/// run was on. Absent for a run that filed nothing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Provenance {
     pub key: String,
@@ -1999,7 +1966,7 @@ pub struct Provenance {
     pub load: String,
     pub jobs: String,
     pub date: String,
-    /// Each later run that measured some of its libraries AGAIN on the same key
+    /// Each later run that measured some of its libraries again on the same key
     /// ([`remeasured`]): `<date> <commit> <library>…`, oldest first.
     pub remeasured: Vec<String>,
 }
@@ -2025,7 +1992,7 @@ pub struct Facts {
     /// Two selected packages sharing a name: the name and both specs.
     pub ambiguous: Vec<(String, String, String)>,
     pub crates: Vec<Crate>,
-    /// The machine the run was on (MEMORY).
+    /// The machine the run was on.
     pub host: Host,
     /// When the run measured, `YYYY-MM-DDTHH:MM:SSZ` — what the memory record
     /// and this host's observations say a figure was measured on.
@@ -2226,7 +2193,7 @@ impl Facts {
 }
 
 // ---------------------------------------------------------------------------
-// THE JUDGE: facts + a ratchet -> a verdict
+// The judge: facts and a ratchet make a verdict
 // ---------------------------------------------------------------------------
 
 /// One ratchet row, as the lane reads it: `<crate>\t<proved>\t<total>\t<prover>[\t<why>]`.
@@ -2237,8 +2204,7 @@ struct Floor {
     why: String,
 }
 
-/// The first row naming `name` (`awk -F'\t' '$1==c{…; exit}'`); `None` when
-/// there is no ratchet or no row.
+/// The first row naming `name`; `None` when there is no ratchet or no row.
 fn floor_of(ratchet: Option<&str>, name: &str) -> Option<Floor> {
     let row = ratchet?
         .lines()
@@ -2276,10 +2242,9 @@ pub struct Verdict {
     /// The rows, totals, notes and the verdict sentence, as the lane prints
     /// them (a blank line first).
     pub report: String,
-    /// The last line the lane prints after its FACTS line: `VERDICT: FAIL — …`
-    /// (the failed rows),
-    /// `VERDICT: COULD NOT RUN — …`, `VERDICT: NARROWED BY MEMORY — …`, or
-    /// empty for a pass.
+    /// The last line the lane prints after its FACTS line: `VERDICT: FAIL — …` (the failed
+    /// rows), `VERDICT: COULD NOT RUN — …`, `VERDICT: NARROWED BY MEMORY — …`, or empty for
+    /// a pass.
     pub tail: String,
     /// `PASS`, `FAIL`, `COULD-NOT-RUN` or `NARROWED`.
     pub word: &'static str,
@@ -2295,9 +2260,8 @@ pub struct Verdict {
     /// starting or refused work their shortfall is within, or lapsed wall-clock
     /// budgets could cover their shortfall: what `--remeasure` runs again.
     pub unverified: Vec<String>,
-    /// NARROWED BY MEMORY: each library this host could not verify — refused up
-    /// front or CAP-BOUND — with its need (`~N` or `>N`) and the RAM that
-    /// surely verifies it, when its floor records a ceiling.
+    /// Each library this host could not verify for memory (refused up front or CAP-BOUND),
+    /// with its need (`~N` or `>N`) and the RAM that surely verifies it, when known.
     pub memory: Vec<(String, String, Option<u64>)>,
     /// The machine the run was on, said (`<RAM> GiB RAM, verifier ceiling <C>
     /// GiB`).
@@ -2312,16 +2276,12 @@ pub struct Verdict {
     pub host_obs: Vec<(String, Option<[String; 5]>)>,
 }
 
-/// What to do while the trustd a run met holds the socket (the lane's
-/// `trustd_remedy`): `verdict` is the probe's word, or `dirty`.
-/// THE CLOCK'S CREDIT for one library's shortfall: its `timed_out=` lapses
-/// always, and the proof checks ay's caller cancelled ([`CHECK_CANCELLED`])
-/// only in a filed record's FIRST measurement of it. Those lines come in passing
-/// runs too, so counting them every time would leave a real drop they could
-/// cover undecided on every run; credited once, the `--remeasure` that
-/// completes the record decides it — met, or a regression the lapses it stamps
-/// cannot cover. A run that files nothing (a `-p` run) has no re-measure to
-/// resolve it, so it is judged on `timed_out=` alone.
+/// The clock's credit for one library's shortfall: its `timed_out=` lapses always, and its
+/// cancelled proof checks ([`CHECK_CANCELLED`]) only in a filed record's first measurement
+/// of it. Those lines come in passing runs too, so crediting them every time would leave a
+/// real drop undecided on every run; credited once, the `--remeasure` that completes the
+/// record decides it. A run that files nothing (a `-p` run) has no re-measure, so it is
+/// judged on `timed_out=` alone.
 fn clock_credit(facts: &Facts, name: &str, m: &Measured) -> u64 {
     let first = facts.provenance.as_ref().is_some_and(|p| {
         !p.remeasured
@@ -2331,11 +2291,9 @@ fn clock_credit(facts: &Facts, name: &str, m: &Measured) -> u64 {
     m.lapsed.saturating_add(if first { m.cancelled } else { 0 })
 }
 
-/// How to measure AGAIN the libraries a run left undecided, in the words of a
-/// lane that can: a run whose facts were filed (they carry a provenance) is
-/// completed on its own key by `--remeasure`; a narrowed run, or one that could
-/// not file, has no record for `--remeasure` to complete, so its own scope runs
-/// again.
+/// How to measure again the libraries a run left undecided: a filed run (its facts carry a
+/// provenance) is completed on its own key by `--remeasure`; a narrowed run, or one that
+/// could not file, has no record to complete, so its own scope runs again.
 fn measure_again(facts: &Facts, names: &[&str]) -> String {
     if facts.provenance.is_some() {
         return "targo --unverified ship trust run --remeasure".into();
@@ -2388,10 +2346,9 @@ pub struct Update<'a> {
     /// with its floor unchanged, and a re-base of another prover's floor that
     /// this run meets. Never a lowering.
     pub on: bool,
-    /// The reason a floor ANOTHER prover recorded is lowered onto this one —
-    /// written in the row's fifth column, where the up-only rule reads it
-    /// (`ship trust judge --update-ratchet --reason`). Without it no floor goes
-    /// down.
+    /// The reason a floor another prover recorded is lowered onto this one, written in the
+    /// row's fifth column where the up-only rule reads it (`ship trust judge
+    /// --update-ratchet --reason`). Without it no floor goes down.
     pub reason: Option<&'a str>,
 }
 
@@ -2411,10 +2368,10 @@ impl Update<'_> {
 /// Judge a run's facts against a ratchet; a
 /// floor that is not a count fails as `FLOOR-UNPARSED`.
 ///
-/// `ratchet` is the floors file's text (`None` when there is none);
-/// `ratchet_name` and `memory_name` are how the notes name the floors file and
-/// the memory record. Each library is judged against the memory row the run
-/// used ([`Crate::memory`]). `update` is `--update-ratchet` ([`Update`]).
+/// `ratchet` is the floors file's text (`None` when there is none); `ratchet_name` and
+/// `memory_name` are how the notes name the floors file and the memory record. Each library
+/// is judged against the memory row the run used ([`Crate::memory`]). `update` is
+/// `--update-ratchet` ([`Update`]).
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn judge(
@@ -2499,8 +2456,8 @@ pub fn judge(
     // Checks that did not finish (OVER-BUDGET, NOT-VERIFIED(incomplete)): each
     // ran and decided nothing, so none is counted as gated.
     let mut unfinished_n = 0usize;
-    // UNDECIDED, by what kept it so: trustd (a check it kept from starting, or
-    // work it refused within the shortfall) or the wall clock.
+    // Undecided, by what kept it so: trustd (a check it kept from starting, or work it
+    // refused within the shortfall) or the wall clock.
     let (mut by_trustd, mut by_clock) = (Vec::<String>::new(), Vec::<String>::new());
     let (mut trustd_dirty, mut trustd_block) = (false, None::<(String, String)>);
     let mut ratchet_now: Option<String> = ratchet.map(str::to_string);
@@ -2560,12 +2517,10 @@ pub fn judge(
             fail = true;
             continue;
         }
-        // A CHECK TARGO WOULD NOT START compiled nothing: the machine's trustd
-        // kept it from starting, which decides nothing about the crate —
-        // NOT-VERIFIED(trustd), never GATE-BROKE. The verdict names what kept
-        // it: a DIRTY crash epoch, the trustd that held the socket, or — when
-        // that was this build's, answering the lane in time — this build's
-        // trustd answering targo too late for it.
+        // A check targo would not start compiled nothing and decides nothing about the
+        // crate: NOT-VERIFIED(trustd), never GATE-BROKE. The verdict names what kept it: a
+        // DIRTY crash epoch, the trustd that held the socket, or this build's trustd
+        // answering targo too late.
         if !m.launch.is_empty() {
             if m.launch == "dirty" {
                 trustd_dirty = true;
@@ -2609,7 +2564,7 @@ pub fn judge(
             ));
             continue;
         }
-        // VERIFICATION THAT DID NOT RUN is not a verdict about the crate.
+        // Verification that did not run is no verdict about the crate.
         if m.transport {
             let s = format!("NOT-VERIFIED(rc={})", m.rc);
             failed.push(format!("{name} {s}"));
@@ -2617,10 +2572,8 @@ pub fn judge(
             fail = true;
             continue;
         }
-        // NOR IS ONE THAT DID NOT FINISH ("A CHECK THAT DID NOT FINISH", the
-        // module docs), whatever its Summary counts: never scored, never held to
-        // a floor or written as one, in neither total, and it fails — a
-        // verification that broke, like GATE-BROKE.
+        // Nor is a check that did not finish, whatever its Summary counts: never scored,
+        // never held to a floor or written as one, and it fails like GATE-BROKE.
         if !m.ended.is_empty() {
             let counted = match parse_summary(&m.summary) {
                 (Some(p), Some(t)) => {
@@ -2687,12 +2640,11 @@ pub fn judge(
         let lapsed = clock_credit(facts, name, m);
         let mem = &c.memory;
         let cen = Census::of(m);
-        // CAP-BOUND (MEMORY): a drop under the floor's own prover that the lapses
-        // do not cover, from a run that ran out of its ceiling, when the floor was
-        // set at a larger ceiling than this run's — unless the memory row says the
-        // library FITS this run's ceiling on this host ([`fits`]): then it needed
-        // more than its row says, and the drop is the code's. Never a pass: the
-        // run is NARROWED, which no cut accepts.
+        // CAP-BOUND: a drop under the floor's own prover that the lapses do not cover, from
+        // a run that ran out of its ceiling, when the floor was set at a larger ceiling than
+        // this run's, unless the memory row says the library fits this run's ceiling here
+        // ([`fits`]), when the drop is the code's. Never a pass: the run is NARROWED, which
+        // no cut accepts.
         let capbound = floor.is_some_and(|f| proved.saturating_add(lapsed) < f)
             && own_floor
             && cen.exhausted
@@ -2701,10 +2653,10 @@ pub fn judge(
                 .ceil
                 .as_deref()
                 .is_some_and(|x| !gib_le(&mem.f, x) && !fits(mem, &host, x));
-        // AN OBLIGATION THE VERIFIER NEVER DISPATCHED (trustd refused it): each
-        // refusal takes at most one proof away. A drop they, with the lapses,
-        // could cover decided nothing; a first floor is not recorded from such a
-        // run; a larger drop is scored, whoever recorded the floor.
+        // An obligation trustd refused was never dispatched, and takes at most one proof
+        // away. A drop the refusals and lapses could cover decides nothing, and no first
+        // floor is recorded from such a run; a larger drop is scored, whoever recorded the
+        // floor.
         if m.refused > 0 {
             let (refused, why) = (m.refused, &m.refused_why);
             match floor {
@@ -2738,10 +2690,9 @@ pub fn judge(
                 }
             }
         }
-        // CAP-BOUND: the drop is this host's ceiling, not the code. In neither
-        // total and no failure, and no pass: NARROWED. No floor is written or
-        // lowered, `--update-ratchet` included (which records only the need it
-        // learned); remembered, so the next run here refuses it up front.
+        // CAP-BOUND: the drop is this host's ceiling, not the code. In neither total, no
+        // failure and no pass: NARROWED. No floor is written or lowered (`--update-ratchet`
+        // records only the need it learned), and the next run here refuses it up front.
         if let (true, Some(f), Some(x)) = (capbound, floor, cen.ceil.as_deref()) {
             rows.push([name.into(), format!("CAP-BOUND(<{f})"), dash(), dash()]);
             capbound_n += 1;
@@ -2849,10 +2800,8 @@ pub fn judge(
             Some(f) if proved < f => {
                 status = format!("RATCHET-REGRESSION(<{f})");
                 bad = true;
-                // ANOTHER PROVER SET THE FLOOR, and it is held (no floor excuses).
-                // A new prover meets the floors it inherits; when it
-                // proves less, the row goes down onto it only with a reason in its
-                // fifth column, which the up-only rule admits.
+                // Another prover's floor is held: the row goes down onto this prover only
+                // with a reason in its fifth column.
                 if !own_floor {
                     notes.push(format!(
                         "DRIVER CHANGED: {name}: its floor of {f} was recorded under {floor_driver}; this run's prover is {driver_row}, and proved {proved}: fix what it no longer proves, or lower the row onto it with a reason (`targo --unverified ship trust judge --update-ratchet --reason '<why>'`)"
@@ -2935,7 +2884,7 @@ pub fn judge(
             }
             Some(_) => {}
         }
-        // A FLOOR LOWERED BY HAND IS HELD TO ITS TOTAL.
+        // A floor lowered by hand is held to its total.
         if !floor_why.is_empty() && !floor_total.is_empty() && floor_driver == driver_row {
             match floor_total.parse::<u64>() {
                 Ok(t) if all > t => {
@@ -3099,7 +3048,7 @@ pub fn judge(
         facts.driver_id.as_str()
     };
     out.push_str(&format!("DRIVER: {} ({id})\n", facts.driver));
-    // THE HOST'S VERIFIER CEILING (MEMORY): what it refused up front by.
+    // The host's verifier ceiling, by which it refused up front.
     match host.ceiling() {
         Some(c) => out.push_str(&format!(
             "HOST: {} GiB RAM, verifier ceiling {c} GiB per library (targo trust: RAM / 8)\n",
@@ -3107,8 +3056,8 @@ pub fn judge(
         )),
         None => out.push_str("HOST: memory unreadable, nothing refused up front\n"),
     }
-    // WHETHER TRUSTD WAS HELD: a run that gated a crate with no grant held ran
-    // with trustd free to go idle under it.
+    // Whether trustd was held: a run that gated a crate with no grant held ran with
+    // trustd free to go idle under it.
     if gated > 0 {
         match facts.grants.as_str() {
             "1" => out.push_str(&format!("TRUSTD: held by this run's keeper ({sock})\n")),
@@ -3228,9 +3177,9 @@ pub fn judge(
             format!("VERDICT: COULD NOT RUN — {}", said.join("; and ")),
         )
     } else if memory_n > 0 {
-        // NARROWED BY MEMORY: nothing failed and nothing was left undecided, but
-        // this host could not verify every library it was asked about. Not a
-        // pass about those libraries, and not a finding about the code.
+        // Narrowed by memory: nothing failed or was left undecided, but this host could
+        // not verify every library it was asked about. No pass about those libraries, and
+        // no finding about the code.
         let ram_all = match (mem_ram, mem_ram_unknown) {
             (None, _) if memory_n == 1 => {
                 "no RAM is known to verify it (its floor records no ceiling)".to_string()
@@ -3302,33 +3251,25 @@ pub fn judge(
 }
 
 // ---------------------------------------------------------------------------
-// THE UP-ONLY FLOOR, for facts reused on another commit
+// The up-only floor, for facts reused on another commit
 // ---------------------------------------------------------------------------
 
-/// THE UP-ONLY FLOOR ON REUSE. Facts measured on commit A
-/// judge commit B when B differs from A only in [`RATCHET`]
-/// — so the floors are the ONE input that differs, and B's floors are held
-/// here to the ratchet's up-only rule: every row of `measured` (A's floors) whose
-/// floor `judged` (B's) lowers — or whose prover column it rewrites — named. `driver` is the
-/// `--version` line of the prover that MEASURED the facts; `gated(name)` says
-/// the facts verified that library.
+/// The up-only floor on reuse. Facts measured on commit A judge commit B when B differs
+/// from A only in [`RATCHET`], so B's floors are held here to the ratchet's up-only rule:
+/// every row of `measured` (A's floors) whose floor `judged` (B's) lowers, or whose prover
+/// column it rewrites, is named. `driver` is the `--version` line of the prover that
+/// measured the facts; `gated(name)` says the facts verified that library.
 ///
-/// A floor goes DOWN in exactly two ways, each saying WHY in the row's fifth
-/// column (a reason the measured commit's row did not already give): a RE-BASE
-/// onto `driver`, the prover the facts were measured with, of a floor another
-/// prover recorded (what `ship trust judge --update-ratchet --reason` writes —
-/// a new prover meets the floors it inherits, or says why it does not); or a
-/// hand edit under the same prover whose proved count fell by no more than its
-/// total. A re-base that does not lower is free. A row's prover column changes
-/// only onto `driver`: the facts measured that prover and no other, and the
-/// judge holds some checks (CAP-BOUND, the hand-lowered total) to a floor's own
-/// prover alone. For the same reason a floor that APPEARS after the measured
-/// commit for a library the facts verify names `driver`: a ratchet edit may add
-/// a new row under any prover (a branch recorded before a seal changed),
-/// but here the facts' prover is known exactly. A row removed while the facts
-/// still verify its library lowers it to nothing. A floor or total that is not
-/// a count is named too. With no `driver` (the facts' prover gave no
-/// `--version` line) no re-base, re-label or new row is admitted.
+/// A floor goes down in exactly two ways, each with a reason in the row's fifth column
+/// that A's row did not already give: a re-base onto `driver` of a floor another prover
+/// recorded (what `ship trust judge --update-ratchet --reason` writes), or a hand edit
+/// under the same prover whose proved count fell by no more than its total. A re-base that
+/// does not lower is free. A prover column changes only onto `driver`, since the facts
+/// measured that prover alone and the judge holds some checks (CAP-BOUND, the hand-lowered
+/// total) to a floor's own prover; for the same reason a floor added after A for a library
+/// the facts verify must name `driver`. A row removed while the facts still verify its
+/// library lowers it to nothing. A floor or total that is not a count is named too. With
+/// no `driver` no re-base, re-label or new row is admitted.
 #[must_use]
 pub fn floors_lowered(
     measured: &str,
@@ -3479,12 +3420,10 @@ pub fn tree_sans_floors(git: &dyn GitRunner, rev: &str) -> Result<String> {
     Ok(hex(&h.finalize()))
 }
 
-/// THE PROVER, by content: atpkg's `tree_root` — a SHA-256 over every file's
-/// path, mode and content — of the toolchain directory whose `bin/` holds the
-/// driver. For a store build it is the digest the signed index names; for any
-/// other toolchain it is the same fold over what is on disk. A directory
-/// without `targo` AND `trustc` in its `bin/` is no toolchain the lane or the
-/// cut runs, and is not identified.
+/// The prover, by content: atpkg's `tree_root` (a SHA-256 over every file's path, mode and
+/// content) of the toolchain directory whose `bin/` is `bin`, with that directory. For a
+/// store build it is the digest the signed index names. A `bin/` without both `targo` and
+/// `trustc` is no toolchain the lane or the cut runs, and is not identified.
 ///
 /// # Errors
 /// Why the directory names no prover: no `trustc`/`targo` beside each other,
@@ -3517,7 +3456,7 @@ pub fn facts_key(tree_sans_floors: &str, prover: &str, lane: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// THE LANE'S END: [`conclude`]
+// The lane's end: [`conclude`]
 // ---------------------------------------------------------------------------
 
 /// What a lane run wrote in its log directory (`.plan`, read by [`conclude`]): the
@@ -3530,8 +3469,7 @@ pub struct Plan {
     pub specs: BTreeMap<String, String>,
     pub logdir: PathBuf,
     pub ratchet: PathBuf,
-    /// The memory record the run read (MEMORY), which `--update-ratchet` keeps
-    /// current.
+    /// The memory record the run read, which `--update-ratchet` keeps current.
     pub memory: PathBuf,
     /// This host's memory observations, `None` outside a git checkout.
     pub host_obs: Option<PathBuf>,
@@ -3571,13 +3509,12 @@ pub struct FilePlan {
     pub date: String,
 }
 
-/// THE LANE'S ENVIRONMENT, as the lane declared it in its plan: every variable
-/// its compiles run with. `env -i` and these, nothing else (the script's "THE
-/// LANE'S ENVIRONMENT").
+/// The lane's environment as its plan declares it: every variable its compiles run with,
+/// on a cleared environment ([`crate::trust_lane::lane_env`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaneEnv {
-    /// A variable the lane sets to a constant it holds (`lane-pin NAME=VALUE`):
-    /// the value is the script's, and the script is in the tree the key covers.
+    /// A variable the lane sets to a constant it holds (`lane-pin NAME=VALUE`): the
+    /// value is the lane's, and the lane is in the tree the key covers.
     pub pins: BTreeMap<String, String>,
     /// A variable the lane passes from the host (`lane-passed NAME`: `HOME`,
     /// `TMPDIR`, the slot's target directory …). Its value is no input the key

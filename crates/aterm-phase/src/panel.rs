@@ -1,22 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claude Code's SETTINGS PANEL — the dialog `/usage`, `/status`, `/config`
-//! and `/stats` open, one container with the tabs `Status`, `Config`,
-//! `Usage`, `Stats` — as pure functions over a screen's rows: whether the
-//! panel is what the screen shows ([`settings_panel`]), and what a row under
-//! its header says of the Usage tab ([`usage_tab_mark`],
-//! [`usage_unsettled`], [`panel_tail`]).
+//! Claude Code's Settings panel — the dialog `/usage`, `/status`, `/config` and `/stats` open,
+//! with the tabs `Status`, `Config`, `Usage`, `Stats`: whether the panel is what the screen
+//! shows ([`settings_panel`]), and what a row under its header says of the Usage tab
+//! ([`usage_tab_mark`], [`usage_unsettled`], [`panel_tail`]).
 //!
-//! It is here for the accounts probe (`docs/SPEC-claude-accounts-probe-
-//! 2026-10-01.md`, P9, P10, P13): the supervisor types `/usage`, reads the
-//! panel only once it is SETTLED, and closes it with an Escape fenced by the
-//! panel's own header row ([`SettingsPanel::header_guard`]). The settled
-//! rule itself is `aterm_agent::harness::usage::usage_panel_read`, composed
-//! from the predicates here; the words are the vendor's, so they live in
-//! this crate.
+//! The accounts probe (`docs/SPEC-claude-accounts-probe-2026-10-01.md`) types `/usage`, reads
+//! the panel only once it is settled (`aterm_agent::harness::usage::usage_panel_read`, built
+//! from these predicates), and closes it with an Escape fenced by the header row
+//! ([`SettingsPanel::header_guard`]).
 //!
-//! WHAT IS MEASURED AND WHAT IS READ.
+//! Measured on Claude Code 2.1.287 (`prompt::fixtures::USAGE_*`):
 //!
 //! * MEASURED on Claude Code 2.1.287, 2026-10-01, by the probe's live check
 //!   (the spec's §6: `/usage` typed at an idle composer of a private
@@ -86,31 +81,22 @@ use crate::anchors::{anchor, guard_regex};
 use crate::phase::{has_composer_frame, is_rule};
 use crate::prompt::is_panel_rule;
 
-/// The header row's own words, in the order the vendor draws them: the
-/// container's title, then the tabs the reader asks for. `Stats` is the
-/// fourth tab (MEASURED) and is not asked for: the three before it place the
-/// row, and a tab added after them changes nothing here.
+/// The header row's words in drawing order: the title, then the tabs the reader asks for.
+/// `Stats`, the fourth tab, is not asked for: the three before it place the row.
 ///
-/// NOT ROWS OF [`crate::anchors::ANCHORS`], on purpose: a one-word anchor is
-/// a word aterm's own Settings surface spells in half a dozen files, so it
-/// would name aterm's UI as much as the vendor's. Nothing
-/// outside this module needs the words — a caller that guards on the header
-/// row asks [`SettingsPanel::header_guard`].
+/// Not [`crate::anchors::ANCHORS`] rows, on purpose: aterm's own Settings surface spells these
+/// words in many files, so a one-word anchor would name aterm's UI as much as the vendor's. A
+/// caller that guards on the header asks [`SettingsPanel::header_guard`].
 const TITLE: &str = "Settings";
 const TABS: [&str; 3] = ["Status", "Config", "Usage"];
 
-/// The Usage tab's own rows, by their first words (MEASURED on 2.1.278 and
-/// 2.1.287: the `Session` block's first figure and the first window's title;
-/// the third mark is the loading line, [`anchor`] `usage.loading`, READ in
-/// 2.1.287).
-/// One of them under the header is what says the tab drawn is Usage and not
-/// Status, Config or Stats.
+/// First words of rows only the Usage tab draws: the `Session` block's first figure and the
+/// first window's title (measured on 2.1.278 and 2.1.287). One under the header tells the Usage
+/// tab from Status, Config and Stats.
 const USAGE_MARKS: [&str; 2] = ["Total cost:", "Current session"];
 
-/// What a failed load draws before its reason (READ in 2.1.287:
-/// `children:["Error: ",L]`), and the words every rate-limited reading
-/// carries (`Usage endpoint is rate limited. …`, `… (rate limited — try
-/// again in a moment)`).
+/// What a failed load draws before its reason, and the words every rate-limited reading
+/// carries (read in 2.1.287).
 const ERROR_HEAD: &str = "Error:";
 const RATE_LIMITED: &str = "rate limited";
 
@@ -129,11 +115,10 @@ const UNSETTLED: [&str; 6] = [
 /// Which of Claude Code's two renderers drew the panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelRenderer {
-    /// The fullscreen renderer (the alternate screen): the panel under a
-    /// `▔` rule, three columns in. MEASURED.
+    /// The fullscreen renderer (the alternate screen): under a `▔` rule, three columns in.
     Fullscreen,
-    /// The inline renderer (the main screen, `CLAUDE_CODE_NO_FLICKER=0`):
-    /// the panel under a `─` rule, two columns in. MEASURED.
+    /// The inline renderer (the main screen, `CLAUDE_CODE_NO_FLICKER=0`): under a `─` rule, two
+    /// columns in.
     Inline,
 }
 
@@ -160,15 +145,11 @@ pub struct SettingsPanel {
 }
 
 impl SettingsPanel {
-    /// The `key if=` / `await gone` guard for the header row AS OBSERVED on
-    /// `rows`: `^`, the row from its first column through the `Usage` tab's
-    /// name, every space spelled `.` ([`guard_regex`]) — so the guard is one
-    /// wire token, anchored at column zero, and matches the row whichever
-    /// spacing the vendor drew between the tabs. A copy of the row quoted
-    /// further in (a tool's output under `⎿`, the worker's own words) is at
-    /// another column and does not match. Empty where `rows` does not hold
-    /// the header this value names: the caller then has no guard and presses
-    /// nothing.
+    /// The `key if=` / `await gone` guard for the header row as observed on `rows`: `^`, then the
+    /// row from column zero through the `Usage` tab's name with every space spelled `.`
+    /// ([`guard_regex`]) — one wire token that matches whatever tab spacing was drawn, and not a
+    /// copy of the row quoted at another column. Empty where `rows` does not hold this header: the
+    /// caller then presses nothing.
     #[must_use]
     pub fn header_guard(&self, rows: &[String]) -> String {
         let Some(row) = rows.get(self.header) else {
@@ -214,29 +195,17 @@ fn column_of(row: &str) -> usize {
     row.len() - row.trim_start_matches(' ').len()
 }
 
-/// The Settings panel, where it is what the screen shows. `Some` only when
-/// ALL hold:
+/// The Settings panel, where it is what the screen shows. `Some` only when all hold:
 ///
-/// * no composer frame is on the rows (the panel replaces the composer, in
-///   both renderers);
-/// * a full-width rule — `▔` for the fullscreen renderer, `─` for the
-///   inline one — whose next non-blank row is the header, at that
-///   renderer's column: `Settings` as a word, then `Status`, `Config` and
-///   `Usage` named in that order;
-/// * every non-blank row below the header is at the header's column or
-///   further in.
+/// * no composer frame is on the rows (the panel replaces the composer in both renderers);
+/// * a full-width rule — `▔` fullscreen, `─` inline — whose next non-blank row is the header
+///   at that renderer's column: `Settings` as a word, then `Status`, `Config` and `Usage` in
+///   that order;
+/// * every non-blank row below the header is at its column or further in.
 ///
-/// With more than one such rule, the LOWEST is the panel's (the live zone is
-/// at the bottom; a transcript above it may quote anything).
-///
-/// What this refuses is the point. A header with no rule over it (a quoted
-/// panel, the copied text form); the header one column off (another
-/// renderer's, or a quote); the same rows with the composer drawn (the
-/// worker pasted a panel into its answer, and the session is at its
-/// prompt); anything under the header that starts further left (a shell
-/// line, a transcript row: the panel is not the last thing on the screen).
-/// A caller that closes "the panel" presses Escape, which elsewhere stops a
-/// turn — so no reading here is a guess.
+/// With several such rules the lowest is the panel's (a transcript above may quote anything).
+/// The caller closes the panel with Escape, which elsewhere stops a turn, so a quoted panel, a
+/// header off its column, a drawn composer or a row further left under it all read `None`.
 #[must_use]
 pub fn settings_panel(rows: &[String]) -> Option<SettingsPanel> {
     if has_composer_frame(rows) {
@@ -264,21 +233,17 @@ pub fn settings_panel(rows: &[String]) -> Option<SettingsPanel> {
     })
 }
 
-/// Whether `row`, a row under the Settings header, is one only the USAGE tab
-/// draws: the session block's `Total cost:`, a `Current session` window
-/// title, or the loading line. One such row is what tells the tab drawn from
-/// Status, Config and Stats.
+/// Whether `row`, a row under the Settings header, is one only the Usage tab draws: `Total
+/// cost:`, a `Current session` window title, or the loading line.
 #[must_use]
 pub fn usage_tab_mark(row: &str) -> bool {
     let t = crate::text::trim(row);
     USAGE_MARKS.iter().any(|mark| t.starts_with(mark)) || t.starts_with(anchor("usage.loading"))
 }
 
-/// Whether `row`, a row under the Settings header, says the Usage tab's
-/// figures are NOT SETTLED: a load or a refresh in flight (`Loading usage
-/// data…`, `Refreshing…`), figures the vendor calls last-known, partial or
-/// unrefreshed (its enrich-error line), a failed load (`Error: …`), or any
-/// row that says `rate limited`. READ in the 2.1.287 bundle (module header).
+/// Whether `row`, a row under the Settings header, says the Usage tab's figures are not
+/// settled: a load or refresh in flight, an enrich-error line, a failed load (`Error: …`), or
+/// any row that says `rate limited` (read in the 2.1.287 bundle).
 #[must_use]
 pub fn usage_unsettled(row: &str) -> bool {
     let t = crate::text::trim(row);
@@ -287,14 +252,11 @@ pub fn usage_unsettled(row: &str) -> bool {
         || t.contains(RATE_LIMITED)
 }
 
-/// Whether `row` is the panel's TAIL: the cancel hint and nothing else
-/// (`Esc to cancel`, the `confirm:no` binding's key and its description —
-/// [`anchor`] `prompt.cancel`, a key hint, so a rebound key is another
-/// word and no tail), ASCII case ignored. The vendor draws it LAST (READ:
-/// module header), so the tail on the grid is what says the whole panel is:
-/// `Refreshing…` and the enrich-error line stand right above it and can be
-/// under the fold while the windows show. A retry hint beside it (drawn only
-/// with an enrich error) is not this row.
+/// Whether `row` is the panel's tail: the cancel hint alone ([`anchor`] `prompt.cancel`, a key
+/// hint, so a rebound key is no tail), ASCII case ignored. The vendor draws it last, so the
+/// tail on the grid says the whole panel is: `Refreshing…` and the enrich-error line stand
+/// right above it and can be under the fold while the windows show. The hint with a retry
+/// beside it is not this row.
 #[must_use]
 pub fn panel_tail(row: &str) -> bool {
     crate::text::trim(row).eq_ignore_ascii_case(anchor("prompt.cancel"))
@@ -308,13 +270,9 @@ mod tests {
         text.lines().map(str::to_owned).collect()
     }
 
-    /// MEASURED: rows 1 to 10 and 21 to 26 of aterm-agent's
-    /// `tests/testdata/vendor/2.1.278/screen/usage.txt` (Claude Code
-    /// 2.1.278, 2026-09-22), verbatim — the blank first row, the done row,
-    /// the `▔` rule, the header, the head of the session block and the first
-    /// window. The whole capture is read by aterm-agent's `harness::usage`
-    /// tests. (The literal opens with a real line break and no `\`: a
-    /// continuation would eat the first row's indent.)
+    /// Rows 1–10 and 21–26 of aterm-agent's `tests/testdata/vendor/2.1.278/screen/usage.txt`,
+    /// verbatim. The literal opens with a real line break, not `\`, which would eat the first
+    /// row's indent.
     const HEAD_2_1_278: &str = "
 ✻ Sautéed for 6s · done 1:16 PM
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
@@ -333,12 +291,9 @@ mod tests {
    18% used
 ";
 
-    /// THE PANEL AS MEASURED: under the `▔` rule, the header three columns
-    /// in, fullscreen. NEGATIVE CONTROLS, each the same rows with one thing
-    /// changed: no rule over the header; the header one column further out,
-    /// and one further in; a row under it that starts at column zero; the
-    /// composer's frame drawn under it; a tab missing; the tabs out of
-    /// order; the title run into another word.
+    /// The measured panel is read under its `▔` rule, three columns in; each negative control
+    /// changes one thing (no rule, the header or a row off its column, the composer drawn, a tab
+    /// missing or out of order, another title).
     #[test]
     fn the_settings_panel_is_read_under_its_rule_at_its_column() {
         let measured = rows(HEAD_2_1_278);
@@ -376,9 +331,7 @@ mod tests {
             None,
             "a row under it one column out"
         );
-        // The composer's frame ABOVE the panel (its rows under it would be
-        // refused for their column alone): everything else of the panel is
-        // as measured, so this is the frame's own refusal.
+        // The composer's frame above the panel, the rest as measured: the frame alone refuses it.
         let rule = "─".repeat(56);
         let framed: Vec<String> = [rule.clone(), "❯ ".to_string(), rule.clone()]
             .into_iter()
@@ -407,9 +360,8 @@ mod tests {
         ] {
             assert_eq!(edited(&|r| r[3] = header.to_string()), None, "{why}");
         }
-        // What does NOT matter: the spacing between the tabs, a tab after
-        // them, a blank row between the rule and the header, a toast drawn
-        // inside the rule.
+        // What does not matter: the spacing between tabs, a tab after them, a blank row under the
+        // rule, a toast inside the rule.
         for (why, header) in [
             (
                 "other spacing",
@@ -435,16 +387,9 @@ mod tests {
         );
     }
 
-    /// THE PANEL ON EVERY MEASURED 2.1.287 SCREEN (`prompt::fixtures`): the
-    /// fullscreen renderer's at five grids — unsettled, settled, with its
-    /// tail under the fold, whole on a tall grid, narrow, short — always
-    /// under the `▔` rule on the third row with the header on the fourth;
-    /// the inline renderer's under its `─` rule, two columns in. NEGATIVE
-    /// CONTROLS: the inline panel once the main screen scrolled its rule and
-    /// header off the grid is no panel (measured: nothing on that grid
-    /// places it); and the two renderers' shapes are not interchangeable — a
-    /// `─` rule over a header three columns in, and a `▔` rule over one two
-    /// columns in, are no panel.
+    /// Every measured 2.1.287 screen places the panel: fullscreen under the `▔` rule on the
+    /// third row, inline under its `─` rule two columns in. The scrolled inline panel is no
+    /// panel, and the two renderers' rule and column are not interchangeable.
     #[test]
     fn the_panel_is_placed_on_every_measured_screen_of_both_renderers() {
         use crate::prompt::fixtures as fx;
@@ -473,8 +418,7 @@ mod tests {
                 "^...Settings..Status...Config...Usage",
                 "{what}"
             );
-            // What the crate's own reader says of a panel screen: idle by
-            // default, with no composer — and its word is no evidence.
+            // The crate's own reader: idle, not authoritative, no composer.
             let reading = crate::read(Some("claude"), &screen, None);
             assert_eq!(
                 (
@@ -514,14 +458,9 @@ mod tests {
         assert_eq!(settings_panel(&wrong_rule), None);
     }
 
-    /// THE ROWS OF THE MEASURED TABS, told by the predicates the settled
-    /// rule is made of: every measured screen holds a mark of the Usage tab;
-    /// only the refreshing one holds an unsettled row; the settled, whole,
-    /// narrow and inline ones end on the tail, and the folded and short ones
-    /// — and the refreshing one's last row IS the tail too, which is why the
-    /// unsettled rows are asked first. NEGATIVE CONTROL: `Scanning local
-    /// sessions…`, the contributing block's own loading word, is no
-    /// unsettled row (it says nothing of the windows).
+    /// Every measured screen holds a Usage-tab mark; only the refreshing one holds an unsettled
+    /// row, and its last row is the tail too, which is why the settled rule asks for unsettled
+    /// rows first. `Scanning local sessions…` is no unsettled row.
     #[test]
     fn the_measured_tabs_rows_are_told_by_the_predicates() {
         use crate::prompt::fixtures as fx;
@@ -685,10 +624,8 @@ mod tests {
         }
     }
 
-    /// The lowest rule is the panel's: a panel quoted in the transcript
-    /// above the live one (its own rule and header, at the panel's column)
-    /// does not move the reading. NEGATIVE CONTROL: with the live panel gone
-    /// and the quoted one left over a shell line, there is no panel.
+    /// The lowest rule is the panel's: a panel quoted above the live one does not move the reading,
+    /// and the quoted one alone over a shell line is no panel.
     #[test]
     fn the_lowest_rule_over_a_header_is_the_panels() {
         let measured = rows(HEAD_2_1_278);
@@ -702,9 +639,8 @@ mod tests {
         assert_eq!(settings_panel(&quoted), None);
     }
 
-    /// THE HEADER'S GUARD is the row as observed, anchored at column zero,
-    /// one wire token. NEGATIVE CONTROL: rows that do not hold the header
-    /// this value names give no guard.
+    /// The header guard is the observed row, anchored at column zero, one wire token; rows that do
+    /// not hold the header give none.
     #[test]
     fn the_header_guard_is_the_observed_row_through_the_usage_tab() {
         let measured = rows(HEAD_2_1_278);
@@ -732,10 +668,8 @@ mod tests {
         assert_eq!(inline.header_guard(&measured), "", "another column");
     }
 
-    /// The Usage tab's marks, the unsettled rows and the tail, each by the
-    /// vendor's own words. NEGATIVE CONTROLS beside each: the settled
-    /// panel's own rows are no unsettled row; the hint with a retry beside
-    /// it, or the fold's arrow, is no tail; another tab's rows are no mark.
+    /// The Usage tab's marks, the unsettled rows and the tail, by the vendor's words; beside each,
+    /// rows that are not.
     #[test]
     fn the_usage_tabs_rows_are_told_by_the_vendors_words() {
         for row in [

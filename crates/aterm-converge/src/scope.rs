@@ -373,6 +373,9 @@ impl Item for Narrowed<'_> {
     fn refresh_changes(&self) -> bool {
         self.inner.refresh_changes()
     }
+    fn activation(&self) -> Option<std::sync::Arc<dyn crate::Activation + '_>> {
+        self.inner.activation()
+    }
     fn explain(&self, probe: &Probe) -> Explain {
         self.inner.explain(probe)
     }

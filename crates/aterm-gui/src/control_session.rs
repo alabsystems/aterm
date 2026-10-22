@@ -675,17 +675,10 @@ pub(crate) fn release_connection_lease(ctx: &SessionCtx, conn: u64) {
     lease_freed(ctx);
 }
 
-/// `edges` / `grants` -> list this session's INBOUND capability edges (the rows
-/// of its [`EdgeTable`]), the query face of the authority data `grant`/`revoke`
-/// mint and remove (which had zero read surface before).
-///
-/// Header `OK <n>\n`, then one line per edge: `<src> <dst> <op>` where `<op>` is
-/// the wire op token (`read-screen`/`write-input`/`signal`/`derive-loop`) and
-/// `<dst>` is always THIS session's id (every row in the table targets it). The
-/// bearer TOKEN is DELIBERATELY never emitted — it is the unforgeable secret; an
-/// agent enumerates WHO may reach this session for WHAT, not the secrets. Sorted
-/// by `(src, op)` for a stable listing. Cross-session (`@<sel>`) reads a sibling's
-/// table through the same `@<selector>` resolution + `ReadScreen` gate.
+/// `edges` / `grants` -> this session's inbound capability edges (its
+/// [`aterm_session::EdgeTable`]): `OK <n>` then `<src> <dst> <op>` per edge, sorted by
+/// `(src, op)`; `<dst>` is always this session. The bearer token is never emitted: the listing
+/// says who may reach the session for what, not the secrets.
 pub(crate) fn cmd_edges(ctx: &SessionCtx) -> String {
     let mut edges = {
         let tbl = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
@@ -932,9 +925,7 @@ pub(crate) fn cmd_ready(
 
     use aterm_core::terminal::{BlockState, WatcherSpec};
 
-    // Accept a bare `<ms>` (original) or `timeout=<ms>` (k=v, aligning with the
-    // rest of the wait family); anything else is the usage line, never the
-    // default ([`aterm_control::wire::wait_ms`]).
+    // A bare `<ms>` or `timeout=<ms>`; anything else is the usage line, never the default.
     let timeout_ms = match rest.trim() {
         "" => aterm_control::wire::WAIT_DEFAULT_MS,
         t => match aterm_control::wire::wait_ms(t.strip_prefix("timeout=").unwrap_or(t)) {
@@ -2481,10 +2472,8 @@ pub(crate) enum MomentumWait {
     Unreadable(String),
 }
 
-/// Classify a fresh read before another timer is armed. A satisfied reading
-/// keeps precedence; an unmet reading cannot re-park beyond the backstop even
-/// if the previous crossing latched immediately (or the GUI reply was delayed).
-/// The bounded guard contract is `momentum_wait_read_model`.
+/// Classify a fresh read before another timer is armed: a satisfied reading wins, and an unmet
+/// one never re-parks past the backstop (`momentum_wait_read_model`).
 fn momentum_read_outcome(
     value: f32,
     floor: f32,
@@ -3047,10 +3036,8 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
 /// wait was armed; and that done is the one the turn opens again
 /// ([`crate::task_record::reopen_at_turn`]), never one marked since.
 ///
-/// Fully event-driven like `ready`/`await` (subscriber park + kernel deadlines,
-/// zero polling). Empty `<text>` skips the paste (submit-only: useful to fire a
-/// chip already sitting in the target's editor); `submit=none` skips the press
-/// (type-only). `ERR exited` if the target dies at any phase.
+/// `if-gen=`/`if-rows=` type only into the screen, or the rows, the caller judged; a moved one
+/// answers `OK 0 turn skipped reason=changed`.
 ///
 /// `submit=guarded:<re>` submits with Enter, and presses it
 /// only while the row holding the cursor still matches `<re>` — checked and
@@ -4576,9 +4563,9 @@ fn meta_unknown_field() -> String {
     format!("ERR unknown meta field ({})\n", MetaField::NAMES)
 }
 
-/// A LEADING `owner=<k>` token on an attention value, and the text after it.
-/// `None` when the value does not lead with one (the bare form). `Err` carries
-/// the refusal for a malformed key — named before anything is stored.
+/// A leading `owner=<k>` token on an attention value, and the text after it. `None` when the
+/// value does not lead with one (the bare form); `Err` carries the refusal for a malformed key,
+/// named before anything is stored.
 fn leading_attention_owner(value: &str) -> Option<(Result<&str, String>, &str)> {
     let value = value.trim_start();
     let (head, text) = value.split_once(char::is_whitespace).unwrap_or((value, ""));
@@ -5821,13 +5808,11 @@ fn reserved_src(src: &str) -> Option<String> {
     })
 }
 
-/// `revoke <edge-hex>` -> remove one edge by its bearer token. `revoke
-/// src=<sid>` -> sweep EVERY edge from that source (any op) and reply
-/// `OK <removed>` — the wire dissolution primitive (design §1.4#4/§6): token
-/// hexes are deliberately non-enumerable, so the sweep is the only way to
-/// dissolve edges whose hex is lost. Owner-only; both forms fail closed with
-/// `ERR no such edge` when nothing matches. Each successful act emits one
-/// `session_edge` audit event (§1.4#5).
+/// `revoke <edge-hex>` -> remove one edge by its bearer token. `revoke src=<sid>` -> sweep every
+/// edge from that source (any op) and reply `OK <removed>`: token hexes are not enumerable, so
+/// the sweep is the only way to dissolve edges whose hex is lost. Owner-only; both forms answer
+/// `ERR no such edge` when nothing matches. Each successful act emits one `session_edge` audit
+/// event.
 pub(crate) fn cmd_revoke(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
     if !scope.is_owner_class() {
         return "ERR denied\n".to_string();
@@ -6732,8 +6717,8 @@ mod tests {
         assert_eq!(under, replies);
     }
 
-    /// Tier-1: every production read decision has exactly the model's guard.
-    /// The retired decision re-armed after an expired, unmet reading.
+    /// Every production read decision has exactly the model's guard; the buggy model, which
+    /// re-parks after an expired unmet reading, breaks `ExpiredReadingCannotRepark`.
     #[test]
     fn momentum_wait_read_guards_conform_and_catch_expired_reparking() {
         use std::time::{Duration, Instant};
@@ -6921,6 +6906,7 @@ mod tests {
             reset_lane: Default::default(),
             crash_journal: Default::default(),
             typed: Default::default(),
+            bells: Default::default(),
             update_parked: Default::default(),
             watchers: observed.watchers,
             frame: Default::default(),
@@ -7956,6 +7942,7 @@ mod tests {
             reset_lane: Default::default(),
             crash_journal: Default::default(),
             typed: Default::default(),
+            bells: Default::default(),
             update_parked: Default::default(),
             watchers: observed.watchers,
             frame: Default::default(),
@@ -8164,14 +8151,11 @@ mod tests {
         );
     }
 
-    /// A flap that lands after the program's last output is PENDING: no reader
-    /// hold has handed it to the spine yet, so a replay at the spine's end is
-    /// the screen before it. `temporal status` and the replay's header say how
-    /// many (`pending_resizes=2`) instead of passing that screen off as the
-    /// live one; the program's next output hands both halves over, and the
-    /// replay then IS the live screen, with nothing pending. The flap is a
-    /// width flap (20 -> 19 -> 20 columns cuts the last one), which the
-    /// engine's resize undo does not serve, so the two screens differ.
+    /// A flap after the program's last output is pending: no reader hold has handed it to the
+    /// spine, so a replay at the spine's end is the screen before it. `temporal status` and the
+    /// replay header say so (`pending_resizes=2`); the next output hands both halves over and
+    /// the replay is the live screen. A width flap (20 -> 19 -> 20 cuts the last column)
+    /// defeats the engine's resize undo, so the two screens differ.
     #[test]
     fn temporal_discloses_resizes_still_pending_on_the_spine() {
         use crate::temporal::{SpineMark, SpinePre};
@@ -8692,10 +8676,9 @@ mod exits_tests {
         }
     }
 
-    /// The `history`/`timeline` grammar: `<n>` keeps the newest n, `since=<id>`
-    /// keeps rows with id strictly greater (the seq the row itself prints, so a
-    /// reader pages with the last id it saw), and anything else is `ERR usage`
-    /// — never a silently ignored argument.
+    /// The window grammar `history` and `timeline` share: `<n>` keeps the newest n,
+    /// `since=<id>` keeps ids strictly greater (the id a row prints, so a reader pages with the
+    /// last one it saw), and anything else is `ERR usage`.
     #[test]
     fn window_cursor_and_usage() {
         let store = new_store();

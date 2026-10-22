@@ -898,18 +898,20 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
     assert_ne!(refused, reason(&text, silent_port), "{text}");
 
     // `--host`: a word that names more than one peer is refused, naming them;
-    // the issuer's own address and port is one, read in full.
+    // the issuer's own address and port is one, read in full. The word is
+    // looked up among the peers a key binds first (c3a2a44a1b, as a drive
+    // does): the issuer and the other node answer to it, so the refusal names
+    // those two, and the entries added by hand at the same address, which a
+    // lookup reaches only when no bound peer answers, are not among them.
     let ambiguous = ctl_in(&member.0, &["survey", "--host", "127.0.0.1"]);
     assert_eq!(ambiguous.status.code(), Some(1), "{ambiguous:?}");
     assert!(ambiguous.stdout.is_empty(), "{ambiguous:?}");
     let named = String::from_utf8_lossy(&ambiguous.stderr);
-    for each in [
-        port.as_str(),
-        &other_port.to_string(),
-        &closed_port.to_string(),
-        &silent_port.to_string(),
-    ] {
+    for each in [port.as_str(), &other_port.to_string()] {
         assert!(named.contains(&format!(":{each}")), "{ambiguous:?}");
+    }
+    for each in [closed_port, silent_port] {
+        assert!(!named.contains(&format!(":{each}")), "{ambiguous:?}");
     }
     let one = ctl_in(
         &member.0,

@@ -2895,6 +2895,12 @@ fn quietly<T>(f: impl FnOnce() -> T) -> T {
 /// is `#!/bin/sh` + `. "$0.sh"` and `body` goes beside it as `<exe>.sh`, so the same shell runs
 /// the same commands with the same `$0`, arguments, environment and descriptors. Where no link
 /// can be made (another filesystem), `exe` is a fresh copy.
+///
+/// The stand-in's own first exec is paid as it is made, unclocked
+/// ([`aterm_spec::wait::first_exec`], under its own hang detector), before any link of it
+/// exists: the system's scans are serial, so on a loaded host that one exec waits out the
+/// whole queue (40 queued scans held a fresh script 5.4 s), and a test whose clocked read
+/// happened to run the process's first link read the queue instead of its script.
 #[cfg(unix)]
 pub(super) fn sh_script(exe: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2920,8 +2926,12 @@ pub(super) fn sh_script(exe: &Path, body: &str) {
         let dir = ScratchDir::new("upgrade", "stand-in");
         let file = dir.join("sh");
         if std::fs::write(&file, STAND_IN).is_ok()
+            && std::fs::write(dir.join("sh.sh"), "exit 0\n").is_ok()
             && std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o555)).is_ok()
         {
+            // Its first exec, with the no-op body beside it, while the lock holds every
+            // other caller off linking it.
+            aterm_spec::wait::first_exec(&file, &[]);
             *shared = Some((dir, file));
             // SAFETY: registers, once, a plain `extern "C"` function with no
             // captured state that only takes the stand-in out of its lock
@@ -4400,7 +4410,7 @@ fn carry_on_is_held_for_a_person_at_the_keys() {
 /// later visit that finds the relaunched agent owed one (no caller holds a
 /// hand) takes one for the typing alone and gives it back at once; the
 /// relaunch's own wait passes the hand it has kept and the typing neither
-/// takes nor gives back a second. NEGATIVE CONTROL: a tab another driver
+/// takes nor gives back a second. Negative control: a tab another driver
 /// holds is `wait:held`, nothing typed, and this process gives back nothing.
 ///
 /// ON THE PRODUCTION CLOCK (`Timings::PRODUCTION`): the carry-on family's
@@ -28943,10 +28953,12 @@ fn a_crash_is_never_moved_onto_a_newer_build_not_proved_to_start() {
         // The stand-in's first exec is macOS's to assess, one at a time
         // machine-wide ([`sh_script`]): paid here, under the first exec's own
         // hang detector (`aterm_spec::wait::FIRST_EXEC`), so the relaunch's
-        // bounded reads of the build (its `--version`, the probe's `--help`,
-        // five seconds each) read the build and not the queue (the review of
-        // the r20 relaunch lane: under the dev set's parallel test binaries
-        // the ledger here named no `build-probe:exited`).
+        // bounded reads of the build (its `--version`, the probe's `--help`)
+        // read the build and not the queue (the review of the r20 relaunch
+        // lane: under the dev set's parallel test binaries the ledger here
+        // named no `build-probe:exited`). A link of the shared stand-in was
+        // paid for as `sh_script` made it; this pays for a copy made where no
+        // link could be.
         let warmed = aterm_uds::deadline::output_until(
             aterm_uds::spawnfd::command(versions.join("99.9.9")).arg("--version"),
             std::time::Instant::now() + aterm_spec::wait::FIRST_EXEC,

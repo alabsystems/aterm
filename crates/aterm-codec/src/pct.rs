@@ -9,8 +9,8 @@
 //! it is safe on hostile bytes.
 //!
 //! Users: the server (`aterm_control::wire`'s `pct_*` re-exports), `aterm-ctl`,
-//! `aterm_link::pct`, the supervisor, the wasm32 web hosts (which cannot link
-//! `aterm-control`), and the engine's OSC 7 `file://` path decode.
+//! `aterm_link::pct`, the supervisor, and the engine's OSC 7 `file://` path
+//! decode. The wasm32 web hosts keep their own copies of [`encode`].
 
 /// Percent-encode `s` into one space-free token: every byte that is not
 /// ASCII-graphic, and `%`, becomes `%XX`. Empty -> "".
@@ -115,8 +115,7 @@ pub fn decode(s: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The escape's `core::fmt` spelling, the reference every former copy was
-    /// written against.
+    /// The escape's `core::fmt` spelling: the reference.
     fn fmt_spelling(s: &str) -> String {
         let mut out = String::new();
         for b in s.bytes() {

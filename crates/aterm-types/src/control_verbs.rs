@@ -1241,10 +1241,12 @@ pub const VERBS: &[VerbSpec] = &[
          `remediate debugger=` names a place for that human, never a command: \
          `aterm-settings:security`, aterm's Settings ▸ Security, where the owner can allow or \
          turn off debugger access for this Mac — their press, confirmed in aterm's alert; macOS \
-         then asks for an administrator password in its own dialog. Once per Mac, a \
-         hardened aterm also raises that alert by itself, at a quiet moment after it starts, to \
-         ask whether to allow it; nothing a session sends raises or answers it, and \
-         `[privacy] notice = false` keeps it from coming up. Running \
+         then asks for an administrator password in its own dialog. Once per Mac and account, \
+         a hardened aterm also raises that alert by itself, at a quiet moment after it starts, \
+         to ask whether to allow it (in a launch that runs first-launch setup, only once \
+         that setup is applied with its macOS permissions choice checked); nothing a \
+         session sends raises or answers it, and `[privacy] notice = false` keeps it from \
+         coming up. Running \
          `DevToolsSecurity` \
          yourself, with any flag, or `sudo` is not the fix; `await consent kind=debugger` waits \
          for `mode=` to change. \
@@ -1357,7 +1359,12 @@ pub const VERBS: &[VerbSpec] = &[
          human_ms only, \"unkeyed_ms\":<ms> (how long the host has \
          served the session with no person's input, a seamless update's carried time \
          included; an adopted shell nothing was carried for counts from the successor's \
-         Commit); \"submits\":<n> ends the object: how many Enters this instance has \
+         Commit); \"inputs\":[<n|null>,<n>], just before submits: how many input writes of any kind \
+         (keys, text, pastes, raw bytes, whoever sent them; never a report) this instance had \
+         made to the session before the rows were read, null while one was still in flight, \
+         and after them, so a later read's second equal to an earlier read's first says no \
+         key reached the session between the two screens; \"submits\":<n> ends the object: \
+         how many Enters this instance has \
          written to the session's program over something typed since the Enter before \
          (a plain Enter key, keypad Enter, or a CR in raw bytes, after any key that is no \
          plain Enter, text, a paste or a raw byte), whoever typed them — a person at the \
@@ -2758,12 +2765,26 @@ pub const VERBS: &[VerbSpec] = &[
          log_seq=<n> log_ep=<e> run=<r<n>|-> turn=<t<n>|-> \
          step=<p<n>|-> need=<word|-> need_since_ms=<ms|-> \
          rollout=<bound|unmeasured|no-rollout|no-meta|other-thread|no-run|no-thread|stopped|-> \
-         rollout_asks=<n> editing=<n> gen=<e.s|-> seq=<n|-> hash=<hex16|->. \
+         rollout_asks=<n> editing=<n> bells=<n> bells_sounded=<n> \
+         last_bell=<ms>/<sounded|headless|serious|off|limited>/<program|->[,…]|- \
+         gen=<e.s|-> seq=<n|-> hash=<hex16|->. \
          `editing=` counts the open `edit` tickets whose program waits in this session (an \
          `edit … wait=0` is not one); while it is not 0, `send`, `key`, `ctrl`, `feed`, \
          `feed-bin`, `mouse`, `paste`, `paste-bin`, `turn` and `focus` answer `ERR busy editing \
          ticket=<t> view=<v>`, for any caller, and so do `hwkey`, `invoke Paste` and every \
          `pointer` but `pointer status` while this session's tab is the one on screen. \
+         `bells=` counts the BELs this session's programs rang (the bell that may play the \
+         Mac's alert sound), `bells_sounded=` how many of them played it, and `last_bell=` \
+         keeps the last four, the newest first, each as how long ago it rang (ms), what \
+         became of its sound — `sounded`, else the gate that kept it quiet: `headless` (a \
+         headless instance never beeps), `serious` (serious mode), `off` (`bell_sound = \
+         false` in aterm.toml) or `limited` (the sound had played less than a second \
+         before) — and the program in front then (as `program=` names it, its `/` and \
+         `,` read as `_`); `-` before the first. Which tab rang, so a ping has an answer \
+         afterwards: a fact for later, never an alert (it raises no attention, posts no \
+         message, moves no need), and it changes nothing the bell does. Counted by this \
+         aterm process: a self-update starts them over (the session `log`'s `bell` marks \
+         cross it); `survey` carries the same three fields. \
          `disk=` is the volume holding the session's working directory as the disk watch \
          last measured it (ok, low below its warning, short below its floor, emergency), \
          `disk_free_mb=` its free MiB, `disk_room_mb=` its room (what one round of this \
@@ -3190,7 +3211,8 @@ pub const VERBS: &[VerbSpec] = &[
          command between OSC 133 C and D, a program in front, an agent), an agent run's turns \
          (`t<n>`) and a turn's steps (`p<n>`: an approval box, a question dialog, a wall, an \
          input stall, the survey), with point marks: `human` (a person's input burst, and \
-         their first input to reach the program after mail came in; `reached=0` when the \
+         their first input to reach the program after mail came in, which says `why=mail` \
+         when no burst opened with it; `reached=0` when the \
          input it marks reached no program — a view scroll, a selection, a wheel no program \
          is sent, a composition — so it dismissed no box and answers no mail), `input` (a \
          control input: `verb= [act=] [re=] [dropped= [pool=shared]] [cause= cause_k=]`, see \
@@ -3212,8 +3234,11 @@ pub const VERBS: &[VerbSpec] = &[
          block's own stamps) and its rollup (`steps= appr= qs= walls= stalls= errs= lost=`); \
          values pct-encoded; a word this build does not know reads `unknown`. Never stored: a \
          command's arguments (a `cmd` run keeps its program word, and a known subcommand, as \
-         `detail=`, as `status detail=` shows it), a box's command, the bytes typed, or screen \
-         text beyond a wall's reset time (its `detail=`). `as_of=` is the newest seq: read on with `since=<as_of> ep=<ep>` (both, \
+         `detail=`, as `status detail=` shows it), the bytes typed, or screen text beyond a \
+         wall's reset time (its `detail=`); a box's command or a question's words only as the \
+         supervisor's attention text names them, kept in memory alone at the content tier \
+         (`meta field=attention attn_text=`, beside its `fp=`), never journaled, carried or \
+         published. `as_of=` is the newest seq: read on with `since=<as_of> ep=<ep>` (both, \
          from the same reply: an aterm self-update moves `ep=`; one that carries the log \
          continues it, writing `mark - handoff carried=<n> shed=<m> epoch=<ep>` with every \
          run, turn and step still open, and an old cursor reads on with a `gap why=handoff` \
@@ -3232,8 +3257,11 @@ pub const VERBS: &[VerbSpec] = &[
          `<node>` keeps that node's subtree; `lvl=session|run|turn|step` the levels down to \
          it; `n=` the newest n that match (`more=` counts the rest); `kinds=<k>,...` those \
          kinds; `class=turn` what a fleet mirror would carry (sessions, runs, turns, needs, \
-         gaps). The reply stops at the host tier; `tier=content` adds content-tier fields \
-         (the OSC title, which `timeline` and `text` already show). `--json` (or `json`, \
+         gaps). The reply stops at the host tier; `tier=content` adds content-tier fields, \
+         each kept in memory only, never journaled, carried or published: the OSC title \
+         (`title=`, which `timeline` and `text` already show), the supervisor's attention text \
+         (`attn_text=`), a hold's or an advisory's `reason=`, a topic's `topic_name=` and \
+         `since=`, a session close's raw `closer=`, and an in-doubt write's `reply=`. `--json` (or `json`, \
          anywhere): one object per record, the same keys, the gap line as `{\"op\":\"gap\",\
          \"why\":…,\"lost\":…,\"resync_to\":…}`. A session that closed in this process \
          still answers `log @<sid>` (and `brief`), for the last 512 closed: the newest 32 from a \
@@ -6216,7 +6244,8 @@ pub const VERBS: &[VerbSpec] = &[
          task=<state|-> task_rev=<n> task_from=<pct|-> task_ms=<ms|-> model=<pct|-> \
          effort=<pct|-> ctx_left_pct=<n|-> detail=<pct|-> doing=<pct|-> \
          role=<pct|-> supervisor=<pct|-> attention=<1|-> needs=<word|-> hold_by=<word|-> \
-         held_from=<32 hex|-> typed_by=<pct|-> typed_ms=<ms|->` \
+         held_from=<32 hex|-> typed_by=<pct|-> typed_ms=<ms|-> bells=<n> \
+         bells_sounded=<n> last_bell=<ms>/<sound>/<program|->[,…]|->` \
          (the FACTS: words, counts and ages, and `role=` the role `meta set role` stamped \
          when it is a label - one word of at most 32 letters, digits and `:_.-`, redacted - \
          else `-`; no other text a person or a program wrote: `attention=1` a raised \
@@ -6225,7 +6254,8 @@ pub const VERBS: &[VerbSpec] = &[
          `typed_by=` and `typed_ms=` who last typed into it over the socket and how long ago, \
          as `status` prints them, `typed_by=` at facts only the typist tab's role or session \
          id, or aterm's own word, and only when it is a label as `role=` is, never the tab \
-         name a person set), \
+         name a person set; `bells=`, `bells_sounded=` and `last_bell=` the bells it rang, \
+         as `status` prints them), \
          then, with `content` (the local default), `user_title= \
          title= cwd= branch= prompt= said= cmd= rows=`, each `<pct|->` (`user_title=` the \
          tab name a person set), `role=` any role (an excerpt), and `attention=` carries the \
@@ -6923,9 +6953,8 @@ mod tests {
         assert!(!EMPTY_SELECTOR.contains('\n'));
     }
 
-    /// The wire spelling round-trips, and every other shape — including a part
-    /// that overflows `u64` — is refused, so a client that asks this reader
-    /// never sends a fence the server refuses.
+    /// The wire spelling round-trips, and every other shape (a `u64` overflow included) is
+    /// refused.
     #[test]
     fn screen_gen_parses_exactly_the_wire_spelling() {
         let g = ScreenGen::parse("3.15").expect("canonical spelling");
@@ -6954,8 +6983,8 @@ mod tests {
         }
     }
 
-    /// The regression: `metrics --json` framed as Status while the server wrote
-    /// Lines, so the client consumed the `OK 1` header and dropped the JSON body.
+    /// Under `--json`/`json` every json-capable verb frames as Lines, so the client keeps the
+    /// JSON body.
     #[test]
     fn json_flag_switches_every_json_capable_verb_to_lines() {
         assert!(json_verbs().count() >= 10, "non-vacuity");

@@ -1953,7 +1953,7 @@ fn a_recording_holds_the_handback_and_reset_bytes_at_their_offsets() {
     }
 }
 
-// ---- ForegroundHandbackOwnership (2026-09-27, the lane at load 59-65) ------
+// ---- ForegroundHandbackOwnership ---------------------------------------------------------
 //
 // Tier-1 for `aterm_models_gui::foreground_handback_ownership_model`: who
 // owns an input mode across jobs when the reader MISSES one. The scripted
@@ -1973,9 +1973,9 @@ fn a_recording_holds_the_handback_and_reset_bytes_at_their_offsets() {
 
 const OWNERSHIP_PROJECTED: [&str; 4] = ["life", "n", "bit", "backs"];
 
-/// The real reader's ownership projection once `backs` events are recorded
-/// (the reader records an event just after it releases the term lock), or
-/// after the patience runs out — the comparison then says what differs.
+/// The real reader's ownership projection once `backs` events are recorded (an event follows
+/// the term lock's release), or after the patience runs out, so the comparison says what
+/// differs.
 fn project_ownership(rig: &Rig, n: i64, backs: i64) -> State {
     let deadline = Instant::now() + PATIENCE;
     while (rig.restored().len() as i64) < backs && Instant::now() < deadline {

@@ -16,18 +16,12 @@ use aterm_hash::FxHashSet;
 
 use crate::type_scale::TypeStep;
 
-/// Stable logical identity of a semantic node.  Keys survive layout, filtering,
-/// and route changes; vector positions are deliberately not identities.
+/// Stable logical identity of a semantic node. Keys survive layout, filtering, and route
+/// changes; vector positions are deliberately not identities.
 ///
-/// The payload is an `Arc<str>`, not a `String`, because a key is authored ONCE
-/// per node and then CLONED up to six times on the way through
-/// [`UiTree::compile`] (duplicate-key set, paint node, semantic node, that
-/// node's parent link, focus order, hit region) plus three more per node in the
-/// accessibility projection — every one of those was a malloc + memcpy of the
-/// key text on every native frame.  `Arc<str>` makes each of them a refcount
-/// bump while `as_str`, `Debug`, `Ord`, and `Hash` all still forward to `str`,
-/// so key ordering and hashing are unchanged.  `Arc` (not `Rc`) keeps `UiKey`
-/// — and therefore the retained `CompiledUi` — `Send`.
+/// `Arc<str>` because a key is cloned many times per node per frame through
+/// [`UiTree::compile`] and the accessibility projection; `as_str`, `Debug`, `Ord` and `Hash`
+/// forward to `str`, and `Arc` (not `Rc`) keeps the retained `CompiledUi` `Send`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct UiKey(Arc<str>);
 
@@ -132,13 +126,9 @@ impl LogicalRect {
         let right = self.right().min(other.right());
         let bottom = self.bottom().min(other.bottom());
         (right > x && bottom > y).then(|| {
-            // Fractional-track layout arithmetic drifts by ulps when edges are
-            // recomputed through a clip chain. A cut smaller than the
-            // paint-audit edge epsilon is not real clipping (the exact
-            // judgment `materially_clipped` makes), so an axis that is
-            // effectively one input's own extent keeps that extent
-            // bit-identical instead of a resummed `right - x` — compiled
-            // paint and hit geometry must never disagree over an ulp.
+            // A cut below the edge epsilon is ulp drift from recomputing edges through a clip
+            // chain, not clipping (`materially_clipped`), so an axis that is effectively one
+            // input's own extent keeps it bit-identical: paint and hit geometry must agree.
             let snap_axis =
                 |low: f32, high: f32, a_low: f32, a_len: f32, b_low: f32, b_len: f32| {
                     if (low - a_low).abs() < EDGE_EPSILON
@@ -181,13 +171,8 @@ impl LogicalRect {
     }
 }
 
-/// Whether an effective ancestor clip removes a perceptible part of a node.
-///
-/// Layout arithmetic can produce a few thousandths of a logical pixel of edge
-/// drift when nested fractional tracks are intersected. That is neither
-/// paint-visible nor actionable, so introspection must not report it as real
-/// clipping. Keeping this decision in one helper also makes every paint audit
-/// agree about the exact same compiled geometry.
+/// Edge drift below this (a few thousandths of a logical pixel, from intersecting nested
+/// fractional tracks) is not real clipping; every paint audit judges by this one value.
 const CLIP_EDGE_EPSILON: f32 = 0.01;
 
 fn materially_clipped(rect: LogicalRect, clip: LogicalRect) -> bool {
@@ -415,11 +400,9 @@ pub(crate) struct ControlState {
     pub(crate) selected: bool,
     pub(crate) invalid: bool,
     pub(crate) busy: bool,
-    /// A DISCLOSURE control's state (design ruling 262): `Some(true)` while
-    /// what it discloses is open, `Some(false)` while it is closed, `None`
-    /// for a control that discloses nothing. A screen reader hears it as
-    /// expanded or collapsed — never as `selected` — and the painter draws the
-    /// button flush, with its trailing chevron (`›` closed, `⌄` open).
+    /// A disclosure control's state: `Some(true)` open, `Some(false)` closed, `None` for a
+    /// control that discloses nothing. A screen reader hears expanded or collapsed (never
+    /// `selected`); the painter draws the button flush with a trailing chevron (`›` / `⌄`).
     pub(crate) expanded: Option<bool>,
     /// The control works, but what it sets is idle right now (a sound row
     /// while Music effects is off, a Harness row while supervision is off, a
@@ -623,10 +606,8 @@ pub(crate) struct ButtonSpec {
     /// fields use this instead of appending a font-dependent `v` glyph.
     pub(crate) trailing_icon: Option<ButtonIcon>,
     pub(crate) description: Option<String>,
-    /// An ATTENTION BADGE: a small dot in the danger role, painted at the end of
-    /// a rail row (on the pictogram of an icon-only one). Paint only — a control
-    /// that wears it states why in its semantic value, so the dot is never the
-    /// only carrier of the fact (the Settings rail's Packages entry, 2026-09-22).
+    /// An attention badge: a small danger-role dot at the end of a rail row (on the pictogram of
+    /// an icon-only one). Paint only: a control that wears it states why in its semantic value.
     pub(crate) badge: bool,
     /// A theme's COLOUR STRIP, painted along the bottom of a text button
     /// inside its own height: the first entry is the background the band is
@@ -803,18 +784,14 @@ pub(crate) struct ColorWheelSpec {
 /// label simply names the scenery for accessibility.
 pub(crate) const RAINBOW_BANNER_AUDIT: &str = "settings.home.rainbow";
 
-/// Settings ▸ Messages' SEVERITY MARK (design ruling 262): a paint-only custom
-/// node whose value is the wire's severity word (`error`, `warn`, `success`,
-/// `info`). It draws the band's own icon for it at the row text's cap height —
-/// ✕ in the danger red, ⚠ in the band's warn amber, ✓ in green, ℹ in the
-/// muted secondary — and, for an Error or a Warning, a 3 pt rail down the
-/// row's leading edge in the same hue. Decorative: the row's control says
-/// the severity in words.
+/// Settings ▸ Messages' severity mark: a paint-only custom node whose value is `severity:glyph`
+/// (severity `error`, `warn`, `success` or `info`), drawn as the band's icon at the row text's
+/// cap height, plus a 3 pt leading-edge rail for an error or a warning. Decorative: the row's
+/// control says the severity in words.
 pub(crate) const MESSAGES_SEVERITY_AUDIT: &str = "settings.messages.severity";
 
-/// Settings ▸ Messages' HAIRLINE between rows in the log's one container
-/// (design ruling 262): a paint-only custom node, a 1 pt rule in the
-/// separator role across its rect.
+/// Settings ▸ Messages' hairline between rows in the log's container: a paint-only custom node,
+/// a 1 pt rule in the separator role across its rect.
 pub(crate) const MESSAGES_RULE_AUDIT: &str = "settings.messages.rule";
 
 /// Settings ▸ Themes' row SLAB: a paint-only custom node whose value carries
@@ -841,12 +818,10 @@ pub(crate) const THEME_SWATCH_AUDIT: &str = "settings.themes.swatch";
 /// technology.
 pub(crate) const COLOR_CHIP_AUDIT: &str = "settings.color.chip";
 
-/// Settings ▸ Messages' SCROLL INDICATOR (design ruling 264): the log is one
-/// scrolling list with no pager, and this paint-only custom node, laid over
-/// the log's card, is the sighted reader's cue that it scrolls and where the
-/// view is — a thin rounded thumb down the card's trailing edge. Its value is
-/// `first,shown,total` in entries. Decorative: the list itself is the
-/// screen reader's scrolling surface ([`SemanticRole::List`]).
+/// Settings ▸ Messages' scroll indicator: a paint-only custom node over the log's card, a thin
+/// rounded thumb down its trailing edge showing that the list scrolls and where the view is.
+/// Its value is `first,shown,total` in entries; the list itself is the screen reader's
+/// scrolling surface ([`SemanticRole::List`]).
 pub(crate) const MESSAGES_SCROLL_AUDIT: &str = "settings.messages.scroll";
 
 /// A Settings page's own SCROLL INDICATOR: [`MESSAGES_SCROLL_AUDIT`]'s node
@@ -1721,9 +1696,8 @@ pub(crate) struct RichTextSpec {
     pub(crate) selectable: bool,
 }
 
-/// Presentation vocabulary for the native Markdown reader. Keeping block kind
-/// in the semantic tree lets paint, inspection, and accessibility agree that a
-/// heading is a heading and code is code without introducing a web view.
+/// Presentation vocabulary for the native Markdown reader, kept in the semantic tree so paint,
+/// inspection and accessibility agree on what a block is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MarkdownBlockKind {
     Heading(u8),
@@ -1759,13 +1733,10 @@ pub(crate) struct MarkdownBlockSpec {
     /// or reparsing document bytes in the renderer.
     pub(crate) visual_row: usize,
     pub(crate) total_visual_rows: usize,
-    /// Styled spans of `text` (byte ranges, disjoint, in order) — bold, emphasis,
-    /// strikethrough, inline code, links — recorded by the lowering that
-    /// produced `text` ([`crate::native_markdown::lower_inline_text_styled`]) and
-    /// handed out per block by
-    /// [`crate::native_markdown::MarkdownDocument::block_styles`]. PAINT only: semantics,
-    /// accessibility and copy keep reading the flat `text`. Empty for a block
-    /// with no inline markup, and for code/table blocks, which paint verbatim.
+    /// Styled spans of `text` (byte ranges, disjoint, in order) from
+    /// [`crate::native_markdown::MarkdownDocument::block_styles`]. Paint only: semantics,
+    /// accessibility and copy read the flat `text`. Empty for code and table blocks, which
+    /// paint verbatim.
     pub(crate) inline: Vec<(std::ops::Range<usize>, crate::native_markdown::InlineStyle)>,
 }
 
@@ -1774,9 +1745,7 @@ pub(crate) struct TextViewportSpec {
     pub(crate) label: String,
     pub(crate) document_key: String,
     pub(crate) selectable: bool,
-    /// Visible-only, source-addressable editor rows. `None` keeps the primitive
-    /// useful for future non-editor text surfaces without inventing a second
-    /// paint path.
+    /// Visible-only, source-addressable editor rows; `None` for a non-editor surface.
     pub(crate) projection: Option<crate::native_editor::EditorViewportProjection>,
     pub(crate) preedit: String,
     pub(crate) preedit_caret: Option<usize>,
@@ -1879,11 +1848,9 @@ fn editor_minibuffer_caret_rect(
 /// keymap, so no badge names it ahead of the text.
 const EDITOR_FOOTER_TEXT_INSET: f32 = 12.0;
 
-/// The editor rect's fixed chrome bands and text metre, at 1×. These are the
-/// pixels `text_viewport_geometry_at_scale` spends before and after the
-/// document, so any policy that reserves room for the *document* has to know
-/// them — see `editor_shell_metrics_at_scale`, which sizes the completion
-/// palette against whatever is left.
+/// The editor rect's fixed chrome bands and text metre, at 1×: what
+/// `text_viewport_geometry_at_scale` spends around the document, which
+/// `editor_shell_metrics_at_scale` must know to size the completion palette.
 const EDITOR_HEADER_H: f32 = 44.0;
 const EDITOR_FOOTER_H: f32 = 30.0;
 const EDITOR_LINE_H: f32 = 20.0;
@@ -1899,10 +1866,8 @@ pub(crate) fn text_viewport_geometry_at_scale(
     } else {
         1.0
     };
-    // Editor text is painted at the native Secondary step (13 px at 1×).
-    // Measure the active mono stack with the same fixed-point metric as the
-    // raster pen so custom terminal fonts cannot drift from hit-testing,
-    // selections, carets, or accessibility bounds.
+    // Editor text paints at the Secondary step (13 px at 1×); measure the active mono stack
+    // with the raster pen's metric so hit-testing, carets and accessibility bounds agree.
     let measured_cell_w = crate::tray_raster::measure_text(
         "M",
         13.0 * text_scale,
@@ -1914,10 +1879,8 @@ pub(crate) fn text_viewport_geometry_at_scale(
         FALLBACK_CELL_W * text_scale
     };
 
-    // Header and footer are CHROME bands, not content: like the editor shell's
-    // `chrome_scale`, they stop growing at 1.35× so a 2× Dynamic Type phone
-    // keeps its line capacity for actual document text (the type inside them
-    // is already clamped to the same chrome steps).
+    // Header and footer are chrome, not content: like the editor shell's `chrome_scale` they
+    // stop growing at 1.35× so a 2× Dynamic Type phone keeps its document line capacity.
     let chrome_scale = text_scale.min(1.35);
     let header_h = (EDITOR_HEADER_H * chrome_scale).min(rect.height);
     let footer_h = (EDITOR_FOOTER_H * chrome_scale).min((rect.height - header_h).max(0.0));
@@ -2213,16 +2176,9 @@ pub(crate) fn editor_shell_metrics_at_scale(
     let palette_header_height = (28.0 * text_scale).clamp(28.0, 40.0);
     let palette_row_height = (34.0 * text_scale).clamp(34.0, 48.0);
     let palette_row_gap = 3.0 * chrome_scale;
-    // THE EDITOR FLOOR IS COUNTED IN DOCUMENT ROWS, NOT RECT PIXELS. The rect
-    // this reserves is not document: `text_viewport_geometry_at_scale` spends
-    // EDITOR_HEADER_H on the modeline and EDITOR_FOOTER_H on the status strip
-    // before one line of the file is painted. The old floor — a flat 78 px —
-    // therefore promised 78 - 74 = 4 px of body, i.e. ZERO complete text rows,
-    // and at the default 80x24 window (viewport 744x420) the arithmetic landed
-    // on a 94 px editor rect: one visible line of aterm.toml under a 262 px
-    // completion list the user never asked for, on a page that advertises
-    // "Edit aterm.toml with live help". Reserve the chrome plus whole lines so
-    // the floor means what it says, and let the palette page what is left.
+    // The editor floor counts document rows, not rect pixels: the header and footer
+    // (`text_viewport_geometry_at_scale`) take their share before any line of the file, so
+    // reserve that chrome plus whole lines and let the palette page what is left.
     let editor_chrome_height = (EDITOR_HEADER_H + EDITOR_FOOTER_H) * chrome_scale;
     let minimum_editor_height =
         editor_chrome_height + MINIMUM_EDITOR_DOCUMENT_ROWS as f32 * EDITOR_LINE_H * text_scale;
@@ -2271,11 +2227,9 @@ pub(crate) fn editor_shell_metrics_at_scale(
 
 const COMMAND_COMPLETION_RENDER_LIMIT: usize = 8;
 
-/// Document rows the editor keeps before the completion palette may claim a
-/// single pixel. Six is the smallest run that shows an erroring config line
-/// *in context* — the line above it and the line below — at the default window,
-/// and it is what makes the buffer the larger of the two regions there
-/// (205 px of editor against 151 px of palette at viewport 744x420).
+/// Document rows the editor keeps before the completion palette may claim a pixel: the
+/// smallest run that shows an erroring config line in context at the default window, where it
+/// leaves the buffer the larger region (205 px of editor against 151 px of palette at 744x420).
 const MINIMUM_EDITOR_DOCUMENT_ROWS: usize = 6;
 
 /// Exact editor paint rectangle derived from the same responsive shell metrics
@@ -2817,10 +2771,8 @@ impl UiTree {
         Self { root }
     }
 
-    /// Apply the host's one canonical keyboard-focus key to every standard
-    /// control before any observer is compiled. Paint, hit testing,
-    /// accessibility, and control inspection therefore see the same focus
-    /// state even for controls authored by different native apps.
+    /// Apply the host's one keyboard-focus key to every standard control before any observer
+    /// is compiled, so paint, hit testing, accessibility and inspection agree on focus.
     #[cfg(test)]
     pub(crate) fn apply_focus(mut self, focus: Option<&UiKey>) -> Self {
         self.apply_interaction(focus, None, None, true);
@@ -2891,14 +2843,9 @@ impl UiTree {
 
     /// Compile all observable UI products from one typed tree.
     ///
-    /// CONSUMES the authored tree. Every production caller renders a fresh tree
-    /// and drops it on the next line, and the compiler is the only reader — so
-    /// taking `self` by value lets each node's [`UiContent`] be MOVED into its
-    /// paint node instead of deep-cloned. That clone was the single largest
-    /// per-frame allocation in the native path: for the editor it copied the
-    /// entire visible `TextViewportSpec` projection (up to 256 lines, each an
-    /// owned `String` of up to 4 KiB plus its selection/caret/syntax/diagnostic
-    /// vectors) once per frame, and for a Markdown reader the whole block text.
+    /// Consumes the tree so each node's [`UiContent`] moves into its paint node instead of being
+    /// deep-cloned (for the editor, the whole visible `TextViewportSpec` projection, per frame).
+    /// Every caller renders a fresh tree and drops it.
     pub(crate) fn compile(self, viewport: LogicalRect) -> Result<CompiledUi, CompileError> {
         if !viewport.is_valid() || viewport.is_empty() {
             return Err(CompileError::InvalidViewport);
@@ -2911,11 +2858,8 @@ impl UiTree {
                 ..CompiledUi::default()
             },
         };
-        // From the AUTHORED tree, not the clipped observers — see the field doc.
-        // Hoisted ABOVE the traversal because the traversal now consumes the
-        // tree; it still walks every child (a clipped subtree keeps contributing
-        // its default action), and on the error path its result is discarded by
-        // the `?` exactly as before.
+        // From the authored tree, not the clipped observers (see the field doc), so it runs
+        // before the traversal consumes the tree.
         fn find_default(node: &UiNode) -> Option<(UiKey, ActionId)> {
             if let UiContent::Button(control) = &node.content
                 && control.style == StyleRef::Primary
@@ -3433,10 +3377,9 @@ pub(crate) struct SemanticNode {
     pub(crate) state: Option<ControlState>,
     pub(crate) action: Option<ActionId>,
     pub(crate) audit_id: Option<&'static str>,
-    /// A control's DESCRIPTION — what a screen reader says after its name
-    /// (`Error, CI, 3 minutes ago` on a Messages row). It rode the paint node
-    /// only, so no observer saw it (design ruling 267): every observer —
-    /// the accessibility projection and `inspect … tree` — reads it here.
+    /// A control's description, what a screen reader says after its name (`Error, CI, 3 minutes
+    /// ago` on a Messages row). Every observer, the accessibility projection and `inspect … tree`
+    /// alike, reads it here.
     pub(crate) description: Option<String>,
     /// A list's row off its screen ([`UiNode::offscreen`]): in the tree at
     /// the bounds scrolling would give it, with nothing painted or hit.
@@ -3454,19 +3397,12 @@ pub(crate) struct CompiledUi {
     pub(crate) hits: Vec<HitRegion>,
     pub(crate) semantics: Vec<SemanticNode>,
     pub(crate) focus_order: Vec<UiKey>,
-    /// The page's DEFAULT button — what a bare Return activates when NO
-    /// control holds keyboard focus, mirroring the native "Return fires the
-    /// highlighted default button" convention: the first enabled
-    /// `StyleRef::Primary` button in authoring (= visual) order. Pages follow
-    /// the platform rule of one primary-styled action per state (Software
-    /// Update swaps Primary between "Check for Updates" and "Update to
-    /// Latest Now" as a build stages), so "first" is the unique one. Recorded
-    /// from the AUTHORED tree before viewport clipping — a route's default is
-    /// semantic, not visual, so Return works even with the button scrolled out
-    /// of view (clipped subtrees are absent from every other observer here).
-    /// A focused control and a focused text field's Submit take precedence at
-    /// the call site, and Space never falls back to this (Space activates only
-    /// the focused control on macOS).
+    /// The page's default button, which a bare Return activates when no control holds keyboard
+    /// focus: the first enabled `StyleRef::Primary` button in authoring order (pages keep one
+    /// primary per state). Recorded from the authored tree before clipping, so Return works with
+    /// the button scrolled out of view. A focused control or text field's Submit wins at the
+    /// call site, and Space never falls back to this (on macOS it activates only the focused
+    /// control).
     pub(crate) default_action: Option<(UiKey, ActionId)>,
     /// Every segmented control ([`UiNode::segmented`]): its group's key and
     /// its segments, in order.
@@ -3656,15 +3592,13 @@ impl CompiledUi {
         Some(snap_slider_value(raw, low, high, control.spec.step))
     }
 
-    /// Resolve a pointer x-coordinate to the nearest UTF-8 grapheme boundary
-    /// in the exact bounded text projection painted for `key`.
+    /// Resolve a pointer x-coordinate to the nearest UTF-8 grapheme boundary in the exact
+    /// bounded text projection painted for `key`.
     ///
-    /// The full control remains a useful click target: leading padding clamps
-    /// to the first visible boundary, while trailing padding and a color swatch
-    /// clamp to the last. Width comparisons use the same proportional text
-    /// measurer as paint. The visible projection is capped by
-    /// `TEXT_FIELD_GEOMETRY_BYTES`, so even an adversarial field cannot turn a
-    /// pointer event into an unbounded full-value scan.
+    /// The whole control is a click target: leading padding clamps to the first visible
+    /// boundary, trailing padding and a color swatch to the last. Widths use paint's
+    /// proportional measurer, and the projection is capped by `TEXT_FIELD_GEOMETRY_BYTES`, so
+    /// no field turns a pointer event into an unbounded scan.
     pub(crate) fn text_field_byte_at(&self, key: &UiKey, x: f32) -> Option<usize> {
         if !x.is_finite() {
             return None;
@@ -3786,11 +3720,10 @@ impl CompiledUi {
 
     /// Complete paint/semantic inspection for the exact compiled viewport.
     ///
-    /// The first line and `paint-text` records remain backward compatible with
-    /// the original text-fit audit. The additive `paint-node` and typed records
-    /// make the compiled renderer artifact self-describing: authored geometry,
-    /// effective ancestor clip, semantics, interaction state, focus order, and
-    /// paint-only state are all bound to the same [`CompiledUi`].
+    /// The first line and `paint-text` records keep the text-fit audit's format; the
+    /// `paint-node` and typed records bind authored geometry, effective ancestor clip,
+    /// semantics, interaction state, focus order and paint-only state to the same
+    /// [`CompiledUi`].
     pub(crate) fn paint_audit_lines(&self) -> Vec<String> {
         let audits = self
             .paint
@@ -4055,9 +3988,8 @@ impl CompiledUi {
         overlaps
     }
 
-    /// The `paint-text` record [`Self::paint_audit_lines`] prints for the FIRST
-    /// painted node keyed `key` that has a text-fit audit — the same line, built
-    /// without building the rest of the audit.
+    /// The `paint-text` record [`Self::paint_audit_lines`] prints for the first painted node
+    /// keyed `key` that has a text-fit audit, built without the rest of the audit.
     #[cfg(test)]
     pub(crate) fn text_fit_audit_line(&self, key: &UiKey) -> Option<String> {
         self.paint
@@ -4108,19 +4040,13 @@ impl CompiledUi {
         )
     }
 
-    /// Stable fingerprint of every visible semantic value and paint projection
-    /// plus exact compiled geometry. The host folds this into its repaint and
-    /// raster-cache keys; responsive paint-only copy must therefore participate
-    /// even though accessibility deliberately does not publish it.
+    /// Stable fingerprint of every visible semantic value and paint projection plus exact
+    /// compiled geometry. The host folds it into its repaint and raster-cache keys, so
+    /// responsive paint-only copy participates even though accessibility does not publish it.
     ///
-    /// This runs once per native frame (and once per visible native leaf in the
-    /// split path), so it deliberately touches NO heap: the semantic half hashes
-    /// the typed fields directly rather than round-tripping them through
-    /// `controls_lines()`'s `format!` per node, and the paint fallback streams
-    /// `Debug` straight into the hasher through [`HashFmt`] instead of
-    /// materializing a `String` per node. FxHash replaces SipHash for the same
-    /// reason the rest of the workspace uses it: this is a cache key over
-    /// first-party data, not a hash table exposed to untrusted input.
+    /// It runs once per native frame (and per visible native leaf in the split path), so it
+    /// touches no heap: semantic fields are hashed directly and the paint fallback streams
+    /// `Debug` through [`HashFmt`]. FxHash: a cache key over first-party data, not untrusted input.
     pub(crate) fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
 
@@ -4129,20 +4055,14 @@ impl CompiledUi {
         self.bounds.y.to_bits().hash(&mut hash);
         self.bounds.width.to_bits().hash(&mut hash);
         self.bounds.height.to_bits().hash(&mut hash);
-        // Exactly the fields `controls_lines()` renders — key, role, label,
-        // value, action, state, rect — fed to the hasher untouched. Geometry is
-        // hashed at full precision instead of the audit line's `{:.1}`, which
-        // only ever makes the fingerprint MORE discriminating (the paint loop
-        // below already hashes the same rect bit-exactly).
+        // The fields `controls_lines()` renders (key, role, label, value, action, state, rect),
+        // geometry at full precision rather than the audit line's `{:.1}`.
         for node in &self.semantics {
             hash_semantic_node(node, &mut hash);
         }
-        // Paint can intentionally differ from semantics (compact button labels,
-        // responsive status copy, editor windows, preview animation). Hash the
-        // typed paint product itself so none of those projections can stale-serve
-        // an old retained raster. Large custom paint types keep their bounded
-        // purpose-built hashes; ordinary controls use their complete Debug
-        // projection, which is deterministic for these value-only structs.
+        // Paint can differ from semantics (compact labels, responsive status copy, editor
+        // windows, preview animation), so hash the paint product itself: large custom paint
+        // types by their bounded hashes, ordinary controls by their Debug projection.
         for node in &self.paint {
             node.key.hash(&mut hash);
             node.rect.x.to_bits().hash(&mut hash);
@@ -4169,17 +4089,13 @@ impl CompiledUi {
         hash.finish() | 1
     }
 
-    /// Bootstrap native-app painter. Typed controls lower to the shared
-    /// renderer-independent draw vocabulary, so CPU, GPU, and image capture
-    /// consume identical pixels. Document apps may later lower large text runs
-    /// directly to the retained scene without changing their semantic tree.
+    /// Native-app painter: typed controls lower to the shared renderer-independent draw
+    /// vocabulary, so CPU, GPU and image capture consume identical pixels.
     ///
-    /// One theme plays both parts here — chrome roles AND terminal specimen —
-    /// which is exact whenever chrome follows the terminal. A host forcing the
-    /// chrome side (Linux config `window_theme=light|dark`,
-    /// [`crate::App::chrome_palette_theme`]) must call
-    /// [`Self::tray_with_chrome`] so the Settings preview keeps showing real
-    /// terminal colors on the forced chrome.
+    /// One theme plays both chrome roles and terminal specimen, which is exact whenever chrome
+    /// follows the terminal. A host forcing the chrome side (a forced `window_theme` on Linux or
+    /// Windows, [`crate::App::chrome_palette_theme`]) calls [`Self::tray_with_chrome`] so the
+    /// Settings preview keeps real terminal colors.
     #[cfg(test)]
     pub(crate) fn tray(
         &self,
@@ -4247,21 +4163,13 @@ impl CompiledUi {
 
     /// Assert the cross-observer invariant for every actionable semantic node.
     ///
-    /// [`Compiler::node`] establishes it by construction (one paint node per
-    /// key, and a hit region exactly when the semantic node is actionable and
-    /// enabled), so the per-frame compile does not re-check it; the structural
-    /// tests and the inspection fallback do.
-    ///
-    /// Indexed, not nested-scanned: the three per-semantic linear scans it
-    /// replaces cost `S x (P + 2H)` key comparisons — quadratic in page size.
-    /// One `O(P + H)` sweep builds the tally, then each actionable semantic is
-    /// a single lookup. Semantics are still walked in THEIR authored order so
-    /// the FIRST offending key is the one reported.
+    /// [`Compiler::node`] establishes it by construction (one paint node per key, and a hit
+    /// region exactly when the semantic node is actionable and enabled), so the per-frame
+    /// compile does not re-check it; the structural tests and the inspection fallback do. One
+    /// indexed sweep in authored order, so the first offending key is the one reported.
     pub(crate) fn validate_parity(&self) -> Result<(), CompileError> {
-        // (paint count, hit count, first hit's action) per key. `Compiler::seen`
-        // already rejects duplicate keys before anything is pushed, so a count
-        // can only be 0 or 1 — but the counts are kept exact so this stays a
-        // faithful restatement of the scans, not a restatement of the invariant.
+        // (paint count, hit count, first hit's action) per key. `Compiler::seen` already
+        // rejects duplicate keys, so a count is 0 or 1; it is kept exact anyway.
         let mut index: aterm_hash::FxHashMap<&UiKey, (u32, u32, Option<&ActionId>)> =
             aterm_hash::FxHashMap::with_capacity_and_hasher(
                 self.paint.len(),
@@ -4273,7 +4181,6 @@ impl CompiledUi {
         for node in &self.hits {
             let entry = index.entry(&node.key).or_default();
             entry.1 += 1;
-            // First-wins, matching the `.find(..)` this replaces.
             if entry.2.is_none() {
                 entry.2 = Some(&node.action);
             }
@@ -4297,11 +4204,9 @@ impl CompiledUi {
 
 /// `fmt::Write` sink that streams a formatter's output straight into a hasher.
 ///
-/// The paint fingerprint needs the COMPLETE `Debug` projection of the ordinary
-/// control specs (they are value-only structs, so `Debug` is an exhaustive,
-/// derive-checked field list — a new field cannot silently escape the cache
-/// key). It does not need that projection to exist as a `String`, which is what
-/// `format!("{content:?}").hash(..)` was buying once per paint node per frame.
+/// The paint fingerprint needs the complete `Debug` projection of the value-only control specs
+/// (an exhaustive, derive-checked field list, so a new field cannot escape the cache key), but
+/// not as a `String` per paint node per frame.
 struct HashFmt<'a, H: std::hash::Hasher>(&'a mut H);
 
 impl<H: std::hash::Hasher> fmt::Write for HashFmt<'_, H> {
@@ -4315,16 +4220,13 @@ impl<H: std::hash::Hasher> fmt::Write for HashFmt<'_, H> {
 fn hash_debug<H: std::hash::Hasher>(value: &impl fmt::Debug, hash: &mut H) {
     use fmt::Write as _;
 
-    // Infallible: `HashFmt::write_str` never errors, and `Debug` for these
-    // value-only structs never returns `Err` on its own.
+    // Infallible: `HashFmt::write_str` never errors and these `Debug` impls never fail alone.
     let _ = write!(HashFmt(hash), "{value:?}");
-    // Terminator, so two adjacent nodes cannot alias by concatenation — the
-    // same job `str`'s own `Hash` impl does with its trailing 0xff.
+    // Terminator, so adjacent nodes cannot alias by concatenation (as `str`'s `Hash` does).
     hash.write_u8(0xff);
 }
 
-/// Hash one semantic node's observable fields — the exact set
-/// [`CompiledUi::controls_lines`] renders, minus the `format!` per node.
+/// Hash one semantic node's observable fields: the set [`CompiledUi::controls_lines`] renders.
 fn hash_semantic_node<H: std::hash::Hasher>(node: &SemanticNode, hash: &mut H) {
     use std::hash::Hash;
 
@@ -4425,9 +4327,8 @@ fn hash_text_viewport<H: std::hash::Hasher>(spec: &TextViewportSpec, hash: &mut 
 fn text_viewport_fingerprint(spec: &TextViewportSpec) -> u64 {
     use std::hash::Hasher;
 
-    // FxHash, not SipHash: this walks the whole visible editor projection
-    // (up to 256 lines of up to 4 KiB) on every frame, and it is a repaint
-    // cache key over first-party text, never a hash table under attack.
+    // FxHash: this walks the whole visible editor projection every frame, and it is a repaint
+    // cache key over first-party text, not a table under attack.
     let mut hash = aterm_hash::FxHasher::default();
     hash_text_viewport(spec, &mut hash);
     hash.finish() | 1
@@ -4625,10 +4526,8 @@ fn navigation_is_rail_destination(control: &Control<ButtonSpec>) -> bool {
 /// a segmented control's selection is.
 const FLUENT_RAIL_SELECTION: bool = cfg!(windows);
 
-/// THE decision about what type a button's label is painted in — read by
-/// [`paint_compiled_node`], which draws it, and by [`text_fit_audit`], which
-/// measures and elides it. One function, so the repo's own paint-truth audit
-/// cannot measure a different face from the one that reaches the glass.
+/// The type a button's label is painted in, read by both [`paint_compiled_node`] and
+/// [`text_fit_audit`] so the audit measures the painted face.
 ///
 /// Only ONE state moves it off the regular UI face: a SELECTED rail
 /// DESTINATION. That row's ink IS the accent, and the accent is floored at
@@ -4672,10 +4571,8 @@ fn navigation_label_type(
     }
 }
 
-/// The width a button's label gives up to its attention badge
-/// ([`ButtonSpec::badge`]): the dot and the gap before it. The painter and
-/// [`text_fit_audit`] read this one number, so the audit measures the slot the
-/// glass has.
+/// The width a button's label gives up to its attention badge ([`ButtonSpec::badge`]): the
+/// dot and the gap before it. The painter and [`text_fit_audit`] both read it.
 fn badge_reserve(spec: &ButtonSpec) -> f32 {
     if spec.badge { 16.0 } else { 0.0 }
 }
@@ -4855,11 +4752,8 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
         }
         UiContent::Button(control) => {
             let navigation = control.style == StyleRef::Navigation;
-            // Measure the face that is PAINTED. A selected rail row wears
-            // semibold, a different font with wider advances, so an audit that
-            // measured the regular metrics would report a fit the painter never
-            // draws — the one row that grew ink is exactly the row this audit
-            // exists to catch overflowing.
+            // Measure the face that is painted: a selected rail row's semibold has wider
+            // advances, and that row is the one this audit exists to catch overflowing.
             let (_, face) = navigation_label_type(control);
             let size = native_type_px(TypeStep::Secondary).get();
             let (label, text_x, text_right) = if control.spec.visual_icon.is_some() {
@@ -4940,7 +4834,7 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                 available,
             ))
         }
-        // A plain switch paints no word (design ruling 262).
+        // A plain switch paints no word.
         UiContent::Switch(control) if control.style == StyleRef::Quiet => None,
         UiContent::Switch(control) => {
             let text = if matches!(control.value, SemanticValue::Bool(true)) {
@@ -5263,8 +5157,7 @@ fn hash_markdown_kind<H: std::hash::Hasher>(kind: &MarkdownBlockKind, hash: &mut
 fn markdown_paint_fingerprint(node: &PaintNode, spec: &MarkdownBlockSpec) -> u64 {
     use std::hash::{Hash, Hasher};
 
-    // FxHash, not SipHash: `spec.text` is up to 128 KiB of block source and this
-    // runs per visible block per frame.
+    // FxHash: `spec.text` is up to 128 KiB of block source, hashed per visible block per frame.
     let mut hash = aterm_hash::FxHasher::default();
     node.rect.x.to_bits().hash(&mut hash);
     node.rect.y.to_bits().hash(&mut hash);
@@ -5274,10 +5167,8 @@ fn markdown_paint_fingerprint(node: &PaintNode, spec: &MarkdownBlockSpec) -> u64
     node.clip.y.to_bits().hash(&mut hash);
     node.clip.width.to_bits().hash(&mut hash);
     node.clip.height.to_bits().hash(&mut hash);
-    // The typed kind, not its `markdown_kind_label(..)` `String`: one fewer
-    // heap allocation per visible block per frame, and strictly more
-    // discriminating (the label collapses `Code { language: None }` and
-    // `Code { language: Some("") }` to the same "code:plain" text).
+    // The typed kind, not its `markdown_kind_label` string: no allocation, and the label
+    // collapses `Code { language: None }` and `Some("")` into one "code:plain".
     hash_markdown_kind(&spec.kind, &mut hash);
     spec.text.hash(&mut hash);
     spec.dense.hash(&mut hash);
@@ -5500,13 +5391,9 @@ fn text_typography(spec: &TextSpec) -> (TypeStep, crate::widget::TextFace) {
     text_typography_for(spec.role, spec.style)
 }
 
-/// The size and face the painter will draw a [`TextSpec`] of this role and
-/// style at.
-///
-/// Copy that an author WRAPS has to be measured at exactly these metrics.
-/// Wrapping at any other size hands the painter a line it must then elide,
-/// which is the whole failure [`text_fit_audit`] reports as `overflow=true` —
-/// the reason this pair is published instead of re-derived by each author.
+/// The size and face the painter draws a [`TextSpec`] of this role and style at. Copy an
+/// author wraps must be measured at exactly these metrics: wrapped at any other size, the
+/// painter must elide the line, which [`text_fit_audit`] reports as `overflow=true`.
 pub(crate) fn text_paint_metrics(
     role: SemanticRole,
     style: StyleRef,
@@ -5530,8 +5417,7 @@ fn text_typography_for(role: SemanticRole, style: StyleRef) -> (TypeStep, crate:
             (TypeStep::Body, TextFace::UiBold)
         }
         SemanticRole::Heading => (TypeStep::Title, TextFace::UiBold),
-        // Settings ▸ Messages' technical details (design ruling 262): small
-        // monospace, secondary — a status-sized code line.
+        // Settings ▸ Messages' technical details: small secondary monospace.
         SemanticRole::Status if style == StyleRef::Code => (TypeStep::Caption, TextFace::Mono),
         _ if style == StyleRef::Code => (TypeStep::Body, TextFace::Mono),
         SemanticRole::Status if style == StyleRef::Primary => (TypeStep::Body, TextFace::Ui),
@@ -5606,10 +5492,8 @@ fn paint_compiled_node(
                     color: rgba(roles.separator, 128),
                 });
             } else if matches!(spec.style, StyleRef::Primary | StyleRef::Secondary) {
-                // Settings cards are part of the canvas, not floating popovers:
-                // one flat surface and one separator, with no fake drop shadow.
-                // A one-pixel inner light along the top edge is the whole nod
-                // to dimensionality — a material sheen, not an elevation lie.
+                // Settings cards are part of the canvas, not floating popovers: one flat surface
+                // and one separator, no drop shadow, and a one-pixel inner light along the top.
                 let hero = spec.style == StyleRef::Primary;
                 // A piece of a card that runs on is drawn as the card is,
                 // its open edges carried past a clip at its own bounds (and
@@ -5996,10 +5880,8 @@ fn paint_compiled_node(
             };
             if let Some(icon) = control.spec.visual_icon {
                 if navigation && rect.width >= 96.0 {
-                    // Wide navigation keeps the same renderer-native icon as
-                    // the compact rail, then adds the full semantic label.
-                    // The 32px icon slot is independent of the label width, so
-                    // localization cannot move the pictogram.
+                    // Wide navigation keeps the compact rail's icon and adds the full label; the
+                    // fixed icon slot keeps localization from moving the pictogram.
                     let icon_rect = LogicalRect::new(rect.x + 6.0, rect.y, 28.0, rect.height);
                     paint_button_icon(prims, icon_rect, icon, color);
                     let size = native_type_px(TypeStep::Secondary);
@@ -6206,12 +6088,9 @@ fn paint_compiled_node(
             }
             let track_w = SWITCH_TRACK_WIDTH.min((rect.width - 8.0).max(0.0));
             let track_h = 22.0_f32.min((rect.height - 8.0).max(0.0));
-            // A switch that cannot be operated must LOOK inert: the track
-            // fill sinks toward the surface and the thumb dims to the same
-            // subordinate tone `control_text_color` gives the caption.
-            // Full-strength accent on a disabled switch left the off-macOS
-            // Updates toggle pixel-identical to a live one (2026-08 settings
-            // audit).
+            // A switch that cannot be operated must look inert: the track fill sinks toward the
+            // surface and the thumb dims to the subordinate tone `control_text_color` gives the
+            // caption.
             prims.push(DrawPrim::Capsule {
                 x: rect.right() - track_w - 8.0,
                 y: rect.y + (rect.height - track_h) / 2.0,
@@ -6231,9 +6110,8 @@ fn paint_compiled_node(
                 ),
                 track: rgba(roles.control_track, if enabled { 180 } else { 90 }),
             });
-            // A moving, high-contrast thumb is the primary state cue; color and
-            // the adjacent On/Off text are redundant cues. This reads as a
-            // switch in grayscale and at a glance, unlike the old fill-only bar.
+            // The moving, high-contrast thumb is the primary state cue (it reads in grayscale);
+            // color and the On/Off text are redundant cues.
             prims.push(DrawPrim::Dot {
                 cx: if on {
                     rect.right() - 8.0 - track_h / 2.0
@@ -6571,9 +6449,8 @@ fn paint_compiled_node(
             }
         }
         UiContent::Custom(spec) => {
-            // TWO custom nodes carry a raster lowering; every other custom node
-            // keeps the plain label projection below. The rainbow banner is
-            // pure static decoration — its semantics live entirely on the node.
+            // These custom nodes carry their own raster lowering; every other custom node keeps
+            // the plain label projection below.
             if spec.audit_id == MESSAGES_SEVERITY_AUDIT {
                 paint_messages_severity(prims, rect, spec.value.as_deref(), &roles);
                 return;
@@ -6727,10 +6604,9 @@ fn paint_compiled_node(
     }
 }
 
-/// Bounded, UTF-8-safe visual projection for renderer-native button labels.
-/// Semantics retain the complete authored label; paint receives an ellipsis
-/// that fits the exact UI-face width budget so adjacent picker cells and
-/// trailing affordances can never overdraw one another.
+/// Bounded, UTF-8-safe visual projection for renderer-native button labels: semantics keep the
+/// whole label, paint gets an ellipsis that fits the UI-face width budget, so adjacent cells
+/// and trailing affordances never overdraw.
 fn elide_ui_label(value: &str, max_width: f32, px: f32) -> String {
     elide_text_label(value, max_width, px, crate::widget::TextFace::Ui)
 }
@@ -6752,14 +6628,10 @@ pub(crate) fn fit_native_button_label(value: &str, max_width: f32) -> String {
     )
 }
 
-/// The width the painter needs to draw a native button label WHOLE, in the
-/// exact face and rung [`fit_native_button_label`] elides against.
-///
-/// A picker whose option spellings are owned elsewhere — a config vocabulary,
-/// a catalog of built-in names — cannot shorten its longest label to suit a
-/// button authored from a flat constant. Sizing that button from this measure
-/// is how such a control gets a slot its own widest option occupies, instead
-/// of ellipsizing the value the control exists to state.
+/// The width the painter needs to draw a native button label whole, in the face and rung
+/// [`fit_native_button_label`] elides against. A picker whose option spellings are owned
+/// elsewhere (a config vocabulary, a catalog of names) sizes its button from this so the
+/// widest option fits instead of ellipsizing the value the control exists to state.
 pub(crate) fn native_button_label_width(value: &str) -> f32 {
     visual_text_width(
         value,
@@ -6949,9 +6821,8 @@ fn painted_icons(paint: impl FnOnce()) -> Vec<std::ops::Range<usize>> {
     icons
 }
 
-/// Paint small navigation pictograms entirely from the shared draw IR. These
-/// shapes deliberately use no font glyphs, so the medium Settings rail remains
-/// stable under custom/fallback UI fonts on every backend.
+/// Paint small navigation pictograms from the shared draw IR with no font glyphs, so the
+/// Settings rail stays stable under custom or fallback UI fonts on every backend.
 fn paint_button_icon(
     prims: &mut Vec<crate::widget::DrawPrim>,
     rect: LogicalRect,
@@ -7035,9 +6906,8 @@ fn paint_button_icon_prims(
             prims.push(segment(cx, cy + 2.25, cx + 4.5, cy - 2.25));
         }
         ButtonIcon::ChevronDown => {
-            // A compact filled disclosure triangle. The former disconnected
-            // one-pixel strokes read as an ellipsis after device scaling; three
-            // touching rows retain an unmistakable down affordance at 1×/2×.
+            // A compact filled disclosure triangle: three touching rows stay an unmistakable
+            // down affordance at 1× and 2×, where one-pixel strokes read as an ellipsis.
             prims.push(block(cx - 5.0, cy - 3.0, 10.0, 2.0, 0.0));
             prims.push(block(cx - 3.0, cy - 1.0, 6.0, 2.0, 0.0));
             prims.push(block(cx - 1.0, cy + 1.0, 2.0, 2.0, 0.0));
@@ -7618,12 +7488,11 @@ fn wrapped_piece_ranges(
         .collect()
 }
 
-/// Paint a prose block's visible rows with its inline styles: strong spans in the
-/// bold face, inline code in the mono face on a tinted chip, links in the accent
-/// with an underline, strikethrough with a line through, emphasis tinted toward
-/// the accent (the raster path has no italic UI face). Each segment advances by
-/// its measured width in the face it is drawn with. Wrapping is exactly the flat
-/// path's (`wrap_markdown_text`), so rows and scrolling do not move.
+/// Paint a prose block's visible rows with its inline styles: strong in the bold face, code in
+/// mono on a tinted chip, links in the accent and underlined, strikethrough struck, emphasis
+/// tinted toward the accent (the raster path has no italic UI face). Each segment advances by
+/// its width in its own face; wrapping is the flat path's (`wrap_markdown_text`), so rows and
+/// scrolling do not move.
 fn paint_styled_markdown_rows(
     prims: &mut Vec<crate::widget::DrawPrim>,
     spec: &MarkdownBlockSpec,
@@ -7750,16 +7619,12 @@ fn paint_styled_markdown_rows(
     }
 }
 
-/// Bounded, allocation-conscious wrapping for visible reader blocks. The app
-/// already caps source copied into a block; this cap also bounds paint prims.
+/// Bounded wrapping for visible reader blocks. The app already caps source copied into a
+/// block; this cap also bounds paint prims.
 ///
-/// `skip` is the number of leading wrapped rows the caller does not want. They
-/// are still COUNTED — the row budget and the tail-ellipsis rule below are
-/// defined over the whole wrap, not over the returned window — but never
-/// materialized. Intra-block scrolling therefore costs one `String` per VISIBLE
-/// row instead of one per row from the top of the block; the thousand-line
-/// fence in the shipped Manual, scrolled near its end, used to build and
-/// immediately drop ~970 of them on every frame.
+/// `skip` leading rows are counted (the row budget and the tail-ellipsis rule are defined over
+/// the whole wrap) but never materialized, so intra-block scrolling costs one `String` per
+/// visible row, not one per row from the top of the block.
 fn wrap_markdown_text(
     text: &str,
     max_columns: usize,
@@ -7775,20 +7640,15 @@ fn wrap_markdown_text(
     // scan and wraps exactly as it always did.
     use crate::native_markdown::reader_columns as columns;
     let max_columns = max_columns.max(1);
-    // Upstream caps block text at 128 KiB. Even the adversarial one-byte-line
-    // case is therefore bounded while still allowing a tail viewport far past
-    // the former 512-row ceiling.
+    // Upstream caps block text at 128 KiB, so even one-byte lines stay bounded here.
     let max_lines = max_lines.clamp(1, 131_072);
     let mut output = Vec::with_capacity(max_lines.saturating_sub(skip).min(16));
-    // `produced` is the total row counter this function used to keep implicitly
-    // in `output.len()`; `produced_chars` is the emitted-character total the
-    // tail-ellipsis rule compares against, which must still cover the SKIPPED
-    // prefix or that rule would change meaning.
+    // `produced` counts every row, skipped ones included; `produced_chars` is the emitted
+    // character total the tail-ellipsis rule compares against, and must cover the skipped
+    // prefix too.
     let mut produced = 0usize;
     let mut produced_chars = 0usize;
-    // Hoisted out of the source-line loop: a long fence is thousands of lines,
-    // and a fresh `Vec<char>` per line was thousands of malloc/free pairs per
-    // frame for a buffer that is dead the moment the line is wrapped.
+    // Reused across source lines: a long fence is thousands of lines per frame.
     let mut characters: Vec<char> = Vec::new();
     // A preserved line's breaks between CJK characters, as the char each
     // would start the next row at.
@@ -7845,10 +7705,8 @@ fn wrap_markdown_text(
                         produced_chars += hard_end - start;
                         break;
                     }
-                    // Preserve authored line boundaries and interior spacing,
-                    // but prefer the last word boundary that fits. Exact
-                    // source remains in semantics; paint no longer strands a
-                    // single letter at the edge of a split Markdown pane.
+                    // Preserve authored line boundaries and interior spacing, but prefer the
+                    // last word boundary that fits, so a split pane never strands one letter.
                     let soft_end = characters[start..=hard_end]
                         .iter()
                         .rposition(|character| character.is_whitespace())
@@ -7991,19 +7849,14 @@ fn wrap_markdown_text_window(
 ) -> Vec<String> {
     let take = max_lines.clamp(1, 512);
     let requested = visual_row.saturating_add(take).clamp(1, 131_072);
-    // `skip = visual_row` replaces a `drain(..visual_row)` over rows that were
-    // built only to be thrown away. `truncate` still stands: the word-wrap path
-    // can overshoot the budget by one row (it pushes, then tests), exactly as
-    // it did before.
+    // Truncate: the word-wrap path can overshoot the budget by one row (it pushes, then tests).
     let mut lines = wrap_markdown_text(text, max_columns, visual_row, requested, preserve_lines);
     lines.truncate(take);
     lines
 }
 
-/// Paint the editor from the same bounded, source-addressable projection used by
-/// semantics and pointer mapping. Nothing here walks the full document: even a
-/// multi-gigabyte buffer costs at most the visible line count prepared by the
-/// controller.
+/// Paint the editor from the bounded, source-addressable projection semantics and pointer
+/// mapping use: it never walks the document, only the visible lines the controller prepared.
 fn paint_text_viewport(
     prims: &mut Vec<crate::widget::DrawPrim>,
     rect: LogicalRect,
@@ -8233,9 +8086,8 @@ fn paint_text_viewport(
                 });
                 if *primary && !spec.preedit.is_empty() {
                     let preedit = spec.preedit.replace(['\r', '\n'], "↵");
-                    // The marked range covers complete display cells even
-                    // when the current font cannot paint a cluster. The input
-                    // caret separately follows the text's painted advance.
+                    // The marked range covers whole display cells even where the font cannot
+                    // paint a cluster; the input caret follows the painted advance.
                     let preedit_width =
                         crate::native_editor::editor_display_column(&preedit, preedit.len(), 0)
                             .max(1) as f32
@@ -8318,10 +8170,9 @@ fn paint_text_viewport(
     }
 }
 
-/// Lower one projected editor row into positioned monospace runs. Tabs never
-/// reach the font rasterizer: they become spaces at the canonical four-column
-/// phase, while the following run is placed at its exact cell origin. Source
-/// bytes remain untouched in the projection used by selection and hit-testing.
+/// Lower one projected editor row into positioned monospace runs. Tabs never reach the font
+/// rasterizer: they paint as spaces at the four-column phase and the next run starts at its
+/// exact cell origin. The projection's source bytes are untouched.
 fn paint_editor_line_text(
     prims: &mut Vec<crate::widget::DrawPrim>,
     text_x: f32,
@@ -8484,12 +8335,9 @@ fn column_offset(column: usize, origin: usize) -> usize {
     column.saturating_sub(origin)
 }
 
-/// The resting fill of an INTERACTIVE control. One perceptual step above
-/// `elevated` — controls sit ON cards that are themselves `elevated`, so a
-/// control filled with the card's own color dissolves into it and only its
-/// hairline is left doing the work. The step is small enough that
-/// `text_primary` (contrast-ensured against `surface`) keeps comfortable
-/// margin on top of it.
+/// The resting fill of an interactive control: one perceptual step above `elevated`, since
+/// controls sit on `elevated` cards and would otherwise dissolve into them. Small enough that
+/// `text_primary` keeps a comfortable margin on it.
 fn control_rest_fill(roles: &crate::settings::Roles) -> [u8; 3] {
     control_rest_fill_over(roles.elevated, roles)
 }
@@ -8589,11 +8437,9 @@ pub(crate) fn disclosure_label_room(width: f32) -> f32 {
     (width - BUTTON_LABEL_INSET - DISCLOSURE_LABEL_END).max(0.0)
 }
 
-/// A DISCLOSURE button ([`ControlState::expanded`], design ruling 262): a row
-/// of a list, not a raised control — flush at rest, a quiet wash under the
-/// pointer, pressed or open, the focus ring when the keyboard is on it, and a
-/// trailing chevron — `›` closed, `⌄` open — in the secondary ink. Its label
-/// (when it paints one) is the Secondary step, left.
+/// A disclosure button ([`ControlState::expanded`]): a list row, not a raised control. Flush at
+/// rest, a quiet wash when hovered, pressed or open, the focus ring for the keyboard, and a
+/// trailing chevron (`›` closed, `⌄` open) in the secondary ink; any label is Secondary, left.
 fn paint_disclosure_button(
     prims: &mut Vec<crate::widget::DrawPrim>,
     rect: LogicalRect,
@@ -8691,19 +8537,10 @@ fn paint_disclosure_button(
     }
 }
 
-/// Settings ▸ Messages' severity mark ([`MESSAGES_SEVERITY_AUDIT`]): the
-/// band's drawn icon at the Body step's cap height, centred in the rect after
-/// the rail's room, and the rail for an Error or a Warning. The node's value
-/// is `severity:glyph`: the ICON is the one the band draws for the row's
-/// glyph (`aterm v0.92.0 is ready` keeps its ✓, `aterm crashed last time`
-/// its ⚠ — ruling 263), the severity's own where the glyph has none; the
-/// COLOUR and the rail are always the severity's.
 /// Settings ▸ Messages' scroll thumb ([`MESSAGES_SCROLL_AUDIT`]): `value` is
-/// `first,shown,total` — the entries the view starts at and shows, of how
-/// many. A 3 pt rounded thumb down the rect's trailing edge, inset clear of
-/// the card's rounded corners, its length the share shown (never under
-/// 18 pt) and its place the share scrolled past. Nothing where every entry is
-/// shown.
+/// `first,shown,total` in entries. A 3 pt rounded thumb down the trailing edge, inset clear of
+/// the card's corners, its length the share shown (at least 18 pt) and its place the share
+/// scrolled past; nothing when every entry is shown.
 fn paint_messages_scroll(
     prims: &mut Vec<crate::widget::DrawPrim>,
     rect: LogicalRect,
@@ -8836,10 +8673,8 @@ fn paint_messages_severity(
             fill: rgba(color, 255),
         });
     }
-    // The icon's square: the Body step's capital height reads at about 0.7
-    // of its pixel size; the icon's own raster fits its cap to 0.68 of the
-    // square, so a square of the step's size stands the mark as tall as the
-    // row's capitals.
+    // The Body step's capitals stand about 0.7 of its pixel size and the icon raster fits its
+    // cap to 0.68 of its square, so a square of the step's size matches the row's capitals.
     let size = native_type_px(TypeStep::Body).get().round();
     let x = rect.x + 3.0 + ((rect.width - 3.0 - size) / 2.0).max(0.0);
     let y = rect.y + ((rect.height - size) / 2.0).max(0.0);
@@ -9086,10 +8921,9 @@ fn control_text_color(state: ControlState, roles: &crate::settings::Roles) -> [u
     }
 }
 
-/// Native tab apps use an OS-like, zoom-independent type ladder. We still mint
-/// every size through the repository's named type-scale proof token, but pick
-/// the base that lands exactly on the app-shell contract rather than inheriting
-/// the terminal's monospace zoom: 24 / 20 / 13 / 13 / 11 logical pixels.
+/// Native tab apps use an OS-like type ladder independent of the terminal's zoom: bases chosen
+/// so the named type-scale steps land on 24 / 20 / 13 / 13 / 11 logical pixels, then scaled by
+/// the text-size preference.
 pub(crate) fn native_type_px(step: crate::type_scale::TypeStep) -> crate::type_scale::StepPx {
     use crate::type_scale::TypeStep;
 
@@ -9108,10 +8942,7 @@ fn mix_rgb(a: [u8; 3], b: [u8; 3], amount: f32) -> [u8; 3] {
     crate::native_appearance::mix_srgb(a, b, amount)
 }
 
-/// The Top Settings hero banner's `(sky, rim)` — the ONE place the rainbow
-/// banner's surface is decided, resolved from the SAME role palette every other
-/// Settings card paints from ([`crate::settings::paint_rainbow_banner`] takes
-/// them the way [`crate::settings::paint_settings_aurora`] takes `surface`).
+/// The Top Settings hero banner's `(sky, rim)`, from the role palette the other cards use.
 ///
 /// A SKY is the most OPEN neutral the palette has, so the base is whichever of
 /// `surface` and `elevated` MEASURES lighter. It used to be picked by proxy —
@@ -9177,23 +9008,13 @@ fn mix_rgb(a: [u8; 3], b: [u8; 3], amount: f32) -> [u8; 3] {
 /// the hold never fires — all four shipping appearance states are byte-identical
 /// with it and without it.
 fn rainbow_banner_sky(roles: &crate::settings::Roles) -> ([u8; 3], [u8; 3]) {
-    // `contrast_ratio` against black is monotone in relative luminance, so this
-    // is a luminance probe — the same one the banner's test uses to state the
-    // property "a sky is never heavier than the cards standing on it".
+    // Contrast against black is monotone in relative luminance: a luminance probe.
     let openness = |c: [u8; 3]| crate::native_appearance::contrast_ratio(c, [0, 0, 0]);
     let base = if openness(roles.elevated) >= openness(roles.surface) {
         roles.elevated
     } else {
         roles.surface
     };
-    // Which way does the pour go? MEASURE it, on the same probe and against the
-    // same palette the base was chosen with: the leaf green either sits above
-    // this base, in which case pouring it LIFTS the sky and it can take a real
-    // pour, or it does not, and every part of the pour is a SHADE the sky pays
-    // for in height. That comparison is the question `success_tint` is asking
-    // when it asks for a side — and unlike `surface_is_dark`, it is asked of the
-    // two colours that are actually about to be mixed, so it cannot be right
-    // about the window and wrong about the mix.
     let lift = openness(crate::native_appearance::success_tint(true)) >= openness(base);
     let tint = crate::native_appearance::success_tint(lift);
     let wash = if lift { 0.14 } else { 0.045 };
@@ -9211,9 +9032,7 @@ pub(crate) fn readable_secondary(roles: &crate::settings::Roles) -> [u8; 3] {
 }
 
 fn quiet_text(roles: &crate::settings::Roles) -> [u8; 3] {
-    // Quiet is hierarchy, never "disabled". Keep authored supporting copy on
-    // the same contrast-conditioned secondary ramp; only disabled controls use
-    // tertiary text.
+    // Quiet is hierarchy, never "disabled": only disabled controls use tertiary text.
     readable_secondary(roles)
 }
 
@@ -9371,10 +9190,8 @@ pub(crate) fn visible_label_in_name(visual: &str, name: &str) -> bool {
 }
 
 struct Compiler {
-    // FxHash, not SipHash: this set exists only to reject duplicate keys inside
-    // one compile, is keyed by internal authored keys (never untrusted input),
-    // and is rebuilt from scratch every native frame — the DoS resistance was
-    // paying for nothing.
+    // FxHash: rejects duplicate authored keys within one compile and is rebuilt every frame;
+    // no untrusted input reaches it.
     seen: FxHashSet<UiKey>,
     /// Segments that are not their control's Tab stop ([`UiNode::segmented`]).
     not_tab_stops: FxHashSet<UiKey>,
@@ -9403,10 +9220,7 @@ pub(crate) fn segments_of(children: &[UiNode]) -> Vec<(UiKey, ControlState)> {
 }
 
 impl Compiler {
-    /// Takes the node BY VALUE so its `content` can be moved into the paint
-    /// node. Everything else the node carries (`layout`, `children`) is still
-    /// read in full afterwards — the destructure below just separates the field
-    /// that moves from the fields that do not.
+    /// Takes the node by value so its `content` moves into the paint node.
     fn node(
         &mut self,
         node: UiNode,
@@ -9473,8 +9287,7 @@ impl Compiler {
             return Err(CompileError::CustomWithoutAudit(key));
         }
 
-        // Runs BEFORE `content` moves into the paint node; `semantic()` clones
-        // only the labels it needs.
+        // Before `content` moves into the paint node; `semantic()` clones only the labels.
         let projection = content.semantic();
         let description = content.description();
         let look_first = content.look_first();
@@ -10175,8 +9988,7 @@ pub(crate) mod tests {
                 roles.elevated,
                 openness(roles.elevated),
             );
-            // And it is MINT, not mud — the wash has to arrive as green, which
-            // a wash toward a contrast-clamped near-black green does not.
+            // And mint, not mud: the wash arrives as visible green.
             let base = if openness(roles.elevated) >= openness(roles.surface) {
                 roles.elevated
             } else {
@@ -10186,7 +9998,7 @@ pub(crate) mod tests {
                 green_lean(sky) - green_lean(base) >= VISIBLE_LEAN,
                 "{label}: the banner sky {sky:?} carries no visible green over its base {base:?}",
             );
-            // The hairline keeps the same job it has on every other state.
+            // The hairline shows on its sky without outshouting the page's ink.
             let rim_vs_sky = contrast_ratio(rim, sky);
             assert!(
                 rim_vs_sky > 1.08,
@@ -10402,39 +10214,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// SEMIBOLD is a rail DESTINATION's mark, and only a destination's.
-    ///
-    /// `StyleRef::Navigation` dresses three shapes, and the marks are not all
-    /// affordable on all of them. The wash, the accent ink and the rim cost
-    /// nothing but colour and go everywhere. The rail BAR costs no width either
-    /// but asserts a rail edge, so it goes to the rows that are stacked in a
-    /// column of their own and not to a toolbar chip. SEMIBOLD costs WIDTH, in a
-    /// slot that was measured in the regular face, so it goes only where an
-    /// author left slack to spend:
-    ///
-    /// * the Settings rail row — one of 16 authored labels in a rail the same
-    ///   author sized. `Keyboard & Input`, the longest, clears the narrower rail
-    ///   by 7pt in semibold. It grows ink.
-    /// * the markdown OUTLINE row — a document heading capped at 32 characters,
-    ///   in a column sized for the reader. It is rail-SHAPED and keeps the bar,
-    ///   but `Getting started with aterm` measures 159.7pt regular in its 166pt
-    ///   slot and 173.1pt semibold, so growing its ink would spell "selected" by
-    ///   deleting the last word. It does not.
-    /// * the markdown mode CHIP — `Length::Fixed` at
-    ///   `markdown_toolbar_label_width`, the regular advance of its own word plus
-    ///   a fixed pad. No slack exists by construction; it was painting `Previ…`
-    ///   in a slot that fits `Preview`. No semibold, and no bar either.
-    ///
-    /// The two that give up semibold keep every mark that costs them no width.
+    /// Semibold goes only to a rail destination, whose slot has slack to grow ink. The outline
+    /// row (a heading of up to 32 characters) keeps the bar but stays regular, and the mode chip
+    /// (sized to its own regular word) gets neither; both keep the marks that cost no width.
     #[test]
     fn semibold_goes_only_where_a_slot_was_sized_with_room_to_grow_ink() {
         use crate::native_appearance::forced_chrome_theme;
         use crate::widget::{DrawPrim, TextFace};
         use aterm_render::Theme;
 
-        // Measure on the faces the app really installs — a semibold that is
-        // silently the regular face proves nothing about a slot measured for
-        // regular.
+        // On the faces the app installs: a semibold that is silently the regular face proves
+        // nothing.
         crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
 
         let rect = LogicalRect::new(8.0, 40.0, 180.0, 34.0);
@@ -10453,11 +10243,9 @@ pub(crate) mod tests {
                 joins: Joins::default(),
             }
         };
-        // The three shapes that actually ship, exactly as their authors build
-        // them: the Settings rail row (a route pictogram, and a label only at
-        // large Dynamic Type), the markdown outline row (a bare document
-        // heading, left aligned), and the markdown mode chip (a centred
-        // `visual_label` in a measured slot).
+        // The three shapes that ship, as their authors build them: the Settings rail row (a
+        // route pictogram), the outline row (a bare left-aligned heading) and the mode chip (a
+        // centred `visual_label` in a measured slot).
         let rail_row = || ButtonSpec::new("Appearance").visual_icon(ButtonIcon::Home);
         let outline_row = || ButtonSpec::new("A document heading");
         let mode_chip = || ButtonSpec::new("Preview mode").visual_label("Preview");
@@ -10485,7 +10273,7 @@ pub(crate) mod tests {
         };
         // The label is the accent AS TEXT: its hue at the text floor.
 
-        // SEMIBOLD is only the destination's.
+        // Semibold is only the destination's.
         assert!(
             semibold(&paint(rail_row(), true)),
             "the selected rail destination is not semibold — selection reads as nothing"
@@ -10509,9 +10297,8 @@ pub(crate) mod tests {
             "a selected toolbar chip lost its accent rim"
         );
 
-        // The defect itself, at the AUTHORED slot: `markdown_toolbar_label_width`
-        // is the regular advance of the word plus a fixed pad, floored at the
-        // touch minimum. The selected chip has to paint the whole word in it.
+        // At the authored slot (`markdown_toolbar_label_width`: the word's regular advance plus
+        // a fixed pad, floored at the touch minimum) the selected chip paints its whole word.
         let px = native_type_px(TypeStep::Secondary).get();
         let slot = (crate::tray_raster::ui_text_width("Preview", 13.0) + 20.0)
             .ceil()
@@ -10637,16 +10424,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// The paint-truth audit measures the face the painter DRAWS.
-    ///
-    /// [`text_fit_audit`] is the repo's own overflow sensor: it re-derives the
-    /// label's slot and re-runs the elision, and its answer is what
-    /// introspection reports. A selected rail row paints in semibold — a
-    /// different font with different advances — so an audit that elided with the
-    /// REGULAR metrics would report a fit for a string the painter never draws,
-    /// and would be blindest at exactly the row that grew ink. Both now go
-    /// through [`navigation_label_type`], so this compares the two answers
-    /// directly, on labels long enough that the elision is doing work.
+    /// The paint-truth audit ([`text_fit_audit`]) elides the same label the painter paints,
+    /// semibold included, on labels long enough for elision to matter.
     #[test]
     fn the_paint_audit_elides_the_same_label_the_painter_paints() {
         use crate::native_appearance::forced_chrome_theme;

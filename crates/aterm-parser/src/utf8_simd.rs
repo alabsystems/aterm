@@ -242,15 +242,11 @@ mod tests {
         assert_eq!(bi, RUN_CAP * 3);
     }
 
-    /// THE FIRST SEQUENCE IS THE SHIPPED SCALAR ORACLE'S, FOR EVERY INPUT
-    /// CLASS. Every lead byte x every second byte x third and fourth bytes over
-    /// the representatives of every class the decoder tells apart (ASCII, the
-    /// continuation range's edges and the `0x90`/`0xA0` splits that decide
-    /// overlongs, surrogates and the plane bound, a lead, `0xFF`): when
-    /// `Parser::decode_multibyte_char` takes a valid first sequence, the bulk
-    /// lane consumes at least it and its first char is the oracle's; when the
-    /// oracle takes nothing, the bulk lane consumes and emits nothing, so the
-    /// caller's scalar boundary step always makes progress.
+    /// Every lead x every second byte x representative third and fourth bytes
+    /// (the edges that decide overlongs, surrogates and the plane bound): when
+    /// `Parser::decode_multibyte_char` decodes a first sequence, the bulk lane
+    /// consumes at least it and emits the same first char; otherwise it
+    /// consumes and emits nothing.
     #[test]
     fn bulk_first_sequence_matches_scalar_for_every_lead_and_continuation_class() {
         const CLASSES: [u8; 10] = [0x00, 0x7F, 0x80, 0x8F, 0x90, 0x9F, 0xA0, 0xBF, 0xC0, 0xFF];

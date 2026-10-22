@@ -156,8 +156,8 @@ fn the_real_center_follows_the_model_in_lock_step() {
                     assert_eq!(c.file_digest(stamp(wall), now), open);
                 }
                 "Resurface" => {
-                    // time passes: 91 days clear every resurface span, the
-                    // backed-off ones (at most 90 days) included
+                    // 91 days clear every resurface span, the backed-off ones (at most 90
+                    // days) included
                     wall += 91 * DAY_MS;
                     filed_facts.append(&mut recent);
                 }

@@ -649,6 +649,9 @@ impl Item for Guard {
     fn effect(&self) -> Effect {
         self.inner.effect()
     }
+    fn activation(&self) -> Option<Arc<dyn crate::items::Activation>> {
+        self.inner.activation()
+    }
     fn after(&self) -> Vec<String> {
         self.inner.after()
     }

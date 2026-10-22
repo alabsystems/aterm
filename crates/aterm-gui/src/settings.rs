@@ -121,12 +121,9 @@ pub(crate) fn u32_rgb(c: u32) -> [u8; 3] {
     ]
 }
 
-/// The width of `s` at size `px` in the MONO (terminal) face — REAL advances from
-/// the chrome font stack (the user's terminal face, DejaVu strictly as coverage
-/// fallback), replacing the old hardcoded `0.6 em × chars` estimate that drifted
-/// from every non-DejaVu face. Regular weight; measure bold runs via
-/// [`crate::tray_raster::measure_text`] directly. UI-face chrome measures with
-/// [`ui_text_width`] instead.
+/// The width of `s` at `px` in the mono (terminal) face, from real advances in the chrome
+/// font stack. Regular weight; measure bold runs with [`crate::tray_raster::measure_text`].
+/// UI-face chrome measures with [`crate::tray_raster::ui_text_width`].
 pub(crate) fn text_w(s: &str, px: f32) -> f32 {
     crate::tray_raster::measure_text(s, px, TextWeight::Regular)
 }

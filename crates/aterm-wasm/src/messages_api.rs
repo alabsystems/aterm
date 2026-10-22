@@ -1381,15 +1381,10 @@ mod tests {
         false
     }
 
-    /// THE PET UNDER A BAND IS PRESSED WHERE IT IS DRAWN. The band's rows
-    /// land above the grid after the effects ran, and the compose moves the
-    /// pet's sprite down with the grid; the page presses in canvas pixels,
-    /// band included (ruling 347). So with a row committed, a press at the
-    /// drawn body's centre or its feet pets the cat, and a press on the text
-    /// half a row above the drawn body passes to the terminal — where a hit
-    /// rect left a band row too high swallowed that press and let a press on
-    /// the cat's feet start a selection. Without the band the same holds (the
-    /// control).
+    /// The pet under a band is pressed where it is drawn: the page presses in
+    /// canvas pixels, band included, so with a row committed a press on the drawn
+    /// body's centre or feet pets the cat and a press on the text half a row
+    /// above passes to the terminal. Without the band the same holds (control).
     #[test]
     fn the_pet_is_pressed_where_the_band_draws_it() {
         let (mut t, t0) = clocked(12, 60);
@@ -1432,15 +1427,9 @@ mod tests {
         }
     }
 
-    /// A STILL POINTER'S LIT CHIP FOLLOWS THE LAYOUT (ruling 441 (f)), under
-    /// ruling 341's "a pointer lights only where a press acts": an echo is
-    /// `Hit::Nothing` and a press there is `OK none`, so the chip the pointer
-    /// lit never stays lit on the echo a row leaves (the web twin of rulings
-    /// 417 (k) and 418 (a)). A progress row the pointer rests on ends `done …
-    /// ok` (a Complete echo): the band draws as a twin's that took the same
-    /// lines with no pointer at all. (A Details press on a plain warning
-    /// leaves no echo — only an animated row records one — so the press itself
-    /// does not reach this.)
+    /// A still pointer's lit chip follows the layout: when the progress row under
+    /// the pointer ends `done … ok`, its echo is `Hit::Nothing`, so the band draws
+    /// as a twin's that took the same lines with no pointer.
     #[test]
     fn a_still_pointers_chip_never_lights_the_echo() {
         let (mut t, t0) = clocked(12, 60);
@@ -1490,12 +1479,8 @@ mod tests {
         );
     }
 
-    /// A RESTORE MOVES THE PAGE'S `rev=` (ruling 441 (e)). Ruling 388 (5):
-    /// the site reads the page again after a notice or a tick, "the head's
-    /// `rev=` says whether the log moved", and `MessageCenter::revision` bumps
-    /// on every observable change. A restore that moves the log from no
-    /// records to two moves `rev=` too. Control: a post after the restore
-    /// moves it.
+    /// A restore moves the page's `rev=`, as any observable log change does; a
+    /// post after it moves it again (control).
     #[test]
     fn the_restore_moves_the_pages_rev() {
         let (mut prev, p0) = clocked(20, 80);

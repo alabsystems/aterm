@@ -678,6 +678,298 @@ fn a_really_cleared_tail_leaves_and_takes_only_its_own_spaces() {
     );
 }
 
+/// A partial repaint can outlast the release animation under load. The
+/// standing prefix keeps the typing run alive, so the original suffix must
+/// still be recoverable when its same glyphs return and typing resumes.
+#[test]
+fn a_stalled_repaint_restores_the_suffix_when_typing_resumes() {
+    for stall_ms in [40, 300, 800] {
+        let mut h = Host::new(false);
+        h.type_str("hello brave new world");
+        h.idle(200);
+        let cut = COL0 + "hello ".len();
+        h.label = "stalled repaint".into();
+        h.program(format!("\x1b[?2026h\x1b[?25l\x1b[{};{}H\x1b[K", ROW + 1, cut + 1).as_bytes());
+        h.idle(stall_ms);
+        h.label = "same text returned".into();
+        h.repaint(Split::Whole);
+        let returned = h.census.last().expect("returned frame");
+        let missing: Vec<_> = (COL0..COL0 + h.text.len())
+            .filter(|&col| !returned.live.contains(&(col as u16)))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{stall_ms}ms repaint: restored text lost suffix cells {missing:?} before the next key\n{}",
+            h.story()
+        );
+        let y = i32::from(ROW) * CH as i32 + CH as i32 / 2;
+        for col in [cut + 3, cut + 6, COL0 + h.text.len() - 2] {
+            let x = (col * CW + CW / 2) as i32;
+            assert!(
+                h.glow.under_quads().iter().any(|q| q.alpha >= 50
+                    && i32::from(q.x) <= x
+                    && x < i32::from(q.x) + i32::from(q.w)
+                    && i32::from(q.y) <= y
+                    && y < i32::from(q.y) + i32::from(q.h)),
+                "{stall_ms}ms repaint: restored ownership was not painted on its first frame at col {col}"
+            );
+        }
+        h.key_after('!', KEY_MS);
+        h.idle(200);
+        let restored = h.census.last().expect("restored frame");
+        let missing: Vec<_> = (COL0..COL0 + h.text.len())
+            .filter(|&col| !restored.live.contains(&(col as u16)))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{stall_ms}ms repaint: same typing run lost suffix cells {missing:?}\n{}",
+            h.story()
+        );
+    }
+}
+
+#[test]
+fn stalled_repaint_custody_is_dark_and_expires_with_its_run() {
+    let mut h = Host::new(false);
+    h.type_str("hello brave new world");
+    h.idle(200);
+    let cut = COL0 + "hello ".len();
+    h.program(format!("\x1b[?25l\x1b[{};{}H\x1b[K", ROW + 1, cut + 1).as_bytes());
+    h.idle(300);
+    assert!(
+        h.glow
+            .v2_ribbon()
+            .expect("ribbon")
+            .cells()
+            .iter()
+            .any(|cell| { usize::from(cell.col) >= cut && cell.released_at.is_some() }),
+        "partial release still has exact identities in custody"
+    );
+    let cov = coverage(&h.glow, geom(), ROW);
+    // The standing prefix's final boundary is at `cut`; everything beyond
+    // that edge belongs only to the released suffix.
+    assert!(
+        cov[cut + 1..COL0 + h.text.len()].iter().all(|&c| c == 0),
+        "custody paints no light"
+    );
+    assert!(
+        h.glow
+            .v2_ribbon()
+            .expect("ribbon")
+            .field_at(ROW, cut as u16)
+            .is_none(),
+        "custody owns no field"
+    );
+    h.idle(3000);
+    assert!(
+        h.glow.v2_ribbon().expect("ribbon").at_rest(),
+        "custody expires with the original run"
+    );
+    assert!(
+        h.glow
+            .v2_ribbon()
+            .expect("ribbon")
+            .next_change_deadline(h.now)
+            .is_none(),
+        "expired custody schedules no wake"
+    );
+    h.repaint(Split::Whole);
+    assert!(
+        h.glow.v2_ribbon().expect("ribbon").at_rest(),
+        "a late same-glyph repaint earns no new light"
+    );
+}
+
+#[test]
+fn abandoning_a_stalled_repaints_run_retires_its_custody() {
+    let mut h = Host::new(false);
+    h.type_str("hello brave new world");
+    h.idle(200);
+    let cut = COL0 + "hello ".len();
+    h.program(format!("\x1b[?25l\x1b[{};{}H\x1b[K", ROW + 1, cut + 1).as_bytes());
+    h.idle(300);
+    h.text.clear();
+    h.caret = 0;
+    h.repaint(Split::Whole);
+    h.idle(((RETRACT_DUR_S + RETRACT_FADE_S) * 1000.0) as u64 + 3 * FRAME_MS);
+    assert!(
+        h.glow.v2_ribbon().expect("ribbon").at_rest(),
+        "a whole clear releases all partial custody on its existing swoosh"
+    );
+    assert!(
+        h.glow
+            .v2_ribbon()
+            .expect("ribbon")
+            .next_change_deadline(h.now)
+            .is_none(),
+        "a cleared run schedules no custody wake"
+    );
+}
+
+#[test]
+fn replaced_glyphs_revoke_a_stalled_repaints_custody() {
+    let mut h = Host::new(false);
+    h.type_str("hello brave new world");
+    h.idle(200);
+    let cut = COL0 + "hello ".len();
+    h.program(format!("\x1b[?25l\x1b[{};{}H\x1b[K", ROW + 1, cut + 1).as_bytes());
+    h.idle(300);
+    let original = h.text.clone();
+    h.text = format!("hello {}", "Z".repeat(original.len() - "hello ".len()));
+    h.repaint(Split::Whole);
+    h.idle((RETIRE_MELT_S * 1000.0) as u64 + 3 * FRAME_MS);
+    assert!(
+        h.glow
+            .v2_ribbon()
+            .expect("ribbon")
+            .cells()
+            .iter()
+            .all(|cell| usize::from(cell.col) < cut),
+        "replacement retires every released original glyph"
+    );
+    h.text = original;
+    h.repaint(Split::Whole);
+    assert!(
+        h.glow
+            .v2_ribbon()
+            .expect("ribbon")
+            .cells()
+            .iter()
+            .all(|cell| usize::from(cell.col) < cut),
+        "a later same-glyph repaint cannot restore revoked custody"
+    );
+}
+
+#[test]
+fn a_stalled_repaints_dark_tail_follows_its_standing_prefix() {
+    let mut h = Host::new(false);
+    h.type_str("hello brave new world");
+    h.idle(200);
+    let cut = COL0 + "hello ".len();
+    h.program(format!("\x1b[?25l\x1b[{};{}H\x1b[K", ROW + 1, cut + 1).as_bytes());
+    h.idle(300);
+    h.program(
+        format!(
+            "\x1b[{};1H\x1b[2K\x1b[{};1H\x1b[2K│ > hello \x1b[{};{}H\x1b[?25h",
+            ROW + 1,
+            ROW,
+            ROW,
+            cut + 1
+        )
+        .as_bytes(),
+    );
+    let text = h.text.clone();
+    h.program(
+        format!(
+            "\x1b[?25l\x1b[{};1H\x1b[2K│ > {text}\x1b[{};{}H\x1b[?25h",
+            ROW,
+            ROW,
+            COL0 + text.len() + 1
+        )
+        .as_bytes(),
+    );
+    let ribbon = h.glow.v2_ribbon().expect("ribbon");
+    let missing: Vec<_> = (COL0..COL0 + text.len())
+        .filter(|&col| {
+            !ribbon
+                .cells()
+                .iter()
+                .any(|cell| cell.row == ROW - 1 && usize::from(cell.col) == col && !cell.leaving())
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "moved prefix stranded its dark tail: {missing:?}"
+    );
+}
+
+#[test]
+fn a_stalled_repaints_dark_tail_shifts_with_its_standing_prefix() {
+    for insert_at in [0, 2] {
+        let mut h = Host::new(false);
+        h.type_str("hello brave new world");
+        h.idle(200);
+        let cut = COL0 + "hello ".len();
+        h.program(format!("\x1b[?25l\x1b[{};{}H\x1b[K", ROW + 1, cut + 1).as_bytes());
+        h.idle(300);
+        let prefix = "hello ";
+        let shifted = format!("{}++{}", &prefix[..insert_at], &prefix[insert_at..]);
+        h.program(
+            format!(
+                "\x1b[{};1H\x1b[2K│ > {shifted}\x1b[{};{}H\x1b[?25h",
+                ROW + 1,
+                ROW + 1,
+                cut + 3
+            )
+            .as_bytes(),
+        );
+        let text = h.text.clone();
+        let shifted = format!("{}++{}", &text[..insert_at], &text[insert_at..]);
+        h.program(
+            format!(
+                "\x1b[?25l\x1b[{};1H\x1b[2K│ > {shifted}\x1b[{};{}H\x1b[?25h",
+                ROW + 1,
+                ROW + 1,
+                COL0 + text.len() + 3
+            )
+            .as_bytes(),
+        );
+        let ribbon = h.glow.v2_ribbon().expect("ribbon");
+        let missing: Vec<_> = (0..text.len())
+            .map(|i| COL0 + i + if i >= insert_at { 2 } else { 0 })
+            .filter(|&col| {
+                !ribbon
+                    .cells()
+                    .iter()
+                    .any(|cell| cell.row == ROW && usize::from(cell.col) == col && !cell.leaving())
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "insert at {insert_at}: shifted prefix stranded its dark tail: {missing:?}"
+        );
+    }
+}
+
+#[test]
+fn moving_only_part_of_a_standing_prefix_does_not_guess_where_its_dark_tail_went() {
+    let mut h = Host::new(false);
+    h.type_str("hello brave new world");
+    h.idle(200);
+    let cut = COL0 + "hello brave".len();
+    h.program(format!("\x1b[?25l\x1b[{};{}H\x1b[K", ROW + 1, cut + 1).as_bytes());
+    h.idle(300);
+    h.program(
+        format!(
+            "\x1b[{};1H\x1b[2K│ > hello \x1b[{};{}Hbrave\x1b[{};{}H\x1b[?25h",
+            ROW + 1,
+            ROW,
+            COL0 + "hello ".len() + 1,
+            ROW,
+            cut + 1
+        )
+        .as_bytes(),
+    );
+    let ribbon = h.glow.v2_ribbon().expect("ribbon");
+    let held: Vec<_> = ribbon
+        .cells()
+        .iter()
+        .filter(|cell| cell.released_at.is_some() && usize::from(cell.col) >= cut)
+        .collect();
+    assert!(!held.is_empty(), "the original run still has dark custody");
+    assert!(
+        held.iter().all(|cell| cell.row == ROW),
+        "a partial visible split cannot choose a new owner for dark custody"
+    );
+    assert!(
+        ribbon
+            .cells()
+            .iter()
+            .any(|cell| cell.row == ROW - 1 && !cell.leaving()),
+        "the witnessed partial move actually happened"
+    );
+}
+
 /// The other control: a whole run re-laid one or two rows away (the composer moved, its old row
 /// blanked) is carried with its clocks to where its glyphs stand (`Witness::follow_runs`,
 /// `Ribbon::translate_run`), so no light stays under moved text. Text that is gone rather than

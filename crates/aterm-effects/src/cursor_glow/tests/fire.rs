@@ -67,7 +67,6 @@ fn typing_wrap_no_meteor_deliberate_enter_still_meteors() {
         "a typing wrap flies no meteor (got {})",
         wrapper.fire_meteors.len()
     );
-    // The only wake is a single spark at the landing (5,0) — nothing right of it.
     assert!(
         !wrapper.sparks.iter().any(|s| s.row == 5 && s.col >= 1),
         "no wrap smear right of the landing: {:?}",
@@ -78,7 +77,6 @@ fn typing_wrap_no_meteor_deliberate_enter_still_meteors() {
             .map(|s| s.col)
             .collect::<Vec<_>>()
     );
-    // A second later the landing row right of the cursor is totally dark.
     wrapper.tick(
         Some((5, 0)),
         t0 + Duration::from_millis(1000),
@@ -297,10 +295,10 @@ fn emberforge_thermal_model_proves_and_catches_heating_quench() {
     aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
 }
 
-/// Tier-1 conformance: drive the real fire integrators at 16 ms ticks through a
-/// stoke burst and a backspace quench run, project `disp_t` onto the model's
-/// tier, and check every observed transition against the derived machine.
-/// Negative control: no frame climbs two tiers.
+/// Tier-1 conformance: drive the real fire integrators through a stoke burst, a
+/// backspace quench run and an idle cool-down, project `disp_t` onto the model's
+/// tier, and check every observed transition against the derived machine (no
+/// frame moves more than one tier).
 #[test]
 fn emberforge_real_thermal_conforms_to_model() {
     let model = emberforge_thermal_model();
@@ -334,7 +332,7 @@ fn emberforge_real_thermal_conforms_to_model() {
         prev_tier.set(cur_tier);
     };
 
-    // Stoke: 60 forward keys at 40 ms with a tick per frame (16 ms grid).
+    // Stoke: 60 forward keys at 40 ms, one tick per key.
     glow.tick(Some((row, col)), t, &c, g, &mut out);
     for _ in 0..60 {
         t += Duration::from_millis(40);
@@ -360,8 +358,8 @@ fn emberforge_real_thermal_conforms_to_model() {
         glow.tick(Some((row, col)), t, &c, g, &mut out);
         check(&glow, &mut state);
     }
-    // Idle: frame ticks with no moves until fully cold (the coal bed's
-    // 6 s τ needs ~30 s to fall under the snap threshold).
+    // Idle until fully cold: the coal bed's 6 s τ needs ~30 s to fall under the
+    // snap threshold.
     for _ in 0..2000 {
         t += Duration::from_millis(16);
         glow.tick(Some((row, col)), t, &c, g, &mut out);
@@ -621,7 +619,6 @@ fn fire_field_full_blaze_respects_quad_budget_with_head_band() {
     t += Duration::from_millis(120);
     glow.tick(Some((30, 10)), t, &c, g, &mut out); // strike frame
     assert!(out.len() <= CursorGlow::MAX_QUADS);
-    // Window-space invariants: every quad inside the window, single-band.
     for q in &out {
         assert!((q.row as usize) < g.rows, "row tag in grid: {q:?}");
         assert!(
@@ -1228,9 +1225,8 @@ fn fire_row_change_snuffs_the_old_lines_trail() {
         glow.sparks.iter().all(|s| s.row == 3),
         "the old line's trail is snuffed after a line change"
     );
-    // The landing cell's curtain may tower into the band above it (the fire's
-    // height, not a trail), so only columns away from the landing must be dark
-    // on the old row.
+    // The landing cell's curtain may tower into the row above, so only columns
+    // away from the landing must be dark on the old row.
     assert!(
         out.iter().all(|q| q.row != 2 || (q.x as usize) < 8 * g.cw),
         "the old row is dark away from the landing after a line change"

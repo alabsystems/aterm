@@ -223,11 +223,6 @@ aterm_types::bitflags! {
 
 impl Line {
     /// Create a new empty line.
-    ///
-    /// ENSURES: self.is_empty()
-    /// ENSURES: !self.has_attrs()
-    /// ENSURES: !self.has_hyperlinks()
-    /// ENSURES: !self.is_wrapped()
     #[must_use]
     #[inline]
     pub fn new() -> Self {
@@ -235,10 +230,6 @@ impl Line {
     }
 
     /// Create a line from bytes (no attributes).
-    ///
-    /// ENSURES: self.len() == bytes.len()
-    /// ENSURES: !self.has_attrs()
-    /// ENSURES: !self.has_hyperlinks()
     #[must_use]
     #[inline]
     pub fn from_bytes(bytes: &[u8]) -> Self {
@@ -328,8 +319,6 @@ impl Line {
     ///
     /// Returns default attributes if the line has no stored attributes
     /// or if the index is out of bounds.
-    ///
-    /// ENSURES: !self.has_attrs() implies result == CellAttrs::DEFAULT
     #[must_use]
     pub fn get_attr(&self, char_idx: usize) -> CellAttrs {
         let idx = u32::try_from(char_idx).unwrap_or(u32::MAX);
@@ -580,8 +569,6 @@ impl Line {
     }
 
     /// Check if empty.
-    ///
-    /// ENSURES: result == (self.len() == 0)
     #[must_use]
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -596,8 +583,6 @@ impl Line {
     }
 
     /// Set wrapped flag.
-    ///
-    /// ENSURES: self.is_wrapped() == wrapped
     #[inline]
     pub fn set_wrapped(&mut self, wrapped: bool) {
         // Inherent `insert`/`remove`, not `|=`/`-=`: the operator path resolves to

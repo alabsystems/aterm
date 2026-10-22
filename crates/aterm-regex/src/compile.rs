@@ -443,14 +443,9 @@ mod tests {
         compile(&ast, usize::MAX).expect("compiles")
     }
 
-    /// The second-byte filter EXCLUDES positions, so arming it for a pattern
-    /// that can match on one code point would lose matches. Pin both halves.
-    ///
-    /// Armed means "every path consumes a second code point"; disarmed means
-    /// some path can stop after the first, and the disarmed list is the
-    /// interesting one — each entry can end after one character by a different
-    /// route: it is one character long, its tail is optional, its tail is a
-    /// star, or one branch of an alternation is shorter than the other.
+    /// The second-byte filter excludes positions, so it must stay disarmed for every
+    /// pattern that can match one code point: by length, an optional or starred tail, a
+    /// shorter alternative, or only an assertion after the first.
     #[test]
     fn the_second_byte_filter_arms_only_when_a_second_code_point_is_certain() {
         let second = |pattern: &str| {
@@ -588,10 +583,8 @@ mod tests {
         }
     }
 
-    /// The byte map is the fast half of the prefilter, and its two invariants
-    /// are what make a byte-at-a-time scan legal: continuation bytes are never
-    /// marked, and every code point a candidate accepts has its lead byte
-    /// marked.
+    /// The byte map never marks a continuation byte, and marks the lead byte of every
+    /// code point a match can start with.
     #[test]
     fn the_prefilter_byte_map_marks_lead_bytes_only() {
         let mut buf = [0u8; 4];

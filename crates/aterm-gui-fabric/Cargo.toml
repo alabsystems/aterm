@@ -9,6 +9,11 @@ license.workspace = true
 repository.workspace = true
 description = "aterm-gui's fabric endpoint, below the window: each session's inbox ring, outbound posts, watermarks and hold gate, and the instance's view of its bridge. Reaches a session and the registry through two traits; aterm-gui re-exports it as `crate::fabric`."
 
+[features]
+# Read `ATERM_FABRIC_STALE_AFTER_MS` in an optimized build too (`aterm-gui/dev-seams`
+# forwards it). A debug build reads it anyway; a shipped build never does.
+dev-seams = ["aterm-types/dev-seams"]
+
 [dependencies]
 # The wire's percent escape and the blocking verbs' caller-hangup check.
 aterm-control = { workspace = true }

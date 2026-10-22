@@ -30,7 +30,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
-/// The observed shape of the wrap frame.
+/// How the host observes the wrap frame (the module doc describes each).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WrapShape {
     ScrolledOneMove,
@@ -56,12 +56,11 @@ impl WrapShape {
 const INSET: u16 = 2;
 /// The composer's caret row (the box's bottom row) before the wrap.
 const ROW: u16 = 20;
-/// The line typed before the wrap key — 76 cells from the inset, so the
-/// caret stands at col 78 when the wrap key comes; `it's` sits at cols
-/// 70..=73 and ` per` at 74..=77 (the cells Ink's re-wrap will blank).
+/// The line typed before the wrap key: 76 cells from the inset, leaving the
+/// caret at col 78; `it's` sits at cols 70..=73 and ` per` at 74..=77 (the
+/// cells Ink's re-wrap blanks).
 const LINE: &str = "r streak doesn't follow the new line down in claude code and codex. it's per";
-/// The wrapped word's length: `pers` — the wrap key is its `s`, and after
-/// the re-wrap the caret sits at `INSET + 4` on the new row.
+/// The wrapped word's length: `pers`, whose `s` is the wrap key.
 const WRAPPED: u16 = 4;
 /// Typed after the wrap, on the new row.
 const AFTER: &str = "istent on the sc";
@@ -215,8 +214,7 @@ fn replay(shape: WrapShape) -> Replay {
         let old = v2_cols(&glow, old_row);
         let new = v2_cols(&glow, new_row);
 
-        // The ring around the wrap: snapshot after the wrap echo tick(s) and
-        // after the first two keys on the new row.
+        // The ring around the wrap: a snapshot on each echo within 200 ms of it.
         if let Some(w) = wrap_echo
             && observed_this_tick
             && now <= w + Duration::from_millis(200)
@@ -318,8 +316,8 @@ fn replay(shape: WrapShape) -> Replay {
                             since.as_secs_f32()
                         ));
                     }
-                    // (1) The old row's light is gone within ~2 s of the wrap
-                    // (its own swoosh); no key on the new row renews it.
+                    // The old row's light is gone within ~2 s of the wrap; no key
+                    // on the new row renews it.
                     if since >= Duration::from_millis(2000) && !old.is_empty() && law_hits[0] < 4 {
                         law_hits[0] += 1;
                         violations.push(format!(
@@ -330,9 +328,8 @@ fn replay(shape: WrapShape) -> Replay {
                     }
                 }
                 WrapShape::BoxGrowsUpNoScroll => {
-                    // The light must be where the text is: on the caret's
-                    // row nothing lit beyond the caret (the old line's cells
-                    // now sit under blanks / the new text).
+                    // The light is where the text is: nothing lit on the caret's
+                    // row beyond the caret.
                     if since >= Duration::from_millis(1000) {
                         let beyond: BTreeSet<u16> =
                             new.iter().copied().filter(|c| *c >= caret.1).collect();
@@ -348,9 +345,8 @@ fn replay(shape: WrapShape) -> Replay {
                     }
                 }
             }
-            // (3) the new row is contiguous from the inset column while it
-            // is being typed (from the second key on the new row, so a
-            // one-tick-late echo is not counted).
+            // The new row is contiguous from the inset column while it is being
+            // typed (from its second key, so a one-tick-late echo is not counted).
             if hand_on_new_row && caret.1 > INSET + wrapped && since >= Duration::from_millis(100) {
                 let dark: Vec<u16> = (INSET..caret.1).filter(|c| !new.contains(c)).collect();
                 if !dark.is_empty() && law_hits[2] < 4 {

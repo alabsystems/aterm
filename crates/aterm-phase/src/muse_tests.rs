@@ -685,13 +685,170 @@ fn a_turn_ended_on_its_read_row_is_over_with_no_words() {
     assert_eq!(said_tail(&glued), None);
 }
 
+/// EVERY TOOL ROW THE LAB MEASURED ENDS A TURN WITH NO WORDS (1.4.10, `lab
+/// muse-captures --only tool-row`, 2026-10-22): a turn the stub answered
+/// with one call and, after its result, a reply holding none is over, idle
+/// as evidence, and said nothing — on a search row two columns in (`
+/// Searched "parser" (1 match)`, `(no matches)`), as on the read row, and on
+/// each `◆` row of Muse Code's own: `Wrote`/`Edited` over a diff, `Ran … —
+/// failed` over its branch, `Read memory … — failed` and `Used tool
+/// operation` over a branch in column 0, `Saved memory …`, `Read goal …`.
+/// FAILS WITHOUT THE FIX: the search row was nothing the grammar knew (idle
+/// NOT as evidence: the turn never judged), a branch in column 0 was taken
+/// for the reply's head (the same), and `Saved memory notes.md` or `Read
+/// goal goal — no effect · ctrl+o` were read as the agent's last words.
+/// `write_todos` draws nothing: its end reads as a message not answered yet
+/// (busy, not evidence), and nothing in sight tells the two apart.
+/// NEGATIVE CONTROLS: a sentence two columns in that opens `Searched `, one
+/// whose pattern is not in double quotes though a count follows it, and a
+/// search row with no count, are no tool rows; the agent's own sentences
+/// opening `Saved memory`, `Read goal` and `Used tool` are its words; a
+/// branch row under the message with no `◆` row over it is nothing known.
+#[test]
+fn a_turn_ended_on_any_measured_tool_row_is_over_with_no_words() {
+    for (name, text, row) in [
+        ("search", TOOL_ROW_SEARCH, "  Searched \"parser\" (1 match)"),
+        (
+            "search-none",
+            TOOL_ROW_SEARCH_NONE,
+            "  Searched \"no-such-word-here\" (no matches)",
+        ),
+        ("write", TOOL_ROW_WRITE, "◆ Wrote notes.txt (+1)"),
+        ("edit", TOOL_ROW_EDIT, "◆ Edited README.md (+1 −1)"),
+        ("bash", TOOL_ROW_BASH, "◆ Ran ls — failed"),
+        (
+            "read-memory",
+            TOOL_ROW_READ_MEMORY,
+            "◆ Read memory notes.md — failed",
+        ),
+        ("add-memory", TOOL_ROW_ADD_MEMORY, "◆ Saved memory notes.md"),
+        (
+            "goal",
+            TOOL_ROW_GOAL,
+            "◆ Read goal goal — no effect · ctrl+o",
+        ),
+        ("work-list", TOOL_ROW_WORK_LIST, "◆ Used tool operation"),
+    ] {
+        let rows = screen(text);
+        assert!(rows.iter().any(|r| r == row), "{name}: the row measured");
+        assert!(message_drawn(&rows), "{name}");
+        assert_eq!(phase(&rows), (Phase::Idle, true), "{name}");
+        assert_eq!(said_tail(&rows), None, "{name}");
+        let r = muse(text);
+        assert_eq!(
+            (r.phase, r.phase_authoritative, r.said_tail, r.wall),
+            (Phase::Idle, true, None, None),
+            "{name}"
+        );
+    }
+    let todos = screen(TOOL_ROW_TODOS);
+    assert!(message_drawn(&todos));
+    assert_eq!(
+        phase(&todos),
+        (Phase::Busy, false),
+        "nothing drawn under it"
+    );
+    // NEGATIVE CONTROLS.
+    let search = screen(TOOL_ROW_SEARCH);
+    for not in [
+        "  Searched the repository for the parser module",
+        "  Searched the parser (1 match)",
+        "  Searched \"parser\"",
+        "  Searched \"parser\" (some matches)",
+        "    Searched \"parser\" (1 match)",
+    ] {
+        let rows = edited(&search, "  Searched ", not);
+        assert_eq!(phase(&rows), (Phase::Idle, false), "{not}");
+    }
+    for (text, head, said) in [
+        (
+            TOOL_ROW_ADD_MEMORY,
+            "◆ Saved memory",
+            "Saved memory of the parser layout for the next turn.",
+        ),
+        (
+            TOOL_ROW_GOAL,
+            "◆ Read goal",
+            "Read goal of the sprint again before you start.",
+        ),
+        (
+            TOOL_ROW_WORK_LIST,
+            "◆ Used tool",
+            "Used tool calls to check the parser.",
+        ),
+    ] {
+        let mut rows = edited(&screen(text), head, &format!("◆ {said}"));
+        if let Some(at) = rows.iter().position(|r| r.starts_with("└ ")) {
+            rows.remove(at);
+        }
+        assert_eq!(phase(&rows), (Phase::Idle, true), "{said}");
+        assert_eq!(said_tail(&rows).as_deref(), Some(said));
+    }
+    let mut bare = screen(TOOL_ROW_READ_MEMORY);
+    bare.retain(|r| !r.starts_with("◆ Read memory"));
+    assert!(bare.iter().any(|r| r == "└ memory file not found"));
+    assert_eq!(phase(&bare), (Phase::Idle, false), "a branch alone");
+}
+
+/// THE STATUS ROW'S FIRST FRAME IS A TURN RUNNING (measured 2026-10-22, the
+/// lab: `◇ Thinking` bare, 0.02 s after the first prompt's Enter, for
+/// 0.04-0.19 s before `◇ Working (0s · esc to interrupt)`): never a turn
+/// ended with no words. Before, it read idle with nothing said, and the
+/// forever lab's r10 ladder on `ba4e9e2bd3` took it for the harness's first
+/// point: the first reply named two short turns, and every rung of the
+/// back-off ladder came a step late. NEGATIVE CONTROLS: a reply whose words
+/// are `Thinking` (`◆`), another verb or a longer row, another glyph, the
+/// row indented, and the bare row with a reply drawn under it are no first
+/// frame; the timed status row reads running as before.
+#[test]
+fn the_status_rows_first_frame_is_a_turn_running() {
+    let rows = screen(BUSY_FIRST_FRAME);
+    assert!(rows.iter().any(|r| r == "◇ Thinking"), "the frame measured");
+    assert!(message_drawn(&rows));
+    assert_eq!(phase(&rows), (Phase::Busy, true));
+    assert_eq!(said_tail(&rows), None);
+    let r = muse(BUSY_FIRST_FRAME);
+    assert_eq!(
+        (r.phase, r.phase_authoritative, r.said_tail, r.wall),
+        (Phase::Busy, true, None, None)
+    );
+    // NEGATIVE CONTROLS.
+    for (not, read) in [
+        ("◆ Thinking", (Phase::Idle, true)),
+        ("◇ Thinking about the parser", (Phase::Idle, false)),
+        ("◇ Pondering", (Phase::Idle, false)),
+        ("◈ Thinking", (Phase::Idle, false)),
+        ("  ◇ Thinking", (Phase::Idle, false)),
+        ("◇ Working (0s · esc to interrupt)", (Phase::Busy, true)),
+    ] {
+        let rows = edited(&screen(BUSY_FIRST_FRAME), "◇ Thinking", not);
+        assert_eq!(phase(&rows), read, "{not}");
+    }
+    let mut under = screen(BUSY_FIRST_FRAME);
+    let at = under
+        .iter()
+        .position(|r| r == "◇ Thinking")
+        .expect("the row");
+    under.splice(
+        at + 1..at + 1,
+        [String::new(), "◆ Hi! I am the local lab stub.".to_string()],
+    );
+    assert_eq!(phase(&under), (Phase::Idle, true), "a reply under it");
+    assert_eq!(
+        said_tail(&under).as_deref(),
+        Some("Hi! I am the local lab stub.")
+    );
+}
+
 /// THE AGENT'S OWN SENTENCE THAT OPENS LIKE A TOOL ROW IS ITS WORDS
 /// (`docs/measured/forever-lab-2026-10-20.md` P2): a reply `Wrote the parser
 /// module and its unit tests in this turn.` (or `Edited the config …`) is the
 /// agent's last words, where a reader matching the heads alone left the turn
-/// none. NEGATIVE CONTROL: every `Ran `, `Wrote ` and `Edited ` row the
-/// captures measured — a path, a cut path, its `(+1)` or `— denied` tail,
-/// any command — is still Muse Code's own row, no word of the agent's.
+/// none. NEGATIVE CONTROL: every `Ran `, `Wrote `, `Edited `, `Read memory
+/// `, `Saved memory `, `Read goal ` and `Used tool ` row the captures
+/// measured — a path, a cut path, a name, its `(+1)`, `— denied` or `·
+/// ctrl+o` tail, any command — is still Muse Code's own row, no word of the
+/// agent's.
 #[test]
 fn a_sentence_that_opens_like_a_tool_row_is_the_agents_words() {
     let rows = screen(END_OF_TURN_1_4_10);
@@ -709,9 +866,17 @@ fn a_sentence_that_opens_like_a_tool_row_is_the_agents_words() {
             let Some(head) = row.strip_prefix("◆ ") else {
                 continue;
             };
-            if ["Ran ", "Wrote ", "Edited "]
-                .iter()
-                .any(|h| head.starts_with(h))
+            if [
+                "Ran ",
+                "Wrote ",
+                "Edited ",
+                "Read memory ",
+                "Saved memory ",
+                "Read goal ",
+                "Used tool ",
+            ]
+            .iter()
+            .any(|h| head.starts_with(h))
             {
                 measured += 1;
                 assert!(tool_row(head), "{name}: {head}");
@@ -748,6 +913,183 @@ fn a_sentence_that_opens_like_a_tool_row_is_the_agents_words() {
         drawn.extend(rows[at + 1..].iter().cloned());
         assert_eq!(turn_said_before(&drawn).as_deref(), words, "{before}");
     }
+}
+
+/// A REPLY THAT NAMES A FILE AFTER A TOOL'S HEAD IS THE AGENT'S WORDS (the
+/// review of `b9/resid4-lab`): `Saved memory notes.md with the parser
+/// layout. Shall I push the branch now?` is a question, and a need in a
+/// later paragraph of `Saved memory notes.md now holds the parser layout.`
+/// is read — where a first word holding a `.` was enough to read the whole
+/// reply as Muse Code's tool row, its question plain idle and its need lost,
+/// for `Read memory`, `Saved memory`, `Read goal`, `Used tool`, `Wrote` and
+/// `Edited` alike. A tool row names one path or name and its own tail alone
+/// ([`names_a_path`]). NEGATIVE CONTROLS: each measured row's shape — a
+/// name alone, a diff's count, an outcome, the expander, a cut path — is
+/// still Muse Code's own row with no words; an outcome no capture measured,
+/// or a count that is no diff's, is the agent's words.
+#[test]
+fn a_reply_naming_a_file_after_a_tool_head_is_the_agents_words() {
+    let rows = screen(END_OF_TURN_1_4_10);
+    let head = "◆ Hi! I am the local lab stub";
+    for said in [
+        "Saved memory notes.md with the parser layout. Shall I push the branch now?",
+        "Read memory notes.md first, then wrote the parser. Shall I push it?",
+        "Read goal goal.md says land the parser. Shall I push it?",
+        "Used tool operation.json to list the work. Shall I push it?",
+        "Wrote notes.md with the parser layout. Shall I push it?",
+        "Edited README.md so it names the stub. Shall I push it?",
+        "Edited README.md — it now names the stub. Shall I push it?",
+        "Wrote src/parser.rs (+40) and its tests. Shall I push it?",
+    ] {
+        let reply = edited(&rows, head, &format!("◆ {said}"));
+        assert_eq!(phase(&reply), (Phase::Question, true), "{said}");
+        assert_eq!(said_tail(&reply).as_deref(), Some(said));
+    }
+    let at = rows
+        .iter()
+        .position(|r| r.starts_with(head))
+        .expect("the reply");
+    for first in [
+        "◆ Saved memory notes.md now holds the parser layout.",
+        "◆ Read memory notes.md first, then wrote the parser.",
+    ] {
+        let mut need = rows.clone();
+        need[at] = first.to_string();
+        need.splice(
+            at + 1..at + 1,
+            [
+                String::new(),
+                "  NEEDS YOU: the deploy key for the staging push.".to_string(),
+            ],
+        );
+        let words = format!(
+            "{}\nNEEDS YOU: the deploy key for the staging push.",
+            first.trim_start_matches("◆ ")
+        );
+        assert_eq!(said_tail(&need), Some(words), "{first}");
+    }
+    // NEGATIVE CONTROLS: the measured shapes are Muse Code's own rows
+    for row in [
+        "◆ Saved memory notes.md",
+        "◆ Read memory notes.md — failed",
+        "◆ Read goal goal — no effect · ctrl+o",
+        "◆ Used tool operation",
+        "◆ Used tool operation — denied · ctrl+o",
+        "◆ Wrote notes.txt (+1)",
+        "◆ Wrote notes.txt (+1) · ctrl+o",
+        "◆ Edited README.md (+1 −1)",
+        "◆ Edited .agents/a-protected-note-with-a-rather-lo… — denied",
+    ] {
+        let tool = edited(&rows, head, row);
+        assert_eq!(phase(&tool), (Phase::Idle, true), "{row}");
+        assert_eq!(said_tail(&tool), None, "{row}");
+    }
+    for said in [
+        "Edited README.md — fixed",
+        "Wrote notes.txt (+one)",
+        "Saved memory notes.md (+1",
+    ] {
+        let reply = edited(&rows, head, &format!("◆ {said}"));
+        assert_eq!(said_tail(&reply).as_deref(), Some(said), "{said}");
+    }
+}
+
+/// MUSE CODE'S OWN ROW OVER ITS OUTCOME BRANCH IS NO WORDS (the review of
+/// `b9/resid4-lab`): a turn ended on any `◆` row with a `└ ` branch in
+/// column 0 right under it — `◆ Monitor … — failed`, `◆ Stopped terminal
+/// tool operation — failed`, `◆ Scheduled …`, `◆ Unscheduled …`, `◆
+/// Message not sent to …`, each with its branch as the captures measured
+/// them — is over and said nothing ([`branched`]), and the turn's other
+/// words pass such a block over. Where the branch was skipped to the head
+/// with no more, Muse Code's row and its tool's output were read as the
+/// agent's last words, as evidence, and a need or a question in them acted
+/// on. NEGATIVE CONTROLS: the agent's reply with an indented `└` row is its
+/// words; a `└ ` row with a blank over it is no branch and no part of the
+/// reply above it (nothing known); the agent's own `◆` words above a tool
+/// call stay its words.
+#[test]
+fn muse_codes_own_row_over_its_outcome_branch_is_no_words() {
+    let measured = [
+        (
+            "◆ Monitor Watch the lab socket — failed",
+            "└ network access denied",
+        ),
+        (
+            "◆ Stopped terminal tool operation — failed",
+            "└ unified exec session 424242 is not live",
+        ),
+        (
+            "◆ Scheduled 7 3 * * *: lab probe",
+            "└ 109c3489 · Every day at 3:07 AM · once",
+        ),
+        (
+            "◆ Unscheduled 109c3489",
+            "└ Removed scheduled job 109c3489.",
+        ),
+        (
+            "◆ Message not sent to lab-no-such-session · ✗ · not found · ctrl+o",
+            "└ \"hello from the lab stub\"",
+        ),
+    ];
+    let captured: Vec<String> = [BOX_NETWORK_DIGIT_APPROVED, END_OF_TURN_WORK_PANEL]
+        .iter()
+        .flat_map(|t| screen(t))
+        .collect();
+    let base = screen(TOOL_ROW_WORK_LIST);
+    for (head, branch) in measured {
+        assert!(
+            captured.windows(2).any(|w| w[0] == head && w[1] == branch),
+            "measured: {head}"
+        );
+        let rows = edited(&edited(&base, "◆ Used tool", head), "└ ", branch);
+        assert_eq!(phase(&rows), (Phase::Idle, true), "{head}");
+        assert_eq!(said_tail(&rows), None, "{head}");
+        let r = read(Some("muse"), &rows, None);
+        assert_eq!(
+            (r.phase, r.phase_authoritative, r.said_tail),
+            (Phase::Idle, true, None),
+            "{head}"
+        );
+    }
+    // The turn's other words pass the block over.
+    let end = screen(END_OF_TURN_1_4_10);
+    let at = end
+        .iter()
+        .position(|r| r.starts_with("◆ Hi!"))
+        .expect("the reply");
+    let before = |block: &[&str]| {
+        let mut rows = end.clone();
+        rows.splice(
+            at..at,
+            block
+                .iter()
+                .map(|r| (*r).to_string())
+                .chain([String::new()]),
+        );
+        turn_said_before(&rows)
+    };
+    let (head, branch) = measured[0];
+    assert_eq!(before(&[head, branch]), None, "the monitor's row");
+    // NEGATIVE CONTROLS.
+    assert_eq!(
+        before(&["◆ I will watch the lab socket."]).as_deref(),
+        Some("I will watch the lab socket.")
+    );
+    let mut tree = end.clone();
+    tree.splice(at + 1..at + 1, ["  └ src/parser.rs".to_string()]);
+    assert_eq!(phase(&tree), (Phase::Idle, true));
+    assert_eq!(
+        said_tail(&tree).as_deref(),
+        Some("Hi! I am the local lab stub, not a model. (reply 1)\n└ src/parser.rs")
+    );
+    let mut stray = end.clone();
+    stray.splice(at + 1..at + 1, [String::new(), "└ stray".to_string()]);
+    assert_eq!(
+        phase(&stray),
+        (Phase::Idle, false),
+        "a branch under a blank"
+    );
+    assert_eq!(said_tail(&stray), None);
 }
 
 /// THE QUESTION (1.4.10) IS A PROMPT OVER AN OPEN COMPOSER, whatever glyph

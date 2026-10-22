@@ -213,12 +213,8 @@ fn parse_c1_osc_with_c1_st() {
     assert_eq!(parser.state(), State::Ground);
 }
 
-/// Regression test for #7556: C1 control bytes must not introduce new
-/// sequences when C1 controls are disabled and the parser is mid-sequence.
-///
-/// Before the fix, 0x9B (C1 CSI) in CsiParam state would transition to
-/// CsiEntry, effectively injecting a new CSI sequence from within an
-/// existing one. This could be exploited by a malicious remote server.
+/// With C1 controls off, a C1 introducer mid-sequence is dropped: 0x9B in
+/// `CsiParam` must not inject a new CSI from inside one.
 #[test]
 fn c1_disabled_blocks_injection_in_csi_param_state() {
     let mut parser = Parser::new();

@@ -21,17 +21,10 @@ pub use crate::render_fx::{
     fx_layer_builds, fx_payload_copies,
 };
 
-/// One faded cell of the cursor motion trail: a cell the cursor recently swept
-/// through, painted in the trail colour at `alpha` coverage over its own
-/// background. The trail fades within a few hundred milliseconds, reading as a
-/// comet behind the cursor.
-///
-/// Position is in the same viewport coordinates as
-/// [`RenderInput::cursor_row`]/[`RenderInput::cursor_col`] (after the tab-strip
-/// splice and any split-pane offset), so trail cells use the cursor's
-/// `pad + col*cell_w` / `pad + row*cell_h` geometry. The host owns the clock
-/// and resolves `alpha` per cell each frame, keeping the renderer
-/// deterministic (CPU/GPU byte parity); an empty trail draws nothing.
+/// One faded cell of the cursor motion trail, painted in the trail colour at `alpha` over its
+/// own background, in the cursor's viewport coordinates (after the tab-strip splice and any
+/// split-pane offset). The host owns the clock and resolves `alpha` each frame, keeping the
+/// renderer deterministic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrailCell {
     /// Viewport row (0-indexed from the top of the visible area).

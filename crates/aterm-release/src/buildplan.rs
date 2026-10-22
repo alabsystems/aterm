@@ -1,43 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Build plan (release spec §6 `buildplan.rs`): the release's ONE build (build
-//! once, 2026-10-09 — `artifact.rs` keeps what it makes): both architecture slices
-//! of `aterm` AT ONCE, each in a target directory and with a log of its own, with
-//! `SOURCE_DATE_EPOCH=n` as the SOLE build-number conduit (zero build.rs changes —
-//! spec decision 11), `lipo` to universal, then dSYM (success judged by DWARF file
-//! existence — inherited dsymutil exit-code caveat — plus UUID match), `strip -x`
-//! on the shipped copy, the dSYM zip, the x86_64 slice driven under Rosetta, and
-//! the unsigned bundle laid out from the same snapshot (`bundle::assemble_at`).
+//! The release's one build (`artifact.rs` keeps what it makes): both architecture slices
+//! of `aterm` at once, each with its own target directory and log, `SOURCE_DATE_EPOCH=n`
+//! as the sole build-number conduit, `lipo` to universal, the dSYM (judged by DWARF file
+//! existence plus UUID match, see [`extract_dsym`]), `strip -x` on the shipped copy, the
+//! dSYM zip, the x86_64 slice driven under Rosetta, and the unsigned bundle laid out from
+//! the same snapshot (`bundle::assemble_at`).
 //!
-//! TWO compiler lanes and no third (owner decision, 2026-07): the native aarch64
-//! slice on Trust (the repo's rust-toolchain.toml pin, built on targo's explicit
-//! `--unverified` lane) and the x86_64-apple-darwin compat slice on
-//! upstream stable. Both architectures build from one source take made from git
-//! objects and one lock-checksummed, offline dependency bundle ([`crate::snapshot`]);
-//! only their compiler differs. The ONLY
-//! toolchain override is
-//! `RUSTUP_TOOLCHAIN=stable` on the compat slice, set in `run_cargo` AFTER inherited
-//! RUSTC / RUSTC_BOOTSTRAP / RUSTFLAGS / RUSTUP_TOOLCHAIN are scrubbed on both lanes:
-//! no `RUSTC=…` pin, no RUSTFLAGS surgery, no `--no-trust` flag. The native binary
-//! must still self-report `+t` (see [`run`]).
+//! Two compiler lanes: the native aarch64 slice on Trust (targo's `--unverified` lane) and
+//! the x86_64-apple-darwin compat slice on upstream stable. Both build from one source take
+//! made from git objects and one lock-checksummed, offline dependency bundle
+//! ([`crate::snapshot`]); only the compiler differs. The environment is cleared, so
+//! inherited RUSTC, RUSTC_BOOTSTRAP, RUSTFLAGS and RUSTUP_TOOLCHAIN steer neither lane, and
+//! the native binary must self-report a Trust compiler (see [`run`]).
 //!
-//! The ONE exception: the x86_64-apple-darwin compat slice of the universal binary rides upstream
-//! stable via `RUSTUP_TOOLCHAIN=stable`. STOCK EXCEPTION (Trust lacks an x86_64-apple-darwin std in
-//! the aarch64 sysroot this lane builds with; MEASURED: `targo --unverified check --target
-//! x86_64-apple-darwin -p aterm` → error[E0463] can't find crate for `std`). That pin lives HERE
-//! and nowhere else, and the lane scrubs inherited RUSTC/RUSTFLAGS state so stale shell exports
-//! cannot steer it.
+//! STOCK EXCEPTION: the compat slice builds with `RUSTUP_TOOLCHAIN=stable`, because Trust
+//! has no x86_64-apple-darwin std in the aarch64 sysroot (`targo --unverified check
+//! --target x86_64-apple-darwin -p aterm` fails with E0463). That pin lives here and
+//! nowhere else.
 //!
-//! Preserved semantics:
-//!   * `SOURCE_DATE_EPOCH` inherited by every cargo child so the binary's
-//!     ATERM_BUILD_NUMBER == the plist CFBundleVersion == the manifest
-//!     build_number, from ONE in-process u64 (spec §2 "propagation");
-//!   * dsymutil success judged by the DWARF file's existence, NOT its exit
-//!     code (see [`extract_dsym`]);
-//!   * a failed cargo build is a hard error — a release artifact with a
-//!     silently missing arch slice or missing atpkg/aterm-ctl/aterm-cli must
-//!     be impossible.
+//! `SOURCE_DATE_EPOCH` reaches every cargo child, so the binary's ATERM_BUILD_NUMBER, the
+//! plist CFBundleVersion and the manifest build_number come from one u64. A failed cargo
+//! build is a hard error: no artifact ships with a missing slice.
 
 use aterm_uds::spawnfd::{Command, command};
 use std::ffi::OsString;
@@ -81,9 +66,8 @@ pub struct BuildPlan {
     /// Receives what the build made, once the snapshot verified: the unsigned
     /// `aterm.app`, the dSYM and its zip, and the x86_64 record.
     pub out_dir: PathBuf,
-    /// The reserved ledger number `n`, exported as `SOURCE_DATE_EPOCH` to every
-    /// cargo child (→ ATERM_BUILD_NUMBER + ATERM_BUILD_TIME via the untouched
-    /// build.rs — spec decision 11) and stamped as the bundle's CFBundleVersion.
+    /// The reserved ledger number `n`: every cargo child's `SOURCE_DATE_EPOCH` and the
+    /// bundle's CFBundleVersion.
     pub build_number: u64,
     /// Release version ("0.2.0") — names the dSYM zip `aterm-0.2.0-dSYM.zip`.
     pub short_version: String,
@@ -113,18 +97,16 @@ pub struct BuildOutput {
     /// Each slice's build: its triple, its wall seconds, and the peak resident
     /// memory its build child reported (`wait4`), when it did.
     pub slices: Vec<SliceBuild>,
-    /// `lipo -archs` of the shipped `aterm` (e.g. "x86_64 arm64") — for the
-    /// cut transcript and a universal/single-arch sanity print.
+    /// `lipo -archs` of the shipped `aterm` (e.g. "x86_64 arm64"), for the cut transcript.
     pub archs: String,
-    /// The built binary's `--diagnose` `compiler:` line — provenance for the
-    /// cut transcript (`rustc <release> (<slug>) · trust · release ·
-    /// trust_verify …`). Always Trust-flavor: [`run`] hard-fails otherwise.
+    /// The built binary's `--diagnose` `compiler:` line (`Trust <own version> · trustc
+    /// <slug> · …`), for the cut transcript. Always Trust-flavor: [`run`] refuses otherwise.
     pub compiler_line: String,
-    /// `dist/aterm.dSYM` — present iff dsymutil produced a non-empty DWARF
-    /// whose UUIDs match the binary (see the exit-code caveat on [`extract_dsym`]).
+    /// `<out_dir>/aterm.dSYM`, present iff dsymutil produced a non-empty DWARF whose UUIDs
+    /// match the binary (see [`extract_dsym`]).
     pub dsym: Option<PathBuf>,
-    /// `dist/aterm-<ver>-dSYM.zip` — the owner's symbolication archive, kept in `dist/`
-    /// and never published (its DWARF names this machine's paths).
+    /// `<out_dir>/aterm-<ver>-dSYM.zip`: the owner's symbolication archive, never
+    /// published (its DWARF names this machine's paths).
     pub dsym_zip: Option<PathBuf>,
     /// `aterm-<ver>-x86_64-probe.txt` — the x86_64 slice's `--diagnose` report under
     /// Rosetta ([`x86_64_probe_transcript`]), the record that the universal build RAN
@@ -207,14 +189,11 @@ pub(crate) fn current_release_uid() -> Result<u32, String> {
 
 /// Open one release-owned directory without accepting a symlink substitution.
 ///
-/// The first metadata read rejects a static symlink. Opening and comparing the
-/// device/inode pair before any chmod closes the check/use gap: if the path was
-/// swapped while it was opened, no referent is modified. All later permission
-/// changes apply to the opened directory descriptor, and the final path check
-/// proves the same directory remains published at `path`.
-///
-/// The crate's one rule for a directory the release owns: every directory of the
-/// release cache and the build's stage is made through [`snapshot::private_dir`],
+/// The first metadata read rejects a static symlink. Comparing the opened descriptor's
+/// device/inode with it before any chmod closes the check/use gap: a path swapped while
+/// opening modifies no referent. Later permission changes go through the descriptor, and
+/// the final path check proves the same directory is still at `path`. Every directory of
+/// the release cache and the build's stage is made through [`snapshot::private_dir`],
 /// which holds it to this.
 #[cfg(unix)]
 pub(crate) fn open_release_directory(
@@ -634,10 +613,9 @@ fn publish_verified_output(
             ));
         }
     }
-    // Validate and tighten the output directory before any destructive
-    // replacement below can be redirected outside it. (No `.metadata_never_index`
-    // marker is written: it is inert for Spotlight, and its one reader went with
-    // the sealed-seed client lane — `bundle::prepare_staging` says both.)
+    // Validate and tighten the output directory before any replacement below can be
+    // redirected outside it. (No `.metadata_never_index`: `bundle::prepare_staging` says
+    // why.)
     drop(open_release_directory(
         out_dir,
         expected_uid,
@@ -700,14 +678,10 @@ fn publish_staged_file(staged: &Path, out_dir: &Path, what: &str) -> Result<Path
     Ok(published)
 }
 
-/// The slices' builds, AT ONCE (build once, 2026-10-09): the native slice on the
-/// Trust lane and the x86_64 compat slice on upstream stable, each in its own
-/// target directory ([`Take::slice_target`]), `CARGO_HOME` and log
-/// (`<stage>/<triple>.log`, whose tail a failure prints), each line of the
-/// transcript saying when it started and how long it took. Serial measured 7m04s
-/// then 6m33s (0.101's cut log); at once they overlap. `plan.one_slice_at_a_time`
-/// (the memory the last build's slices peaked at would not fit beside each other)
-/// builds them one after the other, and says so.
+/// The slices' builds, at once: the native slice on the Trust lane and the x86_64 compat
+/// slice on upstream stable, each with its own target directory ([`Take::slice_target`]),
+/// `CARGO_HOME` and log (`<stage>/<triple>.log`, whose tail a failure prints).
+/// `plan.one_slice_at_a_time` builds them one after the other, and says so.
 ///
 /// Returns each slice's binary (native first) and what its build measured.
 fn build_slices(
@@ -715,10 +689,8 @@ fn build_slices(
     take: &Take,
     logs: &Path,
 ) -> Result<(Vec<PathBuf>, Vec<SliceBuild>), String> {
-    // x86_64 compat slice: upstream stable via rustup's target std — THE one
-    // exception to the single Trust lane. STOCK EXCEPTION (Trust lacks an
-    // x86_64-apple-darwin std; E0463, see the module docs). Its target std is
-    // asked for before either build starts, so a missing one refuses at once.
+    // The x86_64 compat slice is the STOCK EXCEPTION (see the module doc). Its target std
+    // is checked before either build starts.
     require_rustup_target(X86_64)?;
     let slices: [(&'static str, Option<&'static str>, &str); 2] = [
         (ARM64, None, "Trust toolchain (+t): native build"),
@@ -818,14 +790,13 @@ fn log_tail(log: &Path, n: usize) -> String {
 }
 
 fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<BuildOutput, String> {
-    // Everything stays in the private stage until the snapshot has passed its
-    // post-build verification. Only then is it moved into the output directory.
+    // Everything stays in the private stage until the snapshot passes its post-build
+    // verification.
     snapshot::private_dir(symbol_out, "release symbol stage")?;
 
     // --- both slices, at once ------------------------------------------------
-    // The native slice is the ordinary Trust lane, rooted in the snapshot
-    // materialized above. No --target on purpose (host proc-macros and build
-    // scripts ride the same config rustflags). Provenance remains hard-gated.
+    // The native slice has no --target, so host proc-macros and build scripts ride the
+    // same config rustflags.
     let (slices, slice_builds) = build_slices(plan, take, &take.stage)?;
 
     if let Some(expected) = &plan.expected_update_pin_sha256 {
@@ -844,47 +815,38 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
     let archs = lipo_archs(&fat)?;
     println!("    universal binary: {archs}");
 
-    // --- dSYM from the UN-stripped binary ----------------------------------
+    // --- dSYM from the unstripped binary -------------------------------------
     let (dsym, dsym_zip) = extract_dsym(&fat, symbol_out, &plan.short_version, &plan.repo_root)?;
 
-    // --- strip the SHIPPED copy -------------------------------------------
-    // Symbols live in the archived .dSYM (matched by the Mach-O UUID, which
-    // strip preserves); the bundle binary stays small while crash reports
-    // remain symbolicatable. Stripping a private COPY keeps the unstripped
-    // original available to dsymutil.
+    // --- strip the shipped copy ----------------------------------------------
+    // Symbols live in the dSYM (matched by the Mach-O UUID, which strip preserves).
     let ship_dir = universal.join("ship");
     snapshot::private_dir(&ship_dir, "release ship stage")?;
     let shipped = ship_dir.join("aterm");
     std::fs::copy(&fat, &shipped).map_err(|e| format!("copy {}: {e}", fat.display()))?;
     make_executable(&shipped)?;
-    // `strip -x`: local symbols only — matches build-app.sh; a failure here
-    // is tolerated (`|| true` in the script) because an unstripped binary
-    // is merely bigger, never wrong.
+    // `strip -x`: local symbols only. A failure is tolerated: unstripped is bigger, never
+    // wrong.
     let _ = command("strip")
         .arg("-x")
         .arg(&shipped)
         .current_dir(&plan.repo_root)
         .output();
 
-    // Bind the ACTUAL post-strip bytes, not merely cargo's pre-lipo inputs.
-    // A tolerated strip failure still reaches this mandatory proof; a successful
-    // strip/lipo that drops or changes either architecture's dedicated section
-    // fails closed. Fat slices are extracted as data and never executed.
+    // Bind the post-strip bytes: a tolerated strip failure still reaches this proof, and
+    // a strip or lipo that drops or changes either slice's pin section fails closed. Fat
+    // slices are extracted as data, never executed.
     if let Some(expected) = &plan.expected_update_pin_sha256 {
         verify_shipped_update_pin_slices(&shipped, &archs, expected)?;
         println!("    updater pin: every final shipped architecture structurally verified");
     }
 
-    // --- compiler provenance HARD GATE ---------------------------------------
-    // Ask the BUILT binary which compiler produced it: build.rs bakes the
-    // `$RUSTC -vV` probe into `build_info::compiler_summary()`, and
-    // `--diagnose` prints it as the `compiler:` line (`Trust <own version> ·
-    // trustc <slug> · compatible with Rust <release> · <profile> · trust_verify
-    // on|off`, or `Rust <release> · rustc <slug> · …` for upstream) — ground
-    // truth for the shipped bytes. Single-lane invariant: the native slice
-    // MUST be a Trust build (the row leads with `Trust`). Anything else means the toolchain
-    // file was bypassed (broken rustup link, stale env) — that is a broken
-    // toolchain, not a fallback, so the build refuses to continue.
+    // --- compiler provenance gate --------------------------------------------------
+    // Ask the built binary: `--diagnose` prints build.rs's `$RUSTC -vV` probe as the
+    // `compiler:` line, which leads with the toolchain's name (`Trust <own version> ·
+    // trustc <slug> · …`, or `Rust <release> · rustc <slug> · …` upstream). The native
+    // slice must be Trust; anything else is a bypassed toolchain file (broken rustup
+    // link, stale env), and the build refuses.
     let diagnose = match command(&shipped)
         .arg("--diagnose")
         .current_dir(&plan.repo_root)
@@ -929,9 +891,6 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
         .map(str::trim)
         .unwrap_or_default()
         .to_string();
-    // The row LEADS with the toolchain's own name: `Trust <own version> · trustc
-    // <slug> · compatible with Rust <release> · …` for a Trust build, `Rust
-    // <release> · rustc <slug> · …` for upstream (build_info::compiler_summary).
     if !compiler_line.starts_with("Trust") {
         return Err(format!(
             "compiler provenance gate: the native slice reports {compiler_line:?} — not a \
@@ -941,12 +900,9 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
         ));
     }
     println!("    compiler: {compiler_line}  (Trust provenance gate passed)");
-    // The host-registration line, echoed so the build transcript records what
-    // THIS builder's frameworks register. A NOTE, not a gate: the builder's
-    // macOS registering everything is what let v0.72.0-v0.75.0 ship green
-    // while macOS 14.4.1 lacked `NSApplicationDelegate`; the fix is in the
-    // objc layer (it supplies a missing protocol itself), and this line is
-    // how a reader of the transcript can see which host the proof ran on.
+    // The host-registration line, echoed so the transcript records which host the proof
+    // ran on. A note, not a gate: a builder whose macOS registers everything says nothing
+    // about an older host (the objc layer supplies a missing protocol itself).
     let objc_line = diagnose
         .lines()
         .find_map(|l| l.strip_prefix("objc:"))
@@ -954,14 +910,11 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
         .unwrap_or("(no objc: line in --diagnose — binary predates the probe)");
     println!("    objc: {objc_line}");
 
-    // --- THE x86_64 SLICE MUST RUN BEFORE A UNIVERSAL BUILD SHIPS ---------------
-    // (docs/DESIGN-intel-just-works-2026-09-14.md §3.1.) Every Intel-only fault
-    // the port found sat where an x86_64 EXECUTION differs from an arm64 one —
-    // ObjC encodings, stret sends, `BOOL` width — which no build, type-check,
-    // lint or structural pin proof can see. Rosetta reproduces that ABI exactly,
-    // so the universal binary's x86_64 slice answers `--diagnose` under it, and
-    // its updater pin and app version are cross-checked like the native one's.
-    // No Rosetta is a refusal naming the remedy, never an unexecuted slice.
+    // --- the x86_64 slice runs before a universal build ships -----------------------
+    // (docs/DESIGN-intel-just-works-2026-09-14.md §3.1.) Intel-only faults sit where
+    // x86_64 execution differs from arm64 (ObjC encodings, stret sends, `BOOL` width),
+    // which no build or structural proof sees; Rosetta reproduces that ABI. No Rosetta is
+    // a refusal naming the remedy, never an unexecuted slice.
     let scratch = private_slice_scratch()?;
     let probed = (|| {
         let report = x86_64_slice_runs(&shipped, &scratch.join("home"), &mut |command| {
@@ -972,8 +925,8 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
             validate_slice_update_pin_reports(expected, &[(label, &report)])?;
         }
         validate_app_version_reports(&plan.short_version, &[(label, &report)])?;
-        // `--diagnose` never reaches the session, PTY and CoreText paths, which is
-        // where x86_64 stret/`BOOL` faults live: the slice must also DRIVE a session.
+        // `--diagnose` never reaches the session, PTY and CoreText paths, where x86_64
+        // stret/`BOOL` faults live: the slice must also drive a session.
         slice_drives_a_session(
             &shipped,
             SliceArch::X86_64,
@@ -987,8 +940,7 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
     })();
     let _ = std::fs::remove_dir_all(&scratch);
     let report = probed?;
-    // The record of the run, staged beside the dSYM and published with it: the proof
-    // §3.1 promises the site gate, not a line that scrolled by.
+    // The record of the run, staged beside the dSYM and published with it.
     let record = symbol_out.join(x86_64_probe_asset_name(&plan.short_version));
     std::fs::write(
         &record,
@@ -1001,10 +953,9 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
         x86_64_probe_asset_name(&plan.short_version)
     );
 
-    // --- the unsigned bundle, laid out ONCE, from the same snapshot -------------
-    // Its resources (the Info.plist template, the shell integration, the handoff
-    // policy) are the release commit's own bytes, read from the snapshot this take
-    // verifies after it. Signing is the cut's, over a byte copy of exactly this.
+    // --- the unsigned bundle, from the same snapshot --------------------------------
+    // Its resources are the release commit's bytes, from the snapshot this take verifies
+    // after. Signing is the cut's, over a byte copy of exactly this.
     let app = symbol_out.join("aterm.app");
     crate::bundle::assemble_at(
         &crate::bundle::BundleSpec {
@@ -1191,16 +1142,11 @@ fn release_build_command(driver: &Path, args: Vec<OsString>, env: &ReleaseEnv<'_
     cmd
 }
 
-/// One `cargo build --release -p <pkg>` invocation. `target` = None for the
-/// native Trust slice (the toolchain file supplies the compiler);
-/// `target` = Some(triple) for the upstream-stable compat slice. Each slice builds
-/// in its own target directory and `CARGO_HOME` ([`Take::slice_target`]), so two
-/// can run at once.
-///
-/// Output goes to `log` when one is given (the slices build at once, and each has a
-/// log of its own whose tail [`build_slices`] prints on a failure), else it streams
-/// to the operator. Returns the peak resident memory the build child reported
-/// (`wait4`), where the host reports it.
+/// One `cargo build --release -p <pkg>`: `target` is `None` for the native Trust slice,
+/// `Some(triple)` for the upstream-stable compat slice. Each slice has its own target
+/// directory and `CARGO_HOME`, so two can run at once. Output goes to `log` when given
+/// (its tail printed on failure), else streams to the operator. Returns the build
+/// child's peak resident memory, where the host reports it.
 fn build_one(
     plan: &BuildPlan,
     take: &Take,
@@ -1209,12 +1155,9 @@ fn build_one(
     log: Option<&Path>,
 ) -> Result<Option<u64>, String> {
     snapshot::refuse_root_cargo_config()?;
-    // The build driver, per lane. Native slice: `targo` from the Trust stage2
-    // tool dir — never a PATH `cargo`, a rustup shim the repo's toolchain pin
-    // cannot satisfy. Compat
-    // slice: upstream stable's `cargo` via the rustup shim — the ONE stock
-    // lane, a STOCK EXCEPTION (the pinned Trust sysroot has no
-    // x86_64-apple-darwin std: E0463; see the module docs).
+    // The build driver, per lane. Native: `targo` from the Trust stage2 tool dir, never a
+    // PATH `cargo`. Compat: stable's `cargo` via the rustup shim (STOCK EXCEPTION, see the
+    // module doc).
     let home = std::env::var_os("HOME").ok_or("release build requires HOME")?;
     let compat_shim = if target.is_some() {
         Some(release_rustup_shim_dir(&home)?)
@@ -1300,17 +1243,15 @@ fn build_one(
     let (status, peak_bytes) =
         wait_with_peak(child).map_err(|e| format!("wait for {driver_name} for {pkg}: {e}"))?;
     if !status.success() {
-        // Hard error: a warn-and-skip would let a release ship with a missing
-        // slice.
+        // Hard error: a skip would ship a release with a missing slice.
         return Err(format!("{driver_name} build -p {pkg} failed ({status})"));
     }
     Ok(peak_bytes)
 }
 
-/// Wait for `child`, and read the peak resident memory of it and the children it
-/// waited for (`wait4`'s `ru_maxrss`: bytes on macOS, KiB on Linux) — what the
-/// build's own compilers held at their peak, which decides whether the next
-/// build's slices may run at once.
+/// Wait for `child` and read the peak resident memory of it and the children it waited
+/// for (`wait4`'s `ru_maxrss`), which decides whether the next build's slices may run at
+/// once.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn wait_with_peak(
     mut child: aterm_uds::spawnfd::Child,
@@ -1326,11 +1267,9 @@ fn wait_with_peak(
     Ok((child.wait()?, None))
 }
 
-/// Refuse (with the exact remediation) when the stable toolchain's target std
-/// is absent. Probes STABLE explicitly: the compat slice builds with
-/// `RUSTUP_TOOLCHAIN=stable`, and a bare `rustup target list` here would
-/// resolve the repo's `trust` toolchain (rust-toolchain.toml), which never
-/// carries rustup-managed targets. Also refuses when rustup itself is missing.
+/// Refuse, with the remediation, when stable's target std (or rustup) is absent. Probes
+/// stable explicitly: a bare `rustup target list` would resolve the repo's `trust`
+/// toolchain, which never carries rustup-managed targets.
 fn require_rustup_target(triple: &str) -> Result<(), String> {
     let home = std::env::var_os("HOME").ok_or("compat target probe requires HOME")?;
     let rustup_home = release_rustup_home(&home)?;

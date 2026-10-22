@@ -3260,7 +3260,9 @@ impl App {
         {
             return None;
         }
-        let (row, col) = self.frame_cell_at(wid, x, y)?;
+        // Laid by the footer's splice with the harness's glass: on the grid
+        // its lists were laid on, or nowhere.
+        let (row, col) = self.glass_cell_at(wid, x, y)?;
         let ws = self.windows.get(&wid)?;
         let hit = ws
             .claude_card

@@ -340,46 +340,97 @@ fn read_full(file: &mut std::fs::File, buf: &mut [u8]) -> io::Result<usize> {
     Ok(filled)
 }
 
+/// What a directory is under [`ensure_private_dir`]'s rules, as it stands
+/// ([`judge_private_dir`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateDir {
+    /// There is none: `ensure_private_dir` would make it 0700.
+    Missing,
+    /// It is private already: this user's, no group or other mode bit, no
+    /// symlink and no access-list grant.
+    Private,
+    /// It is this user's, but its mode bits (these, `& 0o777`) open it to
+    /// others: `ensure_private_dir` would narrow it to 0700.
+    Open(u32),
+}
+
+/// [`ensure_private_dir`]'s refusal of `dir`, `why` worded for a person.
+fn dir_refused(dir: &Path, why: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("the directory {} {why}", dir.display()),
+    )
+}
+
+/// [`ensure_private_dir`]'s refusal of a directory an access list opens to others.
+fn dir_acl_refused(dir: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "the directory {}: {}",
+            dir.display(),
+            ACL_OPEN.replace("`chmod -N`", &format!("`chmod -N {}`", dir.display()))
+        ),
+    )
+}
+
+/// `dir` judged by [`ensure_private_dir`]'s rules with nothing changed: what
+/// it would do (make it, narrow it, or nothing), so a dry run can say so.
+///
+/// # Errors
+/// What `ensure_private_dir` refuses — a symlink, no directory, another
+/// user's, an access list that grants others anything — as
+/// `PermissionDenied` naming the directory, with no OS error code; or the
+/// filesystem's own error, which carries one.
+pub fn judge_private_dir(dir: &Path) -> io::Result<PrivateDir> {
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(PrivateDir::Missing),
+        Err(e) => Err(e),
+        Ok(meta) if meta.file_type().is_symlink() => Err(dir_refused(
+            dir,
+            "is a symlink; it must be a directory of its own",
+        )),
+        Ok(meta) if !meta.is_dir() => Err(dir_refused(dir, "is no directory")),
+        Ok(meta) if meta.uid() != crate::peer::our_uid() => {
+            Err(dir_refused(dir, "is another user's"))
+        }
+        Ok(_) if granted_to_others(AclOf::Path(dir))? => Err(dir_acl_refused(dir)),
+        Ok(meta) if meta.mode() & 0o077 != 0 => Ok(PrivateDir::Open(meta.mode() & 0o777)),
+        Ok(_) => Ok(PrivateDir::Private),
+    }
+}
+
 /// Make `dir` a private state directory, or say why it cannot be one: made
 /// 0700 when it is missing (its parents as the platform makes them),
 /// narrowed to 0700 when it is this user's but open to others — the mode it
 /// had is returned, so the caller can say so — and refused when it is a
-/// symlink, no directory, or another user's. Nothing in it is touched.
+/// symlink, no directory, another user's, or open to others by an access
+/// list ([`judge_private_dir`]). A directory it makes is judged too: an
+/// access list a parent passes on to a new directory makes it no private
+/// one. Nothing in it is touched.
 ///
 /// # Errors
 /// The refusal, worded for a person, or the filesystem's own error.
 pub fn ensure_private_dir(dir: &Path) -> io::Result<Option<u32>> {
-    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
-    let refused = |why: &str| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("the directory {} {why}", dir.display()),
-        )
-    };
-    match std::fs::symlink_metadata(dir) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    match judge_private_dir(dir)? {
+        PrivateDir::Missing => {
             if let Some(parent) = dir.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::DirBuilder::new().mode(0o700).create(dir)?;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            if granted_to_others(AclOf::Path(dir))? {
+                return Err(dir_acl_refused(dir));
+            }
             Ok(None)
         }
-        Err(e) => Err(e),
-        Ok(meta) if meta.file_type().is_symlink() => {
-            Err(refused("is a symlink; it must be a directory of its own"))
-        }
-        Ok(meta) if !meta.is_dir() => Err(refused("is no directory")),
-        Ok(meta) if meta.uid() != crate::peer::our_uid() => Err(refused("is another user's")),
-        Ok(_) if granted_to_others(AclOf::Path(dir))? => Err(refused(&format!(
-            "has {}",
-            ACL_OPEN.replace("`chmod -N`", &format!("`chmod -N {}`", dir.display()))
-        ))),
-        Ok(meta) if meta.mode() & 0o077 != 0 => {
+        PrivateDir::Open(mode) => {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-            Ok(Some(meta.mode() & 0o777))
+            Ok(Some(mode))
         }
-        Ok(_) => Ok(None),
+        PrivateDir::Private => Ok(None),
     }
 }
 
@@ -474,8 +525,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        PrivateFileError, PrivateRead, create_private_dir, read_private, read_private_into,
-        remove_private, write_private,
+        PrivateDir, PrivateFileError, PrivateRead, create_private_dir, ensure_private_dir,
+        judge_private_dir, read_private, read_private_into, remove_private, write_private,
     };
 
     /// A directory `name` in `root`, mode `mode`.
@@ -644,13 +695,6 @@ mod tests {
         let root = aterm_tempfile::tempdir().unwrap();
         let parent = dir_in(root.path(), "parent", 0o700);
         let child = parent.join("child");
-        let chmod = |args: &[&std::ffi::OsStr]| {
-            let ran = crate::spawnfd::command("/bin/chmod")
-                .args(args)
-                .status()
-                .expect("run chmod");
-            assert!(ran.success(), "chmod {args:?}");
-        };
         chmod(&[
             "+a".as_ref(),
             "everyone allow list,search,directory_inherit".as_ref(),
@@ -663,6 +707,89 @@ mod tests {
         chmod(&["-N".as_ref(), parent.as_os_str(), child.as_os_str()]);
         create_private_dir(&child).unwrap();
         assert_eq!(mode_of(&child), 0o700);
+    }
+
+    /// `chmod <args>`, which must succeed.
+    #[cfg(target_os = "macos")]
+    fn chmod(args: &[&std::ffi::OsStr]) {
+        let ran = crate::spawnfd::command("/bin/chmod")
+            .args(args)
+            .status()
+            .expect("run chmod");
+        assert!(ran.success(), "chmod {args:?}");
+    }
+
+    /// On macOS an access list that allows anyone anything makes a 0700 directory no
+    /// private one: `judge_private_dir` and `ensure_private_dir` refuse it, naming
+    /// `chmod -N`, and leave it as it was. A new directory that inherits such a list from
+    /// its parent is refused too, though `ensure_private_dir` made it. A deny entry (macOS puts
+    /// one on `~/Library`) takes nothing away, and is accepted: the negative control.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ensure_private_dir_refuses_an_access_list_that_allows_others() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let granted = dir_in(root.path(), "granted", 0o700);
+        chmod(&[
+            "+a".as_ref(),
+            "everyone allow read".as_ref(),
+            granted.as_os_str(),
+        ]);
+        for refusal in [
+            judge_private_dir(&granted).unwrap_err(),
+            ensure_private_dir(&granted).unwrap_err(),
+        ] {
+            assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(refusal.raw_os_error().is_none(), "{refusal}");
+            assert!(refusal.to_string().contains("chmod -N"), "{refusal}");
+        }
+        assert_eq!(mode_of(&granted), 0o700);
+
+        let parent = dir_in(root.path(), "parent", 0o700);
+        chmod(&[
+            "+a".as_ref(),
+            "everyone allow list,search,directory_inherit".as_ref(),
+            parent.as_os_str(),
+        ]);
+        let child = parent.join("child");
+        assert_eq!(
+            ensure_private_dir(&child).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let denied = dir_in(root.path(), "denied", 0o700);
+        chmod(&[
+            "+a".as_ref(),
+            "everyone deny add_file".as_ref(),
+            denied.as_os_str(),
+        ]);
+        assert_eq!(judge_private_dir(&denied).unwrap(), PrivateDir::Private);
+        assert_eq!(ensure_private_dir(&denied).unwrap(), None);
+    }
+
+    /// `judge_private_dir` says what `ensure_private_dir` would do and changes nothing: a
+    /// missing directory stays missing, an open one keeps its mode until
+    /// `ensure_private_dir` narrows it (returning the mode it had), and a symlink is
+    /// refused with no OS error code.
+    #[test]
+    fn judge_private_dir_says_what_ensure_would_do_and_changes_nothing() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let fresh = root.path().join("fresh");
+        assert_eq!(judge_private_dir(&fresh).unwrap(), PrivateDir::Missing);
+        assert!(!fresh.exists());
+        assert_eq!(ensure_private_dir(&fresh).unwrap(), None);
+        assert_eq!(judge_private_dir(&fresh).unwrap(), PrivateDir::Private);
+
+        let open = dir_in(root.path(), "open", 0o755);
+        assert_eq!(judge_private_dir(&open).unwrap(), PrivateDir::Open(0o755));
+        assert_eq!(mode_of(&open), 0o755);
+        assert_eq!(ensure_private_dir(&open).unwrap(), Some(0o755));
+        assert_eq!(mode_of(&open), 0o700);
+
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&fresh, &link).unwrap();
+        let refusal = judge_private_dir(&link).unwrap_err();
+        assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(refusal.raw_os_error().is_none(), "{refusal}");
     }
 
     /// A symlink in the file's place is refused as one.

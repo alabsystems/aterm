@@ -144,10 +144,9 @@ pub(crate) fn shell_check(path: &str) -> crate::ShellCheck {
 /// resolves `aterm.toml`'s top-level `shell` or the platform default (`pwsh`,
 /// `powershell`, `%COMSPEC%`, `cmd.exe`) via [`aterm_pty::select_shell_with_origin`].
 pub(crate) struct WindowShell {
-    /// The program `CreateProcessW` is handed: an absolute path when the name
-    /// resolved (or was given as one), the bare name verbatim when it did not —
-    /// which [`shell_check`] then reports as missing, exactly as the
-    /// spawn would fail.
+    /// The program `CreateProcessW` is handed: an absolute path when the name resolved,
+    /// else the bare name verbatim, which [`shell_check`] reports missing as the spawn
+    /// would fail.
     pub(crate) program: String,
     /// Which input decided it.
     pub(crate) source: ShellSource,
@@ -468,9 +467,8 @@ fn pump_console_input(stdin: isize, master: i32) {
                     }
                 }
                 WINDOW_BUFFER_SIZE_EVENT => {
-                    // Resize from the live window rect (the event carries the
-                    // buffer size). `aterm_pty::resize` is thread-safe on
-                    // Windows.
+                    // The live window rect, not the event's buffer size.
+                    // `aterm_pty::resize` is thread-safe on Windows.
                     let (rows, cols) = host_winsize();
                     aterm_pty::resize(master, rows, cols);
                 }
@@ -605,10 +603,8 @@ mod tests {
         ));
     }
 
-    /// The window's precedence, over the spawn's resolver: aterm.toml outranks
-    /// the platform default, and the program is what the spawn would run — an
-    /// absolute path for a name that resolves, the bare name verbatim (hence
-    /// `does not exist`) for one that does not.
+    /// aterm.toml outranks the platform default, and the program is what the spawn would
+    /// run: an absolute path for a name that resolves, else the bare name verbatim.
     #[test]
     fn window_shell_follows_the_windows_precedence_and_names_its_source() {
         let config = WindowShell::resolve_with(ConfigShell::Set("cmd".to_string()));
@@ -655,8 +651,8 @@ mod tests {
         );
     }
 
-    /// With nothing named, the report IS the spawn's default (`select_shell`'s
-    /// program, its origin arm named) — on this box pwsh on PATH.
+    /// With nothing named, the report is the spawn's default (`select_shell`'s program and
+    /// origin arm).
     #[test]
     fn window_shell_default_is_the_spawns_default() {
         let dflt = WindowShell::resolve_with(ConfigShell::Absent);

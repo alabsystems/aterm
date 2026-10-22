@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The macOS sheet that offers the ALab secrets vault's join (`secrets_join`), built as
+//! The macOS sheet that offers a secrets vault's join (`secrets_join`: its URL field holds
+//! the ALab default until the person edits it), built as
 //! the `sudo` askpass sheet is (`askpass_sheet.rs`): a window-attached `NSAlert` with an
 //! `NSSecureTextField`, raised on the focused window at the ask's quiet moment — it never
 //! selects a tab or makes a window key. Synthetic key posting is fenced off while it is up

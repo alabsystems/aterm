@@ -444,7 +444,6 @@ __aterm_report_cwd() {
     __aterm_osc "7;${uri}"
 }
 
-# Mark prompt start (OSC 133;A)
 __aterm_mark_prompt_start() {
     __aterm_osc "133;A${__aterm_id_suffix_str}"
 }
@@ -461,12 +460,10 @@ __aterm_mark_command_start() {
     fi
 }
 
-# Mark command execution start (OSC 133;C)
 __aterm_mark_exec_start() {
     __aterm_osc "133;C${__aterm_id_suffix_str}"
 }
 
-# Mark command completion (OSC 133;D;exitcode)
 __aterm_mark_exec_finish() {
     __aterm_osc "133;D;$1${__aterm_id_suffix_str}"
 }

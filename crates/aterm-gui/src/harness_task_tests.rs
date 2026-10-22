@@ -768,6 +768,7 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         opened_by: None,
         message_drawn: true,
         submits: None,
+        inputs_before: None,
         screen_mark: None,
         worked,
         rules: None,

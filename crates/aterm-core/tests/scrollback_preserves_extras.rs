@@ -80,12 +80,9 @@ fn row_text_screen_ignores_scroll_position() {
     assert_ne!(live0_scrolled.as_deref(), Some("L00"));
 }
 
-/// The strongest scrollback invariant: a row rendered live (display_offset==0)
-/// must render byte-for-byte identically once it has scrolled into history — the
-/// full `RenderCell` (glyph, fg/bg, wide, emoji_presentation, bold/italic,
-/// underline + colour, strike/overline) plus the cluster and combining overlays.
-/// `input` is one line (no newline); `find` is its first char, used to relocate
-/// the row after `scroll_to_top`.
+/// A row rendered live (display_offset 0) renders identically once scrolled into history:
+/// the full `RenderCell` plus the cluster and combining overlays. `input` is one line (no
+/// newline); `find`, its first char, relocates the row after `scroll_to_top`.
 fn assert_scrollback_parity(input: &[u8], find: char) {
     assert_scrollback_parity_dims(6, 80, input, find);
 }

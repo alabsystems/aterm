@@ -435,8 +435,8 @@ impl Default for Scrollback {
     }
 }
 
-/// How many of `lines` carry an inline-image span — i.e. how many FOOTPRINT
-/// ROWS lose their picture when this batch is compressed.
+/// How many of `lines` carry an inline-image span: the rows that lose their
+/// picture when this batch is compressed.
 ///
 /// The one seam the tiered store counts the image retention horizon through
 /// (from [`Scrollback`]'s `promote_hot_to_warm`). Counts LINES, not spans: a row covered by two placements
@@ -466,7 +466,6 @@ mod tests;
 #[cfg(test)]
 mod decode_fuzz_tests;
 
-// Incremental memory-tracking regression tests.
 #[cfg(test)]
 #[path = "memory_tracking_tests.rs"]
 mod memory_tracking_tests;

@@ -1798,8 +1798,7 @@ fn saturating_increment_u64(counter: &std::sync::atomic::AtomicU64) {
     let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1));
 }
 
-/// The UI-thread ingress decision. `try_send` never blocks; a full channel
-/// keeps queued cues, drops the newest, and counts it (saturating).
+/// The device the worker drives: [`mac::MacOut`], or a test double.
 #[cfg(target_os = "macos")]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -2572,12 +2571,8 @@ mod tests {
         }
     }
 
-    /// Wait for the worker thread to reach a state. Every predicate is an
-    /// "eventually", so the deadline is a HANG DISCRIMINATOR, a minute like the
-    /// repo's other thread handoffs: a correct run leaves as soon as the state
-    /// holds, and a wedged worker still fails. It was 500 ms spun on
-    /// `yield_now`, which kept the waiter runnable and competing for the core
-    /// the worker needed (the load-sensitive test audit of 2026-09-27).
+    /// Wait for the worker thread to reach a state: a one-minute hang detector
+    /// polled every millisecond, so a correct run leaves as soon as it holds.
     fn wait_until(label: &str, pred: impl Fn() -> bool) {
         let seen = aterm_spec::wait::within(
             aterm_spec::wait::MUST_HAPPEN,
@@ -4167,7 +4162,7 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), ["add"]);
     }
 
-    /// A device double for the WORKER-level proof: the real `DeviceHealth`
+    /// A device double for the worker-level proof: the real `DeviceHealth`
     /// verdict and the real listener body, over a fake `IsRunning` property,
     /// driven through the shipping `worker_loop` and its reopen ladder.
     #[derive(Default)]

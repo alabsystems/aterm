@@ -56,6 +56,19 @@ pub struct Screen {
     /// read again ([`crate::supervise::policy::turn_end::TurnEndReading::submits`]).
     /// `None` from a host that sends none.
     pub submits: Option<u64>,
+    /// How many input writes of any kind the session had been sent before
+    /// the rows were read (`"inputs"`' first: keys, text, pastes, raw bytes,
+    /// submitting or not, whoever sent them; never a report), counted only
+    /// where none was in flight, so every one of them had landed before the
+    /// rows. What a later read's [`Self::inputs_after`] is set against: equal,
+    /// no key reached the session between the two screens
+    /// ([`crate::supervise::policy::turn_end::TurnEndState::redrawn_fresh`]).
+    /// `None` while a write was in flight, or from a host that sends none.
+    pub inputs_before: Option<u64>,
+    /// The same count read after the rows (`"inputs"`' second): every write
+    /// whose effect the rows can show is counted. `None` from a host that
+    /// sends none.
+    pub inputs_after: Option<u64>,
 }
 
 /// A `person` launch witness ([`Screen::launch`]; aterm-gui's `launch_witness`).
@@ -195,6 +208,11 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         .collect::<Result<Vec<_>, _>>()?;
     let cursor = v.get("cursor");
     let num = |o: Option<&Json>, k: &str| o.and_then(|c| c.get(k)).and_then(Json::as_u64);
+    // `"inputs":[before|null,after]`, whole or not at all.
+    let inputs = v
+        .get("inputs")
+        .and_then(Json::as_array)
+        .filter(|i| i.len() == 2);
     Ok(Screen {
         rows,
         cursor_row: usize::try_from(num(cursor, "row").unwrap_or(0)).unwrap_or(usize::MAX),
@@ -220,6 +238,8 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         pane_rows: num(v.get("dims"), "rows").and_then(|r| usize::try_from(r).ok()),
         launch: v.get("launch").and_then(launch_witness),
         submits: v.get("submits").and_then(Json::as_u64),
+        inputs_before: inputs.and_then(|i| i[0].as_u64()),
+        inputs_after: inputs.and_then(|i| i[1].as_u64()),
     })
 }
 
@@ -668,6 +688,27 @@ mod tests {
         assert_eq!(with(""), None, "an older host");
         assert_eq!(with(r#","submits":"7""#), None);
         assert_eq!(with(r#","submits":-1"#), None);
+    }
+
+    /// `"inputs"` (aterm-gui's input writes, before and after the rows): both
+    /// counts are read, a `null` first (a write in flight) is none before and
+    /// the count after; absent (an older host) and any other shape are none.
+    #[test]
+    fn the_input_counts_are_read_and_a_write_in_flight_is_none_before() {
+        let with = |tail: &str| {
+            let s = parse_text_json(&format!(
+                r#"{{"rows":[],"cursor":{{"row":0,"col":0}},"dims":{{"rows":2,"cols":2}},"seq":15,"gen":"2.15","human_ms":null{tail},"submits":1}}"#
+            ))
+            .expect("parses");
+            (s.inputs_before, s.inputs_after)
+        };
+        assert_eq!(with(r#","inputs":[3,4]"#), (Some(3), Some(4)));
+        assert_eq!(with(r#","inputs":[null,4]"#), (None, Some(4)));
+        assert_eq!(with(""), (None, None), "an older host");
+        assert_eq!(with(r#","inputs":[3]"#), (None, None));
+        assert_eq!(with(r#","inputs":[3,4,5]"#), (None, None));
+        assert_eq!(with(r#","inputs":7"#), (None, None));
+        assert_eq!(with(r#","inputs":["3",-1]"#), (None, None));
     }
 
     /// `"launch"` (the server's launch witness, in the shape aterm-gui's

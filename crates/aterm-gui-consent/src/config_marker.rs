@@ -32,7 +32,13 @@ pub fn read_marker(path: &Path, max_bytes: usize) -> Option<String> {
 /// Record `text` at `path`, exclusively and atomically (see the module doc), its
 /// sibling finished with `flush` before the rename: [`Flush::Ordered`] where a lost or
 /// older marker only brings its question back, [`Flush::Durable`] where something
-/// beyond this device's write order depends on it. Each caller says which.
+/// beyond this device's write order depends on it. Each caller says which. On unix a
+/// durable marker's directory is flushed too, after the rename: the new entry is
+/// metadata the file's own flush does not cover, and a power loss could otherwise keep
+/// the old entry. That flush is best-effort: the marker is in place once the rename has
+/// happened, so a directory that cannot be opened or flushed leaves the write a success,
+/// and an `Err` always means the marker was not written. (Windows opens no directory
+/// as a plain `File`, and its rename is the only barrier there.)
 /// Creates the parent directory best-effort; an unwritable one surfaces as the
 /// `create_new` error, which callers treat as "the card comes back".
 pub fn write_marker(
@@ -82,7 +88,21 @@ pub fn write_marker(
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    written
+    written?;
+    #[cfg(unix)]
+    if flush == Flush::Durable
+        && let Some(dir) = path.parent()
+    {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        if let Ok(dir) = std::fs::File::open(dir) {
+            let _ = crate::durable::sync_all(&dir);
+        }
+    }
+    Ok(())
 }
 
 /// Remove the marker at `path`, if a regular file is there. A link or a directory at the path
@@ -236,6 +256,46 @@ mod tests {
         assert!(!marker.exists());
         remove_marker(&marker).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A durable marker makes two durable flushes, an ordered one a single ordered flush.
+    /// One of the two is the directory's: a directory this process may write and search
+    /// but not open (mode 0o300) drops it, and the write still succeeds with the new text
+    /// in place, so an error never reports a marker that was written. Which flush comes
+    /// first, and where each falls against the rename, is `write_marker`'s order: the
+    /// recording seam sees neither a path nor the rename. NEGATIVE CONTROL: the ordered
+    /// write's single flush.
+    #[cfg(unix)]
+    #[test]
+    fn a_durable_marker_also_flushes_its_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = aterm_tempfile::TempDir::new().expect("a private marker fixture");
+        let marker = root.path().join("answered");
+        let recording = aterm_durable::seam::Recording::start();
+        write_marker(&marker, "kept", 64, Flush::Durable).unwrap();
+        assert_eq!(
+            recording.take(),
+            [Flush::Durable, Flush::Durable],
+            "the sibling and the directory"
+        );
+        write_marker(&marker, "ordered", 64, Flush::Ordered).unwrap();
+        assert_eq!(recording.take(), [Flush::Ordered], "the sibling only");
+        assert_eq!(read_marker(&marker, 64).as_deref(), Some("ordered"));
+
+        let shut = root.path().join("shut");
+        std::fs::create_dir(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let inside = shut.join("answered");
+        let written = write_marker(&inside, "renamed", 64, Flush::Durable);
+        let flushes = recording.take();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).unwrap();
+        written.expect("the rename happened: written");
+        assert_eq!(
+            flushes,
+            [Flush::Durable],
+            "the sibling only: the directory would not open"
+        );
+        assert_eq!(read_marker(&inside, 64).as_deref(), Some("renamed"));
     }
 
     /// The parent directory is created on demand: a fresh install has no config directory yet.

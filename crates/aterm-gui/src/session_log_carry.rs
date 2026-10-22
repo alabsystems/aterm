@@ -204,7 +204,9 @@ impl SessionLog {
         let now = self.now();
         // The program's newest state its bucket held is written before the
         // fence: the successor's bucket starts full and holds none of it.
+        // So is the newest shown tuple (6F-9), which the carry then names.
         self.flush_program(now);
+        self.flush_shown(now);
         // The bus mirror's state first (`session_log_mirror::sync`): a
         // replaced bus log's cursor never crosses, and while the node mirrors
         // the carry numbers the bus class even of a log no take reached.

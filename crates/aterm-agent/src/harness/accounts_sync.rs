@@ -1542,6 +1542,137 @@ fn resolve_mailbox_dir(home: &Path, store: &accounts::Store) -> Option<PathBuf> 
 /// directory for the next non-limited account (`sign_in_next`), bounded by a
 /// single in-flight worker and a 15-minute per-label cooldown. Once verified
 /// via `claude auth status --json`, binds the account in `logins.json` +
+fn next_auto_renew_target(
+    file_roster: &Roster,
+    state: &accounts::State,
+    logins: &accounts::Logins,
+    now: i64,
+) -> Option<accounts::Row> {
+    let roster = accounts::bound(file_roster, logins);
+    let enrolled = accounts::enrolled(&roster);
+    let is_walled_or_low = |label: &str| {
+        state.accounts.get(label).is_some_and(|a| {
+            a.limited_until(now).is_some() || a.low(now) || a.auth == accounts::Auth::SignedOut
+        })
+    };
+    let me = state
+        .active
+        .as_deref()
+        .filter(|label| roster.row(label).is_some())
+        .or_else(|| {
+            state
+                .sessions
+                .values()
+                .map(|s| s.account.as_str())
+                .find(|label| roster.row(label).is_some() && is_walled_or_low(label))
+        })
+        .or_else(|| roster.row_for_login(None).map(|row| row.label.as_str()));
+    let any_walled = me.is_some_and(is_walled_or_low)
+        || state
+            .sessions
+            .values()
+            .any(|s| is_walled_or_low(&s.account));
+    if !any_walled {
+        return None;
+    }
+    let wall_point = accounts::Point::Wall {
+        window: String::new(),
+        at: None,
+    };
+    let has_ready_candidate = accounts::candidates(&roster, state, &enrolled, me, &wall_point, now)
+        .iter()
+        .any(|(_, verdict)| verdict.is_ok());
+    if has_ready_candidate {
+        return None;
+    }
+    let (next_label, true) = accounts::sign_in_next(&roster, state, &enrolled, me, now)? else {
+        return None;
+    };
+    let next_row = roster.row(&next_label)?.clone();
+    next_row.email.as_ref()?;
+    Some(next_row)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "staging renewal commit binds store, rosters, target row, staging dir, status JSON, and clock"
+)]
+fn complete_staging_renewal(
+    store: &accounts::Store,
+    file_roster: &Roster,
+    roster: &Roster,
+    next_row: &accounts::Row,
+    staging: &Path,
+    staging_text: &str,
+    status_got: &super::align::Captured,
+    now_done: i64,
+) -> bool {
+    let matched = std::iter::once(next_row)
+        .chain(roster.rows.iter().filter(|r| r.label != next_row.label))
+        .find_map(|row| {
+            let email = row.email.as_deref()?;
+            let facts = super::cli::status_facts(status_got, email)?;
+            if !facts.renews() {
+                return None;
+            }
+            Some((row.label.clone(), facts.subscription))
+        });
+    let Some((matched_label, subscription)) = matched else {
+        let _ = fs::remove_dir_all(staging);
+        return false;
+    };
+    let (fresh_state, _) = store.load(now_done).unwrap_or_default();
+    if fresh_state
+        .accounts
+        .get(&matched_label)
+        .is_some_and(|a| a.limited_until(now_done).is_some())
+    {
+        let _ = fs::remove_dir_all(staging);
+        return false;
+    }
+    let own_dir = file_roster
+        .row(&matched_label)
+        .and_then(|r| r.dir.as_deref());
+    let mut note = None;
+    store
+        .transact_logins(now_done, &mut note, |state, logins| {
+            Ok(accounts::note_renewed(
+                state,
+                logins,
+                &matched_label,
+                own_dir,
+                staging_text,
+                subscription.as_deref(),
+                now_done,
+            ))
+        })
+        .is_ok()
+}
+
+fn select_auto_renew_browser(
+    row_browser: Option<&str>,
+    mailbox_dir: Option<&Path>,
+    opener: Option<PathBuf>,
+) -> Option<super::cli::RenewBrowser> {
+    let opener = opener?;
+    if mailbox_dir.is_some() {
+        return Some(super::cli::RenewBrowser::Remote {
+            opener: Some(opener),
+        });
+    }
+    row_browser.map(|profile| super::cli::RenewBrowser::Profile {
+        opener,
+        profile: profile.to_owned(),
+    })
+}
+
+/// Automatically start a non-blocking staging login (`claude auth login --claudeai --email ...`)
+/// for the next un-enrolled account when the active or walled account has no ready candidate
+/// (`NotEnrolled` or `SignedOut`), so weekly-limit rollovers complete without manual CLI intervention.
+///
+/// Runs at most one renewal at a time across the process with a 15-minute cooldown per account
+/// label, and once `claude auth login` succeeds in `<state>/accounts/logins/<label>+<seq>`,
+/// verifies `claude auth status --json`, binds the staging directory in `logins.json` and
 /// `state.json` and touches `wake` so waiting sessions rotate immediately.
 pub fn auto_renew_next_account(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) {
     let Ok(file_roster) = Roster::load(roster_path) else {
@@ -1557,45 +1688,18 @@ pub fn auto_renew_next_account(home: &Path, state_dir: &Path, roster_path: &Path
     let Ok((logins, _)) = store.load_logins(now) else {
         return;
     };
-    let roster = accounts::bound(&file_roster, &logins);
-    let enrolled = accounts::enrolled(&roster);
-    let me = state
-        .active
-        .as_deref()
-        .filter(|label| roster.row(label).is_some())
-        .or_else(|| roster.row_for_login(None).map(|row| row.label.as_str()));
-    let is_walled = |label: &str| {
-        state
-            .accounts
-            .get(label)
-            .is_some_and(|a| a.limited_until(now).is_some() || a.auth == accounts::Auth::SignedOut)
+    let Some(next_row) = next_auto_renew_target(&file_roster, &state, &logins, now) else {
+        return;
     };
-    let any_walled =
-        me.is_some_and(is_walled) || state.sessions.values().any(|s| is_walled(&s.account));
-    if !any_walled {
+    let mailbox_dir = resolve_mailbox_dir(home, &store);
+    if next_row.browser.is_none() && mailbox_dir.is_none() {
         return;
     }
-    let wall_point = accounts::Point::Wall {
-        window: String::new(),
-        at: None,
-    };
-    let has_ready_candidate =
-        accounts::candidates(&roster, &state, &enrolled, me, &wall_point, now)
-            .iter()
-            .any(|(_, verdict)| verdict.is_ok());
-    if has_ready_candidate {
-        return;
-    }
-    let Some((next_label, true)) = accounts::sign_in_next(&roster, &state, &enrolled, me, now)
-    else {
-        return;
-    };
-    let Some(next_row) = roster.row(&next_label).cloned() else {
-        return;
-    };
+    let next_label = next_row.label.clone();
     let Some(next_email) = next_row.email.clone() else {
         return;
     };
+    let roster = accounts::bound(&file_roster, &logins);
     let Some(permit) = AutoRenewPermit::claim(&AUTO_RENEW_GUARD, &next_label, Instant::now())
     else {
         return;
@@ -1606,6 +1710,14 @@ pub fn auto_renew_next_account(home: &Path, state_dir: &Path, roster_path: &Path
         permit,
         move || {
             let store = accounts::Store::at(&state_owned);
+            let opener = resolve_opener_link(&home_owned, &store);
+            let Some(browser) = select_auto_renew_browser(
+                next_row.browser.as_deref(),
+                mailbox_dir.as_deref(),
+                opener,
+            ) else {
+                return;
+            };
             let Ok(staging) = store.claim_staging_dir(&next_label) else {
                 return;
             };
@@ -1620,18 +1732,6 @@ pub fn auto_renew_next_account(home: &Path, state_dir: &Path, roster_path: &Path
             let Ok(pass_env) = super::cli::auth_check_env(&env_var) else {
                 let _ = fs::remove_dir_all(&staging);
                 return;
-            };
-            let mailbox_dir = resolve_mailbox_dir(&home_owned, &store);
-            let opener = resolve_opener_link(&home_owned, &store);
-            let browser = match (next_row.browser.as_deref(), opener) {
-                (Some(profile), Some(opener)) => super::cli::RenewBrowser::Profile {
-                    opener,
-                    profile: profile.to_owned(),
-                },
-                (None, Some(opener)) if mailbox_dir.is_some() => super::cli::RenewBrowser::Remote {
-                    opener: Some(opener),
-                },
-                _ => super::cli::RenewBrowser::Default,
             };
             let claude_prog = resolve_claude_program(&home_owned);
             let mut cmd = super::cli::renew_command(
@@ -1661,44 +1761,16 @@ pub fn auto_renew_next_account(home: &Path, state_dir: &Path, roster_path: &Path
                 return;
             };
             let now_done = crate::supervise::limit::unix_now().max(now);
-            let matched = std::iter::once(&next_row)
-                .chain(roster.rows.iter().filter(|r| r.label != next_row.label))
-                .find_map(|row| {
-                    let email = row.email.as_deref()?;
-                    let facts = super::cli::status_facts(&status_got, email)?;
-                    if !facts.renews() {
-                        return None;
-                    }
-                    Some((row.label.clone(), facts.subscription))
-                });
-            let Some((matched_label, subscription)) = matched else {
-                let _ = fs::remove_dir_all(&staging);
-                return;
-            };
-            let (fresh_state, _) = store.load(now_done).unwrap_or_default();
-            if fresh_state
-                .accounts
-                .get(&matched_label)
-                .is_some_and(|a| a.limited_until(now_done).is_some())
-            {
-                let _ = fs::remove_dir_all(&staging);
-                return;
-            }
-            let own_dir = file_roster
-                .row(&matched_label)
-                .and_then(|r| r.dir.as_deref());
-            let mut note = None;
-            let _ = store.transact_logins(now_done, &mut note, |state, logins| {
-                Ok(accounts::note_renewed(
-                    state,
-                    logins,
-                    &matched_label,
-                    own_dir,
-                    &staging_text,
-                    subscription.as_deref(),
-                    now_done,
-                ))
-            });
+            let _ = complete_staging_renewal(
+                &store,
+                &file_roster,
+                &roster,
+                &next_row,
+                &staging,
+                &staging_text,
+                &status_got,
+                now_done,
+            );
         },
         |work| {
             std::thread::Builder::new()
@@ -2896,5 +2968,319 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             .expect("the original account can retry after its cooldown");
         drop(permit);
         assert!(!state.lock().unwrap().in_flight);
+    }
+
+    #[test]
+    fn weekly_limit_rollover_selects_and_renews_next_account_via_mailbox_and_rotates_session() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-rollover-mailbox-")
+            .tempdir()
+            .expect("tempdir");
+        let root = dir.path();
+        let home = root.join("home");
+        let state_dir = root.join("state");
+        let config_dir = root.join("config");
+        let claude_dir = home.join(".claude");
+        let projects_dir = claude_dir.join("projects").join("ws");
+        let store = accounts::Store::at(&state_dir);
+        let mailbox_dir = store.dir.join(super::super::open_url::DEFAULT_MAILBOX_DIR);
+        fs::create_dir_all(&projects_dir).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&mailbox_dir).unwrap();
+
+        let csv_path = root.join("fleet.csv");
+        fs::write(
+            &csv_path,
+            concat!(
+                "email,computer,claude\n",
+                "m15@example.test,m15,1\n",
+                "m15-2@example.test,m15,1\n",
+                "m15-3@example.test,m15,1\n"
+            ),
+        )
+        .unwrap();
+
+        let claude_profile = home.join(".claude.json");
+        fs::write(
+            &claude_profile,
+            "{\"oauthAccount\":{\"emailAddress\":\"m15-2@example.test\"}}\n",
+        )
+        .unwrap();
+
+        let transcript = projects_dir.join("session.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"attachment\",\"attachment\":{\"type\":\"session_context\",\"context\":{\"userEmail\":\"The user's email address is m15@example.test. Use it only to identify the user.\"}}}\n",
+                "{\"type\":\"assistant\",\"timestamp\":\"2026-10-20T06:50:53Z\",\"isApiErrorMessage\":true,\"error\":\"rate_limit\",\"message\":{\"model\":\"<synthetic>\",\"content\":[{\"type\":\"text\",\"text\":\"You've hit your weekly limit · resets Oct 26 at 10am\"}]},\"quotaLimits\":{\"status\":\"rejected\",\"resetsAt\":1792999200,\"rateLimitType\":\"seven_day\"}}\n",
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"<local-command-stdout>Login successful</local-command-stdout>\"}}\n",
+                "{\"type\":\"attachment\",\"attachment\":{\"type\":\"session_context\",\"context\":{\"userEmail\":\"The user's email address is m15-2@example.test. Use it only to identify the user.\"},\"changed\":true,\"reason\":\"account_change\"}}\n",
+                "{\"type\":\"assistant\",\"timestamp\":\"2026-10-22T06:21:44Z\",\"isApiErrorMessage\":true,\"error\":\"rate_limit\",\"message\":{\"model\":\"<synthetic>\",\"content\":[{\"type\":\"text\",\"text\":\"You've hit your weekly limit · resets Oct 25 at 2pm\"}]},\"quotaLimits\":{\"status\":\"rejected\",\"resetsAt\":1792936800,\"rateLimitType\":\"seven_day\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let now = 1_792_660_000;
+        let aterm_toml = config_dir.join("aterm.toml");
+        let env = Env {
+            state: state_dir,
+            aterm_state: Some(root.join("aterm-state")),
+            cwd: root.to_path_buf(),
+            home: Some(home),
+            claude_dir: Some(claude_dir),
+            claude_config_unusable: None,
+            claude_profile: Some(claude_profile),
+            claude_custom_oauth: false,
+            claude_session: None,
+            claude_pid: None,
+            codex_thread: None,
+            codex_home: None,
+            now,
+            tz_s: 0,
+            sid: String::new(),
+            sock: None,
+            config: Some(aterm_toml),
+            claude_tmp: None,
+            claude_running: None,
+        };
+
+        let mut sync_out = Vec::new();
+        let mut sync_err = Vec::new();
+        assert_eq!(
+            run_accounts_sync(
+                &env,
+                csv_path.to_str(),
+                Some("m15"),
+                false,
+                &mut sync_out,
+                &mut sync_err
+            ),
+            ExitCode::SUCCESS,
+            "sync failed: {}",
+            String::from_utf8_lossy(&sync_err)
+        );
+
+        let roster_path = config_dir.join("accounts.toml");
+        let file_roster = Roster::load(&roster_path).expect("accounts.toml written");
+        let (logins_before, _) = store.load_logins(now).expect("logins loaded");
+
+        // Record a live supervised session `sid-m15-live` on `m15-2` hitting its weekly wall.
+        let who_m15_2 = accounts::ProcessLogin {
+            login: None,
+            default_home: true,
+            stored_login: true,
+        };
+        let standing_wall = super::super::upgrade::StandingWall {
+            at: u64::try_from(now).unwrap(),
+            until: Some(1_792_936_800),
+            window: Some("seven_day".to_owned()),
+            credits: None,
+        };
+        assert!(matches!(
+            accounts::record_wall(
+                &store,
+                &file_roster,
+                "sid-m15-live",
+                &who_m15_2,
+                &standing_wall,
+                now - 60,
+                now,
+            ),
+            accounts::Recorded::Wall { .. }
+        ));
+
+        let (state_walled, _) = store.load(now).unwrap();
+        let next_row = next_auto_renew_target(&file_roster, &state_walled, &logins_before, now)
+            .expect("must select m15-3 for auto-renewal");
+        assert_eq!(next_row.label, "m15-3");
+        assert_eq!(next_row.email.as_deref(), Some("m15-3@example.test"));
+
+        // Also verify `next_auto_renew_target` finds `m15-3` when `state.active` is None
+        // and the active account is only recorded in `state.sessions`.
+        let mut session_only_state = state_walled;
+        session_only_state.active = None;
+        assert_eq!(
+            next_auto_renew_target(&file_roster, &session_only_state, &logins_before, now)
+                .map(|r| r.label),
+            Some("m15-3".to_owned()),
+            "must select m15-3 even when state.active is None and only state.sessions names m15-2"
+        );
+        assert_eq!(
+            select_auto_renew_browser(None, None, Some(PathBuf::from("/bin/aterm-open-url"))),
+            None,
+            "without a mailbox or profile, background auto-renew must never fall back to Default browser"
+        );
+        assert_eq!(
+            select_auto_renew_browser(
+                Some("Claude m15-3"),
+                Some(&mailbox_dir),
+                Some(PathBuf::from("/bin/aterm-open-url"))
+            ),
+            Some(super::super::cli::RenewBrowser::Remote {
+                opener: Some(PathBuf::from("/bin/aterm-open-url")),
+            }),
+            "when a mailbox directory is present, headless Remote opener is preferred over GUI profile"
+        );
+
+        // Claim the staging directory for `m15-3`, deliver a decoy + a Quoted-Printable magic-link
+        // email to the mailbox, and run the capability-injected OAuth + magic-link flow.
+        let staging = store
+            .claim_staging_dir(&next_row.label)
+            .expect("claim staging dir");
+        let staging_text = staging.to_str().unwrap().to_owned();
+
+        fs::write(
+            mailbox_dir.join("00_decoy_spoof.eml"),
+            concat!(
+                "From: Claude <no-reply@claude.ai>\r\n",
+                "To: <not-m15-3@example.test>\r\n\r\n",
+                "https://claude.ai/magic?token=spoofed_wrong_account\r\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            mailbox_dir.join("01_magic_m15_3.eml"),
+            concat!(
+                "From: Claude <no-reply@claude.ai>\r\n",
+                "To: Claude Fleet\r\n",
+                "  <m15-3@example.test>\r\n",
+                "Content-Transfer-Encoding: quoted-printable\r\n\r\n",
+                "<html><body>\r\n",
+                "<a href=3D\"https://claude.ai/unsubscribe\">Unsubscribe</a>\r\n",
+                "<a href=3D\"https://claude.ai/magic?token=3Dtok_m15_3&amp;=\r\n",
+                "hint=3Dm15-3\">Sign in to Claude.ai</a>\r\n",
+                "</body></html>\r\n"
+            ),
+        )
+        .unwrap();
+
+        let authorize_url = "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A9123%2Fcallback&state=st_m15_3&login_hint=m15-3%40example.test";
+        let responses = [
+            "HTTP/1.1 200 OK\r\nSet-Cookie: session=sess_m15_3; Secure; Path=/\r\n\r\nCheck your email",
+            concat!(
+                "HTTP/1.1 200 OK\r\n\r\n",
+                "<form method=\"POST\" action=\"/oauth/approve\">",
+                "<input type=\"hidden\" name=\"approve\" value=\"allow\"></form>"
+            ),
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9123/callback?code=code_m15_3&state=st_m15_3\r\n\r\n",
+            "HTTP/1.1 200 OK\r\n\r\nLogin successful",
+        ];
+        let mut resp_iter = responses.iter();
+        let mut seen_urls = Vec::new();
+        super::super::open_url::authorize_using(
+            authorize_url,
+            next_row.email.as_deref(),
+            |email| {
+                super::super::open_url::poll_mailbox_for_magic_link(
+                    &mailbox_dir,
+                    email,
+                    Duration::from_secs(1),
+                )
+            },
+            &mut |_method, url, cookies, _body| {
+                seen_urls.push(url.to_owned());
+                super::super::open_url::parse_raw_http_response(
+                    resp_iter.next().expect("expected request"),
+                    cookies,
+                )
+                .ok_or("malformed response")
+            },
+        )
+        .expect("OAuth + mailbox magic-link authorization must succeed");
+        assert_eq!(
+            seen_urls,
+            vec![
+                authorize_url.to_owned(),
+                "https://claude.ai/magic?token=tok_m15_3&hint=m15-3".to_owned(),
+                "https://claude.ai/oauth/approve".to_owned(),
+                "http://127.0.0.1:9123/callback?code=code_m15_3&state=st_m15_3".to_owned(),
+            ]
+        );
+
+        // Write the newly authorized staging login profile and commit via `complete_staging_renewal`.
+        fs::write(
+            staging.join(".claude.json"),
+            "{\"oauthAccount\":{\"emailAddress\":\"m15-3@example.test\",\"subscriptionType\":\"max\"}}\n",
+        )
+        .unwrap();
+        let status_got = super::super::align::Captured {
+            stdout: b"{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"email\":\"m15-3@example.test\",\"subscriptionType\":\"max\"}\n".to_vec(),
+            code: Some(0),
+        };
+        let roster_before = accounts::bound(&file_roster, &logins_before);
+        assert!(
+            complete_staging_renewal(
+                &store,
+                &file_roster,
+                &roster_before,
+                &next_row,
+                &staging,
+                &staging_text,
+                &status_got,
+                now + 5,
+            ),
+            "complete_staging_renewal must bind m15-3"
+        );
+        assert!(
+            store.wake_path().exists(),
+            "complete_staging_renewal must touch wake so waiting sessions rotate immediately"
+        );
+
+        // Prove the waiting session on `m15-2` immediately receives `Advice::Move` to `m15-3`
+        // and rotates onto `CLAUDE_LOGIN_DIR=<state>/accounts/logins/m15-3+1`.
+        let (state_after_renew, _) = store.load(now + 5).unwrap();
+        let (logins_after_renew, _) = store.load_logins(now + 5).unwrap();
+        let bound_roster = accounts::bound(&file_roster, &logins_after_renew);
+        let enrolled_after = accounts::enrolled(&bound_roster);
+        let wall_point = accounts::Point::Wall {
+            window: "seven_day".to_owned(),
+            at: Some(1_792_936_800),
+        };
+        let me_after = who_m15_2.me(&bound_roster);
+        assert_eq!(
+            accounts::advise(
+                &bound_roster,
+                &state_after_renew,
+                &enrolled_after,
+                &me_after,
+                &wall_point,
+                accounts::Mode::Wall,
+                now + 5,
+            ),
+            accounts::Advice::Move {
+                to: "m15-3".to_owned(),
+                ahead: false,
+                rotates: true,
+                takes_canary: false,
+            }
+        );
+
+        let expect_active = state_after_renew.active.clone();
+        let mut note = None;
+        store
+            .transact(now + 5, &mut note, |st| {
+                let ev = accounts::begin_rotation(
+                    st,
+                    &bound_roster,
+                    &enrolled_after,
+                    expect_active.as_deref(),
+                    accounts::Mover {
+                        sid: "sid-m15-live",
+                        account: "m15-2",
+                    },
+                    "m15-3",
+                    now + 5,
+                )
+                .map_err(|lost| format!("rotation lost: {lost:?}"))?;
+                Ok(vec![ev])
+            })
+            .expect("begin_rotation transaction");
+        let (state_rotated, _) = store.load(now + 5).unwrap();
+        assert_eq!(state_rotated.active.as_deref(), Some("m15-3"));
+        let target_row = bound_roster.row("m15-3").expect("m15-3 row");
+        assert_eq!(
+            accounts::login_env(target_row),
+            (accounts::LOGIN_ENV, staging_text)
+        );
     }
 }

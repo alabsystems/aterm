@@ -678,9 +678,8 @@ fn langs_of(lx: &Lexicon, text: &str, opts: &ScanOptions) -> Vec<String> {
         .collect()
 }
 
-/// The CJK homograph 猫 is listed by BOTH the ja and zh entries: the union
-/// carries both, primary = ja (first TOML appearance). Single-language
-/// compounds stay single-language.
+/// 猫 is listed by both the ja and zh entries: the union carries both, primary ja (first TOML
+/// appearance). Single-language compounds stay single-language.
 #[test]
 fn cjk_homograph_neko_unions_ja_zh() {
     let lx = lex();

@@ -40974,6 +40974,132 @@ fn a_tried_styles_hint_says_what_its_gesture_does() {
     );
 }
 
+/// A TRIED STYLE SAYS SO AFTER THE ADJUST CARD HAD THE KEYBOARD (looks4
+/// settings-3): focusing a tuning control (Trail length) cached it as the
+/// page preview's subject, and no style row ever replaced it, so a style
+/// tried from the list and kept by the preview's own control was drawn with
+/// "Trail length: 24 cells" over it — no "Trying", no "not saved", no way
+/// back named. A row is a value of the style setting: the keyboard on a row
+/// makes the style the subject, and a kept trial says it is tried. The
+/// pointer's trial says so too while the keyboard is on a tuning control.
+/// NEGATIVE CONTROLS: with nothing tried, the keyboard on Trail length keeps
+/// Trail length the subject, and so does the preview's own focus after it.
+#[test]
+fn a_kept_style_says_it_is_tried_after_the_adjust_card_had_the_keyboard() {
+    let (mut runtime, instance, view) =
+        cursor_styles_runtime("cursor_trail_style = \"rainbow kitty pet\"\n");
+    compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
+    let length = UiKey::new(format!(
+        "settings/control/{}",
+        prefs::EDIT_CURSOR_TRAIL_LENGTH
+    ));
+    let preview = UiKey::new("settings/preview/cursor-styles");
+    let dog = UiKey::new(cursor_style_row_key("rainbow dog pet"));
+    let underline = UiKey::new(cursor_style_row_key("rainbow kitty underline"));
+    let painted = |spec: &SettingsPreviewSpec| {
+        let mut prims = Vec::new();
+        spec.paint(
+            &mut prims,
+            LogicalRect::new(0.0, 0.0, 900.0, 240.0),
+            aterm_render::Theme::default(),
+            crate::settings::Roles::from_theme(aterm_render::Theme::default()),
+        );
+        prims
+            .iter()
+            .filter_map(|prim| match prim {
+                crate::widget::DrawPrim::Text { s, .. } => Some(s.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let set = |runtime: &mut NativeRuntime, hovered: Option<&UiKey>, focus: &UiKey| {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.common.hovered = hovered.cloned();
+        state.common.last_focus = Some(focus.clone());
+    };
+
+    // NEGATIVE CONTROL: Trail length has the keyboard and nothing is tried;
+    // the preview's own focus after it keeps demonstrating Trail length.
+    set(&mut runtime, None, &length);
+    let spec = cursor_styles_spec(&runtime, view);
+    assert_eq!(spec.focused_key, prefs::EDIT_CURSOR_TRAIL_LENGTH);
+    assert_eq!(spec.style_trial, None);
+    set(&mut runtime, None, &preview);
+    let spec = cursor_styles_spec(&runtime, view);
+    assert_eq!(spec.focused_key, prefs::EDIT_CURSOR_TRAIL_LENGTH);
+    assert!(
+        painted(&spec).contains("Trail length"),
+        "{}",
+        painted(&spec)
+    );
+
+    // The keyboard on the saved style's row (nothing tried) makes the style
+    // the subject the preview's own focus keeps.
+    set(&mut runtime, None, &length);
+    let _ = cursor_styles_spec(&runtime, view);
+    set(
+        &mut runtime,
+        None,
+        &UiKey::new(cursor_style_row_key("rainbow kitty pet")),
+    );
+    let _ = cursor_styles_spec(&runtime, view);
+    set(&mut runtime, None, &preview);
+    let spec = cursor_styles_spec(&runtime, view);
+    assert_eq!(spec.style_trial, None);
+    assert_eq!(spec.focused_key, prefs::EDIT_CURSOR_TRAIL_STYLE);
+
+    // The keyboard tries a row, then the preview's own control keeps it.
+    set(&mut runtime, None, &length);
+    let _ = cursor_styles_spec(&runtime, view);
+    set(&mut runtime, None, &dog);
+    assert_eq!(
+        cursor_styles_spec(&runtime, view).style_trial,
+        Some(StyleTrial::Keyboard)
+    );
+    set(&mut runtime, None, &preview);
+    let spec = cursor_styles_spec(&runtime, view);
+    assert_eq!(spec.style_trial, Some(StyleTrial::Kept));
+    assert_eq!(spec.focused_key, prefs::EDIT_CURSOR_TRAIL_STYLE);
+    assert_eq!(spec.cursor.trail_style_label(), "Rainbow dog");
+    let words = painted(&spec);
+    assert!(words.contains("Trying"), "{words}");
+    assert!(!words.contains("Trail length"), "{words}");
+    let spoken = spec.semantic_value();
+    assert!(
+        spoken.contains(&format!(
+            "trying Rainbow dog ({})",
+            StyleTrial::Kept.spoken()
+        )),
+        "{spoken}"
+    );
+
+    // The pointer tries a row while Trail length has the keyboard.
+    set(&mut runtime, Some(&underline), &length);
+    let spec = cursor_styles_spec(&runtime, view);
+    assert_eq!(spec.style_trial, Some(StyleTrial::Pointer));
+    assert_eq!(spec.focused_key, prefs::EDIT_CURSOR_TRAIL_STYLE);
+    assert!(
+        painted(&spec).contains(
+            StyleTrial::Pointer
+                .save_hint()
+                .expect("a pointer's gesture")
+        ),
+        "{}",
+        painted(&spec)
+    );
+    assert!(
+        spec.semantic_value().contains(&format!(
+            "trying Rainbow underline ({})",
+            StyleTrial::Pointer.spoken()
+        )),
+        "{}",
+        spec.semantic_value()
+    );
+}
+
 /// A HOVER GOES WITH ITS PAGE (review of audit r14 PV8): a Cursor Styles row
 /// the pointer hovered stayed hovered after the keyboard went to another
 /// page, so coming back tried that style again, "Click to save", with

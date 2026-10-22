@@ -872,7 +872,7 @@ impl Stub {
             info.results,
             one_line(&info.last_user, 70)
         );
-        self.dump(body);
+        self.dump(body, kind);
         let in_tok = est_tokens(blen);
         let t = (method, path, blen, mode, model, verb, in_tok);
         if kind != "gemini" {

@@ -425,14 +425,12 @@ fn a_discard_ends_a_writer_parked_mid_frame() {
     close_pair(master, slave);
 }
 
-/// A FLUSH IS NOT A RESTART. `reset flush` and the drop before `signal term` empty the
-/// same queue and both move the discard epoch — a frame in flight belongs to
-/// the input that went, whichever drop took it. Only the restart's drop moves
-/// `restart_discards`, the count aterm-gui's input watch starts a published
-/// stall's restart grace on. Before the split a `reset flush` on a stalled
-/// program read as its restart signal, and five seconds later the program
-/// was named as having survived it, remedy `signal kill`, though no signal
-/// was ever sent. Off a tty nothing is dropped, and neither count moves.
+/// A flush is not a restart: `reset flush` and the drop before `signal term` empty the
+/// same queue and both move the discard epoch (a frame in flight belongs to the input
+/// that went), but only the restart moves `restart_discards`, the count aterm-gui's
+/// input watch starts a published stall's restart grace on; a flush counted there
+/// would name a program as surviving a signal never sent. Off a tty nothing is
+/// dropped and neither count moves.
 #[test]
 fn a_flush_moves_the_discard_epoch_and_not_the_restart_count() {
     let (master, slave) = pty_pair(true);

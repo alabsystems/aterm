@@ -965,10 +965,8 @@ fn told_on_by(log: &crate::log::MessageLog, rec: &LogRecord) -> Option<MessageId
     (rec.severity != Severity::Error || next.posted_severity == Severity::Error).then_some(*by)
 }
 
-/// Whether `intent` is a word for a tab whose upgrade this host does not have
-/// at all ([`Host::upgrade_stands`]): the host hands over the upgrade rows of
-/// its live tabs, so none for the intent's tab means its session ended here
-/// (a tab id never comes back) or its move is over. Either way the word is
+/// Whether `intent` is a word for a tab whose upgrade this host does not have at all
+/// ([`Host::upgrade_stands`]): its session ended here or its move is over, so the word is
 /// moot.
 fn session_gone(intent: &Intent, host: &impl Host) -> bool {
     match intent {

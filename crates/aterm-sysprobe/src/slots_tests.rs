@@ -190,6 +190,27 @@ fn a_slot_is_held_only_when_the_same_holder_is_seen_on_two_reads() {
     assert_eq!(counts_of(&third).pending, 1);
     let fourth = book.judge(obs(3_000, &[other]), &CALM, &mut never);
     assert_eq!(counts_of(&fourth).held, 1);
+
+    // A path's replacement is a new physical slot even when the same
+    // process has it open: neither a new device nor a new inode borrows the
+    // old file's first sighting. The replacement's own second sighting can
+    // still prove the holder.
+    for file in [(2, 100), (1, 101)] {
+        let sight = Sighted(holder(40));
+        let mut book = SlotBook::default();
+        book.judge(obs(0, std::slice::from_ref(&sight)), &CALM, &mut never);
+        let mut replaced = obs(1_000, &[sight]);
+        replaced.slots[0].file = file;
+        let first = book.judge(replaced.clone(), &CALM, &mut never);
+        assert_eq!(
+            (counts_of(&first).pending, counts_of(&first).held),
+            (1, 0),
+            "{file:?}"
+        );
+        replaced.mono_ms = 2_000;
+        let second = book.judge(replaced, &CALM, &mut never);
+        assert_eq!(counts_of(&second).held, 1, "{file:?}");
+    }
 }
 
 #[test]
@@ -227,6 +248,24 @@ fn a_free_slot_needs_two_reads_with_no_holder() {
             ..SlotCounts::default()
         }
     );
+
+    // The same index on a new device/inode has only one absence reading.
+    // Once that replacement is seen absent again, it is free as usual.
+    for file in [(2, 100), (1, 101)] {
+        let mut book = SlotBook::default();
+        book.judge(obs(0, &[Sight::NotHeld { gone: None }]), &CALM, &mut never);
+        let mut replaced = obs(1_000, &[Sight::Empty]);
+        replaced.slots[0].file = file;
+        let first = book.judge(replaced.clone(), &CALM, &mut never);
+        assert_eq!(
+            (counts_of(&first).pending, counts_of(&first).free),
+            (1, 0),
+            "{file:?}"
+        );
+        replaced.mono_ms = 2_000;
+        let second = book.judge(replaced, &CALM, &mut never);
+        assert_eq!(counts_of(&second).free, 1, "{file:?}");
+    }
 }
 
 #[test]
@@ -286,6 +325,60 @@ fn an_unreadable_record_is_unknown_never_free() {
     assert_eq!(counts_of(&unproven).unknown, 1);
     let none = SlotBook::default().judge(obs(0, &[]), &CALM, &mut never);
     assert_eq!(none, SlotsRead::Unread(Unread::NotSampled));
+
+    // A failed lock query is not an unlocked file. Even an empty record or
+    // a gone writer could hide a new winner stalled before its record.
+    let absent = [Sight::Empty, Sight::NotHeld { gone: None }, gone(9, NOW)];
+    for lock in [None, Some(true)] {
+        let sights: Vec<_> = absent
+            .iter()
+            .cloned()
+            .map(|s| lock_checked(s, lock))
+            .collect();
+        assert_eq!(sights, vec![Sight::Unproven; 3], "{lock:?}");
+        let mut book = SlotBook::default();
+        book.judge(obs(0, &sights), &CALM, &mut never);
+        let read = book.judge(obs(1_000, &sights), &CALM, &mut never);
+        assert_eq!(
+            counts_of(&read),
+            SlotCounts {
+                n: 3,
+                unknown: 3,
+                ..SlotCounts::default()
+            },
+            "{lock:?}"
+        );
+    }
+    // Negative control: affirmative unlocked answers let the same absence
+    // pair free, including a writer whose descriptor read was refused.
+    let unlocked: Vec<_> = absent
+        .iter()
+        .cloned()
+        .chain([Sight::Unproven])
+        .map(|s| lock_checked(s, Some(false)))
+        .collect();
+    assert_eq!(&unlocked[..3], &absent);
+    assert_eq!(unlocked[3], Sight::NotHeld { gone: None });
+    let mut book = SlotBook::default();
+    book.judge(obs(0, &unlocked), &CALM, &mut never);
+    assert_eq!(
+        counts_of(&book.judge(obs(1_000, &unlocked), &CALM, &mut never)),
+        SlotCounts {
+            n: 4,
+            free: 4,
+            ..SlotCounts::default()
+        }
+    );
+    // Positive descriptor evidence is retained whichever answer the lock
+    // query gave, and can still pair as the same holder.
+    for lock in [None, Some(false), Some(true)] {
+        let sight = lock_checked(Sight::Sighted(holder(40)), lock);
+        assert_eq!(sight, Sight::Sighted(holder(40)));
+        let mut book = SlotBook::default();
+        book.judge(obs(0, std::slice::from_ref(&sight)), &CALM, &mut never);
+        let read = book.judge(obs(1_000, &[sight]), &CALM, &mut never);
+        assert_eq!(counts_of(&read).held, 1, "{lock:?}");
+    }
 }
 
 /// The counts of two reads of `sights` under `m`, and the pids the witness
@@ -433,9 +526,14 @@ fn a_witness_was_adopted_by_launchd_leads_its_group_and_was_born_in_the_window()
 #[cfg(target_os = "macos")]
 mod live {
     use std::fs::OpenOptions;
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::OwnedFd;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::ExitStatusExt as _;
     use std::path::Path;
+    use std::process::ExitStatus;
+    use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use aterm_uds::spawnfd::{Child, Stdio};
@@ -449,7 +547,7 @@ mod live {
     const STAND_IN: &str = "slots::tests::live::stand_in";
     /// The slot file the stand-in takes.
     const SLOT_ENV: &str = "ATERM_SLOT_STAND_IN";
-    /// The program the stand-in starts as its build, in a session of its own.
+    /// `holder` asks for a build; `build` runs the same in-place image as it.
     const BUILD_ENV: &str = "ATERM_SLOT_STAND_IN_BUILD";
     /// The hang detector for what must happen (a child's line, a reap).
     const HANG: Duration = Duration::from_secs(60);
@@ -497,8 +595,8 @@ mod live {
     /// Not a test: the `build-slot` holder the live tests start in a child.
     /// It takes the slot named by [`SLOT_ENV`] as `build-slot` does (open,
     /// `LOCK_EX | LOCK_NB`, truncate, one write of its record), starts the
-    /// build [`BUILD_ENV`] names in a session of its own, says `held`, and
-    /// waits for its `SIGKILL`.
+    /// optional in-place build in a session of its own, says `held`, and
+    /// waits for its `SIGKILL`. The build waits on its inherited stop endpoint.
     #[test]
     #[ignore = "the build-slot holder the live tests start in a child; alone it returns"]
     fn stand_in() {
@@ -506,6 +604,25 @@ mod live {
             return;
         };
         let slot = Path::new(&slot);
+        if std::env::var(BUILD_ENV).as_deref() == Ok("build") {
+            // This process's own proof, before the wrapper announces held.
+            std::fs::write(
+                slot.with_file_name("build.pid"),
+                std::process::id().to_string(),
+            )
+            .expect("write build.pid");
+            println!("\nbuild-held");
+            std::io::stdout().flush().expect("the build's proof");
+            let mut byte = [0; 1];
+            loop {
+                match std::io::stdin().read(&mut byte) {
+                    Ok(0) => aterm_uds::process::kill_self_now(),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => aterm_uds::process::kill_self_now(),
+                }
+            }
+        }
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -525,17 +642,23 @@ mod live {
         let cwd = std::env::current_dir().expect("the working directory");
         file.write_all(python_record(std::process::id(), &cwd, now_us()).as_bytes())
             .expect("write the record");
-        let _build = std::env::var_os(BUILD_ENV).map(|program| {
-            let build = aterm_uds::spawnfd::command(program)
-                .arg("600")
+        let _build = std::env::var_os(BUILD_ENV).map(|_| {
+            let child = aterm_uds::spawnfd::command(std::env::current_exe().expect("test image"))
+                .args([
+                    "--exact",
+                    STAND_IN,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(BUILD_ENV, "build")
                 .setsid(true)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::piped())
                 .spawn()
                 .expect("the build starts");
-            std::fs::write(slot.with_file_name("build.pid"), build.id().to_string())
-                .expect("write build.pid");
+            let mut build = ChildGuard(Some(child));
+            aterm_uds::deadline::prints(build.0.as_mut().expect("build"), "build-held", HANG);
             build
         });
         // Its own line: libtest has written `test … ... ` before the body.
@@ -545,13 +668,68 @@ mod live {
         }
     }
 
-    /// A stand-in holder; dropped, it is `SIGKILL`ed and reaped.
-    struct Holding(Option<Child>);
+    /// Direct-child custody, armed before readiness can allocate a reader.
+    struct ChildGuard(Option<Child>);
+
+    impl ChildGuard {
+        fn end(&mut self) -> Result<(), String> {
+            let Some(child) = self.0.as_mut() else {
+                return Ok(());
+            };
+            let _ = child.kill();
+            let mut exit = aterm_uds::deadline::ExitWait::new(child);
+            let end = Instant::now() + HANG;
+            loop {
+                if let Some(status) = child.try_wait().map_err(|e| format!("reap: {e}"))? {
+                    self.0 = None;
+                    return if status.signal() == Some(libc::SIGKILL) {
+                        Ok(())
+                    } else {
+                        Err(format!("the direct child did not end by SIGKILL: {status}"))
+                    };
+                }
+                let left = end.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err("direct child not reaped after SIGKILL".into());
+                }
+                exit.wait(left);
+            }
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Err(why) = self.end() {
+                eprintln!("slot fixture cleanup unknown: {why}");
+            }
+        }
+    }
+
+    /// A wrapper, and its build's stop authority armed before either starts.
+    struct Holding {
+        child: ChildGuard,
+        build: Option<Build>,
+        world: Arc<aterm_tempfile::TempDir>,
+    }
 
     impl Holding {
-        /// Start the stand-in on `slot`, working in `dir`, with `build` as its
+        /// Start the stand-in on `slot`, working in `dir`, optionally with a
         /// build; back once it holds the slot.
-        fn start(dir: &Path, slot: &Path, build: Option<&Path>) -> Self {
+        fn start(dir: &Arc<aterm_tempfile::TempDir>, slot: &Path, build: bool) -> Self {
+            Self::start_with(dir, slot, build, |_| {})
+        }
+
+        fn start_with(
+            dir: &Arc<aterm_tempfile::TempDir>,
+            slot: &Path,
+            build: bool,
+            before_ready: impl FnOnce(&mut Child),
+        ) -> Self {
+            let mut holding = Self {
+                child: ChildGuard(None),
+                build: None,
+                world: Arc::clone(dir),
+            };
             let mut cmd =
                 aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"));
             cmd.args([
@@ -562,66 +740,146 @@ mod live {
                 "--test-threads=1",
             ])
             .env(SLOT_ENV, slot)
-            .current_dir(dir)
+            .env_remove(BUILD_ENV)
+            .current_dir(dir.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped());
-            if let Some(build) = build {
-                cmd.env(BUILD_ENV, build);
+            if build {
+                let (stop, far) = UnixStream::pair().expect("the build's stop authority");
+                stop.set_nonblocking(true)
+                    .expect("nonblocking build witness");
+                holding.build = Some(Build {
+                    stop,
+                    pid: 0,
+                    watch: None,
+                    eof: false,
+                    done: false,
+                    world: Arc::clone(dir),
+                });
+                cmd.env(BUILD_ENV, "holder")
+                    .stdin(Stdio::from(OwnedFd::from(far)));
             }
-            let mut child = cmd.spawn().expect("the stand-in starts");
-            aterm_uds::deadline::prints(&mut child, "held", HANG);
-            Self(Some(child))
+            holding.child = ChildGuard(Some(cmd.spawn().expect("the stand-in starts")));
+            let child = holding.child.0.as_mut().expect("the wrapper");
+            before_ready(child);
+            aterm_uds::deadline::prints(child, "held", HANG);
+            if let Some(build) = &mut holding.build {
+                build.confirm(slot);
+            }
+            holding
         }
 
         fn pid(&self) -> u32 {
-            self.0.as_ref().map_or(0, Child::id)
+            self.child.0.as_ref().map_or(0, Child::id)
         }
 
         /// `SIGKILL` and reap it (once).
         fn end(&mut self) {
-            if let Some(mut child) = self.0.take() {
-                child.kill().expect("SIGKILL the stand-in");
-                child.wait().expect("reap the stand-in");
-            }
+            self.child.end().expect("SIGKILL and reap the stand-in");
         }
     }
 
     impl Drop for Holding {
         fn drop(&mut self) {
-            self.end();
+            let direct = self.child.end();
+            let build = self.build.as_mut().map(Build::end).transpose();
+            if direct.is_err() || build.is_err() {
+                eprintln!(
+                    "KEPT {}: fixture cleanup unknown: {direct:?}, {build:?}",
+                    self.world.path().display()
+                );
+                std::mem::forget(Arc::clone(&self.world));
+            }
         }
     }
 
-    /// The stand-in's build, which launchd adopts once its parent dies; dropped,
-    /// it is `SIGKILL`ed while it is still the process this test started.
+    /// The adopted build stops itself on this exclusively owned endpoint's
+    /// EOF. A kernel exit watch proves its SIGKILL status; launchd reaps it.
+    /// No raw pid is used as signal authority.
     struct Build {
+        stop: UnixStream,
         pid: u32,
-        birth: u64,
+        watch: Option<aterm_uds::exitwatch::ExitWatch>,
+        eof: bool,
+        done: bool,
+        world: Arc<aterm_tempfile::TempDir>,
     }
 
     impl Build {
-        fn kill(&self) {
-            if birth(self.pid) == Some(self.birth)
-                && let Ok(pid) = i32::try_from(self.pid)
-            {
-                // SAFETY: a signal to the process this test started (its pid
-                // and birth checked just now).
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+        fn confirm(&mut self, slot: &Path) {
+            // The wrapper's held line followed the build's own build-held
+            // proof. Its stop endpoint is still held, so it is alive here.
+            self.pid = std::fs::read_to_string(slot.with_file_name("build.pid"))
+                .expect("the build's own pid")
+                .trim()
+                .parse()
+                .expect("a pid");
+            let born = birth(self.pid).expect("the build is alive");
+            self.watch = aterm_uds::exitwatch::ExitWatch::watch(self.pid);
+            assert!(self.watch.is_some(), "the kernel exit watch");
+            assert_eq!(
+                birth(self.pid),
+                Some(born),
+                "same build across registration"
+            );
+        }
+
+        fn end(&mut self) -> Result<(), String> {
+            if self.done {
+                return Ok(());
+            }
+            let _ = self.stop.shutdown(std::net::Shutdown::Write);
+            let end = Instant::now() + HANG;
+            loop {
+                let mut byte = [0; 1];
+                match self.stop.read(&mut byte) {
+                    Ok(0) => self.eof = true,
+                    Ok(_) => return Err("unexpected build witness bytes".into()),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(e) => return Err(format!("build witness: {e}")),
+                }
+                let status = self.watch.as_ref().and_then(|w| w.exit_status());
+                if self.eof
+                    && let Some(raw) = status
+                {
+                    let status = ExitStatus::from_raw(raw);
+                    if status.signal() != Some(libc::SIGKILL) {
+                        return Err(format!("the build did not end by SIGKILL: {status}"));
+                    }
+                    self.done = true;
+                    return Ok(());
+                }
+                if Instant::now() >= end {
+                    return Err(
+                        "build endpoint EOF and kernel exit status not both confirmed".into(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
     }
 
     impl Drop for Build {
         fn drop(&mut self) {
-            self.kill();
+            if let Err(why) = self.end() {
+                eprintln!(
+                    "KEPT {}: build cleanup unknown: {why}",
+                    self.world.path().display()
+                );
+                std::mem::forget(Arc::clone(&self.world));
+            }
         }
     }
 
     #[test]
     fn a_stand_in_holds_slot_0_then_dies_by_sigkill() {
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let dir = Arc::new(aterm_tempfile::tempdir().expect("scratch dir"));
         let slot = dir.path().join("slot-0");
-        let mut holding = Holding::start(dir.path(), &slot, None);
+        let mut holding = Holding::start(&dir, &slot, false);
         let pid = holding.pid();
         let mut book = SlotBook::default();
         let first = book.judge(look(dir.path(), 0), &BUSY, &mut live_witness());
@@ -669,6 +927,26 @@ mod live {
                 },
                 holders: vec![],
             }
+        );
+        // A readiness failure unwinds through already-armed child custody.
+        // Establish actual execution before injecting it; no copy is unlinked.
+        let mut watch = None;
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Holding::start_with(&dir, &slot, false, |child| {
+                aterm_uds::deadline::prints(child, "held", HANG);
+                watch = aterm_uds::exitwatch::ExitWatch::watch(child.id());
+                assert!(watch.is_some(), "watch the proven child before unwinding");
+                panic!("injected failure before the ordinary readiness check");
+            })
+        }));
+        assert!(failed.is_err(), "the injected constructor failure");
+        let watch = watch.expect("the child wrote its proof before the failure");
+        until("the failed constructor's child exits", || {
+            watch.exit_status().is_some()
+        });
+        assert_eq!(
+            ExitStatus::from_raw(watch.exit_status().expect("kernel exit status")).signal(),
+            Some(libc::SIGKILL)
         );
     }
 
@@ -795,19 +1073,13 @@ mod live {
 
     #[test]
     fn a_dead_wrappers_live_build_is_discounted() {
-        let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let dir = Arc::new(aterm_tempfile::tempdir().expect("scratch dir"));
         let slot = dir.path().join("slot-0");
-        let mut holding = Holding::start(dir.path(), &slot, Some(&sleep));
-        let pid: u32 = std::fs::read_to_string(dir.path().join("build.pid"))
-            .expect("build.pid")
-            .trim()
-            .parse()
-            .expect("a pid");
-        let build = Build {
-            pid,
-            birth: birth(pid).expect("the build runs"),
-        };
+        let mut holding = Holding::start(&dir, &slot, true);
+        let mut build = holding
+            .build
+            .take()
+            .expect("owned before the wrapper started");
         holding.end();
         until("launchd adopts the build", || {
             kproc::record(build.pid).is_some_and(|p| p.ppid == 1)
@@ -862,10 +1134,9 @@ mod live {
         let calm = book.judge(look(dir.path(), 2_000), &CALM, &mut live_witness());
         assert_eq!((counts_of(&calm).free, counts_of(&calm).discounted), (1, 0));
         // Negative control: the build gone, the same load finds no witness.
-        build.kill();
-        until("the build is reaped", || {
-            birth(build.pid) != Some(build.birth)
-        });
+        build
+            .end()
+            .expect("the build's EOF and kernel SIGKILL status");
         let gone = book.judge(look(dir.path(), 3_000), &BUSY, &mut live_witness());
         assert_eq!((counts_of(&gone).free, counts_of(&gone).discounted), (1, 0));
     }

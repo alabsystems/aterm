@@ -81,8 +81,8 @@ fn the_session_corpus_classifies_as_the_manager_did() {
     }
 }
 
-/// (b): a `>` inside a quoted string is data; a redirect to /dev/null and a
-/// descriptor dup are not writes; an unquoted `>` is.
+/// A `>` inside a quoted string is data; a redirect to /dev/null and a descriptor dup are not
+/// writes; an unquoted `>` is.
 #[test]
 fn quotes_hide_redirect_glyphs_but_not_substitutions() {
     assert!(ro("git log --format='%h <%ae> -> %s' | head"));

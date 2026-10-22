@@ -999,7 +999,7 @@ mod tests {
         );
     }
 
-    // ---- Motion (design §10.7, §10.12; rulings 136–142) ------------------
+    // ---- Motion ----------------------------------------------------------------
 
     /// One frame of `center`'s motion over `p` at `at` in `look`, painted on
     /// the unit grid.

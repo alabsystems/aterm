@@ -848,8 +848,8 @@ pub fn with_cmap_record_last(bytes: &[u8], platform: u16, encoding: u16) -> Opti
     Some(moved)
 }
 
-/// aterm-font's parse failure, as the `&'static str` the call sites format
-/// (ttf-parser's wording, which they always printed).
+/// aterm-font's parse failure, in ttf-parser's wording, as the `&'static str` the call
+/// sites format.
 fn describe(error: aterm_font::FaceParsingError) -> &'static str {
     use aterm_font::FaceParsingError::*;
     match error {

@@ -68,8 +68,8 @@ impl Scene {
                 (y1 - y0) as f32 / f32::from(CELL_H),
                 (x1 - x0) as f32 / f32::from(CELL_W),
             );
-            // The caret's keep-off ring is not protected from its own escort: `STATION_LEAD` seats
-            // the pet one cell past the caret, inside that 3x3 ring. Selections, images and
+            // The caret's keep-off ring is not protected to its escort: `STATION_LEAD` seats the
+            // pet one cell past the caret, inside that 3x3 ring. Selections, images and
             // uncertified rows still fail here.
             assert!(world.under_text_clearance_past_caret(rect, 0.0) == Some(true));
             // Real ink under the drawn body is in front of it; the caret's ring is protection,

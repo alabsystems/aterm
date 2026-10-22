@@ -301,7 +301,7 @@ fn find_byte_agrees_with_a_linear_search() {
     assert_eq!(find_byte(&hay, b'r'), None);
 }
 
-// --- compiler admission ------------------------------------------------------------------
+// Compiler admission.
 
 fn trust_vv(commit: &str) -> String {
     format!(

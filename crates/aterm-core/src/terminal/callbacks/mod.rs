@@ -28,8 +28,7 @@ pub enum ColorTarget {
 }
 
 /// Most bytes all active DCS operations may hold (`dcs.total_bytes`); past it
-/// new DCS data is dropped until existing operations complete. Enforced in
-/// `handler_dcs.rs` and `handler_actions.rs`.
+/// new DCS data is dropped until existing operations complete.
 pub(super) const MAX_DCS_GLOBAL_BUDGET: usize = 10 * 1024 * 1024;
 
 /// Maximum depth of the title stack, so hostile pushes cannot grow memory

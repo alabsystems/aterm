@@ -109,7 +109,6 @@ fn prepend_shifts_content_and_cursor_down() {
         w: 1,
         h: 1,
         color: 0,
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: 0,
         alpha2: 0,

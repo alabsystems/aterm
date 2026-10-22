@@ -10,9 +10,7 @@ use super::{
 use crate::presence::Cursor;
 use crate::{App, WindowId};
 
-/// A session's retirement reaches the Claude footer's resolver, which
-/// holds its usage fold: a closed tab's fold goes with it, not at the end
-/// of its watch.
+/// Retiring a session stops its Claude footer state, usage fold included.
 #[test]
 fn retiring_a_session_retires_its_footer_state() {
     let mut observer = StatusObserver::new(StatusPolicy::default(), Duration::from_millis(0));
@@ -24,9 +22,8 @@ fn retiring_a_session_retires_its_footer_state() {
     );
 }
 
-/// The background resolver can answer after the usual one-interval
-/// follow-up has already gone quiet. Its completion wake restores one
-/// status read at the observation floor, including on a static screen.
+/// A resolver answer after the ordinary follow-up went quiet owns one observation wake at the
+/// floor, even on a static screen.
 #[test]
 fn a_late_program_answer_owns_one_observation_wake() {
     let t0 = Instant::now();
@@ -92,8 +89,7 @@ fn a_late_program_answer_owns_one_observation_wake() {
     assert_eq!(observer.next_wake(), None);
 }
 
-/// Claude Code 2.1.280's rm circuit-breaker box, measured 2026-09-23 in a
-/// private headless aterm (120 columns; rows 1-24 of the capture).
+/// Claude Code 2.1.280's rm circuit-breaker box, as captured (120 columns, rows 1-24).
 const RM_BOX: &[&str] = &[
     "",
     "  Get to finished work sooner with Opus 5.5. Switch anytime with /model.",
@@ -135,8 +131,7 @@ fn busy_screen(secs: u32) -> Vec<String> {
     rows
 }
 
-/// The rm box with its top rule at full width, and a transcript row above
-/// it that keeps TICKING (a live monitor line) — the audit's INT-1 shape.
+/// The rm box with its top rule at full width, under a transcript row that keeps ticking.
 fn box_screen(tick: u32) -> Vec<String> {
     let mut rows: Vec<String> = RM_BOX.iter().map(|r| (*r).to_string()).collect();
     rows[10] = "\u{2500}".repeat(120);
@@ -176,11 +171,8 @@ fn app_with_stub() -> (App, u64) {
     (app, sid)
 }
 
-/// INT-1: a box raised while a row keeps ticking must reach `agent=` at
-/// the next sweep, although the shell status FSM's revision — the old
-/// classifier gate — never moves. The negative control is the revision
-/// itself: it stays put across the busy→prompt move, so a verdict gated on
-/// it (today's `level=quiet` with a box up) would never have been read.
+/// A box raised while a row keeps ticking reaches `agent=` at the next sweep, though the status
+/// FSM's revision never moves (the negative control).
 #[test]
 fn a_box_under_a_ticking_row_is_published_though_the_status_revision_never_moves() {
     let (mut app, sid) = app_with_stub();
@@ -249,8 +241,7 @@ fn a_box_under_a_ticking_row_is_published_though_the_status_revision_never_moves
         )
     );
 
-    // The row keeps ticking: the zone changed, so it is re-read — and the
-    // verdict holds, so nothing is re-published.
+    // The row keeps ticking: the zone is re-read, the verdict holds, nothing is re-published.
     let calls = crate::presence::classifier_calls();
     paint(&app, sid, &box_screen(2));
     let _ = app.observe_session_statuses(t);
@@ -272,14 +263,9 @@ fn a_box_under_a_ticking_row_is_published_though_the_status_revision_never_moves
     );
 }
 
-/// THE VERDICT'S STAMP (review major): `agent_gen=`/`agent_fp=` name the
-/// screen the verdict was read from, byte-equal to what `status gen=`/
-/// `hash=` printed for that screen. A screen that changes after the sweep
-/// moves `status gen=` but NOT `agent_gen=` — the NEGATIVE CONTROL, and the
-/// reason a press decided from the verdict fences on `agent_gen`: a fence
-/// on the fresh `status gen=` would hold over a box nothing classified.
-/// A re-read whose zone is unchanged re-confirms the verdict: the stamp
-/// moves, the rev does not.
+/// `agent_gen=`/`agent_fp=` equal the `status gen=`/`hash=` of the screen the verdict was read
+/// from, and stay put when the screen moves without a sweep (the negative control: a press
+/// fences on `agent_gen`). A same-verdict re-read moves the stamp, not the rev.
 #[test]
 fn the_verdict_carries_the_stamp_of_the_screen_it_was_read_from() {
     let field = |record: &str, key: &str| {
@@ -312,8 +298,7 @@ fn the_verdict_carries_the_stamp_of_the_screen_it_was_read_from() {
     );
     let rev = published(&app, sid).rev;
 
-    // The screen moves with no sweep in between: `status` reads the new
-    // screen, the verdict still names the one it was read from.
+    // The screen moves with no sweep: `status` reads the new screen, the verdict names its own.
     paint(&app, sid, &box_screen(2));
     let record = app.session_status_record(sid).expect("live");
     assert_ne!(
@@ -327,8 +312,7 @@ fn the_verdict_carries_the_stamp_of_the_screen_it_was_read_from() {
         "{record}"
     );
 
-    // The sweep re-reads it (the ticking row, same verdict): the stamp
-    // catches up, the rev stays.
+    // The sweep re-reads it (same verdict): the stamp catches up, the rev stays.
     let _ = app.observe_session_statuses(t);
     let record = app.session_status_record(sid).expect("live");
     assert_eq!(
@@ -373,8 +357,7 @@ fn the_rate_floor_defers_a_read_and_arms_a_followup() {
         &None,
         t0 + super::AGENT_MIN_INTERVAL
     ));
-    // A resolution in flight keeps the follow-up armed over an unmoved
-    // screen, so its answer is read one interval later.
+    // A resolution in flight keeps the follow-up armed over an unmoved screen.
     let t2 = t0 + super::AGENT_MIN_INTERVAL;
     let _ = obs.agent_observe(
         1,
@@ -399,11 +382,8 @@ fn the_rate_floor_defers_a_read_and_arms_a_followup() {
     );
 }
 
-/// A redraw can advance the screen generation without changing the live
-/// zone or its verdict. At a 50 ms status interval, each such redraw used
-/// to repeat the full-screen read because only classification charged the
-/// 250 ms floor. The changed ready frame is deferred, then published at
-/// the next due read rather than lost.
+/// A redraw that advances the generation but not the zone still charges the read floor; the
+/// changed ready frame is deferred, then published at the next due read.
 #[test]
 fn unchanged_zone_reads_charge_the_agent_rate_floor() {
     use aterm_phase::prompt::fixtures::{INLINE_REPL_READY, screen};
@@ -479,8 +459,7 @@ fn unchanged_zone_reads_charge_the_agent_rate_floor() {
     assert_eq!(changed.publish.map(|p| p.0), Some("idle"));
 }
 
-/// A newly resolved foreground program keeps the pre-existing
-/// classification clock: a same-zone read must not postpone its verdict.
+/// A newly resolved program is not delayed by a recent same-zone read.
 #[test]
 fn a_program_change_is_not_delayed_by_an_unchanged_zone_read() {
     let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
@@ -532,10 +511,8 @@ fn a_program_change_is_not_delayed_by_an_unchanged_zone_read() {
     assert_eq!(obs.agents[&1].program_seen, Some(new));
 }
 
-/// The foreground group is discovered after the screen-read decision.
-/// When an unchanged read just charged that floor, the departing agent's
-/// shell handback gets one immediate follow-up instead of waiting for the
-/// next 250 ms status tick.
+/// The foreground group is read after the screen-read decision: when an unchanged read just
+/// charged the floor, the shell handback gets one immediate follow-up.
 #[test]
 fn group_change_after_unchanged_read_gets_immediate_followup() {
     let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
@@ -833,16 +810,9 @@ fn the_sweeps_capped_read_leaves_a_group_moves_look_immediate() {
     );
 }
 
-/// THE FINAL FRAME OF A BURST THAT LANDED BETWEEN LOOKS (2026-09-24,
-/// live: a box answered and a static busy screen drawn still read
-/// `agent=prompt` after the host had cleared its badge; an exited agent's
-/// prompt left `program=claude` standing). A look that saw nothing move
-/// arms no follow-up, and output inside the interval runs no look: the
-/// output wake's [`super::StatusObserver::note_output`] owes the session a
-/// look one interval after the burst (never before its next due instant)
-/// — and so does a look the terminal lock refused
-/// ([`super::StatusObserver::note_skipped`]). NEGATIVE CONTROL: before the
-/// burst nothing is owed that soon.
+/// Output between looks is owed a look one interval after it (never before the next due
+/// instant), through [`super::StatusObserver::note_output`], and so is a look the lock refused
+/// ([`super::StatusObserver::note_skipped`]). Before the burst nothing is owed that soon.
 #[test]
 fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
     let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
@@ -874,8 +844,7 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
         obs.next_wake().is_none_or(|w| w > due),
         "NEGATIVE CONTROL: nothing owes a look at {due:?} yet"
     );
-    // A burst lands 10 ms later: not due, so no look — but one is owed,
-    // one interval after it.
+    // A burst lands 10 ms later: not due, so no look, but one is owed one interval after it.
     let burst = t1 + Duration::from_millis(10);
     obs.note_output(1, burst);
     let owed = burst + interval;
@@ -908,16 +877,9 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
     assert_eq!(obs.next_wake(), Some(obs.sessions[&1].next_due));
 }
 
-/// OUTPUT THAT KEEPS ARRIVING IS NOT A POLL (the spin matrix's claude row,
-/// aterm-conformance `tests/spin.rs`, after 2026-09-24's owed look
-/// landed: 39 timer wakes in 10 s against a quiet loop's 5). A program
-/// that repaints without moving the grid ~6x/s — a Claude Code spinner —
-/// wakes the loop by its own output, and each output wake's sweep looks
-/// whenever the session is due; an owed look pinned to the slot's next due
-/// instant fired between those wakes, 4x/s, forever. The owed look waits
-/// for the output to PAUSE: every burst pushes it one interval on, so no
-/// timer precedes the next burst, and the last burst is still read within
-/// one interval of it. RED before: the owed wake was the next due instant.
+/// Output that keeps arriving (a spinner repainting ~6x/s without moving the grid) owes no
+/// timer look before it pauses: each burst pushes the owed look one interval on, and the last
+/// burst is still read within one interval of it.
 #[test]
 fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
     let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
@@ -935,9 +897,8 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
             last_output: None,
         },
     };
-    // Settle first: the status FSM's first sample serves a dwell, and the
-    // first look (a screen never read) owes its own follow-up. Past both,
-    // the only deadline left to judge is the one output owes.
+    // Settle past the FSM's first dwell and the first look's follow-up, so only the deadline
+    // output owes is left.
     let start = Instant::now();
     let _ = obs.observe(1, &ev, start);
     let _ = obs.agent_observe(
@@ -958,9 +919,8 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
         None,
         "fixture: a settled, unmoved session owes nothing"
     );
-    // Twelve output wakes ~6/s over an unmoved screen, in the output
-    // wake's order: `note_output`, then the sweep, which looks only when
-    // the session is due (the rate gate) and answers for the burst.
+    // Twelve output wakes ~6/s over an unmoved screen: `note_output`, then a sweep that looks
+    // only when the session is due.
     let mut at = t0;
     let mut looks = 0;
     for _ in 0..12 {
@@ -982,8 +942,7 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
         looks >= 5,
         "fixture: the output wakes' own sweeps looked ({looks})"
     );
-    // The LAST burst lands between looks, and the output pauses: it is
-    // read within one interval of it.
+    // The last burst lands between looks and the output pauses: it is read within one interval.
     let last = at + gap;
     obs.note_output(1, last);
     assert!(
@@ -993,16 +952,9 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
     assert_eq!(obs.next_wake(), Some(last + interval));
 }
 
-/// THE CHANGE GATE HASHES THE ZONE THE VERDICT READS (the review of
-/// 2026-09-26): the sweep re-derives the verdict only when its zone's
-/// hash moved, and that hash covered the grid's last 40 rows. Claude
-/// Code's inline renderer draws the REPL at the top of a tall pane, so a
-/// turn that ends ABOVE those rows — the spinner row over the prompt box
-/// replaced, every row from the box down unchanged — moved no hash, and
-/// the verdict stayed `busy`. The gate hashes the live zone
-/// (`presence::live_zone`): the idle REPL is classified and published.
-/// NEGATIVE CONTROL: the same screen again under a new generation moves
-/// no hash, and nothing is re-derived.
+/// The change gate hashes the live zone (`presence::live_zone`), not the grid's last 40 rows: an
+/// inline REPL's turn ending above them is classified `idle`. The same screen under a new
+/// generation re-derives nothing (the control).
 #[test]
 fn a_change_above_the_last_40_rows_of_an_inline_repl_is_classified() {
     use aterm_phase::prompt::fixtures::{INLINE_REPL_READY, screen};
@@ -1042,13 +994,8 @@ fn a_change_above_the_last_40_rows_of_an_inline_repl_is_classified() {
     assert_eq!(look(3, &ready, 2), None, "the control: nothing moved");
 }
 
-/// THE CURSOR MOVING ALONE IS READ (2026-09-27): Claude Code's `idle` is
-/// the prompt box that holds the terminal's cursor, and the cursor moves
-/// without the content seq — a frame drawn whole, then the cursor stepped
-/// into its box. The gate reads the zone again when the cursor moved
-/// under an unchanged generation, and publishes `idle` once it is in the
-/// box. NEGATIVE CONTROL: the same generation and cursor again read
-/// nothing.
+/// The cursor moving alone (into the prompt box, with the content seq unchanged) is read, and
+/// publishes `idle` once in the box; the same generation and cursor again read nothing.
 #[test]
 fn a_cursor_that_steps_into_the_box_is_read() {
     use aterm_phase::prompt::fixtures::{INLINE_REPL_READY, cursor, screen};
@@ -1085,33 +1032,13 @@ fn a_cursor_that_steps_into_the_box_is_read() {
     assert_eq!(look(in_box, 2), None, "the control: nothing moved");
 }
 
-/// Tier-1 for `ClaudeIdleAtComposer` (the live e2e's NEW-1, 2026-09-26,
-/// and its review's same-tab relaunch): over EVERY reachable state of the
-/// model, the shipping observer — one `agent_observe` of the screen the
-/// state names, under `program=claude`, with the terminal CURSOR measured
-/// on it — publishes the verdict the model's `Look` publishes there:
-/// `prompt` for the trust dialog, `idle` only for the NEW REPL drawn
-/// whole, neither for the shell's rows (before the dialog, after its
-/// press, or with no dialog) nor for the half-drawn REPL — in a new tab,
-/// and with the previous run's prompt box on the screen above the new
-/// launch line (`stale`). So `await agent idle` answers exactly where the
-/// model's `Type` is enabled, and the model proves a prompt typed there
-/// is never lost. The screens are the frames Claude Code 2.1.283 drew
-/// (aterm-phase's fixtures, each with its measured cursor; the one dialog
-/// with none measured is 2.1.280's, read with the cursor on none of its
-/// rows), each model screen looked at through EVERY measured frame of it:
-/// the fullscreen renderer (`LAUNCH_*`, `SHELL_MODE*`: `!` typed, the
-/// caret `!`, the REPL up and taking keys), the inline one in a new tab
-/// (`INLINE_*`: on the main grid under the launch line, 150x50, blank
-/// rows below — its whole REPL above the grid's last 40 rows), and the
-/// inline one relaunched in the same tab (`INLINE_RELAUNCH_*`). NEGATIVE
-/// CONTROLS: the reader before 2026-09-26 (`Buggy=1`) publishes idle on
-/// the shell's rows and the half-drawn REPL, the reader of 2026-09-26
-/// (`Buggy=2`, the box by its frame alone) on the relaunch's shell rows
-/// under the previous run's box — and the real observer disagrees with
-/// each there, and only there. RED: read by its frame alone (the cursor
-/// not given, the rule this branch had), every frame publishes what
-/// `Buggy=2` publishes: `idle` on that old box.
+/// Conformance with the `ClaudeIdleAtComposer` model: in every reachable state, one
+/// `agent_observe` of each captured frame of the state's screen (under `program=claude`, with
+/// its measured cursor; `stale` is a relaunch under the previous run's box) publishes what the
+/// model's `Look` does, so `await agent idle` answers exactly where `Type` is enabled. Negative
+/// controls: `Buggy=1` (idle on the shell's rows and the half-drawn REPL) and `Buggy=2` (the box
+/// by its frame alone: idle on the relaunch's shell rows) disagree with the observer only where
+/// they say idle.
 #[test]
 fn claude_is_published_idle_exactly_where_the_model_types() {
     use aterm_phase::prompt::fixtures::{
@@ -1203,7 +1130,7 @@ fn claude_is_published_idle_exactly_where_the_model_types() {
                         disagreed[bug].insert((stale, at));
                     }
                 }
-                // RED: the frame alone, the cursor not given.
+                // The frame alone, the cursor not given: what `Buggy=2` models.
                 let by_frame = publish(text, Cursor::Unknown);
                 let theirs = framed.successors("Look", &state).remove(0)["published"];
                 assert_eq!(
@@ -1238,14 +1165,8 @@ fn claude_is_published_idle_exactly_where_the_model_types() {
     );
 }
 
-/// THE DEPARTED AGENT'S LAST FRAME (2026-09-24): the look that first sees
-/// a new foreground group read `program=` from the timeline before this
-/// sweep's `note_foreground_group` forgot it — the name of the group that
-/// LEFT. Judged under it, an exited Claude Code's last frame published
-/// Claude's reader again, and the in-GUI host went on seeing the agent
-/// (the relaunch on exit missed exits that way). The zone of a moved
-/// group is judged under no name: `agent=-`, no reader. NEGATIVE CONTROL:
-/// the same rows in the SAME group are the agent's.
+/// The first look at a new foreground group judges the zone under no name, never the departed
+/// group's (`agent=-`); the same rows in the same group are still the agent's.
 #[test]
 fn a_group_that_left_is_never_judged_under_its_name() {
     let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
@@ -1303,17 +1224,9 @@ fn a_group_that_left_is_never_judged_under_its_name() {
     }
 }
 
-/// THE GATE HASHES THE ZONE THE VERDICT READS (the live run of
-/// 2026-09-26: Claude Code 2.1.283 in a fresh 149x62 pane). The pane
-/// idle at its top, then the folder-trust dialog drawn there: the last
-/// 40 rows of the SCREEN are blank on both, so a gate that hashed them
-/// passed over the dialog, and `agent=idle` stood while the hosted loop
-/// slept on it. The gate hashes [`crate::presence::live_zone`], the rows
-/// the verdict reads: the dialog is classified and published a trust
-/// prompt. NEGATIVE CONTROL: the dialog read again, nothing in the zone
-/// moved, is not classified again. The cursor is where Claude Code parks
-/// it: the idle prompt box's caret row, then the dialog's focused option
-/// (the measured row 17).
+/// A trust dialog drawn at the top of a pane whose last 40 rows stay blank passes the gate,
+/// which hashes the live zone ([`crate::presence::live_zone`]), and publishes a trust prompt;
+/// read again unchanged, it is not re-classified. Cursors are where Claude Code parks them.
 #[test]
 fn a_dialog_above_a_blank_foot_passes_the_classifier_gate() {
     use aterm_phase::prompt::fixtures::{TRUST_FRESH_PANE, composer, rows, screen};
@@ -1352,12 +1265,8 @@ fn a_dialog_above_a_blank_foot_passes_the_classifier_gate() {
     assert_eq!(word(&step), None, "the zone did not move");
 }
 
-/// `history_lost=` (2026-09-26): the history lines this session's update
-/// handoffs could not carry, summed — what its adoption brought on its
-/// record plus every import that failed here — and `0` for a session that
-/// lost none. The update's total rides one band row as well
-/// (`App::settle_handoff_history`), never the log alone. NEGATIVE CONTROL:
-/// an update that carried every line posts no row.
+/// `history_lost=` sums the history lines this session's update handoffs could not carry, and
+/// the loss posts a band row; an update that carried every line posts none.
 #[cfg(unix)] // App::settle_handoff_history is the unix handoff's
 #[test]
 fn the_status_record_counts_the_history_an_update_could_not_carry() {
@@ -1369,7 +1278,7 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
             " history_lost=0 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
              resizes=0 flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- \
              end=- end_seen=- end_cheered=- task_state=- task_rev=0 \
-             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 gen="
+             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
     );
@@ -1413,23 +1322,15 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
             " history_lost=1234 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
              resizes=0 flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- \
              end=- end_seen=- end_cheered=- task_state=- task_rev=0 \
-             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 gen="
+             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
     );
     assert!(app.has_live_message("Couldn't carry all scrollback"));
 }
 
-/// THE REGISTRY'S FROZEN MARK IS LOWERED BY A MEASUREMENT, NEVER RAISED
-/// (gap audit 2026-09-24: a tab healed by the live upgrade's relaunch line
-/// read `path=frozen` through seven handoffs, because nothing ever lowered
-/// the mark; review of 2026-09-25: a one-off `PATH=` override then RAISED
-/// it, and the band counted that tab "from before this update"). A live
-/// reading lowers it — so the handoff's carry and the managed record's
-/// count lose the tab. A frozen reading from one job, and then from a
-/// second, leaves an unmarked tab unmarked: one reads `unconfirmed`, two
-/// read `frozen` as measured. NEGATIVE CONTROL: with no reading, the
-/// carried mark stands through a sweep.
+/// A live PATH reading lowers the carried frozen mark; frozen readings never raise it (one job
+/// reads `unconfirmed`, two read `frozen` as measured). With no reading the mark stands.
 #[test]
 fn a_measured_path_lowers_the_carried_frozen_mark_and_never_raises_it() {
     use crate::session_status::program::PathVerdict;
@@ -1461,8 +1362,7 @@ fn a_measured_path_lowers_the_carried_frozen_mark_and_never_raises_it() {
     assert!(record.contains(" path=live program=claude "), "{record}");
     assert!(record.contains(" path_evidence=measured:"), "{record}");
     assert!(record.contains(" copy=foreign upgrade=- "), "{record}");
-    // One job's frozen reading (a `PATH=/usr/bin:/bin tool` override
-    // reads exactly so) is not the shell's: not raised, and `path=` stays.
+    // One job's frozen reading (a `PATH=` override reads so) is not the shell's: nothing raised.
     measure(&app, PathVerdict::Frozen);
     let _ = app.observe_session_statuses(t0 + Duration::from_millis(600));
     assert!(
@@ -1472,8 +1372,7 @@ fn a_measured_path_lowers_the_carried_frozen_mark_and_never_raises_it() {
     let record = app.session_status_record(sid).expect("live");
     assert!(record.contains(" path=live program=claude "), "{record}");
     assert!(record.contains(" path_evidence=unconfirmed:"), "{record}");
-    // A SECOND job agreeing settles it as the shell's: `path=frozen`,
-    // measured — and still no mark (it is not "from before this update").
+    // A second job agreeing settles it as the shell's (`path=frozen`, measured), still unmarked.
     {
         let pooled = app.pool.get(sid).unwrap();
         let mut tl = pooled.ctx.timeline.lock().unwrap();
@@ -1488,10 +1387,8 @@ fn a_measured_path_lowers_the_carried_frozen_mark_and_never_raises_it() {
     assert!(record.contains(" path_evidence=measured:"), "{record}");
 }
 
-/// Tier-1 for `ProgramResolutionRetry`: a failed process-table lookup on a
-/// motionless Claude screen still owns a wake and another resolution.
-/// This drives the shipping observer's request bookkeeping, timer and
-/// guard; the model's old-code mutant is the negative control.
+/// Conformance with `ProgramResolutionRetry`: a failed lookup on a motionless Claude screen
+/// still owns a wake and another resolution; the model's `Buggy=1` mutant is the control.
 #[test]
 fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     let model = aterm_models_harness::program_resolution_retry_model();
@@ -1513,9 +1410,8 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         },
     );
 
-    // Record the first group request before the zone read to exercise
-    // the request helper independently. Production creates the watch
-    // earlier via `agent_zone_wanted`; either order retains its deadline.
+    // The request before the zone read (production creates the watch first, in
+    // `agent_zone_wanted`); either order keeps the deadline.
     assert!(observer.program_due(id, true, None, generation, t0));
     observer.note_program_request(id, pgid, t0);
     assert!(model.fire("Start", &mut modeled));
@@ -1538,8 +1434,7 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     );
     assert_eq!(observer.next_wake(), Some(t0 + floor));
 
-    // The one follow-up read sees the same frame. Its flag clears, but
-    // the unresolved name keeps an independently bounded deadline.
+    // The follow-up read sees the same frame; the unresolved name keeps its own deadline.
     observer.sessions.get_mut(&id).unwrap().next_due = t0 + floor * 2;
     observer.agent_observe(
         id,
@@ -1571,9 +1466,8 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         modeled["attempts"]
     );
 
-    // The second miss waits one second, then the third and every later
-    // miss waits five seconds. Each resolution's single follow-up is
-    // charged to the ordinary observation floor.
+    // The second miss waits 1 s, every later one 5 s; each resolution's follow-up is charged to
+    // the observation floor.
     observer.sessions.get_mut(&id).unwrap().next_due = first_retry + floor;
     observer.agent_observe(
         id,
@@ -1639,14 +1533,12 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     );
     assert_eq!(observer.next_wake(), Some(second_retry + PROGRAM_RECHECK));
 
-    // A contended terminal can skip a deadline. The same past timer is
-    // clamped to the charged next observation, never rearmed immediately.
+    // A contended terminal skips a deadline: the past timer clamps to the charged observation.
     let late = second_retry + PROGRAM_RECHECK + Duration::from_secs(1);
     observer.note_skipped(id, late);
     assert_eq!(observer.next_wake(), Some(late + floor));
 
-    // A later successful name on the same static frame identifies Claude
-    // and disarms every unresolved retry.
+    // A later name on the same frame identifies Claude and disarms every retry.
     let named_at = late + floor;
     let named = observer.agent_observe(
         id,
@@ -1676,9 +1568,8 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         named_at + PROGRAM_RECHECK * 2
     ));
 
-    // The same group can exec again. Once a name was known, its next
-    // transient miss starts at the fast 250 ms retry instead of inheriting
-    // the old five-second backoff. A departed or retired group owns none.
+    // The same group can exec again: once a name was known, the next miss starts at the fast
+    // 250 ms retry. A departed or retired group owns none.
     let newer = crate::control::ScreenGen { epoch: 0, seq: 2 };
     let exec_at = named_at + PROGRAM_RECHECK * 2;
     assert!(observer.program_due(id, false, Some("claude"), newer, exec_at));
@@ -1723,10 +1614,9 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     assert_eq!(observer.next_wake(), None);
 }
 
-/// Tier-1 for the named-shell side of `ProgramResolutionRetry`. A first
-/// lookup can catch `sh` before its same-PGID exec into Claude. One short
-/// confirmation may still see `sh`; a later single Claude frame must arm
-/// another bounded lookup even though that frame then stays still.
+/// Conformance with the named-shell side of `ProgramResolutionRetry`: a first lookup can catch
+/// `sh` before its same-pgid exec into Claude, so a later single Claude frame arms one more
+/// bounded lookup though it then stays still.
 #[test]
 fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
     let model = aterm_models_harness::program_resolution_retry_model();
@@ -1763,8 +1653,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         !observer.agents[&id].name_confirmed,
         "the group-change sweep's old Claude name is not this group's answer"
     );
-    // The first later sweep sees the transient shell name, not the stale
-    // name sampled before `note_foreground_group` on the launch sweep.
+    // The next sweep sees the transient shell name, not the launch sweep's stale one.
     let shell_at = t0 + floor;
     observer.agent_observe(
         id,
@@ -1818,9 +1707,8 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
     assert_eq!(modeled["confirm_armed"], 0);
     assert_eq!(observer.next_wake(), None, "stable sh stops polling");
 
-    // Claude execs at t=3 s and draws once. At this point the 5 s
-    // screen-moved guard is still closed; the deferred deadline is the
-    // only way to name the now-static new program.
+    // Claude execs at t=3 s and draws once: the 5 s screen-moved guard is still closed, so the
+    // deferred deadline is the only way to name the now-static program.
     let moved_at = t0 + Duration::from_secs(3);
     assert!(!observer.program_due(id, false, Some("sh"), later, moved_at));
     observer.agent_observe(
@@ -1899,8 +1787,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
     assert_eq!(modeled["confirm_armed"], 0);
     assert_eq!(observer.next_wake(), None);
 
-    // A later non-agent name can arm another deadline, but leaving the
-    // foreground group cancels it even if the retired screen stays put.
+    // A later non-agent name can arm another deadline; leaving the group cancels it.
     let third = crate::control::ScreenGen { epoch: 0, seq: 3 };
     observer.agent_observe(
         id,
@@ -1930,9 +1817,8 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
     assert_eq!(modeled["confirm_armed"], 0);
     assert_eq!(observer.next_wake(), None);
 }
-/// INT-4: a shell whose last line ends in `?` is not an agent — `agent=-`
-/// and no attention — while the SAME screen under `program=claude` is read
-/// as the question it is. Identity, not screen text, decides.
+/// A shell whose last line ends in `?` is no agent (`agent=-`, no attention); the same screen
+/// under `program=claude` is a question. Identity, not screen text, decides.
 #[test]
 fn a_shell_ending_in_a_question_mark_is_not_an_agent() {
     let (mut app, sid) = app_with_stub();
@@ -1955,9 +1841,7 @@ fn a_shell_ending_in_a_question_mark_is_not_an_agent() {
     assert!(!record.contains("level=attention"), "{record}");
     assert!(record.contains(" why=- "), "{record}");
 
-    // The same screen, the foreground program named `claude`: an agent,
-    // asking. (The stub has no PTY, so the program is published by hand
-    // exactly as the resolver would.)
+    // The same screen under `program=claude` (published by hand: the stub has no PTY).
     {
         let pooled = app.pool.get(sid).unwrap();
         let mut tl = pooled.ctx.timeline.lock().unwrap();
@@ -1982,11 +1866,9 @@ fn a_shell_ending_in_a_question_mark_is_not_an_agent() {
     assert!(record.contains(" why=question "), "{record}");
 }
 
-/// ACT-4: an adopted, checkpointed session whose handoff CARRIED its
-/// shell-integration nonce still takes its shell's marks — fed `633;E;claude
-/// --resume` then `133;C`, it reads `detail=claude` — and one whose
-/// handoff did not stays `integration=degraded` with its marks dropped
-/// (the requirement is never cleared as a fallback).
+/// An adopted session whose handoff carried its shell-integration nonce takes its shell's marks
+/// (`detail=claude`); without it, `integration=degraded` and the marks drop (the requirement
+/// is never cleared as a fallback).
 #[test]
 fn an_adopted_session_with_its_carried_nonce_reads_its_command() {
     use aterm_core::terminal::{ShellIntegrationPosture, Terminal};
@@ -2012,8 +1894,7 @@ fn an_adopted_session_with_its_carried_nonce_reads_its_command() {
     adopted.process(feed.as_bytes());
     assert_eq!(super::executing_detail(&adopted).as_deref(), Some("claude"));
 
-    // NEGATIVE CONTROL: the same adopt without the carried nonce (a parent
-    // that predates the carry) drops every mark and says so.
+    // NEGATIVE CONTROL: the same adopt without the carried nonce drops every mark and says so.
     let mut uncarried = carried.clone();
     uncarried.shell_integration_nonce = None;
     let mut blind = Terminal::new(24, 80);
@@ -2046,16 +1927,9 @@ fn looking_at(app: &App, sessions: &[u64]) {
     set.extend(sessions.iter().copied());
 }
 
-/// THE E2E PROBE OF 2026-09-25 (W1): a trust dialog drawn at the top of
-/// a 45-row pane had its title above the live zone's 40 rows, so the
-/// server published `agent_detail=other` and the menu bar said "other
-/// approval" — and it said so from the raw verdict before the window's
-/// supervisor had taken the session's claim, then again from the
-/// supervisor's own escalation: two notifications for one box. The zone
-/// that cuts a box is read again whole (the verdict names `trust`), and a
-/// session the host supervises raises no verdict row, claim or not — its
-/// box is the host's to answer or escalate. NEGATIVE CONTROL: with no host
-/// supervising, the verdict's row is there.
+/// A trust dialog whose title sits above the live zone is read whole (`trust`, not `other`),
+/// and a session the host supervises raises no verdict row: its box is the host's to answer or
+/// escalate. With no host supervising, the row is there.
 #[test]
 fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
     let (mut app, sid) = app_with_stub();
@@ -2149,13 +2023,9 @@ fn another_holders_claim_is_named_apart_from_this_hosts() {
     assert_eq!(read(&app), (true, true, true), "another holder's claim");
 }
 
-/// ONE PLACE FOR ANDREW, end to end on the measured rm box: the sweep
-/// publishes `agent=prompt`, and the presence fan-out raises exactly one
-/// menu row naming the tab, the kind and the command, and exactly one
-/// notification. Re-classifying the same box (its ticking row moves the
-/// zone hash) posts nothing more; a new box while the human is looking
-/// at the tab posts nothing but still lists the row; a headless instance
-/// posts nothing at all.
+/// On the rm box, the sweep publishes `agent=prompt` and the presence fan-out raises one menu
+/// row (tab, kind, command) and one notification. Re-classifying the same box posts nothing
+/// more; a new box while the person looks posts nothing but lists the row; headless posts none.
 #[test]
 fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     let (mut app, sid) = app_with_stub();
@@ -2213,8 +2083,7 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     );
     let rev = published(&app, sid).rev;
 
-    // The same box re-read: the ticking row moves the zone hash, so the
-    // sweep classifies it again — the same verdict, the same rev.
+    // The same box re-read (the ticking row moves the zone hash): same verdict, same rev.
     paint(&app, sid, &box_screen(2));
     sweep(&mut app, t);
     t += step;
@@ -2231,8 +2100,8 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     );
     assert_eq!(app.status_glance().need_count(), 1);
 
-    // The box is answered, and a NEW one comes up while the human is
-    // looking at this tab in the active app: listed, not announced.
+    // The box is answered and a new one comes up while the person looks at this tab: listed,
+    // not announced.
     paint(&app, sid, &busy_screen(9));
     sweep(&mut app, t);
     t += step;
@@ -2248,8 +2117,7 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     );
     assert_eq!(app.status_glance().need_count(), 1);
 
-    // NEGATIVE CONTROL: the same first transition in a headless instance
-    // reaches the published verdict and posts nothing.
+    // NEGATIVE CONTROL: a headless instance publishes the verdict and posts nothing.
     let (mut headless, hsid) = app_with_stub();
     assert!(headless.headless);
     looking_at(&headless, &[]);

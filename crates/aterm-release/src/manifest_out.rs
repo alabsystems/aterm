@@ -26,8 +26,8 @@ pub struct ManifestInputs<'a> {
     /// because the client binds all three (`aterm_update_core::Manifest::version`). Not the
     /// ordering key: `build_number` is the apply gate.
     pub version: &'a str,
-    /// The verified ledger claim `n` — must equal the binary's
-    /// ATERM_BUILD_NUMBER and the plist's CFBundleVersion (self-checked).
+    /// The verified ledger claim `n`: equals the binary's ATERM_BUILD_NUMBER and the
+    /// plist's CFBundleVersion (self-checked).
     pub build_number: u64,
     /// Full 40-hex release commit (the claim commit for a real cut).
     pub commit: &'a str,
@@ -43,15 +43,13 @@ pub struct ManifestInputs<'a> {
     pub zip_sha256: &'a str,
     /// "owner/repo" for the `url` field: the public update channel
     /// (`[workspace.metadata.aterm] update_channel`) when one is configured, never the
-    /// private publish repo, whose `url` 404s for everyone without a credential.
-    ///
-    /// The credential-less updater (`aterm_update::github::web_container_url_agrees`)
-    /// refuses a manifest whose `url` is not exactly
-    /// `https://github.com/<slug>/releases/download/v<version>/<dmg_name>` for the tag its
-    /// pointer chose; `tools/install.sh` binds it too. The URL is never followed: it binds
-    /// the signed manifest to its tag and container. The cut checks the served appcast's
-    /// `url` against `aterm_update_core::cdn::release_download_url` (publish.rs), so a
-    /// mis-set `update_channel` fails the cut rather than the fleet.
+    /// private publish repo, whose `url` 404s without a credential. The credential-less
+    /// updater (`aterm_update::github::web_container_url_agrees`) and `tools/install.sh`
+    /// refuse a manifest whose `url` is not exactly
+    /// `https://github.com/<slug>/releases/download/v<version>/<dmg_name>`. The URL is never
+    /// followed: it binds the signed manifest to its tag and container. publish.rs checks the
+    /// served `url` against `aterm_update_core::cdn::release_download_url`, so a mis-set
+    /// `update_channel` fails the cut rather than the fleet.
     pub repo_slug: &'a str,
     /// LSMinimumSystemVersion from the stamped bundle plist.
     pub min_os: &'a str,

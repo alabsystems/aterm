@@ -23,10 +23,10 @@
 //
 // It is a theorem about the model below, not about the Rust; the queue holds one post at a time
 // here. The code-bound half is the derived twin,
-// `aterm_models_harness::harness_policy_one_writer_model` (the same machine, registered, so
-// aterm-models' registry-wide sweeps prove it with the second writer as its `Buggy` member), and
-// its Tier-1 binds: `config_watcher::tests::the_watcher_is_the_policys_one_writer` drives the
-// real read, post, dedupe, delivery, admission and Commit reset; `app_native`'s
+// `aterm_spec::derive::harness_policy_one_writer_model` (Tier-0 in aterm-spec's
+// `derived_harness_policy_one_writer.rs`, with the second writer as its `Buggy` member), and its
+// Tier-1 binds: `config_watcher::tests::the_watcher_is_the_policys_one_writer` drives the real
+// read, post, dedupe, delivery, admission and Commit reset; `app_native`'s
 // `a_late_admission_never_moves_the_watchers_harness_policy` drives the real admission path.
 //
 // A sibling file, like `app_update_handoff_island.rs`: a compiler without the Clean surface fails

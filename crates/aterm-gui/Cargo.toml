@@ -12,8 +12,7 @@ description = "aterm — a native windowed terminal: winit presenting the aterm-
 [[bin]]
 name = "aterm-gui"
 path = "src/main.rs"
-# No test lives in main.rs (no #[test], no cfg(test), no `mod`); its libtest
-# harness ran 0 tests in every gate. Integration tests still get the binary.
+# main.rs holds no tests; integration tests still get the binary.
 test = false
 
 # The Phase 1a redraw gate. A BINARY because `EventLoop` construction panics off
@@ -101,13 +100,11 @@ path = "examples/objc_ime_drive.rs"
 name = "objc_toolbar_drive"
 path = "examples/objc_toolbar_drive.rs"
 
-# THE DEVELOPER TOOLS HELPER PANEL'S DRIVER (owner ask 2026-10-15). The panel
-# (`src/devtools_helper.rs`'s `live` module) stands beside System Settings, so no
-# unit test can build it (libtest is never on the main thread) and no check may
-# show it on a desktop a person is using. This builds its views exactly as the
-# live arm does, in NO window, under the Prohibited activation policy, captures
-# every state to PNG in the directory given as its argument and reads back the
-# panel window it never shows. A look, NOT an `OBJC_DRIVES` row; by hand it is
+# The Developer Tools helper panel's driver: builds `devtools_helper::live`'s views as
+# the live arm does, in no window and under the Prohibited activation policy, so it may
+# run beside a person; captures every state to PNG in the directory given as its
+# argument and reads back the panel window it never shows. Not an `OBJC_DRIVES` row; by
+# hand it is
 # `targo --unverified run -p aterm-gui --example objc_devtools_helper_drive -- <dir>`.
 [[example]]
 name = "objc_devtools_helper_drive"
@@ -155,10 +152,11 @@ bench-support = []
 # `[packages]` prefix/account/repo links), to the renderers' own (the
 # `ATERM_GPU_*` / `ATERM_RASTERIZER` seams), to the PTY seam
 # (`ATERM_PTY_IDLE_POLL_US`, `ATERM_TRACE_BOOST`) and to the state-root rule
-# (`ATERM_STATE_HOME`, aterm-types) and to the harness's live-upgrade settle
-# (`ATERM_UPGRADE_QUIET_S`, aterm-agent). A debug build compiles them anyway. The
-# release cutter NEVER enables it — `aterm-release`'s buildplan pins that — so a
-# shipped binary reads none of them.
+# (`ATERM_STATE_HOME`, aterm-types), to the harness's live-upgrade settle
+# (`ATERM_UPGRADE_QUIET_S`, aterm-agent) and to the fabric endpoint's stale
+# horizon (`ATERM_FABRIC_STALE_AFTER_MS`, aterm-gui-fabric). A debug build
+# compiles them anyway. The release cutter NEVER enables it — `aterm-release`'s
+# buildplan pins that — so a shipped binary reads none of them.
 dev-seams = [
     "aterm-agent/dev-seams",
     "aterm-update/dev-seams",
@@ -168,6 +166,7 @@ dev-seams = [
     "aterm-pty/dev-seams",
     "aterm-types/dev-seams",
     "aterm-gui-timing/dev-seams",
+    "aterm-gui-fabric/dev-seams",
 ]
 
 [dependencies]
@@ -182,17 +181,16 @@ aterm-control = { workspace = true }
 # The in-GUI supervisor (`harness_host`) and the agent harness readers. This
 # crate remains host-agnostic and has no GUI edge.
 aterm-agent = { workspace = true }
-# The control client's ONE token reader (no-follow, regular file, bounded) and
-# its connect-then-read order, for this instance's own dials to a sibling. Not
-# a new edge in the BUILD graph: `aterm-agent` above already links it.
+# The control client's one token reader (no-follow, regular file, bounded) and its
+# connect-then-read order, for dials to a sibling instance. Already linked via
+# aterm-agent.
 aterm-ctl = { path = "../aterm-ctl" }
-# L0.5 semantic predicates: the `await match <re>` verb compiles its regex here,
-# so the engine core stays regex-free (RFC R2 purity).
+# `await match <re>` compiles its regex here (`row_matcher`), so the engine core stays
+# regex-free.
 aterm-observe = { workspace = true }
 # Multilingual whole-word matching for the sparkle-words text decorations.
 aterm-lexicon = { workspace = true }
-# The cursor aurora/comet-trail + sparkle-words state machines (extracted so the
-# web embedders share them); re-exported at the crate root as `crate::<module>`.
+# Cursor effects and sparkle-words state machines (shared with the web embedders).
 aterm-effects = { workspace = true }
 # The `aos` verb's refusals, witness and trace decode (the momentum glow's Aos
 # boundary). Not a new edge in the BUILD graph: `aterm-effects` above links it.
@@ -258,9 +256,9 @@ aterm-session = { workspace = true }
 # presence band reads off the last rows of the screen — run only when a
 # session's status revision moves (`presence::classify`), never per frame.
 aterm-phase = { workspace = true }
-# The session log engine (`crate::session_log`): each session's hierarchical
-# record (session > run > turn > step), its turn tracker, fold and brief. Pure:
-# no clock, file, thread or socket (time enters as the host's `Stamp`).
+# The session log engine behind `crate::session_log`: each session's hierarchical
+# record (session > run > turn > step), its turn tracker, fold and brief. Pure (no
+# clock, file, thread or socket); time enters as the host's `Stamp`.
 aterm-slog = { workspace = true }
 # The fleet: the opt-in (secure-default-OFF) TLS listener whose proved LAN
 # peers the control server serves as `Scope::Fleet` (see fleet_listen.rs).
@@ -268,9 +266,9 @@ aterm-net = { workspace = true }
 # Portable control-socket stream (std Unix sockets on Unix, AF_UNIX-over-winsock
 # on Windows) + the latest-alias/CSPRNG/pid-liveness helpers control_auth uses.
 aterm-uds = { workspace = true }
-# The coding-agent primer installer: every fresh session spawn runs its
-# fail-soft `auto_prime` on a detached thread (spawn.rs), so the primer is
-# installed by aterm itself and never by a manual step nobody runs.
+# The coding-agent primer (context files, skills, hooks): each spawn's fail-soft
+# `auto_prime` (spawn.rs), identity priming, the harness's upkeep and the diagnostics
+# status line.
 aterm-primer = { workspace = true }
 aterm-cap = { workspace = true, features = ["launcher-mint"] }
 aterm-sandbox = { workspace = true }
@@ -278,24 +276,19 @@ aterm-containment = { workspace = true }
 aterm-log = { workspace = true }
 aterm-render = { workspace = true }
 aterm-gpu = { workspace = true }
-# Cmd-F find bar: back the find over the live screen + scrollback with the shared
-# trigram/Bloom search engine instead of a hand-rolled scan (app_search.rs).
+# The find bar's search over screen and scrollback (trigram/Bloom; app_search.rs).
 aterm-search = { workspace = true }
 # build_info: FxHash the running binary into a content signature off macOS (no crypto dep).
 aterm-hash = { workspace = true }
-# POL-1: install a default OSC policy. NO FEATURES — the winit→engine key map
-# this used to enable here (`features = ["winit-keymap"]`) is its own crate now,
-# `aterm-winit-keymap` below. Enabling it from here turned it on for every OTHER
-# consumer of aterm-types in the same resolve too, which is how `aterm-ctl`
-# acquired AppKit; keep this edge featureless.
+# Keep this edge featureless: a feature enabled here turns on for every consumer of
+# aterm-types in the same resolve.
 aterm-types = { workspace = true }
 # Settings ▸ Themes ▸ Community: the community theme pack, embedded.
 aterm-theme-pack = { workspace = true }
 # The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin), already in
 # the graph via aterm-types.
 aterm-time = { workspace = true }
-# K-2: the winit→engine key map, so the GUI and the future native shell share one
-# table instead of an inline match that drifts.
+# The winit-to-engine key map, one shared table.
 aterm-winit-keymap = { workspace = true }
 # `toml` (the serde derives on Policy, `Policy::to_toml`) is asked for here,
 # where serde's derive is already in the closure, and not only by the
@@ -309,17 +302,13 @@ aterm-policy = { workspace = true, features = ["toml"] }
 # swap is only the fallback). Inert in a plain build (no pinned Team ID) and a
 # no-op outside an installed .app.
 aterm-update = { workspace = true }
-# Manual's config language service validates package-owner slugs with the exact
-# URL-safety predicate consumed by both the updater and atpkg. The crate is
-# already present through those dependencies; naming it here prevents a second,
-# subtly different validator from drifting into the editor.
+# The updater's shared core (handoff policy, pins, settings, the package-check schedule,
+# the URL-safe slug predicate atpkg also uses), so this crate grows no second copy.
 aterm-update-core = { workspace = true }
-# Settings ▸ Packages: read the co-located toolchain manager's OWN durable state
-# (status.toml, dev-link markers, inert/enabled posture) in-process — same source
-# of truth as the `atpkg` verbs, no parallel parser to drift. Network/install
-# verbs still run ONLY via the co-located `atpkg` binary, never in this process;
-# the one in-process fetch is the vendor head watch's conditional GET (a hint —
-# the `atpkg update <program>` it triggers re-verifies everything).
+# Settings ▸ Packages reads atpkg's own durable state (status.toml, dev-link markers,
+# posture) in-process. Network and install verbs run only through the co-located `atpkg`
+# binary; the one in-process fetch is the vendor head watch's GET, a hint that the
+# `atpkg update` it triggers re-verifies.
 atpkg = { workspace = true }
 libc = { workspace = true }
 aterm-window = { workspace = true }
@@ -344,11 +333,7 @@ aterm-toml = { workspace = true }
 # 2026-10-15, when it replaced `ureq` — 12 packages / 89,080 lines — and its
 # bundled `webpki-roots`.)
 aterm-http = { workspace = true }
-# PNG encode/decode for the control-socket `window` verb (the macOS full-window
-# capture): it draws the front NSWindow's on-screen pixels into a tightly-packed
-# RGBA8 buffer and encodes them here, and decodes AppKit's own PNG normalization
-# on the way in. The SAME first-party crate aterm-render uses for the `image`
-# verb's framebuffer PNG, so this adds no dep to the tree.
+# PNG codec: the `window` verb's full-window capture and wallpaper decoding.
 aterm-png = { workspace = true }
 # First-party JPEG decode: the wallpaper lane reads PNG and JPEG on every
 # platform (`app_config::decode_wallpaper_portable`), not PNG alone off macOS.
@@ -383,14 +368,9 @@ aterm-tempfile = { workspace = true }
 # trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
 aterm-digest = { workspace = true }
-# Windows only: compile + link the application .ico (assets/aterm.rc → assets/
-# aterm.ico) into the DEV `aterm-gui.exe` so the shell shows the aterm icon
-# (taskbar button, Alt-Tab, titlebar, Explorer) instead of the generic exe
-# glyph; the shipped `aterm.exe` gets its resources from crates/aterm/build.rs.
-# First-party (crates/aterm-winres) — that crate's root says why
-# `embed-resource` left. build.rs gates the call on CARGO_CFG_TARGET_OS =
-# "windows" and a missing resource compiler is a warning, so non-Windows
-# targets and toolchain-less builds are entirely unaffected.
+# Windows only: links assets/aterm.ico into the dev `aterm-gui.exe` (the shipped
+# `aterm.exe` gets its resources from crates/aterm/build.rs). A missing resource
+# compiler is a warning.
 aterm-winres = { workspace = true }
 
 [dev-dependencies]
@@ -458,10 +438,9 @@ aterm-win32 = { workspace = true }
 # oracle, aterm-dirfd's and then the rustix 0.38 facade's, until it left the
 # lock at linux-windowing LW.7.)
 aterm-dirfd = { workspace = true }
-# THE PTY KEEPER's client (P3, opt-in: `[keeper] enabled`): the window's link
-# registers every master with the keeper and takes its offers at boot
-# (`keeper_link.rs`). The keeper itself links no GUI framework (the aterm-census
-# guards `keeper-gui` and `keeper-gui-deps`).
+# The PTY keeper's client (opt-in, `[keeper] enabled`): `keeper_link.rs` registers each
+# master with the keeper and takes its offers at boot. The keeper itself links no GUI
+# framework (census guards `keeper-gui`, `keeper-gui-deps`).
 aterm-keeper = { workspace = true }
 # THE CRASH-RESTORE JOURNAL (`crash_restore.rs`, on wherever the keeper link is):
 # each session's region layout, its single-writer protocols and keyframe policy,
@@ -507,47 +486,8 @@ aterm-window = { workspace = true, features = ["rwh_06"] }
 aterm-a11y = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# THE FOUR objc2-FAMILY ROWS THAT STOOD HERE ARE RETIRED — `objc2-app-kit`,
-# `objc2-foundation`, `objc2` and `block2`. `block2` went first, with the
-# NSException containment (2026-09-05): its two sites here — the alert key
-# monitor in alert_keys.rs and the paste sheet's completion handler in lib.rs —
-# are `aterm_objc::RcBlock` now, whose `invoke` contains an NSException instead
-# of aborting from a `nounwind` frame. The other three went with W13: this
-# crate's last five family files (`alert_keys.rs`, `menu.rs`, `lib.rs`'s paste
-# sheet, `app_introspect.rs` and `appkit.rs`) ported to `aterm-objc`, so the
-# rows were declaring dependencies no line of this crate could reach. What they backed is unchanged
-# and is now first-party: the audible bell and `setColorSpace`, the always-on
-# native menu bar, the per-window COMPACT toolbar and its tab strip, the
-# in-process pasteboard, the local-file panels, the full-window bitmap capture,
-# the menu-bar operator status item, the modal paste-confirm sheet, and the
-# `+[NSEvent keyEventWithType:…]` hardware-key injector.
-#
-# WHAT RETIRING THEM BUYS, MEASURED RATHER THAN CLAIMED: **nothing yet — zero
-# packages, zero lines, zero unsafe tokens.** `cargo forge survey --cell
-# mac-arm` is byte-identical across this commit. All six family packages are
-# held by a SECOND parent that is still live: the winit fork's own four macOS
-# rows (`crates/aterm-window/Cargo.toml`), whose backend has eight files still using
-# them. `cargo tree -i -p objc2-app-kit` answers `winit` and nothing else once
-# these rows are gone.
-#
-# So this row's removal is an HONESTY fix, not a size win: it stops this crate
-# claiming a dependency it does not have, and it makes the fork the single
-# remaining parent, which is what the next wave has to port. The packages leave
-# `mac-arm` on the commit that empties `crates/aterm-window/src/platform_impl/macos`,
-# at no earlier one. aterm-forge's dominator survey asserts the family absent
-# from the mac-arm graph.
-#
-# THAT COMMIT IS THE W12 + W13 MERGE onto the containment (2026-09-05): the
-# fork's rows are gone too (see the retirement note in crates/aterm-window/Cargo.toml),
-# and the mac-arm cell moved by the packages and lines tools/forge-budget.tsv
-# records with its dated note (6).
-
-# THE FIRST-PARTY REPLACEMENT for the four rows retired above (and for the
-# objc2-* binding crates): typed message sends, ownership, runtime class creation
-# and the block ABI, with zero dependencies of its own. W1 ported ONE of the
-# seven `declare_class!` sites onto it — `platform.rs`'s `ReduceMotionTarget`;
-# as of W13 it carries every macOS site this crate has. Not optional and not
-# feature-gated: it is the shipping path.
+# First-party Objective-C bindings (typed sends, ownership, runtime class creation, the
+# block ABI; no dependencies of its own): every AppKit call in this crate goes through it.
 aterm-objc = { workspace = true }
 
 # The `window` capture's `CGImage` layout reads (`app_introspect.rs`'s AppKit

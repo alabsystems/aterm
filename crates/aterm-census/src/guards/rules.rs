@@ -65,7 +65,7 @@ const ENGINE_STD_MODULES: &[(&str, &str)] = &[
     ("thread", "a thread"),
 ];
 
-/// The platform frameworks, read on the TEXT view: a framework is linked or
+/// The platform frameworks, read on the text view: a framework is linked or
 /// opened by a name in a literal (`link(name = "AppKit")`, a
 /// `/System/Library/Frameworks/Metal.framework` path).
 const ENGINE_FRAMEWORKS: &[(&str, Bound)] = &[

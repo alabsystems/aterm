@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Log shims for the Trust lane (`ship trust run`).
+//! Strict-gate log shims.
 //!
 //! `aterm_log::warn!` expands `format_args!` at the call site, and with runtime
 //! arguments that expansion embeds unsafe `fmt::Arguments` construction. Under
-//! the Trust lane (`ship trust run`) a function containing it loses the "no unsafe →
+//! the strict Trust gate a function containing it loses the "no unsafe →
 //! memory-safe warning" demotion, so any unlowerable construct elsewhere in it
 //! (a `Cow`, a `VecDeque` call) becomes a hard error. These `#[inline(never)]`
 //! shims confine the expansion to one tiny function; callers pre-compose their

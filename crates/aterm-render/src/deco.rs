@@ -191,9 +191,8 @@ pub const fn squarewave_up(x: usize, cell_h: usize) -> bool {
     (x / seg) % 2 == 1
 }
 
-/// The maximum deco-atlas texture dimension both renderers agree on (the
-/// downlevel/WebGL2 `max_texture_dimension_2d`). The GPU sprite atlas packs
-/// [`DECO_ATLAS_SPRITES`] cell-wide sprites in one row.
+/// The deco atlas size cap both renderers share (the WebGL2 `max_texture_dimension_2d`);
+/// the atlas packs [`DECO_ATLAS_SPRITES`] cell-wide sprites in one row.
 pub const DECO_ATLAS_MAX_DIM: usize = 2048;
 
 /// Sprites in the shared deco atlas: the 7 sparkle-word glyphs plus the undercurl tile

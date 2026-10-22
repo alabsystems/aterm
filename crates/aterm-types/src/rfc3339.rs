@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Howard Hinnant's civil-calendar conversions and the RFC3339 UTC stamp
-//! built on them — the workspace home for this math (update, release, gui,
-//! atpkg and the agent harness all stamp/parse the same
-//! `YYYY-MM-DDTHH:MM:SSZ` shape). Pure functions only: callers keep their own
-//! clock reads. The crates that do not depend on this one keep a date
-//! formatter of their own: `aterm-messages` (no dependencies, by design),
-//! `aterm-spec`'s report date and `verify perf`'s date.
+//! Howard Hinnant's civil-calendar conversions and the RFC 3339 UTC stamp
+//! (`YYYY-MM-DDTHH:MM:SSZ`) built on them: the workspace's one home for this math. Pure
+//! functions; callers keep their own clock reads. Crates that do not depend on this one keep
+//! their own date formatter: `aterm-messages` (dependency-free by design), `aterm-spec`'s
+//! report date and `verify perf`'s date.
 //!
 //! PARSING has one home too. [`parse_utc`] inverts [`format_rfc3339`] through
 //! year 9999 and is the default for every reader; [`parse_utc_fractional`]
@@ -189,8 +187,7 @@ fn push_padded(out: &mut String, v: u64, width: usize) {
 mod tests {
     use super::*;
 
-    /// The goldens the per-crate copies were pinned to before unification:
-    /// the epoch, a plain date, a leap day, and the pre-leap-day boundary.
+    /// Known instants: the epoch, a plain date, a leap day and the day before it.
     #[test]
     fn format_rfc3339_matches_known_instants() {
         assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
@@ -199,8 +196,7 @@ mod tests {
         assert_eq!(format_rfc3339(1_709_164_799), "2024-02-28T23:59:59Z");
     }
 
-    /// The strict parser inverts the formatter, and refuses every looser shape
-    /// the five folded copies refused between them.
+    /// The strict parser inverts the formatter and refuses every looser shape.
     #[test]
     fn parse_utc_inverts_format_and_refuses_looser_shapes() {
         for secs in [

@@ -710,12 +710,21 @@ pub(crate) struct SessionLog {
     /// or writes mail ([`Self::reconcile_person`]), and each count is
     /// delivered ONCE, whichever entry gets there first
     /// ([`Self::person_input`]); `marked_through` is the count the last
-    /// `human` mark covered, so a burst a reconcile already marked is not
-    /// marked again.
+    /// burst's `human` mark covered, so a burst a reconcile already marked
+    /// is not marked again (a mark of the mail latch alone, `why=mail`,
+    /// covers no burst: phase 6, 6F-8).
     person: Option<std::sync::Arc<crate::human_input::HumanInputStamp>>,
     person_seen: u64,
     reached_seen: u64,
     marked_through: u64,
+    /// THE `human` ROWS THE TIMELINE OWES (phase 6, the review of 6F-8;
+    /// ruling U13): one per burst mark [`Self::person_input`] wrote, the
+    /// key's own delivery's or a reconcile's that took over a burst whose
+    /// own call had not run yet. The timeline pays them
+    /// ([`crate::session_timeline::SessionTimeline::pay_burst_rows`]) before
+    /// its next row and at the end of the key's own delivery, so the ring's
+    /// `human` row stands where its mark stands, row for record, in order.
+    burst_rows: u32,
     /// What the codex-alab rollout tap answered for this session
     /// (`status rollout= rollout_asks=`, [`transcript::TapAnswers`]).
     rollout: transcript::TapAnswers,
@@ -811,6 +820,7 @@ impl SessionLog {
             person_seen: 0,
             reached_seen: 0,
             marked_through: 0,
+            burst_rows: 0,
             rollout: transcript::TapAnswers::default(),
         }
     }
@@ -1280,8 +1290,10 @@ impl SessionLog {
     ) {
         // A name still waiting ran too: it opens, and closes with the rest.
         self.name_pending(self.cmd, None);
-        // The program's newest state its bucket held is written, never lost.
+        // The program's newest state its bucket held is written, never lost,
+        // and the newest tuple the person was shown (6F-9).
         self.flush_program(at);
+        self.flush_shown(at);
         let f = with(Fields::new(), Key::Code, code.map(|c| Val::I(i64::from(c))));
         let f = with(
             f,
@@ -2190,6 +2202,18 @@ impl SessionLog {
     /// `reached=0` (a view scroll, a
     /// selection, a composition): the fold reads it as no answer to waiting
     /// mail, and the latch stays for the input that does reach the program.
+    /// THE LATCH'S MARK ALONE SAYS SO (phase 6, 6F-8, ruling U13): a mark
+    /// no burst opened, the timeline's `human` row's none, is `why=mail`,
+    /// which the log's view of the timeline filters on (the fold reads no
+    /// `why=`), so every row is one mark and every other mark is a
+    /// `why=mail` one. A reconciling delivery (`own` none) that writes the
+    /// latch's mark over a burst whose own call has not run yet (the
+    /// reading's `burst` past `marked_through`) writes the burst's, and that
+    /// call then marks nothing. EVERY BURST MARK OWES ITS ROW WHERE IT IS
+    /// WRITTEN (the review of 6F-8): the timeline pays it before its next
+    /// row ([`Self::take_burst_rows`]), so a reconcile inside an entry that
+    /// writes its mark before its row (the agent verdict, a fabric fact)
+    /// puts the `human` row before that entry's, as the mark is.
     /// `own` is the calling gesture's ([`PersonGesture`]), `None` for
     /// [`Self::reconcile_person`]'s.
     ///
@@ -2205,7 +2229,15 @@ impl SessionLog {
         let own_reaches = own.is_some_and(|g| g.reaches);
         let Some(p) = self.person.as_ref() else {
             if let Some(g) = own {
-                self.deliver_person(true, g.reaches, g.burst.is_some(), own_reaches, 0, at);
+                let marked = self.deliver_person(
+                    true,
+                    g.reaches,
+                    (g.burst.is_some(), false),
+                    own_reaches,
+                    0,
+                    at,
+                );
+                self.burst_rows += u32::from(marked);
             }
             return;
         };
@@ -2215,9 +2247,28 @@ impl SessionLog {
         let burst = own
             .and_then(|g| g.burst)
             .is_some_and(|n| n > self.marked_through);
+        // A burst counted and published whose own delivery is still to come:
+        // a mark this delivery writes is that burst's.
+        let unmarked_burst = c.burst > self.marked_through;
         self.person_seen = self.person_seen.max(c.seq);
         self.reached_seen = self.reached_seen.max(c.reached);
-        self.deliver_person(fresh, reached, burst, own_reaches, c.seq, at);
+        let marked = self.deliver_person(
+            fresh,
+            reached,
+            (burst, unmarked_burst),
+            own_reaches,
+            c.seq,
+            at,
+        );
+        self.burst_rows += u32::from(marked);
+    }
+
+    /// The `human` rows the burst marks [`Self::person_input`] wrote owe the
+    /// timeline, taken: the timeline records them before its next row and at
+    /// the end of the key's own delivery
+    /// ([`crate::session_timeline::SessionTimeline::pay_burst_rows`]).
+    pub(crate) fn take_burst_rows(&mut self) -> u32 {
+        std::mem::take(&mut self.burst_rows)
     }
 
     /// [`Self::person_input`] for a gesture no count names (a test's, or a
@@ -2228,25 +2279,28 @@ impl SessionLog {
         let c = self.person.as_ref().map(|p| p.counts()).unwrap_or_default();
         self.person_seen = self.person_seen.max(c.seq);
         self.reached_seen = self.reached_seen.max(c.reached);
-        self.deliver_person(true, true, burst, true, c.seq, at);
+        let _ = self.deliver_person(true, true, (burst, false), true, c.seq, at);
     }
 
     /// The delivery itself: the tracker and the arrivals for a `fresh`
     /// count, the step's binding and the mail latch for a `reached` one,
-    /// and the `human` mark for a `burst` or the latch, covering `seq`;
-    /// `reached=0` on a mark that neither `reached` nor the calling gesture
-    /// (`own_reaches`) brings a program-bound input to.
+    /// and the `human` mark for a burst (`burst.0`, the calling gesture's
+    /// own) or the latch: a burst's covering `seq`, the latch's alone
+    /// `why=mail` unless an unmarked burst is counted (`burst.1`), whose
+    /// mark it then is; `reached=0` on a mark that neither `reached` nor
+    /// the calling gesture (`own_reaches`) brings a program-bound input to.
+    /// Whether it wrote a burst's mark (whose `human` row the timeline owes).
     fn deliver_person(
         &mut self,
         fresh: bool,
         reached: bool,
-        burst: bool,
+        (burst, unmarked_burst): (bool, bool),
         own_reaches: bool,
         seq: u64,
         at: Stamp,
-    ) {
+    ) -> bool {
         if !fresh && !reached && !burst {
-            return;
+            return false;
         }
         self.resync();
         if fresh {
@@ -2266,15 +2320,26 @@ impl SessionLog {
         // clears it, as its record folds.
         let after_mail = reached && self.log.fold().in_since_human();
         if burst || after_mail {
-            let mut mark = Mark::new(Kind::Human, Src::Input, Conf::Strong)
-                .at(Node::SESSION)
-                .by(Actor::Human);
+            // The burst's mark (its row's record), or the latch's alone.
+            let a_bursts = burst || unmarked_burst;
+            let mut f = Fields::new();
             if !(reached || own_reaches) {
-                mark = mark.fields(Fields::new().u(Key::Reached, 0).unwrap_or_default());
+                f = f.u(Key::Reached, 0).unwrap_or_default();
             }
-            let _ = self.log.mark(mark, at);
-            self.marked_through = self.marked_through.max(seq);
+            if !a_bursts {
+                f = f.clone().word(Key::Why, "mail").unwrap_or(f);
+            }
+            let mark = Mark::new(Kind::Human, Src::Input, Conf::Strong)
+                .at(Node::SESSION)
+                .by(Actor::Human)
+                .fields(f);
+            let wrote = self.log.mark(mark, at).is_ok();
+            if a_bursts {
+                self.marked_through = self.marked_through.max(seq);
+            }
+            return a_bursts && wrote;
         }
+        false
     }
 
     /// A `ctl turn` exchange from `by`, ledger id `ledger`, handed its input to

@@ -8,7 +8,7 @@
 
 use super::{OutputBlock, Terminal};
 
-/// Result of extracting a block's command/output text from the grid.
+/// Result of reading a block's command or output text from the grid.
 ///
 /// Blocks record monotonic absolute rows, and scrollback keeps only the newest
 /// `scrollback_lines()`, so a block can outlive its text; so can a finished
@@ -122,10 +122,10 @@ impl Terminal {
             .or_else(|| self.shell.current_block.as_ref().filter(|b| b.id == id))
     }
 
-    /// The newest archived block: the youngest whose row extent is sealed
-    /// (`end_row` set when the next prompt's OSC 133 A finalized it).
+    /// The newest archived block, whose row extent the next prompt's OSC 133 A
+    /// sealed.
     ///
-    /// Never the current block, even when it is already
+    /// Never the current block, even when
     /// [`Complete`](crate::terminal::BlockState::Complete): its `end_row` is
     /// `None`, so a multi-line output would read back truncated. Shells send the
     /// next A right after D, so that window is short; an archived block may lack
@@ -145,14 +145,11 @@ impl Terminal {
     }
 
     /// The newest block in state [`Complete`](crate::terminal::BlockState::Complete),
-    /// current block included: the O(1) form of "the last `Complete` in
-    /// `all_blocks()`", which the `wait` verb re-evaluates on every output burst
-    /// under the terminal lock. Checks `current_block` first, then walks the
-    /// archive backwards.
-    ///
-    /// Unlike [`last_completed_block`](Self::last_completed_block) it includes
-    /// the unsealed current block: it reads only `id`/`exit_code`/`state`, which
-    /// are final at D.
+    /// current block included: an O(1) "last `Complete` in `all_blocks()`" for
+    /// the `wait` verb, which asks on every output burst under the terminal
+    /// lock. Unlike [`last_completed_block`](Self::last_completed_block) it
+    /// includes the unsealed current block: its `id`/`exit_code`/`state` are
+    /// final at D.
     #[must_use]
     #[inline]
     pub fn newest_completed_block(&self) -> Option<&OutputBlock> {
@@ -221,8 +218,7 @@ impl Terminal {
                     })
                     .unwrap_or((false, String::new()))
             } else {
-                // Visible line, read independently of the display offset: this
-                // reconstruction must not follow the user's scroll position.
+                // Screen row, independent of the display offset.
                 let visible_row = rel - scrollback_lines;
                 u16::try_from(visible_row)
                     .ok()
@@ -619,8 +615,7 @@ mod eviction_tests {
             "no shell integration yet: no completed block",
         );
 
-        // A full block, then D — Complete but still current (no next A yet):
-        // its extent is unsealed, so it must not be returned.
+        // Complete but still current (no next A yet): its extent is unsealed.
         term.process(b"\x1b]133;A\x07$ ls");
         term.process(b"\x1b]133;B\x07\r\n");
         term.process(b"\x1b]133;C\x07OUT-1\r\nOUT-2\r\n\x1b]133;D;0\x07");
@@ -629,7 +624,7 @@ mod eviction_tests {
             "a Complete-but-current block has an open end_row (truncated span)",
         );
 
-        // The next prompt's A seals + archives it; now both output lines read.
+        // The next prompt's A seals and archives it; both output lines read.
         term.process(b"\x1b]133;A\x07");
         let archived = term
             .last_completed_block()
@@ -651,8 +646,7 @@ mod eviction_tests {
             .size(6, 10)
             .ring_buffer_size(100)
             .build();
-        // 25 chars, no newline → soft-wraps across visible rows 0,1,2 (no scroll, so
-        // oldest_absolute_row()==0 and these are absolute rows 0..3).
+        // 25 chars soft-wrap across rows 0..3 (no scroll: absolute rows 0..3).
         term.process(b"ABCDEFGHIJKLMNOPQRSTUVWXY");
         match term.text_range(0, 3) {
             BlockText::Text(t) => assert!(

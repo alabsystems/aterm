@@ -167,6 +167,9 @@ use crate::codex_alab_model::{
     REPO_PUSH_HOLD, SLOW_TURN,
 };
 use crate::codex_rig;
+
+#[path = "codex_alab_policy_proof.rs"]
+mod policy_proof;
 use crate::forever::pct_decode;
 use crate::instance::{self, Instance, Launch, World};
 use crate::pyjson::J;
@@ -1357,8 +1360,12 @@ impl Proof {
 
     /// The claim of `leg` proven, and the host watching only beside it.
     fn claim(&mut self, leg: &Leg) -> Result<Option<i32>, Stopped> {
+        self.claim_with_limit(leg, Duration::from_secs(180))
+    }
+
+    fn claim_with_limit(&mut self, leg: &Leg, limit: Duration) -> Result<Option<i32>, Stopped> {
         let mut pid = None;
-        Self::wait_for(Duration::from_secs(180), Duration::from_millis(500), || {
+        Self::wait_for(limit, Duration::from_millis(500), || {
             pid = self.proven_pid(&leg.sid);
             pid.is_some()
         })?;
@@ -3107,7 +3114,7 @@ fn codex_config(port: u16, proj: &Path, home: &Path, extra: &str) -> String {
     )
 }
 
-/// `codex-alab-proof [--package DIR] [--aterm PATH] [--keep]`.
+/// `codex-alab-proof [--package DIR] [--aterm PATH] [--keep] [--policy-only]`.
 ///
 /// Once the proof admits its copied programs, it retains its own scratch
 /// even without `--keep` and reports the path on exit: a failed first exec
@@ -3120,6 +3127,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     stop::install();
     let mut a = args.to_vec();
     let keep = instance::take_flag(&mut a, "--keep");
+    let policy_only = instance::take_flag(&mut a, "--policy-only");
     let aterm = instance::take_value(&mut a, "--aterm")?;
     let given = instance::take_value(&mut a, "--package")?;
     if let Some(extra) = a.first() {
@@ -3270,7 +3278,11 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         fails: Vec::new(),
         fabric,
     };
-    let outcome = legs(&mut proof, &pkg_a, &pkg_b);
+    let outcome = if policy_only {
+        policy_proof::legs(&mut proof, &pkg_a)
+    } else {
+        legs(&mut proof, &pkg_a, &pkg_b)
+    };
     proof.end_all();
     if let Err(f) = outcome
         && (f.stopped.is_some() || proof.fails.is_empty())

@@ -22,22 +22,25 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
 admin (a machine in [admins]):
   aterm secrets create <url>|<path> [--import <dir>] [--name <host>]
   aterm secrets edit                     the vault text in $EDITOR; saving publishes it
-  aterm secrets set <name> [--for <host>...] [--file <path>]
+  aterm secrets set <name> [--for <host|code>...] [--file <path>]
         [--if-absent [--with <name> | --no-with]] [--fleet-reads-anchors]
                                          (the value from stdin or the file; --with: filled
                                          only where that if-absent entry is not the machine's own;
                                          set again, an entry keeps its anchor unless --no-with)
-  aterm secrets unset <name> [--for <host>...]
+  aterm secrets unset <name> [--for <host|code>...]
   aterm secrets password [show|set|new|open|off]   the join password a joining machine
                                          types, or open: every machine that asks is let in
   aterm secrets requests                 machines asking to join
   aterm secrets approve <code>... | --all | <age1...> --name <host>
-  aterm secrets revoke <host> [--drop-sections]
-  aterm secrets admins add|remove <host>   (remove also rotates the vault key)
+  aterm secrets revoke <host|code> [--drop-sections]
+  aterm secrets admins add|remove <host|code>   (remove also rotates the vault key)
   aterm secrets rotate-key               sign with a new vault key the current one endorses
 server and services:
-  aterm secrets serve [--listen <addr:port>] [--advertise <name>] [--pin <vault>=<key>]
-        [--store <dir>] [--hold <1-60 secs>] [--no-keep-awake]
+  aterm secrets serve [--listen <addr:port>] [--advertise <name> | --no-advertise]
+        [--pin <vault>=<key>] [--store <dir>] [--hold <1-60 secs>] [--no-keep-awake]
+                                         (on macOS, listening on every address at port 7484
+                                         as it does by default, it advertises the default
+                                         vault's name)
   aterm secrets agent on|off|status [--program <path>]
   aterm secrets server on|off|status [--program <path>] [serve flags]
 ";
@@ -235,7 +238,7 @@ impl Flags {
 
 /// The flags `serve` takes (also passed through by `server on`).
 const SERVE_VALUED: &[&str] = &["--listen", "--advertise", "--pin", "--store", "--hold"];
-const SERVE_SWITCHES: &[&str] = &["--no-keep-awake"];
+const SERVE_SWITCHES: &[&str] = &["--no-keep-awake", "--no-advertise"];
 
 /// The longest `--hold`: a watching machine's request gives up a little after a minute.
 const MAX_HOLD_SECS: u64 = 60;
@@ -257,7 +260,7 @@ fn serve_settings(f: &Flags) -> Result<ServeSettings, String> {
     let listen = f
         .one("--listen")
         .unwrap_or_else(|| format!("0.0.0.0:{}", crate::DEFAULT_PORT));
-    let listen = listen
+    let listen: std::net::SocketAddr = listen
         .parse()
         .map_err(|_| format!("--listen {listen}: not an address:port"))?;
     let mut pins: Vec<(String, [u8; 32])> = Vec::new();
@@ -293,11 +296,25 @@ fn serve_settings(f: &Flags) -> Result<ServeSettings, String> {
             "--advertise {name}: a host label of lowercase letters, digits and -"
         ));
     }
+    // On macOS the default vault's name, so a server set up with no flags answers the URL
+    // every new Mac joins, but only where it can: on every address at the default URL's port.
+    // A server hand-run on loopback or another port (a check, a test) claims no name. Two
+    // Macs advertising one name contend for it: one serving another vault names its own, or
+    // none.
+    let answers_default_url = listen.ip().is_unspecified() && listen.port() == crate::DEFAULT_PORT;
+    let advertise = match (advertise, f.has("--no-advertise")) {
+        (Some(_), true) => return Err("--advertise and --no-advertise are both given".into()),
+        (None, true) => None,
+        (Some(name), false) => Some(name),
+        (None, false) => (cfg!(target_os = "macos") && answers_default_url)
+            .then(|| crate::alab_advertised().to_string()),
+    };
+    let store = f.one("--store");
     Ok(ServeSettings {
         listen,
         advertise,
         pins,
-        store: f.one("--store"),
+        store,
         hold,
         keep_awake: !f.has("--no-keep-awake"),
     })
@@ -486,6 +503,15 @@ fn parse(words: &[String]) -> Result<Command, String> {
                 }
                 _ => {}
             }
+            // Never admitted under a generic name in its place: the machine was told this one.
+            // Nor one shaped like a join code, which names the machine whose key has it.
+            if let Some(name) = &name
+                && (!crate::text::valid_machine_name(name) || crate::transport::valid_code(name))
+            {
+                return Err(format!(
+                    "--name {name:?}: a machine name is lowercase letters, digits and - (at most 63), not machines, admins, everyone or join, and not shaped like a join code"
+                ));
+            }
             let mut which = Vec::with_capacity(f.operands.len());
             for word in &f.operands {
                 if word.starts_with("age1") {
@@ -519,7 +545,7 @@ fn parse(words: &[String]) -> Result<Command, String> {
                     add: verb == "add",
                     host: host.clone(),
                 }),
-                _ => Err("admins takes add <host> or remove <host>".into()),
+                _ => Err("admins takes add <host|code> or remove <host|code>".into()),
             }
         }
         "rotate-key" => {
@@ -641,6 +667,7 @@ mod unix {
             Command::Unset { name, hosts } => {
                 let admin = client::admin_open(&paths)?;
                 let mut doc = admin.doc.clone();
+                let hosts = machines_named(&doc, &hosts)?;
                 if !doc
                     .unset_entry(&audience(&hosts), &name)
                     .map_err(text_error)?
@@ -663,17 +690,23 @@ mod unix {
             Command::Admins { add, host } => {
                 let admin = client::admin_open(&paths)?;
                 let mut doc = admin.doc.clone();
+                let host = client::machine_named(&doc, &host)?;
                 if add {
                     doc.add_admin(&host).map_err(text_error)?;
                     let done = client::admin_publish(&paths, &admin, &doc)?;
                     Ok(published(&format!("added {host} to the admins"), &done))
                 } else {
+                    let held = exposure(&doc, &host);
                     if !doc.remove_admin(&host).map_err(text_error)? {
                         return Err(Error::new(format!("{host} is not an admin")));
                     }
                     // Every admin holds the vault key: the one removed must not keep signing.
                     let done = client::admin_rotate(&paths, &admin, &doc)?;
-                    Ok(published(&format!("removed {host} from the admins"), &done))
+                    let code = published(&format!("removed {host} from the admins"), &done);
+                    if let Some(held) = held {
+                        println!("{held}");
+                    }
+                    Ok(code)
                 }
             }
             Command::RotateKey => {
@@ -711,6 +744,18 @@ mod unix {
 
     fn text_error(error: text::TextError) -> Error {
         Error::new(error.to_string())
+    }
+
+    /// The machines `words` name in `doc`, each by [`client::machine_named`]: a join code
+    /// reaches the machine whose key has it, never one named like it; a name passes as typed.
+    pub(super) fn machines_named(
+        doc: &text::Document,
+        words: &[String],
+    ) -> crate::Result<Vec<String>> {
+        words
+            .iter()
+            .map(|word| client::machine_named(doc, word))
+            .collect()
     }
 
     fn audience(hosts: &[String]) -> Audience {
@@ -1019,6 +1064,22 @@ mod unix {
         }
     }
 
+    /// `status`'s line for this machine, `key` its `age1…` key and `code` its join code. A
+    /// plain text file is read under the name `source.toml` holds. A signed vault calls a
+    /// machine what its admission did, which is not the name it asked for when that was taken
+    /// (it got a free one, which never reaches the machine): that name is said as asked, and
+    /// the machine is named by its code, which `admins add` takes.
+    pub(super) fn machine_line(config: Option<&client::Config>, key: &str, code: &str) -> String {
+        let line = format!("machine: code {code}, key {key}");
+        match config {
+            Some(config) if config.signer.is_some() => {
+                format!("{line}, asked to join as {}", config.host)
+            }
+            Some(config) => format!("machine: {}, code {code}, key {key}", config.host),
+            None => line,
+        }
+    }
+
     fn status(paths: &Paths) -> crate::Result<ExitCode> {
         let status = client::status(paths)?;
         match &status.config {
@@ -1041,13 +1102,9 @@ mod unix {
             }
         }
         if let Some((recipient, code)) = &status.machine {
-            let host = status
-                .config
-                .as_ref()
-                .map_or("this machine", |c| c.host.as_str());
             println!(
-                "machine: {host}, code {code}, key {}",
-                recipient.to_bech32()
+                "{}",
+                machine_line(status.config.as_ref(), &recipient.to_bech32(), code)
             );
         }
         match status.membership {
@@ -1057,13 +1114,13 @@ mod unix {
                     .machine
                     .as_ref()
                     .map_or("?", |(_, code)| code.as_str());
-                // Whether a join password went with the request is not kept, so a vault with
-                // a join queue always says how a mistyped one is fixed. (A path has none, so
-                // its default machine name is never looked up.)
+                // How a mistyped join password is fixed, only when one went with the request.
+                // (A path has no join queue, so its default machine name is never looked up.)
                 let hint = status
                     .config
                     .as_ref()
                     .filter(|config| matches!(config.source, Source::Url(_)))
+                    .filter(|_| client::asked_with_password(paths))
                     .and_then(|config| {
                         let named = (config.host != client::default_host_name())
                             .then_some(config.host.as_str());
@@ -1299,6 +1356,18 @@ mod unix {
         }
     }
 
+    /// The store a `--store` names: a relative one is under the home directory, where a
+    /// systemd unit runs (a launchd job runs from `/`, a hand-run serve from anywhere), so
+    /// one line means one store however it is run.
+    pub(super) fn store_dir(paths: &Paths, text: &str) -> PathBuf {
+        let dir = expand(paths, text);
+        if dir.is_absolute() {
+            dir
+        } else {
+            paths.home.join(dir)
+        }
+    }
+
     /// `$VISUAL` / `$EDITOR` (words split on spaces), else vi, resolved on PATH.
     fn editor() -> crate::Result<Vec<String>> {
         let line = std::env::var("VISUAL")
@@ -1334,9 +1403,31 @@ mod unix {
                 "edit needs a terminal; use set/unset to change one entry",
             ));
         }
+        // Found first, so an editor that is not there leaves no draft behind.
+        let editor = editor()?;
+        edit_with(
+            paths,
+            &mut |file| {
+                let mut cmd = aterm_uds::spawnfd::command(&editor[0]);
+                cmd.args(&editor[1..]).arg(file);
+                cmd.status()
+                    .map(|status| status.success())
+                    .map_err(|e| Error::new(format!("{}: {e}", editor[0])))
+            },
+            &ask,
+        )
+    }
+
+    /// [`edit`] past its terminal check: `run` opens the draft in the editor (false when the
+    /// editor fails), and `ask` asks the person.
+    pub(super) fn edit_with(
+        paths: &Paths,
+        run: &mut dyn FnMut(&Path) -> crate::Result<bool>,
+        ask: &dyn Fn(&str) -> Option<String>,
+    ) -> crate::Result<ExitCode> {
         let mut admin = client::admin_open(paths)?;
-        // The version the text began as: a machine the vault admits after it (the approver,
-        // another admin) is one the person never saw, and is put back into what they save.
+        // The version the text began as: what another admin, or the approver, changed after
+        // it is brought into what the person saves ([`client::keep_admitted`]).
         let base = admin.doc.clone();
         let scratch = client::Scratch::new(paths)?;
         let file = scratch
@@ -1345,18 +1436,24 @@ mod unix {
         let original = base.render();
         fsx::write_atomic(&file, original.as_slice(), 0o600)?;
         eprintln!(
-            "draft: {} (kept if this edit does not publish)",
+            "draft: {} (kept unless edit ends with it published or unchanged, so an interrupted edit leaves it)",
             file.display()
         );
-        let editor = editor()?;
+        // The draft as the editor reopened it on a version that moved: quitting on it unchanged
+        // is no answer to the warning, so it publishes only when the person says so.
+        let mut reopened: Option<SecretBytes> = None;
         loop {
-            let mut cmd = aterm_uds::spawnfd::command(&editor[0]);
-            cmd.args(&editor[1..]).arg(&file);
-            let status = cmd
-                .status()
-                .map_err(|e| Error::new(format!("{}: {e}", editor[0])))?;
-            if !status.success() {
-                return Err(Error::new("the editor failed; nothing published"));
+            let ran = run(&file);
+            if !matches!(ran, Ok(true)) {
+                // A draft that still holds the published text holds no work, so it goes;
+                // one that changed is kept.
+                let kept = scratch.discard(&file, original.as_slice()).is_err();
+                let why = match ran {
+                    Err(error) => error.to_string(),
+                    Ok(_) => "the editor failed".to_string(),
+                };
+                let kept = if kept { " (the draft is kept)" } else { "" };
+                return Err(Error::new(format!("{why}; nothing published{kept}")));
             }
             let edited = fsx::read_private(&file, text::MAX_TEXT)?
                 .ok_or_else(|| Error::new("the edited file is gone; nothing published"))?;
@@ -1366,6 +1463,17 @@ mod unix {
                 }
                 println!("no change; nothing published");
                 return Ok(ExitCode::SUCCESS);
+            }
+            if reopened
+                .as_ref()
+                .is_some_and(|text| text.as_slice() == edited.as_slice())
+                && !yes(ask(&format!(
+                    "No change since the vault moved. Publish it over seq {} as it is? [y/N] ",
+                    admin.seq()
+                )))
+            {
+                eprintln!("nothing published (the draft is kept)");
+                return Ok(ExitCode::FAILURE);
             }
             let parsed = match edited.as_str() {
                 Some(text) => text::Document::parse(text).map_err(text_error),
@@ -1400,27 +1508,16 @@ mod unix {
                     // Another admin, or the approver, may have published meanwhile (the server
                     // refuses a version that is not newer, and so does a path): the next try
                     // goes on top of the newest version, and the person is told their text
-                    // replaces it, all but the machines admitted since, which it keeps.
+                    // replaces it, all but who that version let in or out and its [join] line.
                     match client::admin_open(paths) {
                         Ok(fresh) if fresh.seq() != admin.seq() => {
-                            let added: Vec<String> = client::admitted_since(&base, &fresh.doc)
-                                .into_iter()
-                                .map(|machine| machine.name)
-                                .collect();
-                            let added = if added.is_empty() {
-                                String::new()
-                            } else {
-                                format!(
-                                    " (machines added since, which saving keeps: {})",
-                                    added.join(", ")
-                                )
-                            };
                             eprintln!(
-                                "the vault moved from seq {} to seq {} while you edited; saving again publishes your text over it, so bring its changes in first{added}",
+                                "the vault moved from seq {} to seq {} while you edited; a save publishes your text over it, keeping the machines and admins it let in or out and its [join] line, so bring in its other changes first (a file left as it is publishes only if you say so)",
                                 admin.seq(),
                                 fresh.seq()
                             );
                             admin = fresh;
+                            reopened = Some(edited.clone());
                         }
                         Ok(_) => {}
                         Err(reopen) => eprintln!("the vault could not be reopened: {reopen}"),
@@ -1479,6 +1576,23 @@ mod unix {
         Ok((next, anchor))
     }
 
+    /// A value piped in as one line of text (`echo token | …`) loses its line end: the LF and
+    /// a CR before it, when what is left is one line `name=value` spells (UTF-8 without CR, LF
+    /// or NUL). Anything else, a binary value above all, is kept byte for byte, as `--file`
+    /// keeps it.
+    pub(super) fn trim_piped_line(bytes: &mut Vec<u8>) {
+        let Some(body) = bytes.strip_suffix(b"\n") else {
+            return;
+        };
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        let one_line = std::str::from_utf8(body).is_ok()
+            && !body.iter().any(|b| matches!(b, b'\r' | b'\n' | 0));
+        let keep = body.len();
+        if one_line {
+            bytes.truncate(keep);
+        }
+    }
+
     fn set(
         paths: &Paths,
         name: &str,
@@ -1514,14 +1628,7 @@ mod unix {
                     bytes.zeroize();
                     return Err(Error::new("the value is larger than 1 MiB"));
                 }
-                // One line piped in (`echo token | …`) loses its newline.
-                let body_end = bytes.len().saturating_sub(1);
-                if bytes.last() == Some(&b'\n') && !bytes[..body_end].contains(&b'\n') {
-                    bytes.pop();
-                    if bytes.last() == Some(&b'\r') {
-                        bytes.pop();
-                    }
-                }
+                trim_piped_line(&mut bytes);
                 SecretBytes::new(bytes)
             }
         };
@@ -1531,6 +1638,7 @@ mod unix {
             )));
         }
         let admin = client::admin_open(paths)?;
+        let hosts = &machines_named(&admin.doc, hosts)?;
         let (doc, anchor) = set_in(&admin.doc, &audience(hosts), name, value.as_slice(), fill)?;
         let done = client::admin_publish(paths, &admin, &doc)?;
         let gaps = match (fill.if_absent, anchor) {
@@ -1578,23 +1686,13 @@ mod unix {
                 // while the vault was closed, its approved request still queued. Not let in
                 // here, each joins only by code (the publish names them).
                 let waiting = client::requests(paths, Some(&doc))?;
-                if !waiting.is_empty() && interactive() {
-                    eprintln!("these machines asked to join before the vault opened:");
-                    for request in &waiting {
-                        let when = request.at.map(ago).unwrap_or_default();
-                        eprintln!("  {}  code {}  {when}", request.host, request.code);
-                    }
-                    let question = format!(
-                        "Let these {} in now? Any you do not know may be a machine you let go. Each reads every [everyone] secret. [y/N] ",
-                        waiting.len()
-                    );
-                    if yes(ask(&question)) {
-                        for request in &waiting {
-                            let host = client::free_name(&doc, &request.host);
-                            doc.add_machine(&host, &request.recipient)
-                                .map_err(text_error)?;
-                        }
-                    }
+                if interactive() {
+                    admit_on_opening(
+                        &mut doc,
+                        waiting,
+                        &mut |line| eprintln!("{line}"),
+                        &mut |question| yes(ask(question)),
+                    )?;
                 }
                 doc.set_open(true).map_err(text_error)?;
                 let done = client::admin_publish(paths, &admin, &doc)?;
@@ -1658,6 +1756,90 @@ mod unix {
         }
     }
 
+    /// What `password open` at a terminal does with the requests `waiting` as it opens the
+    /// vault: names each machine once on `say`, and on one yes from `agree` lets in every one
+    /// but a key a `code-only` line names, or one asking under more than one name. The first
+    /// is a machine let go (or one held when the vault last opened): it is named, marked, and
+    /// joins only by its code. The second may be a stranger that read the key off the listing
+    /// and queued it under a name of its choosing: it joins only as the person names it.
+    pub(super) fn admit_on_opening(
+        doc: &mut text::Document,
+        waiting: Vec<client::Request>,
+        say: &mut dyn FnMut(String),
+        agree: &mut dyn FnMut(&str) -> bool,
+    ) -> crate::Result<()> {
+        let code_only = doc.code_only();
+        let (mut offered, mut held, mut named) = (Vec::new(), Vec::new(), Vec::new());
+        for request in &waiting {
+            // One host asked from two addresses is one machine.
+            let listed = |list: &[&client::Request]| {
+                list.iter()
+                    .any(|r| r.recipient == request.recipient && r.host == request.host)
+            };
+            if listed(&offered) || listed(&held) || listed(&named) {
+                continue;
+            }
+            if code_only.contains(&request.recipient) {
+                held.push(request);
+            } else if names_asked(&waiting, &request.recipient).len() > 1 {
+                named.push(request);
+            } else {
+                offered.push(request);
+            }
+        }
+        let line = |request: &client::Request, mark: &str| {
+            let when = request.at.map(ago).unwrap_or_default();
+            format!("  {}  code {}  {when}{mark}", request.host, request.code)
+        };
+        if !offered.is_empty() {
+            say("these machines asked to join before the vault opened:".into());
+            for request in &offered {
+                say(line(request, ""));
+            }
+        }
+        if !held.is_empty() {
+            say(
+                "these are asking too, and are let in only by code (aterm secrets approve):".into(),
+            );
+            for request in &held {
+                say(line(request, CODE_ONLY_MARK));
+            }
+        }
+        if !named.is_empty() {
+            say("these keys ask under more than one name, and anyone on the LAN can queue a key under a name of its choosing: let one in under the name its machine asked for with aterm secrets approve <age1…> --name <host>".into());
+            for request in &named {
+                say(format!("{}  {}", line(request, ""), request.recipient));
+            }
+        }
+        if offered.is_empty() {
+            return Ok(());
+        }
+        let question = format!(
+            "Let these {} in now? Any you do not know may be a machine you let go. Each reads every [everyone] secret. [y/N] ",
+            offered.len()
+        );
+        if agree(&question) {
+            for request in offered {
+                let host = client::free_name(doc, &request.host);
+                doc.add_machine(&host, &request.recipient)
+                    .map_err(text_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The names the queue lists `key` under, sorted, each once.
+    fn names_asked<'a>(pending: &'a [client::Request], key: &str) -> Vec<&'a str> {
+        let mut hosts: Vec<&str> = pending
+            .iter()
+            .filter(|r| r.recipient == key)
+            .map(|r| r.host.as_str())
+            .collect();
+        hosts.sort_unstable();
+        hosts.dedup();
+        hosts
+    }
+
     fn requests(paths: &Paths) -> crate::Result<ExitCode> {
         let admin = client::admin_open(paths).ok();
         let pending = client::requests(paths, admin.as_ref().map(|a| &a.doc))?;
@@ -1697,12 +1879,13 @@ mod unix {
         let admin = client::admin_open(paths)?;
         let mut doc = admin.doc.clone();
         let pending = client::requests(paths, Some(&doc))?;
-        let mut chosen: Vec<(String, String)> = Vec::new();
+        if all && pending.is_empty() {
+            println!("no machines are asking to join");
+            return Ok(ExitCode::SUCCESS);
+        }
+        // Before any prompt: a code no machine asks with, or a key listed under two names.
+        let mut chosen = from_queue(&pending, which, all)?;
         if all {
-            if pending.is_empty() {
-                println!("no machines are asking to join");
-                return Ok(ExitCode::SUCCESS);
-            }
             if !interactive() {
                 return Err(Error::new(
                     "approve --all asks for a yes at a terminal; approve each code instead",
@@ -1728,33 +1911,17 @@ mod unix {
                 println!("nothing approved");
                 return Ok(ExitCode::FAILURE);
             }
-            chosen.extend(
-                pending
-                    .iter()
-                    .map(|r| (r.recipient.clone(), r.host.clone())),
-            );
         }
-        for word in which {
-            if word.starts_with("age1") {
-                crate::age::Recipient::parse(word)
-                    .map_err(|_| Error::new(format!("{word} is not a valid age key")))?;
-                let host = name
-                    .clone()
-                    .ok_or_else(|| Error::new("approving a key needs --name <host>"))?;
-                chosen.push((word.clone(), host));
-                continue;
-            }
-            match pending.iter().find(|r| &r.code == word) {
-                Some(request) => chosen.push((request.recipient.clone(), request.host.clone())),
-                None => {
-                    return Err(Error::new(format!(
-                        "no machine waiting to join has code {word} (aterm secrets requests)"
-                    )));
-                }
-            }
+        // A key named here is not in the queue's pairs: `--name` goes with one key alone, and
+        // `add_machine` refuses a key twice rather than pick one of its names.
+        for word in which.iter().filter(|word| word.starts_with("age1")) {
+            crate::age::Recipient::parse(word)
+                .map_err(|_| Error::new(format!("{word} is not a valid age key")))?;
+            let host = name
+                .clone()
+                .ok_or_else(|| Error::new("approving a key needs --name <host>"))?;
+            chosen.push((word.clone(), host));
         }
-        chosen.sort();
-        chosen.dedup_by(|a, b| a.0 == b.0);
         if chosen.is_empty() {
             println!("nothing to approve");
             return Ok(ExitCode::SUCCESS);
@@ -1775,10 +1942,83 @@ mod unix {
         ))
     }
 
+    /// What `host` could read in `doc`, said where it is let go (`revoke`, `admins remove`),
+    /// so a person rotates all of it: as an admin, every entry, since the admin locker holds
+    /// the whole text; else every entry of `[everyone]` and of each section naming it, an
+    /// `[everyone]` value its own section overrides too, since it opened both lockers. A host
+    /// section's entry is named with its header. `None` when it could read none.
+    pub(super) fn exposure(doc: &text::Document, host: &str) -> Option<String> {
+        let admin = doc.admins().iter().any(|name| name == host);
+        let held: Vec<String> = doc
+            .entries()
+            .into_iter()
+            .filter(|entry| admin || entry.audience.includes(host))
+            .map(|entry| match &entry.audience {
+                Audience::Everyone => entry.name.clone(),
+                hosts => format!("{} {}", entry.name, hosts.header()),
+            })
+            .collect();
+        if held.is_empty() {
+            return None;
+        }
+        let (n, list) = (held.len(), held.join(", "));
+        Some(if admin {
+            format!(
+                "{host} was an admin, so it could read every secret ({n}: {list}); rotate them if it was lost or compromised"
+            )
+        } else {
+            format!(
+                "{host} could read {n} secrets ({list}); rotate them if it was lost or compromised"
+            )
+        })
+    }
+
+    /// The `(key, host)` pairs `approve` takes from the queue, one per key: the request each
+    /// code in `which` names (an `age1…` word is not a code), or with `all` every request. A
+    /// key listed under more than one host is refused: anyone on the LAN can read a key from
+    /// the listing and queue it beside its machine's own line under a name of its choosing,
+    /// so which name is the machine's is the person's call (`approve <age1…> --name`).
+    pub(super) fn from_queue(
+        pending: &[client::Request],
+        which: &[String],
+        all: bool,
+    ) -> crate::Result<Vec<(String, String)>> {
+        let mut picked: Vec<&client::Request> = Vec::new();
+        if all {
+            picked.extend(pending);
+        }
+        for code in which.iter().filter(|word| !word.starts_with("age1")) {
+            let request = pending.iter().find(|r| &r.code == code).ok_or_else(|| {
+                Error::new(format!(
+                    "no machine waiting to join has code {code} (aterm secrets requests)"
+                ))
+            })?;
+            picked.push(request);
+        }
+        let mut chosen = Vec::with_capacity(picked.len());
+        for request in picked {
+            let hosts = names_asked(pending, &request.recipient);
+            if hosts.len() > 1 {
+                return Err(Error::new(format!(
+                    "code {} asks to join under {} names ({}), and anyone on the LAN can queue a key under a name of its choosing: approve it under the name its machine asked for with aterm secrets approve {} --name <host>",
+                    request.code,
+                    hosts.len(),
+                    hosts.join(", "),
+                    request.recipient
+                )));
+            }
+            chosen.push((request.recipient.clone(), request.host.clone()));
+        }
+        chosen.sort();
+        chosen.dedup();
+        Ok(chosen)
+    }
+
     fn revoke(paths: &Paths, host: &str, drop_sections: bool) -> crate::Result<ExitCode> {
         let admin = client::admin_open(paths)?;
         let mut doc = admin.doc.clone();
-        let held: Vec<String> = doc.entries_for(host).into_iter().map(|e| e.name).collect();
+        let host = &client::machine_named(&doc, host)?;
+        let held = exposure(&doc, host);
         if !doc
             .remove_machine(host, drop_sections)
             .map_err(text_error)?
@@ -1787,12 +2027,8 @@ mod unix {
         }
         let done = client::admin_publish(paths, &admin, &doc)?;
         let code = published(&format!("revoked {host}"), &done);
-        if !held.is_empty() {
-            println!(
-                "{host} could read {} secrets ({}); rotate them if it was lost or compromised",
-                held.len(),
-                held.join(", ")
-            );
+        if let Some(held) = held {
+            println!("{held}");
         }
         Ok(code)
     }
@@ -1809,7 +2045,7 @@ mod unix {
         let store = settings
             .store
             .as_deref()
-            .map_or_else(|| paths.served(), |dir| expand(paths, dir));
+            .map_or_else(|| paths.served(), |dir| store_dir(paths, dir));
         eprintln!(
             "{} serving on {}, store {}",
             stamp(),
@@ -1998,6 +2234,88 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn opening_never_offers_a_machine_let_go() {
+        let key = || {
+            crate::age::Identity::generate()
+                .expect("a key")
+                .recipient()
+                .to_bech32()
+        };
+        let (gone, asking) = (key(), key());
+        let mut doc = crate::text::Document::new_vault("m22", &key());
+        doc.add_code_only(&gone).expect("let go");
+        let request = |recipient: &str, host: &str| crate::client::Request {
+            recipient: recipient.to_owned(),
+            host: host.to_owned(),
+            code: String::new(),
+            at: None,
+            proof: None,
+        };
+        // Only the machine let go is asking: it is named and marked, and nothing is asked.
+        let mut said = Vec::new();
+        unix::admit_on_opening(
+            &mut doc,
+            vec![request(&gone, "laptop")],
+            &mut |line| said.push(line),
+            &mut |_| panic!("asked to let in a machine let go"),
+        )
+        .expect("named");
+        assert!(
+            said.iter()
+                .any(|line| line.contains("laptop") && line.contains("code only")),
+            "{said:?}"
+        );
+        // Beside one that may be let in, one yes lets in that one only.
+        unix::admit_on_opening(
+            &mut doc,
+            vec![request(&gone, "laptop"), request(&asking, "m7")],
+            &mut |_| {},
+            &mut |_| true,
+        )
+        .expect("let in");
+        let members: Vec<String> = doc.machines().into_iter().map(|m| m.recipient).collect();
+        assert!(
+            members.contains(&asking) && !members.contains(&gone),
+            "{members:?}"
+        );
+        assert_eq!(doc.code_only(), [gone]);
+
+        // The queue lists a key once per address. One machine that asked from two is offered
+        // and let in once; a key listed under two names is left to the person, who names it.
+        let (moved, doubled) = (key(), key());
+        let mut asked = Vec::new();
+        unix::admit_on_opening(
+            &mut doc,
+            vec![
+                request(&moved, "m8"),
+                request(&doubled, "m9"),
+                request(&moved, "m8"),
+                request(&doubled, "evil"),
+            ],
+            &mut |line| said.push(line),
+            &mut |question| {
+                asked.push(question.to_owned());
+                true
+            },
+        )
+        .expect("one yes lets in the machine that asked from two addresses");
+        assert!(asked[0].starts_with("Let these 1 in now?"), "{asked:?}");
+        let machines = doc.machines();
+        assert_eq!(
+            machines.iter().filter(|m| m.recipient == moved).count(),
+            1,
+            "{machines:?}"
+        );
+        assert!(!machines.iter().any(|m| m.recipient == doubled));
+        assert!(
+            said.iter()
+                .any(|line| line.contains("evil") && line.contains(&doubled)),
+            "{said:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn setting_an_entry_again_keeps_how_it_fills_unless_told() {
         let everyone = crate::text::Audience::Everyone;
         let anchor_of = |doc: &crate::text::Document, name: &str| {
@@ -2083,6 +2401,53 @@ mod tests {
         unix::set_in(&doc, &everyone, "plain", b"v", &Fill::default()).expect("a plain entry");
     }
 
+    /// Anyone on the LAN can read a waiting machine's key from the listing and queue it from
+    /// its own address under a name of its choosing, beside the machine's line. Such a key is
+    /// approved neither by its code nor by `--all`, whichever line sorts or was queued first:
+    /// the person names the machine. One name asked from two addresses is one machine.
+    #[cfg(unix)]
+    #[test]
+    fn approve_takes_no_key_listed_under_two_names() {
+        let (code_k, code_j) = ("aaaa-bbbb-cccc-dddd", "eeee-ffff-gggg-hhhh");
+        let request = |recipient: &str, host: &str, code: &str| crate::client::Request {
+            recipient: recipient.into(),
+            host: host.into(),
+            code: code.into(),
+            at: None,
+            proof: None,
+        };
+        let pair = |k: &str, h: &str| (k.to_string(), h.to_string());
+        let pending = [
+            request("age1k", "m30", code_k),
+            request("age1j", "m31", code_j),
+            request("age1k", "a", code_k),
+        ];
+        assert_eq!(
+            unix::from_queue(&pending, &[code_j.into()], false),
+            Ok(vec![pair("age1j", "m31")])
+        );
+        for (which, all) in [(vec![code_k.to_string()], false), (Vec::new(), true)] {
+            let refused = unix::from_queue(&pending, &which, all).expect_err("two names");
+            assert!(
+                refused.0.contains("(a, m30)") && refused.0.contains("approve age1k --name"),
+                "{refused:?}"
+            );
+        }
+        let moved = [
+            request("age1k", "m30", code_k),
+            request("age1k", "m30", code_k),
+        ];
+        assert_eq!(
+            unix::from_queue(&moved, &[], true),
+            Ok(vec![pair("age1k", "m30")])
+        );
+        assert_eq!(
+            unix::from_queue(&moved, &[code_k.into(), code_k.into()], false),
+            Ok(vec![pair("age1k", "m30")])
+        );
+        assert!(unix::from_queue(&moved, &[code_j.into()], false).is_err());
+    }
+
     #[test]
     fn approve_takes_codes_never_host_names() {
         let code = "abcd-ef23-ghij-k234";
@@ -2158,9 +2523,72 @@ mod tests {
             format!("serve --pin alab={key} --pin alab={key}"),
             "serve --advertise Bad_Name".to_string(),
             "server on --hold 0".to_string(),
+            "serve --advertise lab-vault --no-advertise".to_string(),
         ] {
             assert!(parse(&words(&refused)).is_err(), "{refused}");
         }
+        for accepted in [
+            "serve --store /srv/vaults",
+            "server on --store ~/vaults",
+            "server on --store vault-store",
+        ] {
+            assert!(parse(&words(accepted)).is_ok(), "{accepted}");
+        }
+    }
+
+    /// A relative `--store` is under the home directory whether launchd (from `/`), systemd
+    /// (from the home directory) or a person in another directory runs the server.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_store_is_under_the_home_directory() {
+        let paths = crate::client::Paths::for_home(std::path::Path::new("/Users//someone"));
+        for (store, dir) in [
+            ("vault-store", "/Users//someone/vault-store"),
+            ("~/vaults", "/Users//someone/vaults"),
+            ("/srv/vaults", "/srv/vaults"),
+        ] {
+            assert_eq!(unix::store_dir(&paths, store), std::path::Path::new(dir));
+        }
+    }
+
+    /// A server set up with no flags answers the default vault's URL: on macOS it advertises
+    /// that name unless told another, or none, and only on every address at the URL's port,
+    /// so a server hand-run on loopback or another port takes no Mac's name.
+    #[test]
+    fn serve_advertises_the_default_vaults_name_unless_told() {
+        let advertised = |line: &str| {
+            let f = flags(&words(line), SERVE_VALUED, SERVE_SWITCHES).expect("flags");
+            serve_settings(&f).expect("settings").advertise
+        };
+        let default = cfg!(target_os = "macos").then(|| crate::alab_advertised().to_string());
+        assert_eq!(advertised(""), default);
+        assert_eq!(advertised("--listen 0.0.0.0:7484"), default);
+        assert_eq!(advertised("--listen [::]:7484"), default);
+        for elsewhere in [
+            "--listen 127.0.0.1:7485",
+            "--listen 127.0.0.1:7484",
+            "--listen 0.0.0.0:7485",
+            "--listen [::1]:7484",
+        ] {
+            assert_eq!(advertised(elsewhere), None, "{elsewhere}");
+        }
+        assert_eq!(
+            advertised("--listen 127.0.0.1:7485 --advertise lab-vault"),
+            Some("lab-vault".into())
+        );
+        assert_eq!(
+            advertised("--advertise lab-vault"),
+            Some("lab-vault".into())
+        );
+        assert_eq!(advertised("--no-advertise"), None);
+        assert_eq!(
+            parse(&words("server on --no-advertise")),
+            Ok(Command::Server {
+                action: Action::On,
+                program: None,
+                serve: vec!["--no-advertise".into()],
+            })
+        );
     }
 
     #[cfg(unix)]
@@ -2270,6 +2698,324 @@ mod tests {
         assert_eq!(
             unix::retype(&Source::Path("/v/x.vault".into()), None, false),
             None
+        );
+    }
+
+    /// An admin of a new vault at a path under `root`.
+    #[cfg(unix)]
+    fn admin_of_a_path_vault(root: &std::path::Path) -> crate::client::Paths {
+        let shared = root.join("shared").join("team.vault");
+        std::fs::create_dir_all(shared.parent().expect("parent")).expect("dir");
+        let admin = crate::client::Paths::for_home(&root.join("ma"));
+        crate::client::create(&admin, shared.to_str().expect("utf-8"), None, Some("ma"))
+            .expect("create");
+        admin
+    }
+
+    /// The edit directories left under `paths`.
+    #[cfg(unix)]
+    fn edit_dirs(paths: &crate::client::Paths) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(&paths.dir)
+            .expect("state directory")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("edit-"))
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_editor_that_fails_on_the_published_text_leaves_no_draft() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let admin = admin_of_a_path_vault(root.path());
+        let nothing_asked = |_: &str| -> Option<String> { panic!("nothing to ask") };
+        let error = unix::edit_with(&admin, &mut |_: &std::path::Path| Ok(false), &nothing_asked)
+            .expect_err("the editor failed");
+        assert!(error.0.contains("nothing published"), "{error}");
+        let error = unix::edit_with(
+            &admin,
+            &mut |_: &std::path::Path| Err(crate::Error::new("synthetic-editor: not found")),
+            &nothing_asked,
+        )
+        .expect_err("the editor did not start");
+        assert!(error.0.contains("synthetic-editor"), "{error}");
+        assert_eq!(edit_dirs(&admin), Vec::<std::path::PathBuf>::new());
+        // A draft the failed editor changed may be the only copy of new work: it stays.
+        let error = unix::edit_with(
+            &admin,
+            &mut |file: &std::path::Path| {
+                let mut draft = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(file)
+                    .expect("draft");
+                std::io::Write::write_all(&mut draft, b"# new work\n").expect("write");
+                Ok(false)
+            },
+            &nothing_asked,
+        )
+        .expect_err("the editor failed");
+        assert!(error.0.contains("the draft is kept"), "{error}");
+        assert_eq!(edit_dirs(&admin).len(), 1);
+    }
+
+    /// An edit on a new vault at a path under `root`: the person adds `note` while another
+    /// admin lets `mb` in and sets `other`, so the save is refused; reopened, the person quits
+    /// without saving and answers `publish` when asked to publish the draft as it is. The
+    /// admin, the seq the edit began on, the exit code and the prompts asked.
+    #[cfg(unix)]
+    fn edit_reopened_unchanged(
+        root: &std::path::Path,
+        publish: &str,
+    ) -> (crate::client::Paths, u64, ExitCode, Vec<String>) {
+        let admin = admin_of_a_path_vault(root);
+        let began = crate::client::admin_open(&admin).expect("open").seq();
+        let mut opened = 0;
+        let asked = std::cell::RefCell::new(Vec::new());
+        let code = unix::edit_with(
+            &admin,
+            &mut |file: &std::path::Path| {
+                opened += 1;
+                if opened == 1 {
+                    let mut draft = std::fs::read_to_string(file).expect("draft");
+                    draft.push_str("[everyone]\nnote=synthetic-note\n");
+                    std::fs::write(file, draft).expect("save");
+                    let other = crate::client::admin_open(&admin).expect("open");
+                    let mut doc = other.doc.clone();
+                    let mb = crate::age::Identity::generate().expect("identity");
+                    doc.add_machine("mb", &mb.recipient().to_bech32())
+                        .expect("add");
+                    doc.set_entry(
+                        &crate::text::Audience::Everyone,
+                        "other",
+                        b"synthetic-other",
+                    )
+                    .expect("set");
+                    crate::client::admin_publish(&admin, &other, &doc).expect("publish");
+                }
+                // Reopened after the warning, the person quits without saving.
+                Ok(true)
+            },
+            &|prompt: &str| {
+                asked.borrow_mut().push(prompt.to_string());
+                Some(
+                    if prompt.contains("as it is") {
+                        publish
+                    } else {
+                        ""
+                    }
+                    .to_string(),
+                )
+            },
+        )
+        .expect("edit");
+        assert_eq!(opened, 2, "the editor reopened once");
+        (admin, began, code, asked.into_inner())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_draft_reopened_unchanged_on_a_vault_that_moved_publishes_only_when_the_person_says_so() {
+        let everyone = crate::text::Audience::Everyone;
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        // Quitting the reopened editor and pressing return publishes nothing: the draft is
+        // kept, and only the other admin's version is the vault's.
+        let (admin, began, code, asked) = edit_reopened_unchanged(&root.path().join("a"), "");
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(asked.iter().any(|p| p.contains("as it is")), "{asked:?}");
+        let after = crate::client::admin_open(&admin).expect("open");
+        assert_eq!(after.seq(), began + 1, "only the other admin's version");
+        assert!(after.doc.entry(&everyone, "other").is_some());
+        assert!(after.doc.entry(&everyone, "note").is_none());
+        assert_eq!(edit_dirs(&admin).len(), 1, "the draft is kept");
+        // Told to, the same draft publishes over that version with no change to make up: its
+        // text replaces the version's entries, and the machine it let in is kept.
+        let (admin, began, code, _) = edit_reopened_unchanged(&root.path().join("b"), "y");
+        assert_eq!(code, ExitCode::SUCCESS);
+        let after = crate::client::admin_open(&admin).expect("open");
+        assert_eq!(after.seq(), began + 2, "the edit went on top");
+        assert!(after.doc.entry(&everyone, "note").is_some());
+        assert!(after.doc.entry(&everyone, "other").is_none());
+        assert!(after.doc.machines().iter().any(|m| m.name == "mb"));
+        assert_eq!(edit_dirs(&admin), Vec::<std::path::PathBuf>::new());
+    }
+
+    /// A key approved with `--name` gets that name or none: a name that is not a machine name
+    /// is a usage error, never a generic `machine` in its place.
+    #[test]
+    fn a_key_is_never_approved_under_a_name_it_was_not_given() {
+        // A code-shaped name would be a code for `admins`, `revoke` and `set --for`.
+        for refused in [
+            "M9",
+            "join",
+            "everyone",
+            "-m9",
+            "m9 extra",
+            "abcd-efgh-ijkm-npqr",
+        ] {
+            let line = vec![
+                "approve".to_string(),
+                "age1xyz".to_string(),
+                "--name".to_string(),
+                refused.to_string(),
+            ];
+            let why = parse(&line).expect_err(refused);
+            assert!(why.contains("--name"), "{refused}: {why}");
+        }
+        assert!(parse(&words("approve age1xyz --name m9")).is_ok());
+    }
+
+    /// A value piped to `set` loses its line end only when it is one line of text; a binary
+    /// value that happens to end in LF (or CR LF) keeps every byte, as `--file` keeps it.
+    #[cfg(unix)]
+    #[test]
+    fn a_piped_value_loses_its_line_end_only_when_it_is_one_line_of_text() {
+        let trimmed = |bytes: &[u8]| {
+            let mut bytes = bytes.to_vec();
+            unix::trim_piped_line(&mut bytes);
+            bytes
+        };
+        assert_eq!(trimmed(b"token\n"), b"token");
+        assert_eq!(trimmed(b"token\r\n"), b"token");
+        assert_eq!(trimmed("t\u{f6}ken\n".as_bytes()), "t\u{f6}ken".as_bytes());
+        for kept in [
+            &b"two\nlines\n"[..],
+            b"no line end",
+            b"\xff\x00\x41\n",
+            b"\x80\x0d\x0a",
+            b"\x9f\x13\xc0\xfe\x0a",
+            b"a\x00b\n",
+            b"a\rb\n",
+        ] {
+            assert_eq!(trimmed(kept), kept, "{kept:?}");
+        }
+    }
+
+    /// `revoke` and `admins remove` name everything the machine could read: an admin read the
+    /// whole text in the admin locker, every host section's entries too; any machine read
+    /// `[everyone]`'s locker beside its own sections', so an `[everyone]` value its section
+    /// overrides is named as well.
+    #[cfg(unix)]
+    #[test]
+    fn letting_a_machine_go_names_everything_it_could_read() {
+        use crate::text::{Audience, Document};
+        let key = || {
+            crate::age::Identity::generate()
+                .expect("a key")
+                .recipient()
+                .to_bech32()
+        };
+        let mut doc = Document::new_vault("m22", &key());
+        for name in ["m5", "m3", "build"] {
+            doc.add_machine(name, &key()).expect("machine");
+        }
+        doc.add_admin("m5").expect("admin");
+        let hosts = |name: &str| Audience::Hosts(vec![name.to_string()]);
+        for (audience, name) in [
+            (Audience::Everyone, "gh_token"),
+            (Audience::Everyone, "npm_token"),
+            (hosts("build"), "deploy_key"),
+            (hosts("m3"), "signing_key"),
+            (hosts("m3"), "npm_token"),
+        ] {
+            doc.set_entry(&audience, name, b"synthetic").expect("set");
+        }
+        let admin = unix::exposure(&doc, "m5").expect("an admin read everything");
+        assert!(
+            admin.contains(
+                "m5 was an admin, so it could read every secret (5: gh_token, npm_token, deploy_key [build], signing_key [m3], npm_token [m3])"
+            ),
+            "{admin}"
+        );
+        let m3 = unix::exposure(&doc, "m3").expect("m3 read its own and everyone's");
+        assert!(
+            m3.contains(
+                "m3 could read 4 secrets (gh_token, npm_token, signing_key [m3], npm_token [m3])"
+            ),
+            "{m3}"
+        );
+        assert!(!m3.contains("deploy_key"), "{m3}");
+        assert_eq!(
+            unix::exposure(&Document::new_vault("m22", &key()), "m22"),
+            None,
+            "nothing to read, nothing to rotate"
+        );
+    }
+
+    /// A JOIN CODE TYPED FOR A MACHINE (`revoke`, `set|unset --for`, as `admins`) reaches the
+    /// machine whose key has it, never one an older approver let in under that code as its
+    /// name; a name passes as typed, and a code no key has is refused, even when a machine is
+    /// so named.
+    #[cfg(unix)]
+    #[test]
+    fn a_code_typed_for_a_machine_reaches_the_key_that_has_it() {
+        use crate::text::Document;
+        let key = || crate::age::Identity::generate().expect("a key").recipient();
+        let mac = key();
+        let code = crate::client::join_code(&mac);
+        let mut doc = Document::new_vault("m22", &key().to_bech32());
+        doc.add_machine("mb", &mac.to_bech32()).expect("machine");
+        let typed = [code.clone(), code.to_uppercase(), "m3".to_string()];
+        assert_eq!(
+            unix::machines_named(&doc, &typed).expect("named"),
+            ["mb", "mb", "m3"]
+        );
+        assert!(unix::machines_named(&doc, &["aaaa-bbbb-cccc-dddd".to_string()]).is_err());
+
+        // A machine an older approver let in under another's code as its name: the code is
+        // refused, naming both, since either may be meant.
+        let mut both = doc.clone();
+        let stranger = key();
+        both.add_machine(&code, &stranger.to_bech32())
+            .expect("a code is a valid machine name in a text");
+        let error = unix::machines_named(&both, std::slice::from_ref(&code))
+            .expect_err("either machine may be meant");
+        assert!(
+            error.0.contains("mb") && error.0.contains(&stranger.to_bech32()),
+            "{error}"
+        );
+        // Named with a code no key has, a machine is not reached by it (meant for a machine
+        // not yet in, it would reach a stranger): the refusal gives its own code, which is.
+        let unkeyed = "aaaa-bbbb-cccc-dddd".to_string();
+        let named = key();
+        doc.add_machine(&unkeyed, &named.to_bech32())
+            .expect("machine");
+        let error = unix::machines_named(&doc, std::slice::from_ref(&unkeyed))
+            .expect_err("a code no key has");
+        let own = crate::client::join_code(&named);
+        assert!(error.0.contains(&own), "{error}");
+        assert_eq!(
+            unix::machines_named(&doc, &[own]).expect("its own code"),
+            [unkeyed]
+        );
+    }
+
+    /// `status` of a machine of a signed vault names it by its code: the name it asked for
+    /// may be another machine's in the vault. A plain text file is read under that name.
+    #[cfg(unix)]
+    #[test]
+    fn status_names_a_machine_of_a_signed_vault_by_its_code() {
+        use crate::transport::Source;
+        let config = |signer: Option<[u8; 32]>| crate::client::Config {
+            source: Source::Path("/v/team.vault".into()),
+            name: "team".to_string(),
+            signer,
+            followed: Vec::new(),
+            host: "m5".to_string(),
+        };
+        let code = "abcd-efgh-ijkm-npqr";
+        let signed = unix::machine_line(Some(&config(Some([7; 32]))), "age1k", code);
+        assert_eq!(
+            signed,
+            format!("machine: code {code}, key age1k, asked to join as m5")
+        );
+        let plain = unix::machine_line(Some(&config(None)), "age1k", code);
+        assert_eq!(plain, format!("machine: m5, code {code}, key age1k"));
+        assert_eq!(
+            unix::machine_line(None, "age1k", code),
+            format!("machine: code {code}, key age1k")
         );
     }
 }

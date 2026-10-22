@@ -44,12 +44,15 @@
 //!   only moves); a post landed nowhere with its `why=`; a hold's `origin=
 //!   hold_origin=` and its reason at the content tier;
 //! - `mark - meta field=<f> value=<v>` by its writer, from the one
-//!   `meta-change` writer (`SessionTimeline::record_meta_change`) — for
-//!   `attention`, whose text can hold a box's command or a question's words
-//!   (the supervisor's escalation), `fp=<16 hex>` in place of the value,
-//!   never the text — when the field's value moved from what this log last
-//!   said of it (a successor restoring a carried value says nothing), and
-//!   the `need`/`clear word=escalated src=meta` it derives `by=aterm`;
+//!   `meta-change` writer (`SessionTimeline::record_meta_change`), one for
+//!   every row (phase 6, 6F-8, ruling U13) — for `attention`, whose text
+//!   can hold a box's command or a question's words (the supervisor's
+//!   escalation), `fp=<16 hex>` in place of the value, the text beside it
+//!   at the content tier only (`attn_text=`: RAM, never journaled, carried
+//!   or published); the Autopilot pair's timer `land_at=`; and `carried=1`
+//!   where the value is what this log last said of the field (a successor
+//!   restoring a carried value: no news) — and the `need`/`clear
+//!   word=escalated src=meta` it derives `by=aterm`;
 //! - `mark - story word=<told verb>` by its teller, never its text;
 //! - `mark - usage h5=<pct> d7=<pct>` `by=vendor src=aterm`, each usage tap
 //!   reading the harness worker takes while `[harness] usage_tap` is on;
@@ -74,6 +77,19 @@
 //!   next front's, and no program mark ever falls to the deepest open node.
 //!   The log keeps [`aterm_slog::program_share`] of them a run (64, T6); the
 //!   fold never reads them and `brief` prints none;
+//! - `mark - shown [need=<w> sev=<stuck|decide>] [held=<w>] [coalesced=<n>]
+//!   by=aterm src=aterm conf=strong`, each move of what the person is shown
+//!   of the session's need (phase 6, 6F-9; rulings U26, U44): KEYED ON THE
+//!   PRINTED TUPLE ([`ShownTuple`]: `status needs=`, its severity, and
+//!   `hold_by=`; each absent for none), never on the published verdict's
+//!   other facts (`waiting`, `recheck_unix`), from the one verdict writer
+//!   (`SessionTimeline::set_need`); a per-session bucket like the program
+//!   marks' coalesces a flapping verdict to its newest tuple, written once a
+//!   token frees (the next move or status sweep, [`SessionLog::shown_tick`]),
+//!   before the session closes and before an update's carry. Local (no bus
+//!   class), journaled; `brief` counts them (`shown <n>`, a count line shed
+//!   first), and the carry holds the last tuple so a successor does not
+//!   restate it;
 //! - THE RING-ONLY FACTS (phase 6, 6F-5), each in the hold that records its
 //!   ring row: `mark - state state=<w>` each registry move
 //!   ([`SessionLog::observe_state`]; the close is the session's close
@@ -103,6 +119,49 @@ pub(crate) const PROGRAM_BURST: u64 = 20;
 pub(crate) const PROGRAM_REFILL_MS: u64 = 1_000;
 /// A full bucket, in thousandths of a token.
 const PROGRAM_FULL_MILLI: u64 = PROGRAM_BURST * 1_000;
+
+/// A THROTTLED MARK CLASS'S BUCKET (6F-4, 6F-9; ruling U44): [`PROGRAM_BURST`]
+/// tokens, refilled one each [`PROGRAM_REFILL_MS`], held in thousandths as
+/// of `at` (monotonic ms). A program's run keeps one ([`ProgramMarks`]), and
+/// a session's shown marks one ([`ShownMarks`]); each coalesces what finds
+/// it empty to its newest value, never dropping that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MarkBucket {
+    milli: u64,
+    at: u64,
+}
+
+impl Default for MarkBucket {
+    fn default() -> Self {
+        MarkBucket::full(0)
+    }
+}
+
+impl MarkBucket {
+    /// A full bucket as of `at` (monotonic ms).
+    const fn full(at: u64) -> Self {
+        MarkBucket {
+            milli: PROGRAM_FULL_MILLI,
+            at,
+        }
+    }
+
+    /// Refill to `now` (monotonic ms; a clock read behind the last is the
+    /// last), then spend a whole token, or spend one anyway (`force`: a
+    /// close or a carry, which never loses the newest value). Whether it
+    /// was spent.
+    fn spend(&mut self, now: u64, force: bool) -> bool {
+        let now = now.max(self.at);
+        let earned = (now - self.at).saturating_mul(1_000) / PROGRAM_REFILL_MS;
+        self.milli = self.milli.saturating_add(earned).min(PROGRAM_FULL_MILLI);
+        self.at = now;
+        if self.milli < 1_000 && !force {
+            return false;
+        }
+        self.milli = self.milli.saturating_sub(1_000);
+        true
+    }
+}
 
 /// What the program in front says about itself, as its mark words it: the
 /// `state` word (`none` once the shown report went away) and the `ask` word
@@ -137,11 +196,72 @@ impl ProgramWords {
 pub(crate) struct ProgramMarks {
     /// The run the bucket is the share of (`None`: no move yet).
     run: Option<Node>,
-    /// Its tokens, in thousandths, as of `at` (monotonic ms).
-    milli: u64,
-    at: u64,
+    /// Its tokens.
+    bucket: MarkBucket,
     /// The newest move not yet written, and how many states it replaced.
     pending: Option<(ProgramWords, u64)>,
+}
+
+/// WHAT THE PERSON IS SHOWN of a session's need (phase 6, 6F-9; ruling
+/// U26): the printed tuple, as its `shown` mark words it — the need's word
+/// (`status needs=`), how it is shown (its severity) and whose hold stands
+/// (`hold_by=`), each `None` for none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ShownTuple {
+    pub(crate) need: Option<&'static str>,
+    pub(crate) sev: Option<&'static str>,
+    pub(crate) held: Option<&'static str>,
+}
+
+impl ShownTuple {
+    /// The tuple verdict `v` prints; its `waiting` and `recheck_unix` are
+    /// not shown in it.
+    pub(crate) fn of(v: &crate::needs::Verdict) -> Self {
+        ShownTuple {
+            need: v.need.as_ref().map(|n| n.word.word()),
+            sev: v.need.as_ref().map(|n| n.word.severity().word()),
+            held: v.held.map(aterm_types::needs::HoldWord::word),
+        }
+    }
+
+    /// The carry's token (`<need>.<sev>.<held>`, `-` for none).
+    #[cfg(any(unix, test))]
+    fn token(self) -> String {
+        format!(
+            "{}.{}.{}",
+            self.need.unwrap_or("-"),
+            self.sev.unwrap_or("-"),
+            self.held.unwrap_or("-")
+        )
+    }
+
+    /// The tuple a carry's token names, each word one its list holds (`-`:
+    /// none); `None` for a token that does not read.
+    fn read(token: &str) -> Option<Self> {
+        let mut it = token.split('.');
+        let word = |raw: Option<&str>, words: &[&'static str]| match raw? {
+            "-" => Some(None),
+            w => carried_word(words, w).map(Some),
+        };
+        let need = word(it.next(), aterm_slog::vocab::NEED_WORDS)?;
+        let sev = word(it.next(), aterm_slog::vocab::SEV_WORDS)?;
+        let held = word(it.next(), aterm_slog::vocab::HELD_WORDS)?;
+        it.next()
+            .is_none()
+            .then_some(ShownTuple { need, sev, held })
+    }
+}
+
+/// THE SHOWN MARKS' BUCKET (6F-9; rulings U26, U44): the tuple last taken
+/// (written, or pending: the dedupe), the session's tokens, and the newest
+/// tuple not yet written with how many it replaced. A move that finds no
+/// token replaces the pending one, counted, and the pending tuple is
+/// written as soon as a token frees, so the newest is never lost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ShownMarks {
+    last: ShownTuple,
+    bucket: MarkBucket,
+    pending: Option<(ShownTuple, u64)>,
 }
 
 /// What the engine says, read under the status sweep's terminal guard
@@ -223,16 +343,21 @@ pub(crate) struct Observed {
     /// The program marks' bucket (this process's: a successor starts a full
     /// one, and the carry writes any pending state first).
     program: ProgramMarks,
+    /// The shown marks' tuple and bucket (6F-9): the tuple crosses an
+    /// update (`obs_shown=`), the bucket is this process's.
+    shown: ShownMarks,
 }
 
 /// The most meta fields [`Observed`] remembers: every user field and the
 /// supervisor's claim (`SUPERVISOR_FIELD`).
 const META_FIELDS_MAX: usize = crate::session_timeline::MetaField::ALL.len() + 1;
 
-/// A meta field whose value is free text that can hold what the log never
-/// stores (a box's command, a question's words, the screen's last line:
-/// the supervisor's escalation): its mark says a fingerprint, never the
-/// text.
+/// A meta field whose value is free text that can hold what must never
+/// leave RAM (a box's command, a question's words, the screen's last line:
+/// the supervisor's escalation): its mark says a fingerprint below the
+/// content tier, and the text only at it (`attn_text=`; phase 6, 6F-8,
+/// ruling U13: "never stored" became "never leaves RAM", the ring's own
+/// exposure).
 const FINGERPRINTED_META: &[&str] = &["attention"];
 
 /// A title's fingerprint, its leading busy-spinner frame left out
@@ -327,6 +452,9 @@ impl Observed {
                 .collect();
             s.push_str(&format!(" meta_fp={}", fields.join(",")));
         }
+        if self.shown.last != ShownTuple::default() {
+            s.push_str(&format!(" obs_shown={}", self.shown.last.token()));
+        }
         s
     }
 
@@ -366,6 +494,9 @@ impl Observed {
                 .take(META_FIELDS_MAX)
                 .collect()
         });
+        self.shown.last = kv("obs_shown")
+            .and_then(|t| ShownTuple::read(&t))
+            .unwrap_or_default();
     }
 
     /// Note that the log says meta field `field` holds the value of
@@ -503,8 +634,7 @@ impl SessionLog {
             self.write_program(at, true);
             self.observed.program = ProgramMarks {
                 run: Some(run),
-                milli: PROGRAM_FULL_MILLI,
-                at: at.mono_ms,
+                bucket: MarkBucket::full(at.mono_ms),
                 pending: None,
             };
         }
@@ -552,14 +682,9 @@ impl SessionLog {
         let Some((words, replaced)) = p.pending else {
             return;
         };
-        let now = at.mono_ms.max(p.at);
-        let earned = (now - p.at).saturating_mul(1_000) / PROGRAM_REFILL_MS;
-        p.milli = p.milli.saturating_add(earned).min(PROGRAM_FULL_MILLI);
-        p.at = now;
-        if p.milli < 1_000 && !force {
+        if !p.bucket.spend(at.mono_ms, force) {
             return;
         }
-        p.milli = p.milli.saturating_sub(1_000);
         p.pending = None;
         let node = open.unwrap_or(Node::SESSION);
         let f = with(Fields::new(), Key::State, Some(Val::Word(words.state)));
@@ -570,6 +695,65 @@ impl SessionLog {
             (replaced > 0).then_some(Val::U(replaced)),
         );
         self.put(Kind::Program, Src::Engine, Conf::Claim, node, f, at);
+    }
+
+    /// `mark - shown [need= sev=] [held=] [coalesced=]`: what the person is
+    /// shown of the session's need moved to `tuple` (the module doc), from
+    /// the one verdict writer
+    /// ([`crate::session_timeline::SessionTimeline::set_need`]), through
+    /// the session's bucket. A publication that moves only what the tuple
+    /// does not print writes nothing.
+    pub(crate) fn observe_shown(&mut self, tuple: ShownTuple, at: Stamp) {
+        let s = &mut self.observed.shown;
+        if s.last == tuple {
+            return;
+        }
+        s.last = tuple;
+        s.pending = Some(match s.pending {
+            Some((_, replaced)) => (tuple, replaced.saturating_add(1)),
+            None => (tuple, 0),
+        });
+        self.write_shown(at, false);
+    }
+
+    /// THE SHOWN BUCKET'S TICK, each status sweep: a pending tuple is
+    /// written once the session's bucket has a token again.
+    pub(crate) fn shown_tick(&mut self, at: Stamp) {
+        self.write_shown(at, false);
+    }
+
+    /// Write the pending shown tuple now, whatever the bucket holds: the
+    /// session closes, or its log is carried across an update.
+    pub(crate) fn flush_shown(&mut self, at: Stamp) {
+        self.write_shown(at, true);
+    }
+
+    /// Refill the bucket to `at`, and write the pending tuple with a token
+    /// (or without one, `force`), on the session, by aterm.
+    fn write_shown(&mut self, at: Stamp, force: bool) {
+        let s = &mut self.observed.shown;
+        let Some((tuple, replaced)) = s.pending else {
+            return;
+        };
+        if !s.bucket.spend(at.mono_ms, force) {
+            return;
+        }
+        s.pending = None;
+        let f = with(Fields::new(), Key::Need, tuple.need.map(Val::Word));
+        let f = with(f, Key::Sev, tuple.sev.map(Val::Word));
+        let f = with(f, Key::Held, tuple.held.map(Val::Word));
+        let f = with(
+            f,
+            Key::Coalesced,
+            (replaced > 0).then_some(Val::U(replaced)),
+        );
+        let _ = self.log.mark(
+            Mark::new(Kind::Shown, Src::Aterm, Conf::Strong)
+                .at(Node::SESSION)
+                .by(aterm_slog::Actor::Aterm)
+                .fields(f),
+            at,
+        );
     }
 
     /// `mark <run> status …`: one published status transition (the status
@@ -713,42 +897,63 @@ impl SessionLog {
 
     /// `mark - cwd cwd=<path>`: the OSC 7 directory the drift flush read
     /// (`SessionTimeline::record_cwd_change`), when it moved; a cleared one
-    /// is the mark with no `cwd=`.
-    pub(crate) fn observe_cwd(&mut self, cwd: Option<&str>, at: Stamp) {
+    /// is the mark with no `cwd=`, and the first read of a session with no
+    /// directory is no news (as a title's is). Returns the directory the
+    /// mark holds (empty: none) when it was written: the text the
+    /// timeline's `cwd-change` row prints, so the row is its record's
+    /// (phase 6, 6F-8, ruling U13), on the record's trigger too — a
+    /// successor that carried the fingerprint restates neither.
+    pub(crate) fn observe_cwd(&mut self, cwd: Option<&str>, at: Stamp) -> Option<String> {
         let cwd = cwd.filter(|c| !c.is_empty());
         let fp = name_fp(cwd);
         if self.observed.cwd == Some(fp) {
-            return;
+            return None;
         }
+        let first = self.observed.cwd.is_none();
         self.observed.cwd = Some(fp);
+        if first && cwd.is_none() {
+            return None;
+        }
         let mut f = Fields::new();
-        if let Some(t) = cwd.and_then(|c| BoundedText::new(Key::Cwd, c)) {
+        let text = cwd.and_then(|c| BoundedText::new(Key::Cwd, c));
+        let held = text
+            .as_ref()
+            .map_or_else(String::new, |t| t.as_str().to_string());
+        if let Some(t) = text {
             let _ = f.set(Key::Cwd, Val::Text(t));
         }
         self.put(Kind::Cwd, Src::Engine, Conf::Exact, Node::SESSION, f, at);
+        Some(held)
     }
 
     /// `mark - title title=<informative title>`: the drift flush's title
     /// ([`crate::tab_label::informative`]) moved, a spinner frame's move
     /// aside ([`title_fp`]). The title is content tier: `log` prints it
     /// only at `tier=content`, and neither the journal nor the carry holds
-    /// it.
-    pub(crate) fn observe_title(&mut self, title: &str, at: Stamp) {
+    /// it. Returns the title the mark holds (empty: cleared) when it was
+    /// written: the `title-change` row's text, which since phase 6 (6F-8,
+    /// ruling U13) follows this mark, its cadence and its words.
+    pub(crate) fn observe_title(&mut self, title: &str, at: Stamp) -> Option<String> {
         let fp = title_fp(title);
         if self.observed.title == Some(fp) {
-            return;
+            return None;
         }
         // The first read of a session with no title is no news.
         let first = self.observed.title.is_none();
         self.observed.title = Some(fp);
         if first && fp == 0 {
-            return;
+            return None;
         }
         let mut f = Fields::new();
-        if let Some(t) = BoundedText::new(Key::Title, title) {
+        let text = BoundedText::new(Key::Title, title);
+        let held = text
+            .as_ref()
+            .map_or_else(String::new, |t| t.as_str().to_string());
+        if let Some(t) = text {
             let _ = f.set(Key::Title, Val::Text(t));
         }
         self.put(Kind::Title, Src::Engine, Conf::Exact, Node::SESSION, f, at);
+        Some(held)
     }
 
     /// `mark - modes n=<k> …`: a foreground handback or a manual reset put
@@ -1027,12 +1232,16 @@ impl SessionLog {
 
     /// `mark - meta field=<f> value=<v>` by its writer (`value=` absent for
     /// a key unset; host tier; `fp=` its fingerprint in place of the text
-    /// for a [`FINGERPRINTED_META`] field), from the one `meta-change`
-    /// writer ([`crate::session_timeline::SessionTimeline::record_meta_change`]),
-    /// when the value moved from what this log last said of the field (a
-    /// carried log's included: a successor's restore of the same value is
-    /// no news, ruling S5), and the `escalated` need that write moves
-    /// (addendum A16):
+    /// for a [`FINGERPRINTED_META`] field, the text beside it at the content
+    /// tier, `attn_text=`, RAM only), from the one `meta-change` writer
+    /// ([`crate::session_timeline::SessionTimeline::record_meta_change`]):
+    /// ONE MARK FOR EVERY ROW (phase 6, 6F-8, ruling U13), with every field
+    /// the row prints (the Autopilot pair's timer, `land_at=`), so the
+    /// `meta-change` row is its record's. A value this log last said of the
+    /// field (a carried log's: a successor restoring what it carried) is
+    /// no news (ruling S5): its mark says `carried=1`, as a carried
+    /// session's `state` and `hold` marks do. And the `escalated` need that
+    /// write moves (addendum A16):
     /// `escalated` is whether the effective attention owner is now the
     /// supervisor's, and on a move it is `need` (raised) or `clear`
     /// (lifted) `word=escalated src=meta conf=strong`, always `by=aterm`,
@@ -1045,30 +1254,39 @@ impl SessionLog {
         escalated: bool,
         at: Stamp,
     ) {
-        let fp = name_fp(change.value);
-        if self.observed.meta_moved(change.field, fp) {
-            let mut f = Fields::new();
-            if let Some(t) = BoundedToken::new(Key::Field, change.field) {
-                let _ = f.set(Key::Field, Val::Tok(t));
-            }
-            if FINGERPRINTED_META.contains(&change.field) {
-                if let Some(id) = change
-                    .value
-                    .and_then(|_| aterm_slog::ShortId::new(&format!("{fp:016x}")))
-                {
+        let land_at = change.land_at.map(|ms| ms.div_euclid(1000));
+        // The timer is the pair's: a move of it alone is a move.
+        let fp = match land_at {
+            None => name_fp(change.value),
+            Some(s) => name_fp(Some(&format!("{}\u{0}{s}", change.value.unwrap_or("")))),
+        };
+        let moved = self.observed.meta_moved(change.field, fp);
+        let mut f = Fields::new();
+        if let Some(t) = BoundedToken::new(Key::Field, change.field) {
+            let _ = f.set(Key::Field, Val::Tok(t));
+        }
+        if FINGERPRINTED_META.contains(&change.field) {
+            if let Some(v) = change.value {
+                let shown = name_fp(Some(v));
+                if let Some(id) = aterm_slog::ShortId::new(&format!("{shown:016x}")) {
                     let _ = f.set(Key::Fp, Val::Id(id));
                 }
-            } else if let Some(t) = change.value.and_then(|v| BoundedText::new(Key::Value, v)) {
-                let _ = f.set(Key::Value, Val::Text(t));
+                if let Some(t) = BoundedText::new(Key::AttnText, v) {
+                    let _ = f.set(Key::AttnText, Val::Text(t));
+                }
             }
-            let _ = self.log.mark(
-                Mark::new(Kind::Meta, Src::Meta, Conf::Exact)
-                    .at(Node::SESSION)
-                    .by(change.by)
-                    .fields(f),
-                at,
-            );
+        } else if let Some(t) = change.value.and_then(|v| BoundedText::new(Key::Value, v)) {
+            let _ = f.set(Key::Value, Val::Text(t));
         }
+        let f = with(f, Key::LandAt, land_at.map(Val::I));
+        let f = with(f, Key::Carried, (!moved).then_some(Val::U(1)));
+        let _ = self.log.mark(
+            Mark::new(Kind::Meta, Src::Meta, Conf::Exact)
+                .at(Node::SESSION)
+                .by(change.by)
+                .fields(f),
+            at,
+        );
         // The first write to a session that is not escalated is no news.
         let was = self.observed.escalated.replace(escalated).unwrap_or(false);
         if was == escalated {
@@ -1250,11 +1468,15 @@ mod tests;
 
 #[cfg(test)]
 #[path = "session_log_overlap_tests.rs"]
-mod overlap_tests;
+pub(crate) mod overlap_tests;
 
 #[cfg(test)]
 #[path = "session_log_program_tests.rs"]
 mod program_tests;
+
+#[cfg(test)]
+#[path = "session_log_shown_tests.rs"]
+mod shown_tests;
 
 #[cfg(test)]
 #[path = "session_log_ring_facts_tests.rs"]

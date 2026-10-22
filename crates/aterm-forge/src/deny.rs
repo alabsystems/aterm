@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `[OB-18]`: `deny.toml`'s `[bans] deny` list and its `[sources]` policy, held over each
-//! cell's resolved graph.
+//! `[OB-18]`: `deny.toml`'s `[bans] deny` list and its `[sources]` policy,
+//! held over each cell's RESOLVED graph.
 //!
-//! A ban is cargo-deny's: a package `name`, an optional version requirement (`"<0.17.14"`), and
-//! optional `wrappers`, the only packages allowed to depend on it directly. A resolved package
-//! the ban matches fails unless every parent it has in the graph is a wrapper. A source is
-//! judged from the annotation cargo prints beside a package: none for crates.io, a directory for
-//! a path package (the workspace and its `[patch]` forks); anything else (a git URL, another
-//! registry) is a source `deny.toml` does not allow unless `[sources] allow-git` names its
-//! prefix.
+//! A ban is cargo-deny's: a package `name`, an optional version requirement
+//! (`"<0.17.14"`), and optional `wrappers`, the only packages allowed to
+//! depend on it directly. A resolved package the ban matches fails unless
+//! every parent it has in the graph is a wrapper. A source is judged from the
+//! annotation cargo prints beside a package: none for crates.io, a directory
+//! for a path package (the workspace and its `[patch]` forks), anything else
+//! (a git URL, another registry) is a source `deny.toml` does not allow.
 //!
-//! Resolution sees every crate whatever its name, so a ban cannot be dodged by a rename, a
-//! dotted key or a `package =` alias in a manifest.
+//! Resolution sees every crate whatever its name, so a ban here cannot be
+//! dodged by a rename, a dotted key or a `package =` alias in a manifest.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

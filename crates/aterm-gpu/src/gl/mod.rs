@@ -62,6 +62,40 @@ pub(crate) use canvas::GlCanvasSurface as WindowSurface;
 #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
 pub(crate) use surface::GlWindowSurface as WindowSurface;
 
+/// A failed GL post and its frontend disposition. Only a window bind that has
+/// not reached the device-loss threshold may retry; other GL failures keep
+/// their validation disposition (a latched loss is recovered before retrying).
+#[cfg(any(target_arch = "wasm32", not(wgpu_arm)))]
+#[derive(Debug)]
+pub(crate) struct GlPresentError {
+    pub(crate) kind: crate::SurfacePresentFailure,
+    pub(crate) detail: String,
+}
+
+#[cfg(any(target_arch = "wasm32", not(wgpu_arm)))]
+impl From<String> for GlPresentError {
+    fn from(detail: String) -> Self {
+        Self {
+            kind: crate::SurfacePresentFailure::Validation,
+            detail,
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", not(wgpu_arm)))]
+impl From<&str> for GlPresentError {
+    fn from(detail: &str) -> Self {
+        detail.to_owned().into()
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", not(wgpu_arm)))]
+impl std::fmt::Display for GlPresentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
 /// A headless device for a GL test; a machine without EGL or a GLES 3 driver
 /// could not run the test.
 #[cfg(all(test, not(target_arch = "wasm32")))]

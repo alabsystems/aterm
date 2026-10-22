@@ -15,16 +15,11 @@
 //! [`MenuAction`] enum and a no-op [`install`] still exist so the workspace builds
 //! everywhere and `Wake::MenuAction { action, mark }` is a valid variant on every target.
 
-// macOS-only menu bar: off macOS `install` is a no-op stub, and the helpers
-// only the AppKit menu reads are gated to macOS (and the tests).
-
-/// Pure arbitration behind AppKit's synchronous `applicationShouldTerminate:`
-/// callback. AppKit is answered immediately, while the real quit decision is
-/// deferred onto the event loop where `App` owns document durability. A stable
-/// generation makes delayed/duplicate callbacks harmless. Every answer names
-/// the generation it belongs to — the new one, the one still pending, or the
-/// one whose quit is already under way — so a system quit is noted against the
-/// quit it will actually ride ([`crate::system_quit`]).
+/// Pure arbitration behind AppKit's synchronous `applicationShouldTerminate:`: AppKit is
+/// answered at once and the quit decision runs later on the event loop, where `App` owns
+/// document durability. Every answer names its generation (new, still pending, or already
+/// exiting), so delayed or duplicate callbacks are harmless and a system quit is noted against
+/// the quit it rides ([`crate::system_quit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) enum NativeTerminateDecision {
@@ -700,9 +695,9 @@ pub(crate) fn retired_invoke_name(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Commands whose implementation requires a live terminal leaf. Native apps are
-/// currently whole-tab surfaces, so advertising these while one is active would
-/// promise a split/session operation the host cannot perform.
+/// Commands that need a live terminal leaf: they act on the focused session or its metadata.
+/// A native app is a whole-tab surface with no session, so these grey out over one. The
+/// connection map, the fabric commands and the identity spawns are instance-wide and not listed.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
@@ -2653,10 +2648,10 @@ pub(crate) const MENU_MODEL: &[MenuSection] = &[
     },
 ];
 
-/// Serialise [`MENU_MODEL`] to the `chrome` verb's menu lines — `menu "<title>": a, b, …`
-/// of the non-separator item labels — byte-matching the macOS live-`NSMenu` reader in
-/// `app_introspect::read_native_chrome`, so the cross-platform (off-macOS) `chrome`
-/// reports the SAME logical menu the macOS bar shows.
+/// Serialise [`MENU_MODEL`] to the `chrome` verb's menu lines (`menu "<title>": a, b, …`, the
+/// non-separator labels), byte-matching the macOS live-`NSMenu` reader
+/// (`app_introspect::read_native_chrome`), so off-macOS `chrome` reports the menu the macOS
+/// bar shows.
 ///
 /// A submenu prints twice, as both readers do: `<label> ▸` in its parent's line, then its own
 /// line titled `"<parent> ▸ <label>"`. The Version menu's first row is dynamic: `apply_row` is
@@ -2822,11 +2817,8 @@ pub(crate) fn choose_local_image(title: &str, prompt: &str) -> Option<std::path:
     crate::file_picker_win::choose_image(title, prompt)
 }
 
-/// No portable native picker is linked on the REMAINING targets (Linux). The
-/// global action remains visible in the cross-platform command palette, but
-/// acquires no filesystem authority there — and every surface that would spend
-/// one asks [`local_file_picker_available`] first, so the row greys out instead
-/// of accepting a dead click.
+/// No native picker is linked on the remaining targets (Linux): the palette row stays visible
+/// but greys, since every surface asks [`local_file_picker_available`] first.
 #[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn choose_local_file(_title: &str, _prompt: &str) -> Option<std::path::PathBuf> {
     None
@@ -3216,15 +3208,10 @@ mod macos {
         }
     }
 
-    /// Build aterm's menu bar and install it as the shared application's main
-    /// menu. Returns the retained action [`MenuTarget`] for the caller to keep
-    /// alive (AppKit holds menu-item targets only weakly). Called from `resumed`
-    /// after the window exists and only when NOT headless.
-    ///
-    /// Best-effort: if we are somehow off the main thread (`MainThread::new`
-    /// is `None`) the menu is simply not installed — never a panic. The winit
-    /// event loop always runs `resumed` on the main thread, so in practice the
-    /// marker is always present.
+    /// Build aterm's menu bar and install it as the shared application's main menu, returning
+    /// the retained [`MenuTarget`] for the caller to keep (AppKit holds item targets weakly).
+    /// Called with the first OS window, never headless. Off the main thread
+    /// (`MainThread::new` is `None`) nothing is installed.
     pub(crate) fn install(proxy: &EventLoopProxy<Wake>) -> Option<MenuHandle> {
         // A menu bar is a windowed process's: headless, the `-setMainMenu:`
         // below would first CREATE the application object.
@@ -3969,11 +3956,9 @@ mod macos {
         })
     }
 
-    /// How long after the first open the same URL is issued again. The anchor
-    /// after `?` is not Apple-documented and is not always honoured on the
-    /// first open (design Appendix A.2); a second issue about a second later is
-    /// the shipped workaround. Long enough that System Settings has finished
-    /// launching cold, short enough that it is one gesture rather than two.
+    /// How long after the first open the same URL is issued again: the `?` anchor is not
+    /// Apple-documented and not always honoured on the first open. Long enough for a cold
+    /// System Settings launch, short enough to read as one gesture.
     const SECOND_OPEN_DELAY_SECS: f64 = 1.0;
 
     /// Open System Settings at `pane` — twice, about [`SECOND_OPEN_DELAY_SECS`] apart, the second
@@ -4663,10 +4648,8 @@ mod tests {
         set_menu_live(before);
     }
 
-    /// `chrome` on macOS reads each row's title off its `NSMenuItem`, and ⌘W's
-    /// is stamped only when the menu validates: ⌘W on a split tab stamps Close
-    /// Pane, then closes the pane, and the item keeps Close Pane for a tab that
-    /// is no longer split. The reader prints the live title instead.
+    /// `chrome` on macOS prints ⌘W's live title, not the one last stamped on its `NSMenuItem`
+    /// (stamped only when the menu validates, so it can outlive a split).
     #[test]
     fn chrome_reads_the_close_row_live_not_as_last_stamped() {
         use super::{MenuLive, menu_live, native_row_title, set_menu_live};
@@ -5354,7 +5337,7 @@ mod tests {
         );
     }
 
-    // ---- the System Settings deep link (design §3.4, §3.7, Appendix A.2) --------
+    // ---- the System Settings deep link -------------------------------------------
 
     /// Every candidate uses the dotted `x-apple.systempreferences` scheme. The hyphenated
     /// spelling is a different string (the one the link allowlist's rejection list names), and a

@@ -363,8 +363,8 @@ fn a_codex_pad_reads_only_where_its_cells_prove_the_slab() {
 /// theme's ink — the real codex-alab 0.164.0-dev's pad, `#2b2d33` on
 /// `#2d2f33`, 2026-10-21. The run's ink, which every law lifts and quiets
 /// toward, is the pane's own ink or ground, whichever reads farther from
-/// the slab, so the switch's first letter reads at 4.5:1 or better on it
-/// and its quiet label clears 3:1.
+/// the slab, so the switch's first letter and its quiet label read at
+/// 4.5:1 or better on it.
 ///
 /// NEGATIVE CONTROL: the slab cell's own ink, as the laws took it before,
 /// puts that letter under 4.5:1 (3.1 measured on the lab's frame).
@@ -420,9 +420,22 @@ fn a_slab_left_by_a_theme_change_keeps_its_letters_readable() {
         "the switch's first letter reads {:.2}",
         reads(first)
     );
-    let quiet = mix(run.rule.fg, run.rule.bg, 0.3);
+    // The bare switch's quiet label (`alab harness ○ off`), as it is laid.
+    let off = SwitchPaint {
+        face: HarnessSwitch::Off(SwitchOff::Master),
+        hover: false,
+    };
+    let quiet = switch_cell(
+        'a',
+        SwitchInk::Label,
+        off,
+        None,
+        run.rule,
+        [0x1a, 0x7f, 0x37],
+    )
+    .fg;
     assert!(
-        reads(quiet) >= 3.0,
+        reads(quiet) >= aterm_effects::cli_marks::NAME_CONTRAST,
         "the quiet label reads {:.2}",
         reads(quiet)
     );
@@ -564,21 +577,25 @@ fn switch_of(app: &App, wid: WindowId, session: u64) -> Option<crate::claude_lig
 
 /// CODEX GETS A SWITCH ONLY AS CODEX-ALAB (design §6.2): at every width
 /// from 20 to 160 a vendor `codex` pane — no proven self-claim, no copy, no
-/// ALab image: no host admits it — wears the lockup on its slab's pad (its
-/// blanks the slab's, never tinted) and no switch; a codex-alab pane whose
-/// self-claim is proven wears the lockup and `alab harness ● on`, its glyphs
-/// on Cruise's arc in the slab's letter law, and a switch whose press
-/// writes the session's word `off`. Only the pad row is written: the card,
-/// the prompt row and the footer are byte-identical to Codex's own.
+/// ALab image: no host admits it — wears the lockup named `codex` on its
+/// slab's pad (its blanks the slab's, never tinted) and no switch; a
+/// codex-alab pane whose self-claim is proven wears the lockup named
+/// `codex-alab` (the owner's name for it, its letters floored to 4.5:1 on
+/// the slab) and `alab harness ● on`, its glyphs on Cruise's arc in the
+/// slab's letter law, and a switch whose press writes the session's word
+/// `off`; it never reads the vendor's bare `codex`. Only the pad row is
+/// written: the card, the prompt row and the footer are byte-identical to
+/// Codex's own.
 ///
 /// NEGATIVE CONTROL: the same pane admitted by its copy alone, its claim
 /// not proven, draws the bare switch — its `●` in the accent, none of its
-/// glyphs on the arc.
+/// glyphs on the arc — under the same `codex-alab`: the admission that gives
+/// the switch names the build, not the proof that themes it.
 #[test]
 fn codex_gets_a_switch_only_as_codex_alab() {
     let (mut app, wid, session) = pane_of(24, 100, "codex");
     let _host = hosted(&mut app);
-    let mut lockups = 0;
+    let (mut lockups, mut alab_names) = (0, 0);
     for cols in 20..=160usize {
         assert!(app.apply_term_resize(wid, 24, cols as u16));
         bytes(&app, session, codex_screen(cols, Some(SLAB)).as_bytes());
@@ -600,7 +617,7 @@ fn codex_gets_a_switch_only_as_codex_alab() {
         if cols >= 14 {
             assert!(
                 line.starts_with("      codex ") && !line.contains("alab"),
-                "{cols}: the lockup alone: {line:?}"
+                "{cols}: the lockup alone, the vendor's name: {line:?}"
             );
             assert!(
                 after[PAD].iter().all(|c| c.bg == SLAB),
@@ -661,16 +678,36 @@ fn codex_gets_a_switch_only_as_codex_alab() {
                 c.ch
             );
         }
-        if cols >= 35 {
+        let line = glass_chars(&app, wid, PAD);
+        assert!(
+            !line.contains(" codex "),
+            "{cols}: codex-alab never reads the vendor's name: {line:?}"
+        );
+        // Its name, from the lockup's fifth cell, where the full rung fits
+        // (`codex-alab` and `alab harness ● on`: 40 cells).
+        if cols >= 40 {
             assert!(
-                glass_chars(&app, wid, PAD).starts_with("      codex ")
-                    && glass_chars(&app, wid, PAD).contains(" alab harness \u{25cf} on "),
-                "{cols}: {:?}",
-                glass_chars(&app, wid, PAD)
+                line.starts_with("      codex-alab ")
+                    && line.contains(" alab harness \u{25cf} on "),
+                "{cols}: {line:?}"
             );
+            let ground = u32::from_be_bytes([0, slab.bg[0], slab.bg[1], slab.bg[2]]);
+            for (k, c) in after[PAD][6..16].iter().enumerate() {
+                let fg = u32::from_be_bytes([0, c.fg[0], c.fg[1], c.fg[2]]);
+                assert!(
+                    c.bold
+                        && c.bg == SLAB
+                        && fg == aterm_effects::cli_marks::name_fg(CliMark::Codex, k, ground)
+                        && aterm_effects::color_math::contrast_ratio(fg, ground)
+                            >= aterm_effects::cli_marks::NAME_CONTRAST,
+                    "{cols}: letter {k} ({:?}) floored on the slab",
+                    c.ch
+                );
+            }
+            alab_names += 1;
         }
     }
-    assert!(lockups > 100, "{lockups}");
+    assert!(lockups > 100 && alab_names > 100, "{lockups} {alab_names}");
     // The press writes the session's word `off`.
     app.press_harness_switch(wid, session, HarnessSwitch::On);
     assert_eq!(
@@ -709,6 +746,76 @@ fn codex_gets_a_switch_only_as_codex_alab() {
         brand_letter_fg(CardPalette::Cruise, 0.0, slab),
         "CONTROL: bare, no glyph on the arc"
     );
+    assert!(
+        glass_chars(&app, wid, PAD).starts_with("      codex-alab "),
+        "CONTROL: admitted, codex-alab: {:?}",
+        glass_chars(&app, wid, PAD)
+    );
+}
+
+/// THE PET HOLDS CODEX'S LOCKUP AND SWITCH, NEVER THE PAD BETWEEN
+/// (`crate::pet_chrome`): what the footer's write puts on the glass is the
+/// resident pet's protected ground, and on Codex's slab every cell aterm
+/// writes is a blank of the slab, so the write is all the pet has to go by.
+/// At 40, 100 and 160 columns, on vendor codex's pad (the lockup alone) and
+/// codex-alab's (the lockup and `alab harness ● on`), the pad cells held are
+/// exactly the lockup's — its pads and the icon's two blank cells under the
+/// sprite included — and the switch's: the slab's own blanks between them
+/// are left on the glass, Codex's, and walkable.
+///
+/// NEGATIVE CONTROL (as run, the write left whole, `ComposedTop::glass`
+/// empty): codex-alab's pad held from the lockup's first column to the
+/// switch's last, 62 of Codex's own blanks among them at 100 columns, so no
+/// stand on the prompt line under them is the pet's at rest.
+#[test]
+fn the_pet_holds_codexs_lockup_and_switch_never_the_pad_between() {
+    let (mut app, wid, session) = pane_of(24, 100, "codex");
+    let _host = hosted(&mut app);
+    let mut gaps = 0;
+    for cols in [40usize, 100, 160] {
+        assert!(app.apply_term_resize(wid, 24, cols as u16));
+        for proven in [false, true] {
+            bytes(&app, session, codex_screen(cols, Some(SLAB)).as_bytes());
+            set_proven(&app, session, proven);
+            refill(&mut app, wid);
+            let _ = pass(&mut app, wid);
+            // The menu's splice ends the pet's pass (`crate::pet_chrome`).
+            app.splice_autopilot_menu(wid);
+            let lockup = app.windows[&wid]
+                .claude_lights
+                .mark_hits
+                .iter()
+                .find(|m| m.session == session)
+                .map(|m| m.cols.clone())
+                .expect("the lockup on the slab");
+            let switch = switch_of(&app, wid, session).map(|s| s.cols);
+            assert_eq!(switch.is_some(), proven, "{cols}: a switch for codex-alab");
+            let held = app.windows[&wid].pet_chrome.held().to_vec();
+            // Pane-local: one pane, at the window's first column and row.
+            let covered = |col: usize| {
+                let (r, c) = (PAD as f32 + 0.5, col as f32 + 0.5);
+                held.iter().any(|rect| {
+                    rect.row <= r
+                        && r < rect.row + rect.rows
+                        && rect.col <= c
+                        && c < rect.col + rect.cols
+                })
+            };
+            let ours = |col: usize| {
+                lockup.contains(&col) || switch.as_ref().is_some_and(|s| s.contains(&col))
+            };
+            let wrong: Vec<usize> = (0..cols).filter(|&c| covered(c) != ours(c)).collect();
+            assert!(
+                wrong.is_empty(),
+                "{cols}, proven {proven}: lockup {lockup:?}, switch {switch:?}: columns \
+                 held other than the host's marks, or marks not held: {wrong:?}"
+            );
+            if let Some(s) = &switch {
+                gaps += s.start - lockup.end;
+            }
+        }
+    }
+    assert!(gaps > 100, "the slab's pad lies between the marks: {gaps}");
 }
 
 /// A SENT MESSAGE IS NEVER CODEX'S TOP LINE (design §5.6 invariant 1,
@@ -833,8 +940,10 @@ fn plain_run(len: usize) -> TopRun {
     }
 }
 
-/// agy's top line on `run`, resting or with the pointer on its lockup.
-fn agy_key(
+/// The top line of `program`'s `build` on `run`, resting or with the
+/// pointer on its lockup.
+fn lockup_key(
+    (program, build): (aterm_phase::Program, Build),
     run: TopRun,
     switch: Option<SwitchPaint>,
     palette: Option<CardPalette>,
@@ -845,7 +954,8 @@ fn agy_key(
         term_row: 20,
         line: TopLine::Rule,
         run,
-        program: aterm_phase::Program::Agy,
+        program,
+        build,
         switch,
         palette,
         blank: RenderCell {
@@ -917,79 +1027,149 @@ fn title_of(top: &ComposedTop, run: TopRun) -> String {
 }
 
 /// THE HOVER TITLE NEVER MOVES THE SWITCH (design §7): for agy, version
-/// `1.4.0`, at every span from 8 to 80 and under each switch and theme —
+/// `1.4.0`, and for codex-alab, whose name is the longest, version
+/// `0.164.0`, at every span from 8 to 80 and under each switch and theme —
 /// lit on Cruise, Off in white, lit bare, no host — the composition with the
 /// pointer on the lockup lays the switch at the resting columns and every
 /// cell outside the lockup as resting (so the tint's stops), leaves two `─`
 /// before the switch, and names `Antigravity CLI 1.4.0` (21 cells) where it
 /// fits, `Antigravity CLI` where only the product does, and `agy` where
-/// neither does — falling back in that order as the span narrows. On the
-/// glass, the pointer resting on Claude Code's lockup shows `Claude Code
-/// 2.1.283` with the switch where it stood; the press there is the pane's,
-/// and the pointer leaving puts the name back.
+/// neither does — falling back in that order as the span narrows on one
+/// form of the switch (a narrower form frees room again); and
+/// `Codex 0.164.0` where it fits, else `codex-alab`: never the product alone,
+/// `Codex`, narrower than the name it would cover. On the glass, the pointer
+/// resting on Claude Code's lockup shows `Claude Code 2.1.283` with the
+/// switch where it stood; the press there is the pane's, and the pointer
+/// leaving puts the name back.
 ///
-/// NEGATIVE CONTROL: a title allowed into the switch's two-cell lead
-/// (`compose_top_in` with no lead) is caught.
+/// NEGATIVE CONTROLS: a title allowed into the switch's two-cell lead
+/// (`compose_top_in` with no lead) is caught; and codex-alab's lockup with
+/// `Codex` written over its name, the lockup cut to the title, is caught
+/// too: the name's last cells, blanked, lie outside the cut lockup.
 #[test]
 fn the_hover_title_never_moves_the_switch() {
-    let rank = |title: &str| match title {
-        "Antigravity CLI 1.4.0" => 2,
-        "Antigravity CLI" => 1,
-        "agy" => 0,
-        other => panic!("not a title: {other:?}"),
-    };
-    let mut seen = [0usize; 3];
+    use aterm_phase::Program;
+    let titles: [((Program, Build), &str, [&str; 3]); 2] = [
+        (
+            (Program::Agy, Build::Vendor),
+            "1.4.0",
+            ["agy", "Antigravity CLI", "Antigravity CLI 1.4.0"],
+        ),
+        (
+            (Program::Codex, Build::Alab),
+            "0.164.0",
+            ["codex-alab", "", "Codex 0.164.0"],
+        ),
+    ];
     let mut caught = 0;
-    for (switch, palette) in [
-        (Some(LIT), Some(CardPalette::Cruise)),
-        (Some(OFF), Some(CardPalette::Off)),
-        (Some(LIT), None),
-        (None, None),
-    ] {
-        let mut last = 2;
-        for len in (8..=80).rev() {
-            let run = plain_run(len);
-            let (mut rest, mut hovered) = (ComposedTop::default(), ComposedTop::default());
-            compose_top(
-                &agy_key(run, switch, palette, false),
-                &mut rest,
-                Some("1.4.0"),
-            );
-            compose_top(
-                &agy_key(run, switch, palette, true),
-                &mut hovered,
-                Some("1.4.0"),
-            );
-            keeps_the_layout(&rest, &hovered, run)
-                .unwrap_or_else(|e| panic!("{len}, {switch:?} {palette:?}: {e}"));
-            let full = rest.lockup.len() == aterm_effects::cli_marks::CliMark::Agy.lockup_cells();
-            if !full {
-                assert_eq!(rest.cells, hovered.cells, "{len}: no name, no title");
-                continue;
-            }
-            let title = title_of(&hovered, run);
-            let r = rank(&title);
-            assert!(r <= last, "{len}: {title:?} after a narrower title");
-            last = r;
-            seen[r] += 1;
-            // CONTROL: the title let into the switch's lead.
-            let mut loose = ComposedTop::default();
-            compose_top_in(
-                &agy_key(run, switch, palette, true),
-                &mut loose,
-                Some("1.4.0"),
-                0,
-            );
-            if keeps_the_layout(&rest, &loose, run).is_err() {
-                caught += 1;
+    let mut cut = 0;
+    for (lockup, version, ranks) in titles {
+        let (program, build) = lockup;
+        let mark = cli_mark(program).expect("a mark");
+        let rank = |title: &str| {
+            ranks
+                .iter()
+                .position(|r| !r.is_empty() && *r == title)
+                .unwrap_or_else(|| panic!("{lockup:?}: not a title: {title:?}"))
+        };
+        let mut seen = [0usize; 3];
+        for (switch, palette) in [
+            (Some(LIT), Some(CardPalette::Cruise)),
+            (Some(OFF), Some(CardPalette::Off)),
+            (Some(LIT), None),
+            (None, None),
+        ] {
+            // The rung the title last fell back on: a narrower switch frees
+            // room for a wider title again.
+            let (mut last, mut rung) = (2, None);
+            for len in (8..=80).rev() {
+                let run = plain_run(len);
+                let at = format!("{lockup:?} {len}, {switch:?} {palette:?}");
+                let (mut rest, mut hovered) = (ComposedTop::default(), ComposedTop::default());
+                compose_top(
+                    &lockup_key(lockup, run, switch, palette, false),
+                    &mut rest,
+                    Some(version),
+                );
+                compose_top(
+                    &lockup_key(lockup, run, switch, palette, true),
+                    &mut hovered,
+                    Some(version),
+                );
+                keeps_the_layout(&rest, &hovered, run).unwrap_or_else(|e| panic!("{at}: {e}"));
+                let full = rest.lockup.len() == mark.lockup_cells(build);
+                if !full {
+                    assert_eq!(rest.cells, hovered.cells, "{at}: no name, no title");
+                    continue;
+                }
+                assert_eq!(
+                    title_of(&rest, run),
+                    mark.name(build),
+                    "{at}: at rest, the name"
+                );
+                let tier = rest.switch.as_ref().map(|s| s.tier);
+                if rung != Some(tier) {
+                    (last, rung) = (2, Some(tier));
+                }
+                let title = title_of(&hovered, run);
+                let r = rank(&title);
+                assert!(r <= last, "{at}: {title:?} after a narrower title");
+                last = r;
+                seen[r] += 1;
+                // CONTROL: the title let into the switch's lead.
+                let mut loose = ComposedTop::default();
+                compose_top_in(
+                    &lockup_key(lockup, run, switch, palette, true),
+                    &mut loose,
+                    Some(version),
+                    0,
+                );
+                if keeps_the_layout(&rest, &loose, run).is_err() {
+                    caught += 1;
+                }
+                // CONTROL: codex-alab's name cut to the product.
+                if build == Build::Alab {
+                    let short = program.product();
+                    assert!(short.len() < mark.name(build).len(), "{at}");
+                    let mut narrow = ComposedTop {
+                        cells: rest.cells.clone(),
+                        col: rest.col,
+                        switch: rest.switch.clone(),
+                        lockup: rest.lockup.clone(),
+                        ..ComposedTop::default()
+                    };
+                    // As the composition would lay it unrefused: the name's
+                    // cells blanked, the product over them, the lockup cut
+                    // to the product's pad.
+                    let name_at = narrow.lockup.start + aterm_effects::cli_marks::ICON_RUN;
+                    let pad = narrow.cells[narrow.lockup.start - narrow.col];
+                    for c in name_at..narrow.lockup.end {
+                        narrow.cells[c - narrow.col] = pad;
+                    }
+                    for (k, ch) in short.chars().enumerate() {
+                        narrow.cells[name_at + k - narrow.col].ch = ch;
+                    }
+                    narrow.lockup.end = name_at + short.len() + 1;
+                    assert!(
+                        keeps_the_layout(&rest, &narrow, run).is_err(),
+                        "CONTROL {at}: a title narrower than the name is caught"
+                    );
+                    cut += 1;
+                }
             }
         }
+        let want = ranks.iter().filter(|r| !r.is_empty()).count();
+        assert_eq!(
+            seen.iter().filter(|&&n| n > 0).count(),
+            want,
+            "{lockup:?}: every title is seen: {seen:?}"
+        );
     }
-    assert!(seen.iter().all(|&n| n > 0), "every title is seen: {seen:?}");
     assert!(
         caught > 0,
         "CONTROL: a title in the switch's lead is caught"
     );
+    assert!(cut > 0, "CONTROL: a narrower title is caught");
     hover_title_on_the_glass();
 }
 
@@ -1103,4 +1283,291 @@ fn hover_title_on_the_glass() {
     assert!(!app.windows[&wid].claude_lights.mark_hovered(session));
     let _ = pass(&mut app, wid);
     assert_eq!(glass_chars(&app, wid, top), resting, "the name is back");
+}
+
+/// The probe's screen as Claude lays it in a window `rows` × `cols`: its
+/// rules as wide as the window, a blank transcript row above it for every
+/// row more.
+fn screen_at(live: &Live<'_>, rows: u16, cols: u16) -> Vec<String> {
+    let mut s: Vec<String> = screen(live)
+        .into_iter()
+        .map(|row| {
+            if row.starts_with('\u{2500}') {
+                "\u{2500}".repeat(usize::from(cols))
+            } else {
+                row
+            }
+        })
+        .collect();
+    let more = usize::from(rows).saturating_sub(s.len());
+    s.splice(0..0, std::iter::repeat_n(String::new(), more));
+    s
+}
+
+/// Claude Code's pane ([`probe_glass`]), read as Claude, whose top line the
+/// harness holds — its lockup and its switch on the glass — and the host's
+/// guard.
+fn claude_held() -> (App, WindowId, u64, Hosted) {
+    let (mut app, wid, session) = probe_glass();
+    {
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.set_agent_reader_for_test(true);
+    }
+    let host = held(&mut app, session);
+    (app, wid, session, host)
+}
+
+/// The window re-gridded to `rows` × `cols` and Claude's screen re-laid in
+/// it — no frame painted yet.
+fn regrid(app: &mut App, wid: WindowId, session: u64, rows: u16, cols: u16) {
+    assert!(
+        app.apply_term_resize(wid, rows, cols),
+        "the window re-grids"
+    );
+    feed(app, session, &screen_at(&AT_REST, rows, cols));
+}
+
+/// The next frame: extracted and the footer's pass run on it.
+fn next_frame(app: &mut App, wid: WindowId) {
+    refill(app, wid);
+    let _ = pass(app, wid);
+}
+
+/// The pointer moved to frame cell `cell` and resting there: the motion's
+/// pixel kept as the window's, and the glass asked as a motion asks it.
+fn point_at(app: &mut App, wid: WindowId, cell: (usize, usize)) -> crate::claude_lights::OverChips {
+    let (x, y) = cell_px(app, wid, cell);
+    let ws = app.windows.get_mut(&wid).expect("window");
+    ws.last_cursor_px = (x, y);
+    ws.pointer_position_known = true;
+    app.track_claude_light_hover(wid, x, y)
+}
+
+/// The session whose harness switch the pointer is over, as the next frame
+/// draws it.
+fn switch_hovered(app: &App, wid: WindowId) -> Option<u64> {
+    app.windows[&wid].claude_lights.switch_hover
+}
+
+/// A RE-GRID'S POINTER IS HIT-TESTED ON THE GLASS IT LANDS ON: Claude Code's
+/// pane this window's host holds, the pointer resting on its top line's
+/// switch. The window widens and Claude re-lays its rules: a motion before
+/// the next frame, where the switch was, finds the last frame's lists laid
+/// on a grid the window no longer has — they answer nothing, so nothing is
+/// hovered and no frame draws the switch hovered columns from the pointer.
+/// The next frame lays the switch at its new columns, and the pointer
+/// resting where it was hovers nothing there. The window narrows back under
+/// the still pointer: the frame that lays the switch under it again hovers
+/// it, with no motion — the window's cursor the switch's hand once that
+/// frame is presented — and the frame after draws it hovered.
+///
+/// NEGATIVE CONTROLS: the last frame's lists stamped as the re-grid's (no
+/// stamp, as before), the same motion hovers the switch that is no longer
+/// there; a present at rest resolves no cursor; and with the pointer gone
+/// from the window, the switch the re-grid brings back under where it was is
+/// not hovered.
+#[test]
+fn a_regrid_hit_tests_the_glass_it_lands_on() {
+    use crate::claude_lights::OverChips;
+    let (mut app, wid, session, _host) = claude_held();
+    for _ in 0..2 {
+        next_frame(&mut app, wid);
+    }
+    let laid = switch_of(&app, wid, session).expect("the switch");
+    let on = (laid.frame_row, laid.switch.start + laid.switch.len() / 2);
+    assert_eq!(
+        point_at(&mut app, wid, on),
+        OverChips::Chip,
+        "on the switch"
+    );
+    assert_eq!(switch_hovered(&app, wid), Some(session));
+    next_frame(&mut app, wid);
+    let hovered = pane_cells(&app, wid);
+
+    // The window widens: the switch's columns move right, from under the
+    // pointer; no frame is painted yet.
+    let wide = COLS + 24;
+    regrid(&mut app, wid, session, ROWS, wide);
+    // CONTROL: the last frame's lists stamped as this grid's, the motion
+    // where the switch was hovers it — the switch no frame will lay there.
+    let stamp = *app
+        .windows
+        .get_mut(&wid)
+        .expect("window")
+        .claude_lights
+        .drawn_at_mut();
+    assert!(stamp.is_some(), "the last frame stamped its lists");
+    *app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .claude_lights
+        .drawn_at_mut() = app.glass_grid(wid);
+    assert_eq!(
+        point_at(&mut app, wid, on),
+        OverChips::Chip,
+        "CONTROL: unstamped, the old lists answer"
+    );
+    assert_eq!(switch_hovered(&app, wid), Some(session), "CONTROL");
+    *app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .claude_lights
+        .drawn_at_mut() = stamp;
+    assert_eq!(
+        point_at(&mut app, wid, on),
+        OverChips::No,
+        "lists laid on a grid the window no longer has answer nothing"
+    );
+    assert_eq!(switch_hovered(&app, wid), None, "nothing is hovered");
+    assert!(
+        !app.press_claude_light(wid),
+        "a press there is the pane's: no switch the glass shows is there"
+    );
+    next_frame(&mut app, wid);
+    let moved = switch_of(&app, wid, session).expect("the switch, re-laid");
+    assert!(
+        moved.frame_row == laid.frame_row && !moved.cols.contains(&on.1),
+        "the switch moved from under the pointer: {:?} -> {:?}",
+        laid.cols,
+        moved.cols
+    );
+    assert_eq!(
+        switch_hovered(&app, wid),
+        None,
+        "the frame that laid it leaves the pointer on nothing"
+    );
+
+    // The window narrows back under the still pointer, the window's cursor
+    // the pane's I-beam where no glass is.
+    let cursor = |app: &App| {
+        let ws = &app.windows[&wid];
+        (ws.hover_pointer, ws.native_text_cursor)
+    };
+    let (hand, beam) = ((true, false), (false, true));
+    app.update_hover_cursor(wid);
+    assert_eq!(cursor(&app), beam, "the pane's cursor");
+    regrid(&mut app, wid, session, ROWS, COLS);
+    next_frame(&mut app, wid);
+    assert_eq!(
+        switch_of(&app, wid, session).map(|b| b.cols),
+        Some(laid.cols.clone()),
+        "the switch is back under the pointer"
+    );
+    assert_eq!(
+        switch_hovered(&app, wid),
+        Some(session),
+        "the frame that laid it under the still pointer hovers it"
+    );
+    assert_eq!(
+        cursor(&app),
+        beam,
+        "the cursor waits for that frame's present"
+    );
+    app.refresh_glass_cursor_for_frame(wid);
+    assert_eq!(cursor(&app), hand, "and then it is the switch's hand");
+    next_frame(&mut app, wid);
+    assert_eq!(
+        pane_cells(&app, wid),
+        hovered,
+        "and the next frame draws it hovered"
+    );
+    // CONTROL: a present at rest resolves nothing — a cursor forged since
+    // stands.
+    app.windows.get_mut(&wid).expect("window").hover_pointer = false;
+    app.refresh_glass_cursor_for_frame(wid);
+    assert!(!cursor(&app).0, "CONTROL: a frame at rest reads one flag");
+    app.update_hover_cursor(wid);
+
+    // CONTROL: the pointer gone from the window, a re-grid that brings the
+    // switch back under where it was hovers nothing.
+    regrid(&mut app, wid, session, ROWS, wide);
+    next_frame(&mut app, wid);
+    assert_eq!(switch_hovered(&app, wid), None);
+    app.on_cursor_left(wid);
+    regrid(&mut app, wid, session, ROWS, COLS);
+    next_frame(&mut app, wid);
+    assert_eq!(
+        switch_of(&app, wid, session).map(|b| b.cols),
+        Some(laid.cols.clone()),
+        "CONTROL: the switch is back"
+    );
+    assert_eq!(
+        switch_hovered(&app, wid),
+        None,
+        "CONTROL: no pointer, no hover"
+    );
+}
+
+/// A RE-GRID BRINGS THE HOVER TITLE UNDER A STILL POINTER: the pointer
+/// resting two rows under Claude Code's top line, on the composer's bottom
+/// rule, where the line's lockup lands when the window grows two rows and
+/// Claude lays its screen two rows lower. The frame that lays it there
+/// hovers it with no motion, and the frame after shows the title in place
+/// of the name.
+///
+/// NEGATIVE CONTROL: the same re-grid with the pointer gone from the window
+/// shows the name.
+#[test]
+fn a_regrid_brings_the_hover_title_under_a_still_pointer() {
+    let (mut app, wid, session, _host) = claude_held();
+    for _ in 0..2 {
+        next_frame(&mut app, wid);
+    }
+    let lockup = app.windows[&wid]
+        .claude_lights
+        .mark_hits
+        .iter()
+        .find(|m| m.session == session)
+        .expect("the lockup is a target")
+        .clone();
+    let top = AT_REST.bottom() - 2;
+    let resting = glass_chars(&app, wid, top);
+    assert!(resting.contains("    claude \u{2500}"), "{resting:?}");
+    let below = (lockup.frame_row + 2, lockup.cols.start + 5);
+    // CONTROL first: the pointer was there, and left.
+    let _ = point_at(&mut app, wid, below);
+    assert!(!app.windows[&wid].claude_lights.mark_hovered(session));
+    app.on_cursor_left(wid);
+    regrid(&mut app, wid, session, ROWS + 2, COLS);
+    next_frame(&mut app, wid);
+    let grown = app.windows[&wid]
+        .claude_lights
+        .mark_hits
+        .iter()
+        .find(|m| m.session == session)
+        .expect("the lockup, re-laid")
+        .clone();
+    assert_eq!(
+        (grown.frame_row, grown.cols.clone()),
+        (below.0, lockup.cols.clone()),
+        "the lockup moved down two rows"
+    );
+    assert!(
+        !app.windows[&wid].claude_lights.mark_hovered(session),
+        "CONTROL: no pointer, no title"
+    );
+    next_frame(&mut app, wid);
+    assert!(
+        glass_chars(&app, wid, top + 2).contains("    claude \u{2500}"),
+        "CONTROL: the name"
+    );
+
+    // Back, and the pointer rests where the lockup will land.
+    regrid(&mut app, wid, session, ROWS, COLS);
+    next_frame(&mut app, wid);
+    let _ = point_at(&mut app, wid, below);
+    assert!(!app.windows[&wid].claude_lights.mark_hovered(session));
+    regrid(&mut app, wid, session, ROWS + 2, COLS);
+    next_frame(&mut app, wid);
+    assert!(
+        app.windows[&wid].claude_lights.mark_hovered(session),
+        "the frame that laid the lockup under the still pointer hovers it"
+    );
+    next_frame(&mut app, wid);
+    let titled = glass_chars(&app, wid, top + 2);
+    assert!(
+        titled.contains("    Claude Code 2.1.283 \u{2500}\u{2500}"),
+        "the title: {titled:?}"
+    );
 }

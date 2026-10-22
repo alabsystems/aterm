@@ -645,7 +645,7 @@ fn a_complete_echo_without_a_past_tense_says_done() {
             }
         }
     }
-    // No time slot at all (a bare `pct=`): the `100%` is the word left.
+    // No time slot (a bare `pct=`): the `100%` is the word left.
     let now = Instant::now();
     let mut c = fresh(now);
     let pct = Message::new(tags::PACKAGES, Severity::Info, "Uploading the backup")

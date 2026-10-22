@@ -149,13 +149,11 @@ pub fn parse_reset(text: &str) -> Option<ResetSpec> {
     })
 }
 
-/// A LIMIT NOTICE'S RESET AS ITS CLOCK SAYS IT — the date it names, the hour
-/// and the minute — what tells one limit's notice from another's: the one a
-/// supervisor waits on from an older one a `/resume`d conversation redraws
-/// (`policy/turn_end.rs`'s fold of [`aterm_phase::SinceLimit`]). The zone is
-/// left out (a notice row cut at its wrap drops it), and so is a span (`in
-/// 3h` counts from a print nobody kept): a reset that names no clock tells
-/// no limit apart, and [`Self::of`] reads `None` for it.
+/// A limit notice's reset as its clock says it (the date it names, the hour, the minute): what
+/// tells the notice a supervisor waits on from an older one a `/resume`d conversation redraws
+/// (`policy/turn_end.rs`'s fold of [`aterm_phase::SinceLimit`]). The zone is left out (a
+/// notice row cut at its wrap drops it), and so is a span (`in 3h` counts from a print nobody
+/// kept): [`Self::of`] reads `None` for a reset that names no clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResetClock {
     date: Option<(u32, u32)>,

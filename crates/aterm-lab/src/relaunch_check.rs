@@ -62,24 +62,12 @@ pub fn exit_of(door: &Door<'_>, cmd: &str) -> Option<i64> {
     block_exit(json, cmd)
 }
 
-/// The stub's request dumps (`req-NNNNN.json`), newest index first.
+/// The stub's dumps of the turns (`req-NNNNN.json`), newest index first:
+/// never a side call's (`side-NNNNN.json`, [`crate::stub::is_side`]), whose
+/// copy of the conversation — a Muse Code reminder observer's carries the
+/// harness's continuation and its words — is no request of the turn's.
 fn dumps(run: &Run) -> Vec<(u64, PathBuf)> {
-    let mut out: Vec<(u64, PathBuf)> = std::fs::read_dir(run.w.join("dump"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let n = name
-                .strip_prefix("req-")?
-                .strip_suffix(".json")?
-                .parse()
-                .ok()?;
-            Some((n, e.path()))
-        })
-        .collect();
-    out.sort_by_key(|a| std::cmp::Reverse(a.0));
-    out
+    crate::stub::turn_dumps(&run.w.join("dump"))
 }
 
 /// The newest request dump past `since` whose body holds every one of

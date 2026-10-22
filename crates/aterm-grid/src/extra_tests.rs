@@ -4,10 +4,9 @@
 
 use super::*;
 
-/// Kitty layers stack in draw order (z, then first-send time, then placement
-/// order), at most `MAX_IMAGE_LAYERS` deep with the lowest dropped first;
-/// `set_image` makes one image the only layer and `retain_images` drops layers
-/// without reordering the rest.
+/// Kitty layers stack in draw order (z, first-send time, placement order), at
+/// most `MAX_IMAGE_LAYERS` deep with the lowest dropped first; `set_image`
+/// replaces them all and `retain_images` keeps the survivors' order.
 #[test]
 fn cell_extra_stacks_image_layers_in_draw_order() {
     use crate::KittyPlacementTag;
@@ -377,9 +376,8 @@ fn test_hyperlink_limit_preserves_non_hyperlink_extras() {
     );
 }
 
-/// The O(1) guard tests the hyperlink population, not the whole map: with
-/// 14_600 entries of which 600 carry a link, the first call repairs the bound
-/// and later calls take the early-out, evicting nothing.
+/// The O(1) guard bounds the hyperlink population, not the map: 600 links among
+/// 14_600 entries cost one repairing walk, then every call takes the early-out.
 #[test]
 fn hyperlink_guard_counts_links_not_total_entries() {
     use crate::extra_collection::MAX_HYPERLINK_ENTRIES;

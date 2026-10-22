@@ -17,12 +17,11 @@
 //! (`LEFT`). The answer:
 //!
 //! * `<n>` or an option's exact label (case folded): that option;
-//! * on a multi-select, the options to check, `, `-joined, then the button;
-//!   refused while the free-text row holds text;
+//! * on a multi-select, the options to check, `, `-joined, then the button; refused while the
+//!   free-text row holds text;
 //! * `submit` on the review tab;
 //! * `recommended`: what the window presses under the `recommended` priority
-//!   ([`super::super::policy::question::answer_question`]), the whole tab on a
-//!   multi-select;
+//!   ([`super::super::policy::question::answer_question`]), the whole tab on a multi-select;
 //! * `human`: nothing typed, `LEFT`.
 //!
 //! On a question read by its ANSWERS' ROLES (agy's, Muse Code's: no
@@ -66,8 +65,7 @@ use super::*;
 
 /// No question dialog on the screen.
 pub const EXIT_NO_BOX: u8 = 1;
-/// The answer does not fit the dialog, or `--box` names another: nothing
-/// typed.
+/// The answer does not fit the dialog, or `--box` names another: nothing typed.
 pub const EXIT_REFUSED: u8 = 2;
 /// A key the host or the dialog did not take as decided.
 pub const EXIT_NOT_SERVED: u8 = 3;
@@ -229,11 +227,9 @@ fn plan(
             Pane::of(rows),
         );
         return match decision {
-            // A multi-select's recommended answer is the whole tab: the
-            // decider returns one step of it, so it is planned as the
-            // explicit `a, b` answer is (each unchecked recommended option
-            // toggled, then the button), after the decider approved the tab,
-            // so its refusals still stand and nothing is ever unchecked.
+            // A multi-select's recommended answer is the whole tab, but the decider returns
+            // one step of it: once it approves, plan the explicit `a, b` answer (each unchecked
+            // recommended option toggled, then the button). Nothing is ever unchecked.
             Decision::Approve {
                 choice: Choice::Answer(answer),
                 ..
@@ -843,10 +839,8 @@ mod tests {
         plan(&p, &rows, answer, "@s-w")
     }
 
-    /// Single-select: a number or an exact label (case folded) names the
-    /// option; `recommended` is what the window would press; `human` types
-    /// nothing. Negative controls: a word that names no option is refused as
-    /// free text, and a number past the options is too.
+    /// Single-select: a number or label (case folded) names one option; a word or number
+    /// naming none is refused as free text.
     #[test]
     fn a_single_select_answer_names_one_option_or_is_refused() {
         let one = |n| {
@@ -869,11 +863,8 @@ mod tests {
         }
     }
 
-    /// A priority word that is an option's label is that option: a question
-    /// whose options are `Long-term` / `Short-term` is answered by its label as
-    /// any other; the word is refused as a policy only where it names no
-    /// option on the tab. Single- and multi-select alike. Negative control: the
-    /// same word on a dialog without such a label is still refused.
+    /// A priority word that labels an option answers that option, single- and multi-select
+    /// alike; it is refused as a policy only where it names no option.
     #[test]
     fn a_priority_word_that_labels_an_option_answers_that_option() {
         let single = f::QUESTION_ONE.replace("  2. Light", "  2. Long-term");
@@ -901,11 +892,8 @@ mod tests {
         planned(&multi, "long-term").expect_err("no such option");
     }
 
-    /// `recommended` on a multi-select is the whole tab: every unchecked
-    /// recommended option toggled, then the button. A tab whose recommended
-    /// options are all checked is its button alone. Negative control: a
-    /// person's check outside the recommended set is still refused before any
-    /// key.
+    /// `recommended` on a multi-select toggles each unchecked recommended option, then the
+    /// button; a person's check outside the recommended set refuses it.
     #[test]
     fn recommended_on_a_multi_select_plans_the_whole_tab() {
         let said = "Which glyph sets should be bundled? → Next (Box drawing (Recommended), \
@@ -943,9 +931,8 @@ mod tests {
         planned(&person, "recommended").expect_err("a person's check");
     }
 
-    /// Multi-select: the options to CHECK — each whose check differs is
-    /// toggled, then the button; labels and numbers mix. The review tab takes
-    /// `submit` only.
+    /// Multi-select: each option whose check differs is toggled, then the button. The review
+    /// tab takes `submit` only.
     #[test]
     fn a_multi_select_toggles_what_differs_then_presses_the_button() {
         assert_eq!(

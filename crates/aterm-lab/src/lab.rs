@@ -1332,7 +1332,8 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
         "cfg/aterm/aterm.toml",
         &scratch_aterm_toml(&o.aterm_toml, &o.harness_keys),
     );
-    put("home/.zshrc", "PROMPT='lab$ '\n");
+    // the tab shells' startup file, a person's profile: the lab's Gemini CLI on PATH with its fake key and the stub
+    put_tab_shell(&w, &run.run, &run.gemini_bin, &run.port);
 
     // ---- the private headless instance (jailed)
     if let Err(e) = start_instance(&mut run, o.scale.as_deref(), o.lifeline) {
@@ -1737,6 +1738,57 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     Ok(keep)
 }
 
+/// What `lab up` writes for its TAB SHELLS in scratch `w`: Gemini CLI's
+/// wrapper (`<run>/gbin/gemini`, which runs `gemini_bin`) where the lab has
+/// one, and `home/.zshrc`, the profile every tab's shell reads
+/// ([`tab_profile`], the stub at `port`).
+fn put_tab_shell(w: &Path, run: &Path, gemini_bin: &str, port: &str) {
+    let gbin = (!gemini_bin.is_empty()).then(|| run.join("gbin"));
+    if let Some(dir) = &gbin {
+        let _ = crate::sys::put(
+            &dir.join("gemini"),
+            0o755,
+            &crate::sys::PutSrc::Bytes(crate::forever::gemini_wrapper(gemini_bin).as_bytes()),
+        );
+    }
+    let _ = crate::util::atomic_write(
+        &w.join("home/.zshrc"),
+        tab_profile(port, gbin.as_deref()).as_bytes(),
+    );
+}
+
+/// THE LAB'S TAB SHELLS' STARTUP FILE (`<scratch>/home/.zshrc`, every tab's
+/// shell reads it at its start): the lab's prompt, and Gemini CLI's
+/// environment as a person who runs it on an API key keeps it in their
+/// profile — the lab's fake key ([`crate::gemini::LAB_GEMINI_KEY`]) and
+/// `GOOGLE_GEMINI_BASE_URL` the stub at `port` (`NO_BROWSER` too, and no
+/// Google Cloud credential variable), and, where the lab has a Gemini CLI,
+/// its wrapper's directory `gbin` leading `PATH`, so the word `gemini` runs
+/// the lab's build. A line the harness types into a tab's shell — a Gemini
+/// CLI's relaunch, `HOME=<its home> 'gemini' '--resume' '<id>'`, which
+/// carries its `HOME` alone — then reaches the stub as the launch did,
+/// where before it came up at Gemini CLI's API-key dialog (the key lived in
+/// the lab's launcher's environment alone: `spawn-residuals-2`'s `p5g` and
+/// `v4g`, 2026-10-21).
+#[must_use]
+pub fn tab_profile(port: &str, gbin: Option<&Path>) -> String {
+    let mut s = String::from("PROMPT='lab$ '\n");
+    if let Some(dir) = gbin {
+        s.push_str(&format!(
+            "export PATH={}:\"$PATH\"\n",
+            shell_quote(&dir.to_string_lossy())
+        ));
+    }
+    s.push_str(
+        "unset GOOGLE_API_KEY GOOGLE_GENAI_USE_VERTEXAI GOOGLE_CLOUD_PROJECT GOOGLE_APPLICATION_CREDENTIALS\n",
+    );
+    s.push_str(&format!(
+        "export GEMINI_API_KEY={} GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:{port} NO_BROWSER=true\n",
+        crate::gemini::LAB_GEMINI_KEY
+    ));
+    s
+}
+
 /// `account="…"` masked as `account="<user>"`.
 #[must_use]
 pub fn mask_account(line: &str) -> String {
@@ -2051,6 +2103,71 @@ pub fn cmd_claude(args: &[String]) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE TAB SHELLS' PROFILE CARRIES GEMINI CLI'S KEY: a line typed into a
+    /// tab's shell as a Gemini CLI's relaunch is (`HOME=<its home> gemini
+    /// --resume <id>`, its `HOME` alone) runs the lab's build with the lab's
+    /// fake key and the stub's base URL, read here off a stand-in build that
+    /// prints what it was handed, under zsh sourcing the profile as a tab's
+    /// shell reads it — the very `home/.zshrc` and `gbin/gemini` `lab up`
+    /// writes ([`put_tab_shell`]), so `up` writing any other profile fails
+    /// it. NEGATIVE CONTROLS: the profile before (the prompt alone) finds no
+    /// `gemini`; with no Gemini CLI in the lab, the key is still exported and
+    /// `PATH` left alone.
+    #[test]
+    fn a_line_typed_in_a_tab_shell_runs_gemini_with_the_labs_key() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        // the temporary directory's real path: `/var` is a link, and the
+        // lab's writer refuses a link in a path
+        let dir = tmp.path().canonicalize().unwrap();
+        let build = dir.join("gemini-build");
+        std::fs::write(
+            &build,
+            "#!/bin/sh\nprintf 'key=%s url=%s home=%s args=%s\\n' \"$GEMINI_API_KEY\" \"$GOOGLE_GEMINI_BASE_URL\" \"$HOME\" \"$*\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&build, fs::Permissions::from_mode(0o755)).unwrap();
+        let (w, run) = (dir.join("scratch"), dir.join("run"));
+        put_tab_shell(&w, &run, &build.to_string_lossy(), "4242");
+        let written = std::fs::read_to_string(w.join("home/.zshrc")).unwrap();
+        let gbin = run.join("gbin");
+        assert_eq!(written, tab_profile("4242", Some(&gbin)));
+        let typed = |profile: &str| {
+            let rc = dir.join("zshrc");
+            std::fs::write(&rc, profile).unwrap();
+            let out = aterm_uds::spawnfd::command("/bin/zsh")
+                .args([
+                    "-f",
+                    "-c",
+                    "source \"$1\"; HOME=/elsewhere/gemini-home gemini --resume abc",
+                ])
+                .arg("zsh")
+                .arg(&rc)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(
+            typed(&written),
+            format!(
+                "key={} url=http://127.0.0.1:4242 home=/elsewhere/gemini-home args=--resume abc",
+                crate::gemini::LAB_GEMINI_KEY
+            )
+        );
+        assert_eq!(typed("PROMPT='lab$ '\n"), "", "the profile before");
+        let (w, run) = (dir.join("scratch-none"), dir.join("run-none"));
+        put_tab_shell(&w, &run, "", "4242");
+        let none = std::fs::read_to_string(w.join("home/.zshrc")).unwrap();
+        assert_eq!(none, tab_profile("4242", None));
+        assert!(!run.join("gbin").exists(), "no wrapper");
+        assert!(!none.contains("PATH"), "{none}");
+        assert!(
+            none.contains(&format!("GEMINI_API_KEY={}", crate::gemini::LAB_GEMINI_KEY)),
+            "{none}"
+        );
+    }
 
     /// Every lab's scratch Claude Code settings carry the settings witness: a
     /// `ConfigChange` hook that runs the run directory's `config-change.sh`

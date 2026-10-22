@@ -52,18 +52,16 @@
 //! [`Role::Other`], and [`PromptV2::autocompact_offer`] is what a decider
 //! reads.
 //!
-//! **THE CURSOR.** `❯` — the vendor's `X.pointer`, which its Select draws on
-//! the focused row, the usage-limit menu's included (2.1.282 source) — on
-//! every box. `›` (`X.pointerSmall`, which Claude Code draws as the prefix
-//! of other rows, an async agent's latest activity) is read as a cursor too
-//! ONLY in a box titled `What do you want to do?` ([`cursors`]): the owner's
-//! report of that dialog showed `› 1. Stop and wait for limit to reset`, not
-//! captured as text (the 2.1.295 captures draw `❯`), and a cursor missed
-//! there makes the options unsound (the first row is no option), which
-//! escalates the dialog again. That is a tolerance of the report, not
-//! evidence of the vendor's glyph. A box read with no title of its own (a
-//! footerless option block, a box whose head is off the screen) reads `❯`
-//! alone.
+//! **Every box is named by its title** ([`header_kind`]). The kind is a safety
+//! fact: a supervisor answers a tool-permission box with its one-shot allow
+//! only when the box is positively identified as one, and every other dialog
+//! by that dialog's own rule. So the reader names each box Claude Code draws
+//! (the anchors in [`crate::anchors`]) and leaves the rest
+//! [`PromptKind::Other`]. The dialogs that are no tool permission (the
+//! question dialog, plan mode in and out, a held message, a proposed goal, a
+//! Computer Use grant, the read-outside setting) are named too, so none is
+//! taken for one: every option of Claude Code's question dialog is
+//! [`Role::Other`] whatever it says, and Codex's answers are [`Role::Answer`].
 //!
 //! **The header's grammar** ([`Header`], [`PromptV2::header`]). A title row is
 //! `<base>[ (unsandboxed)| (runs on <machine>)][ · <origin>]` ([`Origin`]).

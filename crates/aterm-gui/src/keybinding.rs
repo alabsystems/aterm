@@ -184,11 +184,9 @@ impl Action {
     }
 }
 
-/// Every bindable action NAME, in a stable order — the canonical discoverable
-/// surface for `[keybindings]` config (printed by `--list-actions`). `switch_tab_N`
-/// is parameterized (`switch_tab_1`..`switch_tab_9`), shown here as the template.
-/// A test asserts every concrete name here parses, so this cannot drift from
-/// [`Action::parse`].
+/// Every bindable action name, in a stable order (printed by `--list-actions`).
+/// `switch_tab_N` is shown as its template. A test asserts every concrete name
+/// here parses via [`Action::parse`].
 pub(crate) const ACTION_NAMES: &[&str] = &[
     "new_tab",
     "reopen_closed_tab",
@@ -669,12 +667,11 @@ impl Chord {
         [exact, twin]
     }
 
-    /// Human-readable presentation of this chord — `Ctrl+Shift+C`, `F11`,
-    /// `Shift+Insert` — the accelerator-hint spelling the palette/menu rows
-    /// show off macOS. ROUND-TRIPS: every output re-parses (case-folded)
-    /// through [`Chord::parse`] to this same chord, so a hint is always a
-    /// string the user could paste straight into `[keybindings]`. Modifier
-    /// order is the Windows/GTK convention (Ctrl, Alt, Shift, Super).
+    /// Human-readable presentation of this chord (`Ctrl+Shift+C`, `F11`,
+    /// `Shift+Insert`), the accelerator hint the palette/menu rows show off macOS.
+    /// Every output re-parses (case-folded) through [`Chord::parse`] to this same
+    /// chord, so a hint can be pasted into `[keybindings]`. Modifier order is the
+    /// Windows/GTK convention (Ctrl, Alt, Shift, Super).
     #[must_use]
     // Reached only through `Keybindings::display_chord_for`, whose caller in
     // `app_palette.rs` is `#[cfg(not(target_os = "macos"))]`; `test` because the
@@ -764,11 +761,8 @@ pub(crate) fn chord_layout_twin(
     aterm_winit_keymap::layout_letter_twin_for(logical, physical)
 }
 
-/// The parsed `[keybindings]` table: a chord → action map consulted at the top of
-/// `on_key`. Empty by default only on macOS, where the lookup is one hash probe
-/// that always misses; elsewhere it holds the platform seeds
-/// ([`Self::platform_defaults`]) overlaid by `[keybindings]`. A miss still falls
-/// through to the hardcoded matches.
+/// The chord → action map `on_key` consults before its hardcoded matches: the
+/// platform seeds ([`Self::platform_defaults`]) overlaid by `[keybindings]`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Keybindings {
     map: HashMap<Chord, Action>,
@@ -1293,12 +1287,9 @@ fn pane_focus_passes_through(base: &WinitKey) -> bool {
     )
 }
 
-/// Upper bound on a single `[key_sequences]` value, in bytes. A key chord never
-/// legitimately sends a kilobyte; the cap keeps the SYNCHRONOUS PTY write the seam
-/// performs for a mapped chord bounded — a multi-KB value would otherwise block the
-/// winit event loop until the ~8 KiB tty buffer drains (the hazard the paste path
-/// mitigates with `MAX_PASTE_BYTES` + a detached thread; here a small cap suffices
-/// since the bytes come from the user's own config, not an external stream).
+/// Upper bound on a `[key_sequences]` value, in bytes. A mapped chord is written to
+/// the PTY synchronously, and a multi-KB value would block the event loop until the
+/// ~8 KiB tty buffer drains; a key chord never legitimately sends a kilobyte.
 pub(crate) const MAX_KEY_SEQUENCE_BYTES: usize = 1024;
 
 /// Expand a config byte-string (a `[key_sequences]` value) into the exact bytes to
@@ -1693,10 +1684,7 @@ mod tests {
         );
     }
 
-    /// PANE FOCUS AND TAB NAV EXIST OFF macOS. The splits were seeded and their
-    /// panes were then unreachable from the keyboard: no `focus_pane_*` default, no
-    /// pane-focus MenuAction (so no palette row either) and no control verb. Same
-    /// for the two chords every Windows document window answers.
+    /// Off macOS, pane focus (Alt+arrows) and Ctrl+Tab / Ctrl+Shift+Tab are seeded.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn platform_defaults_seed_pane_focus_and_tab_nav() {
@@ -1806,11 +1794,8 @@ mod tests {
         );
     }
 
-    /// UNBIND (keyboard audit #2): a `[keybindings]` value of `"none"` (or
-    /// `"unbind"`) MASKS a platform seed — the chord misses the map and falls
-    /// through to the PTY encoder as if never seeded — and is NOT an unknown
-    /// action (no warning). Unbinding a chord that was never bound is a silent
-    /// no-op, and the surrounding seeds survive untouched.
+    /// `"none"` / `"unbind"` masks a platform seed without a warning; unbinding a
+    /// never-bound chord is a no-op, and the other seeds survive.
     #[test]
     fn unbind_value_masks_platform_seed() {
         let mut table = std::collections::BTreeMap::new();
@@ -1979,8 +1964,7 @@ mod tests {
         assert_eq!(ks.map.len(), 2, "the bad chord was skipped");
     }
 
-    /// A value over the byte cap is rejected (keeps the synchronous PTY write bounded);
-    /// the loader then warns + skips it. A value exactly at the cap is accepted.
+    /// A value over the byte cap is rejected; one exactly at the cap is accepted.
     #[test]
     fn key_sequence_oversized_value_rejected() {
         let at_cap = "a".repeat(MAX_KEY_SEQUENCE_BYTES);
@@ -2287,9 +2271,8 @@ mod tests {
         }
     }
 
-    /// builtin_shadow_label maps known built-ins (normalizing spelling); None
-    /// otherwise. Exercised through the gate-explicit core with the suite LIVE,
-    /// so the mapping is asserted identically on every platform.
+    /// `builtin_shadow_label` maps known built-ins (normalizing spelling), asserted
+    /// through the gate-explicit core with the suite live, so on every platform.
     #[test]
     fn builtin_shadow_label_maps_known_and_normalizes() {
         let known = |chord: &str, menu_bar: bool| builtin_shadow_label_when(chord, true, menu_bar);

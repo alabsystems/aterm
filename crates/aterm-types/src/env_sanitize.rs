@@ -96,14 +96,8 @@ pub const ENV_DEV_FAST_TIMERS: &str = "ATERM_DEV_FAST_TIMERS";
 /// ([`ENV_DENY_VARS`]) and a nested aterm never offers what only its parent decided.
 pub const ENV_DEFAULT_EDITOR: &str = "ATERM_DEFAULT_EDITOR";
 
-/// Exact env vars that should not leak into child shells.
-///
-/// These are denied by exact name because other `ATERM_*` variables are
-/// required for shell integration inside the child shell. The
-/// recursion-provisioning identity/edge vars are denied so they are never
-/// INHERITED across a hop (each direct child is re-injected a fresh set; see the
-/// consts above and `build_child_env`), and the retired edge-secret names so a
-/// value an older aterm injected stops at the hop.
+/// Exact env vars that should not leak into child shells: by exact name, because other
+/// `ATERM_*` variables are needed for shell integration in the child.
 pub const ENV_DENY_VARS: &[&str] = &[
     // Development seams (`dev_seam!`, read only by a dev build): an aterm launched from an
     // aterm shell never runs under a seam its parent's environment carried.

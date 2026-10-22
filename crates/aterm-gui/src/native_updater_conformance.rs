@@ -1099,8 +1099,8 @@ fn real_bundle_swap_keeps_the_latch_as_the_model_s_bundle_swap() {
     );
 }
 
-/// A capture failure is sorted into a miss or a refusal by its type, and a
-/// refusal never reaches the activity lane.
+/// A capture failure is sorted into a miss or a refusal by its type, and a refusal never
+/// reaches the activity lane.
 ///
 /// Every `CaptureFailure` variant goes through the shipping
 /// `classify_capture_failure`. Timing and storage are `Missed` (the model's
@@ -1592,14 +1592,10 @@ fn due_look(app: &mut crate::App) -> bool {
     app.lapse_expired_auto_apply_manual_only()
 }
 
-/// The decision, exhaustively: for every reachable model state in which the
-/// lane looks at the latch (`Decide` enabled), the shipping `structural_latch`
-/// is fed the facts that state names (the day's re-sample due, an unspent
-/// newer download, the trial's room), and its answer, applied as
-/// `App::look_at_structural_latch` applies it (a supersede starts the retire
-/// and spends the release while the latch holds; a release clears the latch
-/// and spends the re-sample; a hold keeps it, spends the re-sample and is
-/// said), must be exactly the model's `Decide` successor.
+/// The decision, exhaustively: for every reachable model state in which `Decide` is enabled,
+/// the shipping `structural_latch` is fed the facts that state names (the day's re-sample due,
+/// an unspent newer download, the trial's room), and its answer, applied as
+/// `App::look_at_structural_latch` applies it, must be exactly the model's `Decide` successor.
 ///
 /// Negative control: the `Buggy = 1` `Decide` answers a newer release looked at before the day
 /// with one more attempt at the older build (room) or a release held for the Version menu (no

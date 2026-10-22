@@ -2310,10 +2310,8 @@ fn claim_side(error: RendezvousError) -> RendezvousError {
     }
 }
 
-/// Whether the parent's [`ENV_GRANT_CAPS`] offers the chunked grant: its
-/// comma-separated list names [`GRANT_CAPS_CHUNKS`]. Absent or anything else:
-/// no — this successor then claims `ATRZ1C`, as every successor before the
-/// chunked grant did.
+/// Whether the parent's [`ENV_GRANT_CAPS`] offers the chunked grant: its comma-separated list
+/// names [`GRANT_CAPS_CHUNKS`]. Absent or anything else: no, and this successor claims `ATRZ1C`.
 fn offers_chunked_grant(caps: Option<&std::ffi::OsStr>) -> bool {
     caps.and_then(std::ffi::OsStr::to_str)
         .is_some_and(|caps| caps.split(',').any(|cap| cap.trim() == GRANT_CAPS_CHUNKS))

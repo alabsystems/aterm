@@ -343,7 +343,6 @@ fn the_real_reducer_is_the_derived_machine() {
             acting += 1;
             // The gap is closed for a Claude Code record only: a Codex record's
             // act read records nothing and keeps the last word a look found.
-            // Closing it for Codex changes this and the docs that say so.
             assert_eq!(
                 look_word(&dry, false, || f.status.clone()),
                 "",
@@ -486,14 +485,11 @@ fn quiet_bound(s: &State, word: &str) -> bool {
     }
 }
 
-/// T1-a', the quiet upgrade's read. The quiet flow's one step is the restart
-/// at a genuinely idle point ([`upgrade::quiet_step`]), not the machine's; what
-/// the flows share is the word the watch records, bound here over every
-/// reachable state read with the quiet flow ([`quiet_facts`]): the neutral word
-/// ([`upgrade::NEXT_POINT`]) exactly where nothing holds the restart, else the
-/// class of what does ([`quiet_truth`]). Negative controls: the ask flow's
-/// reducer, `RestartOverWork`, a notice past its reset still read as a limit,
-/// and the posture-blind neutral word.
+/// T1-a', the quiet upgrade's read (see the module header). The quiet flow's one step is the
+/// restart at a genuinely idle point ([`upgrade::quiet_step`]); what it shares with the machine is
+/// the recorded word, bound over every reachable state read quietly ([`quiet_facts`],
+/// [`quiet_truth`]). Negative controls: the ask flow's reducer, `RestartOverWork`, a notice past
+/// its reset still read as a limit, and the posture-blind neutral word.
 #[test]
 fn the_quiet_upgrades_read_records_what_holds_its_restart() {
     let today = main_today();

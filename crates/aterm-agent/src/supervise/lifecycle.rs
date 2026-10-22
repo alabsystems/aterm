@@ -55,13 +55,10 @@ pub(super) fn is_parked_off(line: &str) -> bool {
         })
 }
 
-/// What makes two refusals THE SAME for the journal ([`Session::refusal_news`]):
-/// the words, with every field that MEASURES dropped — a `<name>=<number>`
-/// whose name counts time or bytes (`ERR busy person human_ms=<n>`, how long
-/// ago a person typed; `ERR busy input-unread bytes=<n>`; a `…_ms=` wait):
-/// the server says it anew at every retry. Who holds the session
-/// (`lease=s-9`, `turn=17`, `supervisor=…`, `reason=… origin=…`) is kept: a
-/// new holder is news.
+/// What makes two refusals the same for the journal ([`Session::refusal_news`]): the words,
+/// less every field the server measures anew at each retry, a `<name>=<number>` whose name
+/// counts time or bytes (`human_ms=<n>`, `bytes=<n>`, a `…_ms=` wait). Who holds the session
+/// (`lease=s-9`, `turn=17`, `supervisor=…`, `reason=… origin=…`) is kept: a new holder is news.
 pub(super) fn refusal_key(said: &str) -> String {
     said.split_whitespace()
         .filter(|word| {
@@ -352,10 +349,9 @@ impl<C: Ctl> Session<'_, C> {
         );
     }
 
-    /// `ERR busy …` / `ERR rate`: wait [`Session::refusal_pause`] (doubling
-    /// to [`REFUSAL_PAUSE_MAX`]) or until `anchor` leaves the screen, as the
-    /// server's own wait — never a sleep here — then the loop looks again.
-    /// Journaled `REFUSED seq=<n> backoff=<ms> <why>` when the refusal is
+    /// `ERR busy …` / `ERR rate`: wait [`Session::refusal_pause`] (doubling to
+    /// [`REFUSAL_PAUSE_MAX`]) or until `anchor` leaves the screen, as the server's own wait,
+    /// never a sleep here. Journaled `REFUSED seq=<n> backoff=<ms> <why>` when the refusal is
     /// news ([`Self::refusal_news`]).
     pub(super) fn back_off(
         &mut self,

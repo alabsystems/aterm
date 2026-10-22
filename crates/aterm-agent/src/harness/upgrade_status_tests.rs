@@ -418,10 +418,9 @@ fn an_afresh_moves_row_takes_a_word_and_names_its_marks_command() {
     assert!(e.contains(&format!("`claude --resume {ID}`")), "{e}");
 }
 
-/// The user's word lands in the tab's upgrade under the sweep lock with a
-/// ledger line; `--now` re-arms a stopped upgrade; a restart under way and a
-/// tab with nothing recorded are refused; a lock another sweep holds is
-/// `busy:another-sweep`, writing nothing.
+/// The user's word lands in the tab's upgrade under the sweep lock with a ledger line; `--now`
+/// re-arms a stopped upgrade; a restart under way and a tab with nothing recorded are refused; a
+/// lock another sweep holds is `busy:another-sweep`, writing nothing.
 #[test]
 fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold() {
     let dir = ScratchDir::new("upgrade-status", "ask");
@@ -1384,8 +1383,7 @@ fn a_tab_another_supervisor_claims_reads_its_claim_never_aterms_own_fault() {
         "the owner's own setup, a record: {:?}",
         row.attention(NOW)
     );
-    // Stood down, the claims are forgotten with everything else: the next
-    // look, told none, reads the record as it is.
+    // Stood down, the claims are forgotten.
     view.stand_down(&mut |_| {});
     let mut sent: Vec<Row> = Vec::new();
     let _ = view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent = rows.to_vec());
@@ -2092,11 +2090,8 @@ fn a_restart_down_in_flight_is_lowered_once_its_conversation_is_live_again() {
     }
 }
 
-/// A RECORD NO BUILD GAVE A TAB READS THE CLAIM ON ITS HOLDER'S TAB: `--status`
-/// shows such a row under the tab its holder is proven in, and reads its aside
-/// only once that tab is filled in, so a claim there holds it (never
-/// `stalled=unwatched`). NEGATIVE CONTROLS: the same record with no tab
-/// claimed, or another tab, reads `unwatched`.
+/// A record no build gave a tab reads the claim on its holder's tab in `--status`, never
+/// `stalled=unwatched`. Negative controls: no claim, or another tab's, reads `unwatched`.
 #[test]
 fn a_record_with_no_recorded_tab_reads_the_claim_on_its_holders_tab() {
     let dir = ScratchDir::new("upgrade-status", "claimed-untabbed");
@@ -2607,11 +2602,9 @@ fn only_a_stalled_tab_is_marked_and_its_mark_is_lowered_when_it_recovers() {
     );
 }
 
-/// What is shown is vetted against live processes: a pending, announced or
-/// stopped upgrade stands only while a live process holds its conversation in
-/// its tab on a build older than its target; a finished move and a restart in
-/// flight always stand. The host counts no holder whose tab it cannot prove;
-/// the CLI, with no roster, disproves none.
+/// A pending, announced or stopped row stands only while a live process holds its conversation in
+/// its tab on a build older than its target; a move under way or done always stands. The host
+/// counts no holder whose tab it cannot prove; the CLI, with no roster, disproves none.
 #[test]
 fn a_row_stands_only_while_its_conversation_is_live_and_behind_in_its_tab() {
     let row = pending(7 * 3_600);
@@ -2856,10 +2849,9 @@ fn register_as(home: &std::path::Path, pid: u32, session: &str, version: &str) {
     .expect("session file");
 }
 
-/// A state an older build wrote has no tab; it is shown under the tab its live
-/// holder is proven in, and the user's word for that tab lands and records the
-/// tab. Negative control: a holder proven in another tab is neither listed nor
-/// taken by a word for this one.
+/// A state an older build wrote has no tab: it stands in the tab its live holder is proven in,
+/// where the user's word lands and records the tab. Negative control: a holder proven in another
+/// tab is neither listed nor taken by a word for this one.
 #[cfg(unix)]
 #[test]
 fn a_state_with_no_recorded_tab_stands_in_the_tab_its_holder_is_in() {
@@ -3917,10 +3909,8 @@ fn a_claude_started_in_a_new_tab_answers_the_row_whose_shell_is_gone() {
     assert_eq!(status_rows(&o, false).0.len(), 1);
 }
 
-/// A new round inherits nothing of the old one's restart ([`St::rearm`]): a
-/// re-armed record's new stop before any signal is one whose agent lives,
-/// never read as a failure after an exit. Negative control: before the re-arm
-/// the old stop is the old restart's.
+/// A new round inherits nothing of the old one's restart ([`St::rearm`]): a stop after the re-arm
+/// is never read as a failure after an exit. Negative control: before the re-arm it is.
 #[test]
 fn a_rearmed_round_forgets_when_the_old_restarts_agent_was_seen_gone() {
     let mut st = St {
@@ -4380,13 +4370,10 @@ fn a_word_on_a_gave_up_upgrade_forgets_its_answers() {
     }
 }
 
-/// When the next round starts: every stopped round's row says it
-/// (`next_round=<span>`, `next_round_s` and `retry_at` in JSON,
-/// `next-round:<span>` in the column of a non-stall), and `due` once rested (an
-/// unstamped stop is due at once). A skipped round has no next round (`-`), nor
-/// a gave-up round acting on a late READY (`ready` in the column). A refusal
-/// stays a stall through the re-armed round's first look (`last_stop`) until
-/// its first notice, so its band row does not flap at every re-arm.
+/// Every stopped round's row says when its next round starts (`next_round=`, `next_round_s` and
+/// `retry_at` in JSON, `next-round:` in the column), `due` once rested or unstamped; a skipped
+/// round or a gave-up round acting on a late READY has none. A refusal stays a stall through the
+/// re-armed round's first look, so its band row does not flap.
 #[test]
 fn a_stopped_round_says_when_its_next_round_starts() {
     let base = St {
@@ -5839,9 +5826,8 @@ fn a_digest_line_is_keyed_by_kind_and_tab_and_says_no_restart() {
                 {
                     assert_ne!(o.fingerprint, na.fingerprint, "another tab is its own line");
                 }
-                // The band's title law, with the place the host adds
-                // (`in tab 12`): six words (a bare number is no word), 48
-                // characters, no seam, no trailing period.
+                // The band's title law, with the host's `in tab 12`: six words (a bare number is
+                // none), 48 characters, no seam, no trailing period.
                 let placed = format!("{} in tab 12", na.title);
                 let words = placed
                     .split_whitespace()
@@ -7053,8 +7039,7 @@ fn the_ask_count_survives_a_retarget_and_the_state_file() {
     assert_eq!(anew.notices, 0, "{anew:?}");
 }
 
-/// NO UPGRADE STUCK FOREVER, bound to the reducer and the view (design record
-/// 2026-09-28, §4.4): the Tier-1 binds of `HarnessUpgradeProgress`.
+/// The Tier-1 binds of the `HarnessUpgradeProgress` machine to the reducer and the view.
 #[path = "upgrade_progress_tests.rs"]
 mod progress;
 

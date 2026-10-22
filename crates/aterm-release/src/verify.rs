@@ -52,6 +52,81 @@ pub struct Published {
     pub text: String,
 }
 
+/// The channel's head before a claim: [`scan_published`]'s client pick, held to the
+/// release GitHub's `latest` pointer names. A listing page can come back empty while the
+/// channel has releases (seen 2026-10-22, twice in three minutes after an engine source
+/// release appeared), and a head scan that reads no candidate carries no floor: the cut
+/// claimed with none, the late guard refused it, and its build number was burned. The
+/// pointer is a second, independent read, and it lags the listing
+/// ([`publish::POINTER_PROBE_ATTEMPTS`]), so a listing that reaches no candidate at or
+/// above the release the pointer names is torn, and refusing here claims nothing.
+pub fn scan_head_before_claim(slug: &str) -> Result<Vec<Published>> {
+    let latest = latest_release_row(slug)?;
+    let head = scan_published(slug, true)?;
+    head_reaches_latest(
+        latest.as_deref(),
+        head.first().map(|published| published.tag.as_str()),
+    )?;
+    Ok(head)
+}
+
+/// The [`RELEASE_ROW_JQ`] row of the release `releases/latest` names, or `None` when the
+/// channel has none (HTTP 404: a channel nothing was released on yet).
+fn latest_release_row(slug: &str) -> Result<Option<String>> {
+    let endpoint = format!("repos/{slug}/releases/latest");
+    let out = publish::gh_raw(&["api", &endpoint, "--jq", RELEASE_ROW_JQ])?;
+    if !out.success() {
+        let stderr = out.stderr_utf8();
+        if stderr.contains("HTTP 404") || stderr.contains("Not Found") {
+            return Ok(None);
+        }
+        return Err(Error::new(format!(
+            "read the channel's latest release failed: {}; nothing was claimed",
+            stderr.trim()
+        )));
+    }
+    Ok(Some(out.stdout_utf8()))
+}
+
+/// [`scan_head_before_claim`]'s judgement, pure: `latest` is the pointer's row and `head`
+/// the tag of the listing's client pick. Only a pointer naming a published candidate
+/// carrying one appcast binds, and the pick must then be that release or a greater tag.
+pub(crate) fn head_reaches_latest(latest: Option<&str>, head: Option<&str>) -> Result<()> {
+    let Some(latest) = latest else {
+        return Ok(());
+    };
+    let rows = parse_release_metadata(latest)?;
+    let [row] = rows.as_slice() else {
+        return Err(Error::new(format!(
+            "the channel's latest release read as {} rows; nothing was claimed",
+            rows.len()
+        )));
+    };
+    if row.draft || row.prerelease || row.exact_count != 1 {
+        return Ok(());
+    }
+    let TagKind::Candidate(latest_order) = publish::parse_release_tag(row.tag)? else {
+        return Ok(());
+    };
+    let reached = match head {
+        Some(tag) => matches!(
+            publish::parse_release_tag(tag)?,
+            TagKind::Candidate(order) if order >= latest_order
+        ),
+        None => false,
+    };
+    if reached {
+        return Ok(());
+    }
+    Err(Error::new(format!(
+        "the channel's release listing reaches no update candidate at or above {}, the release \
+         its latest pointer names (the listing's newest: {}) — a torn read of the channel; \
+         nothing was claimed — run the release again",
+        row.tag,
+        head.unwrap_or("none")
+    )))
+}
+
 /// Scans the channel's release metadata (at most 10 pages of 100) before downloading any
 /// manifest. `stop_early` is the client's pick: only a published (non-draft,
 /// non-prerelease) release carrying `aterm-appcast.toml` is eligible, the greatest canonical
@@ -159,17 +234,22 @@ pub fn scan_published(slug: &str, stop_early: bool) -> Result<Vec<Published>> {
 /// ID, tag, draft flag, prerelease flag, exact appcast count. A count rather than `[0]`, so
 /// the Rust boundary rejects a duplicate appcast before any immutable-ID, bounded asset
 /// download runs.
-fn release_metadata_listing(slug: &str) -> Result<String> {
-    const PER_PAGE: usize = 100;
-    const MAX_PAGES: u32 = 10;
-    const METADATA_JQ: &str = r#".[] | . as $r |
+/// One release object as the five-field production row [`parse_release_metadata`] reads:
+/// the listing runs it over each release, [`latest_release_row`] over the one
+/// `releases/latest` returns.
+const RELEASE_ROW_JQ: &str = r#". as $r |
         ([$r.assets[]? | select(.name == "aterm-appcast.toml")] | length) as $exact_count |
         [($r.id | tostring), $r.tag_name, ($r.draft | tostring),
          ($r.prerelease | tostring), ($exact_count | tostring)] | @tsv"#;
+
+fn release_metadata_listing(slug: &str) -> Result<String> {
+    const PER_PAGE: usize = 100;
+    const MAX_PAGES: u32 = 10;
+    let metadata_jq = format!(".[] | {RELEASE_ROW_JQ}");
     let mut metadata = String::new();
     for page in 1..=MAX_PAGES {
         let path = format!("repos/{slug}/releases?per_page={PER_PAGE}&page={page}");
-        let listing = gh_retry(&["api", &path, "--jq", METADATA_JQ])?;
+        let listing = gh_retry(&["api", &path, "--jq", &metadata_jq])?;
         let text = listing.stdout_utf8();
         let page_len = text.lines().count();
         metadata.push_str(&text);
@@ -1191,11 +1271,9 @@ fn prove_yank_successor(repo: &Path, slug: &str, bad: &Published) -> Result<Opti
     })
 }
 
-/// Command-level convergence after tag-first cleanup and a demotion
-/// crash/response loss. The bad manifest has left the published set, so only claim
-/// success when no published release carries the build and the exact current
-/// authority is newer, fully verified, and permanently poisons that build via
-/// min_build.
+/// The ratcheted successor once the bad build has left the published set: the channel head
+/// is newer than `build`, fully verified, and poisons it via `min_build`. The bad build's
+/// absence is the caller's to establish.
 fn prove_absent_yank_converged(repo: &Path, slug: &str, build: u64) -> Result<Option<Published>> {
     let required_floor = yank_required_floor(build)?;
     verified_channel_successor(repo, slug, |successor| {
@@ -1272,10 +1350,9 @@ fn yank_cleanup_failure(error: Error, successor: &Published, owner: &str) -> Err
     ))
 }
 
-/// Re-read the exact bad manifest before the demotion. A build-number match alone
-/// is insufficient: tag/version/commit and manifest bytes are immutable yank
-/// identity, and duplicate matches fail closed. `false` when the release is gone
-/// or already out of the published set (demoted by an earlier pass).
+/// Re-read the exact bad manifest before the demotion: a build-number match is not
+/// identity, so tag, release, version and manifest bytes must all still match, and
+/// duplicates fail closed. `false` when the release is gone or already demoted.
 fn prove_yank_target_present(slug: &str, expected: &Published) -> Result<bool> {
     let expected_release = expected.release.as_ref().ok_or_else(|| {
         Error::new("yank target scan carries no immutable GitHub release object snapshot")
@@ -1291,9 +1368,8 @@ fn prove_yank_target_present(slug: &str, expected: &Published) -> Result<bool> {
         return Ok(false);
     }
     publish::validate_release_object_snapshot(exact.as_ref(), expected_release)?;
-    // The tag is intentionally allowed to be absent here: yank deletes it
-    // first, then retains this exact release snapshot + manifest as its durable
-    // crash-recovery receipt.
+    // The tag may be absent: yank deletes it first and keeps this release and manifest as
+    // its crash-recovery receipt.
     let scanned = scan_published(slug, false)?;
     let matches: Vec<&Published> = scanned
         .iter()
@@ -1446,8 +1522,7 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
         &gates::current_own_cutter_gate,
     )?;
     let _cred = publish::ChannelCred::enter();
-    // Keep the release object + manifest discoverable after tag-first cleanup;
-    // a resumed yank may legitimately find the bad tag already absent.
+    // Scan releases, not tags: a resumed yank may find the bad tag already deleted.
     let scanned = scan_published(&slug, false)?;
     let matching = scanned
         .iter()
@@ -1481,8 +1556,8 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
     })?;
     let required_floor = yank_required_floor(build)?;
 
-    // An unfinished local cut remains actionable operator state. A completed
-    // journal is harmless history and run_cut will replace it if needed.
+    // An unfinished journaled cut must be finished or abandoned first; a completed journal
+    // is history `run_cut` clears.
     let journal_path = repo.join("dist/cut-state.toml");
     if let Some(j) = publish::JournalHeader::read(&journal_path)?
         && !j.finished()
@@ -1632,9 +1707,8 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
     publish::ordinary_resume_claim_preflight(repo, &git, &journal)?;
     let _cred = publish::ChannelCred::enter();
 
-    // A published release is outside abandon's authority. Check this before
-    // acquiring a previously absent lease so a mistaken command cannot leave
-    // a new lock behind merely to report the published-state refusal.
+    // A published release is outside abandon's authority; checked before the lease is
+    // acquired, so the refusal leaves no new lock behind.
     if release_state(&slug, &tag)? == ReleaseState::Published {
         return Err(Error::new(format!(
             "{tag} is the channel's PUBLISHED app release — this cut's head PATCH landed, so \
@@ -1709,10 +1783,25 @@ fn origin_slug_of(repo: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
-    /// One page of `release_identity_jq(true)` output, exactly as `gh` hands it
-    /// over: id, tag, draft, target, tab-separated. Release 9 is the shape the
-    /// GitHub web UI produces when a draft is created without picking a tag.
+    /// One page of `release_identity_jq(true)` output: id, tag, draft, target, tab-separated.
+    /// Release 9 is a draft created in the GitHub web UI without picking a tag.
     const PAGE_WITH_A_TAGLESS_DRAFT: &str = "9\t\ttrue\tmain\n12\tv0.3.0\tfalse\tabc123\n";
+
+    /// A head scan below the release the latest pointer names is torn and refuses before
+    /// the claim; a channel with no pointer, or a pointer the client would not elect,
+    /// binds nothing.
+    #[test]
+    fn a_head_scan_below_the_latest_pointer_refuses_before_the_claim() {
+        let latest = "420813912\tv0.112.0\tfalse\tfalse\t1\n";
+        assert!(head_reaches_latest(Some(latest), None).is_err());
+        assert!(head_reaches_latest(Some(latest), Some("v0.111.0")).is_err());
+        assert!(head_reaches_latest(Some(latest), Some("v0.112.0")).is_ok());
+        assert!(head_reaches_latest(Some(latest), Some("v0.113.0")).is_ok());
+        assert!(head_reaches_latest(None, None).is_ok());
+        assert!(head_reaches_latest(Some("7\tv0.112.0\tfalse\tfalse\t0\n"), None).is_ok());
+        assert!(head_reaches_latest(Some("7\tv0.61\tfalse\tfalse\t1\n"), None).is_ok());
+        assert!(head_reaches_latest(Some(""), None).is_err());
+    }
 
     /// Both replays skip a prerelease on the production five-field row; the same row
     /// published is the client replay's head.
@@ -1809,8 +1898,7 @@ mod tests {
         );
         assert!(!cut.dry_run && !cut.resume);
 
-        // A flagless yank asks for the plain real cut, so an unarmed tree (and every
-        // fork with no master pinned) needs no flag.
+        // A flagless yank asks for the plain real cut: an unarmed tree needs no flag.
         assert_eq!(
             successor_cut_options(7, &YankOptions::default()),
             publish::CutOptions {

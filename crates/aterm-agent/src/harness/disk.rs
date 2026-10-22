@@ -717,10 +717,9 @@ impl Config {
         }
     }
 
-    /// How long nothing of a gone owner may have been written before its
-    /// build directory goes whole: `target_stale_days`, and never less than
-    /// ONE day (a window of `0` makes every profile idle; it does not make a
-    /// session that wrote a minute ago ended).
+    /// How long nothing of a gone owner may have been written before its build
+    /// directory goes whole: `target_stale_days`, at least one day (a window of
+    /// `0` makes every profile idle; it does not make a session ended).
     #[must_use]
     pub fn quiet_s(&self) -> i64 {
         self.target_stale_days.max(1).saturating_mul(DAY_S)
@@ -841,7 +840,7 @@ pub struct StoreBuild {
 }
 
 /// What made the host re-measure: the owner's verb, or the window's harness
-/// host on §5.5's one timer (a free-space figure has no event to hang on).
+/// host on its tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
     /// The owner typed the verb.
@@ -2455,14 +2454,11 @@ fn same_place(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Which of `dirs` speaks for the profile at `profile`, in the idle pass and
-/// under pressure alike: the innermost one holding it (the first of two that
-/// are the same). A build directory named inside another is walked by both
-/// surveys, one after the other, and each probes the profile's locks, so a
-/// build starting between the two could make one read it free and the other
-/// held. Only the innermost directory's survey decides (a row, or its reason
-/// to keep the profile), and every outer survey's reading of that profile is
-/// dropped.
+/// Which of `dirs` speaks for the profile at `profile`, in both passes: the
+/// innermost one holding it (the first of two equal ones). A build directory
+/// named inside another is surveyed twice, each survey probing the profile's
+/// locks, and a build starting in between could make them disagree; only the
+/// innermost survey decides.
 fn speaker(dirs: &[&Path], profile: &Path) -> Option<usize> {
     dirs.iter()
         .enumerate()
@@ -4001,9 +3997,8 @@ pub fn scan_with(
     if roots.idle_whole {
         assess_idle_whole(&mut s, roots, config, now, processes);
     }
-    // The census refusal, said once where the report is read (`aterm
-    // harness disk`'s notes): while it stands no session's scratch build is
-    // called ended. Each one's hog line says it too ([`hog_of`]).
+    // While the census is refused, no session's scratch build is called ended:
+    // said once in the notes (each such hog line says it too, `hog_of`).
     if let Some(why) = &roots.claude_unread
         && s.targets
             .iter()

@@ -922,3 +922,92 @@ fn a_pointed_agents_panel_row_keeps_the_switch_the_facts_and_the_chip() {
         );
     }
 }
+
+/// THE SWITCH READS ON A TAB'S OWN THEME (design §8; `session_theme`): a
+/// tab drawn in a theme of its own keeps the instance's accent — the
+/// window's chrome follows the instance — so on an instance in Dracula a
+/// Claude Code tab in Default Light laid the master switch's `○ off ▐ on ▌`
+/// with Dracula's light accent on Default Light's paper, the `on` pill and
+/// its letters at 1.0:1, and the only control that turns the harness back
+/// on could not be read. On the composer's top rule every letter of the
+/// switch reads at 4.5:1 or more on what it is laid on, and the pill's caps
+/// and fill at 3:1 or more on the tab's ground.
+///
+/// NEGATIVE CONTROL: the instance's accent as chosen reads under 1.5:1 on
+/// the tab's ground.
+#[test]
+fn the_switch_reads_on_a_tab_theme_the_instance_did_not_choose() {
+    use aterm_effects::color_math::contrast_ratio;
+    let (mut app, wid, session, _reader, _host) = claude_pane(120);
+    policy(&mut app, "[harness]\nenabled = false\n");
+    let dracula = aterm_types::scheme::builtin("Dracula").expect("a built-in");
+    app.theme = aterm_render::Theme::from(&dracula);
+    app.set_session_theme(
+        session,
+        Some(crate::session_theme::SessionTheme {
+            selector: "Default Light".into(),
+            origin: crate::session_theme::SessionThemeOrigin::Ctl,
+        }),
+    );
+    draw_claude(&app, session, BYPASS);
+    frame(&mut app, wid);
+    let off = switch(&app, wid).expect("the master switch off draws the switch");
+    assert_eq!(off.face, HarnessSwitch::Off(SwitchOff::Master));
+    assert!(
+        top_rule(&app, wid).contains(OFF_FACE),
+        "{:?}",
+        top_rule(&app, wid)
+    );
+    let paper = aterm_types::scheme::builtin("Default Light")
+        .expect("a built-in")
+        .background;
+    let ground = [paper.r, paper.g, paper.b];
+    let row = &app.windows[&wid].input_scratch.cells[off.frame_row];
+    assert_eq!(
+        row[off.cols.start].bg, ground,
+        "the tab's own paper is the switch's ground"
+    );
+    let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+    let reads = |a: [u8; 3], b: [u8; 3]| contrast_ratio(pack(a), pack(b));
+    let accent = crate::chrome_band::band_colors(app.theme).accent;
+    assert!(
+        reads(accent, ground) < 1.5,
+        "CONTROL: the instance's accent reads {:.2} on the tab's paper",
+        reads(accent, ground)
+    );
+    let button = off.button.clone().expect("the off switch's button");
+    let floor = aterm_effects::cli_marks::NAME_CONTRAST;
+    let mut letters = 0;
+    for (col, c) in row.iter().enumerate().take(button.end).skip(off.cols.start) {
+        if c.ch == ' ' {
+            continue;
+        }
+        let what = format!("{:?} at column {col}", c.ch);
+        if button.contains(&col) && c.bg == ground {
+            assert!(
+                reads(c.fg, ground) >= 3.0,
+                "{what}: a cap at {:.2}",
+                reads(c.fg, ground)
+            );
+        } else {
+            letters += 1;
+            assert!(
+                reads(c.fg, c.bg) >= floor,
+                "{what}: a letter at {:.2}",
+                reads(c.fg, c.bg)
+            );
+            if button.contains(&col) {
+                assert!(
+                    reads(c.bg, ground) >= 3.0,
+                    "{what}: the pill at {:.2}",
+                    reads(c.bg, ground)
+                );
+            }
+        }
+    }
+    assert_eq!(
+        letters,
+        "alabharness○offon".chars().count(),
+        "every letter read"
+    );
+}

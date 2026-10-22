@@ -153,11 +153,8 @@ fn probe(invert: Option<&str>) -> String {
     s
 }
 
-/// THE RECIPE, RUN — both arches, and this box cannot execute one of them.
-///
-/// `-fsyntax-only` is why the x86_64 arm is possible at all: every row is a
-/// compile-time value, so COMPILING the assertion for an arch is the whole
-/// measurement and no binary for that arch has to run.
+/// The recipe, run on both arches. Every row is a compile-time value, so `-fsyntax-only` for an
+/// arch is the whole measurement and no binary for it has to run.
 #[test]
 fn every_seam_constant_equals_the_sdk_on_both_arches() {
     let body = probe(None);

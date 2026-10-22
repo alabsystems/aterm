@@ -87,7 +87,7 @@ impl Screen {
             .map_or(0, |cell| cell.flags().bits())
     }
 
-    /// Hyperlink URL attached to the visible cell at `(r, c)` (0-based), if any.
+    /// Hyperlink URL on the visible cell at `(r, c)` (0-based), if any.
     ///
     /// A URI shows here only if it passed the OSC 8 handler's scheme allowlist
     /// and length/control-char/BiDi guards and a glyph was printed while the

@@ -654,6 +654,8 @@ impl App {
             was.map(|a| (a.first.as_str(), a.more)) != now.map(|a| (a.first.as_str(), a.more))
         };
         let moved = tl.set_need(verdict);
+        // The shown mark's wake (6F-9): its `log` watchers, under this hold.
+        let _ = tl.slog_take_wake();
         drop(tl);
         // THE CHIP'S TITLE READS THE NEED (§12.2.3 item 5; the W4 title
         // slice): where its words moved, the session's trail generation

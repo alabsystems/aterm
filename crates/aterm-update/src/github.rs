@@ -1451,10 +1451,9 @@ fn asset_failure_class() -> &'static str {
     }
 }
 
-/// The exact asset names a release carries for the updater. The roster chain looks
-/// them up by name; the check DERIVES their URLs from them ([`web_release`]). The
-/// appcast's is one constant with the dev build's look at the channel
-/// ([`crate::dev_channel`]), so the two can never HEAD different names.
+/// The asset names a release carries for the updater; the check derives their URLs
+/// ([`web_release`]). The appcast's is shared with the dev build's channel look
+/// ([`crate::dev_channel`]), so the two never HEAD different names.
 const APPCAST_ASSET: &str = crate::dev_channel::APPCAST_ASSET;
 const APPCAST_SIG_ASSET: &str = "aterm-appcast.toml.sig";
 

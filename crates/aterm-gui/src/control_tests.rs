@@ -7533,6 +7533,7 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
         reset_lane: Default::default(),
         crash_journal: Default::default(),
         typed: Default::default(),
+        bells: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),
@@ -8148,15 +8149,16 @@ fn meta_rejects_controls_line_separators_and_bidi_formatting() {
 }
 
 /// `timeline`: lifecycle events (spawned, state, title, meta changes) are recorded
-/// in order with monotonic ids by the store mutators and `meta set`, one per actual
-/// change. (The `<n>` / `since=<id>` grammar: `control_session`'s
+/// in order with monotonic ids by the store mutators, the title's writer and `meta
+/// set`, one per actual change. (The `<n>` / `since=<id>` grammar: `control_session`'s
 /// `history_and_timeline_limits_match_retained_wire_rows`.)
 #[test]
 fn timeline_records_lifecycle_in_order() {
     let store = session_store::new_store();
     let h = registered_session(3, -1, b"");
     store.write().unwrap().register(h.clone()); // -> spawned
-    store.write().unwrap().set_title(3, "vim"); // -> title-change
+    // -> title-change: the drift flush's writer (phase 6, 6F-8).
+    assert!(h.ctx.timeline.lock().unwrap().record_title("vim"));
     let (_, changed) = cmd_meta(&h.term, &store, 3, &h.ctx, "set title build agent");
     assert!(changed); // -> meta-change
     store

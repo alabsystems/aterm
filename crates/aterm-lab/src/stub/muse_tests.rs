@@ -411,3 +411,65 @@ fn the_log_observation_keeps_present_lines_and_refuses_missing_ones() {
         "{got}"
     );
 }
+
+/// MUSE CODE'S SIDE CALLS ARE DUMPED APART FROM ITS TURNS, by the role it
+/// names (`x-tbh-agent-role`): a reminder observer and the prompt hint as
+/// `side-<n>.json`, a turn (`main`, or no role) as `req-<n>.json`, one count
+/// over both; the turns' reader ([`super::super::turn_dumps`]) reads the
+/// turns alone. The observer's body here carries the conversation rendered
+/// into one text, as Muse Code 1.4.10-R6427.1 sends it (the lab's `r10-cv`,
+/// 2026-10-22: read as a turn, the owner's words reached the agent with a
+/// line break). NEGATIVE CONTROL: the turns stay `req-`.
+#[test]
+fn muse_codes_side_calls_are_dumped_apart_from_its_turns() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let dump = dir.path().join("dump");
+    let (port, _) = start(Args {
+        dump_dir: Some(dump.clone()),
+        ..Args::default()
+    })
+    .unwrap();
+    let client = aterm_http::Client::new(
+        aterm_http::Trust::PlatformVerifier,
+        aterm_http::ProxyMode::Direct,
+        Duration::from_secs(60),
+    );
+    let post = |b: &str, role: &str| {
+        let mut r = client
+            .post(&format!("http://127.0.0.1:{port}/responses"))
+            .header(
+                "Authorization",
+                &format!("Bearer {}", super::super::LAB_CODEX_KEY),
+            );
+        if !role.is_empty() {
+            r = r.header("x-tbh-agent-role", role);
+        }
+        assert_eq!(r.send(b.as_bytes()).unwrap().status(), 200);
+    };
+    let turn = r#"{"model":"lab-stub","stream":true,"tools":[{"type":"namespace","name":"muse","tools":[{"name":"bash"}]}],"input":[{"type":"message","role":"user","content":"the turn"}]}"#;
+    let observer = r#"{"model":"lab-stub","stream":true,"tools":[{"type":"namespace","name":"muse","tools":[{"name":"submit_reminder_decision"}]}],"input":[{"type":"message","role":"user","content":"You are a reminder observer for the main agent.\n<main-agent-conversation format=\"model-conversation-xml/v1\">\n  <message role=\"user\">\n    <text>the turn</text>\n  </message>\n</main-agent-conversation>"}]}"#;
+    post(turn, "main");
+    post(observer, "reminder:verify-reminder");
+    post(turn, "prompt-hint");
+    post(turn, "");
+    let mut names: Vec<String> = std::fs::read_dir(&dump)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "req-00001.json",
+            "req-00004.json",
+            "side-00002.json",
+            "side-00003.json"
+        ]
+    );
+    let turns: Vec<u64> = super::super::turn_dumps(&dump)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(turns, [4, 1]);
+}

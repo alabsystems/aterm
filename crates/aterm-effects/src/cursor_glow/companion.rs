@@ -7,10 +7,10 @@
 
 use super::*;
 
-/// The exact cursor movement the authenticated typing classifier offers to
-/// the classic flying kitty. A fold is one authored character of movement
-/// whose terminal projection crossed a line boundary (or re-anchored an
-/// input box), not permission to fly across every intervening cell.
+/// The cursor movement the authenticated typing classifier offers the classic
+/// flying kitty. A fold is one typed character whose projection crossed a line
+/// boundary (or re-anchored an input box), not licence to fly across every
+/// intervening cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CursorCatMotionKind {
     /// An ordinary forward/coalesced typed advance. Builds kitty momentum but
@@ -212,8 +212,7 @@ impl CursorGlow {
         if self.momentum.value(now) < drive {
             self.momentum.set_value(now, drive);
         }
-        // §7.2's celebration arm for v2: the same momentum bypass through its
-        // one follower, so every legibility cap holds at full drive.
+        // §7.2's celebration arm: the same bypass through v2's one follower.
         if self.v2.engaged() {
             self.v2.celebrate(now, drive);
         }

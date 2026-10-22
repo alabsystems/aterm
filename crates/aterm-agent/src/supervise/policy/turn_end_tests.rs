@@ -98,6 +98,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         opened_by: None,
         message_drawn: false,
         submits: None,
+        inputs_before: None,
         screen_mark: None,
         worked,
         rules: None,
@@ -762,9 +763,8 @@ fn an_api_error_is_retried_on_the_ladder_and_retries_off_escalate() {
     ));
 }
 
-/// Claude Code 2.1.296's five-hour wall with its own continue armed under it
-/// (`⏺ Usage limit reached · continuing automatically at 3:15pm · esc to
-/// cancel`, the footer's countdown), captured in the lab.
+/// The five-hour wall with Claude Code's own continue armed (`⏺ Usage limit reached ·
+/// continuing automatically at 3:15pm · esc to cancel`, the footer's countdown).
 const AUTO_CONTINUE_ARMED: &str =
     aterm_phase::prompt::fixtures::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED;
 /// The same wall after Esc on the countdown: `⏺ Automatic continue cancelled
@@ -3638,16 +3638,9 @@ fn a_left_limit_is_waited_on_through_what_is_no_served_turn_of_its_own() {
     }
 }
 
-/// A PROMPT SUBMITTED AND NOT ANSWERED YET LEAVES THE LIMIT'S WAIT STANDING
-/// (the review of 2026-10-14: untested). Under a left limit's own notice a
-/// person's turn was served, and then they submitted another, unanswered (the
-/// `❯` row the last thing said: [`TurnEndReading::pending_input`]): that turn
-/// may meet the limit again, so the wait stands until it is answered — by
-/// the screen's witness or the transcript's. Held by `observe`'s arm for
-/// unanswered input, which returns before the wall is looked at whenever
-/// work is read (the fold's guard of 44ed0f339 repeated it, and is gone:
-/// reverted, this passed). NEGATIVE CONTROL: answered, the served turn ends
-/// the wait.
+/// A prompt submitted under a left limit's notice and not answered yet
+/// ([`TurnEndReading::pending_input`]) may meet the limit again: the wait stands until the screen
+/// or the transcript shows it served. Negative control: answered, the served turn ends the wait.
 #[test]
 fn a_prompt_not_answered_yet_leaves_a_left_limits_wait_standing() {
     let t = t0();
@@ -3679,7 +3672,7 @@ fn a_prompt_not_answered_yet_leaves_a_left_limits_wait_standing() {
         st.observe(&point, t + 2 * MIN);
         assert!(st.waits_on_named_reset(), "{name}");
     }
-    // NEGATIVE CONTROL: answered.
+    // Negative control: answered.
     let mut st = TurnEndState::default();
     at(&mut st, &armed, t);
     at(&mut st, &cancelled, t + MIN);
@@ -3687,18 +3680,10 @@ fn a_prompt_not_answered_yet_leaves_a_left_limits_wait_standing() {
     assert!(!st.waits_on_named_reset());
 }
 
-/// AT A LIMIT WHOSE NOTICE LEFT THE SCREEN THE ROSTER IS ASKED AS AT THE WALL
-/// (the review of 2026-10-14). The left limit is decided as if its notice
-/// still showed, and that includes the move to another account in front of
-/// the wall's own rule. The host is asked about a wall, not a turn's end
-/// ([`TurnEndState::account_point`]), and its advice is acted on as at the
-/// wall: another account usable at T cuts the wait to T, and one to move to
-/// now is a relaunch under it, the wall's wait as its `otherwise`. Measured
-/// before: Esc after a wall whose first answer was "another account can be
-/// used then" replaced that with the account's own reset, a move advised
-/// later was passed over, and the session sat idle to the reset (days, for a
-/// weekly limit) beside a usable account. NEGATIVE CONTROL: with no advice,
-/// the wall's own wait.
+/// A limit whose notice left the screen is still a wall to the roster
+/// ([`TurnEndState::account_point`]): another account usable at T cuts the wait to T, and one to
+/// move to now is a relaunch under it, the wall's wait as its `otherwise`. Negative control: with
+/// no advice, the wall's own wait.
 #[test]
 fn at_a_limit_whose_notice_left_the_screen_the_roster_is_asked_as_at_the_wall() {
     let t = t0();
@@ -21832,6 +21817,65 @@ fn a_turn_asked_since_the_point_is_told_by_its_submission_whatever_its_words() {
     }
 }
 
+/// THE SECOND RESIDUAL OF TURNS TOLD BY SUBMISSION, A RESTART'S GAP: a
+/// restart the loop asked for, made, spends the count on its relaunch line
+/// ([`TurnEndState::restarted`]); read again once its new process was taken
+/// ([`TurnEndState::counted_after_harness`]), the count is the baseline again,
+/// and a person's prompt answered with the words of the turn before it, which
+/// only its submission tells, is judged a turn of someone else's at once.
+/// FAILS WITHOUT THE FIX: the baseline gone, the same reading is the point it
+/// came after, and that point's back-off runs on over the person's answer.
+/// NEGATIVE CONTROLS: with the count where the read after the relaunch left
+/// it, nothing was asked; and with no read after it (a host that counts none,
+/// a read that failed), the opener and the words tell alone, as before.
+#[test]
+fn a_prompt_after_a_restart_whose_process_was_taken_is_told_by_its_submission() {
+    const PROMPT: &str = "write the parser for this repository and land it";
+    const FIRST: &str = "Wrote the parser module.";
+    let secs = Duration::from_secs;
+    let t = t0();
+    // The first point, count 1 over conversation 100, then a memory restart
+    // made at it: the relaunch line counted 2, the relaunched conversation
+    // marked 150.
+    let restarted = |read_again: Option<(u64, u64)>| {
+        let mut st = TurnEndState::default();
+        let first = TurnEndReading {
+            worked: Some(secs(6)),
+            ..counted(closing(FIRST, PROMPT, None), 1, 100)
+        };
+        let a = at(&mut st, &first, t);
+        assert!(backs_off(&a, 1), "{a:?}");
+        st.restarted(&Restart::Memory, true, &first, t + secs(2));
+        assert_eq!(st.counted_from(), (None, None), "the relaunch spent it");
+        st.counted_after_harness(read_again);
+        st
+    };
+    // The person's prompt again, answered the same: counted, drawn since.
+    let asked = counted(closing(FIRST, PROMPT, None), 3, 200);
+    let mut st = restarted(Some((2, 150)));
+    assert_eq!(st.counted_from(), (Some(2), Some(150)));
+    let before = st.point_number();
+    let a = at(&mut st, &asked, t + secs(10));
+    assert!(backs_off(&a, 2), "a turn of someone else's: {a:?}");
+    assert_ne!(st.point_number(), before);
+    assert_eq!(st.followed(), None, "someone else's");
+    // NEGATIVE CONTROLS.
+    let mut st = restarted(Some((2, 150)));
+    let before = st.point_number();
+    let a = at(
+        &mut st,
+        &counted(closing(FIRST, PROMPT, None), 2, 200),
+        t + secs(10),
+    );
+    assert!(backs_off(&a, 1), "nothing submitted since: {a:?}");
+    assert_eq!(st.point_number(), before);
+    let mut st = restarted(None);
+    let before = st.point_number();
+    let a = at(&mut st, &asked, t + secs(10));
+    assert!(backs_off(&a, 1), "no read after the relaunch: {a:?}");
+    assert_eq!(st.point_number(), before);
+}
+
 /// P4'S STILL-OPEN CASE, THE ACT: AN ACT TYPED AGAIN WITH THE SAME WORDS AND
 /// ANSWERED THE SAME IS TAKEN BY ITS OWN SUBMISSION
 /// ([`TurnEndState::answered_unseen`], [`Awaited::submitted_since`]). The
@@ -22103,9 +22147,13 @@ fn a_turn_judged_under_a_draft_spends_its_submission() {
 /// taskless only where this says no. FAILS WITHOUT THE FIX (`redrawn_fresh`
 /// always false): the reading stays taskless, the first point's back-off is
 /// dropped (decided `Nothing`) and nothing is ever typed. NEGATIVE
-/// CONTROLS, each taskless as read: a `/clear` (the count moved), the
-/// harness's relaunch (its keys), a host that counts none, and a screen read
-/// so again after a `/clear` (that point held no task).
+/// CONTROLS, each taskless as read: a `/clear` (the count moved), A KEY THAT
+/// CLEARED WITH NOTHING SUBMITTED (the input count moved, the submission
+/// count not: a picker's Enter, an Esc; the third residual of turns told by
+/// submission — FAILS WITHOUT ITS FIX, read as redrawn), a write in flight
+/// at the point's read, the harness's relaunch (its keys), a host that
+/// counts none, and a screen read so again after a `/clear` (that point held
+/// no task).
 #[test]
 fn a_launch_card_read_with_nothing_submitted_is_the_conversation_redrawn() {
     const PROMPT: &str = "write the parser for this repository and land it";
@@ -22116,6 +22164,8 @@ fn a_launch_card_read_with_nothing_submitted_is_the_conversation_redrawn() {
         let mut st = TurnEndState::default();
         let first = TurnEndReading {
             worked: Some(secs(6)),
+            // Seven input writes before its rows, none in flight.
+            inputs_before: Some(7),
             ..counted(opened(FIRST, PROMPT), 2, 100)
         };
         let a = at(&mut st, &first, t);
@@ -22123,12 +22173,25 @@ fn a_launch_card_read_with_nothing_submitted_is_the_conversation_redrawn() {
         st
     };
     // The loop's reading of the re-wrapped screen: no words, no message,
-    // read as a launch card unless the policy says it is a redraw.
+    // read as a launch card unless the policy says it is a redraw. Its input
+    // count after its rows is the point's before them: no key since.
+    let rewrapped_after =
+        |st: &TurnEndState, submits: Option<u64>, inputs: Option<u64>| TurnEndReading {
+            said_tail: None,
+            opened_by: None,
+            taskless: !st.redrawn_fresh(submits, inputs),
+            submits,
+            inputs_before: inputs,
+            screen_mark: Some(200),
+            program: aterm_phase::Program::Gemini,
+            ..idle("", None)
+        };
     let rewrapped = |st: &TurnEndState, submits: Option<u64>| TurnEndReading {
         said_tail: None,
         opened_by: None,
-        taskless: !st.redrawn_fresh(submits),
+        taskless: !st.redrawn_fresh(submits, Some(7)),
         submits,
+        inputs_before: Some(7),
         screen_mark: Some(200),
         program: aterm_phase::Program::Gemini,
         ..idle("", None)
@@ -22151,11 +22214,44 @@ fn a_launch_card_read_with_nothing_submitted_is_the_conversation_redrawn() {
     assert!(matches!(a, TurnEndAction::Type { .. }), "{a:?}");
     // NEGATIVE CONTROLS.
     let st = start();
-    assert!(!st.redrawn_fresh(Some(3)), "a /clear: the count moved");
-    assert!(!st.redrawn_fresh(None), "a host that counts none");
+    assert!(
+        !st.redrawn_fresh(Some(3), Some(8)),
+        "a /clear: the count moved"
+    );
+    assert!(!st.redrawn_fresh(None, Some(7)), "a host that counts none");
+    assert!(
+        !st.redrawn_fresh(Some(2), None),
+        "a host that counts no inputs"
+    );
+    // A KEY THAT CLEARED WITH NOTHING SUBMITTED: taskless as read, its back-off
+    // dropped.
+    assert!(
+        !st.redrawn_fresh(Some(2), Some(9)),
+        "keys since, no submission"
+    );
+    let mut st = start();
+    let keyed = rewrapped_after(&st, Some(2), Some(9));
+    assert!(keyed.taskless, "a key since: read as cleared");
+    let a = at(&mut st, &keyed, t + secs(10));
+    assert_eq!(a, TurnEndAction::Nothing, "cleared by a key: {a:?}");
+    // A write in flight at the point's read: no count before its rows.
+    let mut st = TurnEndState::default();
+    let first = TurnEndReading {
+        worked: Some(secs(6)),
+        inputs_before: None,
+        ..counted(opened(FIRST, PROMPT), 2, 100)
+    };
+    let _ = at(&mut st, &first, t);
+    assert!(
+        !st.redrawn_fresh(Some(2), Some(7)),
+        "a write in flight at the point"
+    );
     let mut st = start();
     st.host_moved();
-    assert!(!st.redrawn_fresh(Some(2)), "the harness's relaunch");
+    assert!(
+        !st.redrawn_fresh(Some(2), Some(7)),
+        "the harness's relaunch"
+    );
     let mut st = start();
     let cleared = TurnEndReading {
         taskless: true,
@@ -22164,7 +22260,7 @@ fn a_launch_card_read_with_nothing_submitted_is_the_conversation_redrawn() {
     let a = at(&mut st, &cleared, t + secs(10));
     assert_eq!(a, TurnEndAction::Nothing, "a cleared conversation: {a:?}");
     assert!(
-        !st.redrawn_fresh(Some(3)),
+        !st.redrawn_fresh(Some(3), Some(7)),
         "read so again after the /clear: no task"
     );
 }

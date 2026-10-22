@@ -157,7 +157,7 @@ pub(crate) fn project_focus_modifier_cache(
 }
 
 /// `on_resize` never leaves a zero-dimension grid even for a degenerate size (macOS
-/// `Resized` payloads can be unreliable): `pad_split` clamps rows/cols to ≥ 1, and a
+/// `Resized` payloads can be unreliable): the grid fit clamps rows and cols to ≥ 1, and a
 /// later normal size recovers full height. Headless drives the passed-size fallback.
 #[test]
 fn on_resize_never_yields_a_degenerate_or_wedged_grid() {
@@ -1095,7 +1095,7 @@ fn close_window_with_split_tab_detaches_every_pane() {
 #[test]
 fn divider_drag_resizes_split_headless() {
     let mut app = App::headless_for_test(); // window 0 = 24x80, session 0
-    let new_sid = app.split_active_stub_tab(WindowId(0)); // 1 | 2 vertical, divider @ col 40
+    let new_sid = app.split_active_stub_tab(WindowId(0)); // 0 | new_sid, divider at col 40
     let wid = WindowId(0);
 
     let left_before = app
@@ -2556,8 +2556,8 @@ fn screen_buffer_switches_retire_coordinates_and_preserve_companion_identity_and
                     .fold
                     .is_some()
             );
-            // Baseline the pet's completion latch on the old stream (seq 7):
-            // the owner edge must forget it.
+            // Baseline the pet's completion latch on the old stream (seq 7); the screen
+            // edge must forget it.
             let seeded = crate::app_render::pet_prepare_for_test(
                 ws,
                 now,

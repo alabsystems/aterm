@@ -1265,8 +1265,7 @@ mod tests {
         assert!(no.matches('1') && no.matches('\u{e9}'));
     }
 
-    /// Whitespace inside `{…}` is insignificant even outside `x` mode, which is
-    /// what the `regex` crate does.
+    /// Whitespace inside `{…}` is insignificant even outside `x` mode.
     #[test]
     fn counted_repetition_tolerates_spaces() {
         assert!(matches!(

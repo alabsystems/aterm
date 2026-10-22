@@ -953,6 +953,105 @@ pub(crate) struct HoverMapping {
     pane_rect: (u16, u16, u16, u16),
 }
 
+/// THE GRID A FRAME'S GLASS WAS LAID ON: every input of where a frame cell
+/// lands among the window's pixels (the cell size, the insets, the frame's
+/// origin in the window) and of where each pane's rows and columns land among
+/// the frame's cells (the window grid, the chrome rows above it, the visible
+/// tab's split) — read lock-free, with no plan built ([`App::glass_grid`]).
+/// The harness's glass records its targets in frame cells as a frame lays
+/// them (`crate::claude_lights`) and stamps them with this; a pointer event
+/// that comes between a re-grid (a window resize, a font zoom, a split, a
+/// strip or band that grew) and the next frame would otherwise be hit-tested
+/// against the last frame's targets at a geometry the window no longer has,
+/// and hover or press what is no longer there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GlassGrid {
+    /// Cell size and the three insets.
+    geom: PointerGeometry,
+    /// The frame's top-left in window pixels ([`App::frame_origin_with`]).
+    origin: (i64, i64),
+    /// The window grid `(rows, cols)`.
+    dims: (u16, u16),
+    /// The chrome rows (strip, presence row, message band) above the grid.
+    chrome_rows: u16,
+    /// The visible tab's split, folded ([`split_word`]).
+    split: u64,
+}
+
+impl GlassGrid {
+    /// The window's cell in device pixels, `(w, h)`.
+    pub(crate) const fn cell(&self) -> (usize, usize) {
+        self.geom.cell
+    }
+
+    /// Window pixel `(x, y)` as a frame cell `(row, col)` under this grid:
+    /// [`App::frame_cell_at`]'s mapping ([`frame_cell_of`]).
+    pub(crate) fn cell_at(&self, x: f64, y: f64) -> Option<(usize, usize)> {
+        frame_cell_of(self.geom, self.origin, self.dims.1, x, y)
+    }
+}
+
+/// Window pixel `(x, y)` as a frame cell `(row, col)` of a frame whose cells
+/// are `geom`'s, whose top-left is window pixel `origin` and whose grid is
+/// `cols` wide: row 0 the strip's first row, `None` off the grid's interior
+/// (the insets, past the right edge). The one mapping [`App::frame_cell_at`]
+/// and [`GlassGrid::cell_at`] share.
+fn frame_cell_of(
+    geom: PointerGeometry,
+    (ox, oy): (i64, i64),
+    cols: u16,
+    x: f64,
+    y: f64,
+) -> Option<(usize, usize)> {
+    let (cw, ch) = (geom.cell.0.max(1), geom.cell.1.max(1));
+    let top = geom.pad_top + geom.head;
+    let (fx, fy) = (x - ox as f64, y - oy as f64);
+    if fy < top as f64 || fx < geom.pad as f64 {
+        return None;
+    }
+    let row = ((fy as usize).saturating_sub(top)) / ch;
+    let col = ((fx as usize).saturating_sub(geom.pad)) / cw;
+    (col < usize::from(cols)).then_some((row, col))
+}
+
+/// Tab `tab`'s split folded into one word: its identity, its zoom (and the
+/// leaf a zoom shows), every split's axis and ratio and every leaf's view —
+/// what the visible plan's pane rects follow from besides the window grid
+/// ([`GlassGrid`]). A walk of the tree's few nodes: no allocation.
+fn split_word(tab: Option<&crate::tab_model::Tab>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn fold(tree: &crate::tab_model::SplitTree<crate::tab_model::ViewId>, h: &mut impl Hasher) {
+        match tree {
+            crate::tab_model::SplitTree::Leaf(view) => {
+                0u8.hash(h);
+                view.hash(h);
+            }
+            crate::tab_model::SplitTree::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                1u8.hash(h);
+                matches!(axis, crate::tab_model::SplitAxis::Horizontal).hash(h);
+                ratio.to_bits().hash(h);
+                fold(first, h);
+                fold(second, h);
+            }
+        }
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Some(tab) = tab {
+        tab.id.hash(&mut h);
+        tab.zoomed.hash(&mut h);
+        if tab.zoomed {
+            tab.focus.hash(&mut h);
+        }
+        fold(&tab.root, &mut h);
+    }
+    h.finish()
+}
+
 /// Pane-local result of one pointer-to-cell mapping. The pane rectangle is
 /// carried with the cell so selection autoscroll can reuse the same split plan.
 #[derive(Clone, Copy)]
@@ -2974,19 +3073,24 @@ impl App {
     /// onto the nearest cell, so a press in the top border or past the right edge would hit
     /// a menu row it never touched. A point outside the grid interior is `None`, off the card.
     pub(crate) fn frame_cell_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(usize, usize)> {
-        let (cw, ch) = self.win_cell_size(wid);
-        let (cw, ch) = (cw.max(1), ch.max(1));
-        let pad = self.win_pad(wid);
-        let top = self.win_pad_top(wid) + self.win_head(wid);
-        let cols = self.windows.get(&wid).map_or(0, |ws| ws.cols) as usize;
-        let (ox, oy) = self.frame_origin(wid);
-        let (fx, fy) = (x - ox as f64, y - oy as f64);
-        if fy < top as f64 || fx < pad as f64 {
-            return None;
-        }
-        let row = ((fy as usize).saturating_sub(top)) / ch;
-        let col = ((fx as usize).saturating_sub(pad)) / cw;
-        (col < cols).then_some((row, col))
+        let geom = self.pointer_geometry(wid);
+        let cols = self.windows.get(&wid).map_or(0, |ws| ws.cols);
+        frame_cell_of(geom, self.frame_origin_with(wid, geom), cols, x, y)
+    }
+
+    /// The grid window `wid`'s frame is laid on now ([`GlassGrid`]): what
+    /// the harness's glass stamps a frame's targets with, and what a pointer
+    /// event finds them stamped with or not. `None` for no window.
+    pub(crate) fn glass_grid(&self, wid: WindowId) -> Option<GlassGrid> {
+        let ws = self.windows.get(&wid)?;
+        let geom = self.pointer_geometry(wid);
+        Some(GlassGrid {
+            geom,
+            origin: self.frame_origin_with(wid, geom),
+            dims: (ws.rows, ws.cols),
+            chrome_rows: self.chrome_rows(wid),
+            split: split_word(ws.tab_set.active()),
+        })
     }
 
     /// The open menu's recorded rect plus the frame cell under `(x, y)`, once the menu has
@@ -10111,8 +10215,8 @@ mod tests {
         assert!(!tracking_bypass_held(M::SUPER));
     }
 
-    /// Audit M6 — Option+drag is the rectangular block selection only when the press
-    /// was local anyway; while Option buys the tracking bypass it selects normally.
+    /// Option+drag is the rectangular block selection only when the press was local anyway;
+    /// while Option buys the tracking bypass it selects normally.
     #[test]
     fn option_drag_kind_depends_on_who_owns_the_mouse() {
         assert_eq!(

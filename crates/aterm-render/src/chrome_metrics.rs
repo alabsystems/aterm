@@ -141,9 +141,7 @@ mod tests {
         }
     }
 
-    /// `q_round_to_px` half-pixel bound over a dense signed lattice: the error
-    /// depends only on `q mod Q`, and the lattice holds every residue many
-    /// times over, on both signs.
+    /// `q_round_to_px` stays within half a pixel over every residue mod `Q`, on both signs.
     #[test]
     fn rounding_error_bounded_by_half_px() {
         for q in -100_000..=100_000i64 {

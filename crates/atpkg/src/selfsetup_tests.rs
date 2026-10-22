@@ -1052,9 +1052,10 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
     write(&support.join("caffeine.lock"), "");
     write(&support.join("caffeine/l.plist"), "<plist/>");
     write(
-        &support.join("caffeine-code.noindex/l/aterm.app/Contents/Info.plist"),
+        &support.join("caffeine-code.noindex/l/1-2/aterm.app/Contents/Info.plist"),
         "<plist/>",
     );
+    write(&support.join("caffeine-code.noindex/l/1-2/ran"), "");
     let (ok, out, err) = a.sweep(None, true);
     assert!(ok, "{out}{err}");
     for step in ["caffeine startup off", "caffeine quit"] {
@@ -1156,6 +1157,193 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
             "only a failed step keeps its bundle: {kind}: {out}"
         );
         drop(held);
+    }
+}
+
+/// A copy of the app no Caffeine mug said it ran from, and younger than the first-exec hang,
+/// stays through an uninstall, SKIPPED with when it may go: its mug was stopped before it said
+/// so, macOS may still be assessing its first exec, and on macOS 27.0.1 removing it then crashes
+/// `syspolicyd`. Everything else in the code directory goes: a copy a mug ran from, a half-made
+/// one, one older than the hang, a stray file, a label holding no such copy. NEGATIVE CONTROL:
+/// removing the code directory whole, as the sweep did before, fails it.
+#[test]
+fn an_uninstall_keeps_a_caffeine_copy_macos_may_still_be_assessing() {
+    let a = Account::new("caffeine-young");
+    let support = a.home().join("Library/Application Support/aterm");
+    let app = a.home().join("Applications/aterm.app");
+    bundle(&app, None);
+    exe(&app.join("Contents/MacOS/aterm"), "#!/bin/sh\nexit 0\n");
+    // Asked once first, so the system's first-exec assessment of the stand-in is behind the
+    // sweep and does not age the copies whose minutes are read below.
+    aterm_spec::wait::first_exec(&app.join("Contents/MacOS/aterm"), &["help", "caffeine"]);
+    write(&support.join("caffeine.state"), "mode=off\n");
+    write(&support.join("caffeine.lock"), "");
+    write(&support.join("caffeine/l.plist"), "<plist/>");
+    let code = support.join("caffeine-code.noindex");
+    let plist = "aterm.app/Contents/Info.plist";
+    for copy in ["l/9-1", "l/9-2", "l/9-3.partial", "l/9-4", "l/9-6", "m/9-5"] {
+        write(&code.join(copy).join(plist), "<plist/>");
+    }
+    // Stamped at its exec a minute of awake time ago, its directory older than the hang on
+    // the wall clock (the Mac slept since): still young.
+    if let Some(awake) = aterm_uds::process::awake_ms() {
+        write(
+            &code.join("l/9-6").join(aterm_uds::deadline::EXEC_STAMP),
+            (awake.saturating_sub(60_000)).to_string(),
+        );
+    }
+    for ran in ["l/9-2", "m/9-5"] {
+        write(&code.join(ran).join(aterm_uds::deadline::RAN), "");
+    }
+    write(&code.join("stray"), "");
+    let made = std::time::SystemTime::now()
+        - aterm_uds::deadline::FIRST_EXEC_HANG
+        - std::time::Duration::from_secs(60);
+    for aged in ["l/9-4", "l/9-6"] {
+        std::fs::File::open(code.join(aged))
+            .and_then(|dir| dir.set_modified(made))
+            .expect("age the copy");
+    }
+
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(!ok, "a kept copy is a partial result: {out}{err}");
+    // The awake minutes a copy's SKIPPED line names.
+    let minutes = |copy: &Path| -> u64 {
+        let line = err
+            .lines()
+            .find(|line| line.contains(&format!("SKIPPED {} ", copy.display())))
+            .unwrap_or_else(|| panic!("no SKIPPED line for {}: {err}", copy.display()));
+        assert!(line.contains("syspolicyd"), "{line}");
+        line.split("awake ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no awake minutes: {line}"))
+    };
+    let young = code.join("l/9-1");
+    let young_left = minutes(&young);
+    assert!((1..=10).contains(&young_left), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(young.join(plist)).expect("the young copy stays"),
+        "<plist/>"
+    );
+    if aterm_uds::process::awake_ms().is_some() {
+        let slept = code.join("l/9-6");
+        assert!(
+            slept.join(plist).is_file(),
+            "kept on the awake clock: {err}"
+        );
+        // A minute less than the unstamped copy made just now, give or take the minute
+        // boundary between the two readings, not the wall clock's minute or so left.
+        let slept_left = minutes(&slept);
+        assert!(
+            slept_left < young_left && young_left - slept_left <= 2,
+            "{slept_left} vs {young_left}: {err}"
+        );
+    }
+    for gone in ["l/9-2", "l/9-3.partial", "l/9-4", "m", "stray"] {
+        assert!(!present(&code.join(gone)), "{gone}: {out}");
+    }
+    for gone in ["caffeine", "caffeine.state"] {
+        assert!(!present(&support.join(gone)), "{gone}: {out}");
+    }
+    assert!(!app.exists(), "the bundle goes: its quit succeeded: {out}");
+}
+
+/// A mug started from the store's `aterm` (the source lane: a bare build runs where it is) is
+/// stopped through that `aterm` before step 3 removes it, as a bundle's is; a store `aterm`
+/// whose step failed stays, with the mug's files. NEGATIVE CONTROL: with only the bundles
+/// asked, nothing asked the store's `aterm`, and it went with its mug still running.
+#[test]
+fn an_uninstall_quits_a_mug_the_stores_aterm_runs() {
+    for fails in [false, true] {
+        let mut a = Account::new(if fails {
+            "caffeine-store-fails"
+        } else {
+            "caffeine-store"
+        });
+        let support = a.home().join("Library/Application Support/aterm");
+        let store = a.dir.join("store");
+        let log = a.dir.join("asked.log");
+        let fail = if fails {
+            "[ \"$*\" = 'caffeine quit' ] && exit 1\n"
+        } else {
+            ""
+        };
+        exe(
+            &store.join("aterm"),
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'aterm 0.0.0'; exit 0; }}\n\
+                 echo \"$*\" >>'{}'\n{fail}exit 0\n",
+                log.display()
+            ),
+        );
+        aterm_spec::wait::first_exec(&store.join("aterm"), &["--version"]);
+        a.places.store_dir = store.clone();
+        write(&support.join("caffeine.state"), "mode=off\n");
+        write(&support.join("caffeine.lock"), "");
+        let (ok, out, err) = a.sweep(None, false);
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("the store's aterm was asked"),
+            "help caffeine\ncaffeine startup off\ncaffeine quit\n",
+            "{out}{err}"
+        );
+        assert_eq!(ok, !fails, "{out}{err}");
+        assert_eq!(store.join("aterm").exists(), fails, "{out}{err}");
+        assert_eq!(
+            present(&support.join("caffeine.state")),
+            fails,
+            "{out}{err}"
+        );
+    }
+}
+
+/// With another aterm staying, a scoped uninstall asks its build to quit only its own mug
+/// (`caffeine quit own`) once its startup is off, and leaves the shared files to the aterm
+/// that stays. A build from before `own` answers a usage error (exit 2), which is not a
+/// failure: its bundle goes, and a mug it runs keeps running, as before. NEGATIVE CONTROL: a
+/// scoped run asked only `caffeine startup off`.
+#[test]
+fn a_scoped_uninstall_quits_only_its_own_mug() {
+    for old in [false, true] {
+        let mut a = Account::new(if old {
+            "caffeine-scoped-old"
+        } else {
+            "caffeine-scoped"
+        });
+        let home = a.home().to_path_buf();
+        let support = home.join("Library/Application Support/aterm");
+        let log = a.dir.join("asked.log");
+        bundle(&home.join("Applications/aterm.app"), None);
+        let scoped = home.join("aterm.app");
+        bundle(&scoped, None);
+        let refuse = if old {
+            "[ \"$*\" = 'caffeine quit own' ] && exit 2\n"
+        } else {
+            ""
+        };
+        exe(
+            &scoped.join("Contents/MacOS/aterm"),
+            &format!(
+                "#!/bin/sh\necho \"$*\" >>'{}'\n{refuse}exit 0\n",
+                log.display()
+            ),
+        );
+        a.places.install_dir = Some(home.clone());
+        write(&support.join("caffeine.state"), "mode=off\n");
+        write(&support.join("caffeine.lock"), "");
+        let (ok, out, err) = a.sweep(None, false);
+        assert!(ok, "{out}{err}");
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("asked"),
+            "help caffeine\ncaffeine startup off\ncaffeine quit own\n"
+        );
+        assert!(!scoped.exists(), "{out}");
+        assert!(
+            support.join("caffeine.state").exists(),
+            "the staying aterm's: {out}"
+        );
+        assert_eq!(out.contains("cannot quit only its own mug"), old, "{out}");
     }
 }
 

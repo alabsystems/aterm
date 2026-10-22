@@ -6,7 +6,7 @@
 
 use super::*;
 
-/// Prove that push_line with line_limit does NOT degrade with scrollback size.
+/// push_line under a line limit does not degrade with scrollback size.
 ///
 /// #5893: cold tier front_offset gives O(1) truncate, where a decompress-all
 /// truncate costs O(total_lines) per push to a full scrollback.
@@ -51,16 +51,9 @@ fn push_with_line_limit_constant_time_truncate() {
     }
 }
 
-/// #5918: Prove that `remove_newest(1)` on a large scrollback does NOT spike
-/// memory to O(total_lines).
-///
-/// Loading ALL kept lines into a Vec when removal spans tiers OOMs on large
-/// scrollbacks; the tier-aware path decompresses at most one boundary block
-/// (~block_size lines).
-///
-/// This test verifies the memory-bounded property by checking that
-/// `memory_used()` after `remove_newest(1)` stays close to the pre-removal
-/// level — NOT doubling from full-materialization.
+/// `remove_newest(1)` across tiers decompresses at most one boundary block
+/// (~block_size lines), so `memory_used()` stays near its pre-removal level
+/// rather than doubling from full materialization.
 #[test]
 fn remove_newest_memory_bounded_cross_tier() {
     // A 5-line hot limit clamps block_size to 5, so a cross-tier

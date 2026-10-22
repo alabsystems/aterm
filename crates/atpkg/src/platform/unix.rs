@@ -14,14 +14,13 @@ use std::path::{Path, PathBuf};
 
 use aterm_types::fs_restricted::dir_safe_for_private_write;
 
-/// Appended to a tool name to form the concrete executable name. Empty on Unix.
-/// Applied ONLY by [`crate::store::ToolName::exe_file`]: both suffixes are `""` here, so a
-/// hand-written append would go unnoticed until a Windows build.
+/// Appended to a tool name to form its executable name: empty on Unix. Applied only by
+/// [`crate::store::ToolName::exe_file`]; both suffixes are `""` here, so a hand-written
+/// append would go unnoticed until a Windows build.
 pub const EXE_SUFFIX: &str = "";
-/// Appended to a tool name to form the concrete `bin/` shim filename. Empty on Unix
-/// (the shim is an exec stub named `<tool>`). Applied ONLY by
-/// [`crate::store::ToolName::shim_file`] and stripped ONLY by
-/// [`crate::store::ToolName::from_shim_file`].
+/// Appended to a tool name to form its `bin/` shim name: empty on Unix (the shim is an exec
+/// stub named `<tool>`). Applied only by [`crate::store::ToolName::shim_file`]; stripped
+/// only by [`crate::store::ToolName::from_shim_file`].
 pub const SHIM_SUFFIX: &str = "";
 
 /// The default install prefix under `home`. On macOS
@@ -275,12 +274,9 @@ pub fn universal_control_state() -> [crate::machine::Read<bool>; 2] {
                 .arg("read")
                 .arg(UNIVERSAL_CONTROL_DOMAIN)
                 .arg(key);
-            // ABSENT IS AN ANSWER; UNUSABLE IS NOT. `defaults read` of a key that is not
-            // set exits 1 with EMPTY stdout — that is macOS saying "the OS default", and
-            // it is the shape this feature is normally looking at. Anything else (the
-            // binary would not run, the deadline killed it, a nonzero exit that still
-            // printed something, or output this module cannot parse) taught us nothing,
-            // and must not be folded into the same `None` the OS default arrives as.
+            // Absent is an answer, unusable is not: an unset key exits 1 with empty stdout
+            // (the OS default). Anything else (no spawn, the deadline, a nonzero exit that
+            // printed, unparseable output) taught nothing and must not read as absent.
             match bounded_exit_and_stdout(&mut cmd) {
                 Some((true, out)) => match crate::machine::parse_defaults_bool(&out) {
                     Some(value) => Read::Value(value),
@@ -309,8 +305,8 @@ pub fn universal_control_state() -> [crate::machine::Read<bool>; 2] {
 }
 
 /// Write both Universal Control switches true for the current host (`defaults
-/// -currentHost write com.apple.universalcontrol <key> -bool true`). `true` iff both
-/// writes exited 0. No sudo: the domain is the user's. The revert is
+/// -currentHost write com.apple.universalcontrol <key> -bool true`); `true` iff both writes
+/// exited 0. No sudo: the domain is the user's. The revert is
 /// [`crate::machine::UNIVERSAL_CONTROL_REVERT`]. Non-macOS: `false`, nothing run.
 #[must_use]
 pub fn universal_control_disable() -> bool {
@@ -413,9 +409,8 @@ pub fn rosetta_install(within: std::time::Duration) -> Result<(), String> {
     }
 }
 
-/// [`bounded_stdout`], but keeping the child's SUCCESS bit instead of folding a nonzero
-/// exit into `None`: `defaults read` uses exit 1 with empty output to mean "this key is
-/// not set", a real answer the caller must tell apart from a read that did not happen.
+/// [`bounded_stdout`], keeping the child's success bit: `defaults read` exits 1 with empty
+/// output for "this key is not set", an answer to tell apart from a read that did not run.
 #[cfg(target_os = "macos")]
 fn bounded_exit_and_stdout(cmd: &mut aterm_uds::spawnfd::Command) -> Option<(bool, Vec<u8>)> {
     bounded_stdout_inner(cmd, BOUNDED_CEILING)
@@ -446,15 +441,12 @@ fn bounded_stdout_inner(
     crate::doctor::output_bounded_within(cmd, ceiling).map(|out| (out.status.success(), out.stdout))
 }
 
-/// The system-prefix counterpart of `ensure_private_dir`'s `0700`. A root-owned store
-/// exists precisely so every user can execute out of it, so it must be readable and
-/// traversable by all — while staying writable only by root, which is what the prefix
-/// chain check enforces and what Trust's launcher predicate requires
-/// (`mode & 0o022 == 0`). `0755` satisfies both; `0700` satisfies both checks too and
-/// then denies every non-root user at exec time.
+/// The system-prefix counterpart of `ensure_private_dir`'s `0700`: `0755`. A root-owned
+/// store exists so every user can execute out of it, while staying writable only by root
+/// (the prefix chain check and Trust's launcher predicate, `mode & 0o022 == 0`). `0700`
+/// passes both checks and then denies every non-root user at exec time.
 ///
-/// Fails closed on a symlink at the target, mirroring `ensure_private_dir`: a
-/// pre-created link must never capture our writes.
+/// Fails closed on a symlink at the target, like `ensure_private_dir`.
 pub fn ensure_shared_dir(dir: &Path) -> std::io::Result<()> {
     if let Ok(md) = std::fs::symlink_metadata(dir)
         && md.file_type().is_symlink()
@@ -475,21 +467,15 @@ pub fn ensure_shared_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Whether a directory's metadata says it is SYSTEM-owned: owned by root (uid 0) and
-/// not group/other-writable.
+/// Whether a directory's metadata says it is system-owned: owned by root and not
+/// group/other-writable.
 ///
-/// The second trusted chain shape, and the one a verified toolchain requires. The
-/// `$HOME` chain check answers "no attacker-writable ancestor" by proving every
-/// component is ours; a root-owned chain answers the same question at least as
-/// strongly — nothing below root can swap a component. This shape is for a genuinely
-/// shared multi-user store.
-///
-/// Trust's default `CallerOwned` mode admits a component owned by root OR by the invoking
-/// identity (`process_authority.rs`; it REFUSES to authenticate at all when targo runs as
-/// root), so a user-owned 0700 prefix proves fine too.
-///
-/// Deliberately NOT "root-owned OR ours": admitting our own uid here would let the
-/// system prefix fall back to exactly the property the verified lane refuses.
+/// The second trusted chain shape, for a shared multi-user store, and the one a verified
+/// toolchain requires: nothing below root can swap a root-owned component. Trust's default
+/// `CallerOwned` mode admits root or the invoking identity (and refuses to authenticate at
+/// all as root), so a user-owned `0700` prefix proves fine too. Deliberately not
+/// "root-owned or ours": that would let the system prefix fall back to exactly the property
+/// the verified lane refuses.
 #[must_use]
 pub fn dir_meta_is_system(meta: &Metadata) -> bool {
     meta.uid() == 0 && meta.mode() & 0o022 == 0
@@ -504,44 +490,34 @@ pub fn dir_meta_is_private(meta: &Metadata) -> bool {
 
 /// Whether the CALLING user can write into `dir`.
 ///
-/// This answers the question [`dir_meta_is_system`] does not. That a prefix chain is
-/// *trusted* — every component root-owned and not group/other-writable — says nothing
-/// about whether the caller can *use* it. A non-root user with a root-owned prefix
-/// configured passes the trust check and then fails on `store.lock` for every verb,
-/// forever.
-///
-/// Uses `access(2)` rather than re-deriving permission from the mode bits, so group
-/// membership and ACLs are honoured by the kernel instead of approximated here. It
-/// tests the REAL uid, which is what we want: atpkg is not setuid, and the question is
-/// "can this user install", not "can this process momentarily write".
+/// `access(2)`, so the kernel honours group membership and ACLs. It tests the real uid,
+/// which is right: atpkg is not setuid, and the question is "can this user install".
 #[must_use]
 pub fn dir_writable_by_caller(dir: &Path) -> bool {
     let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
         // An interior NUL cannot name a real directory.
         return false;
     };
-    // SAFETY: `c` is a valid NUL-terminated C string that outlives the call, and
-    // `access` only reads it.
+    // SAFETY: `c` is a NUL-terminated C string that outlives the call; `access` only reads
+    // it.
     unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
 }
 
-/// Whether `meta` (from `symlink_metadata`) is a link-like indirection that must NOT be
-/// trusted as a real directory in the fail-closed prefix chain check. On Unix that is
-/// exactly a symlink; the Windows backend also treats a directory **junction** (a reparse
-/// point that reports `is_symlink() == false`) as disqualifying.
+/// Whether `meta` (from `symlink_metadata`) is a link-like indirection the fail-closed
+/// prefix chain check must not trust as a directory: on Unix, exactly a symlink.
 #[must_use]
 pub fn is_reparse(meta: &Metadata) -> bool {
     meta.file_type().is_symlink()
 }
 
-/// Remove whatever indirection sits at `link`. On Unix a `store/<program>/current` link is a
-/// symlink, so `remove_file` unlinks it (never following into the target). Best-effort.
+/// Remove whatever indirection sits at `link`: on Unix a symlink, which `remove_file`
+/// unlinks without following. Best-effort.
 pub fn remove_link(link: &Path) {
     let _ = fs::remove_file(link);
 }
 
-/// Force a file to `0600` (owner-only). The Unix hardening for the durable
-/// floor/pin/links/cache state files.
+/// Force a file to `0600`: the hardening for the durable floor, pin, links and cache state
+/// files.
 pub fn harden_file(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, Permissions::from_mode(0o600))
 }
@@ -551,22 +527,17 @@ pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     fs::set_permissions(path, Permissions::from_mode(mode))
 }
 
-/// Set an OPEN file's permission bits to `mode`: `fchmod(2)` on the handle, which std
-/// lowers `File::set_permissions` to.
-///
-/// The same bits as [`set_mode`], for a caller that still holds the file it just wrote
-/// ([`crate::extract::write_capped`]): no second resolution of the path — which for a
-/// staged toolchain is a deep `<prefix>/store/<program>/<build>.incoming-<pid>/lib/...`
-/// walk paid once per file — and the mode lands on the inode we wrote by construction
-/// rather than on whatever the name resolves to now.
+/// Set an open file's permission bits to `mode` (`fchmod(2)` on the handle), for a caller
+/// that still holds the file it just wrote ([`crate::extract::write_capped`]): no second
+/// path resolution (a deep walk per file in a staged toolchain), and the mode lands on the
+/// inode written rather than whatever the name resolves to now.
 pub fn set_mode_on(f: &File, mode: u32) -> io::Result<()> {
     f.set_permissions(Permissions::from_mode(mode))
 }
 
-/// The BSD file flags that stop an entry's OWNER changing or removing it — user and
-/// system immutable and append-only (`chflags(1)`'s `uchg`, `uappnd`, `schg`, `sappnd`).
-/// No archive lane lays a flag; `ditto` copies a bundle's with it (the `dmg` lane,
-/// `install::vet_copied_tree`).
+/// The BSD file flags that stop an entry's owner changing or removing it: user and system
+/// immutable and append-only (`uchg`, `uappnd`, `schg`, `sappnd`). No archive lane lays a
+/// flag; `ditto` copies a bundle's with it (the `dmg` lane, `install::vet_copied_tree`).
 #[cfg(target_os = "macos")]
 pub const OWNER_BINDING_FLAGS: u32 =
     libc::UF_IMMUTABLE | libc::UF_APPEND | libc::SF_IMMUTABLE | libc::SF_APPEND;
@@ -596,9 +567,9 @@ pub fn open_create_write(path: &Path, mode: u32) -> io::Result<File> {
 }
 
 /// Create `path` for writing with initial permission `mode`, failing
-/// [`io::ErrorKind::AlreadyExists`] when the NAME already resolves to anything —
-/// `O_CREAT|O_EXCL`, which follows no symlink and which the filesystem answers by its own
-/// name equality (case-insensitive APFS, Unicode normalization), not by the bytes asked.
+/// [`io::ErrorKind::AlreadyExists`] when the name already resolves to anything
+/// (`O_CREAT|O_EXCL`: follows no symlink, and the filesystem answers by its own name
+/// equality, e.g. case-insensitive APFS, not by the bytes asked).
 pub fn open_create_new_write(path: &Path, mode: u32) -> io::Result<File> {
     OpenOptions::new()
         .write(true)
@@ -607,29 +578,23 @@ pub fn open_create_new_write(path: &Path, mode: u32) -> io::Result<File> {
         .open(path)
 }
 
-/// Open `path` the way [`sync_file_contents`] needs it: read-only — `fsync(2)` takes any
-/// open descriptor, and a read-only open never fails on a file the store cannot write
-/// (no lane lays one since AT3, 2026-10-10, when the `dmg` lane stopped keeping the
-/// image's modes and owners; the read-only open asks for nothing it does not need).
+/// Open `path` for [`sync_file_contents`]: read-only, since `fsync(2)` takes any open
+/// descriptor and a read-only open asks for nothing it does not need.
 pub fn open_for_sync(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
-/// Push ONE open file's contents out of the page cache: a plain `fsync(2)`.
+/// Push one open file's contents out of the page cache: a plain `fsync(2)`.
 ///
-/// **Deliberately not [`File::sync_all`].** On Apple targets std lowers BOTH `sync_all`
-/// and `sync_data` to `fcntl(F_FULLFSYNC)` — a full device-cache flush, a barrier of
-/// milliseconds each however few bytes the file holds. The caller
-/// ([`crate::store::sync_tree`]) flushes an entire staged toolchain, tens of thousands of
-/// files for the ~3.4 GB `trust` member, so a drive flush per file would add minutes to
-/// every install and buy only the difference between "the drive acknowledged the write"
-/// and "the drive's cache is on platter". `fsync(2)` buys the property the store actually
-/// needs and cannot do without: the tree's DATA reaches the filesystem before the renames
-/// and the completeness marker that vouch for it become durable, so no crash can leave a
-/// build marked installed over zero-length files.
+/// Not [`File::sync_all`]: on Apple targets std lowers both `sync_all` and `sync_data` to
+/// `fcntl(F_FULLFSYNC)`, a device-cache flush of milliseconds per file. The caller
+/// ([`crate::store::sync_tree`]) flushes a whole staged toolchain (tens of thousands of
+/// files for `trust`), where that would add minutes per install. `fsync(2)` gives what the
+/// store needs: the tree's data reaches the filesystem before the renames and the
+/// completeness marker that vouch for it become durable, so no crash leaves a build marked
+/// installed over zero-length files.
 ///
-/// `EINTR` is retried rather than reported, exactly as std's own `cvt_r` does: an
-/// interrupted call is not a flush that failed.
+/// `EINTR` is retried, as std's `cvt_r` does: an interrupted call is not a failed flush.
 pub fn sync_file_contents(f: &File) -> io::Result<()> {
     use std::os::unix::io::AsRawFd as _;
     loop {
@@ -657,11 +622,10 @@ pub fn permission_mode(meta: &Metadata) -> u32 {
 /// and never a declared-mode record ([`crate::tree::tree_root_declared`]).
 pub const HAS_POSIX_MODES: bool = true;
 
-/// The mode slot the extraction-time fold records for a file just written with
-/// `requested` bits: the bits READ BACK from the open handle (`meta`), masked to
-/// `0o7777` — never the request — so a filesystem that stores something other than what
-/// it was asked for moves the root and the stage fails closed. Unix stores them
-/// verbatim (`fchmod`), so this equals `requested` on every filesystem atpkg has met.
+/// The mode the extraction-time fold records for a file just written with `requested`
+/// bits: the bits read back from the open handle (`meta`), masked to `0o7777`, never the
+/// request, so a filesystem that stores something else moves the root and the stage fails
+/// closed.
 #[must_use]
 pub fn folded_mode(meta: &Metadata, requested: u32) -> u32 {
     let _ = requested;
@@ -674,10 +638,9 @@ pub fn os_str_bytes(s: &OsStr) -> &[u8] {
     s.as_bytes()
 }
 
-/// Free bytes on the volume holding `dir` (which must EXIST), or `None` on any
-/// `statvfs` failure. Uses `f_bavail` — blocks free to an UNPRIVILEGED user (correct:
-/// atpkg never runs as root) — times the fragment size, saturating so a pathological
-/// filesystem can never wrap to a bogus "fits".
+/// Free bytes on the volume holding `dir` (which must exist), or `None` on any `statvfs`
+/// failure: `f_bavail` (blocks free to an unprivileged user) times the fragment size,
+/// saturating so a pathological filesystem never wraps to a bogus "fits".
 #[must_use]
 pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
@@ -696,10 +659,9 @@ pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
     Some((st.f_bavail as u64).saturating_mul(frsize as u64))
 }
 
-/// Atomically point `link` at `target`: create a sibling temp symlink and `rename(2)` it
-/// over `link`. `rename` is atomic on POSIX, so the swap has no window where `link` is
-/// missing or partially written — even if a previous `link` already existed. The
-/// directory-indirection primitive behind `store/<program>/current` and the sysroot dir links.
+/// Atomically point `link` at `target`: a sibling temp symlink `rename(2)`d over `link`, so
+/// there is no window where `link` is missing. The directory indirection behind
+/// `store/<program>/current` and the sysroot dir links.
 pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
     let file_name = link
         .file_name()
@@ -709,7 +671,6 @@ pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
     // A leftover temp from a crashed run must not block us.
     let _ = fs::remove_file(&tmp);
     std::os::unix::fs::symlink(target, &tmp)?;
-    // Atomic replace. On failure, clean the temp so it can't accumulate.
     if let Err(e) = fs::rename(&tmp, link) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
@@ -717,9 +678,8 @@ pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Install a bin shim at `shim` forwarding to `target`, exporting `env` first (design
-/// S7; an empty `env` is the plain shim). The `(shim, target)` form without an
-/// environment is [`super::install_shim_to`].
+/// Install a bin shim at `shim` forwarding to `target`, exporting `env` first (empty: the
+/// plain shim). The form without an environment is [`super::install_shim_to`].
 pub fn install_shim_to_env(
     shim: &Path,
     target: &Path,
@@ -728,19 +688,15 @@ pub fn install_shim_to_env(
     crate::lay::write_in_process(&shim_executable_to_env(shim, target, env)?)
 }
 
-/// The shim [`install_shim_to_env`] lays, RENDERED but not written: an EXEC STUB, not a
-/// symlink (`platform::sh_shim_content` says why). Written by [`crate::lay`] —
-/// temp+rename, `0755` — so a shim on the user's PATH is never briefly absent or
-/// half-written.
+/// The shim [`install_shim_to_env`] lays, rendered but not written: an exec stub, not a
+/// symlink (`platform::sh_shim_content` says why), laid by [`crate::lay`] (temp + rename,
+/// `0755`) so a shim on PATH is never briefly absent or half-written.
 ///
-/// ROUTED WHEN AN EXEC ROOT STANDS. The body carries the guard line of
-/// `platform::sh_shim_content_routed` exactly when [`crate::compat::route_for_shim`]
-/// finds a complete exec root for the trust build `target` lies in — `stat` only, and
-/// `None` for every other program, every build without a root and every target outside
-/// this shim's prefix. Deciding it HERE, in the one function every shim writer renders
-/// through (`install_tools_env`, the alias and agents reconciles, flow's restore,
-/// linkmode's unlink), keeps a writer from laying a plain shim beside a root that the
-/// next reconcile would have to route again; with no root the body is the plain shim.
+/// The body carries `platform::sh_shim_content_routed`'s guard line exactly when
+/// [`crate::compat::route_for_shim`] finds a complete exec root for the trust build `target`
+/// lies in (`stat` only). Deciding it here, in the one function every shim writer renders
+/// through, keeps a writer from laying a plain shim beside a root that the next reconcile
+/// would have to route again.
 pub fn shim_executable_to_env(
     shim: &Path,
     target: &Path,
@@ -779,29 +735,23 @@ pub fn install_twin_to_env(
     crate::lay::write_in_process(&twin_executable_to_env(shim, target, env, prelude)?)
 }
 
-/// Install a **failing tombstone shim** at `shim` — a tiny `sh` script that prints
-/// `message` to stderr and exits 70 (`EX_SOFTWARE`). Written atomically (temp `0755` +
-/// `rename(2)`), replacing whatever shim (symlink or file) was there.
+/// Install a failing tombstone shim at `shim`: an `sh` script that prints `message` to
+/// stderr and exits 70 (`EX_SOFTWARE`), laid through [`crate::lay`] (temp `0755` +
+/// `rename(2)`) over whatever shim was there.
 pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
-    // The failing script. `printf '%s\n' <quoted>` keeps the message a fixed format with the
-    // (quoted) tool-bearing text as a separate arg — no format-string or shell injection — and
-    // exits 70 (EX_SOFTWARE), a clear nonzero.
+    // `printf '%s\n' <quoted>`: a fixed format with the quoted message as a separate
+    // argument, so no format-string or shell injection.
     let script = format!(
         "#!/bin/sh\nprintf '%s\\n' {} 1>&2\nexit 70\n",
         crate::stub::sh_single_quote(message)
     );
 
-    // Atomic install through the one executable writer (`crate::lay`): a sibling temp,
-    // `0755`, then `rename(2)` over `shim` — atomic on POSIX and replacing the
-    // destination regardless of its prior type (symlink or regular file), so the live
-    // shim flips to the tombstone with no torn window.
     crate::lay::write_in_process(&crate::lay::Executable::new(shim, script.as_bytes()))
 }
 
-/// Resolve the store/checkout target a `bin/<tool>` shim execs, or `None` for no shim or
-/// a TOMBSTONE (no `exec` line). `active_builds`, `prune_stale_shims` and gc's retention
-/// all key on it. A symlink shim from an older atpkg still resolves until the next
-/// activation rewrites it as a stub.
+/// Resolve the store/checkout target a `bin/<tool>` shim execs, or `None` for no shim or a
+/// tombstone (no `exec` line). `active_builds`, `prune_stale_shims` and gc's retention key
+/// on it. A symlink shim still resolves until the next activation rewrites it as a stub.
 #[must_use]
 pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {
     if let Ok(target) = fs::read_link(shim) {
@@ -812,9 +762,9 @@ pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {
     super::parse_sh_shim_target(&content)
 }
 
-/// The environment the shim at `shim` exports before it execs — its `export` lines,
-/// parsed back by [`super::parse_sh_shim_env`] (fail-closed: NONE for a symlink an older
-/// atpkg left, a tombstone, a pending stub, or anything the rule refuses).
+/// The environment the shim at `shim` exports before it execs: its `export` lines
+/// ([`super::parse_sh_shim_env`]; `NONE` for a symlink shim, a tombstone, a pending stub,
+/// or anything the rule refuses).
 #[must_use]
 pub fn shim_env_of(shim: &Path) -> crate::shim_env::ShimEnv {
     match crate::metadata_io::read_bounded_regular_utf8(shim, super::MAX_SHIM_BYTES) {
@@ -826,28 +776,22 @@ pub fn shim_env_of(shim: &Path) -> crate::shim_env::ShimEnv {
 /// Replace the current process image with `command` (`execve`); returns only on failure.
 pub fn exec_or_run(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
     use std::os::unix::process::CommandExt as _;
-    // `exec` replaces this process and never returns on success; the returned value is
-    // the error that PREVENTED the exec.
     command.exec()
 }
 
-/// Wait for `child` while this process STANDS ASIDE from the terminal's interrupt and quit
-/// keys — the rule `system(3)` keeps: a ^C typed at the terminal reaches the whole
-/// foreground group, the child decides what it means, and this process lives on to collect
-/// its status. What `aterm pkg lease` waits with ([`crate::lease::hold_for`]): a holder that
-/// died of the ^C its child was still cleaning up after would drop the lease under it, and
-/// hand the shell its prompt back over the child's last lines.
+/// Wait for `child` while this process stands aside from the terminal's interrupt and quit
+/// keys, as `system(3)` does: a ^C reaches the whole foreground group, the child decides
+/// what it means, and this process lives on to collect its status. `aterm pkg lease` waits
+/// with this ([`crate::lease::hold_for`]): a holder that died of the ^C would drop the lease
+/// under a child still cleaning up.
 ///
-/// A SIGTERM or SIGHUP sent to this process alone is PASSED ON to the child, and this
-/// process waits on. Those are how a supervisor ends a run — `kill
-/// <pid>`, `timeout`, a closed tab — and the pid it holds is the holder's: a packer
-/// `exec`s into `aterm pkg lease`. Died of it, the holder let the lease go while the
-/// command ran on UNLEASED and unwatched (measured: holder exit 143, its `sh` child still
-/// looping, the build no longer leased), and a pack its caller had stopped went on to its
-/// upload. Passed on, the command ends the way it would have with no holder between, and
-/// [`exit_code_like`] then leaves this process by the same signal. A signal this process
-/// was started ignoring (`nohup`) stays ignored; ^C and quit are NOT passed on, since the
-/// terminal already sent them to the whole group and a second would read as a second key.
+/// A SIGTERM or SIGHUP sent to this process alone is passed on to the child and this
+/// process waits on: it is how a supervisor ends a run (`kill <pid>`, `timeout`, a closed
+/// tab), and the pid it holds is the holder's, since a packer `exec`s into `aterm pkg
+/// lease`. A holder that died of it would leave the command running unleased. Passed on,
+/// the command ends as it would with no holder, and [`exit_code_like`] then leaves by the
+/// same signal. A signal this process was started ignoring (`nohup`) stays ignored; ^C and
+/// quit are not passed on, since the terminal already sent them to the whole group.
 ///
 /// The dispositions are set AFTER the spawn — an ignored signal is inherited across `exec`,
 /// and the child must meet the key with its own — and put back before this returns. So a
@@ -883,8 +827,7 @@ pub fn wait_standing_aside(
         }
     }
     let status = child.wait();
-    // The child is reaped: its pid is free for the kernel to hand out again, so nothing is
-    // sent to it from here on.
+    // The child is reaped and its pid free for reuse: nothing more is sent to it.
     let _ = FORWARD_TO.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
     for (sig, was) in previous {
         if was != libc::SIG_ERR {
@@ -899,8 +842,8 @@ pub fn wait_standing_aside(
 /// none.
 static FORWARD_TO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-/// [`wait_standing_aside`]'s handler: the signal, sent on to the child it waits on — or,
-/// with none (a handler outliving its wait), the default action, as if never installed.
+/// [`wait_standing_aside`]'s handler: the signal sent on to the child it waits on, or, with
+/// none (a handler outliving its wait), the default action.
 extern "C" fn forward_to_child(sig: libc::c_int) {
     let pid = FORWARD_TO.load(std::sync::atomic::Ordering::SeqCst);
     // SAFETY: `kill`, `signal` and `raise` are async-signal-safe.
@@ -918,13 +861,12 @@ extern "C" fn forward_to_child(sig: libc::c_int) {
     }
 }
 
-/// Leave this process the way `status` says its child left: the child's exit code, or — for
-/// a child ended by SIGINT, SIGTERM, SIGHUP or SIGPIPE — the same signal, raised on this
-/// process with its default action, so the shell that ran it sees what it would have seen
-/// without a holder between them (bash stops a script whose foreground command died of
-/// SIGINT; it carries on past one that exited 130). Any other signal is `128 + n`: its
-/// default action may dump core, and a holder's core is nobody's evidence. Never returns
-/// for a raised signal.
+/// Leave this process the way `status` says its child left: the child's exit code, or, for
+/// a child ended by SIGINT, SIGTERM, SIGHUP or SIGPIPE, the same signal raised here with its
+/// default action, so the shell sees what it would without a holder between them (bash
+/// stops a script whose foreground command died of SIGINT, not one that exited 130). Any
+/// other signal is `128 + n`: its default action may dump core. Never returns for a raised
+/// signal.
 #[must_use]
 pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCode {
     use std::os::unix::process::ExitStatusExt as _;
@@ -983,12 +925,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A SHARED DIRECTORY ALREADY `0755` IS NOT REWRITTEN. `ensure_shared_dir` runs on
-    /// every store-lock acquisition over a system prefix, and a same-mode `chmod(2)` still
-    /// moves `st_ctime` — which tippy's ancestor check reads, so a `repair` or `gc` aborted
-    /// every tippy running from that store. A second call moves no stamp; a drifted mode
-    /// (too tight, group-writable, a sticky bit) is still forced to `0755`; a symlink at
-    /// the name is refused and the directory it names left as it was.
+    /// A shared directory already `0755` is not rewritten (a same-mode `chmod(2)` moves
+    /// `st_ctime`, which tippy's ancestor check reads); a drifted mode is forced to `0755`;
+    /// a symlink at the name is refused and its target left alone.
     #[test]
     fn a_shared_dir_already_0755_is_not_rewritten_and_a_drifted_one_is_forced() {
         let root = crate::testdir::dir("atpkg-shared-dir-");
@@ -1031,14 +970,9 @@ mod tests {
         assert_eq!(named, 0o700, "the refused link's target was chmodded");
     }
 
-    /// THE FAIL-CLOSED KEYSTONE, MEASURED ON THE MACHINE RUNNING THE TEST.
-    ///
-    /// `account_home()` decides whether the `[machine]` settings apply at all: a
-    /// `None` here means "the account could not be resolved", which the guard reads as
-    /// a synthetic machine and refuses. So any regression in the FFI — a buffer too
-    /// small for a long gecos (ERANGE), a changed passwd binding, an empty `pw_dir` —
-    /// silently turns the default-on doctor OFF for every user, on every launch, with
-    /// no failing test anywhere. Nothing else asserts it resolves.
+    /// `account_home()` resolves on the machine running the test. A `None` reads as a
+    /// synthetic machine and turns the `[machine]` doctor off, so an FFI regression (a buffer
+    /// too small, a changed binding, an empty `pw_dir`) would fail silently everywhere else.
     #[test]
     fn the_account_home_resolves_on_the_machine_running_this_test() {
         let account = account_home().expect(
@@ -1059,8 +993,8 @@ mod tests {
             "the account home must exist: {}",
             account.display()
         );
-        // Called twice, it answers the same: the buffer is sized once per call and a
-        // partial read would show up here as a truncated second answer.
+        // Called twice it answers the same: a partial read would show as a truncated second
+        // answer.
         assert_eq!(account_home(), Some(account));
     }
 }

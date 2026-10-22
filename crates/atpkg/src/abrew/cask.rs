@@ -2,11 +2,11 @@
 // Copyright 2026 Andrew Yates
 //! Native casks install the plain-data artifact kinds (app, binary,
 //! font, manpage, suites, plugins, generic artifacts, generated
-//! wrappers) from bounded zip/tar payloads, including `container
-//! nested:` archives and `depends_on` dependencies poured first.
-//! Recipe-executing artifacts, disk images and pkg installers need
-//! Homebrew's full recipe and pass through before any native
-//! installation changes.
+//! wrappers) from bounded zip/tar payloads and read-only mounted
+//! disk images, including `container nested:` archives and
+//! `depends_on` dependencies poured first. Recipe-executing
+//! artifacts and pkg installers need Homebrew's full recipe and
+//! pass through before any native installation changes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -127,7 +127,10 @@ pub(super) fn preflight(
             cask.token
         )));
     }
-    if (!cask.naked && !fetch::archive_supported(&download_name(cask))) || cask.artifacts.is_empty()
+    if (!cask.naked
+        && !fetch::archive_supported(&download_name(cask))
+        && !fetch::is_dmg(&download_name(cask)))
+        || cask.artifacts.is_empty()
     {
         return Err(InstallError::PassThrough(format!(
             "cask {} needs its Homebrew extraction recipe",
@@ -340,7 +343,9 @@ fn install_inner(
         }
     }
     let file = download_name(cask);
-    if (!cask.naked && !fetch::archive_supported(&file)) || cask.artifacts.is_empty() {
+    if (!cask.naked && !fetch::archive_supported(&file) && !fetch::is_dmg(&file))
+        || cask.artifacts.is_empty()
+    {
         return Err(InstallError::PassThrough(format!(
             "cask {} needs its Homebrew extraction recipe",
             cask.token
@@ -378,7 +383,7 @@ fn install_inner(
         return Ok(cask.version.clone());
     }
     prefix.ensure()?;
-    let dest = prefix.cache().join(file);
+    let dest = prefix.cache().join(&file);
     let expected = cask.sha256.as_deref().unwrap_or("no_check");
     // A no_check payload is bound to neither version nor URL, so its
     // cache entry is never reused: always re-download, never receipt
@@ -456,6 +461,8 @@ fn install_inner(
                 )));
             }
             fetch::untar(&inner, &payload).map_err(extraction_error)?;
+        } else if fetch::is_dmg(&file) {
+            fetch::extract_dmg(&dest, &payload).map_err(extraction_error)?;
         } else {
             fetch::untar(&dest, &payload).map_err(extraction_error)?;
         }
@@ -734,7 +741,10 @@ fn wrapper_program(
 /// shape, not corruption. Vetting refusals (slip entries, bomb caps)
 /// render differently and stay hard failures.
 fn extraction_error(token: &str, e: String) -> InstallError {
-    if e.contains("unsupported archive") || e.contains("io: zip: ") {
+    if e.contains("unsupported archive")
+        || e.contains("io: zip: ")
+        || e.contains("dmg attach failed")
+    {
         InstallError::PassThrough(format!(
             "cask {token} container format needs Homebrew extraction"
         ))
@@ -2055,7 +2065,7 @@ mod tests {
             "{msg}"
         );
         assert!(!prefix.root.exists());
-        let cask = cask("unused.dmg".to_string());
+        let cask = cask("unused.xar".to_string());
         assert!(matches!(
             install(&prefix, &cask, false, false, false, false),
             Err(InstallError::PassThrough(_))

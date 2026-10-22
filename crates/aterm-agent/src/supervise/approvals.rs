@@ -3094,15 +3094,11 @@ pub fn model_switch_reason(
     )
 }
 
-/// A model switch a loop on the session made and no loop has undone: the
-/// last `typed` `relaunch --model …` (or, from before D7, `/model …`) row of
-/// `model-fallback@v1` with no `model-restore@v1` row after it — and no
-/// account move MADE after it ([`account_switch_reason`]'s row): that
-/// relaunch came back on the model the fallback replaced and the policy let
-/// the switch go (`TurnEndState::restarted`), so a loop that starts after it
-/// has no return to make. Read back as open, the switch relaunched the
-/// session once more at the OLD account's bucket's reset, onto the model it
-/// already ran.
+/// A model switch a loop on the session made and no loop has undone: the last `typed`
+/// `relaunch --model …` (or older `/model …`) row of `model-fallback@v1` with neither a
+/// `model-restore@v1` row nor an account move made after it. An account move relaunches on
+/// the model the fallback replaced and drops the switch (`TurnEndState::restarted`), so it
+/// leaves nothing to switch back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenSwitch {
     /// The bucket's model (`None`: none `/model` knows).
@@ -3320,7 +3316,7 @@ pub fn open_model_switch(path: &Path, sid: Option<&str>) -> Option<OpenSwitch> {
 /// account has in any record; the login directory is never written here.
 pub const ACCOUNT_MOVE_COMMAND: &str = "relaunch under account ";
 
-/// The word a row names [`AccountAt`] by.
+/// The word a row names a `turn_end::AccountAt` by.
 fn account_at_word(at: super::policy::turn_end::AccountAt) -> &'static str {
     match at {
         super::policy::turn_end::AccountAt::Wall => "wall",
@@ -3328,12 +3324,9 @@ fn account_at_word(at: super::policy::turn_end::AccountAt) -> &'static str {
     }
 }
 
-/// The reason an account move's row of the turn-end policy carries
-/// (`account-rotate@v1`, `typed`: the relaunch was MADE): the label moved to
-/// and where the move was asked, so a loop that starts after it
-/// ([`account_moves`]) counts it toward the session's bound and knows a move
-/// is still to be answered — as [`model_switch_reason`] carries a model
-/// switch across a loop's restart.
+/// The reason of an account move made (`account-rotate@v1`, `typed`): the label moved to and
+/// where the move was asked, so a later loop ([`account_moves`]) counts it toward the
+/// session's bound and knows it is still to be answered.
 #[must_use]
 pub fn account_switch_reason(to: &str, at: super::policy::turn_end::AccountAt) -> String {
     format!(
@@ -3342,10 +3335,9 @@ pub fn account_switch_reason(to: &str, at: super::policy::turn_end::AccountAt) -
     )
 }
 
-/// The reason the row of an account move that could NOT be made carries
-/// (`account-rotate@v1`, `skipped`): the label, where it was asked and the
-/// host's word (`-`: no host makes one), so a loop that starts at the same
-/// wall does not ask again ([`AccountMoves::unmade`]).
+/// The reason of an account move that could not be made (`account-rotate@v1`, `skipped`): the
+/// label, where it was asked and the host's step (`-`: none), so a loop that starts at the
+/// same wall does not ask again ([`AccountMoves::unmade`]).
 #[must_use]
 pub fn account_unmade_reason(
     to: &str,
@@ -3367,14 +3359,11 @@ fn unmade_step(reason: &str) -> Option<&str> {
     (!step.is_empty() && step != "-").then_some(step)
 }
 
-/// The reason the row carries that says WHAT ANSWERED an account move
-/// (`account-rotate@v1`, `waiting`: a record, no act): the label and the
-/// answer the loop told its host — `served`, or `wall` / `signed-out` — so a
-/// loop that starts after it ([`account_moves`]) neither forgets a move still
-/// to be served nor tells a bad answer a second time. A bad answer's row
-/// says `until=served`: this build's loops tell a told move `served` where
-/// the worker works past it, so the move stands until such a row closes it,
-/// whatever its age ([`OpenAccountMove::told_closes`]).
+/// The reason of the row (`account-rotate@v1`, `waiting`: a record, no act) that says what
+/// answered an account move: the label and `served`, `wall` or `signed-out`, so a later loop
+/// ([`account_moves`]) neither forgets a move still to serve nor tells a bad answer twice. A
+/// bad answer adds `until=served`: the move stands until a `served` row
+/// ([`OpenAccountMove::told_closes`]).
 #[must_use]
 pub fn account_answer_reason(to: &str, answer: super::policy::turn_end::AccountAnswer) -> String {
     use super::policy::turn_end::{AccountAnswer, AccountBad};
@@ -3386,8 +3375,8 @@ pub fn account_answer_reason(to: &str, answer: super::policy::turn_end::AccountA
     format!("the turn-end policy (account move answered: to={to} by={by}{until})")
 }
 
-/// An account move a loop on the session made that its ledger does not show
-/// SERVED ([`open_account_move`]).
+/// An account move a loop on the session made that its ledger does not show served
+/// ([`open_account_move`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAccountMove {
     /// The label moved to.
@@ -3402,11 +3391,8 @@ pub struct OpenAccountMove {
     /// The host was told of a wall or a lost login that answered it
     /// ([`account_answer_reason`]'s row): told, and not told again.
     pub told: bool,
-    /// That told row says `until=served`: a build whose loops tell the move
-    /// `served` where it ends wrote it, so the move is open until a row says
-    /// so, whatever its age. A told row without it is an older build's,
-    /// which closed told moves silently: open on its ledger for good, and
-    /// history past the window
+    /// The told row says `until=served`: the move stays open until a `served` row, whatever
+    /// its age. A told row without it is history once past the window
     /// ([`super::policy::turn_end::TurnEndState::seed_account`]).
     pub told_closes: bool,
 }
@@ -3414,11 +3400,9 @@ pub struct OpenAccountMove {
 /// What `sid`'s ledger says of its account moves ([`account_moves`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccountMoves {
-    /// When each move MADE was written (unix ms), oldest first.
+    /// When each move made was written (unix ms), oldest first.
     pub made_ms: Vec<i64>,
-    /// The last move made, until a row says it was SERVED
-    /// ([`account_answer_reason`]): still to be answered by the loop that
-    /// reads this.
+    /// The last move made, until a row says it was served ([`account_answer_reason`]).
     pub open: Option<OpenAccountMove>,
     /// A move could not be made, and neither an act of the policy's nor the
     /// end of the wall it waited on ([`RULE_WALL_WAIT_END`]) follows that
@@ -3479,8 +3463,7 @@ pub fn account_moves_in(body: &str, sid: Option<&str>) -> AccountMoves {
             continue;
         }
         if skipped {
-            // Only a move asked AT A WALL latches (one asked ahead of a wall
-            // left no wall standing).
+            // Only a move asked at a wall latches (one asked ahead left no wall standing).
             if rule == Some(RULE_ACCOUNT)
                 && reason.contains("account move unmade:")
                 && reason.contains(" at=wall")
@@ -3531,16 +3514,14 @@ pub fn account_moves(path: &Path, sid: Option<&str>) -> AccountMoves {
     )
 }
 
-/// The account move `sid`'s ledger at `path` holds open
-/// ([`AccountMoves::open`]): beside [`open_model_switch`], for the same
-/// reason — a loop that starts after the move still has it to answer.
+/// The account move `sid`'s ledger at `path` holds open ([`AccountMoves::open`]).
 #[must_use]
 pub fn open_account_move(path: &Path, sid: Option<&str>) -> Option<OpenAccountMove> {
     account_moves(path, sid).open
 }
 
-/// The rule id of the ledger row that records a wall the loop waits on
-/// ([`super::wall_memory`]).
+/// The rule id of the ledger row that records a wall the loop waits on (the loop's wall
+/// memory, `wall_memory.rs`).
 pub const RULE_WALL_WAIT: &str = "wall-wait@v1";
 
 /// The rule id of the row that ends it: the worker worked, the screen left the
@@ -4029,9 +4010,7 @@ mod tests {
         );
     }
 
-    /// The host's journal sits beside the session's ledger, and both are cut
-    /// back past their bound. Negative control: a file within the bound is
-    /// left byte for byte.
+    /// Negative control: a file within the bound is left byte for byte.
     #[test]
     fn the_journal_sits_beside_the_ledger_and_both_are_bounded() {
         let dir = std::env::temp_dir().join(format!("aterm-apr-bound-{}", std::process::id()));
@@ -4183,8 +4162,7 @@ mod tests {
     }
     use super::*;
 
-    /// The ledger at `path` as a loop reads it at its start: a missing file
-    /// is an empty ledger.
+    /// The ledger as a loop reads it at its start: a missing file is empty.
     fn read(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap_or_default()
     }
@@ -4538,19 +4516,10 @@ mod tests {
         assert_eq!(parse_left_retried(wall), None);
     }
 
-    /// THE ACCOUNTS PROBE'S ROWS (`usage-probe@v1`): its `typed` row is no
-    /// act of the turn-end policy's, so [`typed_at`] leaves it out — and
-    /// [`typed_texts`] keeps it, a command row in a transcript being the
-    /// harness's own. NEGATIVE CONTROL: a slash command the policy typed
-    /// (`/compact`) is counted, and so is one whose TEXT is the probe's
-    /// command under another rule.
-    ///
-    /// [`probe_owed`]: the last probe row `typed` is a panel that may still
-    /// stand; a `waiting` row after it is the panel seen gone; a later
-    /// `typed` owes it again. NEGATIVE CONTROLS: a ledger with no probe row
-    /// owes nothing (every ledger of a machine with no roster), another
-    /// session's row owes this one nothing, and a command that spells the
-    /// rule's field forges nothing.
+    /// The probe's `typed` row is no turn-end act ([`typed_at`] skips it) but is a text the
+    /// harness typed ([`typed_texts`] keeps it); [`probe_owed`] holds while the last probe row
+    /// is `typed`. Negative controls: `/compact`, and `/usage` under another rule, are counted;
+    /// no probe row, another session's row, or a forged field owes nothing.
     #[test]
     fn the_probes_rows_are_no_typed_act_and_say_whether_a_panel_is_owed() {
         use super::super::policy::turn_end::{RULE_COMPACT, RULE_USAGE_PROBE};
@@ -4626,8 +4595,7 @@ mod tests {
             "another session owes nothing"
         );
 
-        // NEGATIVE CONTROLS: no probe row at all; the field spelled inside a
-        // command (its quotes are escaped); no file.
+        // Negative controls: no probe row, the field spelled inside a command, no file.
         let forged = ",\"rule_id\":\"usage-probe@v1\",\"decision\":\"typed\",";
         write(&[
             row("continue@v1", Outcome::Typed, "keep going", "-").to_json(1_000, Some("@s-1")),
@@ -4692,8 +4660,8 @@ mod tests {
         let write = |rows: &[String]| std::fs::write(&path, rows.join("\n")).expect("ledger");
         let owed = || reset_owed(&read(&path), Some("@s-1")).map(|open| open.entered);
 
-        // The row taken: owed, not entered — whatever follows it under
-        // another rule, and through a `declined` row of its own.
+        // The grant row taken: owed, not entered, through another rule's row or its own
+        // `declined` one.
         write(&[
             taken(),
             row("continue@v1", Outcome::Typed, "keep going", "-"),
@@ -4762,14 +4730,13 @@ mod tests {
                 taken_ms: 1_000
             })
         );
-        // Ended: nothing owed; a row taken after it owes a new step, not
-        // entered.
+        // Ended: nothing owed; a grant row taken after it owes a new step.
         write(&[taken(), entered(), ended()]);
         assert_eq!(owed(), None);
         write(&[taken(), entered(), ended(), taken()]);
         assert_eq!(owed(), Some(false));
 
-        // NEGATIVE CONTROLS.
+        // Negative controls.
         let forged = ",\"rule_id\":\"limit-reset@v1\",\"decision\":\"approved\",";
         write(&[
             row(
@@ -4797,11 +4764,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// [`typed_texts`] is every text the session's loop TYPED, with when, as
-    /// written — a command that spells the fields included, read as the
-    /// text it is — and nothing else: not another decision, not another
-    /// session's. [`ledger_under`] names the same file [`path_under`] makes,
-    /// and makes nothing.
+    /// Every `typed` row of the session, a command that spells the fields included as text;
+    /// [`ledger_under`] names [`path_under`]'s file and makes nothing.
     #[test]
     fn typed_texts_are_what_the_sessions_loop_typed() {
         let dir = std::env::temp_dir().join(format!("aterm-typed-texts-{}", std::process::id()));

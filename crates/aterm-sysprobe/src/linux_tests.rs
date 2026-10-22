@@ -1030,6 +1030,7 @@ fn the_capability_report_says_what_each_tree_can_give() {
         ("gpu_per_proc", "unavailable(not_read)"),
         ("proc_cpu_others", "yes"),
         ("throttle", "estimate"),
+        ("coalitions", "unavailable(unsupported)"),
         ("capacity", "cgroup_limit"),
     ] {
         assert_eq!(word(&rows, name), want, "{name} of {rows:?}");

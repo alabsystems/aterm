@@ -58,10 +58,9 @@ fn publish_successor_env(
     );
 }
 
-/// A private scratch HOME and runtime dir for one desk ([`ScratchEnv`]), set
-/// BEFORE its App is built, so nothing the App or the manifest writer touches
-/// lands in the real home. Bind it before the App: the App drops first and the
-/// variables are put back before the directory goes.
+/// A private scratch HOME and runtime dir for one desk ([`ScratchEnv`]), set before its App is
+/// built, so nothing the App or the manifest writer touches lands in the real home. Bind it
+/// before the App: the App drops first and the variables are put back before the directory goes.
 fn enter_scratch(label: &str) -> ScratchEnv {
     // Every caller holds ENV_LOCK for its whole body.
     ScratchEnv::home(&format!("app-{label}"))
@@ -666,8 +665,8 @@ fn build_desk(seed: u64, field_report: bool) -> (Desk, impl FnMut() -> u64) {
                 app.push_stub_tab(*wid, crate::stub_session(id));
             }
             let mut splits = 0;
-            // The field report's window stays one pane in its first tab:
-            // 99x338 is the grid the old per-grid cap refused, not a pane of it.
+            // The field report's window stays one pane in its first tab: the 99x338 grid is
+            // the whole window, not a pane of it.
             let wanted = next() % 3;
             let wanted = if field_report && index == 0 && tab == 0 {
                 0
@@ -831,7 +830,7 @@ fn app_capture_case(case: usize, census: &mut DeskCensus) {
     } = desk;
     let at = format!("case {case} (seed {seed:#018x}: {shape})");
 
-    // THE WALK: each session its own hostile program.
+    // The walk: each session its own hostile program.
     let mut ids: Vec<u64> = app.pool.iter().map(|session| session.id).collect();
     ids.sort_unstable();
     for id in &ids {
@@ -850,12 +849,11 @@ fn app_capture_case(case: usize, census: &mut DeskCensus) {
             hostile_walk_step(&mut t, &mut next);
         }
     }
-    // The walk resized engines directly; the App puts every pane back at
-    // its layout's geometry, as it would have all along.
+    // The walk resized engines directly; the App puts every pane back at its layout's geometry.
     for (wid, _) in &sizes {
         app.resize_panes(*wid);
     }
-    // THE BAND TOGGLE, between the program's last frame and the park.
+    // The band toggle, between the program's last frame and the park.
     let before: Vec<u16> = sizes
         .iter()
         .map(|(wid, _)| app.windows.get(wid).map_or(0, |ws| ws.rows))
@@ -908,8 +906,15 @@ fn app_capture_case(case: usize, census: &mut DeskCensus) {
     ptys.release(app);
 }
 
-/// EVERY DESK THE GUI CAN BUILD HANDS EVERY SESSION OVER EXACTLY (the
-/// 2026-09-22/23 update audit, plan P1-6).
+/// Every desk the GUI can build hands every session over exactly. Forty seeded desks, each a
+/// real headless App: 1 to 3 windows of 1 to 4 tabs with random splits (at most twelve
+/// sessions), every window sized by the grid law from the display table (case 0 is a 99x338
+/// window on the 5K display), every pane on a real PTY. Each session gets up to 600 lines of
+/// styled output and then 24 to 63 hostile walk steps; the panes are put back at their layout's
+/// geometry and the message band takes or gives back a row. Every session adopts, the digests
+/// and proof agree, the layout and window carry cross, and every screen crosses at an exact rung
+/// (Full or VisibleOnly) except a line of links past the record cap, which loses only its links
+/// (StrippedLinks).
 ///
 /// Forty seeded desks, each a real headless App: 1 to 3 windows of 1 to 4 tabs
 /// with random splits (at most twelve sessions), every window sized by the
@@ -1017,21 +1022,14 @@ fn every_app_desk_the_gui_can_build_hands_every_session_over_exactly() {
     }
 }
 
-/// A pinned desk: one window, two tabs at 56x149 by the GUI's grid law. Tab 1
-/// is a shell with 400 lines of styled history; tab 0 is Claude Code, entered
-/// from a prompt on the last row, so 1049's DECSC slot is row 55. The update's
-/// row then appears in the message band (through the real messages engine)
-/// and takes one row from every session: 55x149 at the park. Builds before
-/// the saved cursor followed its text left the Claude Code tab's slot on row
-/// 55, a row its grid no longer has; the shrink demotes the saved primary's
-/// top row, and the slot now rides up with the prompt to row 54. The handoff
-/// fixtures' `incident-55x149` desks are the same desk built from bare
-/// engines by those builds, slot past the grid and all.
-///
-/// Both sessions must cross at the Full rung: the slot on the prompt's row
-/// (row 54 of 55, after the prompt, where the successor's 1049 exit puts the
-/// shell back), the shell's full 256 lines of history, the band row and its
-/// message in the window carry, the digest and the proof equal.
+/// A pinned desk: one window, two tabs at 56x149 by the GUI's grid law. Tab 1 is a shell with
+/// 400 lines of styled history; tab 0 is Claude Code, entered from a prompt on the last row, so
+/// 1049's DECSC slot is row 55. The update's row then takes one row from every session (55x149
+/// at the park); the shrink demotes the saved primary's top row and the slot rides up with the
+/// prompt to row 54. The handoff fixtures' `incident-55x149` desks are this desk built from bare
+/// engines by older builds, slot past the grid. Both sessions must cross at the Full rung: the
+/// slot on row 54, the shell's full 256 lines of history, the band row and its message in the
+/// window carry, the digest and proof equal.
 #[test]
 fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
     let Some(_env) = env_alone() else { return };
@@ -1193,28 +1191,18 @@ fn seed_passed_preverification(
     published
 }
 
-/// The successor's signed handoff policy steers the whole park: the escape
-/// hatch for a producer bug the carry ladder cannot see. A real headless App
-/// (windows, tabs and splits on real PTYs, styled history everywhere, one
-/// session in a full-screen program) is parked for an attempt whose candidate
-/// passed pre-verification, with that candidate's policy published into the
-/// App's cache by the worker's own publisher and read for the attempt's ticket
-/// by `App::park_policy`, the call both lanes' parks make. The lanes' own
-/// control flow is not driven here; this is the park they share.
+/// The successor's signed handoff policy steers the whole park, the escape hatch for a producer
+/// bug the carry ladder cannot see. A real headless App is parked for an attempt whose candidate
+/// passed pre-verification, its policy published into the App's cache by the worker's own
+/// publisher and read by `App::park_policy`, the call both lanes' parks make.
 ///
-/// * A policy for other producers changes nothing (`adopt` narrows it away),
-///   and every session crosses exact, scrollback and all.
-/// * `carry = "repaint"` for this build: every session is carried at the
-///   Repaint rung (a blank canonical screen, no control carry) and still
-///   adopts, with `repaint = true`, the successor's digest equal to the
-///   parent's and the adoption proof as expected.
+/// * A policy for other producers changes nothing (`adopt` narrows it away).
+/// * `carry = "repaint"` for this build: every session crosses at the Repaint rung (blank, no
+///   control carry) and still adopts with `repaint = true`, digests and proof equal.
 /// * `carry = "visible"`: every session crosses exact at depth 0.
-/// * Under either of those two, no scrollback crosses at all, in the screen
-///   carry or the history carry: the plan is `HistoryPlan::Withheld`, nothing
-///   is exported, no record names a sidecar, the successor adopts none, and
-///   every line the park saw is counted as left behind (`history_dropped`).
-///   With no policy the same desk's history crosses in sidecars, the control
-///   that proves this pipeline runs the carry.
+/// * Under either, no scrollback crosses at all: the plan is `HistoryPlan::Withheld`, nothing is
+///   exported, no record names a sidecar, and every line the park saw is counted as left behind
+///   (`history_dropped`). With no policy the same desk's history crosses in sidecars.
 /// * A verdict that did not pass is never a policy the park follows.
 #[test]
 fn a_successor_policy_of_repaint_carries_every_session_blank_and_every_one_adopts() {
@@ -1431,12 +1419,10 @@ fn hand_over_held(
         .park_desk_for_test(None)
         .unwrap_or_else(|failure| panic!("{at}: the park refused: {failure}"));
     let layout_digest = parked.layout_digest.expect("the layout commits");
-    // The worker's export, and the held panes' share of it, as
-    // `prepare_outgoing_artifacts` takes it (round eight, finding 39) — or none,
-    // for a successor older than this build, under a policy that carries no
-    // scrollback, or from an export that never reached them. The handed
-    // sessions' share is not joined here: their sidecars are not what this
-    // helper's callers read.
+    // The worker's export and the held panes' share of it, as `prepare_outgoing_artifacts`
+    // takes it, or none: for a successor older than this build, under a policy that carries no
+    // scrollback, or from an export that never reached them. The handed sessions' share is not
+    // joined: this helper's callers do not read their sidecars.
     let exported = std::mem::replace(
         &mut parked.history,
         crate::handoff_history::HistoryPlan::Unexported,
@@ -1476,8 +1462,7 @@ fn hand_over_held(
         entries: adoption.clone(),
     };
     let nonce = mint_outgoing_nonce();
-    // The control carry's export, held panes' included, as the worker takes it
-    // (round eight, finding 730).
+    // The control carry's export, held panes' included, as the worker takes it.
     let controls =
         crate::handoff_carry::export(&parked.carries, crate::control::turn_ids_for_handoff());
     let outgoing = write_outgoing_with_held(
@@ -1582,8 +1567,7 @@ fn a_held_exited_pane_keeps_its_screen() {
     {
         let held = app.pool.get(held_id).expect("the held pane").term.clone();
         let mut t = crate::term_lock(&held);
-        // Scrollback the visible-only held carry leaves behind (round eight,
-        // finding 39).
+        // Scrollback the visible-only held carry leaves behind.
         for line in 0..100 {
             t.process(format!("compile {line}\r\n").as_bytes());
         }
@@ -1785,7 +1769,7 @@ fn a_held_exited_pane_keeps_its_screen() {
         .iter()
         .find(|id| **id != 0)
         .expect("the held pane's terminal");
-    // 49: exited, with its status, and a sweep does not re-read it as idle.
+    // Exited, with its status, and a sweep does not re-read it as idle.
     new.observe_session_statuses(std::time::Instant::now() + std::time::Duration::from_secs(2));
     assert_eq!(
         new.session_status
@@ -1809,7 +1793,7 @@ fn a_held_exited_pane_keeps_its_screen() {
         (-1, -1),
         "{at}: no PTY, no process"
     );
-    // 46: the configured theme.
+    // The configured theme.
     {
         let t = crate::term_lock(&session.term);
         assert_eq!(
@@ -1818,7 +1802,7 @@ fn a_held_exited_pane_keeps_its_screen() {
             "{at}: THE HELD PANE IS DRAWN IN THIS BUILD'S THEME"
         );
     }
-    // 35: its user identity.
+    // Its user identity.
     {
         let meta = session
             .ctx
@@ -1876,12 +1860,9 @@ fn a_held_exited_pane_keeps_its_screen() {
         screen_text(&crate::term_lock(&session.term)).contains("build finished"),
         "{at}: and changes nothing on it"
     );
-    // ROUND EIGHT, FINDING 39: ITS SCROLLBACK CROSSES. The sidecar opened
-    // before the proof is imported after Commit, by the worker every adopted
-    // session's goes through, in front of the restored screen: the pane holds
-    // every line it had, and nothing is counted or said as left behind. RED
-    // before the fix: every line was left behind, counted (the held carry was
-    // its visible screen alone).
+    // Its scrollback crosses: the sidecar opened before the proof is imported after Commit by
+    // the worker every adopted session's goes through, in front of the restored screen, so the
+    // pane holds every line it had and nothing is counted or said as left behind.
     let scrollback = u64::try_from(scrollback).expect("a count");
     let loss = crate::handoff_history::carried_loss(
         new.pool
@@ -1935,18 +1916,14 @@ fn a_held_exited_pane_keeps_its_screen() {
     assert!(new.close_session_by_id(restored).is_ok(), "{at}: it closes");
     assert!(new.pool.get(restored).is_none(), "{at}: and is gone");
 
-    // WITH NOTHING EXPORTED the held pane's scrollback is left behind, counted
-    // on `status` and on the band, and SAID AS WHAT IT WAS (round eight,
-    // finding 39, and the review of its fix, which said every one as a held
-    // pane's by design):
-    // - a successor older than this build takes a held pane's screen alone:
-    //   by design, said as a held pane's, never as a failure;
-    // - a policy that carries no scrollback withheld it: the new version's
-    //   request;
-    // - an export that never reached the pane, although one was offered: a
-    //   FAILURE, said as one — but never with "the newest lines came across",
-    //   since a held screen carries no line of its scrollback. RED before the
-    //   review's fix: "Update left scrollback behind", as a held pane's.
+    // With nothing exported the held pane's scrollback is left behind, counted on `status`
+    // and the band, and said as what it was:
+    // - a successor older than this build takes a held pane's screen alone: by design, said
+    //   as a held pane's, never as a failure;
+    // - a policy that carries no scrollback withheld it: the new version's request;
+    // - an export that never reached the pane, though one was offered: a failure, said as
+    //   one, but never with "the newest lines came across", since a held screen carries no
+    //   line of its scrollback.
     for (plan, held, withheld, held_failed, title, words, not_said) in [
         (
             HeldPlan::OlderSuccessor,
@@ -2031,7 +2008,7 @@ fn a_held_exited_pane_keeps_its_screen() {
             !new.has_live_message("came across"),
             "{at}: never that the newest lines crossed"
         );
-        // The import settles to the same summary: nothing failed HERE.
+        // The import settles to the same summary: nothing failed here.
         let reports = crate::handoff_history::run_imports(new.pool.take_handoff_histories());
         assert_eq!(
             crate::handoff_history::loss_summary(&reports),
@@ -2275,26 +2252,15 @@ fn an_older_producers_held_pane_is_still_its_placeholder() {
     ptys.release(app);
 }
 
-/// ROUND EIGHT, U34: A HELD PANE'S FAILURE THE PERSON HAD SEEN STAYS SEEN
-/// ACROSS AN UPDATE, AND ITS EXIT IS NOT REPLAYED AS NEWS. The successor shows
-/// the carried exit again through the status observer (round six, finding 49),
-/// which made it a new failure: a fresh slot, its mark unseen, so the tab was
-/// flagged again after every update, and a `status-change` row for an exit
-/// that happened before the update was recorded on its timeline and pushed to
-/// `events` subscribers as if the command had just failed. The producer now
-/// carries whether the failure was seen (`HeldPaneCarry::failure_seen`), and
-/// the successor records the carried exit as the status it is, not an event.
-/// CONTROL: a failure nobody had looked at still marks the tab.
+/// A held pane's failure the person had seen stays seen across an update, and its exit is not
+/// replayed as news: the producer carries whether the failure was seen
+/// (`HeldPaneCarry::failure_seen`), and the successor records the carried exit as the status it
+/// is, not a `status-change` event. The control: a failure nobody had looked at still marks the
+/// tab.
 ///
-/// The pane uses shell integration and its shell ended AT THE PROMPT after the
-/// failing command (Ctrl-D, which exits with the last status, or a signal):
-/// the held engine's checkpoint carries that command's completed block, which
-/// every sweep of the successor reads again. The carried exit names the same
-/// block, so the sweep's read is not a second failure (the review of U34's
-/// first fix found the mark re-armed there, at the first sweep).
-///
-/// RED before the fix: the seen failure came back unseen, with a row; and,
-/// before the carried exit named its block, unseen again after the first sweep.
+/// The pane's shell ended at the prompt after the failing command, so the held engine's
+/// checkpoint carries that command's completed block, which every sweep of the successor reads
+/// again; the carried exit names the same block, so the sweep's read is not a second failure.
 #[test]
 fn a_held_panes_seen_failure_stays_seen_across_the_update() {
     let Some(_env) = env_alone() else { return };
@@ -2390,7 +2356,7 @@ fn a_held_panes_seen_failure_stays_seen_across_the_update() {
         (new, restored, carried_seen)
     };
 
-    // CONTROL: unseen in the parent, unseen in the successor.
+    // The control: unseen in the parent, unseen in the successor.
     let at = "a failure nobody looked at";
     let (new, restored, carried_seen) = successor_of(&mut app, at);
     assert_eq!(carried_seen, vec![false], "{at}: nothing seen is carried");
@@ -2450,12 +2416,10 @@ fn a_held_panes_seen_failure_stays_seen_across_the_update() {
         .is_some_and(|block| block.exit_code == Some(2)),
         "{at}: PRECONDITION: the held engine carries the failed command's block"
     );
-    // The sweep's instant is taken AFTER the successor restored the pane: the
-    // carried exit made its status slot at that restore, due one observer
-    // interval later, and a sweep before that skips the pane without reading
-    // the block — which would let every assertion below pass with the carried
-    // exit's block unnamed. Due, and its engine free (no reader runs in a held
-    // pane), so the sweep reads it rather than charging a refusal.
+    // The sweep's instant is after the successor restored the pane: the carried exit made its
+    // status slot at that restore, due one observer interval later, and an earlier sweep would
+    // skip the pane without reading the block, so every assertion below would pass vacuously.
+    // Due, and its engine free (no reader runs in a held pane), so the sweep reads it.
     let swept_at = std::time::Instant::now() + std::time::Duration::from_secs(2);
     assert!(
         new.session_status.due(restored, swept_at),

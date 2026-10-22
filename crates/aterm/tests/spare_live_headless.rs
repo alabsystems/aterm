@@ -72,8 +72,16 @@ fn shell() -> LoginShell {
 }
 
 /// Boot an instance whose home holds `rc` as its shell's startup file, with
-/// `config` prepended to its aterm.toml, the scan's spacing [`SCAN_MS`] and
-/// `seams` in its environment.
+/// `config` prepended to its aterm.toml, the scan's spacing [`SCAN_MS`], the
+/// parked deadline at the hang detector and `seams` in its environment.
+///
+/// NO TEST HERE PROVES THE PARKED DEADLINE, and the product's 1 s
+/// (`PARKED_DEADLINE`, which `aterm-gui`'s
+/// `a_spawned_spare_unparked_at_its_deadline_is_retired_and_a_younger_one_kept`
+/// holds) was a latency budget every one of them inherited: 2 of 160 module
+/// runs at load ~189 had a one-line rc's spare park past it, retired
+/// `no_park`, with spares off for the rest of the instance. At the hang
+/// detector a slow park is only slow.
 fn boot_spare(prefix: &str, rc: &str, config: &str, seams: &[(&str, &str)]) -> Instance {
     let rc = rc.to_owned();
     let config = config.to_owned();
@@ -93,6 +101,10 @@ fn boot_spare(prefix: &str, rc: &str, config: &str, seams: &[(&str, &str)]) -> I
             // message ([`gate_log`]).
             cmd.env("ATERM_LOG", "info");
             cmd.env("ATERM_DEBUG_SPARE_SCAN_MS", SCAN_MS);
+            cmd.env(
+                "ATERM_DEBUG_SPARE_PARKED_MS",
+                aterm_spec::wait::MUST_HAPPEN.as_millis().to_string(),
+            );
             for (k, v) in &seams {
                 cmd.env(k, v);
             }
@@ -163,23 +175,13 @@ fn hang_report(inst: &Instance) -> String {
     )
 }
 
-/// Wait until `metrics spare=` reads `state`; a hang detector. A spare that
-/// said nothing within the product's parked deadline (`PARKED_DEADLINE`, 1 s:
-/// `spare_discard=no_park`) turned spares off for this instance's script set,
-/// so no state but `absent` can come: that is decided at once
-/// ([`a_budget_decided_it`]), not after a minute's wait.
+/// Wait until `metrics spare=` reads `state`; a hang detector.
 fn await_spare(inst: &Instance, state: &str) {
     let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     loop {
         let m = ctl_ok(inst, &["metrics"]);
         if field(&m, "spare") == Some(state) {
             return;
-        }
-        if field(&m, "spare_discard").is_some_and(|d| d.contains("no_park:")) {
-            a_budget_decided_it(
-                inst,
-                "a spare said nothing within the 1 s parked deadline, so spares are off",
-            );
         }
         assert!(
             Instant::now() < give_up,
@@ -190,15 +192,14 @@ fn await_spare(inst: &Instance, state: &str) {
     }
 }
 
-/// End the test on a product time budget `missed` (a gate fold's, or the
-/// parked deadline's): COULD NOT RUN on an oversubscribed host
+/// End the test on a product time budget `missed` (a gate fold's, or a warm
+/// rc's `T_READY`): COULD NOT RUN on an oversubscribed host
 /// ([`aterm_spec::host::oversubscribed`]), where the miss is the load's — the
 /// rcs here are one line — and FAIL on a host with CPU to spare, where the
 /// same miss is a slowdown of the code. Measured
 /// (`docs/DESIGN-warm-spare-2026-10-16.md`, As built): 3 of 160 module runs
-/// at load ~100 on 18 CPUs folded a boot run `failed=start`, and 2 of 160 at
-/// load ~189 had a spare miss the parked deadline; each waited out its
-/// minute and failed.
+/// at load ~100 on 18 CPUs folded a boot run `failed=start`; each waited out
+/// its minute and failed.
 fn a_budget_decided_it(inst: &Instance, missed: &str) -> ! {
     let log = gate_log(inst);
     if let Some(load) = aterm_spec::host::oversubscribed() {

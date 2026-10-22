@@ -608,9 +608,9 @@ fn the_session_log_crosses_the_real_files() {
     staged.teardown();
 }
 
-/// Design test 7: the round trip keeps the ledger and the archive's tail —
-/// `offscreen since=<old origin>:k` reads the rows it read before the
-/// handoff, and `history since=<old id>` goes on from there.
+/// The round trip keeps the ledger and the archive's tail: `offscreen
+/// since=<old origin>:k` reads the rows it read before the handoff, and
+/// `history since=<old id>` goes on from there.
 #[test]
 fn the_carry_round_trips_the_ledger_and_the_archive_tail() {
     let Some(_env) = env_alone() else { return };

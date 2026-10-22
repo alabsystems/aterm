@@ -2544,7 +2544,7 @@ pub struct TapRead {
     pub key: Option<super::profile::AccountKey>,
 }
 
-/// What this machine last learned of a login. MACHINE-LOCAL: a login is a
+/// What this machine last learned of a login. Machine-local: a login is a
 /// keychain item of this machine and says nothing about another's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Auth {

@@ -51,6 +51,17 @@ const MARKED: [aterm_phase::Program; 5] = [
     aterm_phase::Program::Gemini,
 ];
 
+/// Every lockup a top line wears: each marked program's vendor build, and
+/// codex-alab's, whose name (`codex-alab`, 15 cells laid) is the longest.
+const LOCKUPS: [(aterm_phase::Program, Build); 6] = [
+    (aterm_phase::Program::Claude, Build::Vendor),
+    (aterm_phase::Program::Agy, Build::Vendor),
+    (aterm_phase::Program::Muse, Build::Vendor),
+    (aterm_phase::Program::Codex, Build::Vendor),
+    (aterm_phase::Program::Codex, Build::Alab),
+    (aterm_phase::Program::Gemini, Build::Vendor),
+];
+
 /// THE SCAN THE CACHE REPLACED, its run alone (main's
 /// `collect_composer_border_brand_edits` of 2026-10-20): the rightmost plain
 /// run of `─` in the rule's own style — the style most of its `─` wear, its
@@ -228,7 +239,7 @@ const CASES: [(Option<SwitchPaint>, Option<CardPalette>); 8] = [
     (Some(TURNING), None),
 ];
 
-/// A top key for `program` on `run` at frame row 30.
+/// A top key for `program`'s vendor build on `run` at frame row 30.
 fn key_for(
     program: aterm_phase::Program,
     run: TopRun,
@@ -243,6 +254,7 @@ fn key_for(
         line: TopLine::Rule,
         run,
         program,
+        build: Build::Vendor,
         switch,
         palette,
         blank,
@@ -682,8 +694,8 @@ fn blank() -> RenderCell {
     }
 }
 
-/// [`compose_top`] of `run` for `program`, under the switch `switch` and the
-/// theme `palette`, the key's `face`.
+/// [`compose_top`] of `run` for `program`'s vendor build, under the switch
+/// `switch` and the theme `palette`, the key's `face`.
 fn composed_for(
     program: aterm_phase::Program,
     run: TopRun,
@@ -691,9 +703,23 @@ fn composed_for(
     palette: Option<CardPalette>,
     face: KeyFace,
 ) -> ComposedTop {
+    composed_as((program, Build::Vendor), run, switch, palette, face)
+}
+
+/// [`composed_for`] for a lockup's program and build ([`LOCKUPS`]).
+fn composed_as(
+    (program, build): (aterm_phase::Program, Build),
+    run: TopRun,
+    switch: Option<SwitchPaint>,
+    palette: Option<CardPalette>,
+    face: KeyFace,
+) -> ComposedTop {
     let mut top = ComposedTop::default();
     compose_top(
-        &key_for(program, run, switch, palette, blank(), face),
+        &TopKey {
+            build,
+            ..key_for(program, run, switch, palette, blank(), face)
+        },
         &mut top,
         None,
     );
@@ -746,7 +772,7 @@ fn line_of(top: &ComposedTop, run: TopRun) -> Vec<char> {
 fn the_switch_yields_its_cells_to_the_ghost() {
     let key = aterm_primer::CLAUDE_TOP_EFFORT_KEY;
     let ghost_text = format!(" {key} off ");
-    let lockup = CliMark::Claude.lockup_cells();
+    let lockup = CliMark::Claude.lockup_cells(Build::Vendor);
     let mut seen = [false; 4];
     for len in (19..=140).rev() {
         let run = plain_run(len);
@@ -856,25 +882,30 @@ fn the_switch_yields_its_cells_to_the_ghost() {
 
 /// THE LOCKUP (owner, 2026-10-21: "each CLI has an emoji-sized icon and
 /// color on the left side of the top line of CLI to standardize"): on every
-/// rung that lays it, for every program that wears a mark and in every
-/// harness state — lit, Off's white, bare, turning on and with no host —
-/// the lockup stands its lead in from the run's left (two `─`, one on the
-/// compact rung): a pad, the icon's two cells and a pad, all blanks on the
-/// pane's ground with no underline (the sprite draws over the icon's), and
-/// on a full rung the CLI's word bold in its brand ink floored to 4.5:1
-/// (`cli_marks::name_fg`) and a trailing pad. Its cells and its icon's first
-/// are recorded (`ComposedTop::lockup`, `icon`).
+/// rung that lays it, for every lockup — each program that wears a mark,
+/// and codex-alab, whose name is the longest — and in every harness state —
+/// lit, Off's white, bare, turning on and with no host — the lockup stands
+/// its lead in from the run's left (two `─`, one on the compact rung): a
+/// pad, the icon's two cells and a pad, all blanks on the pane's ground with
+/// no underline (the sprite draws over the icon's), and on a full rung the
+/// build's name (`codex-alab` for ALab's Codex, the CLI's word for every
+/// other) bold in its brand ink floored to 4.5:1 (`cli_marks::name_fg`) and
+/// a trailing pad, with at least its lead of `─` after it before the switch
+/// (or the span's end). Its cells and its icon's first are recorded
+/// (`ComposedTop::lockup`, `icon`).
 ///
-/// NEGATIVE CONTROL: a span one cell short of the full rung's need lays no
-/// name.
+/// NEGATIVE CONTROLS: a span one cell short of the full rung's need lays no
+/// name; and a ladder sized for vendor `codex`'s name, laid with
+/// codex-alab's, would leave the lit switch under two `─` after the lockup
+/// — at the 26-column pane among others — which the gap check catches.
 #[test]
 fn the_lockup_stands_two_rule_cells_in() {
     let ground = crate::claude_card::pack(blank().bg);
     let mut laid = [0usize; 2];
     let mut controls = 0;
-    for program in MARKED {
+    for (program, build) in LOCKUPS {
         let mark = cli_mark(program).expect("a mark");
-        let word: Vec<char> = mark.word().chars().collect();
+        let word: Vec<char> = mark.name(build).chars().collect();
         for (switch, palette) in [
             (Some(LIT), Some(CardPalette::Cruise)),
             (Some(OFF), Some(CardPalette::Off)),
@@ -884,9 +915,9 @@ fn the_lockup_stands_two_rule_cells_in() {
         ] {
             for len in 0..=200 {
                 let run = plain_run(len);
-                let top = composed_for(program, run, switch, palette, KeyFace::default());
-                let at = format!("{program:?} {switch:?} {palette:?} {len}");
-                let Some((rung, _)) = lay_top(len, switch, Some(mark.lockup_cells())) else {
+                let top = composed_as((program, build), run, switch, palette, KeyFace::default());
+                let at = format!("{program:?} {build:?} {switch:?} {palette:?} {len}");
+                let Some((rung, _)) = lay_top(len, switch, Some(mark.lockup_cells(build))) else {
                     assert!(top.cells.is_empty(), "{at}: nothing laid");
                     continue;
                 };
@@ -896,7 +927,7 @@ fn the_lockup_stands_two_rule_cells_in() {
                 };
                 let start = run.col + rung.lead;
                 let cells = match lockup {
-                    Lockup::Full => mark.lockup_cells(),
+                    Lockup::Full => mark.lockup_cells(build),
                     Lockup::Icon => aterm_effects::cli_marks::ICON_RUN,
                 };
                 assert_eq!(top.lockup, start..start + cells, "{at}: the lockup's cells");
@@ -905,6 +936,12 @@ fn the_lockup_stands_two_rule_cells_in() {
                 assert!(
                     line[..rung.lead].iter().all(|&c| c == '\u{2500}'),
                     "{at}: the lead is the rule's"
+                );
+                let limit = top.switch.as_ref().map_or(run.col + len, |s| s.cols.start);
+                assert!(
+                    gap_holds(top.lockup.end, limit, rung.lead),
+                    "{at}: {} cells after the lockup",
+                    limit.saturating_sub(top.lockup.end)
                 );
                 let cell = |c: usize| top.cells[c - top.col];
                 for c in start..start + 4 {
@@ -926,15 +963,15 @@ fn the_lockup_stands_two_rule_cells_in() {
                     assert_eq!(cell(start + cells - 1).ch, ' ', "{at}: the trailing pad");
                     laid[0] += 1;
                     // CONTROL: a cell short of the last full rung's need, no
-                    // name.
-                    let (rungs, n) = ladder(switch, Some(mark.lockup_cells()));
+                    // name — not even the CLI's word codex-alab's begins with.
+                    let (rungs, n) = ladder(switch, Some(mark.lockup_cells(build)));
                     let last_full = rungs[..n]
                         .iter()
                         .rev()
                         .find(|r| r.lockup == Some(Lockup::Full))
                         .copied();
-                    let short = composed_for(
-                        program,
+                    let short = composed_as(
+                        (program, build),
                         plain_run(rung.need - 1),
                         switch,
                         palette,
@@ -958,7 +995,33 @@ fn the_lockup_stands_two_rule_cells_in() {
         laid[0] > 1000 && laid[1] > 20,
         "full and icon rungs laid: {laid:?}"
     );
-    assert_eq!(controls, MARKED.len() * 5, "a control a program and state");
+    assert_eq!(controls, LOCKUPS.len() * 5, "a control a lockup and state");
+    // CONTROL: codex-alab's name laid on the rungs of a ladder sized for
+    // vendor `codex`'s.
+    let (vendor, alab) = (
+        CliMark::Codex.lockup_cells(Build::Vendor),
+        CliMark::Codex.lockup_cells(Build::Alab),
+    );
+    let broken: Vec<usize> = (0..=200)
+        .filter(|&span| {
+            let Some((rung, Some(face))) = lay_top(span, Some(LIT), Some(vendor)) else {
+                return false;
+            };
+            rung.lockup == Some(Lockup::Full)
+                && !gap_holds(rung.lead + alab, span - 2 - face.len, rung.lead)
+        })
+        .collect();
+    assert!(
+        broken.contains(&26) && broken.len() > 5,
+        "CONTROL: the vendor's ladder crowds codex-alab's switch: {broken:?}"
+    );
+}
+
+/// Whether a lockup ending at `end` leaves at least `lead` cells of `─`
+/// before `limit` (the switch's first cell, or the span's end): the gap the
+/// ladder's rungs keep (two, one on the compact rung).
+fn gap_holds(end: usize, limit: usize, lead: usize) -> bool {
+    limit >= end + lead
 }
 
 /// The rung's name as the spec's tables print it (§5.2, §5.5).
@@ -1023,16 +1086,20 @@ fn walk_order(rungs: &[Rung], last: Option<usize>) -> Result<(), String> {
     Ok(())
 }
 
-/// One row of §5.5's table: the CLI, its switch's state (`none`: no
-/// switch), and the rung it shows at each span.
-type Shown = (CliMark, &'static str, &'static [(usize, &'static str)]);
+/// One row of §5.5's table: the CLI and its build, its switch's state
+/// (`none`: no switch), and the rung it shows at each span.
+type Shown = (
+    (CliMark, Build),
+    &'static str,
+    &'static [(usize, &'static str)],
+);
 
 /// What §5.5 says each CLI shows, by rung and span (the parenthesised span
 /// of each cell of its table).
 const SHOWS: &[Shown] = &[
     // Claude, its KEY tag drawn: the span is W − 12.
     (
-        CliMark::Claude,
+        (CliMark::Claude, Build::Vendor),
         "on",
         &[
             (108, "full s0"),
@@ -1043,7 +1110,7 @@ const SHOWS: &[Shown] = &[
         ],
     ),
     (
-        CliMark::Claude,
+        (CliMark::Claude, Build::Vendor),
         "off",
         &[
             (108, "full s0"),
@@ -1054,7 +1121,7 @@ const SHOWS: &[Shown] = &[
         ],
     ),
     (
-        CliMark::Claude,
+        (CliMark::Claude, Build::Vendor),
         "turning",
         &[
             (108, "full s0"),
@@ -1066,7 +1133,7 @@ const SHOWS: &[Shown] = &[
     ),
     // Claude, the ghost: the span is W − 16.
     (
-        CliMark::Claude,
+        (CliMark::Claude, Build::Vendor),
         "on",
         &[
             (104, "full s0"),
@@ -1077,7 +1144,7 @@ const SHOWS: &[Shown] = &[
         ],
     ),
     (
-        CliMark::Claude,
+        (CliMark::Claude, Build::Vendor),
         "off",
         &[
             (104, "full s0"),
@@ -1088,7 +1155,7 @@ const SHOWS: &[Shown] = &[
         ],
     ),
     (
-        CliMark::Claude,
+        (CliMark::Claude, Build::Vendor),
         "turning",
         &[
             (104, "full s0"),
@@ -1100,7 +1167,7 @@ const SHOWS: &[Shown] = &[
     ),
     // Claude with no right label, and Gemini and Codex: the span is W.
     (
-        CliMark::Claude,
+        (CliMark::Claude, Build::Vendor),
         "on",
         &[
             (120, "full s0"),
@@ -1111,7 +1178,7 @@ const SHOWS: &[Shown] = &[
         ],
     ),
     (
-        CliMark::Claude,
+        (CliMark::Claude, Build::Vendor),
         "off",
         &[
             (120, "full s0"),
@@ -1122,7 +1189,7 @@ const SHOWS: &[Shown] = &[
         ],
     ),
     (
-        CliMark::Gemini,
+        (CliMark::Gemini, Build::Vendor),
         "turning",
         &[
             (120, "full s0"),
@@ -1132,20 +1199,63 @@ const SHOWS: &[Shown] = &[
             (26, "full s3"),
         ],
     ),
+    // codex-alab (a Codex with a switch is codex-alab: no host admits a
+    // vendor `codex`): its name lays 15 cells, five more than §5.5's `codex`,
+    // so at 26 and 33 columns its name gives way a rung sooner.
     (
-        CliMark::Codex,
+        (CliMark::Codex, Build::Alab),
         "on",
         &[
             (120, "full s0"),
             (80, "full s0"),
             (50, "full s0"),
+            (40, "full s0"),
+            (39, "full s1"),
             (33, "full s1"),
-            (26, "full s2"),
+            (27, "full s2"),
+            (26, "icon s2"),
+            (16, "icon s2"),
+            (15, "icon s2 compact"),
+            (13, "alone s2"),
         ],
+    ),
+    (
+        (CliMark::Codex, Build::Alab),
+        "off",
+        &[
+            (120, "full s0"),
+            (80, "full s0"),
+            (50, "full s0"),
+            (48, "full s0"),
+            (47, "full s1"),
+            (39, "full s2"),
+            (33, "full s3"),
+            (29, "full s3"),
+            (28, "icon s3"),
+            (26, "icon s3"),
+        ],
+    ),
+    (
+        (CliMark::Codex, Build::Alab),
+        "turning",
+        &[
+            (120, "full s0"),
+            (80, "full s0"),
+            (50, "full s0"),
+            (33, "full s3"),
+            (27, "full s3"),
+            (26, "icon s3"),
+        ],
+    ),
+    // Vendor `codex`: no switch, its own word.
+    (
+        (CliMark::Codex, Build::Vendor),
+        "none",
+        &[(120, "full"), (26, "full"), (14, "full"), (13, "icon")],
     ),
     // agy: the span is W.
     (
-        CliMark::Agy,
+        (CliMark::Agy, Build::Vendor),
         "on",
         &[
             (120, "full s0"),
@@ -1156,7 +1266,7 @@ const SHOWS: &[Shown] = &[
         ],
     ),
     (
-        CliMark::Agy,
+        (CliMark::Agy, Build::Vendor),
         "off",
         &[
             (120, "full s0"),
@@ -1167,7 +1277,7 @@ const SHOWS: &[Shown] = &[
         ],
     ),
     (
-        CliMark::Agy,
+        (CliMark::Agy, Build::Vendor),
         "turning",
         &[
             (120, "full s0"),
@@ -1180,7 +1290,7 @@ const SHOWS: &[Shown] = &[
     // Muse: the span is W − 32, after a voice label with news (at rest the
     // lockup takes the idle label, and the span is the whole rule).
     (
-        CliMark::Muse,
+        (CliMark::Muse, Build::Vendor),
         "on",
         &[
             (88, "full s0"),
@@ -1190,7 +1300,7 @@ const SHOWS: &[Shown] = &[
         ],
     ),
     (
-        CliMark::Muse,
+        (CliMark::Muse, Build::Vendor),
         "off",
         &[
             (88, "full s0"),
@@ -1200,7 +1310,7 @@ const SHOWS: &[Shown] = &[
         ],
     ),
     (
-        CliMark::Muse,
+        (CliMark::Muse, Build::Vendor),
         "turning",
         &[
             (88, "full s0"),
@@ -1211,22 +1321,22 @@ const SHOWS: &[Shown] = &[
     ),
     // No switch (no host, a vendor Codex, Grok).
     (
-        CliMark::Claude,
+        (CliMark::Claude, Build::Vendor),
         "none",
         &[(108, "full"), (38, "full"), (21, "full"), (14, "icon")],
     ),
     (
-        CliMark::Claude,
+        (CliMark::Claude, Build::Vendor),
         "none",
         &[(104, "full"), (34, "full"), (17, "full"), (10, "icon")],
     ),
     (
-        CliMark::Muse,
+        (CliMark::Muse, Build::Vendor),
         "none",
         &[(88, "full"), (48, "full"), (18, "full"), (1, "nothing")],
     ),
     (
-        CliMark::Grok,
+        (CliMark::Grok, Build::Vendor),
         "none",
         &[(120, "full"), (33, "full"), (26, "full")],
     ),
@@ -1243,34 +1353,56 @@ fn paint_of(state: &str) -> Option<SwitchPaint> {
 }
 
 /// THE LADDER GIVES UP WORDS, THEN THE NAME, THEN THE ICON (§5.3): for every
-/// mark, every switch face and none, the rung chosen walking down every span
-/// from 200 to 0 keeps the order ([`walk_order`]), and the rungs §5.5's
-/// table names are the ones laid at its spans (Claude with its KEY tag, the
-/// ghost or neither; agy; Muse after its label; Gemini; Codex; no switch).
+/// mark and build — codex-alab's longer name among them — every switch face
+/// and none, the rung chosen walking down every span from 200 to 0 keeps the
+/// order ([`walk_order`]), and the rungs §5.5's table names are the ones laid
+/// at its spans (Claude with its KEY tag, the ghost or neither; agy; Muse
+/// after its label; Gemini; codex-alab, its name giving way a rung sooner
+/// than §5.5's `codex`; vendor `codex` and no switch).
 ///
-/// NEGATIVE CONTROL: a ladder with the icon's rung before the name's last
+/// NEGATIVE CONTROLS: a ladder with the icon's rung before the name's last
 /// tier breaks the order, and at agy off, span 26, shows `icon s3`, not
-/// `full s3`.
+/// `full s3`; and codex-alab's line laid on the ladder of vendor `codex`'s
+/// name shows `full s2` at 26 columns, its name where it no longer fits.
 #[test]
 fn the_ladder_gives_up_words_then_the_name_then_the_icon() {
     let mut walked = 0;
     for mark in CliMark::ALL {
-        for switch in [Some(LIT), Some(OFF), Some(MASTER_OFF), Some(TURNING), None] {
-            let (rungs, n) = ladder(switch, Some(mark.lockup_cells()));
-            let last = rungs[..n].iter().filter_map(|r| r.tier).max();
-            walk_order(&rungs[..n], last).unwrap_or_else(|e| panic!("{mark:?} {switch:?}: {e}"));
-            walked += 1;
+        for build in Build::ALL {
+            for switch in [Some(LIT), Some(OFF), Some(MASTER_OFF), Some(TURNING), None] {
+                let (rungs, n) = ladder(switch, Some(mark.lockup_cells(build)));
+                let last = rungs[..n].iter().filter_map(|r| r.tier).max();
+                walk_order(&rungs[..n], last)
+                    .unwrap_or_else(|e| panic!("{mark:?} {build:?} {switch:?}: {e}"));
+                walked += 1;
+            }
         }
     }
-    assert_eq!(walked, CliMark::ALL.len() * 5);
-    for (mark, state, cells) in SHOWS {
+    assert_eq!(walked, CliMark::ALL.len() * Build::ALL.len() * 5);
+    for ((mark, build), state, cells) in SHOWS {
         for &(span, want) in *cells {
-            let rung = lay_top(span, paint_of(state), Some(mark.lockup_cells())).map(|(r, _)| r);
-            assert_eq!(rung_name(rung), want, "{mark:?} {state} at span {span}");
+            let rung =
+                lay_top(span, paint_of(state), Some(mark.lockup_cells(*build))).map(|(r, _)| r);
+            assert_eq!(
+                rung_name(rung),
+                want,
+                "{mark:?} {build:?} {state} at span {span}"
+            );
         }
     }
+    // CONTROL: codex-alab on the vendor's ladder.
+    let vendor = lay_top(
+        26,
+        Some(LIT),
+        Some(CliMark::Codex.lockup_cells(Build::Vendor)),
+    );
+    assert_eq!(
+        rung_name(vendor.map(|(r, _)| r)),
+        "full s2",
+        "CONTROL: the vendor's ladder keeps a name at 26"
+    );
     // CONTROL: the icon's rung moved before the last full one.
-    let (rungs, n) = ladder(Some(OFF), Some(CliMark::Agy.lockup_cells()));
+    let (rungs, n) = ladder(Some(OFF), Some(CliMark::Agy.lockup_cells(Build::Vendor)));
     let mut mutant: Vec<Rung> = rungs[..n].to_vec();
     let icon = mutant
         .iter()
@@ -1319,28 +1451,31 @@ fn hb_int_faces(paint: SwitchPaint, word: &str) -> Vec<String> {
 }
 
 /// A SWITCH STANDS WHEREVER IT STOOD (§5.6, invariants 2 and 3): for every
-/// span from 0 to 200, every program and every switch face, a switch is laid
-/// exactly where hb-int's `fitted_switch_face` laid one (its widest form of
-/// the program's word that left two rule cells either side), and it stands
-/// at `span − 2 − len`, as [`compose_top`] lays it.
+/// span from 0 to 200, every lockup with a switch — Claude's, agy's, Muse's,
+/// Gemini's and codex-alab's, the longest name — and every switch face, a
+/// switch is laid exactly where hb-int's `fitted_switch_face` laid one (its
+/// widest form of the program's word that left two rule cells either side),
+/// and it stands at `span − 2 − len`, as [`compose_top`] lays it.
 ///
 /// NEGATIVE CONTROL: a ladder with no `alone` rung loses the switch at spans
 /// 10 to 13 on the on face and 12 to 15 on the off face.
 #[test]
 fn a_switch_stands_wherever_it_stood() {
-    for program in [
-        aterm_phase::Program::Claude,
-        aterm_phase::Program::Agy,
-        aterm_phase::Program::Muse,
+    for (program, build) in [
+        (aterm_phase::Program::Claude, Build::Vendor),
+        (aterm_phase::Program::Agy, Build::Vendor),
+        (aterm_phase::Program::Muse, Build::Vendor),
+        (aterm_phase::Program::Gemini, Build::Vendor),
+        (aterm_phase::Program::Codex, Build::Alab),
     ] {
         let mark = cli_mark(program).expect("a mark");
         for paint in [LIT, OFF, MASTER_OFF, TURNING] {
             let old = hb_int_faces(paint, mark.word());
             for span in 0..=200 {
                 let stood = old.iter().any(|f| f.chars().count() + 4 <= span);
-                let laid = lay_top(span, Some(paint), Some(mark.lockup_cells()))
+                let laid = lay_top(span, Some(paint), Some(mark.lockup_cells(build)))
                     .and_then(|(_, face)| face);
-                let at = format!("{program:?} {paint:?} {span}");
+                let at = format!("{program:?} {build:?} {paint:?} {span}");
                 assert_eq!(laid.is_some(), stood, "{at}: a switch where one stood");
                 assert_eq!(
                     fitted_switch_face(paint, span).is_some(),
@@ -1348,8 +1483,8 @@ fn a_switch_stands_wherever_it_stood() {
                     "{at}: the switch alone"
                 );
                 if let Some(face) = laid {
-                    let top = composed_for(
-                        program,
+                    let top = composed_as(
+                        (program, build),
                         plain_run(span),
                         Some(paint),
                         None,
@@ -1367,7 +1502,10 @@ fn a_switch_stands_wherever_it_stood() {
     }
     // CONTROL: no `alone` rung.
     for (paint, lost) in [(LIT, 10..=13), (OFF, 12..=15)] {
-        let (rungs, n) = ladder(Some(paint), Some(CliMark::Claude.lockup_cells()));
+        let (rungs, n) = ladder(
+            Some(paint),
+            Some(CliMark::Claude.lockup_cells(Build::Vendor)),
+        );
         let without: Vec<Rung> = rungs[..n]
             .iter()
             .copied()
@@ -1395,7 +1533,8 @@ fn mark_cell_free(line: &[char], span: usize, switch: bool) -> bool {
 }
 
 /// THE MARK CELL SURVIVES EVERY RUNG (§5.6, invariant 5): on every rung of
-/// every program's ladder, in every switch state and none, at every span
+/// every lockup's ladder (codex-alab's included), in every switch state and
+/// none, at every span
 /// from 6 to 200, the span's last cell is the rule's `─`, and where a
 /// switch is laid the one before it too — so the key's mark (`◐`, `▸`: the
 /// span's last cell, `mark_at`) lands on a `─`, never on the lockup nor
@@ -1407,24 +1546,24 @@ fn mark_cell_free(line: &[char], span: usize, switch: bool) -> bool {
 #[test]
 fn the_mark_cell_survives_every_rung() {
     let mut checked = 0;
-    for program in MARKED {
+    for (program, build) in LOCKUPS {
         for (switch, palette) in CASES {
             for len in 6..=200 {
                 let run = plain_run(len);
-                let top = composed_for(program, run, switch, palette, KeyFace::default());
+                let top = composed_as((program, build), run, switch, palette, KeyFace::default());
                 if top.cells.is_empty() {
                     continue;
                 }
                 let line = line_of(&top, run);
                 assert!(
                     mark_cell_free(&line, len, top.switch.is_some()),
-                    "{program:?} {switch:?} {len}: {:?}",
+                    "{program:?} {build:?} {switch:?} {len}: {:?}",
                     line.iter().collect::<String>()
                 );
                 // The mark drawn left of Claude's tag, just past the run.
                 let tag = (run.col + len + 1, run.col + len + 10);
-                let marked = composed_for(
-                    program,
+                let marked = composed_as(
+                    (program, build),
                     run,
                     switch,
                     palette,
@@ -1438,7 +1577,7 @@ fn the_mark_cell_survives_every_rung() {
                 assert_eq!(
                     (marked.cells[at].ch, marked.cells[at].fg),
                     ('\u{25d0}', [0xd7, 0x77, 0x57]),
-                    "{program:?} {switch:?} {len}: the mark, in the accent"
+                    "{program:?} {build:?} {switch:?} {len}: the mark, in the accent"
                 );
                 checked += 1;
             }
@@ -1446,7 +1585,7 @@ fn the_mark_cell_survives_every_rung() {
     }
     assert!(checked > 5000, "{checked}");
     // CONTROL: tail one on the compact rung.
-    let lockup = CliMark::Claude.lockup_cells();
+    let lockup = CliMark::Claude.lockup_cells(Build::Vendor);
     let span = 14;
     let (rung, face) = lay_top(span, Some(LIT), Some(lockup)).expect("a rung");
     assert_eq!(rung_name(Some(rung)), "icon s2 compact");
@@ -2237,5 +2376,105 @@ fn marks_write_only_the_run() {
             .as_ref()
             .is_err_and(|e| e.contains(&format!("column {}", run.col - 1))),
         "CONTROL: the label's last space is caught: {caught:?}"
+    );
+}
+
+/// THE BARE SWITCH READS ON EVERY GROUND IT IS LAID ON (design §8: every
+/// letter aterm draws reads at 4.5:1 or better): the switch no theme wears
+/// — the master switch off, a claim this host does not hold, a switch
+/// turning on — on every built-in's ground, under the accent of every
+/// built-in's band, since a tab's own theme draws its pane in one theme
+/// while the accent is the instance's (`session_theme`: the window's chrome
+/// follows the instance). In every face, hovered or not, every letter and
+/// state glyph — `alab harness`, `● on`, `○ off`, `◐ turning on`, the `on`
+/// button's letters on its fill — reads at 4.5:1 or more on what it is laid
+/// on, and the button's caps and its fill at 3:1 or more on the ground
+/// (WCAG 1.4.11: the pill is the control's shape).
+///
+/// NEGATIVE CONTROLS: the inks unfloored read under it — the quiet label
+/// (`mix(fg, bg, 0.3)`) on Solarized Light under 3:1, and Dracula's accent,
+/// the `on` pill's fill under an instance in Dracula, on a tab in Default
+/// Light under 1.5:1.
+#[test]
+fn the_bare_switch_reads_on_every_ground() {
+    use aterm_effects::color_math::contrast_ratio;
+    use aterm_types::scheme::{builtin, builtin_names};
+    let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+    let reads = |a: [u8; 3], b: [u8; 3]| contrast_ratio(pack(a), pack(b));
+    let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
+    let accent_of = |s: &aterm_types::ColorScheme| {
+        crate::chrome_band::band_colors(aterm_render::Theme::from(s)).accent
+    };
+    let floor = aterm_effects::cli_marks::NAME_CONTRAST;
+    let schemes: Vec<_> = builtin_names()
+        .into_iter()
+        .filter_map(|n| Some((n, builtin(n)?)))
+        .collect();
+    assert!(schemes.len() >= 17, "{} built-ins", schemes.len());
+    let mut checked = 0usize;
+    for (ground_name, ground) in &schemes {
+        let blank = RenderCell {
+            ch: ' ',
+            fg: rgb(ground.foreground),
+            bg: rgb(ground.background),
+            ..RenderCell::default()
+        };
+        for (accent_name, instance) in &schemes {
+            let accent = accent_of(instance);
+            for face in [
+                HarnessSwitch::On,
+                HarnessSwitch::Off(SwitchOff::Master),
+                HarnessSwitch::Off(SwitchOff::Session),
+                HarnessSwitch::Turning,
+            ] {
+                for hover in [false, true] {
+                    let paint = SwitchPaint { face, hover };
+                    // The widest form wears every ink its face has.
+                    let f = switch_face(paint, 0).expect("the widest form");
+                    let mut seen: Vec<SwitchInk> = Vec::new();
+                    for &(ch, ink) in f.cells() {
+                        if ch == ' ' || seen.contains(&ink) {
+                            continue;
+                        }
+                        seen.push(ink);
+                        let c = switch_cell(ch, ink, paint, None, blank, accent);
+                        let what = format!(
+                            "{accent_name}'s accent on {ground_name}, {face:?}{}, {:?}'s {ch:?}",
+                            if hover { " hovered" } else { "" },
+                            f.text()
+                        );
+                        if ink == SwitchInk::Cap {
+                            let k = reads(c.fg, blank.bg);
+                            assert!(k >= 3.0, "{what}: the cap at {k:.2}:1");
+                        } else {
+                            let k = reads(c.fg, c.bg);
+                            assert!(k >= floor, "{what}: the letter at {k:.2}:1");
+                            if ink == SwitchInk::Button {
+                                let k = reads(c.bg, blank.bg);
+                                assert!(k >= 3.0, "{what}: the pill at {k:.2}:1");
+                            }
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked >= 17 * 17 * 8 * 2, "{checked}");
+    // CONTROLS: the inks unfloored.
+    let solarized = builtin("Solarized Light").expect("a built-in");
+    let paper = rgb(solarized.background);
+    let quiet = mix(rgb(solarized.foreground), paper, 0.3);
+    assert!(
+        reads(quiet, paper) < 3.0,
+        "CONTROL: the quiet label at {:.2}:1 on Solarized Light",
+        reads(quiet, paper)
+    );
+    let dracula = accent_of(&builtin("Dracula").expect("a built-in"));
+    let light = rgb(builtin("Default Light").expect("a built-in").background);
+    assert!(
+        reads(dracula, light) < 1.5,
+        "CONTROL: Dracula's accent at {:.2}:1 on Default Light",
+        reads(dracula, light)
     );
 }

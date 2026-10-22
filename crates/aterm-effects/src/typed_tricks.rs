@@ -13,9 +13,9 @@
 //!
 //! A trick fires only when its token is closed (whitespace, Enter, sentence
 //! punctuation), so `sit` never fires inside `site`, and only while the line is
-//! pure: every token so far was pet vocabulary (trick word, pet name, filler)
-//! and no code punctuation appeared. `npm run build`, `./sit`, `--sit`,
-//! `sit.txt`, `sit: 3` and `play.py` never move the pet.
+//! pure: every token so far was pet vocabulary (trick word, pet name, filler) and
+//! no code punctuation appeared. `npm run build`, `./sit`, `--sit`, `sit.txt`,
+//! `sit: 3` and `play.py` never move the pet.
 //!
 //! Imperative prose often starts with a trick word (`roll back the commit`,
 //! `sleep 5`), so a fire is either addressed (the line also names the pet,
@@ -82,8 +82,8 @@
 //!   goes with its base, as in readline and zsh). A count of zero is a provably
 //!   empty line and resets it to fresh and pure; Backspace at zero is a no-op.
 //! * One boundary can be crossed backwards: closing a token snapshots the line
-//!   and backspacing over the closer restores it (`siy␣⌫⌫t␣` fires), revoking
-//!   a tentative fire made there. Past a second boundary the line is impure but
+//!   and backspacing over the closer restores it (`siy␣⌫⌫t␣` fires), revoking a
+//!   tentative fire made there. Past a second boundary the line is impure but
 //!   still counted, so holding Backspace to the start recovers any line.
 //! * Ctrl+W on an open alphanumeric token after whitespace clears the token; on
 //!   an empty line it is a no-op; any other word-kill poisons the line.

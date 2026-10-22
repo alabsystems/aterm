@@ -34,8 +34,7 @@ fn drain(pipe: [i32; 2]) -> Vec<u8> {
     bytes[..read as usize].to_vec()
 }
 
-/// Arm DEC 1004 on `session`'s engine — the app-set mode bit the egress is
-/// gated on, exactly as `ESC[?1004h` from nvim/tmux sets it.
+/// Arm DEC 1004 on `session`'s engine, as `ESC[?1004h` from nvim or tmux does.
 fn arm_focus_reporting(app: &App, session: u64) {
     let term = app.pool.get(session).expect("live session").term.clone();
     term_lock(&term).process(b"\x1b[?1004h");

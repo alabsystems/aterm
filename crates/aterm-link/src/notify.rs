@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **`aterm-link notify`** — the fabric's only push TO a human (§9.3, story A10).
+//! `aterm-link notify`: the fabric's only push to a human (§9.3). `ls` and `aterm fabric` are
+//! pulls, so without this an `attention` raised on a headless box reaches nobody. It runs a
+//! command the operator chose (ntfy, mail, a webhook) once per matching record; [`USAGE`] has
+//! the flags.
 //!
 //! ```text
 //! aterm-link notify --fleet <F> --broker <socket> --cap-file <p>...
@@ -10,42 +13,27 @@
 //!                   [--exec-timeout <ms>]
 //! ```
 //!
-//! `ls` and `aterm fabric` are PULLS, so without this an `attention` raised on
-//! a headless box reaches nobody until somebody looks (§13). This runs a
-//! command the operator chose — ntfy, mail, a webhook — once per matching record.
+//! `--rate <n>/<window>` bounds fires, not matches, and drops nothing silently: a refused record
+//! gets a durable `dropped` journal line, a stderr line, and a bump of the persisted
+//! `suppressed` counter, handed to the next command as `ATERM_NOTIFY_SUPPRESSED=<n>`. Only a
+//! command that answered `rc=0` clears the counter. A dropped record is terminal; the bus still
+//! holds it for `ls` and the digest.
 //!
-//! ## The failure it chooses, said out loud
+//! `--exec` is the operator's own line, run as `/bin/sh -c <cmd>`. Nothing from a record is
+//! interpolated into it: every fact arrives as an environment variable, the free text flattened
+//! to printable ASCII and capped at [`TEXT_MAX`] bytes.
 //!
-//! Exactly-once across a restart is not available: the command is a foreign
-//! process, so there is no way to make "the command ran" and "we wrote that down"
-//! one atomic act. The journal entry is therefore written **before** the exec and
-//! completed **after** it, and an entry left in `firing` by a crash is IN DOUBT.
+//! State lives under `<state>/notify/`, each file written temp, `fsync`, `rename`:
 //!
-//! **An in-doubt entry re-fires.** The chosen failure is *a command that runs
-//! twice*, never *a command that never runs*: A10 exists to prevent an
-//! escalation that reaches nobody. The re-fire is labelled — the command sees
-//! `ATERM_NOTIFY_DUP=1` and the journal keeps the history.
+//! | file | what it holds |
+//! |---|---|
+//! | `cur/<key>` | the next offset to scan for one selector; monotone |
+//! | `journal` | the newest [`JOURNAL_KEEP`] verdicts, `<off> firing\|fired\|dropped …` |
+//! | `rate` | the timestamps of the last fires, for the budget window |
+//! | `suppressed` | rate-dropped notifications a human has not been told about yet |
 //!
-//! Every other window resolves the same way. A crash between the `firing` write
-//! and the spawn re-fires (the command runs, once). A crash between the spawn and
-//! the `fired` write re-fires (twice). A command that exits non-zero, or that
-//! outlives `--exec-timeout` and is killed, is TERMINAL and is not retried: a
-//! notifier that retried a broken command would hammer it forever, and the
-//! verdict is on the journal line for a human to read.
-//!
-//! ## The rate limit never drops anything silently
-//!
-//! `--rate <n>/<window>` bounds fires, not matches. A record the budget refuses
-//! gets its own durable `dropped` journal line, a line on stderr, and a bump of a
-//! persisted `suppressed` counter that is handed to the NEXT command that does run
-//! as `ATERM_NOTIFY_SUPPRESSED=<n>`. So a human who is being rate-limited learns
-//! it from the notification itself rather than from silence. **The counter is
-//! cleared only by a command that answered `rc=0`** — a spawn that failed told
-//! nobody anything, and a command that exited non-zero, was signalled or was
-//! killed on `--exec-timeout` may have died before it pushed. Anything else is
-//! the count going to zero while the human is still uninformed, which is the
-//! silence again, so the count rides to the next `rc=0`: told twice, never
-//! untold.
+//! Dedup is by offset (§9.3), the only identity a record has: the same `attention=` at a new
+//! offset is a new notification, and the budget is what bounds a storm.
 //!
 //! A dropped record is terminal — it is not re-offered when the window rolls,
 //! because a queue of deferred 3 a.m. pushes arriving at 6 a.m. is its own kind
@@ -69,7 +57,7 @@
 //!
 //! | file | what it holds |
 //! |---|---|
-//! | `cur/<key>` | the next offset to scan for one selector; MONOTONE |
+//! | `cur/<key>` | the next offset to scan for one selector; monotone |
 //! | `journal` | the newest [`JOURNAL_KEEP`] verdicts, `<off> firing\|fired\|dropped …` |
 //! | `log` | the identity of the bus log the two above are offsets on |
 //! | `logs/<identity>/` | `cur/` and `journal` of any other log this notifier read ([`Store::for_log`]) — a moved generation's carried over from the one it continues, clamped at the fork — the newest [`LOGS_KEEP`] kept |
@@ -164,9 +152,8 @@ use crate::transport::{self, Backoff, Closer, Conn};
 /// journal, not changing a number.
 const PAGE: u32 = crate::transport::POST_PAGE;
 
-/// How many verdicts the journal keeps. Far above [`PAGE`] on purpose: the
-/// cursor never moves backwards, so the only re-scan is of the page a crash
-/// interrupted, and the journal has to outlive that page with room to spare.
+/// How many verdicts the journal keeps. Far above [`PAGE`]: the cursor never moves backwards,
+/// so the only re-scan is of the page a crash interrupted.
 const JOURNAL_KEEP: usize = 1024;
 
 /// How many other logs' stores (`logs/<identity>/`) are kept beside the
@@ -179,18 +166,14 @@ const LOGS_KEEP: usize = 4;
 /// one.
 const STANDING_KEEP: usize = JOURNAL_KEEP;
 
-/// The cap on the free text handed to the command. §3.2's reason, at another
-/// seam: a bounded string is one that cannot carry a sentence into somewhere it
-/// was not invited.
+/// The cap on the free text handed to the command.
 const TEXT_MAX: usize = 256;
 
-/// How often the exec wait looks at the child. Not synchronisation — the child's
-/// exit is the observable, and this only keeps the wait off a core.
+/// How often the exec wait looks at the child; it only keeps the wait off a core.
 const EXEC_POLL: Duration = Duration::from_millis(10);
 
-/// How long a notification command may run before it is killed. A hung `curl`
-/// with no timeout would wedge every later notification behind it — which is
-/// silence, arriving by a different road.
+/// How long a notification command may run before it is killed: a hung `curl` would wedge
+/// every later notification behind it.
 const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The default budget: ten pushes a minute.
@@ -208,9 +191,8 @@ const HOLD_MAX: usize = 4 << 20;
 #[derive(Debug)]
 enum Notice {
     Record(usize, u64, String, Vec<u8>),
-    /// The broker scanned through `next`, including offsets the selector did
-    /// not match. Sent after the page's records so the executor persists it
-    /// only after it has handled every matching record in that page.
+    /// The broker scanned through `next`, unmatched offsets included. Sent after the page's
+    /// records, so it is persisted only once each of them is handled.
     Checkpoint(usize, u64),
     /// The reader at this index just connected, to a broker serving the log
     /// with this identity (`None`: one that predates identity). Sent before
@@ -247,9 +229,8 @@ struct Held {
     body: Vec<u8>,
 }
 
-/// A broker reader hands one row directly to the serial notification executor.
-/// No second row is buffered while an operator command runs: a broker body can
-/// be 16 MiB, and an unbounded channel let a slow command grow without limit.
+/// A zero-capacity handoff from the broker readers to the serial executor: a body can be
+/// 16 MiB, and a buffered channel would let a slow command grow memory without limit.
 fn notice_handoff() -> (mpsc::SyncSender<Notice>, mpsc::Receiver<Notice>) {
     mpsc::sync_channel(0)
 }
@@ -268,7 +249,7 @@ pub enum Sel {
     /// a person is reached (§9.3). The person's own cap
     /// ([`crate::enable::person_grants`]'s `ro:/f/<F>/in/p/<p>/>`) reads it.
     Ask(String),
-    /// A fleet halt coming ON (§9.3).
+    /// A fleet halt coming on (§9.3).
     Halt,
 }
 
@@ -302,9 +283,8 @@ impl Sel {
         }
     }
 
-    /// The cursor file this selector's scan position lives in. A principal is
-    /// `[a-z0-9-]{1,32}` (§3.2), so this is a filename by construction — there is
-    /// no path separator any selector can spell.
+    /// The cursor file name. A principal is `[a-z0-9-]{1,32}` (§3.2), so no selector can spell a
+    /// path separator.
     #[must_use]
     pub fn key(&self) -> String {
         match self {
@@ -333,8 +313,7 @@ impl Sel {
         }
     }
 
-    /// The broker filter that carries this selector's records — POSITIONAL, so
-    /// the broker's own subject matcher does the first cut.
+    /// The broker filter that carries this selector's records.
     #[must_use]
     pub fn filter(&self, fleet: &str) -> String {
         match self {
@@ -344,24 +323,16 @@ impl Sel {
         }
     }
 
-    /// THE SECOND WALL. The filter is a property of the grant this process
-    /// happens to hold; this is a property of the reader, and it parses BY
-    /// POSITION FROM THE LEFT for the reason `subject::parse_in` does: `>` is
-    /// one-or-more segments, so a right-anchored reading of an over-long subject
-    /// is exactly the forgery a peer would reach for.
+    /// The reader's own check, behind the grant's filter. It parses by position from the left,
+    /// as `subject::parse_in` does: `>` is one or more segments, and a right-anchored reading of
+    /// an over-long subject is the forgery a peer would reach for.
     ///
-    /// **Every segment it keeps is a principal, checked here**, because each one
-    /// becomes an environment value of `/bin/sh -c`. They are not cap-forced: a
-    /// presence row's owner, and an `ask`'s node and sid, are the SENDER's
-    /// choice, and astream's subject grammar checks structure, not shape: it
-    /// refuses wildcards, empty segments and control bytes, but no character
-    /// set, so a bidi override or a shell metacharacter arrives intact. Its
-    /// 4 KiB bound on a published subject is the broker's, and `--broker` may
-    /// name one that predates it; an oversized segment would then make `spawn`
-    /// fail `E2BIG` after the rate budget was charged. The presence arm calls
-    /// [`crate::glance::Row::parse`]; the others call
-    /// [`crate::subject::is_principal`]. A refused subject is not a hit: no
-    /// journal line, no budget charged, nothing spawned.
+    /// Every segment it keeps must be a principal: each becomes an environment value of
+    /// `/bin/sh -c`, most are the sender's choice rather than cap-forced, and astream's grammar
+    /// checks structure, not character set (a bidi override or shell metacharacter arrives
+    /// intact; an oversized segment would fail `spawn` with `E2BIG` after the budget was
+    /// charged). A refused subject is not a hit: no journal line, no budget charged, nothing
+    /// spawned.
     fn hit(&self, fleet: &str, offset: u64, subject: &str, body: &[u8]) -> Option<Hit> {
         let segs: Vec<&str> = subject.split('/').collect();
         if segs.first() != Some(&"") || segs.get(1) != Some(&"f") || segs.get(2) != Some(&fleet) {
@@ -369,8 +340,7 @@ impl Sel {
         }
         match self {
             Sel::Attention => {
-                // One reader of a presence row: the same wall `ls` and
-                // `aterm fabric` stand behind, so the three cannot disagree.
+                // The one presence-row reader `ls` and `aterm fabric` use too.
                 let row = crate::glance::Row::parse(fleet, offset, subject, body)?;
                 let attention = crate::pct::decode(row.field("attention"));
                 if attention.is_empty() || attention == crate::glance::ABSENT {
@@ -484,22 +454,18 @@ pub struct Hit {
     /// The asking session, for an `ask`: with [`Hit::node`], the
     /// `to=@<sid>@<node>` an answer goes to.
     pub sid: String,
-    /// The free text, flattened and capped. UNTRUSTED, and it never becomes a
-    /// shell word.
+    /// The free text, flattened and capped. Untrusted, and never a shell word.
     pub text: String,
 }
 
-/// The subject, as an environment value. Every segment is already a
-/// principal, but it is flattened and capped here too, so the bound on what
-/// `exec` puts in an environment block is [`TEXT_MAX`], not a property of the
-/// parse.
+/// The subject as an environment value, flattened and capped like the text so [`TEXT_MAX`]
+/// bounds it whatever the parse admitted.
 fn subject_env(subject: &str) -> String {
     one_line(subject)
 }
 
-/// Flatten untrusted text to one line of printable ASCII, capped at
-/// [`TEXT_MAX`]. The command may echo it at a terminal, so a raw `ESC` or `CR`
-/// from a cap holder must not survive.
+/// Flatten untrusted text to one line of printable ASCII, capped at [`TEXT_MAX`]: the command
+/// may echo it at a terminal.
 fn one_line(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(TEXT_MAX));
     for ch in s.chars() {
@@ -522,8 +488,7 @@ fn one_line(s: &str) -> String {
 /// Where a scan starts when a selector has no cursor yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Since {
-    /// The log head: a notifier installed today does not page a human through
-    /// every escalation the fleet has ever had. The default.
+    /// The log head, so a new notifier does not page through the fleet's history. The default.
     Head,
     /// Offset zero — the whole retained log.
     Start,
@@ -572,8 +537,7 @@ impl Store {
         Ok(Self { root })
     }
 
-    /// Temp, `fsync`, `rename`. A half-written journal would be worse than none:
-    /// a truncated verdict reads as "never fired" and fires again.
+    /// Temp, `fsync`, `rename`: a truncated verdict would read as "never fired" and fire again.
     fn write(&self, name: &str, value: &str) -> io::Result<()> {
         let target = self.root.join(name);
         let tmp = target.with_extension("tmp");
@@ -874,9 +838,8 @@ impl Store {
             .and_then(|s| s.trim().parse().ok())
     }
 
-    /// MONOTONE. A cursor that walked backwards would re-offer offsets the
-    /// journal has already forgotten, and re-firing a week-old escalation is a
-    /// duplicate nobody can explain.
+    /// Monotone: a cursor that walked backwards would re-offer offsets the journal has
+    /// already forgotten.
     fn set_cursor(&self, key: &str, off: u64) -> io::Result<()> {
         if self.cursor(key).is_some_and(|have| have >= off) {
             return Ok(());
@@ -938,18 +901,12 @@ impl Store {
     }
 }
 
-/// TEST-ONLY fault injection, armed by `$ATERM_LINK_NOTIFY_FAULT`.
-/// [`Fault::from_env`] reads it through `aterm_types::dev_seam!`, which a
-/// release build compiles to `None`. The gate is required, as for
-/// `bridge::Fault`: the variable is on no env deny list (it is inherited
-/// through `fabric_launch::filter_child_env` on purpose), and [`Fault::fire`]
-/// kills the notifier — the fabric's only outbound path — between a command
-/// and its journal line.
-///
-/// The in-doubt window (command exit to the `fired` line) is microseconds
-/// wide, so instead of racing it from outside the process kills ITSELF there —
-/// one shot, with the marker in the state dir because the process that would
-/// remember is the one that dies.
+/// Test-only fault injection, armed by `$ATERM_LINK_NOTIFY_FAULT` through
+/// `aterm_types::dev_seam!`, so a release build compiles it to `None`; the gate matters because
+/// aterm's `fabric_launch::filter_child_env` passes the variable on. [`Fault::fire`] kills the
+/// notifier inside the in-doubt window (command exit to `fired` line), too narrow to race from
+/// outside. One shot: the marker is in the state dir, since the process that would remember it
+/// is the one that dies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fault {
     None,
@@ -959,7 +916,6 @@ enum Fault {
 
 impl Fault {
     fn from_env(store: &Store) -> Self {
-        // A released binary honours no fault (see the type's doc).
         let Some(fault) = aterm_types::dev_seam!("ATERM_LINK_NOTIFY_FAULT") else {
             return Fault::None;
         };
@@ -972,10 +928,7 @@ impl Fault {
         }
     }
 
-    /// Die HERE, running no destructors — by `SIGKILL` through the `aterm-uds`
-    /// cordon, for the reasons the bridge's twin gives: not `exit` (it would run
-    /// destructors), not a raw `kill(2)` (it would put `unsafe` in this module),
-    /// and not `abort` (its `SIGABRT` made macOS write a crash report per fault).
+    /// Die by `SIGKILL`, running no destructors.
     fn fire(self, store: &Store) -> ! {
         let _ = std::fs::write(store.root.join("fault-fired"), b"1\n");
         eprintln!("aterm-link notify: ATERM_LINK_NOTIFY_FAULT={self:?}: dying");
@@ -1078,9 +1031,8 @@ impl Notifier {
         })
     }
 
-    /// One broker connection with every capability attached, every exchange on
-    /// it bounded by [`ACK_DEADLINE`]: a wedged broker ends `--once` with an
-    /// error, not a cron run that never exits.
+    /// One broker connection with every capability attached, every exchange bounded by
+    /// [`ACK_DEADLINE`] so a wedged broker ends `--once` with an error.
     fn connect(&self) -> io::Result<Conn> {
         let (mut conn, _closer) = transport::connect(&self.cfg.broker, ACK_DEADLINE)?;
         transport::attach_cap_files(&mut conn, &self.cfg.cap_files)?;
@@ -1166,12 +1118,8 @@ impl Notifier {
         Ok(())
     }
 
-    /// The verdict the journal holds for an offset, if any.
-    ///
-    /// Keyed by OFFSET alone, not by (offset, selector): a record is one record,
-    /// and it should wake a human once however many selectors name it. The three
-    /// selector filters are disjoint at the subject's third segment anyway
-    /// (`pub` / `in` / `fleet`), so today no offset can match two.
+    /// The verdict the journal holds for an offset. Keyed by offset alone: a record wakes a human
+    /// once however many selectors name it.
     fn verdict(&self, off: u64) -> Option<&str> {
         self.journal.iter().find_map(|line| {
             let mut it = line.split_whitespace();
@@ -1216,8 +1164,7 @@ impl Notifier {
         self.log_store.set_standing(&self.standing)
     }
 
-    /// Write one verdict, replacing any the offset already had, and keep the
-    /// newest [`JOURNAL_KEEP`].
+    /// Write one verdict, replacing the offset's old one, keeping the newest [`JOURNAL_KEEP`].
     fn record(&mut self, off: u64, line: String) -> io::Result<()> {
         self.journal.retain(|l| {
             l.split_whitespace()
@@ -1232,20 +1179,16 @@ impl Notifier {
         self.log_store.set_journal(&self.journal)
     }
 
-    /// Whether the budget has room, at `now`. Stamps outside the window are
-    /// forgotten here rather than on a timer.
-    ///
-    /// A clock that jumped BACKWARDS leaves stamps in the future; those count as
-    /// inside the window, so the budget errs towards suppressing (and saying so)
-    /// rather than towards a burst nobody asked for.
+    /// Whether the budget has room at `now`, forgetting stamps outside the window. Stamps a
+    /// backwards clock left in the future count as inside, erring towards suppressing.
     fn has_room(&mut self, now: u64) -> bool {
         let window = self.cfg.window_ms;
         self.stamps.retain(|t| now.saturating_sub(*t) < window);
         u64::from(self.cfg.limit) > self.stamps.len() as u64
     }
 
-    /// Charge one fire against the budget, durably — BEFORE the command runs, so
-    /// a crash cannot hand the budget back and let a restart burst.
+    /// Charge one fire against the budget, durably, before the command runs, so a restart cannot
+    /// burst.
     fn charge(&mut self, now: u64) -> io::Result<()> {
         self.stamps.push(now);
         let limit = self.cfg.limit as usize;
@@ -1289,8 +1232,7 @@ impl Notifier {
                 self.counts.skipped += 1;
                 return Ok(());
             }
-            // IN DOUBT — a crash between the spawn and the completion. Fire
-            // again and say so; see the module doc for why this direction.
+            // In doubt: a crash between spawn and completion. Fire again, labelled (module doc).
             Some(_) => true,
             // THE ESCALATION THE HUMAN WAS ALREADY TOLD OF, republished — an
             // attach, a reconnect, an update's successor, a phase change, the
@@ -1333,10 +1275,7 @@ impl Notifier {
             off,
             format!("{off} fired on={} {verdict} dup={}", hit.on, u8::from(dup)),
         )?;
-        // CLEARED ONLY WHEN THE COMMAND WAS TOLD, and `rc=0` is the only verdict
-        // that says so: `spawn-failed` delivered nothing, and `rc=<n>`,
-        // `signalled`, `timeout` and `wait-failed` may not have pushed. The
-        // count rides to the next `rc=0` — told twice, never untold.
+        // Cleared only by `rc=0` (module doc).
         if carried > 0 && verdict == "rc=0" {
             self.suppressed -= carried;
             self.store.set_suppressed(self.suppressed)?;
@@ -1353,8 +1292,8 @@ impl Notifier {
         Ok(())
     }
 
-    /// Run the operator's command. Never fails the run: a notifier that exited
-    /// because `curl` was missing would be a notifier that stopped notifying.
+    /// Run the operator's command and return its verdict. Never fails the run: a missing `curl`
+    /// must not stop the notifier.
     fn exec(&self, hit: &Hit, dup: bool, suppressed: u64) -> String {
         let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
         cmd.arg("-c")
@@ -1485,9 +1424,8 @@ impl Notifier {
         Ok(())
     }
 
-    /// Follow the bus until something kills us. One subscription per selector,
-    /// each on its own connection and its own thread, all feeding one executor —
-    /// because the command must run one at a time and the journal has one writer.
+    /// Follow the bus. One subscription per selector, each on its own connection and thread, all
+    /// feeding one executor: the command runs one at a time and the journal has one writer.
     fn follow(&mut self) -> io::Result<()> {
         let (tx, rx) = notice_handoff();
         for (idx, sel) in self.cfg.on.iter().enumerate() {
@@ -1503,8 +1441,7 @@ impl Notifier {
         while let Ok(notice) = rx.recv() {
             self.take(notice)?;
         }
-        // Every reader gave up, which only happens when they all failed to
-        // reconnect for good. Say so rather than exiting 0.
+        // Every reader gave up for good: not an exit 0.
         Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             "every subscription ended",
@@ -1639,21 +1576,15 @@ impl Notifier {
     }
 }
 
-/// One selector's reader thread: bounded catch-up, then subscribe from the
-/// page's resume cursor, and on any failure back off and do it again. Every
-/// selector has its own reader, so one deep backlog or slow notification does
-/// not delay the other selectors' subscriptions.
+/// One selector's reader thread: bounded catch-up, then subscribe from the page's resume
+/// cursor, and on any failure back off and do it again. One per selector, so one deep backlog
+/// does not delay the others.
 ///
-/// It re-reads the cursor from DISK on every reconnect and never resumes below
-/// what it has already forwarded, so a reconnect replays at most the records the
-/// executor had not finished with — which the journal then dedups. The paged
-/// scan is what moves the durable cursor across records this selector does NOT
-/// match: a `Fetch` page's `next` is the offset after the last record the
-/// broker scanned, and the per-page `Checkpoint` persists it. A subscription
-/// reports only matches, so a sparse selector (`halt`, `ask:<p>`) subscribed
-/// straight from a stale cursor would restart from its last match after every
-/// restart. (Broker memory is not the reason: astream's catch-up copies the log
-/// a bounded `TAIL_CHUNK` at a time.)
+/// It never resumes below what it has forwarded, so a reconnect replays at most what the
+/// executor had not finished, which the journal dedups. The paged scan moves the durable cursor
+/// across records the selector does not match (the per-page `Checkpoint`): a subscription
+/// reports only matches, so a sparse selector subscribed straight from a stale cursor would
+/// restart from its last match every time.
 fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSender<Notice>) {
     let filter = sel.filter(&cfg.fleet);
     let key = sel.key();
@@ -1704,9 +1635,8 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                     if tx.send(Notice::Checkpoint(idx, next)).is_err() {
                         return;
                     }
-                    // The checkpoint follows all records from this page in the
-                    // zero-buffer handoff. Once accepted, those rows have all
-                    // been processed, even if the checkpoint's fsync is pending.
+                    // The zero-buffer handoff accepted the checkpoint after every record of
+                    // this page, so those rows were all processed.
                     seen = Some(seen.map_or(next, |s| s.max(next)));
                     // And the page's mark: how far the broker was durable when
                     // it read the page (what releases a record held for it).
@@ -1793,9 +1723,8 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
     }
 }
 
-/// Open one reader's connection from the highest of the durable cursor, what
-/// this thread has already forwarded, and — only when neither exists —
-/// `--since`. A first `--since=head` is persisted before subscribing, so a
+/// Open one reader's connection from the higher of the durable cursor and what this thread
+/// has forwarded, else `--since`. A first `--since=head` is persisted before subscribing, so a
 /// restart while idle still replays records published after this first start.
 fn connect_for_reader(
     cfg: &Config,
@@ -1907,11 +1836,7 @@ notifier warns and pages held records before durability is known; those can
 still be lost in a power loss. --once leaves one not durable yet for the next run.
 ";
 
-/// `aterm-link notify`.
-///
-/// # Panics
-///
-/// Never: every failure is an exit code and a line on stderr.
+/// `aterm-link notify`. Every failure is an exit code and a line on stderr.
 #[must_use]
 pub fn main(args: &[String]) -> ExitCode {
     let cfg = match parse(args) {
@@ -2078,11 +2003,8 @@ mod tests {
         );
     }
 
-    /// Every subject segment that becomes an environment value is a principal:
-    /// a bidi override passes astream's subject grammar, and a sender-chosen
-    /// 200 000-byte segment, which a broker without the 4 KiB name bound
-    /// passes, would fail `spawn` with `E2BIG` after the budget slot was
-    /// charged.
+    /// Every subject segment that becomes an environment value is a principal: no bidi override,
+    /// no oversized segment.
     #[test]
     fn a_subject_segment_that_is_not_a_principal_never_becomes_an_environment_value() {
         let huge = "x".repeat(200_000);
@@ -2135,7 +2057,7 @@ mod tests {
             None
         );
 
-        // And what does pass is bounded by `TEXT_MAX`.
+        // What passes is bounded by `TEXT_MAX`.
         let hit = ask
             .hit(
                 "f1",
@@ -2204,9 +2126,7 @@ mod tests {
         }
     }
 
-    /// An `attention` selector fires on a presence row that HAS one, and on
-    /// nothing else — a row with no `attention=`, an empty one, or the `-` the
-    /// roster prints for "none" are all silence.
+    /// `attention` fires only on a row that carries one; a halt only when it comes on.
     #[test]
     fn attention_fires_only_on_a_presence_row_that_carries_one() {
         let sel = Sel::Attention;
@@ -2228,7 +2148,7 @@ mod tests {
         ] {
             assert_eq!(sel.hit("f1", 3, subject, body), None);
         }
-        // A halt coming OFF is good news, and good news wakes nobody.
+        // A halt coming off wakes nobody.
         let halt = Sel::Halt;
         let lane = "/f/f1/fleet/h-andrew/halt";
         assert!(halt
@@ -2247,9 +2167,7 @@ mod tests {
         }
     }
 
-    /// UNTRUSTED TEXT IS FLATTENED. An attention string can carry any byte a cap
-    /// holder likes, including an escape sequence, and the command that receives
-    /// it may well echo it at a terminal.
+    /// Untrusted text is flattened to printable ASCII and capped.
     #[test]
     fn untrusted_text_is_flattened_and_capped() {
         let text = one_line("hi\x1b[2Jthere\nand\ta tab");
@@ -2257,8 +2175,7 @@ mod tests {
         assert_eq!(one_line(&"x".repeat(400)).len(), TEXT_MAX);
     }
 
-    /// The budget counts fires inside the window and forgets older ones. The
-    /// clock is INJECTED, so this is arithmetic rather than a race.
+    /// The budget is a sliding window over durable stamps (the clock is injected).
     #[test]
     fn the_budget_is_a_sliding_window_over_the_stamps_it_persisted() {
         let dir = scratch("budget");
@@ -2270,7 +2187,7 @@ mod tests {
         assert!(!n.has_room(1_200), "two in the window is the limit of 2");
         // The window rolls: the first stamp is 60s old at 61_000.
         assert!(n.has_room(61_050), "the 1_000 stamp has left the window");
-        // And the stamps are DURABLE: a restart inside the window still counts.
+        // The stamps are durable: a restart inside the window still counts.
         let mut back = Notifier::new(cfg(&dir)).expect("reopen");
         assert!(
             !back.has_room(1_200),
@@ -2447,9 +2364,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The journal is keyed by offset, keeps one verdict per offset, is bounded,
-    /// and survives a reopen — which is the whole of "deduped by offset across a
-    /// restart".
+    /// The journal keeps one verdict per offset, is bounded, and survives a reopen.
     #[test]
     fn the_journal_keeps_one_verdict_per_offset_and_is_bounded() {
         let dir = scratch("journal");
@@ -3428,8 +3343,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Every selector spells a filename and a filter, and a bad one is refused
-    /// by name. `--on ask:../../etc` must never become a path.
+    /// Every selector spells a filename and a filter; `--on ask:../../etc` is refused.
     #[test]
     fn selectors_parse_and_spell_a_filename() {
         assert_eq!(Sel::parse("attention"), Ok(Sel::Attention));

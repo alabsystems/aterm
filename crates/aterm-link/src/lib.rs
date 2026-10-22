@@ -7,11 +7,11 @@
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
-//! **aterm-link** — the fabric bridge (`DESIGN-aterm-fabric.md` §11.2).
+//! aterm-link: the fabric bridge (`DESIGN-aterm-fabric.md` §11.2).
 //!
-//! One per aterm instance, launched BY the instance as a child holding the far
-//! ends of two `socketpair(AF_UNIX)`s at fds 3 and 4. It is the *node*: the bus
-//! principal under which every session the instance hosts is addressed and
+//! One per aterm instance, launched as its child holding the far ends of two
+//! `socketpair(AF_UNIX)`s at fds 3 and 4. It is the node: the bus principal under which every
+//! session the instance hosts is addressed and attested. Two rules:
 //! attested.
 //!
 //! ## The two rules the whole crate exists to keep
@@ -101,7 +101,6 @@ pub mod ctl;
 pub mod durability;
 /// `aterm fabric on|off|doctor` — see [`enable::on`].
 pub mod enable;
-/// `aterm fabric` — the fabric's state on one screen, and its traffic live.
 pub mod fabric;
 pub mod fabric_brief;
 /// The bridge's doors: its clocks, park, broker dials and readers, verb lane,

@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Andrew Yates
 #
-# THIS CRATE IS NOT AT THE WORKSPACE EDITION, and `rustfmt` learns a file's
-# edition from the nearest `rustfmt.toml` — never from `Cargo.toml`. Without
-# this file `trustfmt <path>` by hand, `targo-fmt -- <paths>`, format-on-save
-# and rust-analyzer format these sources at the workspace's 2024, which invents
-# drift and, for a file using `gen` as an identifier, does not parse at all.
-# Keep it equal to the manifest's edition.
+# This crate is not at the workspace edition, and rustfmt reads a file's edition
+# from the nearest rustfmt.toml, never Cargo.toml. Without this file a hand-run
+# `trustfmt`, format-on-save or rust-analyzer formats it at 2024 (and a file
+# using `gen` as an identifier does not parse). `xtask gate lint --fmt-only`
+# fails when this file and the manifest resolve different editions.
 edition = "2021"

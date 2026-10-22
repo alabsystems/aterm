@@ -604,11 +604,8 @@ fn press_event(keycode: u16, down: bool, flags: u64) -> aterm_objc::Id {
     }
 }
 
-/// Non-macOS: there is no NSEvent queue to post into, and the queue-age backdate
-/// this instrument exists to exercise is `None` on every other platform anyway
-/// (`platform::current_event_queue_age_ns`). Refusing is the honest answer; a
-/// silent fallback to the socket path would reintroduce precisely the
-/// measurement blindness this verb was built to remove.
+/// Non-macOS: there is no NSEvent queue to post into, and falling back to the socket path would
+/// hide the very stall this verb measures, so it refuses.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn post(_spec: &HwKeySpec, _window_number: i64) -> Result<u32, String> {
     Err("ERR hwkey: hardware-path injection is implemented on macOS only\n".to_string())

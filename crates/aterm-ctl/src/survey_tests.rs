@@ -1079,6 +1079,35 @@ fn an_idle_shell_names_its_place_once() {
     );
 }
 
+/// WHICH TAB RANG on the survey's line: a session that rang says how many
+/// bells and the newest's program, sound and age. NEGATIVE CONTROL: one that
+/// rang none (`bells=0`, as every quiet row reads) says nothing of bells, and
+/// a peer's program that is no word shows `?`.
+#[test]
+fn a_session_that_rang_names_its_newest_bell() {
+    let line = |bells: &str, last: &str, remote: bool| {
+        let row = wire_row(&[
+            ("sid", "s-00000000000000000004"),
+            ("program", "zsh"),
+            ("program_kind", "shell"),
+            ("agent", "-"),
+            ("bells", bells),
+            ("bells_sounded", "1"),
+            ("last_bell", last),
+        ]);
+        let survey = parse_reply(&["instance pid=1 sessions=1".to_owned(), row]).unwrap();
+        session_line(&survey.sessions[0], None, remote, false)
+    };
+    let rang = line("2", "180000/sounded/zsh,190000/limited/zsh", false);
+    assert!(rang.contains(" bells=2 (zsh sounded 3m ago)"), "{rang}");
+    let unnamed = line("1", "4000/off/-", false);
+    assert!(unnamed.contains(" bells=1 (off 4s ago)"), "{unnamed}");
+    let quiet = line("0", "-", false);
+    assert!(!quiet.contains("bell"), "{quiet}");
+    let hostile = line("1", "4000/sounded/a b=c", true);
+    assert!(hostile.contains(" bells=1 (? sounded 4s ago)"), "{hostile}");
+}
+
 /// An unanswered line too long for its cap is cut before its label, never
 /// through it, and a label cannot spell another.
 #[test]

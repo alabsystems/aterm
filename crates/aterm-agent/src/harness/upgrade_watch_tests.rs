@@ -732,14 +732,10 @@ fn the_watch_retargets_and_holds_tab_ones_record_off_any_point_with_no_hands() {
     assert_eq!(one.hands(), Vec::<String>::new(), "ZERO input requests");
 }
 
-/// An announced round whose model rides its restart is retargeted in place by
-/// the watch as the visit does: tab one's record with a model promised
-/// (`model_list`) and a newer build installed. The watch hands
-/// [`St::for_target`] the round's own promise ([`St::promised_model`]), so the
-/// round stays announced, marker and promise kept, no release owed, and the
-/// ledger says `in place`. Negative control: `for_target` handed no model or
-/// another one abandons the round (pending again, marker gone, a release
-/// owed).
+/// An announced round with a promised model (`model_list`) is retargeted in place: the watch
+/// hands [`St::for_target`] the round's own promise ([`St::promised_model`]), so the round
+/// stays announced, marker and promise kept, no release owed. Negative control: `for_target`
+/// handed no model or another one abandons the round (pending, marker gone, a release owed).
 #[test]
 fn the_watch_keeps_an_announced_round_whose_model_rides_the_restart_in_place() {
     let one = TabOne::new("t1c-model", "2.1.284");

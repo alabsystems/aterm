@@ -169,8 +169,13 @@ impl Drop for Document {
 
 /// The largest value, and the largest file.
 pub const MAX_VALUE: usize = 1 << 20;
-/// The largest text file.
+/// The largest text file. A vault's version is the tighter bound on what it can publish:
+/// sealed, it holds every entry twice (the admins' locker and its audience's), armored,
+/// within [`crate::envelope::MAX_ENVELOPE`], so about 5.9 MiB of entries.
 pub const MAX_TEXT: usize = 8 << 20;
+/// The most distinct sets of hosts a vault's sections name: each is sealed in a locker of
+/// its own, beside the admins' and `[everyone]`'s, within [`crate::envelope::MAX_LOCKERS`].
+pub const MAX_HOST_AUDIENCES: usize = crate::envelope::MAX_LOCKERS - 2;
 
 /// The section names that are not host names.
 const RESERVED: [&str; 4] = ["machines", "admins", "everyone", "join"];
@@ -252,7 +257,8 @@ impl Document {
     /// a valid `age1…`, no duplicate machine, recipient, admin, or entry name within one
     /// audience, no entry name in two host sections that share a host, at most one `[join]`
     /// line (a strong join password, or an `open` line), heredocs terminated, base64 heredocs
-    /// canonical, names and values within their rules and sizes.
+    /// canonical, names and values within their rules and sizes, at most
+    /// [`MAX_HOST_AUDIENCES`] distinct sets of hosts.
     pub fn parse(text: &str) -> Result<Document, TextError> {
         let lines = split_lines(text)?;
         match parse_lines(&lines, Mode::Vault) {
@@ -427,14 +433,6 @@ impl Document {
             .any(|located| located.entry.anchor.is_some())
     }
 
-    /// The entries `host` receives: `[everyone]`'s, overridden by name by those of sections
-    /// naming `host`. Sorted by name.
-    pub fn entries_for(&self, host: &str) -> Vec<Entry> {
-        // A valid document has no conflict to report (the parse refused it), so the lenient
-        // merge loses nothing.
-        merge(host, self.entries(), false).unwrap_or_default()
-    }
-
     /// One locker per distinct audience that has at least one machine, `[everyone]` first
     /// (always present, even with no entries, so every machine has a locker that tells it
     /// it is in), then host audiences in sorted order. A locker's text is one header and
@@ -523,10 +521,11 @@ impl Document {
     }
 
     /// Remove a machine: its `[machines]` line, its `[admins]` line, and its name from every
-    /// multi-host section header. Refuses (changing nothing) when a section names only this
-    /// machine, saying which line, unless `drop_own_sections` is set, in which case those
-    /// sections and their entries are removed too. Returns false when no such machine.
-    /// Refuses removing the last admin.
+    /// multi-host section header. Refuses (changing nothing) when a section that names only
+    /// this machine holds entries, saying which line, unless `drop_own_sections` is set, in
+    /// which case those sections and their entries are removed too; such a section with no
+    /// entry left (an `unset` of its last) goes with the machine either way. Returns false
+    /// when no such machine. Refuses removing the last admin.
     pub fn remove_machine(
         &mut self,
         name: &str,
@@ -566,7 +565,7 @@ impl Document {
             if hosts.len() > 1 {
                 let rest: Vec<String> = hosts.iter().filter(|h| *h != name).cloned().collect();
                 rewrite.insert(section.header, Audience::Hosts(rest).header());
-            } else if drop_own_sections {
+            } else if drop_own_sections || section.last_item == section.header {
                 drop.extend(section.header..=section.last_item);
             } else {
                 return Err(at(
@@ -1353,6 +1352,21 @@ fn check_vault(model: &Model) -> Result<(), TextError> {
     if model.admins.is_empty() {
         return Err(whole("no admin: [admins] must name at least one machine"));
     }
+    let mut audiences: BTreeSet<&Audience> = BTreeSet::new();
+    for section in &model.sections {
+        if let SectionKind::Audience(audience @ Audience::Hosts(_)) = &section.kind
+            && audiences.insert(audience)
+            && audiences.len() > MAX_HOST_AUDIENCES
+        {
+            return Err(at(
+                section.header + 1,
+                format!(
+                    "more than {MAX_HOST_AUDIENCES} distinct sets of hosts: each is sealed in a locker of its own, and a version holds {} with the admins' and [everyone]'s",
+                    crate::envelope::MAX_LOCKERS
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1494,11 +1508,6 @@ pub fn parse_plain(text: &[u8]) -> Result<Vec<Entry>, TextError> {
 /// entry of the merged set. Entries whose audience does not include `host` are left out.
 /// Sorted by name.
 pub fn merge_for(host: &str, entries: Vec<Entry>) -> Result<Vec<Entry>, TextError> {
-    merge(host, entries, true)
-}
-
-/// [`merge_for`]; `strict` false keeps the first of two clashing entries instead.
-fn merge(host: &str, entries: Vec<Entry>, strict: bool) -> Result<Vec<Entry>, TextError> {
     let mut everyone: BTreeMap<String, Entry> = BTreeMap::new();
     let mut hosts: BTreeMap<String, Entry> = BTreeMap::new();
     for entry in entries {
@@ -1513,7 +1522,7 @@ fn merge(host: &str, entries: Vec<Entry>, strict: bool) -> Result<Vec<Entry>, Te
             None => {
                 map.insert(entry.name.clone(), entry);
             }
-            Some(first) if strict => {
+            Some(first) => {
                 return Err(whole(format!(
                     "`{}` is set twice for host `{host}` (by {} and by {})",
                     entry.name,
@@ -1521,14 +1530,12 @@ fn merge(host: &str, entries: Vec<Entry>, strict: bool) -> Result<Vec<Entry>, Te
                     entry.audience.header()
                 )));
             }
-            Some(_) => {}
         }
     }
     everyone.extend(hosts);
-    if strict
-        && let Some(entry) = everyone
-            .values()
-            .find(|entry| !anchor_received(entry, |name| everyone.get(name)))
+    if let Some(entry) = everyone
+        .values()
+        .find(|entry| !anchor_received(entry, |name| everyone.get(name)))
     {
         return Err(whole(format!(
             "`{}` is anchored to `{}`, which is not an if-absent entry host `{host}` receives",
@@ -1814,7 +1821,7 @@ mod tests {
     #[test]
     fn entries_for_a_host_override_everyone_by_name() {
         let d = doc();
-        let m22 = d.entries_for("m22");
+        let m22 = merge_for("m22", d.entries()).expect("merges");
         assert_eq!(
             m22.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
             [
@@ -1826,7 +1833,7 @@ mod tests {
             ]
         );
         assert_eq!(value(&m22, "gh_token"), b"m22 override");
-        let m3 = d.entries_for("m3");
+        let m3 = merge_for("m3", d.entries()).expect("merges");
         assert_eq!(
             m3.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
             ["gh_token", "notes.txt", "shared"]
@@ -1835,7 +1842,7 @@ mod tests {
             value(&m3, "gh_token"),
             b"a value with spaces # and = signs  "
         );
-        let m9 = d.entries_for("m9");
+        let m9 = merge_for("m9", d.entries()).expect("merges");
         assert_eq!(
             m9.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
             ["gh_token", "notes.txt"]
@@ -1888,7 +1895,7 @@ mod tests {
             .collect();
         assert_eq!(
             merge_for("m22", merged).expect("merges"),
-            d.entries_for("m22")
+            merge_for("m22", d.entries()).expect("merges")
         );
     }
 
@@ -2110,6 +2117,36 @@ mod tests {
     }
 
     #[test]
+    fn a_vault_names_as_many_sets_of_hosts_as_one_version_seals() {
+        let names: Vec<String> = (1..=MAX_HOST_AUDIENCES + 1)
+            .map(|n| format!("m{n}"))
+            .collect();
+        let mut source = String::from("[machines]\n");
+        for (n, name) in names.iter().enumerate() {
+            source.push_str(&format!("{name} = {}\n", recipient(n as u8)));
+        }
+        source.push_str("[admins]\nm1\n[m1 m2]\nshared=1\n");
+        for name in &names[..MAX_HOST_AUDIENCES - 1] {
+            source.push_str(&format!("[{name}]\nown=1\n"));
+        }
+        // A section of an audience named before adds no locker.
+        source.push_str("[m2 m1]\nalso=1\n");
+        let mut d = Document::parse(&source).expect("62 sets of hosts");
+        assert_eq!(
+            d.lockers().len() + 1,
+            crate::envelope::MAX_LOCKERS,
+            "with the admins', a full version"
+        );
+        let before = text(&d);
+        let last = Audience::Hosts(vec![names[MAX_HOST_AUDIENCES - 1].clone()]);
+        let e = d.set_entry(&last, "own", b"1").expect_err("a 63rd");
+        assert!(e.why.contains("distinct sets of hosts"), "{e}");
+        assert_eq!(text(&d), before, "changes nothing");
+        let e = error(&format!("{source}[m62]\nown=1\n"));
+        assert_eq!(e.line, before.lines().count() + 1);
+    }
+
+    #[test]
     fn entry_and_machine_names() {
         for good in [
             "a",
@@ -2213,7 +2250,7 @@ mod tests {
             "{}",
             text(&d)
         );
-        let entries = d.entries_for("m3");
+        let entries = merge_for("m3", d.entries()).expect("merges");
         assert_eq!(value(&entries, "pair"), b"p");
         assert_eq!(value(&entries, "new"), b"v");
     }
@@ -2353,7 +2390,8 @@ mod tests {
         assert!(after.contains("\n[m22]\nshared=both\n"), "{after}");
         assert_eq!(d.lockers().len(), 2);
         assert!(
-            d.entries_for("m3")
+            merge_for("m3", d.entries())
+                .expect("merges")
                 .iter()
                 .all(|e| e.audience == Audience::Everyone)
         );
@@ -2374,6 +2412,24 @@ mod tests {
         );
         assert!(after.contains("k=1\n\n# next\n[m22]\ns=2\n"), "{after}");
         assert_eq!(d.admins(), ["m22"]);
+        assert_eq!(d.machines().len(), 1);
+    }
+
+    /// `unset` of a host section's last entry leaves its header. A section with nothing left
+    /// in it holds nothing to lose, so it goes with its machine: revoke's "remove its entries
+    /// first" is a way through.
+    #[test]
+    fn a_section_its_entries_left_goes_with_the_machine() {
+        let mut d = Document::parse(&base(
+            "[everyone]\nk=1\n\n[m3]\ntoken=1\n# a note\n[m22]\ns=2\n",
+        ))
+        .expect("valid");
+        assert!(d.unset_entry(&hosts(&["m3"]), "token").expect("unset"));
+        assert!(text(&d).contains("\n[m3]\n"), "unset leaves the header");
+        assert!(d.remove_machine("m3", false).expect("nothing left to lose"));
+        let after = text(&d);
+        assert!(!after.contains("[m3]"), "{after}");
+        assert!(after.contains("k=1\n\n# a note\n[m22]\ns=2\n"), "{after}");
         assert_eq!(d.machines().len(), 1);
     }
 
@@ -2485,7 +2541,10 @@ mod tests {
         let mut d = Document::parse(&format!("{head}[m3]\na={sentinel}\n")).expect("valid");
         shown.push(format!("{d:?}"));
         shown.push(format!("{:?}", d.entries()));
-        shown.push(format!("{:?}", d.entries_for("m3")));
+        shown.push(format!(
+            "{:?}",
+            merge_for("m3", d.entries()).expect("merges")
+        ));
         shown.push(format!("{:?}", d.lockers()));
         let e = d
             .set_entry(&hosts(&["m3", "m22"]), "a", sentinel.as_bytes())
@@ -2924,7 +2983,8 @@ mod tests {
             "m22's own gh_token overrides the if-absent one"
         );
         assert!(
-            d.entries_for("m3")
+            merge_for("m3", d.entries())
+                .expect("merges")
                 .iter()
                 .any(|e| e.name == "gh_token" && e.if_absent)
         );
@@ -3065,7 +3125,7 @@ mod tests {
             assert_eq!(entries, d.entries());
             assert_eq!(
                 merge_for("m3", entries).expect("merges"),
-                d.entries_for("m3")
+                merge_for("m3", d.entries()).expect("merges")
             );
         }
 
@@ -3159,8 +3219,8 @@ mod tests {
         ))
         .expect("valid");
         assert_eq!(d.entries()[1].anchor.as_deref(), Some("b"));
-        assert_eq!(d.entries_for("m22").len(), 2);
-        assert_eq!(d.entries_for("m3").len(), 1);
+        assert_eq!(merge_for("m22", d.entries()).expect("merges").len(), 2);
+        assert_eq!(merge_for("m3", d.entries()).expect("merges").len(), 1);
 
         // An edit that would leave an anchor dangling is refused and changes nothing.
         let mut d = Document::parse(&base(

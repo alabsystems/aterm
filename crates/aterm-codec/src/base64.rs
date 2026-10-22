@@ -43,8 +43,8 @@ pub enum DecodeError {
 }
 
 impl fmt::Display for DecodeError {
-    // `write_str` + the crate's digit writers instead of `write!`, whose
-    // `format_args!` Trust fails closed on.
+    // No `write!`: its `format_args!` fails closed under Trust (see
+    // `crate::write_usize_decimal`).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidByte(pos, byte) => {
@@ -89,8 +89,6 @@ pub enum EncodeError {
 }
 
 impl fmt::Display for EncodeError {
-    // `write_str`-based for the same Trust `format_args!` reason as
-    // `DecodeError`; output is byte-identical.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InputTooLarge(len) => {
@@ -229,8 +227,8 @@ const fn sextets(n: u32) -> [u8; 4] {
 }
 
 fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeError> {
-    // Dominating DoS guard: bound the input (and therefore the decoded length and
-    // the with_capacity allocation below) before doing any work.
+    // DoS guard: bounds the input, hence the decoded length and the allocation,
+    // before any work.
     if input.len() > crate::MAX_INPUT_LEN {
         return Err(DecodeError::InputTooLarge(input.len()));
     }
@@ -261,8 +259,6 @@ fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeE
         return Err(DecodeError::InvalidLength(input.len()));
     }
 
-    // The exact decoded length is still produced by the pushes below, so the
-    // returned bytes are identical — only the reservation may be a few bytes larger.
     let mut out = Vec::with_capacity(cap);
 
     let mut i: usize = 0;
@@ -343,8 +339,8 @@ fn decode_strict_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, 
         // rejects `=`, so `"Zg==Zg=="` is an error.
         if idx == last && c3 == b'=' {
             if c2 == b'=' {
-                // `XX==` — 12 bits carried, 8 consumed; the low 4 bits of the
-                // second symbol are discarded and must therefore be zero.
+                // `XX==`: 12 bits carried, 8 consumed; the second symbol's
+                // discarded low 4 bits must be zero.
                 let a = decode_byte(table, c0, i)?;
                 let b = decode_byte(table, c1, i.saturating_add(1))?;
                 if b & 0x0F != 0 {
@@ -353,8 +349,8 @@ fn decode_strict_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, 
                 let n = (u32::from(a) << 18) | (u32::from(b) << 12);
                 out.push(((n >> 16) & 0xFF) as u8);
             } else {
-                // `XXX=` — 18 bits carried, 16 consumed; the low 2 bits of the
-                // third symbol are discarded and must therefore be zero.
+                // `XXX=`: 18 bits carried, 16 consumed; the third symbol's
+                // discarded low 2 bits must be zero.
                 let a = decode_byte(table, c0, i)?;
                 let b = decode_byte(table, c1, i.saturating_add(1))?;
                 let c = decode_byte(table, c2, i.saturating_add(2))?;

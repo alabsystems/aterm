@@ -303,7 +303,7 @@ fn a_flicker_is_not_an_end_and_a_repeated_look_does_not_move_the_clock() {
     let mut real = Real::new();
     real.step("Miss");
     let deadline = real.c.digest_deadline().expect("armed");
-    // a second empty look at once, and one after a tick, in the same pass shape
+    // repeated empty looks at once
     for _ in 0..3 {
         let s = real.c.sync_digest(PREFIX, vec![], real.stamp(), real.now);
         assert_eq!((s.pending_end, s.resolved), (1, 0));

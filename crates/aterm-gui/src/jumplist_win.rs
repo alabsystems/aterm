@@ -634,9 +634,8 @@ fn recents_tracked() -> bool {
     switch_on && !forbidden
 }
 
-/// The executable a jump-list row should launch: the WINDOWED FRONT DOOR — an
-/// image that routes `new-tab` / `new-window` / `split-pane`, and that the
-/// shell starts without a console.
+/// The executable a jump-list row launches: the windowed front door, an image that routes
+/// `new-tab` / `new-window` / `split-pane` and that the shell starts without a console.
 ///
 /// Not `current_exe()`: the console `aterm.exe` routes the verbs but makes the shell allocate
 /// a console that flashes up on every click, and a build tree's thin `aterm-gui.exe` knows no

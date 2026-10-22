@@ -20,8 +20,9 @@
 //! bootout) does not end the assessment, and on macOS 27.0.1 `syspolicyd` crashes when the file
 //! is removed before it ends, stranding every exec on the host. So a mug running from its copy
 //! writes [`RAN`] into it first thing ([`mark_ran`]), and a copy without it stays until the
-//! first-exec hang has passed since it was made ([`sweep`]); each copy has an `<id>` of its own
-//! so a kept one never stands in the next one's way.
+//! first-exec hang has passed since its exec, on the awake clock (the re-exec stamps it,
+//! [`aterm_uds::deadline::stamp_exec`]; [`sweep`]); each copy has an `<id>` of its own so a
+//! kept one never stands in the next one's way.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,7 +36,7 @@ const PLIST_CAP: u64 = 1 << 20;
 
 /// The file a mug running from its copy writes into the copy's directory first thing
 /// ([`mark_ran`]): the copy's exec is over, so it may go ([`sweep`]).
-pub const RAN: &str = "ran";
+pub const RAN: &str = aterm_uds::deadline::RAN;
 
 /// Say, in the directory of the copy under `code_dir` this process runs from
 /// (`<code dir>/<label>/<id>`), that it runs from it. Best effort: a copy without it is kept
@@ -383,8 +384,10 @@ fn sweep(dir: &Path, now: std::time::SystemTime) -> io::Result<()> {
             if dir && !may_go(&at, now) {
                 eprintln!(
                     "aterm caffeine: kept {}: no mug said it ran from it, so macOS may still be \
-                     assessing its first exec",
-                    at.display()
+                     assessing its first exec; `aterm caffeine quit` or the next start removes \
+                     it once the Mac has been awake {} minutes since",
+                    at.display(),
+                    aterm_uds::deadline::FIRST_EXEC_HANG.as_secs() / 60
                 );
                 kept = true;
                 continue;
@@ -400,17 +403,11 @@ fn sweep(dir: &Path, now: std::time::SystemTime) -> io::Result<()> {
 
 /// Whether the copy at `home` (a label directory's entry) may go at `now`: it was never run
 /// (a half-made copy, `<id>.partial`, is renamed whole before its exec), a mug said it ran
-/// from it ([`RAN`]), or the first-exec hang has passed since it was made.
+/// from it ([`RAN`]), or the first-exec hang has passed since its exec
+/// ([`aterm_uds::deadline::copy_may_go`]).
 #[cfg(unix)]
 fn may_go(home: &Path, now: std::time::SystemTime) -> bool {
-    home.extension().is_some_and(|e| e == "partial")
-        || home.join(RAN).exists()
-        || std::fs::symlink_metadata(home)
-            .and_then(|meta| meta.modified())
-            .is_ok_and(|at| {
-                now.duration_since(at)
-                    .is_ok_and(|age| age >= aterm_uds::deadline::FIRST_EXEC_HANG)
-            })
+    home.extension().is_some_and(|e| e == "partial") || aterm_uds::deadline::copy_may_go(home, now)
 }
 
 /// Remove `path`: a directory with all it holds, anything else as itself.
@@ -550,9 +547,15 @@ pub fn code_fingerprint(origin_exe: &Path) -> Option<Vec<u8>> {
 }
 
 /// The command that becomes `copy` with this process's arguments (its `argv[0]` too) and
-/// [`ORIGIN_ENV`] naming `origin`.
+/// [`ORIGIN_ENV`] naming `origin`, the copy's directory stamped for its exec
+/// ([`aterm_uds::deadline::stamp_exec`]).
 #[cfg(unix)]
 fn reexec_command(copy: &Path, origin: &Path) -> aterm_uds::spawnfd::Command {
+    // The copy's age, which a sweep reads when its mug ends before it says it ran, counts from
+    // this exec on the awake clock, not from the copy ([`sweep`]).
+    if let Some(home) = own_bundle(copy).as_deref().and_then(Path::parent) {
+        aterm_uds::deadline::stamp_exec(home);
+    }
     let mut args = std::env::args_os();
     let mut cmd = aterm_uds::spawnfd::command(copy);
     if let Some(arg0) = args.next() {

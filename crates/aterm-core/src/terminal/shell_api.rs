@@ -197,9 +197,8 @@ impl Terminal {
         (block.state == BlockState::EnteringCommand).then_some(block.id)
     }
 
-    /// Get the most recent completed command mark (exit code recorded),
-    /// regardless of status — the "what just finished" probe (PHOSPHOR's
-    /// exit-status weather reads this per frame under the render lock).
+    /// The most recent completed command mark (exit code recorded), whatever its status:
+    /// the "what just finished" probe, read per frame under the render lock.
     #[must_use]
     #[inline]
     pub fn last_completed_command(&self) -> Option<&CommandMark> {

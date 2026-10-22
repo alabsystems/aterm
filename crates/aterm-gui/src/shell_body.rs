@@ -16,20 +16,9 @@
 //! from `<root>/<address>/`, `<root>` being its own folder, and only for a 16-hex address,
 //! so nothing a peer can write names a file it sources.
 //!
-//! THE SPLIT (aterm-shell-integration, "THE LOADER" in the zsh script): each
-//! zsh/bash/fish script is a LOADER around one BODY. The body is also written
-//! alone into the script folder, which is named by a 64-bit hash of everything
-//! in it (`script_set_address`), so a folder's 16-hex address names one body.
-//! At spawn the host exports [`POINTER_VAR`] = `<control dir>/integration/<sid>`
-//! to every zsh/bash/fish it integrates; the loader captures and scrubs it and checks the
-//! file at every prompt (one fork-free `[[ -f ]]`). A successor that adopts such
-//! a shell across an update writes ITS OWN folder's address there
-//! ([`hand_over`]: the folder installed first, then the file `0600`, renamed
-//! into place whole, never through a symlink, in the `0700` control dir — the
-//! re-key channel's discipline, `shell_rekey::deliver`) — and the shell sources
-//! that folder's body at its next prompt. The loader takes a body ONLY from
-//! `<root>/<address>/`, `<root>` being the folder it was itself loaded from, and
-//! only a 16-hex address; nothing a peer can write names a file it sources.
+//! Under an overlap handoff the write waits for the update's Commit
+//! (`shell_rekey::Deferred`): an abandoned attempt hands its sessions back to the old
+//! process, and a pointer written for the candidate would move the shell onto its body.
 //!
 //! The body signs `633;P;AtermIntegration=<address>` before every 133;A; the engine keeps
 //! the last signed one (`Terminal::shell_integration_rev`), the seamless carry takes it

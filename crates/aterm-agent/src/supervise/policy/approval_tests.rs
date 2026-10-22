@@ -24,17 +24,15 @@ const CAP_TRUST: &str = include_str!("fixtures/cap-trust.txt");
 const CAP_TALL_HEREDOC: &str = include_str!("fixtures/cap-tall-heredoc.txt");
 
 /// The decline, captured: one rm breaker box in the four states a decline walks
-/// through. 1: as drawn, focus on `Yes`, the auto-deny countdown under the
-/// note. 2: after `down`, focus on `No`. 3: after Tab, the input open (`❯ 2.
-/// No, and tell Claude what to do differently` over `Esc to cancel` alone). 4:
-/// a reason typed, wrapped at column 10 (`DECLINE_MEASURED_TEXT`). Enter on 4
-/// handed the worker the text and it answered in the same turn.
+/// through. 1: as drawn, focus on `Yes`. 2: after `down`, focus on `No`. 3: after
+/// Tab, the input open over `Esc to cancel` alone. 4: a reason typed, wrapped at
+/// column 10 (`DECLINE_MEASURED_TEXT`).
 pub(crate) const CAP_DECLINE_1: &str = include_str!("fixtures/cap-decline-1-box.txt");
 pub(crate) const CAP_DECLINE_2: &str = include_str!("fixtures/cap-decline-2-focus-no.txt");
 pub(crate) const CAP_DECLINE_3: &str = include_str!("fixtures/cap-decline-3-amend-open.txt");
 pub(crate) const CAP_DECLINE_4: &str = include_str!("fixtures/cap-decline-4-amend-typed.txt");
-/// The text typed into `CAP_DECLINE_4` (a hand-written stand-in, older than
-/// [`DECLINE_PREFIX`]).
+/// The text typed into `CAP_DECLINE_4`: a hand-written stand-in without
+/// [`DECLINE_PREFIX`].
 const DECLINE_MEASURED_TEXT: &str = "aterm harness: this rm was not run: $NOPE is not assigned on \
      this line. Rewrite the removal with literal absolute paths strictly inside /tmp/<dir> or \
      /private/tmp/<dir>, then run it.";
@@ -178,7 +176,7 @@ fn read_box(path: &str) -> Vec<String> {
         .collect()
 }
 
-/// The Read box as 2.1.292 draws it (MEASURED): the call between dashed rules.
+/// The Read box as 2.1.292 draws it: the call between dashed rules.
 fn read_call_box(path: &str) -> Vec<String> {
     let rows = phase_fixtures::screen(phase_fixtures::BOX_READ_OUTSIDE_2_1_292);
     assert!(
@@ -196,7 +194,7 @@ fn read_call_box(path: &str) -> Vec<String> {
         .collect()
 }
 
-/// The same box as 2.1.284 draws it (MEASURED): the call alone, no rules.
+/// The same box as 2.1.284 draws it: the call alone, no rules.
 fn read_call_box_2_1_284(path: &str) -> Vec<String> {
     let rows = phase_fixtures::screen(phase_fixtures::BOX_READ_OUTSIDE_2_1_284);
     assert!(
@@ -271,13 +269,9 @@ fn an_rm_breaker_on_scratch_is_approved_in_bypass_under_its_row_guard() {
     );
 }
 
-/// The breaker box carries an auto-deny countdown under its warning, wrapped
-/// onto its own row at the note column on a narrow grid. That row is the
-/// countdown's, not a second note: the `for`/`set --` loop gets the rm rule's
-/// escalation and full power's `unproven:` names the breaker kind; a scratch
-/// target under the countdown is approved, and a read-only box under it too.
-/// Negative controls: the same box outside bypass escalates; a `git status`
-/// box with a real second note is escalated as a vendor note.
+/// The breaker's auto-deny countdown, wrapped onto its own row or not, is no
+/// second note: the rm rule judges the box, and a read-only box under it is
+/// approved. Control: a real second note is escalated as a vendor note.
 #[test]
 fn the_2_1_281_breaker_with_its_auto_deny_countdown_is_the_rm_rules() {
     let split = |rows: &[String]| -> Vec<String> {
@@ -372,12 +366,9 @@ fn zsh_startup(functions: &str, options: &str) -> Result<ShellStartup, String> {
     .map(|()| state)
 }
 
-/// The shell the line runs in: the rm proof and classifier model default
-/// options with no user function or alias. A startup setting another option
-/// (`setopt globsubst`: `N='~'; rm -rf $N` removes home) proves no rm and reads
-/// nothing, naming the option; a function or alias fails the lines naming it;
-/// an unread startup is unknown. Full power still presses, keeping the reason
-/// as unproven. Negative control: the same boxes under defaults are approved.
+/// A shell startup the rm and classifier models do not assume (another option such
+/// as `setopt globsubst`, a function or alias, an unread startup) proves no rm and
+/// reads nothing; full power still presses, keeping the reason as unproven.
 #[test]
 fn a_shell_startup_the_models_do_not_assume_proves_no_rm_and_reads_nothing() {
     let rm = rm_box("S=/private/tmp/claude-502/x; rm -rf \"$S/t5\"");
@@ -711,9 +702,8 @@ fn a_read_only_box_is_approved_outside_bypass_and_never_in_it() {
         1,
         "the guard matches the command row alone"
     );
-    // 2.1.286's frame counts the asks that stack up (`1 of 2`, dim, right-aligned
-    // on the title row): the same box, approved the same way. Read whole the
-    // title was not a Bash header and every such box escalated.
+    // A stacked-ask count on the title row (`1 of 2`, dim, right-aligned) leaves
+    // the header a Bash header.
     let mut counted = rows.clone();
     counted[1] = format!("{:<113}1 of 2 ", " Bash command");
     let d = on_screen(&counted, &ctx());
@@ -730,10 +720,8 @@ fn a_read_only_box_is_approved_outside_bypass_and_never_in_it() {
     assert_eq!(*choice, Choice::Digit(1));
 }
 
-/// Rows joined with spaces can launder a write: barred rows are judged under
-/// every reading ([`PromptV2::readings`]), the newline one included. Without
-/// bars the command is one shell line, so its rows, description included, are
-/// judged as one wrapped line.
+/// Barred rows are judged under every reading, the newline one included, so the
+/// space join launders no write; unbarred rows are one wrapped line.
 #[test]
 fn a_write_on_a_second_row_is_not_laundered_by_the_space_join() {
     let ctx = || git_host(self::ctx());
@@ -761,11 +749,8 @@ fn a_write_on_a_second_row_is_not_laundered_by_the_space_join() {
     assert_eq!(approved(&on_screen(&wrapped, &ctx())), Some(RULE_READ_ONLY));
 }
 
-/// Without bars, geometry says which rows can be the command's wrap
-/// ([`command_readings`]): a row ending with room for the next word cannot have
-/// wrapped, so the rows under it are the description. Negative controls: the
-/// same rows under a box-filling command row are judged as its tail; a box
-/// without a top rule keeps every reading.
+/// Without bars a row ending with room for the next word cannot have wrapped, so
+/// the rows under it are the description ([`command_readings`]).
 #[test]
 fn a_row_that_cannot_be_a_wrap_ends_the_command() {
     let short = "S=/private/tmp/claude-502/x; rm -rf \"$S/t5\"";
@@ -796,11 +781,8 @@ fn a_row_that_cannot_be_a_wrap_ends_the_command() {
     assert!(approved(&d).is_none(), "{d:?}");
 }
 
-/// Server row text omits wide characters' continuation cells, so a CJK or emoji
-/// row reads half its drawn width: a row that is not printable ASCII is never
-/// measured, and only the rm breaker is ever narrowed. Controls: the same
-/// shapes in ASCII of the same cell width escalate; a read with a wide file
-/// name and nothing wrapped is approved.
+/// A row outside printable ASCII is never measured (the server's text omits wide
+/// characters' continuation cells), so a CJK or emoji row hides no wrapped tail.
 #[test]
 fn a_wide_character_row_never_hides_a_wrapped_tail() {
     // 4 + 110 cells drawn, 62 characters in the text.
@@ -926,10 +908,8 @@ fn only_the_one_shot_allow_is_ever_pressed() {
     assert!(reason(&d).contains("one-shot allow"), "{d:?}");
 }
 
-/// A barred command whose last row reads as prose is shown as the description
-/// and judged anyway (`Rm` is `/bin/rm` on a case-insensitive volume). Negative
-/// control: a real description row under the bars, whose newline reading is a
-/// read.
+/// A barred command whose last row reads as prose is shown as the description and
+/// judged anyway (`Rm` is `/bin/rm` on a case-insensitive volume).
 #[test]
 fn a_barred_row_shown_as_the_description_is_still_judged() {
     let dropped = bash_box(&["│ ls", "│ Rm -rf /Users/_owner/work"], None);
@@ -1093,9 +1073,8 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
             assert!(reason(&d).contains("secret"), "{secret}{view}: {d:?}");
         }
     }
-    // The box draws a character it cannot show as another (a newline, a tab,
-    // an escape: U+FFFD), and this screen drops a zero-width joiner: the name
-    // judged is then a name that is not there. Only plain ASCII is proven.
+    // Only plain ASCII is proven: the box draws some characters as others
+    // (U+FFFD), and this screen drops a zero-width joiner.
     for odd in ["/etc/ho\u{fffd}sts", "/etc/hosté", "/etc/ho\u{200d}sts"] {
         let d = on_screen(&read_call_box(odd), &ctx());
         assert!(reason(&d).contains("outside plain ASCII"), "{odd}: {d:?}");
@@ -1171,8 +1150,7 @@ fn the_measured_trust_dialog_is_answered_for_the_sessions_folder_under_a_trust_r
     );
 }
 
-/// `c` with the captured trust dialog's folder under a trust root, as a
-/// person names one: by default no folder is.
+/// `c` with the captured trust dialog's folder under a named trust root (by default none is).
 fn rooted(mut c: ApprovalCtx) -> ApprovalCtx {
     c.set_trust_roots(&["/private/tmp/claude-502/scratch/work*".to_string()], 502);
     c
@@ -1409,14 +1387,9 @@ fn the_limit_options_dialog_chooses_the_wait_row_by_its_label() {
     );
 }
 
-/// ATERM-KI-1015-1 W2 (the harness sweep of 2026-10-15, Claude Code 2.1.300
-/// at 26 columns): the usage-limit dialog whose title Ink wraps (`What do you
-/// want to` over `do?`) is answered by [`RULE_LIMIT_WAIT`] as it is at 50
-/// columns — under the safe rules and at full power, the focus moved onto the
-/// wait row, guarded on the row its title opens on. Read a row at a time it
-/// was an `other` box: full power pressed `Stop and wait for limit to reset`,
-/// with `limit_wait = false` too, and the safe rules escalated it. With
-/// `limit_wait = false` it is escalated, never pressed.
+/// The usage-limit dialog whose title Ink wraps at 26 columns (`What do you want
+/// to` over `do?`) is answered by [`RULE_LIMIT_WAIT`] as at 50, guarded on the row
+/// its title opens on; with `limit_wait = false` it is escalated, never pressed.
 #[test]
 fn the_limit_options_dialog_whose_title_wraps_chooses_the_wait_row() {
     let guard = crate::supervise::policy::row_guard("  What do you want to");
@@ -1464,15 +1437,9 @@ fn the_limit_options_dialog_whose_title_wraps_chooses_the_wait_row() {
     }
 }
 
-/// A box whose title is whole on its row is decided on the rows under it, as
-/// at any width (the review of round 20's W2 fix, 2026-10-15). Read by the wrap
-/// rule alone, the title took the row under it wherever that row was long: a
-/// subagent's Bash box at 50 columns (`Bash command · from the general-purpose
-/// agent` over `Show status`) was no Bash header, so the safe rules escalated a
-/// `git status` they approve at 144 columns; the measured 2.1.295 Edit box with
-/// a path that fills its row had its path read off the dashed rule under it,
-/// so full power guarded its press on that rule — a row every bracketed box of
-/// the width draws — and journaled the rule as its subject.
+/// A title whole on its row leaves the box its body at any width: a subagent's
+/// Bash box at 50 columns keeps its Bash header, and a file box whose path fills
+/// its row is guarded on the path, not on the dashed rule under it.
 #[test]
 fn a_title_whole_on_its_row_leaves_the_box_its_body() {
     // MEASURED on 2.1.300 at 50 columns (the lab, manual mode): the background
@@ -1503,10 +1470,9 @@ fn a_title_whole_on_its_row_leaves_the_box_its_body() {
     }
 }
 
-/// Nothing but the wait row is ever chosen: with no wait row, with `Don’t
-/// continue automatically` instead, or only stop, spend and upgrade rows, the
-/// dialog escalates at every level (full power with `model_fallback`
-/// included); `limit_wait` off, or a Codex session, escalates too.
+/// Nothing but the wait row is ever chosen: without one (`Don’t continue automatically`, or only
+/// stop, spend and upgrade rows) the dialog escalates at every level, as with `limit_wait` off or
+/// on Codex.
 #[test]
 fn the_limit_options_dialog_without_a_wait_row_is_escalated() {
     for labels in [
@@ -1552,16 +1518,9 @@ fn the_limit_options_dialog_without_a_wait_row_is_escalated() {
     );
 }
 
-/// THE INCIDENT OF 2026-09-27 (aterm-phase's `LIMIT_OPTIONS_PANEL`): the
-/// usage-limit dialog drawn in the fullscreen panel, escalated five times as
-/// "no one-shot allow, nothing that waits and no `No` among the options"
-/// though it offered `Wait here, then continue automatically at Oct 2 at
-/// 5am`. Read through `aterm_phase::read` and decided as the loop decides it,
-/// it is answered by [`RULE_LIMIT_WAIT`] at every level — the focus moved one
-/// row onto the dated wait row by its label, guarded on the panel's title —
-/// with or without the toast in the panel's rule. Controls: wherever the
-/// spend and upgrade rows sit, only the wait row is chosen; with no wait row
-/// the dialog is escalated, never answered by a purchase or by the stop row.
+/// The usage-limit dialog in the fullscreen panel is answered by [`RULE_LIMIT_WAIT`] at every
+/// level, guarded on the panel's title; only the wait row is ever chosen, and without one it
+/// escalates.
 #[test]
 fn the_limit_dialog_in_the_fullscreen_panel_waits_for_its_dated_reset() {
     const WAIT: &str = "Wait here, then continue automatically at Oct 2 at 5am";
@@ -1620,12 +1579,9 @@ fn the_limit_dialog_in_the_fullscreen_panel_waits_for_its_dated_reset() {
     }
 }
 
-/// `Switch to usage credits` opens like the model-refusal pause's switch, so
-/// full power with `model_fallback` could press it. The dialog is decided first
-/// by [`RULE_LIMIT_WAIT`] at every level: every row order gets the wait row
-/// under full power with `model_fallback` exactly as under the safe rules,
-/// never `Switch to usage credits` ([`buys`]) and never `Stop and wait for
-/// limit to reset`.
+/// `Switch to usage credits` opens like the refusal pause's switch, but the
+/// dialog is decided first by [`RULE_LIMIT_WAIT`]: full power with
+/// `model_fallback` gets the wait row in every row order, never the credits.
 #[test]
 fn full_power_with_a_model_fallback_waits_at_the_limit_and_never_buys_credits() {
     let fallback = full();
@@ -1684,9 +1640,8 @@ fn full_power_with_a_model_fallback_waits_at_the_limit_and_never_buys_credits() 
     }
 }
 
-/// The usage-limit dialog with a limit reset on offer, as COMPOSED from the
-/// bundle's texts (aterm-phase's `reset::fixtures`: no such screen has been
-/// captured, and each file's first line says so).
+/// The usage-limit dialog with a limit reset on offer, composed from the vendor
+/// bundle's texts (aterm-phase's `reset::fixtures`).
 fn reset_dialog() -> Vec<String> {
     phase_fixtures::screen(aterm_phase::reset::fixtures::DIALOG_GRANT)
 }
@@ -1748,7 +1703,7 @@ fn the_grant_row_is_taken_by_its_own_rule_and_only_with_its_key_on() {
     };
     assert!(!full().limit_reset, "off unless the loop sets it");
     for c in [ctx(), full(), none(full())] {
-        // NEGATIVE CONTROL: the key off — the wait row, byte for byte.
+        // Negative control: the key off, the wait row.
         assert_eq!(on_screen(&rows, &c), wait(2), "{:?}", c.approve);
         let on = resetting(c);
         assert_eq!(on_screen(&rows, &on), reset(1), "{:?}", on.approve);
@@ -1775,8 +1730,8 @@ fn the_grant_row_is_taken_by_its_own_rule_and_only_with_its_key_on() {
         let screen = phase_fixtures::limit_options_panel(&labels, focus, true);
         assert_eq!(on_screen(&screen, &on), reset(steps), "{labels:?}");
     }
-    // NEGATIVE CONTROLS, key on: every menu that holds no grant row read
-    // whole is the wait row's, exactly as with the key off.
+    // Negative controls, key on: every menu that holds no grant row read whole
+    // is the wait row's, exactly as with the key off.
     let composed = aterm_phase::reset::fixtures::ALL;
     for name in ["dialog-weekly", "dialog-bare"] {
         let (_, text) = composed
@@ -2293,16 +2248,16 @@ fn no_rule_ever_spends_a_limit_reset() {
             );
         }
     }
-    // CONTROL: a yes that spends nothing is allowed once on the same box.
+    // Control: a yes that spends nothing is allowed once on the same box.
     let p = boxed("Yes", Role::Once);
     let (rule, o) = allow_once(&p).expect("a one-shot allow");
     assert_eq!((rule, o.label.as_str()), (RULE_ALLOW_ONCE, "Yes"));
     // (The dialog itself with the key off: the wait row, never either reset
     // row — `the_grant_row_is_taken_by_its_own_rule_and_only_with_its_key_on`.)
 
-    // THE LAST CHECK. A held message's delivery is its one option that does
-    // not refuse, taken by role with no look at its label: where that option
-    // spends a reset, the box is handed over at every level.
+    // The last check: a held message's delivery is its one option that does not
+    // refuse, taken by role with no look at its label; where that option spends
+    // a reset, the box is handed over at every level.
     let confirm = phase_fixtures::screen(aterm_phase::reset::fixtures::CONFIRM);
     let mut held = aterm_phase::read(Some("claude"), &confirm, None);
     held.prompt.as_mut().expect("the box").kind = PromptKind::HeldMessage;
@@ -2314,9 +2269,9 @@ fn no_rule_ever_spends_a_limit_reset() {
         reason(&decide(&held, &confirm, &full())).contains("spends a limit reset"),
         "by the last check, naming the rule"
     );
-    // THE CHECK GOES BY THE BOX TOO: with the yes reworded past every word
-    // that spends (the server may replace any text of the confirmation), the
-    // box is the confirmation still, and its delivery is not made.
+    // The check goes by the box too: with the yes reworded past every word that
+    // spends (the server may replace any text of the confirmation), the box is
+    // still the confirmation, and its delivery is not made.
     let mut reworded = held.clone();
     reworded.prompt.as_mut().expect("the box").options[0].label = "Deliver it".to_string();
     for c in [ctx(), full(), none(full()), resetting(full())] {
@@ -2327,7 +2282,7 @@ fn no_rule_ever_spends_a_limit_reset() {
         reason(&decide(&reworded, &confirm, &full())).contains("on a limit reset's confirmation"),
         "by the last check, naming the box"
     );
-    // CONTROL: a box with no part of the confirmation left, whose delivery
+    // Control: a box with no part of the confirmation left, whose delivery
     // spends nothing, is delivered.
     let plain_rows = no_reset_left(&confirm);
     let mut plain = aterm_phase::read(Some("claude"), &plain_rows, None);
@@ -2366,7 +2321,7 @@ fn no_rule_ever_spends_a_limit_reset() {
             let d = never_spends(&reading, &dialog, chosen(rule, choice.clone()));
             assert_eq!(approved(&d), None, "{rule} {choice:?}");
         }
-        // CONTROL: the reset's own rule is the one that may.
+        // Control: the reset's own rule is the one that may.
         let own = chosen(RULE_LIMIT_RESET, choice.clone());
         assert_eq!(never_spends(&reading, &dialog, own.clone()), own);
     }
@@ -2388,7 +2343,7 @@ fn no_rule_ever_spends_a_limit_reset() {
         let d = never_spends(&reading, &confirm, chosen(RULE_ALLOW_ONCE, choice.clone()));
         assert_eq!(approved(&d), None, "{choice:?}");
     }
-    // CONTROLS: its refusal passes, and on a box that is no confirmation so
+    // Controls: its refusal passes, and on a box that is no confirmation so
     // does the same yes, and the same answer.
     let keep = chosen(RULE_NO_SPEND, focus("No, keep it"));
     assert_eq!(never_spends(&reading, &confirm, keep.clone()), keep);
@@ -2399,10 +2354,8 @@ fn no_rule_ever_spends_a_limit_reset() {
     }
 }
 
-/// A composed reset confirmation's rows with NO PART OF THE CONFIRMATION
-/// LEFT: its title, every row of its body and both options reworded, the
-/// frame as it was — the same box as any other dialog of two unnumbered
-/// options would draw it.
+/// A composed reset confirmation's rows with no part of the confirmation left:
+/// title, body and both options reworded, the frame as it was.
 fn no_reset_left(rows: &[String]) -> Vec<String> {
     let yes = rows
         .iter()
@@ -2425,22 +2378,9 @@ fn no_reset_left(rows: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// A RESET CONFIRMATION IS NEVER ANSWERED YES by the rules every box gets, at
-/// any level and with the reset's key on or off (its Enter is the loop's own
-/// step, never a decision here): full power answers it with the option that
-/// waits — `No, keep it`, by focus and Enter, [`RULE_NO_SPEND`] — and the safe
-/// rules and `approve = "none"` hand it over. With its title row OFF THE SCREEN
-/// it is not read whole ([`head_unread`]) and no level presses anything on it
-/// (full power once answered such a box by its options alone, `Yes, use my
-/// reset`). Over the reader's COMPOSED screens (never captured): the
-/// confirmation as it opens, wrapped at 60 columns, with the early line, and
-/// with the cursor on the no.
-///
-/// AND SO IT IS WITH ITS YES REWORDED (READ: the server's payload may replace
-/// any text of the box): read whole, the box is the confirmation by any part
-/// left of it ([`confirms_reset`]) — its no, or its body alone — and is
-/// refused. NEGATIVE CONTROL: with NO part of the confirmation left and its
-/// title read, it is a dialog of no kind, declined whatever its yes says.
+/// A reset confirmation is never answered yes at any level, key on or off: full power takes `No,
+/// keep it`, the others hand it over, nothing is pressed with its title cut, and a reworded yes is
+/// still refused by any part left. Control: with no part left, a dialog of no kind, declined.
 #[test]
 fn a_reset_confirmation_is_never_answered_yes_at_any_level() {
     use aterm_phase::reset::fixtures as composed;
@@ -2496,8 +2436,8 @@ fn a_reset_confirmation_is_never_answered_yes_at_any_level() {
                     assert!(matches!(d, Decision::Escalate { .. }), "{what}: {d:?}");
                 }
             }
-            // THE YES REWORDED: the confirmation still, by its no and its
-            // body, and kept at every level.
+            // The yes reworded: the confirmation still, by its no and its body,
+            // and kept at every level.
             let refused = |d: &Decision, rule: &str, label: &str, what: &str| {
                 let (by, choice, _, _, _) = approval(d);
                 assert_eq!(by, rule, "{what}: {d:?}");
@@ -2538,7 +2478,7 @@ fn a_reset_confirmation_is_never_answered_yes_at_any_level() {
                     refused(&d, RULE_DECLINE, "No", &what);
                 }
             }
-            // NEGATIVE CONTROL: no part of the confirmation left.
+            // Negative control: no part of the confirmation left.
             let plain = no_reset_left(&rows);
             let d = on_screen(&plain, &full());
             if head == "off" {
@@ -2591,12 +2531,9 @@ fn trust_roots_are_read_from_the_config_spelling() {
     assert!(!held("/private/tmp/other") && !held("/opt/xy"));
 }
 
-/// The rm breaker judges the rest of its line (the bypass it trusts was read
-/// off a footer the box replaced), including a redirect on a `mktemp` segment
-/// beside the rm (truncating `~/.zshrc`) and a command zsh's arithmetic runs a
-/// substitution from (`printf %d 'path[$(…)]'`, `[ -t … ]`), naming the
-/// arithmetic. Negative controls: the lines the rule exists for, a quiet
-/// `mktemp`, and a number under the same format.
+/// The rm breaker judges the rest of its line (bypass was read off a footer the
+/// box replaced): a redirect on a `mktemp` beside the rm, or a substitution zsh's
+/// arithmetic runs, escalates. Controls: the lines the rule exists for.
 #[test]
 fn the_rest_of_an_rm_breaker_line_must_read() {
     for line in [
@@ -2682,18 +2619,14 @@ fn a_tmpdir_that_holds_too_much_is_no_scratch_root() {
     );
 }
 
-/// The Read path is judged as written and as its links resolve, so a committed
-/// `docs/k -> ~/.ssh/id_rsa` under an allowed root escalates; a dangling link
-/// escalates. Control: a link staying under the root, and a plain file, are
-/// approved.
+/// A Read is judged where its links lead too: a link to a secret or out of the root, or a dangling
+/// one, escalates. Controls: a link staying under the root, a plain file.
 #[cfg(unix)]
 #[test]
 fn a_read_through_a_symlink_is_judged_where_it_leads() {
     use std::os::unix::fs::symlink;
-    // Under `/tmp`, never `$TMPDIR`: the hidden-twin scan reads every folder
-    // on the way, and a busy machine's `$TMPDIR` holds more entries than it
-    // will prove (MEASURED 2026-10-07: 43 126, past HIDDEN_TWIN_ENTRIES), so
-    // every Read under it is held as "too big to prove", the control included.
+    // Under `/tmp`, never `$TMPDIR`: the hidden-twin scan lists every folder on
+    // the way, and a busy machine's `$TMPDIR` can pass HIDDEN_TWIN_ENTRIES.
     let base = std::fs::canonicalize("/tmp")
         .expect("/tmp")
         .join(format!("aterm-read-links-{}", std::process::id()));
@@ -2730,11 +2663,9 @@ fn a_read_through_a_symlink_is_judged_where_it_leads() {
         let d = on_screen(&read_box(&at(good)), &c);
         assert_eq!(approved(&d), Some(RULE_READ_OUTSIDE_CWD), "{good}: {d:?}");
     }
-    // The box draws some characters as nothing (MEASURED on 2.1.292 and 2.1.284:
-    // a zero-width space or joiner, a soft hyphen, a byte-order mark): `x<ZWSP>y`,
-    // a link to a secret, is drawn `xy`, a name that is not there, or a decoy
-    // beside the real one. An entry that differs from the shown name only by
-    // characters outside ASCII holds the press, in a folder on the way too.
+    // The box draws some characters as nothing (a zero-width space or joiner, a
+    // soft hyphen, a byte-order mark): an entry that differs from the shown name
+    // only by such characters holds the press, in a folder on the way too.
     symlink(home.join(".ssh/id_rsa"), root.join("x\u{200b}y")).expect("link");
     symlink(home.join(".ssh/id_rsa"), root.join("de\u{ad}coy")).expect("link");
     std::fs::write(root.join("decoy"), "benign").expect("file");
@@ -2755,7 +2686,7 @@ fn a_read_through_a_symlink_is_judged_where_it_leads() {
         let twin = format!("{:?}", root.join(twin).to_string_lossy());
         assert!(reason(&d).contains(&twin), "{shown}: {twin}: {d:?}");
     }
-    // A name of hidden characters ONLY is drawn as nothing, so the box shows an
+    // A name of hidden characters only is drawn as nothing, so the box shows an
     // empty component (`ev//x`, `ev/d/`) that the judging would drop; and the
     // default volume ignores case, so `Q<ZWSP>R` is what a Read of `qr` opens.
     std::fs::create_dir_all(root.join("\u{200b}")).expect("dir");
@@ -2791,7 +2722,7 @@ fn a_read_through_a_symlink_is_judged_where_it_leads() {
     let d = on_screen(&read_call_box(&at("plainly.txt")), &c);
     assert_eq!(approved(&d), Some(RULE_READ_OUTSIDE_CWD), "{d:?}");
     // Under a view (`Read(<link> · lines 1-2)`) the link is still followed, and
-    // a link NAMED like a view is the file Claude Code reads (a repo can commit
+    // a link named like a view is the file Claude Code reads (a repo can commit
     // one): both readings are judged.
     symlink(home.join(".ssh/id_rsa"), root.join("m · lines 1-5")).expect("link");
     for (name, safe) in [
@@ -2950,15 +2881,13 @@ fn the_twin_scan_never_lists_inside_another_apps_data() {
     }
 }
 
-/// Claude Code draws a folder grant (`Yes, allow reading from <dir> …`) on EVERY
+/// Claude Code draws a folder grant (`Yes, allow reading from <dir> …`) on every
 /// Read box for a folder outside its working set and asks about nothing inside
 /// it, so a Read box with none is the owner's ask rule or hook (which draw no
-/// reason for a file tool): held at every level. MEASURED boxes: a Read of
-/// `notes.txt` in the project under `ask: ["Read"]`, in default and in
-/// accept-edits mode, and on 2.1.284. Controls: the boxes with the grant (a
-/// Read outside the project) are not held by it, so the safe rules press them
-/// and full power does; no working directory is asked, so a stale one cannot
-/// hold Claude Code's own box.
+/// reason for a file tool): held at every level. The captures: a Read of
+/// `notes.txt` in the project under `ask: ["Read"]`, in default and accept-edits
+/// mode, and on 2.1.284. Controls: boxes with the grant are not held by it; no
+/// working directory is asked, so a stale one cannot hold Claude Code's own box.
 #[test]
 fn a_read_box_with_no_folder_grant_is_the_owners_review() {
     for (name, text) in [
@@ -2979,9 +2908,8 @@ fn a_read_box_with_no_folder_grant_is_the_owners_review() {
             );
         }
     }
-    // Claude Code's renderer garbles the `No` row at some pane widths (MEASURED
-    // at 30, 31, 40, 55 and 104 columns: `3. Nossion`): a box with no `No` read
-    // is no reason to press the owner's box at the default level.
+    // Claude Code's renderer garbles the `No` row at some pane widths
+    // (`3. Nossion`): a box with no `No` read is still held.
     let mut garbled = phase_fixtures::screen(phase_fixtures::BOX_READ_FORCED_2_1_292);
     let at = garbled
         .iter()
@@ -2996,8 +2924,8 @@ fn a_read_box_with_no_folder_grant_is_the_owners_review() {
             level.approve
         );
     }
-    // A root-level path draws Claude Code's own box with no grant (MEASURED:
-    // `/foo`, `/`): not the owner's.
+    // A root-level path (`/foo`, `/`) draws Claude Code's own box with no grant:
+    // not the owner's.
     let mut root = phase_fixtures::screen(phase_fixtures::BOX_READ_FORCED_2_1_292);
     let at = root
         .iter()
@@ -3022,9 +2950,9 @@ fn a_read_box_with_no_folder_grant_is_the_owners_review() {
     }
 }
 
-/// A `claude-*` trust root a person writes is this uid's own `claude-<uid>`,
-/// in the spelling written: never another user's temp root. Control: another
-/// uid's is a root for neither a Read nor the trust dialog.
+/// A `claude-*` trust root a person writes is this uid's own `claude-<uid>`, in the spelling
+/// written, never another user's. Control: another uid's is a root for neither a Read nor the
+/// trust dialog.
 #[test]
 fn the_claude_tmp_root_is_the_uids_own() {
     for (spec, base) in [
@@ -3042,8 +2970,7 @@ fn the_claude_tmp_root_is_the_uids_own() {
         };
         assert!(held("502") && !held("503"), "{spec}: {:?}", c.trust_roots);
     }
-    // A Read is judged by the same root (under `/private/tmp`, which no link
-    // of the test machine's moves).
+    // A Read is judged by the same root, under `/private/tmp`, which no symlink moves.
     let mut c = ctx();
     c.set_trust_roots(&["/private/tmp/claude-*".to_string()], 502);
     let d = on_screen(&read_box("/private/tmp/claude-503/scratch/x.log"), &c);
@@ -3064,11 +2991,10 @@ fn trust_rows(folder: &str) -> Vec<String> {
         .collect()
 }
 
-/// No folder is a trust root by default: a checkout under `~` (whatever its
-/// name, the names one person's checkouts have included) and Claude Code's
-/// own temp root alike go to a person; that root sits in a `/tmp` where any
-/// local user can leave the instruction files a trusted session reads.
-/// Control: once the person names the folder's root, it answers.
+/// No folder is a trust root by default: a checkout under `~`, whatever its name, and Claude
+/// Code's own temp root alike go to a person (that root sits in a `/tmp` where any local user can
+/// leave the instruction files a trusted session reads). Control: once the person names the
+/// folder's root, the dialog is answered.
 #[test]
 fn the_default_trusts_no_folder() {
     let home = "/Users/_owner";
@@ -3170,11 +3096,8 @@ fn pressed(d: &Decision) -> (&'static str, Choice) {
     }
 }
 
-/// Full power, the default: every permission box gets its one-shot allow (a
-/// write, an edit, a bypass rm breaker outside scratch), never the standing
-/// grant beside it; a box a safe rule proves is ledgered under that rule.
-/// Negative controls: under `approve = "safe"` they escalate, and under
-/// `"none"` so does the read.
+/// Full power gives every permission box its one-shot allow, never the standing grant beside it;
+/// a box a safe rule proves keeps that rule. Controls: `"safe"` escalates them, `"none"` the read.
 #[test]
 fn full_power_answers_every_permission_box_with_its_one_shot_allow() {
     let touch = phase_fixtures::screen(phase_fixtures::BOX_BASH_TOUCH);
@@ -3813,9 +3736,9 @@ fn unproven_of(d: &Decision) -> Option<&str> {
 
 /// Full power never takes a standing grant: a box whose only yes is `don't ask
 /// again` (or a session or mode grant) is declined with its `No`, and one with
-/// no `No` escalates. THE PRESS GATE holds where a rule picks by its own
-/// words, not by role: a plan box whose one yes that names no standing mode
-/// keeps its answer (`Yes, and don't ask again for edits`) is a person's.
+/// no `No` escalates. The press gate holds where a rule picks by its own words,
+/// not by role: a plan box whose one yes naming no standing mode keeps its
+/// answer (`Yes, and don't ask again for edits`) is a person's.
 #[test]
 fn full_power_never_takes_a_standing_grant() {
     let plan: Vec<String> = phase_fixtures::screen(phase_fixtures::PLAN_READY)
@@ -5207,11 +5130,8 @@ fn full_power_presses_bash_under_every_header_form() {
     }
 }
 
-/// Every permission kind is pressed, its one-shot allow only, under its judged
-/// row's guard (the command's first row, the path's, the question naming the
-/// file for `Edit notebook` and the IDE diff, else the title). Write, Create,
-/// Overwrite and origin-suffixed boxes are the captured Edit and Read boxes
-/// retitled.
+/// Every permission kind gets its one-shot allow under its judged row's guard (command row, path,
+/// the question for `Edit notebook` and the IDE diff, else the title).
 #[test]
 fn full_power_presses_every_permission_kind_under_its_judged_row() {
     let f = |t: &str| phase_fixtures::screen(t);
@@ -5418,9 +5338,8 @@ fn full_power_answers_each_dialog_by_its_own_rule() {
             RULE_DECLINE,
             Choice::Digit(3),
         ),
-        // 2.1.287 (MEASURED): its one-shot `4. Yes, but ask again next
-        // time`, never `1. Yes, and keep allowing …` or `2. No, and block
-        // reads … from now on`.
+        // 2.1.287: its one-shot `4. Yes, but ask again next time`, never
+        // `1. Yes, and keep allowing …` or `2. No, and block reads … from now on`.
         (
             "read setting 2.1.287",
             f(phase_fixtures::READ_OUTSIDE_SETTING_MEASURED),
@@ -6040,7 +5959,7 @@ fn full_power_trusts_any_folder_and_names_the_backstops_grants() {
         None,
         std::sync::Arc::new(crate::supervise::policy::LiveProbe),
     );
-    // The fixture's folder named as a root, so the safe rule reaches its options.
+    // The fixture's folder is a named root, so the safe rule reaches its options.
     own.set_trust_roots(&["~/aterm".to_string()], 502);
     let safe = ApprovalCtx {
         approve: Approve::Safe,
@@ -6620,10 +6539,8 @@ fn the_chrome_install_offer_is_declined_with_not_now_and_nothing_else() {
     }
 }
 
-/// The safe Read and rm rules prove boxes by local checks, so a `(runs on <m>)`
-/// box is escalated by them naming the machine, and full power presses it as
-/// `allow-once@v1` with that reason as `unproven`. Controls: without the
-/// suffix they are the proven rules'.
+/// A `(runs on <m>)` box is not proven by the local Read and rm checks: escalated naming the
+/// machine, pressed by full power with that reason `unproven`. Control: without the suffix.
 #[test]
 fn a_box_that_runs_on_another_machine_is_not_proven_by_local_checks() {
     let path = "/etc/hosts";
@@ -6664,11 +6581,9 @@ fn a_box_that_runs_on_another_machine_is_not_proven_by_local_checks() {
     assert!(unproven.is_some_and(|u| u.contains("on m3")), "{d:?}");
 }
 
-/// The generic tool box in card mode (titled by its card's question, or by the
-/// tool name with an origin) is pressed by full power as a tool box, guarded
-/// on its title row, in and out of bypass. Negative controls: the safe rules
-/// escalate it; without the footer's `Tab to amend` it is unknown and
-/// escalated.
+/// The generic tool box in card mode is pressed by full power as a tool box, guarded on its title
+/// row. Controls: the safe rules escalate it; without `Tab to amend` it is a dialog of no kind,
+/// declined.
 #[test]
 fn full_power_presses_a_card_mode_tool_box() {
     let card = phase_fixtures::screen(phase_fixtures::BOX_TOOL_CARD);
@@ -6780,12 +6695,8 @@ fn a_box_taller_than_the_pane_is_pressed_by_no_level() {
     assert_eq!(guarded(approval(&d).2, &whole), ["   │ echo \"hello"]);
 }
 
-/// Plan approval presses the yes that grants no standing mode. Claude Code lists
-/// its broadest yes first (`Yes, and use auto mode`, `Yes, auto-accept edits`,
-/// `Yes, clear context … and bypass permissions`), so `Yes, manually approve
-/// edits` is chosen wherever it sits, and Codex's `Yes, implement this plan`
-/// (never `Yes, clear context and implement`). Negative control: a plan box
-/// whose every yes is broad is declined with its `No`.
+/// A plan is approved on the yes that grants no standing mode, wherever it sits (`Yes, manually
+/// approve edits`, Codex's `Yes, implement this plan`). Control: every yes broad, its `No`.
 #[test]
 fn a_plan_is_approved_on_its_least_power_yes() {
     // PLAN_READY with its three option rows replaced: the list 2.1.282
@@ -6923,14 +6834,9 @@ fn decline_on(rows: &[String], text: &str) -> Result<Decision, String> {
     decline(RULE_UNDER_TEST, &p, text.to_string(), "the box".to_string())
 }
 
-/// The decline over the four captured states: each state is declined on
-/// option 2, so a stopped loop resumes, and each takes exactly one keystroke
-/// guarded on the row showing it (`down` from `❯ 1. Yes`, Tab on `❯ 2. No`, the
-/// text into the open input, Enter on the text). Each guard matches no row of
-/// the next state, so a stale keystroke lands nowhere. Negative controls:
-/// Enter is never the step on text that is not the decline's (the captured
-/// stand-in, a short write) or on the empty input (the bare `No`); a box
-/// holding someone else's text is not declined over it.
+/// The decline over the four captured states: each is declined on option 2 (so a stopped loop
+/// resumes) by one keystroke guarded on the row showing it, a guard no row of the next state
+/// matches. Controls: Enter never on text not the decline's, nor on the empty input.
 #[test]
 fn the_measured_decline_takes_one_guarded_keystroke_per_state() {
     let text = a_decline_text();
@@ -7008,10 +6914,8 @@ fn the_measured_decline_takes_one_guarded_keystroke_per_state() {
     assert!(matches!(step(&box3, &text), Ok(DeclineStep::Type { .. })));
 }
 
-/// Negative controls: a box offering no way to give a reason is never declined.
-/// Without `Tab to amend` the `No` cannot carry text; a stray row among options
-/// makes them unsound; a footerless box's refusal (`No, and tell Claude … (esc)`)
-/// is a fixed label; a box cut above its footer is no box.
+/// A box offering no way to give a reason is never declined: no `Tab to amend`, a stray row among
+/// the options, a footerless box's fixed refusal, a box cut above its footer.
 #[test]
 fn a_box_that_offers_no_way_to_give_a_reason_is_never_declined() {
     let text = a_decline_text();
@@ -7053,9 +6957,8 @@ fn a_box_that_offers_no_way_to_give_a_reason_is_never_declined() {
     );
 }
 
-/// What the worker is told is one printable line: prefix, reason (cut), then
-/// what to do. Tabs, newlines and control characters in a reason become
-/// spaces; a long reason is cut, never the fix.
+/// The decline text is one printable line (prefix, reason, fix): tabs, newlines and control
+/// characters become spaces, and a long reason is cut, never the fix.
 #[test]
 fn the_decline_text_is_one_typeable_line() {
     let t = decline_text(
@@ -7071,11 +6974,9 @@ fn the_decline_text_is_one_typeable_line() {
     assert!(long.ends_with(". Do it another way."), "{long}");
 }
 
-/// A digit is never pressed into an open amend input: once Tab opened it,
-/// Claude Code sends every key but the arrows there, so a `1` would be typed
-/// into the reason. Full power presses `1` as drawn and with focus on the shut
-/// `No` (positive controls), and escalates with the input open, empty or
-/// holding text; the safe rm rule on the same box made provable does the same.
+/// A digit is never pressed into an open amend input (Claude Code types every key but the arrows
+/// into it): full power and the safe rm rule escalate with it open. Controls: `1` as drawn and
+/// with the focus on the shut `No`.
 #[test]
 fn a_digit_is_never_pressed_into_an_open_amend_input() {
     let text = a_decline_text();
@@ -7112,7 +7013,7 @@ fn a_digit_is_never_pressed_into_an_open_amend_input() {
             );
         }
     }
-    // Decision 1's rm rule, the command made one it proves.
+    // The safe rm rule on the same box, its command made one it proves.
     let scratch = "S=/private/tmp/claude-502/x; rm -rf \"$S/t5\"";
     let swap = |rows: &[String]| -> Vec<String> {
         rows.iter()
@@ -7276,13 +7177,9 @@ fn declined(d: &Decision) -> (&'static str, &str) {
     }
 }
 
-/// A Bash box 544 rows tall on a 48-row screen, its header and most command rows
-/// above the screen, the rm breaker's note at its foot. In bypass it is
-/// declined, under the safe rules and full power alike, telling the worker to
-/// rerun exactly the quoted invocation alone, as a short box the rules can
-/// read. Negative controls: out of bypass, without scratch roots, and under
-/// `approve = "none"` it is handed over; the same box whole on a tall enough
-/// screen is pressed by full power as read.
+/// A 544-row Bash box on a 48-row screen, the rm breaker's note at its foot, is declined in bypass
+/// at both levels, telling the worker to rerun the quoted invocation alone. Controls: out of
+/// bypass, no scratch roots, `"none"`; drawn whole, it is pressed.
 #[test]
 fn a_box_taller_than_the_screen_in_a_bypass_session_is_declined_with_its_flagged_rm() {
     let screen = owner_screen(OWNER_COMMAND);
@@ -7373,13 +7270,9 @@ fn a_tall_box_under_a_not_ruled_out_breaker_is_declined_with_a_split() {
 
 // --- a subagent's rm breaker in a bypass session -------------------------------
 
-/// A bypass session's screen rebuilt from a screenshot: a `general-purpose`
-/// subagent's Bash box whose command carries the rm breaker's
-/// possibly-empty-variable note (`$SP/*.log`), 62x149. The box's rows are
-/// exact; transcript rows above are approximate. Home name and uid (502, also
-/// in `/private/tmp/claude-502`) are replaced; launched in
-/// `/Users/_owner/clean`. An older host escalated it as "the box header is not
-/// a Bash header".
+/// A bypass session's screen rebuilt from a screenshot (62x149; the box's rows exact, the
+/// transcript above approximate; home and uid 502 replaced): a `general-purpose` subagent's Bash
+/// box whose command carries the rm breaker's possibly-empty-variable note (`$SP/*.log`).
 const OWNER_SUBAGENT_RM: &str = include_str!("fixtures/owner-rm-breaker-subagent-2026-09-26.txt");
 
 /// The first command row of [`OWNER_SUBAGENT_RM`], as drawn: the row a
@@ -7415,10 +7308,8 @@ fn subagent_owner_ctx(approve: Approve, bypass_mode: bool) -> ApprovalCtx {
     }
 }
 
-/// [`OWNER_SUBAGENT_RM`] at defaults (full power): answered `1` under
-/// [`RULE_ALLOW_ONCE`], guarded on its first command row, subject the command,
-/// ledgered unproven naming the breaker kind, in bypass and with bypass unread.
-/// Negative control: the guard matches that row alone.
+/// [`OWNER_SUBAGENT_RM`] at defaults: `1` under [`RULE_ALLOW_ONCE`], guarded on its first command
+/// row alone, unproven naming the breaker kind, in bypass and with bypass unread.
 #[test]
 fn the_owners_subagent_rm_box_is_pressed_at_default_power() {
     let rows = lines(OWNER_SUBAGENT_RM);
@@ -7575,11 +7466,8 @@ fn a_git_read_is_approved_only_where_its_config_runs_nothing() {
     let _ = std::fs::remove_dir_all(&other);
 }
 
-/// The Bash tool keeps its own directory: an earlier `cd sub` leaves the next
-/// `git status` running in `sub`, so where the transcript puts the Bash tool
-/// ([`ApprovalCtx::shell_cwds`]) is judged too. Negative control: with no such
-/// directory read the box is approved, the nested repository's fsmonitor
-/// unseen.
+/// The Bash tool keeps its own directory (an earlier `cd sub`), so where the transcript puts it
+/// ([`ApprovalCtx::shell_cwds`]) is judged too. Control: unread, the nested fsmonitor is unseen.
 #[test]
 fn a_git_read_is_judged_where_the_bash_tool_stands() {
     let launch = scratch_repo("launch");
@@ -7666,11 +7554,8 @@ fn a_git_read_is_judged_in_the_workers_environment() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// The probe runs the first `git` on the worker's `PATH`, in the supervisor,
-/// before anything is approved, so a `PATH` entry the worker writes unapproved
-/// (`.venv/bin`, a scratch dir) ahead of git escalates naming the entry. A
-/// planted marker-writing `git` in `.venv/bin` never runs. Negative control:
-/// the same entry outside every worker-written directory is read.
+/// A worker-writable `PATH` entry ahead of git (`.venv/bin`, a scratch dir) escalates before the
+/// probe can run a planted `git`. Control: the same entry outside every worker-written directory.
 #[cfg(unix)]
 #[test]
 fn a_worker_path_entry_the_worker_writes_is_refused_before_the_probe_runs_it() {
@@ -7783,18 +7668,13 @@ fn a_git_read_whose_bash_tool_settings_change_git_escalates() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// The user's own review stands: a box the user's Claude Code configuration
-/// sends to a person (an ask rule, one over auto mode, a hook, read off the
-/// box's reason block) is never pressed at any level, bypass included; it is
-/// the person's, with the reason said. Negative control: the same box without
-/// the reason block gets full power's one-shot allow.
+/// A box the user's Claude Code configuration sends to a person (an ask rule, one over auto mode,
+/// a hook) is never pressed at any level, bypass included. Control: without the reason block,
+/// full power's one-shot allow.
 #[test]
 fn a_box_the_owners_own_settings_send_to_a_person_is_never_pressed() {
-    // The 2.1.282 capture, and six MEASURED on 2.1.287 (2026-10-01, the real
-    // binary against the lab's stub): there the reason sits under the box's
-    // dashed rules, and the reader that took it for the command's description
-    // let the harness press the two Bash boxes at full power — the tool ran
-    // each time — and saw no Fetch box at all.
+    // The 2.1.282 capture and six 2.1.287 ones, where the reason sits under the box's dashed
+    // rules, not in the command's description.
     let hook_noreason = phase_fixtures::box_bash_hook_ask_noreason_2_1_287();
     for text in [
         phase_fixtures::BOX_BASH_ASK_RULE,
@@ -7831,9 +7711,8 @@ fn a_box_the_owners_own_settings_send_to_a_person_is_never_pressed() {
         pressed(&on_screen(&plain, &full())),
         (RULE_ALLOW_ONCE, Choice::Digit(1))
     );
-    // NEGATIVE CONTROLS on 2.1.287: the same layout without a reason block is
-    // answered — a command the safe rules prove read-only by the read-only
-    // rule at both levels that have it, and refused to `none`.
+    // Negative controls: the same layout without a reason block is answered, read-only under
+    // both levels that have the rule and refused under `none`.
     let read = phase_fixtures::screen(phase_fixtures::BOX_BASH_READ_2_1_287);
     for c in [ctx(), full()] {
         assert_eq!(
@@ -7844,9 +7723,8 @@ fn a_box_the_owners_own_settings_send_to_a_person_is_never_pressed() {
     assert_eq!(approved(&on_screen(&read, &none(ctx()))), None);
 }
 
-/// The permission reason's wrapping cannot turn the user's explicit review into
-/// an automatic approval, through the real screen reader and policy. Negative
-/// control: the unruled box's guarded one-shot approval.
+/// A wrapped permission reason on a non-shell box still holds it. Control: the unruled box's
+/// guarded one-shot approval.
 #[test]
 fn a_wrapped_non_shell_owner_review_is_never_pressed() {
     let plain = phase_fixtures::screen(phase_fixtures::BOX_FETCH);
@@ -7897,12 +7775,8 @@ fn a_wrapped_non_shell_owner_review_is_never_pressed() {
     assert_eq!(guarded(guard, &plain), [" Fetch"]);
 }
 
-/// The model-switch confirmation: full power presses `1. Yes, switch to <m>` on
-/// `/model`'s box (fullscreen and inline) and `/effort`'s, guarded on the title
-/// row, subject naming box and switch, also when a narrow pane wraps the cost
-/// warning. It fails closed on the subtitle: a PreModelSwitch hook's form and a
-/// reworded subtitle are handed over. Every form is handed over under `"safe"`
-/// and `"none"`.
+/// Full power presses `1. Yes, switch to <m>` on the `/model` and `/effort` confirmation under the
+/// cost warning, wrapped or not. A hook's or reworded subtitle, `"safe"` and `"none"` hand it over.
 #[test]
 fn full_power_confirms_the_model_switch_the_person_typed() {
     let pressed = |name: &str, rows: &[String], subject: &str| {
@@ -7996,10 +7870,9 @@ fn full_power_confirms_the_model_switch_the_person_typed() {
 
 // --- Codex's `Continue with …` ------------------------------------------------
 
-/// Claude Code 2.1.295 MEASURED (the real-Claude lab, 2026-10-09): a file box
-/// an ask rule sends to a person draws no reason, the box an unruled call
-/// draws — under `ask: ["Write", "Edit"]` and `ask: ["Read"]` in manual mode,
-/// and under `ask: ["NotebookEdit"]` in accept-edits mode.
+/// Claude Code 2.1.295: a file box an ask rule sends to a person draws no reason, the same box an
+/// unruled call draws (`ask: ["Write", "Edit"]`, `ask: ["Read"]` in manual mode;
+/// `ask: ["NotebookEdit"]` in accept-edits mode).
 const ASK_WRITE: &str = include_str!("fixtures/claude-2.1.295-box-write-ask-rule.txt");
 const ASK_EDIT: &str = include_str!("fixtures/claude-2.1.295-box-edit-ask-rule.txt");
 const ASK_READ_OUTSIDE: &str =
@@ -8019,15 +7892,9 @@ fn bare_rule(tool: &str, source: &str) -> OwnerAsk {
     }
 }
 
-/// The sweep's wrong action (2026-10-09, Claude Code 2.1.295): the owner's
-/// BARE-TOOL ask rule for a file box's tool, read from the agent's own
-/// settings ([`ApprovalCtx::owner_asks`]), holds the captured box at every
-/// level, naming the rule and its file; settings that could not be read hold
-/// it too, saying so. Negative controls: with no rule, or a rule for another
-/// tool (each bare rule is its own tool's, as Claude Code applies it), the
-/// box is the levels' as before — full power's one-shot allow, the safe
-/// rules' Read outside the project. The IDE diff (hand-built from the render
-/// code) names no tool, so any edit tool's rule holds it.
+/// A bare-tool ask rule for a file box's tool holds it at every level, naming rule and file;
+/// unread settings hold it too, and any edit tool's rule holds the IDE diff. Controls: no rule,
+/// or another tool's.
 #[test]
 fn a_file_box_the_agents_bare_ask_rule_sends_is_held_at_every_level() {
     let source = "/Users/_owner/.claude/settings.json";
@@ -8151,11 +8018,8 @@ fn a_box_more_than_one_tool_draws_is_held_under_a_bare_rule_for_any_of_them() {
     }
 }
 
-/// Claude Code 2.1.300 MEASURED (the real-Claude lab, 2026-10-15, the
-/// harness sweep, ATERM-KI-1015-1 F1): a Bash `sed -i` is drawn as an `Edit
-/// file` box with NO reason under an ask rule WITH a specifier
-/// (`Bash(sed:*)`) and under a PreToolUse hook on Bash answering `ask` — and
-/// at full power the harness pressed it and the file changed.
+/// Claude Code 2.1.300: a Bash `sed -i` drawn as an `Edit file` box with no reason, under an ask
+/// rule with a specifier (`Bash(sed:*)`) and under a PreToolUse hook on Bash answering `ask`.
 const ASK_BASH_SED_SPECIFIER_300: &str =
     include_str!("fixtures/claude-2.1.300-box-bash-sed-specifier-ask.txt");
 const ASK_BASH_SED_HOOK_300: &str =
@@ -8314,12 +8178,8 @@ fn a_sed_edit_box_under_a_bash_specifier_rule_or_bash_hook_is_held_at_every_leve
 // pending call does not bind the current mount. The RAM aggregate below
 // covers ordinary admission and the possible-tool holds through decide.
 
-/// A WRAPPED FOOTER (aterm-phase's prompt.rs): an ordinary Bash box in a
-/// 26-column pane (MEASURED on 2.1.295, its footer `Esc to cancel · Tab to`
-/// over `amend`) read `idle`, and nothing was pressed or escalated. Read
-/// whole, it is pressed under full power as at any width, and a decline
-/// still finds its `No` offered `Tab to amend` with no amend input open: the
-/// footer is the box's whole footer, never its last row.
+/// A Bash box whose footer wraps (`… · Tab to` over `amend` at 26 columns) is decided by its
+/// whole footer: pressed at full power, and declinable with no amend input open.
 #[test]
 fn a_box_whose_footer_wraps_is_decided_by_its_whole_footer() {
     let rows = phase_fixtures::screen(phase_fixtures::BOX_BASH_26_2_1_295);

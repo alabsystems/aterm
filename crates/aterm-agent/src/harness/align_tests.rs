@@ -41,8 +41,6 @@ fn shell(line: &str) -> Command {
     }
 }
 
-// -- the bounded runner every subprocess in this tree borrows -------------------
-
 #[test]
 fn a_child_that_never_returns_is_killed_at_the_deadline() {
     // The point of this shape: `wait_with_output` on a child that hangs never

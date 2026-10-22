@@ -939,12 +939,10 @@ pub(super) fn exit_clock(at_s: u64, exited_at: u64, hand_seen_s: u64) -> u64 {
     at_s.max(exited_at).max(hand_seen_s)
 }
 
-/// A stale exit's ledger line, for `who` (`the agent`, `Codex`), alike in
-/// both lanes: an end no look has seen yet is only the one asked for
-/// ([`St::exited_at`]), and so is one seen only within the bound (a sweep
-/// whose first sighting stamps it now), and the wait the last try recorded
-/// ([`St::wait`]) says what held the line, in a person's words. A wait with
-/// no words gives the bare line; `--status`'s wait log keeps it.
+/// A stale exit's ledger line for `who` (`the agent`, `Codex`), alike in both lanes. An end no look
+/// has seen yet, or seen only within the bound, reads "was asked to end" ([`St::exited_at`]), and
+/// the wait the last try recorded ([`St::wait`]) says what held the line, in a person's words. A
+/// wait with no words gives the bare line; `--status`'s wait log keeps it.
 pub(super) fn stale_exit_line(st: &St, who: &str, now: u64) -> String {
     let what = if st.exited_at != 0 && now.saturating_sub(st.exited_at) > STALE_S {
         "ended"
@@ -1618,7 +1616,7 @@ fn type_at_prompt(
 /// ATERM-KI-1016-1). Counted, so the restart's stale bound ends it and its
 /// row asks the person, as it did before a hand was waited out.
 ///
-/// `Ok(None)`: a read with no cursor, typed at as before.
+/// `Ok(None)`: a read with no cursor, typed at with no mark.
 fn first_mark(
     c: &mut Client,
     tab: &str,
@@ -2372,12 +2370,11 @@ pub(super) fn running_cmdline(c: &mut Client, tab: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Whether the command the relaunch line ran in block `block` is OVER, by the
-/// shell's own marks (`blocks 1 --json`): that block is `complete` (its
-/// `133;D`), or a newer one began (the shell's next prompt — ids only rise in
-/// a terminal). `Some(false)` while it is still the newest and not complete
-/// (the shell's hooks, or the agent, still run); `None` when nothing can be
-/// read, or the newest block is older than it (the tab's blocks were reset).
+/// Whether the command the relaunch line ran in block `block` is over, by the shell's own marks
+/// (`blocks 1 --json`): that block is `complete` (its `133;D`), or a newer one began (the shell's
+/// next prompt; ids only rise in a terminal). `Some(false)` while it is still the newest and not
+/// complete (the shell's hooks, or the agent, still run); `None` when nothing can be read, or the
+/// newest block is older than it (the tab's blocks were reset).
 fn line_over(c: &mut Client, tab: &str, block: u64) -> Option<bool> {
     let newest = newest_block(c, tab)?;
     let id = newest.get("id").and_then(Value::as_u64)?;
@@ -6261,12 +6258,9 @@ pub fn in_flight_here(opts: &Opts, tab: &str, session: &str) -> bool {
     load(opts, session).is_some_and(|st| st.in_flight() && st.tab == tab)
 }
 
-/// Whether a restart of `agent`'s lane is carried by this module's own rules
-/// ([`carry_restart`], [`carry_own_step`]: the stale-exit bound counted from
-/// the carry, the adopted process, the relaunched agent gone, the age limit)
-/// — Claude Code's — or by its lane's, which keeps all of them itself (a
-/// Codex restart: [`super::upgrade_drive::codex_carry_in_flight`], its age
-/// counted from its typed `/exit`).
+/// Whether `agent`'s restarts are carried by this module's rules ([`carry_restart`],
+/// [`carry_own_step`]): Claude Code's are; a Codex's lane keeps its own
+/// ([`super::upgrade_drive::codex_carry_in_flight`], its age counted from its typed `/exit`).
 fn carried_here(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,

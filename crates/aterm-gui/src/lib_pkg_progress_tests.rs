@@ -174,11 +174,9 @@ fn a_routine_pass_posts_only_the_reads_that_could_paint() {
     }
 }
 
-/// The handshake fires after the stop check and just before the park. The
-/// child exit then has to wake this long quiet wait and read the file once
-/// more, even if its unpark beats the park call. The one-minute bound is a
-/// hang detector well inside the injected ten-minute tick: a finish that did
-/// not interrupt the park would wait out the tick and miss it by nine minutes.
+/// The handshake fires after the stop check, just before the park: the child's exit must
+/// wake this ten-minute quiet wait and read the file once more, even if its unpark beats
+/// the park call. The one-minute bound is a hang detector well inside the tick.
 #[test]
 fn child_exit_interrupts_a_parked_progress_tailer() {
     let prefix = std::env::temp_dir().join(format!(

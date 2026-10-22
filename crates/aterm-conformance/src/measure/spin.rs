@@ -133,7 +133,6 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         ctl.ok(&["send", &launch])?;
         ctl.ok(&["key", "enter"])?;
     }
-    // The measured interval itself.
     std::thread::sleep(row.window);
     let mut reasons = None;
     if row.scene == SpinScene::ClaudeShaped {

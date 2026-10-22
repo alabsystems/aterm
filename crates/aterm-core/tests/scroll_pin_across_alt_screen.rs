@@ -85,8 +85,7 @@ fn the_raw_alt_screen_modes_preserve_it_too() {
     }
 }
 
-/// Control: while the user is at the live bottom, an alt-screen app must still
-/// leave them at the live bottom. The fix must not invent an offset.
+/// Control: a reader at the live bottom stays there across the round trip.
 #[test]
 fn a_live_viewport_stays_live_across_the_round_trip() {
     let mut term = Terminal::new(6, 24);
@@ -283,8 +282,8 @@ fn a_width_resize_still_leaves_the_reader_in_history() {
     );
 }
 
-/// Control: a width change genuinely renumbers rows, so it must still clear.
-/// Losing the highlight is right there; keeping it would leave it over the wrong text.
+/// Control: a width change renumbers rows, so the selection clears rather than sit over the
+/// wrong text.
 #[test]
 fn a_width_resize_still_clears_the_selection() {
     use aterm_core::selection::{SelectionSide, SelectionType};

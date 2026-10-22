@@ -247,8 +247,7 @@ mod tests {
             .expect("LCD instance builds for the embedded face")
     }
 
-    /// A space has no outline: the raster declines (`None`) and the caller's
-    /// grayscale path draws nothing — the blank-glyph convention.
+    /// A space has no outline: the raster declines (`None`).
     #[test]
     fn space_declines() {
         let hint = lcd_instance(12.0);
@@ -309,11 +308,10 @@ mod tests {
         }
     }
 
-    /// The unhinted LCD raster fills the outline the grayscale unhinted raster
-    /// fills, at the same scale: the 3× fill and FIR5 both conserve ink, so a
-    /// glyph's LCD ink (channel sum over 3·255) is its grayscale ink to within
-    /// edge rounding (measured on these glyphs: 0.17% at worst). A scale slip
-    /// (design units left unscaled, or `px` applied twice) misses by a factor.
+    /// The unhinted LCD raster fills the grayscale unhinted raster's outline at the same
+    /// scale: the 3× fill and FIR5 both conserve ink, so a glyph's LCD ink (channel sum
+    /// over 3·255) is its grayscale ink to within edge rounding. A scale slip (design
+    /// units left unscaled, or `px` applied twice) misses by a factor.
     #[test]
     fn unhinted_subpixel_ink_is_the_unhinted_outline() {
         for px in [12.0f32, 24.0] {

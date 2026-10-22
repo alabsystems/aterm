@@ -1140,9 +1140,8 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// The other half: a mappable file a WRITER already holds is not mapped
-    /// (its bytes could change under the view) and is not refused either — it
-    /// is admitted as a copy through the fully-shared open.
+    /// A mappable file a writer already holds is not mapped (its bytes could change under the
+    /// view) nor refused: it is copied through the fully-shared open.
     #[cfg(windows)]
     #[test]
     fn a_mappable_font_a_writer_holds_is_copied_not_refused() {

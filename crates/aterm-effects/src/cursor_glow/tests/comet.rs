@@ -19,10 +19,9 @@ fn comet_parses_apart_from_beam_and_lumen() {
     assert!(style_has_beam("comet"), "the comet keeps its beam");
 }
 
-/// A real-window geometry: pad + tab strip/titlebar chrome put the grid
-/// interior at origin (56, 56). The identity-law geoms all use origin 0
-/// (where grid-relative and window-absolute coincide), so only a chrome
-/// origin can expose a producer mixing the two coordinate spaces.
+/// A real-window geometry with the grid interior at origin (56, 56). The other
+/// test geoms use origin 0, where grid-relative and window-absolute coincide,
+/// so only this one exposes a producer mixing the two coordinate spaces.
 fn chrome_geom() -> Geom {
     Geom {
         cw: 8,

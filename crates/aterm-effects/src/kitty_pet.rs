@@ -820,7 +820,7 @@ const PURR_HZ: f32 = 1.9;
 /// Swell depth (~5%): large enough to be visible at common cell sizes.
 const PURR_DEPTH: f32 = 0.05;
 
-// ── the interactive stimuli ────────────────────────────────────────
+// ── play ────────────────────────────────────────────────────────────────────
 //
 // The terminal BEL, the shell's exit status and a click on the cat arrive as
 // `note_*` methods that only latch (the stimulus may land mid-hold or
@@ -4628,15 +4628,21 @@ impl PetBrain {
             // fail and `beside` falls back to `want` (on top of the text). Scan
             // past `INK_EVICT_MAX` for the nearest observed interior blank gap.
             if !clears_caret(beside) || self.ink_overlaps(beside, row, width) {
-                for step in (INK_EVICT_MAX as u16 + 1)..cols {
-                    let step = f32::from(step);
-                    for candidate in [right_base + step, left_base - step] {
-                        if candidate >= 0.0
-                            && candidate <= limit
-                            && clears_caret(candidate)
-                            && self.observed_ink_overlaps(candidate, row, width) == Some(false)
-                        {
-                            return candidate;
+                for require_upper_clear in [true, false] {
+                    for step in (INK_EVICT_MAX as u16 + 1)..cols {
+                        let step = f32::from(step);
+                        for candidate in [right_base + step, left_base - step] {
+                            if candidate >= 0.0
+                                && candidate <= limit
+                                && clears_caret(candidate)
+                                && self.observed_ink_overlaps(candidate, row, width) == Some(false)
+                                && (!require_upper_clear
+                                    || row < 1.0
+                                    || self.observed_ink_overlaps(candidate, row - 1.0, width)
+                                        == Some(false))
+                            {
+                                return candidate;
+                            }
                         }
                     }
                 }

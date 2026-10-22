@@ -53,13 +53,8 @@ fn home_from_env(value: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
 /// (Linux). A shipped binary reads `/etc/passwd` whatever the environment holds.
 pub const PASSWD_FILE_SEAM: &str = "ATERM_PASSWD_FILE";
 
-/// Parse `/etc/passwd` to find the home directory for a given UID.
-///
-/// Byte-wise (`fs::read`, not `read_to_string`): `/etc/passwd` is Unix
-/// boundary data, so it stays byte-exact end to end — the `:`-delimited
-/// format needs no UTF-8 decode (the uid field is ASCII digits and the home
-/// field goes straight into a `PathBuf`, which is bytes on Unix), and a
-/// stray legacy byte in another user's GECOS field cannot fail the lookup.
+/// The home directory for `uid` from `/etc/passwd`, read as bytes: the format needs no UTF-8
+/// decode, and a stray legacy byte in another user's GECOS field cannot fail the lookup.
 #[cfg(unix)]
 fn passwd_home_dir(uid: u32) -> Option<PathBuf> {
     let contents = std::fs::read(passwd_file()).ok()?;
@@ -73,7 +68,7 @@ fn passwd_file() -> PathBuf {
     crate::dev_seam!(PASSWD_FILE_SEAM).map_or_else(|| PathBuf::from("/etc/passwd"), PathBuf::from)
 }
 
-/// Testable helper: extract home dir for `uid` from passwd-format bytes.
+/// Extract the home dir for `uid` from passwd-format bytes.
 #[cfg(unix)]
 // Skip: the line split walks std iterators (absent bodies).
 #[cfg_attr(trust_verify, trust::skip)]
@@ -268,9 +263,8 @@ pub fn resolve_data_dir(platform: DataPlatform) -> Option<PathBuf> {
     }
 }
 
-/// aterm's DATA root — the folder of what a window keeps between its own launches:
-/// the restore manifest (`session.toml`), the crash journals beside it, and the
-/// cell-metrics cache. ONE rule for all three:
+/// aterm's data root: what a window keeps between its own launches (the restore manifest
+/// `session.toml`, the crash journals beside it, the cell-metrics cache).
 ///
 /// - in a development build only, the `ATERM_STATE_HOME` seam ([`crate::dev_seam!`],
 ///   read as [`state_dir`] reads it; the override root itself, and a relative value is

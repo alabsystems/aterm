@@ -1,14 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The operator-readable status record (`…/aterm/Updates/status.toml`).
-//!
-//! A silent updater has no UI, so this file IS the observability surface: it
-//! records when the updater last ran, what it decided, and whether a build is
-//! staged. An operator can `cat` it to answer "is this machine receiving updates,
-//! and why didn't the last one apply?" without any in-app prompt. Diagnostics also
-//! go to the app log via [`crate::log`]/[`crate::warn`]; this file is the durable,
-//! at-a-glance summary.
+//! The human-readable status record (`…/aterm/Updates/status.toml`): when the updater last
+//! ran, what it decided, and whether a build is staged. It is the silent updater's durable
+//! summary; diagnostics also go to the app log ([`crate::log`]/[`crate::warn`]).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,24 +16,21 @@ use crate::paths::Staging;
 #[derive(Serialize)]
 struct Status<'a> {
     schema: u32,
-    /// RFC3339 UTC time this record was written — the file's ANY-WRITER clock.
+    /// RFC3339 UTC time this record was written, by any writer.
     updated_at: String,
-    /// Last completed-check receipt's timestamp, copied for operator visibility.
-    /// The dedup gate reads the source/build-bound check.toml receipt itself;
-    /// no generic status writer may manufacture a completed check.
+    /// The last completed-check receipt's timestamp, copied for visibility. The dedup gate
+    /// reads the `check.toml` receipt itself; no status writer can manufacture a completed
+    /// check.
     #[serde(skip_serializing_if = "Option::is_none")]
     checked_at: Option<String>,
-    /// Whether the updater runs on this platform ([`crate::enabled`]: macOS). Not the
-    /// Settings switch — `[update] enabled = false` stops only the background checker
-    /// ([`crate::automatic`]). No pinned anchor is required (the default Tier REPO);
-    /// inertness on unsigned/repo builds comes from `bundle::resolve`, not from this flag.
+    /// Whether the updater runs on this platform ([`crate::enabled`]). Not the Settings
+    /// switch, which stops only the background checker ([`crate::automatic`]).
     enabled: bool,
     /// The running build number.
     current_build: u64,
-    /// Build number currently staged for next-launch apply, if any.
+    /// The build number currently staged, if any.
     staged_build: Option<u64>,
-    /// Git commit of the staged build's source (from the ready marker), if known —
-    /// so an operator can bind the staged build to a repo commit from this file alone.
+    /// Git commit of the staged build's source (from the ready marker), if known.
     staged_commit: Option<String>,
     /// Last decision, e.g. "up to date", "staged 0.3.0 (build N)",
     /// "deferred: install location not writable".
@@ -48,44 +40,37 @@ struct Status<'a> {
     /// check. Never contains whitespace: it is one token of the status line.
     #[serde(skip_serializing_if = "Option::is_none")]
     delivery: Option<String>,
-    /// The release tag this ledger last AUTHORIZED end to end (verified, and then
-    /// staged, covered, or found up to date). The check's steady state: one whose
-    /// evergreen pointer names this tag stops at its one HEAD — but only while the
-    /// ledger still describes THIS machine's decision: the reader ([`latest_tag`])
-    /// honours it only when `latest_authorized_build` is the caller's build (a manual downgrade
-    /// or an applied stage moved the build, so the old verdict no longer applies) and
-    /// `latest_source` is the caller's channel (a repointed updater has never judged
-    /// the new repository's release). STICKY across records — every writer (the apply
-    /// lane included) carries the file's value forward unless the check set a new one —
-    /// because `status.toml` is one overwritten line; CLEARED by
-    /// [`clear_latest_tag`] when a stage is retired, so the next check re-fetches and
-    /// re-stages instead of reporting "up to date" on a retired build forever.
+    /// The release tag this ledger last authorized end to end (verified, then staged,
+    /// covered, or found up to date): a check whose evergreen pointer names it stops at one
+    /// HEAD. [`latest_tag`] honours it only for the build that authorized it
+    /// (`latest_authorized_build`) and the same channel (`latest_source`). Every writer
+    /// carries it forward unless the check set a new one; [`clear_latest_tag`] drops it when a
+    /// stage is retired.
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_tag: Option<String>,
-    /// The `owner/repo` the `latest_tag` was authorized against. Optional (schema 1);
-    /// an older file without it is read as "no tag", which costs one unmetered re-fetch.
+    /// The `owner/repo` `latest_tag` was authorized against. A file without it reads as no
+    /// tag, which costs one unmetered re-fetch.
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_source: Option<String>,
     /// The running build that actually authorized `latest_tag`. Kept separate from
     /// `current_build`: an unrelated status write must not rebind cached authority.
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_authorized_build: Option<u64>,
-    /// The signed release build that the cached decision judged. If it is newer
-    /// than the running build, the shortcut also requires a still-publishable stage
-    /// covering it. Missing fields in an older ledger force one fresh check.
+    /// The signed release build the cached decision judged. If it is newer than the running
+    /// build, the shortcut also needs a still-publishable stage covering it. An older ledger
+    /// without it forces one fresh check.
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_release_build: Option<u64>,
 }
 
-/// What the current check learned about its delivery, carried onto every record it
-/// writes (the ledger is one overwritten line, so a fact learned mid-check must survive
-/// the check's terminal outcome). Set by the check as it goes, cleared at the start of
-/// the next one.
+/// What the current check learned about its delivery, carried onto every record it writes:
+/// the ledger is one overwritten line, so a mid-check fact must survive the terminal outcome.
+/// Cleared at the start of the next check.
 #[derive(Clone, Default)]
 struct Delivery {
     note: Option<String>,
-    /// A tag the CURRENT check authorized, with the `owner/repo` it was authorized
-    /// against; `None` means "carry the file's forward".
+    /// A tag the current check authorized, with its `owner/repo`; `None` carries the file's
+    /// forward.
     latest: Option<LatestRecord>,
 }
 
@@ -125,10 +110,9 @@ pub(crate) fn set_delivery_note(note: &str) {
     with_delivery(|delivery| delivery.note = Some(note.to_string()));
 }
 
-/// Record the release tag THIS check authorized end to end, against `source`. Written
-/// onto every record from now on (and carried forward by every later writer), so the
-/// next check on the same build and channel can stop at its HEAD when the
-/// pointer still names it.
+/// Record the release tag this check authorized end to end against `source`. Every later
+/// record carries it, so the next check on the same build and channel can stop at its HEAD
+/// while the pointer still names it.
 pub(crate) fn set_latest_tag(
     tag: &str,
     source: &crate::Source,
@@ -188,14 +172,12 @@ fn read_latest(staging: &Staging) -> Option<LatestRecord> {
     })
 }
 
-/// The tag the ledger last authorized FOR THIS BUILD AND SOURCE, if any — the only
-/// tag the steady-state shortcut may trust. `None` whenever the ledger is
-/// absent, unreadable or empty, was written by a DIFFERENT build (the machine moved by
-/// an apply, a manual install or a downgrade, so the old verdict is about another
-/// build), or was authorized against a DIFFERENT `owner/repo` (a repointed updater has
-/// never judged this repository's release; an older file that recorded no source is
-/// treated the same way), or the newer stage it depended on is no longer publishable.
-/// The next check then fetches and re-judges the head, which costs unmetered requests only.
+/// The tag the ledger last authorized for this build and source: the only tag the
+/// steady-state shortcut may trust. `None` when the ledger is absent, unreadable or has no
+/// tag, was authorized by a different build (an apply, manual install or downgrade moved the
+/// machine), against a different `owner/repo` (or recorded no source), or when the newer
+/// stage it depended on is no longer publishable. The next check then re-judges the head, at
+/// the cost of unmetered requests only.
 pub(crate) fn latest_tag(
     staging: &Staging,
     current_build: u64,
@@ -218,27 +200,22 @@ pub(crate) fn latest_tag(
     Some(latest.tag)
 }
 
-/// The tag the ledger last authorized against `source`, WHICHEVER build recorded it:
-/// the machine's newest known release of that repository. What
+/// The tag the ledger last authorized against `source`, whichever build recorded it: what
 /// `github::app_build_in_flight` ranks a source-only channel head against. Not
-/// [`latest_tag`], which answers only the build that recorded it: the head-in-flight
-/// count is machine-wide (`check_receipt`), so the predicate it counts must give
-/// every build the same answer, or one build's checks start the ladder that
-/// another's reset.
+/// [`latest_tag`]: the head-in-flight count is machine-wide (`check_receipt`), so every build
+/// must get the same answer.
 pub(crate) fn authorized_tag(staging: &Staging, source: &crate::Source) -> Option<String> {
     read_latest(staging)
         .filter(|latest| latest.source.eq_ignore_ascii_case(&source_slug(source)))
         .map(|latest| latest.tag)
 }
 
-/// Forget the authorized tag — on disk and for the rest of this process's check — so
-/// the next check re-fetches and re-judges the channel head. Called when a published
-/// stage is RETIRED ([`Staging::retire_published`]): "up to date (channel head vX)"
-/// would otherwise be the answer of every later check while the stage that verdict
-/// rested on is gone, and the machine would sit on the old build until the publisher
-/// cut a NEW tag. Best-effort, like every write to this file; even if another writer
-/// restores an old tag, the reader rechecks its required stage. A lost carry-forward
-/// costs one unmetered re-fetch.
+/// Forget the authorized tag, on disk and for the rest of this check, so the next check
+/// re-judges the channel head. Called when a published stage is retired
+/// ([`Staging::retire_published`]): otherwise every later check would answer "up to date
+/// (channel head vX)" with the stage that verdict rested on gone, until a new tag was cut.
+/// Best-effort like every write here; if another writer restores an old tag, the reader still
+/// rechecks its required stage.
 pub(crate) fn clear_latest_tag(staging: &Staging) {
     with_delivery(|delivery| delivery.latest = None);
     let Ok(text) = std::fs::read_to_string(&staging.status) else {
@@ -270,12 +247,9 @@ fn clear_delivery() {
     with_delivery(|delivery| *delivery = Delivery::default());
 }
 
-/// A scratch path no other in-flight writer of this record can be holding.
-///
-/// The rename makes the write atomic; the SOURCE file must also be exclusive. A pid
-/// separates processes, but [`record`] runs on several lanes inside one process (the
-/// background check, the apply path, the control socket), so the counter makes each
-/// writer rename exactly what it wrote.
+/// A scratch path no other in-flight writer of this record can hold: the pid separates
+/// processes, and the counter separates [`record`]'s lanes inside one process (background
+/// check, apply path, control socket), so each writer renames exactly what it wrote.
 fn temp_path(staging: &Staging) -> PathBuf {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -284,17 +258,14 @@ fn temp_path(staging: &Staging) -> PathBuf {
         .join(format!("status.toml.{}.{sequence}.tmp", std::process::id()))
 }
 
-/// A note a check wants carried onto EVERY status record it writes after a
-/// notable event — a revocation retiring a staged build — because `status.toml` is
-/// a single overwritten line and the check's terminal outcome, recorded moments
-/// later, would otherwise erase the sentence that explains where the stage went. Set
-/// by the event, cleared at the start of the next check.
+/// A note a check carries onto every status record after a notable event (a revocation
+/// retiring a staged build), so the terminal outcome recorded moments later does not erase
+/// where the stage went. Cleared at the start of the next check.
 #[cfg(not(test))]
 static CHECK_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-// Under test the note is per THREAD: the harness runs tests concurrently on its own
-// threads, and a test that retires a revoked stage (which sets the note) otherwise
-// leaks its note onto another test's status line.
+// Per thread under test: concurrent tests that retire a revoked stage would otherwise leak
+// the note onto each other's status lines.
 #[cfg(test)]
 thread_local! {
     static CHECK_NOTE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
@@ -379,8 +350,7 @@ pub fn record(staging: &Staging, current_build: u64, outcome: &str) {
     if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &staging.status).is_ok() {
         return;
     }
-    // BOTH arms reclaim: a per-writer scratch name is never reused, so a failed
-    // write or rename would strand a `status.toml.<pid>.<seq>.tmp` nothing sweeps.
+    // Both arms reclaim: a scratch name is never reused, so nothing else would sweep it.
     let _ = std::fs::remove_file(&tmp);
 }
 
@@ -530,7 +500,7 @@ mod tests {
             owner: "alabsystems".into(),
             repo: "aterm".into(),
         };
-        // An OLDER ledger, exactly as a pre-pointer build wrote it.
+        // An older ledger, as a pre-pointer build wrote it.
         std::fs::write(
             &s.status,
             "schema = 1\nupdated_at = \"2026-09-01T00:00:00Z\"\ncurrent_build = 41\n\
@@ -602,8 +572,8 @@ mod tests {
         )
         .unwrap();
         let text = std::fs::read_to_string(&s.status).unwrap();
-        // An OLDER reader knows schema/updated_at/current_build/outcome and nothing
-        // else; unknown keys are ignored by a TOML table read, so the new file parses.
+        // A reader that knows only schema/updated_at/current_build/outcome ignores the
+        // unknown keys, so the new file parses.
         let v: aterm_toml::Value = aterm_toml::from_str(&text).unwrap();
         assert_eq!(
             v.get("current_build")
@@ -682,8 +652,8 @@ mod tests {
     }
 
     fn historical_cache_would_skip(staging: &Staging, build: u64) -> bool {
-        // The old reader trusted the status writer's current_build and never
-        // inspected the stage that the authorized release still needed.
+        // Negative control: a reader that trusts the status writer's `current_build` and
+        // never inspects the stage the authorized release still needs.
         let text = std::fs::read_to_string(&staging.status).unwrap();
         let value: aterm_toml::Value = text.parse().unwrap();
         value.get("latest_tag").is_some()
@@ -709,8 +679,8 @@ mod tests {
         record(&staging, 1, "verified stage published");
         assert!(cache_decision_matches_model(&staging, 1, &source));
 
-        // A failed replacement can remove the old marker before the new marker
-        // commits. No explicit retirement/clear ran: the reader must notice.
+        // A failed replacement can remove the old marker before the new one commits, with no
+        // retirement or clear: the reader must notice.
         std::fs::remove_file(&staging.ready).unwrap();
         clear_check_note();
         record(&staging, 1, "replacement publication failed");
@@ -732,8 +702,8 @@ mod tests {
         write_cache_stage(&staging, 3);
         assert!(cache_decision_matches_model(&staging, 1, &source));
 
-        // A new process writes a refusal before its first network check. Neither
-        // an in-process carry nor a disk-only carry may mint authority for it.
+        // A new process writes a refusal before its first network check: neither an
+        // in-process nor a disk-only carry may mint authority for it.
         set_latest_tag("v0.85.0", &source, 1, 2);
         for in_memory in [true, false] {
             if !in_memory {

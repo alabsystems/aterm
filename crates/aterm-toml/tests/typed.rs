@@ -215,14 +215,8 @@ fn scalar_coercions() {
     }
 }
 
-/// A fixed-length target takes the WHOLE array or refuses it.
-///
-/// serde's array and tuple visitors stop after their N elements and leave it
-/// to the deserializer to say whether any were left over — serde's own
-/// `SeqDeserializer::end` refuses the extra, and so does this tree's JSON
-/// reader. This one did not, so `[1, 2, 3]` read into `[u32; 2]` as `[1, 2]`:
-/// the third value gone without a word from a config the editor showed as
-/// valid. A `Vec` drains every element and is untouched.
+/// A fixed-length target takes the whole array or refuses it: `[1, 2, 3]` into `[u32; 2]`
+/// is an error, not `[1, 2]`. A `Vec` drains every element and is untouched.
 #[test]
 fn a_fixed_length_target_refuses_a_longer_array() {
     #[derive(Debug, Deserialize)]
@@ -341,10 +335,8 @@ paths = [\"M0 0\"]
     assert!(err.span().is_some(), "a refusal carries a span: {err}");
 }
 
-/// A schema error in a node with no span of its own — a table made by a dotted
-/// key or implied by a deeper header, an array of tables — is located on the
-/// KEY that names it. Unlocated, the config editor put the diagnostic on line
-/// 1 with no key named.
+/// A schema error in a node with no span of its own (a table made by a dotted key or
+/// implied by a deeper header, an array of tables) is located on the key that names it.
 #[test]
 fn a_schema_error_in_a_spanless_node_is_located_on_its_key() {
     #[derive(Debug, Deserialize)]

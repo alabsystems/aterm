@@ -223,7 +223,12 @@ fn is_prose_answer(rule: &str) -> bool {
 fn typed_act(rule: &str, command: &str) -> Option<(Act, Counter)> {
     if matches!(
         rule,
-        RULE_CONTINUE | RULE_SUGGESTION | RULE_DONE_CHECK | RULE_OPEN_ITEMS | RULE_UNCOMMITTED
+        RULE_CONTINUE
+            | RULE_POLICY_CONTINUE
+            | RULE_SUGGESTION
+            | RULE_DONE_CHECK
+            | RULE_OPEN_ITEMS
+            | RULE_UNCOMMITTED
     ) {
         Some((Act::Continued, Counter::Continued))
     } else if is_prose_answer(rule) {
@@ -310,7 +315,7 @@ fn log_rule(rule_id: &str) -> String {
 /// |---|---|
 /// | `approve-all@v1` | `approve` |
 /// | `answer-recommended@v1`, `land-answer@v1`, `answer@v1`, `prose-long-term@v1`, `prose-short-term@v1` | `answer` |
-/// | `continue@v1`, `usage-resume@v1`, `continue-done-check@v1`, `api-retry@v1`, `api-cutoff@v1`, `context-compact@v1` | `continue` |
+/// | `continue@v1`, `policy-continue@v1`, `usage-resume@v1`, `continue-done-check@v1`, `api-retry@v1`, `api-cutoff@v1`, `context-compact@v1` | `continue` |
 /// | `upgrade@v1` | `relaunch` |
 /// | `harness-turn@v1`, `land@v1`, `land-nudge@v1` | `dispatch` |
 /// | `landed@v1` | `landed` ([`LANDED_WORD`]) |
@@ -337,8 +342,8 @@ pub fn self_claim_act(act: &str) -> Option<(&'static str, String)> {
         | RULE_ANSWER
         | RULE_PROSE_LONG_TERM
         | RULE_PROSE_SHORT_TERM => "answer",
-        RULE_CONTINUE | RULE_LIMIT_RESUME | RULE_DONE_CHECK | RULE_API_RETRY | RULE_API_CUTOFF
-        | RULE_COMPACT => "continue",
+        RULE_CONTINUE | RULE_POLICY_CONTINUE | RULE_LIMIT_RESUME | RULE_DONE_CHECK
+        | RULE_API_RETRY | RULE_API_CUTOFF | RULE_COMPACT => "continue",
         RULE_UPGRADE => "relaunch",
         RULE_HOST_TURN | RULE_LAND | RULE_LAND_NUDGE => "dispatch",
         RULE_LANDED => LANDED_WORD,
@@ -383,6 +388,10 @@ const RULE_APPROVE_ALL: &str = "approve-all@v1";
 /// the same conversation resumed by a new image, which carries a landing
 /// across, so it moves no task face.
 pub const RULE_UPGRADE: &str = "upgrade@v1";
+/// codex-alab's bounded continuation of independent allowed work after a
+/// cybersecurity refusal. The rejected action stays excluded; this is new
+/// work continued, never a retry of the refused action.
+pub const RULE_POLICY_CONTINUE: &str = "policy-continue@v1";
 /// codex-alab's LANDING under its own Land (the contract's §5 Land row): a
 /// clean `Nothing left:` defense at a land act's yield over a repository its
 /// probe finds clean, after which it types nothing until someone else's turn.
@@ -689,6 +698,7 @@ mod tests {
         );
         for rule in [
             RULE_CONTINUE,
+            RULE_POLICY_CONTINUE,
             RULE_SUGGESTION,
             RULE_DONE_CHECK,
             RULE_OPEN_ITEMS,
@@ -901,6 +911,7 @@ mod tests {
             ("approve-all@v1", Some("approve")),
             ("answer-recommended@v1", Some("answer")),
             ("continue@v1", Some("continue")),
+            ("policy-continue@v1", Some("continue")),
             ("usage-resume@v1", Some("continue")),
             ("upgrade@v1", Some("relaunch")),
             ("harness-turn@v1", Some("dispatch")),
@@ -949,6 +960,7 @@ mod tests {
         );
         for rule in [
             RULE_CONTINUE,
+            RULE_POLICY_CONTINUE,
             RULE_LIMIT_RESUME,
             RULE_DONE_CHECK,
             RULE_LAND,

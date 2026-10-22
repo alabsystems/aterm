@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A private headless instance of the binary under measurement, and the
-//! client that drives it.
+//! A private headless instance of the binary under measurement, and the client that
+//! drives it.
 //!
 //! The instance runs in a scratch world under `/tmp` (a socket path must fit
 //! `sun_path`): its own HOME, config and runtime dirs, `/bin/sh` with a fixed
@@ -130,8 +130,7 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    /// A fresh directory named `<prefix>-<pid>_<random>_<n>`, made
-    /// exclusively.
+    /// A fresh directory named `<prefix>-<pid>_<random>_<n>`, made exclusively.
     ///
     /// # Errors
     /// The directory could not be made.

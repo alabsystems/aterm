@@ -246,7 +246,9 @@ const TABLE: &[Verb] = &[
                 aterm pkg machine apply           — apply them now: Universal Control off for \
                 this host\n\
                 aterm pkg machine cache           — what the apply would take from the Rust \
-                build cache, and why; removes nothing",
+                build cache, and why; removes nothing\n\
+                aterm pkg machine cache clean     — reclaim unused Rust build cache entries \
+                without applying host settings",
         // The [machine] settings' own door, run by the window and the session on their own
         // schedule: a per-host preference and `<prefix>/machine.applied`, no store lock.
         arity: Arity::Own,
@@ -8150,7 +8152,30 @@ fn machine_read_verdict(st: &crate::machine::MachineState, refusal: Option<Strin
     }
 }
 
-/// `atpkg machine [apply|cache]` — the `[machine]` settings' own door.
+/// Run the existing cache reclamation and report only completed removals. No host
+/// settings are read or applied here. Return how many cache folders lost entries.
+fn reclaim_build_cache() -> usize {
+    let removed = crate::build_cache::reclaim_home();
+    let parts = removed
+        .iter()
+        .filter(|(_, why)| matches!(why, crate::build_cache::Unused::Stale { .. }))
+        .count();
+    if removed.len() > parts {
+        println!(
+            "removed {} unused Rust build cache folder(s)",
+            removed.len() - parts
+        );
+    }
+    if parts > 0 {
+        println!(
+            "removed stale incremental folders and old-compiler units from {parts} Rust \
+             build cache folder(s)"
+        );
+    }
+    removed.len()
+}
+
+/// `atpkg machine [apply|cache [clean]]` — the `[machine]` settings' own door.
 ///
 /// Bare `atpkg machine` reads: the doctor's Universal Control and Rosetta 2 lines, the
 /// byte-stable [`MACHINE_STATE_MARKER`] record, and one verdict — `next — …` naming what an
@@ -8159,7 +8184,8 @@ fn machine_read_verdict(st: &crate::machine::MachineState, refusal: Option<Strin
 /// changed, that nothing changed, or why nothing was applied, then runs the day's build cache
 /// housekeeping (`crate::build_cache::reclaim_home`); `atpkg machine cache` is that
 /// housekeeping's dry run (`crate::build_cache::plan_home`), each folder sized. Exit 0 either
-/// way: this is a state, not a gate. Anything else is a usage error.
+/// way: this is a state, not a gate. `atpkg machine cache clean` runs only the cache
+/// housekeeping, without reading or applying the host settings. Anything else is a usage error.
 fn cmd_machine(rest: &[String]) -> ExitCode {
     match rest {
         [] => {
@@ -8228,22 +8254,16 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
             // The day's housekeeping rides the day's apply (`launch_apply_due`), after its
             // verdict: Rust build cache folders nobody builds into any more go, and from
             // the ones that stay what no build reads again.
-            let removed = crate::build_cache::reclaim_home();
-            let parts = removed
-                .iter()
-                .filter(|(_, why)| matches!(why, crate::build_cache::Unused::Stale { .. }))
-                .count();
-            if removed.len() > parts {
-                println!(
-                    "removed {} unused Rust build cache folder(s)",
-                    removed.len() - parts
-                );
+            reclaim_build_cache();
+            ExitCode::SUCCESS
+        }
+        [sub, action] if sub == "cache" && action == "clean" => {
+            if !cfg!(target_os = "macos") {
+                println!("not applicable — the Rust build cache is kept on macOS only");
+                return ExitCode::SUCCESS;
             }
-            if parts > 0 {
-                println!(
-                    "removed stale incremental folders and old-compiler units from {parts} Rust \
-                     build cache folder(s)"
-                );
+            if reclaim_build_cache() == 0 {
+                println!("no unused Rust build cache entries removed");
             }
             ExitCode::SUCCESS
         }
@@ -8286,13 +8306,13 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
                 format!(
                     "unknown argument {word:?} — a bare `machine` reads, `machine apply` \
                      applies, `machine cache` shows what the apply would take from the build \
-                     cache"
+                     cache, and `machine cache clean` reclaims only that cache"
                 )
             } else {
                 format!(
                     "too many arguments ({}) — a bare `machine` reads, `machine apply` \
                      applies, `machine cache` shows what the apply would take from the build \
-                     cache",
+                     cache, and `machine cache clean` reclaims only that cache",
                     other.len()
                 )
             };

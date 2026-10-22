@@ -488,7 +488,10 @@ GOTCHAS
   * A bare `install` skips undetected agents (no config dir = not in use) — name an
     agent explicitly to force it.
   * The block is short — under fifty-five lines (Codex's adds one
-    paragraph: its sandbox refuses the control socket); the brief also names the first
+    paragraph: its sandbox refuses the control socket). A context file two agents
+    share, one linked to the other (~/.codex/AGENTS.md to ~/.claude/CLAUDE.md), gets
+    ONE block without that paragraph, false for the other agent, and `aterm agents`
+    marks both rows `(shared with …)`. The brief also names the first
     moves (`aterm ctl windows` / `ls`, and that a peer's `status` names its program,
     often another agent). Every sentence states a fact — what happens when — rather
     than an order; rules of your own go OUTSIDE the markers, where every install leaves
@@ -624,10 +627,11 @@ VERBS
       Say whether Enable at Startup is on for this build; `on` or `off`
       sets it, as the menu row does, and `off` also removes the login item
       of any build that is gone. A running mug is left as it is.
-  aterm caffeine quit
+  aterm caffeine quit [own]
       Turn off and end the mug, as Quit Caffeine does, whichever build
       started it, and answer once it has ended (caffeine=quit; caffeine=stopped
-      when none ran).
+      when none ran). `own` ends only this build's mug and job: another
+      build's keeps running, still on.
   aterm caffeine serve
       The mug itself: what its launchd job runs, not a command to type.
 
@@ -659,7 +663,10 @@ FILES
       mug per user.
   ~/Library/Application Support/aterm/caffeine-code.noindex/
       The copy of the app the mug runs from, kept out of backups and
-      removed when the mug quits.
+      removed when the mug quits. A copy whose mug ended before it started
+      (macOS may still be checking it, and removing it then can stall every
+      launch on macOS 27.0.1) stays until the Mac has been awake 10 minutes
+      since; the next start or `quit` removes it.
   ~/Library/Application Support/aterm/caffeine/<label>.plist
       The job `aterm caffeine` starts for this login.
   ~/Library/LaunchAgents/<label>.plist
@@ -668,9 +675,12 @@ FILES
       What the mug's job writes to stderr; its log records go to aterm.log
       beside it.
   Uninstalling aterm (`aterm pkg self-uninstall`) turns that build's Enable
-  at Startup off. When the last aterm install goes, it also asks the mug to
-  quit. Shared files stay while another install uses them, or if shutdown
-  or the idle lock cannot be confirmed. The small lock file itself remains."#,
+  at Startup off and quits its mug (`quit own`, so another install's keeps
+  running); when the last aterm install goes, it quits whichever mug runs.
+  Shared files stay while another install uses them, or if shutdown or the
+  idle lock cannot be confirmed; a copy macOS may still be checking stays
+  too, named with the minutes the Mac must still be awake before you remove
+  it by hand. The small lock file itself remains."#,
         ),
     },
     Topic {
@@ -1058,13 +1068,15 @@ AN ADMIN
   aterm secrets edit
       The file in $EDITOR, in a fresh private directory. Saving publishes;
       an unchanged file publishes nothing; an invalid one reopens with the
-      error. A completed draft is wiped only while unchanged; interrupted
-      or unpublished drafts and other editor files stay at the printed path.
-      A save that lands after another admin's publish is
-      refused, and edit asks to reopen; the next save goes on top of that
-      version. A machine admitted while you edit (by the join password, or
-      another admin) is kept in what you save, and named.
-  aterm secrets set <name> [--for <host>…] [--file <path>]
+      error. A draft is wiped once published, or when edit ends with it
+      still holding the published text; interrupted or unpublished drafts
+      and other editor files stay at the printed path. A save that lands
+      after another admin's publish is refused, and edit asks to reopen;
+      the next save goes on top of that version, keeping who it let in or
+      out, the admins it changed and its [join] line (a name it gave
+      another key is yours to settle); reopened, an unchanged file
+      publishes only if you say so.
+  aterm secrets set <name> [--for <host|code>…] [--file <path>]
                     [--if-absent [--with <other> | --no-with]]
                     [--fleet-reads-anchors]
       One entry from stdin or a file (a binary one is kept as base64), for
@@ -1077,7 +1089,7 @@ AN ADMIN
       first anchored entry needs --fleet-reads-anchors (edit asks instead):
       update every machine and admin first, since an older aterm applies
       nothing from a version holding one, and cannot open it as an admin.
-  aterm secrets unset <name> [--for <host>…]
+  aterm secrets unset <name> [--for <host|code>…]
       Remove it.
   aterm secrets password [show|set|new|open|off]
       The join password: print it (the bare verb), set one typed twice at
@@ -1091,10 +1103,11 @@ AN ADMIN
       opening the vault, and only approving it by code lets it back in.
       Opening lists the machines already waiting and asks before letting
       them in; any not let in join only by code (one may be a machine let
-      go while the vault was closed). `set` or `new` closes it with a
-      password, `off` closes it to approval by code. An admin Mac on an
-      older aterm cannot open a vault that has been opened until it
-      updates.
+      go while the vault was closed), and a key asking under two names
+      joins only as you name it (approve <age1…> --name). `set` or `new`
+      closes it with a password, `off` closes it to approval by code. An
+      admin Mac on an older aterm cannot open a vault that has been opened
+      until it updates.
   aterm secrets requests
       The pending join requests: host, code, key, age, whether the request
       carries a join-password proof, and whether its key joins only by code.
@@ -1102,17 +1115,23 @@ AN ADMIN
       Add them to [machines] and publish. A code is the 16 characters the
       machine printed: compare them. --all lists every request and asks for
       a yes at a terminal. An age1… key with --name admits a machine that
-      joins a vault at a path, which has no request queue.
-  aterm secrets revoke <host> [--drop-sections]
-      Remove it everywhere and publish, saying what it held: rotate those,
-      since it keeps what it already had. A section that names it alone
-      (its own release keys) is dropped only with --drop-sections. Any
+      joins a vault at a path, which has no request queue, and a key listed
+      under two names (anyone on the LAN can queue a key under a name of its
+      choosing), which neither its code nor --all approves.
+  aterm secrets revoke <host|code> [--drop-sections]
+      Remove it everywhere and publish, saying everything it could read
+      (an admin, every entry): rotate those, since it keeps what it already
+      had. A section that names it alone (its own release keys) is dropped
+      only with --drop-sections, or when no entry is left in it. Any
       publish that lets a machine go also changes the join password, which
       it may have joined with (aterm secrets password shows the new one).
-  aterm secrets admins add|remove <host>
-      Edit [admins]. Removing an admin also rotates the vault key and
-      changes the join password, which every admin held. A publish that
-      leaves no admin, or drops the machine publishing, is refused.
+  aterm secrets admins add|remove <host|code>
+      Edit [admins]. A join code names the machine whose key has it (in
+      revoke and --for too), never one named like it: a machine admitted
+      under another name than it asked for (that one was taken) goes by
+      its code. Removing an admin also rotates the vault key and changes
+      the join password, which every admin held. A publish that leaves no
+      admin, or drops the machine publishing, is refused.
   aterm secrets rotate-key
       Sign with a new vault key that the current one endorses. Every later
       version carries every endorsement since the vault's first key, so a
@@ -1132,14 +1151,21 @@ AN ADMIN
       release.
 
 THE SERVER
-  aterm secrets serve [--listen <addr:port>] [--advertise <name>]
+  aterm secrets serve [--listen <addr:port>]
+                      [--advertise <name> | --no-advertise]
                       [--pin <vault>=<b64>] [--store <dir>] [--hold <1-60>]
                       [--no-keep-awake]
       Serve vaults over HTTP (default 0.0.0.0:7484, store
-      ~/.config/aterm/secrets/served). --advertise registers <name>.local
-      over mDNS at this Mac's address, again whenever the address moves
-      (macOS). On macOS the Mac does not idle-sleep while it serves, unless
-      --no-keep-awake. --pin <vault>=<b64> names the signer a vault it holds
+      ~/.config/aterm/secrets/served; a relative --store is under ~/). On
+      macOS it registers alab-secrets.local over mDNS at this Mac's address,
+      again whenever the address moves, so with no flags it answers the ALab
+      URL every new Mac joins; it does so only listening on every address at
+      port 7484, so one on loopback or another port registers nothing.
+      --advertise <name> registers <name>.local instead and --no-advertise
+      registers nothing: use one on a Mac serving another vault, since two
+      Macs registering one name contend for it. On macOS the Mac does not
+      idle-sleep while it serves, unless --no-keep-awake.
+      --pin <vault>=<b64> names the signer a vault it holds
       nothing for must carry (one per vault); without one the first envelope
       it accepts pins it. --hold is how many seconds a watching machine's
       request waits for a new version (default 50). It keeps no key and
@@ -6523,7 +6549,7 @@ DEBUGGER ACCESS (a password dialog, not privacy)
      a Mac where developer mode was turned on and then off: there the retry asks again,
      so tell your operator before it does. Over ssh no dialog can appear: lldb fails at
      once (\"this is a non-interactive debug session\"), and only developer mode changes
-     that.
+     that, except for a program carrying get-task-allow (below).
   4. `aterm ctl @<sid> await consent kind=debugger timeout=<ms>` parks until the row's
      `mode=` changes. A latch means aterm read a different rule; it cannot see what a
      human clicked in a dialog.
@@ -6537,13 +6563,15 @@ DEBUGGER ACCESS (a password dialog, not privacy)
   Security (their press; macOS then asks for an administrator password, in a dialog that
   names SamplingTools), and they can turn it off there again. Tell the operator it
   exists; the decision is theirs.
-  Once per Mac, aterm also asks them in its own alert, at a quiet moment after it starts.
+  Once per Mac and account, aterm also asks them in its own alert, at a quiet moment
+  after it starts; a launch that runs first-launch setup asks only once that setup is
+  applied with its macOS permissions choice checked.
   The same undo in a terminal, for the operator:
     {revert}
-  A narrower route needs no dialog and no switch: lldb attaches without asking to a
-  program signed ad hoc with the `com.apple.security.get-task-allow` entitlement
-  (`codesign -s - -f --entitlements <plist> <program>`). It changes that one program's
-  signature; propose it to the operator for a program you built.
+  A narrower route needs no dialog and no switch: lldb attaches without asking, over
+  ssh too, to a program signed ad hoc with the `com.apple.security.get-task-allow`
+  entitlement (`codesign -s - -f --entitlements <plist> <program>`). It changes that one
+  program's signature; propose it to the operator for a program you built.
   A retry of the attach, in a loop or not, cannot answer the dialog.
   `sudo` (lldb, or anything else) goes around the password the operator is being asked
   for instead of answering it.
@@ -7137,13 +7165,11 @@ fn rust_page() -> String {
             file.display()
         );
     }
-    // A rustup `trust` older than the store's build is ranked below the store — the
-    // rule `aterm pkg doctor` warns by and `aterm pkg repair` fixes by (atpkg's
-    // `stale_against_store`, mirrored in `atpkg::toolchain`). SAID, because a reader who knows
-    // where `~/.rustup/toolchains/trust` points would otherwise expect it above.
-    // The fix is the discovery's own (`Demoted::remedy`), because it follows the entry's
-    // SHAPE: repair re-points a link and refuses a real directory, so a directory is sent
-    // to the by-hand removal first rather than to a verb that answers "refusing".
+    // A rustup `trust` older than the store's build ranks below the store (atpkg's
+    // `stale_against_store`, which `aterm pkg doctor` warns by and `aterm pkg repair` fixes).
+    // Said, because a reader who knows where `~/.rustup/toolchains/trust` points would expect
+    // it above. The fix is `Demoted::remedy`'s: repair re-points a link but refuses a real
+    // directory, which goes to the by-hand removal first.
     if let Some(d) = &tools.demoted {
         let _ = writeln!(
             out,
@@ -8345,6 +8371,16 @@ HOW TO USE IT
   on macOS only: elsewhere nothing is flushed and it says `discarded=-`, never a 0. A live
   full-screen program loses its modes too — reset a stuck prompt, not a running editor. Edit ▸ Reset Terminal is the same act, from the menu.
 
+  WHICH TAB RANG THE BELL (a ping, and nothing on screen to say why)
+  A program's BEL plays the Mac's alert sound, at most once a second (`bell_sound = false`
+  in aterm.toml keeps the flash and drops the sound). Each session keeps its bells: `aterm
+  ctl @sid status` says `bells=<n> bells_sounded=<n>` and `last_bell=<ms>/<sound>/<program>`
+  for the last four, the newest first — how long ago, `sounded` or the gate that kept it
+  quiet (`headless`, `serious`, `off`, `limited`), and the program in front then — and
+  `aterm ctl survey` puts `bells=3 (zsh sounded 4m ago)` on the line of each tab that
+  rang. A fact for later, never an alert; a self-update starts the counts over. A ping no
+  tab counts as `sounded` was not a program's BEL in this aterm.
+
 THE SERVER'S VERB CATALOG (generated from the protocol table):",
     );
     s.push('\n');
@@ -9200,15 +9236,9 @@ fn page_of(t: &str) -> &str {
     }
 }
 
-/// Render the manual. `topic` is the optional `help <topic>` argument; `session` is
-/// the caller's own sid when it is inside an aterm session (from [`in_session`]).
-///
-/// * `None` topic, inside a session -> the agent brief (with the sid wired in).
-/// * `None` topic, outside -> the reference front page (overview + command map).
-/// * `Some("agent")` -> the agent brief explicitly (any context).
-/// * `Some("introspection")` -> the generated protocol page.
-/// * `Some(tool)` -> that tool's deep dive.
-/// * an unknown topic -> a usage error listing the topics, exit code 2.
+/// Render the manual: `topic` is the optional `help <topic>` argument, `session` the caller's
+/// sid inside an aterm session ([`in_session`]). No topic is the agent brief inside a session
+/// and the front page outside; an unknown topic is a usage error listing the topics, exit 2.
 pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
     let topic = topic.map(page_of);
     match topic {
@@ -10052,8 +10082,8 @@ mod tests {
         );
     }
 
-    /// `is_toolchain_bin` is the line between ONE BUILD and a matching line: a
-    /// `trustc` with a `lib/rustlib` sysroot above it, and nothing less.
+    /// `is_toolchain_bin` separates ONE BUILD from a matching line: a `trustc` with a
+    /// `lib/rustlib` sysroot above it, and nothing less.
     #[cfg(unix)]
     #[test]
     fn a_toolchain_bin_needs_trustc_and_a_sysroot() {

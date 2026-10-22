@@ -754,8 +754,8 @@ mod tests {
         );
     }
 
-    /// The final character's LOW FOUR BITS are padding: spellings that differ only there
-    /// name the same master (the fingerprint agrees), while its top bit is significant.
+    /// Spellings that differ only in the last character's low four bits name the same
+    /// master; its top bit is significant.
     #[test]
     fn the_padding_bits_of_the_last_character_are_masked() {
         let base = parse_master(SYNTHETIC)
@@ -817,9 +817,6 @@ mod tests {
         assert_ne!(seed.fingerprint().unwrap(), raw_seed_fp);
     }
 
-    /// SECRETS ARE NOT PRINTABLE. A stray `{:?}` on either secret type prints `<redacted>`
-    /// and nothing else — the `sign.rs` discipline, enforced here by test rather than by
-    /// hoping nobody adds a derive.
     #[test]
     fn debug_never_prints_secret_material() {
         let phrase = parse_master(SYNTHETIC).unwrap();

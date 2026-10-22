@@ -1718,7 +1718,7 @@ pub fn pre_publish_gates(
     if let Err(e) = preflight_channel_target(&slug, false) {
         out.push(("channel", e.to_string()));
     }
-    let head_scan = match verify::scan_published(&slug, true) {
+    let head_scan = match verify::scan_head_before_claim(&slug) {
         Ok(scan) => scan,
         Err(e) => {
             out.push(("channel floor", e.to_string()));
@@ -7888,8 +7888,9 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // release stream. Its floor is channel state, not a one-cut CLI option:
     // every successor must carry it forward or a fresh client could forget a
     // prior yank. The late lock/selfcheck/publish scans repeat this guard to
-    // close the race with another publisher.
-    let head_scan = verify::scan_published(&publish_slug, true)?;
+    // close the race with another publisher. This read is held to the latest
+    // pointer, so a torn listing refuses here rather than burning the claim.
+    let head_scan = verify::scan_head_before_claim(&publish_slug)?;
     let newest_channel = head_scan.first();
     let newest_min_build = newest_channel.and_then(|published| published.min_build);
     // The machine-roster gate, the last pre-claim gate: a refusal after the claim burns

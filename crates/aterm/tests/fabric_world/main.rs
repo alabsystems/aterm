@@ -6,8 +6,8 @@
 //!
 //! The subject is THIS package's own binary (`harness::aterm`), so cargo
 //! builds it, and rebuilds it after any edit below it, before a test here runs.
-//! Every world scratches under its own tag and this process's pid
-//! (`/tmp/atl-<tag>-<pid>`, `/tmp/a5-<tag><pid>`): private sockets, state and
+//! Every world scratches in an exclusive directory of its own
+//! (`/tmp/atl-<random>`, `/tmp/a5-<random>`): private sockets, state and
 //! HOME, so a world never meets another run's daemons or the machine's own.
 //! `harness::boot_permit` caps the tests holding live stacks at once.
 #![cfg(unix)]

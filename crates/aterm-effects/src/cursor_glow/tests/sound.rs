@@ -416,7 +416,7 @@ fn key_time_click_fires_at_the_key_and_mutes_its_own_echo() {
     glow.tick(Some((2, 0)), t0, &c, g, &mut out);
     assert_eq!(glow.drain_sound_cues().count(), 0);
 
-    // The key. One click, immediately — no terminal round trip involved.
+    // One click at the key, before any round trip.
     let key = t0 + Duration::from_millis(1);
     assert!(glow.cue_keystroke(key), "a live engine clicks at the key");
     let cues: Vec<_> = glow.drain_sound_cues().collect();
@@ -427,8 +427,7 @@ fn key_time_click_fires_at_the_key_and_mutes_its_own_echo() {
         "the key-time cue pans from the PRE-echo cursor cell"
     );
 
-    // The echo, 40 ms later (a loaded flood frame): light spawns, sound
-    // does not — the credit is spent instead.
+    // The echo 40 ms later: light spawns, sound does not; the credit is spent.
     let echo = t0 + Duration::from_millis(41);
     glow.note_synthetic_typed(echo, 1);
     glow.tick(Some((2, 1)), echo, &c, g, &mut out);
@@ -702,10 +701,9 @@ fn the_key_time_click_carries_its_own_keystrokes_heat() {
     assert_eq!(charged, 5, "the ramp legs must actually have run");
 }
 
-/// The A/B twin of the test above on the same transition: an explicit synthetic
-/// preview has causal provenance and speaks; a bare gesture timestamp (a Tab
-/// whose completion never echoed, an undelivered paste) stays dark and silent
-/// (a delivered insert has its own class, `note_insert_delivered`).
+/// An explicit synthetic preview has causal provenance and speaks; a bare
+/// gesture timestamp (a Tab whose completion never echoed, an undelivered
+/// paste) stays dark and silent.
 #[test]
 fn a_synthetic_gesture_jump_speaks_but_cold_output_is_dark() {
     use crate::trail_sound::SoundKind;

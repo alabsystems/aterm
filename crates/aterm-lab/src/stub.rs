@@ -118,7 +118,11 @@
 //! `auth=none`; `auth=other(<n> chars)`; a Gemini API request with an
 //! `Authorization` header beside its key, both joined by `+`:
 //! [`gemini::credential_label`]). `--dump-dir` keeps the
-//! request bodies of every API (newest 200).
+//! request bodies of every API (the newest [`DUMPS_KEPT`]): a turn of the
+//! conversation as `req-<n>.json`, a side call ([`is_side`]) as
+//! `side-<n>.json` ([`Stub::dump`]), so a reader of the turns
+//! ([`turn_dumps`]) never takes a side call's copy of the conversation for
+//! a turn.
 //! `--proxy-port` also runs a BLACK-HOLE proxy: it reads the request line a
 //! client sends its `HTTP(S)_PROXY`, logs it (`PROXY refused: CONNECT
 //! api.anthropic.com:443 …`), answers 502 at once and closes — a dead proxy
@@ -270,7 +274,66 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
 
 /// How many request dumps the stub keeps, the newest: a lab of a dozen
 /// agents' conversations (`lab forever`) and their side calls stays whole.
-const DUMPS_KEPT: u64 = 2000;
+pub const DUMPS_KEPT: u64 = 2000;
+
+/// The name a TURN's dump starts with: `req-<n>.json` ([`Stub::dump`]).
+pub const TURN_DUMP: &str = "req-";
+/// The name a SIDE CALL's dump starts with: `side-<n>.json` ([`is_side`]).
+pub const SIDE_DUMP: &str = "side-";
+
+/// Whether a request of `kind` (the log's `kind=`) is a SIDE CALL: a request
+/// the program makes beside the conversation's turns, never one of them —
+/// Claude Code's `aux` (no tools: a title, a topic), `quota` (`max_tokens <=
+/// 1`) and `compact` (the conversation's summary); Codex's and Muse Code's
+/// structured requests (`codex-json`: the thread title; `muse-json`); every
+/// role of Muse Code's but `main` (`muse-side`: its reminder observers, the
+/// prompt hint, the away recap); Gemini CLI's `gemini-json` (its Auto
+/// model's router, its next-speaker and loop checks) and `gemini-aux`. A
+/// side call can carry the whole conversation — Muse Code's reminder
+/// observer renders it into ONE user text, `<main-agent-conversation
+/// format="model-conversation-xml/v1">` with each message on rows of its own
+/// (measured on 1.4.10-R6427.1, the lab's `r10-cv`, 2026-10-22: C4 read that
+/// text as the owner's words reaching the agent with a line break) — so a
+/// judge of the turns reads `req-<n>.json` alone ([`turn_dumps`]). A body
+/// the stub could not read (`opaque`) is kept as a turn: nothing says it is
+/// not one.
+#[must_use]
+pub fn is_side(kind: &str) -> bool {
+    matches!(
+        kind,
+        "aux"
+            | "quota"
+            | "compact"
+            | "codex-json"
+            | "muse-json"
+            | "muse-side"
+            | "gemini-json"
+            | "gemini-aux"
+    )
+}
+
+/// The stub's dumps of the conversations' TURNS in `dir` (`req-<n>.json`;
+/// a side call's `side-<n>.json` is none of them, [`is_side`]), `(n, path)`
+/// each, the newest first. Empty where `dir` cannot be read.
+#[must_use]
+pub fn turn_dumps(dir: &Path) -> Vec<(u64, PathBuf)> {
+    let mut out: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let n = name
+                .strip_prefix(TURN_DUMP)?
+                .strip_suffix(".json")?
+                .parse()
+                .ok()?;
+            Some((n, e.path()))
+        })
+        .collect();
+    out.sort_by_key(|a| std::cmp::Reverse(a.0));
+    out
+}
 
 /// The counters and the mode, as `/__status` shows them.
 #[derive(Debug, Default)]
@@ -1844,21 +1907,26 @@ impl Stub {
         }
     }
 
-    /// The request `body` kept as `req-<index>.json` in the dump directory,
-    /// its index the next of [`Stub::dumped`]; only the newest
+    /// The request `body` of `kind` (the log's `kind=`) kept in the dump
+    /// directory: a turn as `req-<index>.json`, a side call ([`is_side`]) as
+    /// `side-<index>.json`, its index the next of [`Stub::dumped`] (one count
+    /// over both, so the two read in the order they came); only the newest
     /// [`DUMPS_KEPT`] stay.
-    fn dump(&self, body: &[u8]) {
+    fn dump(&self, body: &[u8], kind: &str) {
         let Some(dir) = &self.args.dump_dir else {
             return;
         };
         let _ = std::fs::create_dir_all(dir);
         let idx = self.dumped.fetch_add(1, Ordering::Relaxed) + 1;
+        let prefix = if is_side(kind) { SIDE_DUMP } else { TURN_DUMP };
         let _ = std::fs::write(
-            dir.join(format!("req-{idx:05}.json")),
+            dir.join(format!("{prefix}{idx:05}.json")),
             &body[..body.len().min(4 << 20)],
         );
         if let Some(old) = idx.checked_sub(DUMPS_KEPT) {
-            let _ = std::fs::remove_file(dir.join(format!("req-{old:05}.json")));
+            for prefix in [TURN_DUMP, SIDE_DUMP] {
+                let _ = std::fs::remove_file(dir.join(format!("{prefix}{old:05}.json")));
+            }
         }
     }
 
@@ -2053,7 +2121,7 @@ impl Stub {
             info.sys_chars,
             one_line(&info.last_user, 70)
         );
-        self.dump(body);
+        self.dump(body, kind);
         let rate = self.answer_headers();
         summary.push_str(&rate.summary());
         out.rate = Some(rate);
@@ -2258,7 +2326,7 @@ impl Stub {
             info.instr_chars,
             one_line(&info.last_user, 70)
         );
-        self.dump(body);
+        self.dump(body, kind);
         let blen = body.len();
         let in_tok = est_tokens(blen);
         let mut mode = mode.to_string();

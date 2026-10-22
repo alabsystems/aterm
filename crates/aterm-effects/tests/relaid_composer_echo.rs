@@ -674,12 +674,11 @@ fn the_band_laid_before_the_relayout_stays_lit_under_the_hand() {
     }
 }
 
-/// Regression for the `Screenshot 2026-10-19 at 12.17.46 PM.png` gap (`gaps and `):
-/// typing a prefix, pausing past `SWOOSH_TOTAL_S` so its cells expire, typing a
-/// typo key that revives the prefix via `recent_typed_run`, erasing the typo
-/// with Backspace, suffering a keyless 1-row composer relayout, and typing the
-/// suffix (`"and "`) must keep the revived prefix and new suffix in one solid
-/// cohort without a hole or an expired prefix cell.
+/// Typing a prefix (`" gaps "`), pausing past the phrase rest into the swoosh,
+/// typing a typo key that revives the prefix via `recent_typed_run`, erasing
+/// the typo with Backspace, taking a keyless 1-row composer relayout, and
+/// typing the suffix (`"and "`) keeps the revived prefix and suffix in one
+/// continuous lit cohort without a hole.
 #[test]
 fn revived_prefix_survives_backspace_and_keyless_relayout_without_holes_or_drift() {
     for post_relay_idle_ms in [34, 350, 600] {

@@ -33,8 +33,8 @@ pub enum InflateError {
     BadChecksum,
 }
 
-/// Streaming decompression over `std::io::Read`, for archives (see the
-/// submodule for why they cannot use `inflate`).
+/// Streaming decompression over `std::io::Read`, for output too large to
+/// buffer whole.
 pub mod stream;
 
 const MAXBITS: usize = 15;
@@ -1029,11 +1029,9 @@ mod tests {
         }
     }
 
-    /// The whole-buffer form takes its input as exactly one zlib stream: the
-    /// Adler-32 directly follows the DEFLATE data (RFC 1950 §2.2) and ends the
-    /// input. Bytes between the stream's end and the input's last four are not
-    /// skipped over to find a checksum there; zlib reads them as the checksum
-    /// and refuses the stream, and so does this.
+    /// The whole-buffer form reads the Adler-32 where the DEFLATE data ends
+    /// (RFC 1950 §2.2): stray bytes before the input's last four make it refuse
+    /// the stream, as zlib does.
     #[test]
     fn whole_buffer_form_reads_the_checksum_where_the_stream_ends() {
         // An empty fixed-Huffman block (its stream ends after 10 bits), three
@@ -1162,8 +1160,8 @@ mod tests {
 
     // Root lookup table: differential oracle against the bit-at-a-time walk.
 
-    /// The attacker-crafted incomplete-literal-code stream, hoisted to a const so
-    /// the differential corpus can include a malformed dynamic block.
+    /// The stream from `incomplete_dynamic_huffman_rejected`: a malformed
+    /// dynamic block for the differential corpus.
     const INCOMPLETE_STREAM: &[u8] = &[
         0x78, 0x01, 0x05, 0xc0, 0x01, 0x09, 0x00, 0x00, 0x00, 0x80, 0xa0, 0x6d, 0xfd, 0x3f, 0x25,
         0x01, 0x00, 0x42, 0x00, 0x42,
@@ -1178,8 +1176,7 @@ mod tests {
     #[test]
     fn root_table_resolves_every_fixed_literal_code() {
         let mut lit = fixed_lit();
-        // The table is armed lazily (see `ROOT_BUILD_AFTER`); arm it here the
-        // way a megabyte-scale stream does after its first 1024 symbols.
+        // Armed lazily (see `ROOT_BUILD_AFTER`); arm it directly.
         lit.arm_root();
         assert_eq!(lit.root.len(), ROOT_SIZE, "the root table must be built");
         assert!(
@@ -1366,8 +1363,7 @@ mod tests {
         out
     }
 
-    /// One step of a deterministic LCG (same constants as the engine fuzz), so any
-    /// failure reproduces exactly.
+    /// One step of a deterministic LCG, so any failure reproduces exactly.
     fn next(state: &mut u64) -> u32 {
         *state = state
             .wrapping_mul(6_364_136_223_846_793_005)

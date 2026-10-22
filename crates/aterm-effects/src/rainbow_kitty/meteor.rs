@@ -539,9 +539,8 @@ pub fn fan_reach_ch(cells: f32, grade: f32) -> f32 {
 /// u)^4)`.
 pub const RING_R_CH: f32 = 3.0;
 
-/// The exponent of the ring's radius law (§6.5 layer 10) — `(1 − (1 − u)^4)`,
-/// so the ring is already most of the way out on the frame it is born (the
-/// arrival edge owes the eye an event, not a slow bloom).
+/// The exponent of the impact's radius law (§6.5 layer 10), `1 − (1 − u)^4`: most of
+/// the way out on the frame it is born, an event rather than a slow bloom.
 pub const RING_R_EXP: i32 = 4;
 
 /// Impact coverage as a share of [`TRANSIENT_STAR_COV_CEIL`], the cap every transient star is
@@ -3972,7 +3971,7 @@ mod tests {
         nucleus(halos).map(|h| (f32::from(h.cx), f32::from(h.cy), lum(h.color)))
     }
 
-    // -- the arc (kept from the frozen contract) ---------------------------
+    // -- the arc -------------------------------------------------------------
 
     // -- T2, the frame-0 law ------------------------------------------------
 
@@ -4043,10 +4042,8 @@ mod tests {
 
     // -- §6.2: off the glass --------------------------------------------------
 
-    /// The impact's horizon: the impact stays on glass past `T + 400` (the
-    /// burst, the falling sparks and the rainbow's root still leaving) and is
-    /// off, every stream, by `T + 600` at every published distance, with the
-    /// pool at rest so the host may idle (T6) (owner, 2026-09-08).
+    /// The impact is still on glass at `T + 400` and off every stream by `T + 600`,
+    /// with the pool at rest (T6).
     #[test]
     fn the_impact_is_off_glass_by_t_plus_600() {
         let cfg = config();
@@ -4107,14 +4104,9 @@ mod tests {
         }
     }
 
-    /// The train is the rainbow: on every frame after the first, the colour
-    /// train runs from red to violet (within 8 % of both ends of the spectrum
-    /// table, at least five named stops), and on frame 0 at least four stops;
-    /// at 8, 40 and 80 cells, both directions, over a dead prompt, behind a
-    /// fresh run and at a late phase. The law is spelled on the table's span
-    /// because the nearest-anchor classifier folds indigo into violet and
-    /// misses red unless a slab lands near the reflection. Also pins D4: an
-    /// unclamped arc never reads as one red bar (owner, 2026-09-08).
+    /// Every frame of every flight carries the rainbow: from frame 1 the colour train
+    /// spans the table red to violet (at least five stops), frame 0 at least four. Read
+    /// on the table's span: the nearest-anchor classifier folds indigo into violet.
     #[test]
     fn the_train_carries_the_whole_spectrum_on_every_frame_of_the_flight() {
         use crate::spectrum::{SPECTRUM_LUT, SPECTRUM_LUT_LEN};
@@ -4455,9 +4447,7 @@ mod tests {
         );
     }
 
-    /// §6.9's cap, with a chain: when a continuation makes three un-retired
-    /// trains, the chained stub takes the 60 ms finish, never the head in
-    /// flight on another row.
+    /// §6.9's cap: a chained stub takes the 60 ms finish, never another row's head.
     #[test]
     fn a_chained_stub_never_costs_another_row_its_head() {
         let cfg = config();
@@ -4720,12 +4710,9 @@ mod tests {
         assert_eq!(dust.live(), 0, "a one-cell scrub minted light");
     }
 
-    /// §5.4 / the vertical reach law on row 0: row 0's sky is the `Geom.head`
-    /// band the host opened for effects. A fan landing on row 0 may rise into
-    /// the band, but no star rests above `fx_top()` (the tab strip) or above
-    /// the 1.6 ch ceiling. Under a 40 px band a 40-cell landing puts at least
-    /// one star in the band; with no band every star rests inside the grid,
-    /// re-aimed rather than dropped, so the census holds.
+    /// A row-0 fan may rise into the `Geom.head` band but never above `fx_top()` (the
+    /// tab strip) or the 1.6 ch ceiling; with no band every star rests inside the grid,
+    /// re-aimed rather than dropped.
     #[test]
     fn a_row_zero_fan_may_use_the_head_band_but_never_the_tab_strip_beyond_it() {
         let cfg = config();
@@ -4789,14 +4776,9 @@ mod tests {
         }
     }
 
-    /// §5.4 / L4 at the seam: every star the meteor decides is built by the
-    /// sky through its clearance, which applies where a core comes to rest,
-    /// not where it is born. A fan is born on the ledger-exempt caret cell, so
-    /// a Home/End onto a glyph still throws its hero and four m2 (D6), and a
-    /// core whose rest would be on a probed glyph is nudged ≤ 2 px or dropped.
-    /// Fed a glyph at the landing, a glyph beside it, a row of ink, and no
-    /// probe at all (free transients fly over unprobed rows); the mini-fan
-    /// follows the same law, so Alt-B onto a word's first glyph still winks.
+    /// §5.4 / L4: the sky's clearance applies where a core rests, not where it is born,
+    /// so a fan born on a glyph-covered caret cell still throws its hero and four m2 (D6)
+    /// and no core rests on a probed glyph; likewise the mini-fan.
     #[test]
     fn a_fan_star_core_never_lands_on_a_probed_glyph() {
         let cfg = config();
@@ -4888,14 +4870,10 @@ mod tests {
         );
     }
 
-    /// Seam point 12, the band path: a flight is a span and a landing a point
-    /// under the band's pixel law. Inside: a same-row flight on row 5 under a
-    /// band `[3..10]` sliding down one row rides to row 6 whole, and its
-    /// landing is minted at the moved endpoint; the band `[6..10]` then
-    /// archiving up carries the landing out through the top edge. Outside: a
-    /// band below the flight leaves it untouched. Straddle: a vertical recall
-    /// from row 9 to row 3 under a band `[5..20]` has its tail inside and head
-    /// outside, so the train is dropped and mints no landing.
+    /// Seam point 12, the band path: a flight inside a moving band rides it whole and
+    /// lands at the moved endpoint, a landing carried past the band's edge is gone, a
+    /// band elsewhere leaves the flight alone, and a flight straddling the edge is
+    /// dropped and mints no landing.
     #[test]
     fn a_band_move_carries_a_flight_inside_the_band_and_retires_one_that_straddles_it() {
         let cfg = config();
@@ -5177,9 +5155,8 @@ mod tests {
 
     // ---- the landing's palette ---------------------------------------------
 
-    /// A jet breaks over a glyph and the star survives: over a full row of
-    /// text the mark degrades to the bare core star, and nothing the burst
-    /// emits over an inked cell exceeds the transient ceiling (L3).
+    /// Over a full row of text the burst degrades to the bare core star, never above
+    /// the transient ceiling (L3).
     #[test]
     fn a_jet_breaks_over_a_glyph_and_the_star_survives() {
         let cfg = config();
@@ -5328,10 +5305,7 @@ mod tests {
         assert!(sc.out.is_empty(), "the static star outlived the horizon");
     }
 
-    /// A jet is probed over its whole capped reach: [`SkyMask::row`] spans
-    /// [`JET_PROBE_CELLS`] each side, and the jets' `6.0 ch` covers a number
-    /// of cells that depends on the aspect; at the tuned aspects the gate
-    /// never clips its own jet.
+    /// At the tuned aspects the capped jet's reach fits inside [`JET_PROBE_CELLS`].
     #[test]
     fn a_jet_is_probed_over_its_whole_capped_reach() {
         for g in [owner_geom(), geom()] {
@@ -5348,14 +5322,9 @@ mod tests {
         }
     }
 
-    /// The rise law holds for the painted mark, not its centreline:
-    /// `comet_beam` treats its polyline as a centreline and adds
-    /// `thickness · 0.5` either side. The burst asserts the painted envelope
-    /// at compile time (`BURST_CORE_CH + 0.5·BURST_SEC_THICK_CH[0] +
-    /// BURST_AA_SUPPORT_CH`), clamps it in device px at emit
-    /// ([`burst_rise_limit`]), and this reads every quad of the burst over its
-    /// whole life at four cell heights, one small enough for the px clamp to
-    /// bite.
+    /// The rise law holds for the painted mark (centreline plus half the stroke), read
+    /// off every burst quad over its life at four cell heights, one small enough for
+    /// [`burst_rise_limit`]'s px clamp to bite.
     #[test]
     fn the_burst_paints_inside_the_fan_s_rise_at_every_cell() {
         let cfg = config();
@@ -5570,11 +5539,9 @@ mod tests {
 
     // -- the landing, measured on composited light --------------------------
 
-    /// §27: a party landing is a fan and nothing else (`n` stars ROYGBIV from
-    /// the caret, no sparks, no gold hero, the burst only when asked), born on
-    /// the frame it is staged and off the glass within 315 ms, so one fan per
-    /// 1.6 s bar never stacks and `LANDING_POOL` holds every ring bar. A party
-    /// at a caret off the glass mints nothing.
+    /// §27: a party landing is a fan and nothing else (no sparks, no gold hero, the
+    /// burst only when asked), off the glass within 315 ms; a party at a caret off the
+    /// glass mints nothing.
     #[test]
     fn a_party_landing_is_a_fan_off_the_glass_inside_315_ms() {
         let t0 = Instant::now();

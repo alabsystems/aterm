@@ -265,10 +265,9 @@ struct Coverage {
     destroyers_over_a_park: BTreeSet<&'static str>,
 }
 
-/// Walk `model`'s whole reachable space on the real terminal (with `patch`
-/// injected after every step). `Err` names the first real transition the model
-/// does not admit — the real trace, the step, its actions, and both
-/// projections.
+/// Walk `model`'s whole reachable space on the real terminal, with `patch`
+/// injected after every step. `Err` names the first real transition the model
+/// does not admit.
 fn walk(model: &Model, patch: Patch) -> Result<Coverage, String> {
     let checkpoints = Checkpoints::new();
     let init = model.init_state();

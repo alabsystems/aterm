@@ -62,10 +62,9 @@
 //! What the probe cannot see (a crash in the interface, a resume the build
 //! refuses) is still met by the move, as round eighteen meets it.
 //!
-//! WHAT AN AGENT THE BUILD'S HOLD MEETS IS TOLD (`upgrade::build_hold`): a
-//! round that asked its agent is stopped and the agent released at once; a
-//! round that asked nothing waits [`BUILD_FAILS`], a release it owes typed
-//! there. Nothing waits on a restart the hold keeps from coming.
+//! A stop taken back is no failure ([`note`]): a `no-resume` relaunch whose agent came up after
+//! all is reopened as landed ([`St::reopen_landed`]), and its failure and any blindness it caused
+//! are withdrawn from the build. How a held round proceeds is `upgrade::build_hold`'s.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

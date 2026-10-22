@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The "this machine can never update" announcement.
+//! The announcement that this machine cannot read its release channel, and so is not updating.
 //!
 //! A machine that cannot READ its release channel is not slow to update — it is
 //! PERMANENTLY stranded, and nothing about it looks broken: no failure, no streak, no
@@ -9,25 +9,14 @@
 //! enough to fail (and deliberately so: a configuration state is not a transient
 //! fault, and counting it as one would bury the real signal).
 //!
-//! The state is decided by the network, in `github::resolve_web_head`: the evergreen
-//! pointer answering 404 — the channel has no published release, or the repository is
-//! private, renamed or gone. The updater reads its channel with no credential, so there
-//! is nothing on this machine to repair; the explanation names the causes and the
-//! remedy, and three surfaces carry it:
+//! 1. `status.toml` / `aterm ctl update status`: `outcome` holds the full explanation,
+//!    rewritten every check.
+//! 2. The app log: a warning on the first check, repeated every [`RENOTICE_AFTER`].
+//! 3. An OS notification once per strand ([`StrandNotice`]) through the GUI's `HealthNotify`
+//!    hook.
 //!
-//! 1. **`status.toml` / `aterm-ctl update status`** — the `outcome` field carries the
-//!    full explanation, rewritten on every check so it can never go stale.
-//! 2. **the app log** — warned (not logged) on the first check, then RE-warned every
-//!    [`RENOTICE_AFTER`], so a long-lived process keeps a live breadcrumb without
-//!    per-cycle spam.
-//! 3. **an OS notification**, once per strand, through the GUI's existing
-//!    `HealthNotify` hook — the same channel the "update pipeline is broken" notice
-//!    uses. This is the only surface the owner sees without going looking. A
-//!    readable check re-arms it ([`StrandNotice`]), so a channel that heals and
-//!    breaks again in one long-lived process is announced again.
-//!
-//! [`is_stranded`] exposes the state to the background loop so it can fire (3) and
-//! back off a network cadence that cannot succeed.
+//! [`is_stranded`] lets the background loop fire (3) and back off a cadence that cannot
+//! succeed.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -35,15 +24,13 @@ use std::time::{Duration, Instant};
 
 use crate::paths::Staging;
 
-/// How long between repeats of the log warning while the machine stays stranded.
-/// Long enough not to be spam in a week-long session, short enough that a log
-/// captured at any point in a day contains the explanation at least once.
+/// Repeat interval of the log warning while stranded: not spam in a week-long session, yet a
+/// log captured on any day holds the explanation.
 const RENOTICE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// Whether the LAST completed check found the channel unreadable. Read by the
-/// background checker's loop ([`crate::spawn_background_check_with_settings`]) to
-/// raise the one-shot OS notification and to back the cadence off a check that
-/// cannot possibly succeed.
+/// Whether the last completed check found the channel unreadable. The background loop
+/// ([`crate::spawn_background_check_with_settings`]) reads it to raise the OS notification and
+/// back off.
 static STRANDED: AtomicBool = AtomicBool::new(false);
 
 /// The last time the log warning was emitted, for the [`RENOTICE_AFTER`] throttle.
@@ -66,9 +53,8 @@ pub(crate) fn is_stranded() -> bool {
     STRANDED.load(Ordering::Relaxed)
 }
 
-/// Record that the release channel WAS readable — clears the stranded latch so a
-/// machine fixed mid-session (the remedy works without a restart) stops announcing,
-/// and re-arms the announcement should the channel become unreadable again.
+/// Record that the channel was readable: clears the stranded latch, so a machine fixed
+/// mid-session stops announcing and a later strand is warned about again.
 pub(crate) fn clear() {
     if STRANDED.swap(false, Ordering::Relaxed) {
         crate::log("the release channel is readable again — this machine is receiving updates");
@@ -76,13 +62,12 @@ pub(crate) fn clear() {
     }
 }
 
-/// Announce the stranded state on all three surfaces. Called on every check whose
-/// pointer answered that the channel cannot be read, but only the status write happens
-/// every time; the log warning is throttled to [`RENOTICE_AFTER`] and the notification
-/// is fired once per strand by the background loop's [`StrandNotice`].
+/// Announce the stranded state. Called on every check whose pointer says the channel cannot be
+/// read: the status write happens every time, the log warning at most every
+/// [`RENOTICE_AFTER`], the notification once per strand ([`StrandNotice`]).
 ///
-/// `explanation` comes from `github::unreadable_explanation`: it names every cause a
-/// 404 cannot distinguish, the consequence, and the remedy.
+/// `explanation` comes from `github::unreadable_explanation`: every cause a 404 cannot
+/// distinguish, the consequence, and the remedy.
 pub(crate) fn announce(staging: &Staging, current_build: u64, explanation: &str) {
     crate::status::record(staging, current_build, explanation);
     *last_explanation().lock().unwrap_or_else(|e| e.into_inner()) = Some(explanation.to_string());
@@ -92,18 +77,15 @@ pub(crate) fn announce(staging: &Staging, current_build: u64, explanation: &str)
     let due = last.is_none_or(|t| t.elapsed() >= RENOTICE_AFTER);
     if first || due {
         *last = Some(Instant::now());
-        // `warn`, not `log`: this is a defect in the channel, not a routine decision,
-        // and it is the one condition under which the updater can never make progress.
+        // `warn`, not `log`: a channel defect, and the one condition under which the
+        // updater can never make progress.
         crate::warn(explanation);
     }
 }
 
-/// The background loop's latch for the OS notification: once per STRAND, not once
-/// per process. A channel this machine cannot read is a configuration defect, not an
-/// event, so it is announced once and then lives in `status.toml` (rewritten every
-/// check) rather than nagging — but a readable check ends the strand ([`clear`]), and
-/// a later strand is a new defect the owner has not heard about. As a bare bool set
-/// once, the latch swallowed every strand after the first for the life of the process.
+/// The background loop's latch for the OS notification: once per strand, not once per
+/// process. A strand is announced once and then lives in `status.toml`; a readable check ends
+/// it ([`clear`]), and a later strand is announced again.
 #[derive(Debug, Default)]
 pub(crate) struct StrandNotice {
     notified: bool,
@@ -122,10 +104,8 @@ impl StrandNotice {
     }
 }
 
-/// The `(title, body)` for the one-shot OS notification, built from the explanation
-/// [`announce`] recorded. Split out so the wording is testable without a GUI. The body
-/// IS the explanation: it already carries the consequence and the one remedy, and the
-/// check after a fix clears the latch by itself (`clear`), so nothing is added to it.
+/// The `(title, body)` for the one-shot OS notification. The body is the explanation
+/// [`announce`] recorded, which already carries the consequence and the remedy.
 #[must_use]
 pub(crate) fn notification() -> (String, String) {
     let body = last_explanation()
@@ -138,9 +118,8 @@ pub(crate) fn notification() -> (String, String) {
                 .to_string()
         });
     (
-        // NOT "will never": `clear()` drops the stranded latch on the first readable
-        // check, so the honest claim is the one the body makes — this Mac stays put
-        // UNTIL the cause is fixed.
+        // Not "will never": `clear()` drops the latch on the first readable check, so the
+        // claim is the body's: this Mac stays put until the cause is fixed.
         crate::STRANDED_TITLE.to_string(),
         body,
     )
@@ -150,9 +129,8 @@ pub(crate) fn notification() -> (String, String) {
 mod tests {
     use super::*;
 
-    /// The latch re-arms when the strand clears. Before it, the loop's bare
-    /// `notified_unreadable` bool answered `false` at the second strand's first
-    /// cycle, so a channel that healed and broke again was never announced.
+    /// The latch re-arms when the strand clears, so a channel that heals and breaks again is
+    /// announced again.
     #[test]
     fn the_strand_notice_fires_once_per_strand_and_re_arms_when_it_clears() {
         let mut notice = StrandNotice::default();
@@ -170,8 +148,8 @@ mod tests {
 
     #[test]
     fn announce_writes_the_full_explanation_into_the_status_outcome() {
-        // The status `outcome` IS what `aterm-ctl update status` prints, so the whole
-        // explanation has to survive into it — not a shortened "idle:" summary.
+        // The status `outcome` is what `aterm ctl update status` prints, so the whole
+        // explanation must survive into it, not a shortened "idle:" summary.
         let _serialized = crate::STRANDED_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -207,9 +185,9 @@ mod tests {
 
     #[test]
     fn the_explanation_survives_status_reconciliation_into_update_status() {
-        // `aterm-ctl update status` prints `outcome=`, which comes from `status()` ->
-        // `reconcile_status_outcome`. That reducer NEUTRALIZES a persisted outcome that
-        // falsely claims a stage; the unreadable explanation must pass through untouched.
+        // `aterm ctl update status` prints `outcome=` through `status()` ->
+        // `reconcile_status_outcome`, which neutralizes a persisted outcome that falsely
+        // claims a stage; the unreadable explanation must pass through untouched.
         let explanation = String::from(
             "aterm cannot read its release channel github.com/o/r: this machine stays on \
              its current version until the channel is fixed",

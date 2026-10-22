@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! The native **Windows** application-runtime ([`AppRtWindows`]): the Windows
-//! peer of `platform::AppRtMacOS`, implementing the same [`crate::platform::AppRt`]
-//! seam with real OS chrome instead of the graceful `AppRtLinux` no-ops.
+//! The native Windows application-runtime ([`AppRtWindows`]): the [`crate::platform::AppRt`]
+//! seam with real OS chrome, as a thin decorator over the winit-owned `HWND`
+//! (`docs/NATIVE_WINDOWS_DESIGN.md` §1: extend winit, do not build a second frontend).
 //!
 //! It is deliberately THIN — a decorator over the winit-owned `HWND`, exactly the
 //! spine `docs/NATIVE_WINDOWS_DESIGN.md` §1 ratifies (extend winit; do not build a
@@ -41,12 +41,9 @@ use crate::{Wake, WindowId, menu, toolbar};
 
 // ---- Hand-rolled leaf Win32 (dwmapi + user32) -------------------------------------
 //
-// `DwmSetWindowAttribute(HWND, DWORD attr, LPCVOID pv, DWORD cb)`. HWND is a
-// pointer-sized handle; passing it as `isize` matches the MSVC `system` ABI (and how
-// `hdr_win.rs` already threads HMONITOR as `isize`). Every call is best-effort: the
-// `HRESULT` is IGNORED because an unsupported attribute on an older Windows 10 build
-// returns `E_INVALIDARG` and the correct response is simply to leave that facet at
-// its OS default (§4 "degrade to immersive-dark-only on Windows 10").
+// HWND is a pointer-sized handle, passed as `isize` (the MSVC `system` ABI; `hdr_win.rs`
+// threads HMONITOR the same way). DWM writes are best-effort: an attribute an older Windows 10
+// build lacks returns `E_INVALIDARG`, and that facet stays at its OS default.
 
 #[link(name = "dwmapi")]
 unsafe extern "system" {
@@ -67,12 +64,10 @@ unsafe extern "system" {
     fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
     fn CallWindowProcW(prev: isize, hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn DefWindowProcW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
-    // L1 early reveal: the synchronous themed-erase flush (`window_flush_backdrop`).
+    // The early-reveal themed-erase flush (`window_flush_backdrop`).
     fn RedrawWindow(hwnd: isize, rect: *const Rect, region: isize, flags: u32) -> i32;
-    /// H4: one entry of the live system palette, as a COLORREF. This is a table
-    /// lookup inside user32 (the values are cached per-session and refreshed by the
-    /// OS on a scheme change), not a round trip — cheap enough to re-read whole on
-    /// every settings broadcast rather than caching it here.
+    /// One entry of the live system palette, as a COLORREF: a table lookup inside user32,
+    /// refreshed by the OS on a scheme change, cheap enough to re-read on every broadcast.
     fn GetSysColor(index: i32) -> u32;
     // The new-window cascade's work area (`window_work_area_pts`): HMONITOR is a
     // pointer-sized handle, threaded as `isize` like every other handle here.
@@ -86,37 +81,23 @@ unsafe extern "system" {
     fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
 }
 
-/// `WM_SYSCOMMAND` / `SC_KEYMENU`: ask `DefWindowProc` to open the window menu
-/// — the exact Alt+Space path, anchored at the caption's top-left corner.
-///
-/// Chosen by MEASUREMENT, not taste (Windows 11, 2026-08, this repo's glass
-/// probes): a posted `WM_POPUPSYSTEMMENU` (0x0313), `WM_NCRBUTTONUP`+HTCAPTION
-/// and `WM_CONTEXTMENU` each opened NOTHING — modern DefWindowProc validates
-/// those against real non-client input — while a posted SC_KEYMENU+' '
-/// provably opens the real menu (Restore / Move / Size / Minimize / Maximize /
-/// Close), photographed in the same probe run that saw the other three fail.
+/// `WM_SYSCOMMAND` / `SC_KEYMENU`: ask `DefWindowProc` to open the window menu, the Alt+Space
+/// path, anchored at the caption's top-left. A posted `WM_POPUPSYSTEMMENU`,
+/// `WM_NCRBUTTONUP`+HTCAPTION or `WM_CONTEXTMENU` opens nothing on Windows 11: `DefWindowProc`
+/// validates those against real non-client input.
 const WM_SYSCOMMAND: u32 = 0x0112;
 const SC_KEYMENU: usize = 0xF100;
 
-/// Post the window's own system menu (Restore / Move / Size / Minimize /
-/// Maximize / Close), as a caption right-press does everywhere else on
-/// Windows — the band IS this window's caption. `false` when there is no HWND.
+/// Post the window's own system menu, as a caption right-press does elsewhere on Windows (the
+/// band is this window's caption). `false` when there is no HWND.
 ///
-/// POSTED, not sent: `DefWindowProc` tracks the menu in a MODAL loop, and
-/// entering that from inside the winit callback we are called from would re-enter
-/// the event loop with `App` already borrowed. Posting hands it to the message
-/// pump, so the menu opens exactly as Alt+Space's does — after this turn.
+/// Posted, not sent: `DefWindowProc` tracks the menu in a modal loop, and entering it from this
+/// winit callback would re-enter the event loop with `App` borrowed.
 ///
-/// CALL THIS ON A RELEASE, NEVER A PRESS: winit's win32 backend holds
-/// `SetCapture` from button-down to button-up, and `DefWindowProc` refuses to
-/// enter the menu's modal loop while the thread holds mouse capture — a post
-/// made on the DOWN is silently discarded unless the release is ALREADY in the
-/// queue when it is pumped. Measured (2026-08, this repo's glass probes): with
-/// the button held, `GUI_INMENUMODE` stayed zero for a full two seconds after
-/// this post; the identical post with no button down opened the menu
-/// instantly. That is why only a machine-speed click ever saw the old
-/// press-time popup work. `App::on_mouse_input`'s `band_menu_release_pending`
-/// latch is the shape a caller takes.
+/// Call it on a release, never a press: winit holds `SetCapture` from button-down to button-up,
+/// and `DefWindowProc` will not enter the menu's modal loop while the thread holds capture, so a
+/// post made on the down is discarded. `App::on_mouse_input`'s `band_menu_release_pending`
+/// latch is the caller's shape.
 pub(crate) fn popup_system_menu(window: &Window) -> bool {
     let Some(hwnd) = hwnd_of(window) else {
         return false;
@@ -126,8 +107,8 @@ pub(crate) fn popup_system_menu(window: &Window) -> bool {
     unsafe { PostMessageW(hwnd, WM_SYSCOMMAND, SC_KEYMENU, isize::from(b' ')) != 0 }
 }
 
-/// `MONITORINFO`. `size` MUST be pre-set to the struct's size — that is how
-/// `GetMonitorInfoW` tells this from the longer `MONITORINFOEXW`.
+/// `MONITORINFO`. `size` must be preset to the struct's size: that is how `GetMonitorInfoW`
+/// tells this from the longer `MONITORINFOEXW`.
 #[repr(C)]
 struct MonitorInfo {
     size: u32,
@@ -142,11 +123,9 @@ const MONITOR_DEFAULTTONEAREST: u32 = 0x0000_0002;
 /// `SW_RESTORE`: un-minimize to the size and position it had before.
 const SW_RESTORE: i32 = 9;
 
-/// `rcWork` (physical screen px) → the cascade's logical-point rectangle, or
-/// `None` for geometry the cascade cannot use: a non-finite or non-positive
-/// scale, or an empty/inverted work area (both of which would otherwise wrap
-/// every new window onto the same spot). Pure, so the conversion is pinned by a
-/// unit test rather than by a monitor.
+/// `rcWork` (physical screen px) → the cascade's logical-point rectangle, or `None` for
+/// geometry the cascade cannot use: a non-finite or non-positive scale, or an empty or inverted
+/// work area (either would wrap every new window onto the same spot).
 fn work_area_pts_from_rect(work: &Rect, scale: f64) -> Option<crate::app_window::WorkAreaPts> {
     if !scale.is_finite() || scale <= 0.0 {
         return None;
@@ -194,14 +173,10 @@ unsafe extern "system" {
 /// `GCLP_HBRBACKGROUND` — the window-class background brush slot.
 const GCLP_HBRBACKGROUND: i32 = -10;
 
-/// `RedrawWindow` flags for the early-reveal backdrop flush: mark the whole
-/// client area invalid and needing erase, then deliver the `WM_ERASEBKGND`
-/// *before the call returns*. Deliberately NOT `RDW_UPDATENOW`: that would also
-/// deliver `WM_PAINT` synchronously, re-entering winit's wndproc with a
-/// `RedrawRequested` in the middle of `attach_os_window` — an event the app is
-/// in no state to service (no present target exists yet). The erase alone is
-/// what puts theme colour on glass; the real `WM_PAINT` arrives at the ordinary
-/// time once the loop resumes pumping.
+/// `RedrawWindow` flags for the early-reveal backdrop flush: invalidate and erase the client
+/// area and deliver `WM_ERASEBKGND` before returning. Not `RDW_UPDATENOW`: that also delivers
+/// `WM_PAINT` synchronously, re-entering winit's wndproc with a `RedrawRequested` inside
+/// `attach_os_window`, before any present target exists.
 const RDW_INVALIDATE: u32 = 0x0001;
 const RDW_ERASE: u32 = 0x0004;
 const RDW_ERASENOW: u32 = 0x0200;
@@ -261,9 +236,8 @@ struct BitmapInfoHeader {
     clr_important: u32,
 }
 
-/// `PW_RENDERFULLCONTENT` — render the window's full content INCLUDING its
-/// DirectComposition / GPU (wgpu swapchain) surface, so the terminal grid shows in
-/// the capture rather than a blank client area.
+/// `PW_RENDERFULLCONTENT`: render the window's full content including its DirectComposition /
+/// GPU (wgpu swapchain) surface, so the terminal grid shows in the capture.
 const PW_RENDERFULLCONTENT: u32 = 0x0000_0002;
 /// `DIB_RGB_COLORS`.
 const DIB_RGB_COLORS: u32 = 0;
@@ -282,13 +256,11 @@ const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 /// `DWMWCP_ROUND` — the standard rounded-corner radius.
 const DWMWCP_ROUND: u32 = 2;
-/// `DWMWA_CAPTION_COLOR` (Windows 11+): a solid caption (title-bar) fill, as a
-/// COLORREF. Setting it makes the OS caption read as PART of the terminal surface
-/// instead of a gray system bar bolted on — what Windows Terminal does. On
-/// Windows 10 the write fails with `E_INVALIDARG` and is dropped, degrading to
-/// the immersive-dark-only caption exactly as before this attribute was used.
+/// `DWMWA_CAPTION_COLOR` (Windows 11+): a solid caption fill, as a COLORREF, so the caption
+/// reads as part of the terminal surface. On Windows 10 the write fails with `E_INVALIDARG`,
+/// leaving the immersive-dark-only caption.
 const DWMWA_CAPTION_COLOR: u32 = 35;
-/// `DWMWA_TEXT_COLOR` (Windows 11+): the caption TITLE TEXT colour, as a COLORREF.
+/// `DWMWA_TEXT_COLOR` (Windows 11+): the caption title text colour, as a COLORREF.
 /// Set alongside [`DWMWA_CAPTION_COLOR`]: a pinned caption fill also pins the text
 /// the OS would otherwise contrast against its own palette.
 const DWMWA_TEXT_COLOR: u32 = 36;
@@ -300,9 +272,9 @@ const DWMWA_COLOR_DEFAULT: u32 = 0xFFFF_FFFF;
 const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
 /// `DWMSBT_NONE` — no system backdrop (the minimal, opaque default).
 const DWMSBT_NONE: u32 = 1;
-/// `DWMSBT_MAINWINDOW` — **Mica** (the desktop-tinted top-level backdrop).
+/// `DWMSBT_MAINWINDOW`: Mica (the desktop-tinted top-level backdrop).
 const DWMSBT_MAINWINDOW: u32 = 2;
-/// `DWMSBT_TRANSIENTWINDOW` — **Acrylic** (the blurred transient backdrop).
+/// `DWMSBT_TRANSIENTWINDOW`: Acrylic (the blurred transient backdrop).
 const DWMSBT_TRANSIENTWINDOW: u32 = 3;
 /// `DWMSBT_TABBEDWINDOW` — the tabbed-window (Mica Alt) backdrop.
 const DWMSBT_TABBEDWINDOW: u32 = 4;
@@ -314,12 +286,11 @@ const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
 const SPI_GETHIGHCONTRAST: u32 = 0x0042;
 const HCF_HIGHCONTRASTON: u32 = 0x0000_0001;
 
-// ---- The OS chrome palette (`GetSysColor`) — H4 -------------------------------------
+// ---- The OS chrome palette (`GetSysColor`) -------------------------------------------
 //
-// The five system colours the chrome surfaces are painted from while a High-Contrast
-// scheme is active. Win32's split is DOCUMENT (`WINDOW`/`WINDOWTEXT`), CONTROL
-// (`BTNFACE`) and SELECTION (`HIGHLIGHT`/`HIGHLIGHTTEXT`); `chrome_band::ForcedChrome`
-// documents which aterm surface takes which.
+// The five system colours the chrome is painted from under a High-Contrast scheme: document
+// (`WINDOW`/`WINDOWTEXT`), control (`BTNFACE`) and selection (`HIGHLIGHT`/`HIGHLIGHTTEXT`);
+// `chrome_band::ForcedChrome` says which aterm surface takes which.
 
 /// `COLOR_WINDOW` — the document / editable-field surface.
 const COLOR_WINDOW: i32 = 5;
@@ -345,17 +316,16 @@ const RRF_RT_REG_BINARY: u32 = 0x0000_0008;
 const PERSONALIZE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 const ENABLE_TRANSPARENCY_VALUE: &str = "EnableTransparency";
 
-/// Settings ▸ Accessibility ▸ Text size writes its slider here as a PERCENT
-/// (100..=225); absent means 100. This is the same number
-/// `UISettings.TextScaleFactor` reports as a ratio.
+/// Settings ▸ Accessibility ▸ Text size writes its slider here as a percent (100..=225);
+/// absent means 100. `UISettings.TextScaleFactor` reports the same number as a ratio.
 const ACCESSIBILITY_KEY: &str = r"Software\Microsoft\Accessibility";
 const TEXT_SCALE_FACTOR_VALUE: &str = "TextScaleFactor";
 
-/// `SPI_GETWHEELSCROLLLINES` — how many LINES one wheel notch scrolls, the value
-/// behind Settings ▸ Mouse ▸ "Lines to scroll at a time".
+/// `SPI_GETWHEELSCROLLLINES`: how many lines one wheel notch scrolls, the value behind
+/// Settings ▸ Mouse ▸ "Lines to scroll at a time".
 const SPI_GETWHEELSCROLLLINES: u32 = 0x0068;
-/// `WHEEL_PAGESCROLL` — the sentinel that slider writes in its "One screen at a
-/// time" position, meaning a notch scrolls a whole PAGE rather than N lines.
+/// `WHEEL_PAGESCROLL`: the sentinel that slider writes in its "One screen at a time" position,
+/// meaning a notch scrolls a whole page rather than N lines.
 const WHEEL_PAGESCROLL: u32 = u32::MAX;
 /// The Windows default, and the fallback if the query fails. Every other window on
 /// the desktop moves this far per notch.
@@ -393,13 +363,9 @@ pub(crate) fn hwnd_of(window: &Window) -> Option<isize> {
     }
 }
 
-/// Theme byte order (`0x00RRGGBB`) ↔ COLORREF (`0x00BBGGRR`). GDI brushes and the
-/// DWM caption/text colour attributes all take COLORREF, whose R and B bytes are
-/// reversed relative to how aterm's themes store colour. The swap is its own
-/// inverse, so this ONE helper serves both directions (theme → attribute write,
-/// attribute readback → introspection) — a second copy of the byte shuffle is how
-/// the caption and the class brush would drift apart. Any stray top byte is
-/// dropped, matching how the class-brush site always masked it.
+/// Theme byte order (`0x00RRGGBB`) ↔ COLORREF (`0x00BBGGRR`), which GDI brushes and the DWM
+/// colour attributes take. The swap is its own inverse, so one helper serves writes and
+/// readbacks and the caption and class brush cannot drift; a stray top byte is dropped.
 fn colorref_swap(c: u32) -> u32 {
     ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF)
 }
@@ -419,11 +385,9 @@ fn dwm_set_u32(hwnd: isize, attr: u32, value: u32) {
     }
 }
 
-/// Best-effort `DwmGetWindowAttribute` read of a 4-byte (`BOOL`/`DWORD`) attribute:
-/// `Some(value)` when the OS supports getting it (`hr == 0`), else `None` (older
-/// Windows, or a write-only attribute). The ground-truth counterpart of
-/// [`dwm_set_u32`] — used by [`read_chrome_lines`] so introspection reports what is
-/// ACTUALLY on the live window, not merely what we tried to set.
+/// Best-effort `DwmGetWindowAttribute` read of a 4-byte (`BOOL`/`DWORD`) attribute: `Some`
+/// when the OS supports getting it, else `None` (older Windows, or a write-only attribute).
+/// [`read_chrome_lines`] uses it to report what is on the live window, not what we set.
 fn dwm_get_u32(hwnd: isize, attr: u32) -> Option<u32> {
     let mut value: u32 = 0;
     // SAFETY: a single documented flat-C DWM read into a local `u32`; `cb` is its
@@ -478,20 +442,17 @@ fn caption_color_label(read: Option<u32>, set: Option<u32>) -> String {
     }
 }
 
-/// The `chrome` introspection lines for the live Windows window: the backend name
-/// plus the ACTUAL DWM attributes read back off the HWND (`DwmGetWindowAttribute`)
-/// — dark-mode, corner preference, system backdrop — and the effective winit theme.
-/// This is the W0 acceptance surface: `aterm-ctl chrome` shows that `AppRtWindows`
-/// really applied the native chrome, from ground truth, not from intent. A `None`
-/// window (headless) or a not-yet-realized HWND reports that honestly.
+/// The `chrome` introspection lines for the live Windows window: the backend name, the DWM
+/// attributes read back off the HWND (dark mode, corner preference, system backdrop) and the
+/// effective winit theme, so `aterm-ctl chrome` reports ground truth, not intent. A headless or
+/// not-yet-realized window says so.
 pub(crate) fn read_chrome_lines(
     window: Option<&Window>,
     cfg_theme: WindowTheme,
     cfg_material: BackgroundMaterial,
 ) -> Vec<String> {
-    // The CONFIGURED intent (what the App resolved from config), so introspection can
-    // tell "config didn't reach the window" apart from "the DWM getter reports the
-    // effective, not the set, value".
+    // The configured intent, so introspection can tell "config didn't reach the window" from
+    // "the DWM getter reports the effective, not the set, value".
     let want_theme = match cfg_theme {
         WindowTheme::Auto => "auto",
         WindowTheme::Light => "light",
@@ -567,18 +528,13 @@ pub(crate) fn read_chrome_lines(
             None => "opaque".to_string(),
         }
     };
-    // H4/H5 acceptance surface: the live OS preferences and the chrome palette they
-    // resolve to, read fresh HERE rather than from the latches — introspection's job
-    // is to answer "what does the OS say right now", so that a `chrome` read taken
-    // after a Settings flip and before the next repaint still tells the truth about
-    // the OS. (The latches are what the PAINT uses; if these two ever disagree, the
-    // hook did not fire, which is exactly the failure this line has to be able to
-    // show.) `hc_chrome` prints the three tones that actually differ between HC
-    // schemes — band, ink, selection — so switching Aquatic → Dusk is visible here.
+    // The live OS preferences and the chrome palette they resolve to, read fresh rather than
+    // from the latches, so a `chrome` read between a Settings flip and the next repaint tells
+    // the OS's truth; disagreeing with the painted latches means the hook did not fire.
+    // `hc_chrome` prints the three tones that differ between HC schemes (band, ink, selection).
     let high_contrast = high_contrast_active();
-    // `high_contrast=false hc_chrome=…` (rather than `off`) is the ATERM_FORCE_HC_CHROME
-    // diagnostic being on — the two fields are printed separately so that state is
-    // legible instead of looking like an HC misdetection.
+    // `high_contrast=false hc_chrome=…` (not `off`) is the ATERM_FORCE_HC_CHROME diagnostic;
+    // the fields print separately so it does not read as an HC misdetection.
     let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
     let hc_chrome = match resolve_forced_chrome(high_contrast) {
         Some(p) => format!(
@@ -601,10 +557,9 @@ pub(crate) fn read_chrome_lines(
     }
     .reduce_motion();
     let text_scale = os_text_scale();
-    // The §3.2 hook's own ground truth: broadcasts the subclass saw / wakes it
-    // posted. `0/0` after a settings change means the subclass is not chained (the
-    // `SetWindowLongPtrW` swap failed) — the one failure mode that is otherwise
-    // silent, because everything downstream still works on the focus-gain fallback.
+    // The settings hook's own ground truth: broadcasts the subclass saw / wakes it posted.
+    // `0/0` after a settings change means the subclass is not chained (the swap failed), the
+    // one failure that is otherwise silent behind the focus-gain fallback.
     let (settings_seen, settings_woke) = os_settings_counters();
     vec![format!(
         "windows: backend=AppRtWindows hwnd=0x{hwnd:x} cfg_theme={want_theme} cfg_backdrop={want_backdrop} \
@@ -617,10 +572,8 @@ pub(crate) fn read_chrome_lines(
     )]
 }
 
-/// The `DWMWA_SYSTEMBACKDROP_TYPE` value for a config [`BackgroundMaterial`].
-/// `None` maps to `DWMSBT_NONE` (the minimal opaque default — no backdrop), so a
-/// stock config (material defaults to `None`) leaves the window a plain fast grid,
-/// honouring the "minimal, effects-off-by-default" posture.
+/// The `DWMWA_SYSTEMBACKDROP_TYPE` value for a config [`BackgroundMaterial`]. `None` (the
+/// default) maps to `DWMSBT_NONE`, so a stock config leaves the window a plain opaque grid.
 fn backdrop_for(material: BackgroundMaterial) -> u32 {
     match material {
         BackgroundMaterial::None => DWMSBT_NONE,
@@ -632,17 +585,12 @@ fn backdrop_for(material: BackgroundMaterial) -> u32 {
 
 // ---- Auto-theme caption resolution (Windows only) -----------------------------------
 //
-// WHY THIS EXISTS. `App::window_theme_for_chrome` deliberately passes config
-// `window_theme` through UNCHANGED on every platform — `Auto` stays `Auto` so
-// AppKit/DWM can follow the live system appearance, and terminal-palette selection
-// stays independent of chrome selection. That is right on macOS, where a light
-// NSWindow titlebar over a dark content view is the platform's own look and AppKit
-// blends the two. It is WRONG on Windows: DWM paints the caption a flat opaque
-// system colour with a hard seam against the client area, so a LIGHT system theme
-// over aterm's (default) DARK grid draws a white caption bar directly on top of a
-// near-black terminal — the defect this block fixes. Windows Terminal resolves the
-// same way (its "Use system theme" caption follows the PROFILE background), so this
-// is parity, not invention.
+// `App::window_theme_for_chrome` passes `window_theme` through unchanged on every platform;
+// AppKit blends a light titlebar over a dark view, but DWM paints the caption a flat system
+// colour with a hard seam, so a light system theme over aterm's dark grid draws a white bar on
+// a near-black terminal. Here, in the Windows arm, `Auto` resolves against the terminal
+// background instead (as Windows Terminal's "Use system theme" caption follows the profile
+// background), and macOS keeps receiving a raw `Auto`.
 //
 // The resolution lives HERE, in the Windows arm, rather than in the cross-platform
 // accessor: `window_theme_for_chrome`'s pass-through semantics are upstream intent
@@ -661,75 +609,48 @@ fn backdrop_for(material: BackgroundMaterial) -> u32 {
 /// `0x00RRGGBB`, so the top byte is always clear and `u32::MAX` cannot collide.
 const CHROME_BG_UNKNOWN: u32 = u32::MAX;
 
-/// The terminal THEME background last handed to [`AppRtWindows::window_set_background_color`].
+/// The terminal theme background last handed to [`AppRtWindows::window_set_background_color`].
 static CHROME_BG: AtomicU32 = AtomicU32::new(CHROME_BG_UNKNOWN);
 
-/// The config `window_theme` policy last handed to [`AppRtWindows::window_set_appearance`],
-/// encoded by [`chrome_policy_code`]. Latched so the background-publishing seam can
-/// re-run the SAME resolution on a theme change without the caller threading the
-/// policy through a second argument.
-///
-/// Seeded to the CONFIG DEFAULT (`Auto`) rather than to a "not yet known" state on
-/// purpose. Window attach publishes the background before it applies the appearance,
-/// so on the very first window this latch is momentarily one call stale — with an
-/// explicit `window_theme = "light"` over a dark grid that resolves dark for the few
-/// microseconds until `window_set_appearance` corrects it. That is invisible: the
-/// first window is still hidden at that point (`set_visible` comes after both calls),
-/// and every later window and every live reload finds the latch already warm.
+/// The `window_theme` policy last handed to [`AppRtWindows::window_set_appearance`], encoded by
+/// [`chrome_policy_code`], so the background-publishing seam can re-run the same resolution.
+/// Seeded to the config default (`Auto`): attach publishes the background before the
+/// appearance, so the first window's latch is one call stale, but that window is still hidden
+/// (`set_visible` comes after both).
 static CHROME_POLICY: AtomicU8 = AtomicU8::new(0); // 0 == Auto, the config default
 
-/// The live Windows **High Contrast** state, latched by [`apply_chrome_appearance`].
-///
-/// Latched rather than queried at every resolution because the per-frame guard
-/// [`verify_chrome_appearance`] resolves too, and `SPI_GETHIGHCONTRAST` is a syscall
-/// that has no business on a frame path. Every seam that can plausibly follow an HC
-/// change (window attach, a theme publish, a config reload, an OS appearance flip)
-/// runs `apply_chrome_appearance`, so the latch is refreshed exactly when the answer
-/// can have moved.
+/// The live Windows High Contrast state, latched by [`apply_chrome_appearance`] because the
+/// per-frame guard [`verify_chrome_appearance`] resolves too and `SPI_GETHIGHCONTRAST` is a
+/// syscall. Every seam that can follow an HC change runs `apply_chrome_appearance`.
 static CHROME_HIGH_CONTRAST: AtomicBool = AtomicBool::new(false);
 
-/// The DWM backdrop value last APPLIED to the window, latched (like [`CHROME_BG`])
-/// so the caption-tint resolver can honour it: a solid `DWMWA_CAPTION_COLOR` paints
-/// OVER a Mica/Acrylic caption, so any live material must suppress the tint. Seeded
-/// to `DWMSBT_NONE` — the config default — which matches the window's actual state
-/// before the first vibrancy call.
-///
-/// This is the EFFECTIVE value, which is not always the configured one: see
-/// [`CHROME_BACKDROP_REQUESTED`].
+/// The DWM backdrop last applied to the window, latched so the caption-tint resolver can honour
+/// it (a solid caption colour paints over Mica/Acrylic). The effective value, not always the
+/// configured one ([`CHROME_BACKDROP_REQUESTED`]); seeded to the config default.
 static CHROME_BACKDROP: AtomicU32 = AtomicU32::new(DWMSBT_NONE);
 
-/// The backdrop the CONFIG asked for, before the reduced-transparency gate. Latched
-/// separately from [`CHROME_BACKDROP`] because the gate is a live OS preference: the
-/// user can turn "Transparency effects" off with a Mica window already on screen, and
-/// with only the effective value latched there would be nothing left to restore when
-/// they turn it back on. Seeded to the config default.
+/// The backdrop config asked for, before the reduced-transparency gate. Latched apart from
+/// [`CHROME_BACKDROP`] because the gate is a live OS preference: with only the effective value
+/// latched, turning "Transparency effects" off and on again would leave nothing to restore.
+/// Seeded to the config default.
 static CHROME_BACKDROP_REQUESTED: AtomicU32 = AtomicU32::new(DWMSBT_NONE);
 
-/// H1 HONESTY — WHY the client-area backdrop path is not live, latched once so
-/// `aterm-ctl chrome` can SAY it. `client=opaque` alone answers "is the material
-/// reaching the client pixels" but not "why not", and on this machine the commonest
-/// answer by far — `hdr_glow` is on by default and the scRGB EDR swapchain and the
-/// DirectComposition visual are mutually exclusive — was reachable only as a line of
-/// stderr that a GUI-subsystem launch discards. The chrome row now reads
-/// `client=opaque(hdr_glow)`, so the question is answerable from a socket with no
-/// console anywhere in the picture.
+/// Why the client-area backdrop path is not live, latched so `aterm-ctl chrome` can say it
+/// (`client=opaque(hdr_glow)`) where the cause would otherwise be stderr a GUI launch discards.
+/// The commonest cause: `hdr_glow` is on by default, and the scRGB EDR swapchain excludes the
+/// DirectComposition visual.
 ///
-/// FIRST WRITER WINS. Every later decline is downstream of the first: once the
-/// visual request is never made (hdr_glow) or withdrawn (GPU init failed), the
-/// `window_set_vibrancy` arm will also observe "not active" and would otherwise
-/// overwrite the ROOT cause with its own symptom. `0` = nothing declined (either
-/// the visual path is live, or no material was ever configured, in which case
-/// there is nothing to explain).
+/// First writer wins: once the visual request is never made or is withdrawn, the
+/// `window_set_vibrancy` arm also sees "not active" and would overwrite the root cause with its
+/// symptom. `0` = nothing declined (the visual path is live, or no material was configured).
 static CLIENT_BACKDROP_DECLINE: AtomicU32 = AtomicU32::new(0);
 
-/// The reasons [`CLIENT_BACKDROP_DECLINE`] can hold. Each is a short, stable token
-/// meant to be greppable in a bug report and matched by an acceptance script — not
-/// a sentence (the sentence is the config notice this pairs with).
+/// The reasons [`CLIENT_BACKDROP_DECLINE`] can hold, each a short stable token for bug reports
+/// and acceptance scripts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClientBackdropDecline {
-    /// `hdr_glow` is on: the scRGB EDR swapchain won, so the composition visual
-    /// was never requested. The DEFAULT-CONFIG case, and the one the user has no
-    /// other way to discover.
+    /// `hdr_glow` is on: the scRGB EDR swapchain won, so the composition visual was never
+    /// requested. The default-config case.
     HdrGlow = 1,
     /// The GPU renderer did not come up, so there is no per-pixel-alpha present
     /// path at all and the request was withdrawn.
@@ -740,8 +661,8 @@ pub(crate) enum ClientBackdropDecline {
     /// The device was lost mid-session and the process downgraded to the CPU
     /// renderer, which has no translucent present path.
     GpuLost = 4,
-    /// A material arrived AFTER launch (a live config reload) on a process whose
-    /// presentation system — an instance-level choice — was already opaque.
+    /// A material arrived after launch (a live config reload) on a process whose
+    /// presentation system, an instance-level choice, was already opaque.
     NotAtLaunch = 5,
 }
 
@@ -786,10 +707,8 @@ pub(crate) fn client_backdrop_decline() -> Option<ClientBackdropDecline> {
     ClientBackdropDecline::from_code(CLIENT_BACKDROP_DECLINE.load(Ordering::Relaxed))
 }
 
-/// The live Windows **High Contrast** state (`SPI_GETHIGHCONTRAST` → `HCF_HIGHCONTRASTON`).
-/// The ONE reader of that preference in this file; [`AppRtWindows::native_appearance_preferences`]
-/// and the caption resolver share it so they can never disagree about whether an HC
-/// scheme is active. Fail-safe to `false` (not in high contrast) if the query fails.
+/// The live Windows High Contrast state (`SPI_GETHIGHCONTRAST` → `HCF_HIGHCONTRASTON`), the one
+/// reader of that preference here. `false` if the query fails.
 fn high_contrast_active() -> bool {
     let mut high_contrast = HighContrastW {
         size: std::mem::size_of::<HighContrastW>() as u32,
@@ -810,10 +729,9 @@ fn high_contrast_active() -> bool {
     ok != 0 && high_contrast.flags & HCF_HIGHCONTRASTON != 0
 }
 
-/// One `HKEY_CURRENT_USER` `REG_DWORD`, or `None` when the value is absent, holds
-/// another type, or is unreadable. Every caller reads `None` as "the Windows
-/// default", which is exactly what an untouched machine has — neither of these two
-/// values exists until the user moves the corresponding switch.
+/// One `HKEY_CURRENT_USER` `REG_DWORD`, or `None` when absent, of another type, or unreadable.
+/// Callers read `None` as the Windows default: neither value exists until the user moves the
+/// switch.
 fn hkcu_dword(subkey: &str, value: &str) -> Option<u32> {
     use std::os::windows::ffi::OsStrExt;
     let wide = |s: &str| {
@@ -928,26 +846,16 @@ fn accent_from_palette(
     })
 }
 
-/// The live Settings ▸ Personalization ▸ Colours ▸ **"Transparency effects"**
-/// switch: `true` (the Windows default) when translucent surfaces are permitted.
-///
-/// This is H5's second missing pref. `reduced_transparency` used to be hardcoded to
-/// `high_contrast`, which conflated two different user statements — "I need maximum
-/// contrast" and "I do not want see-through surfaces" — and left the real switch
-/// unread. Both now feed it: High Contrast implies reduced transparency (an HC
-/// scheme has no translucency to speak of), and so does turning this off.
+/// The live Settings ▸ Personalization ▸ Colours ▸ "Transparency effects" switch: `true` (the
+/// Windows default) when translucent surfaces are permitted.
 fn transparency_effects_enabled() -> bool {
     hkcu_dword(PERSONALIZE_KEY, ENABLE_TRANSPARENCY_VALUE).is_none_or(|v| v != 0)
 }
 
-/// The live Settings ▸ Accessibility ▸ **Text size** slider as a ratio (the OS
-/// stores a percent; 100 ⇒ `1.0`), or `1.0` when it has never been moved.
-///
-/// HONEST BOUND: the slider reaches 225 %, and
-/// [`crate::native_appearance::AppearancePreferences::normalized`] clamps the pref
-/// to 2.0 — a cross-platform ceiling this arm deliberately does not widen, because
-/// every layout that consumes it was tuned against that range. A user at 225 %
-/// therefore gets 200 % chrome text, not nothing.
+/// The live Settings ▸ Accessibility ▸ Text size slider as a ratio (the OS stores a percent;
+/// 100 ⇒ `1.0`), or `1.0` when never moved. The slider reaches 225 %, but
+/// [`crate::native_appearance::AppearancePreferences::normalized`] clamps to 2.0, the
+/// cross-platform ceiling the consuming layouts were tuned against.
 fn os_text_scale() -> f32 {
     match hkcu_dword(ACCESSIBILITY_KEY, TEXT_SCALE_FACTOR_VALUE) {
         // A percent, so anything at or below zero is not one; the upper end is left
@@ -970,14 +878,9 @@ fn sys_color(index: i32) -> [u8; 3] {
     ]
 }
 
-/// The chrome palette to force, given the live High-Contrast state: the five system
-/// colours under an HC scheme, and `None` otherwise.
-///
-/// `None` when HC is OFF is the whole policy, stated in one place. Off HC the system
-/// colours still exist and still describe the desktop — but they describe Explorer's
-/// chrome, not a terminal's, and painting a tab strip in `COLOR_BTNFACE` on an
-/// ordinary desktop would throw away the theme-derived band the strip work exists to
-/// provide. The OS palette wins only when the OS says it must.
+/// The chrome palette to force, given the live High-Contrast state: the five system colours
+/// under an HC scheme, `None` otherwise. Off HC the system colours describe Explorer's chrome,
+/// and painting the tab strip `COLOR_BTNFACE` would throw away the theme-derived band.
 fn resolve_forced_chrome(high_contrast: bool) -> Option<crate::chrome_band::ForcedChrome> {
     (high_contrast || force_hc_chrome_env()).then(|| crate::chrome_band::ForcedChrome {
         window: sys_color(COLOR_WINDOW),
@@ -988,23 +891,15 @@ fn resolve_forced_chrome(high_contrast: bool) -> Option<crate::chrome_band::Forc
     })
 }
 
-/// `ATERM_FORCE_HC_CHROME=1` — force the chrome onto the OS system palette WITHOUT a
-/// High-Contrast scheme. A development seam ([`aterm_types::dev_seam!`]: a shipped
-/// binary never reads it) for a reviewer, and it exists because the alternative way to see this code path is to turn High
-/// Contrast on for the whole desktop, which is a hostile thing to ask of a reviewer
-/// (and impossible for an automated check to do without changing the machine).
+/// `ATERM_FORCE_HC_CHROME=1`: force the chrome onto the OS system palette without a
+/// High-Contrast scheme, so a reviewer or a check can see this path without turning High
+/// Contrast on for the whole desktop. A development seam ([`aterm_types::dev_seam!`]; a shipped
+/// binary never reads it), read fresh on every call.
 ///
-/// HONEST LIMIT, and it matters: off High Contrast, `GetSysColor` returns the ORDINARY
-/// desktop palette (white window, black text, accent-blue highlight, #f0f0f0 control
-/// face). So this exercises the whole path — palette → strip band, chip, seam,
-/// separators → `ChromeBleed` → find bar and notice bands → the strip-cache
-/// invalidation → the live re-resolve — and makes it plainly visible, but it does NOT
-/// simulate an HC scheme's COLOURS. The four stock HC palettes are asserted against
-/// fixtures in `chrome_band::hc_fixtures`, which needs no HC desktop either.
-///
-/// Read fresh (not cached): it is consulted only on the event-driven resolve path,
-/// and reading it live means the knob can be checked by a reviewer's `set` without
-/// wondering whether a `OnceLock` beat them to it.
+/// Off High Contrast `GetSysColor` returns the ordinary desktop palette, so this exercises the
+/// whole path (palette → strip, `ChromeBleed`, find bar and notice bands → strip-cache
+/// invalidation → live re-resolve) but not an HC scheme's colours; the stock HC palettes are
+/// asserted against `chrome_band::hc_fixtures`.
 fn force_hc_chrome_env() -> bool {
     aterm_types::dev_seam!("ATERM_FORCE_HC_CHROME").is_some_and(|v| v != "0" && !v.is_empty())
 }
@@ -1051,27 +946,16 @@ fn wheel_notch_from_raw(raw: u32) -> WheelNotch {
 /// never installed still follows the slider within a few seconds.
 const WHEEL_NOTCH_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// The cached `SPI_GETWHEELSCROLLLINES` answer and when it was read. Module-level
-/// (it used to be a `static` inside [`wheel_notch_scroll`]) so the settings hook can
-/// invalidate it — see [`note_os_settings_resample`].
+/// The cached `SPI_GETWHEELSCROLLLINES` answer and when it was read; module-level so the
+/// settings hook can invalidate it ([`note_os_settings_resample`]).
 static WHEEL_NOTCH_CACHE: Mutex<Option<(u32, std::time::Instant)>> = Mutex::new(None);
 
 /// The user's wheel-notch distance, cached.
 ///
-/// aterm banked `LineDelta` straight through, and winit's Windows backend emits
-/// exactly ±1.0 per detent — so aterm scrolled ONE line where the Windows default
-/// (and every other window on the desktop) scrolls THREE. This is the missing
-/// conversion, and it is the OS's number, not a new aterm knob.
-///
-/// The read is `SystemParametersInfoW`, which is cheap but not free, and the wheel
-/// is a hot path (a fast flick delivers dozens of events a second), so the value is
-/// cached. It is now INVALIDATED by the §3.2 settings hook — dragging the
-/// Mouse-settings slider broadcasts `WM_SETTINGCHANGE`, [`note_os_settings_resample`]
-/// drops the cache, and the next notch re-reads — which is the "invalidate + read"
-/// this doc used to promise for when the hook landed. The coarse TTL is KEPT as a
-/// backstop rather than deleted: a window whose `SetWindowLongPtrW` subclass failed
-/// to install has no hook, and there the old few-seconds-late behaviour is far better
-/// than a value pinned for the process lifetime.
+/// `SystemParametersInfoW` is cheap but not free and the wheel is a hot path, so the value is
+/// cached. The settings hook invalidates it ([`note_os_settings_resample`]) when the Mouse
+/// slider broadcasts `WM_SETTINGCHANGE`; the TTL is a backstop for a window whose subclass
+/// failed to install.
 pub(crate) fn wheel_notch_scroll() -> WheelNotch {
     let now = std::time::Instant::now();
     // A poisoned lock still holds a perfectly good number: a panic elsewhere must
@@ -1137,17 +1021,9 @@ fn chrome_policy_from_code(code: u8) -> WindowTheme {
 /// function here, is what guarantees the caption and the tab strip directly beneath it
 /// can never disagree about whether the window is a dark one.
 ///
-/// `high_contrast` ([`high_contrast_active`]) makes `Auto` DEFER TO THE OS again. This
-/// is an accessibility guard, not a style choice: under an HC scheme the OS palette owns
-/// the caption. The deferral used to be delegated to winit — `try_theme(None)` consults
-/// `should_use_dark_mode()` = `should_apps_use_dark_mode() && !is_high_contrast()` — but
-/// winit's `is_high_contrast()` is DEAD CODE (its `HIGHCONTRASTA` carries `cbSize: 0`,
-/// which `SPI_GETHIGHCONTRAST` rejects; measured always-FALSE on this machine), so the
-/// returned `Auto` no longer buys the guard by itself. [`apply_chrome_appearance`]'s HC
-/// arm therefore writes the deferral explicitly — see the comment there for why the fix
-/// lives aterm-side instead of correcting winit's struct. Explicit `Light`/`Dark` stay
-/// hard overrides because a user who typed one asked for it (and pre-fix they already
-/// bypassed the same guard, via `set_theme(Some)`).
+/// Under High Contrast (`high_contrast`, from [`high_contrast_active`]) `Auto` defers to the OS:
+/// the HC palette owns the caption. winit's own HC check never fires (see the HC arm of
+/// [`apply_chrome_appearance`], which writes the deferral explicitly).
 fn resolve_chrome_theme(policy: WindowTheme, bg: u32, high_contrast: bool) -> WindowTheme {
     match policy {
         WindowTheme::Light | WindowTheme::Dark => policy,
@@ -1178,32 +1054,19 @@ fn resolve_chrome_theme(policy: WindowTheme, bg: u32, high_contrast: bool) -> Wi
 // frame ([`note_caption_surface`]). Four deliberate gates keep this from doing
 // damage:
 //
-//  * only the `Auto` policy tints the caption with the terminal COLOUR — an
-//    explicit `window_theme = "light"/"dark"` gets the STOCK OS caption in
-//    that variant (immersive light/dark), NOT a terminal-coloured one. That is
-//    not a half-flip any more: since 2026-08-25 a forced value also drives the
-//    tab band and native pages to the forced VARIANT (App::chrome_palette_theme
-//    -> resolve_chrome_palette, matching Linux), so forced light = a light
-//    caption over a light-authored band, coherent as one chrome. Tinting the
-//    caption the terminal colour on a forced value would instead paint the
-//    terminal palette over the variant the user explicitly asked for;
-//  * High Contrast suppresses it — the HC palette owns the caption (the same
-//    accessibility deferral `resolve_chrome_theme` performs for immersive-dark);
-//  * an active backdrop material suppresses it — a solid caption colour paints
-//    over Mica/Acrylic, silently undoing the user's `background_material`;
-//  * DWM's own unfocused caption treatment dies with a pinned COLORREF (a fixed
-//    colour applies to BOTH focus states), so the resolver derives a second,
-//    DIMMED text tone and the redraw path re-applies on every focus flip. The
-//    caption FILL deliberately stays identical in both states: the grid beneath
-//    it does not dim on focus loss, and a caption that darkened alone would
-//    re-introduce the very seam the tint removes. Dimming the TITLE TEXT is what
-//    stock DWM does for unfocused windows, and is what this reproduces.
+//  * only `Auto` tints with the terminal colour; an explicit `window_theme = "light"/"dark"`
+//    gets the stock OS caption in that variant, matching the forced tab band and native pages
+//    (`App::chrome_palette_theme` → `resolve_chrome_palette`);
+//  * High Contrast suppresses it: the HC palette owns the caption;
+//  * an active backdrop material suppresses it: a solid caption colour paints over Mica/Acrylic;
+//  * a pinned COLORREF disables DWM's unfocused treatment, so the resolver derives a dimmed
+//    text tone and the redraw path re-applies on every focus flip. The fill stays the same in
+//    both states (the grid does not dim on focus loss); only the title text dims, as stock DWM
+//    does.
 
-/// How far the caption title text blends TOWARD the caption fill while the window
-/// is unfocused. 0.45 lands near DWM's own inactive-caption text (roughly #999 on
-/// white): clearly dimmed at a glance, still legible. Deliberately far stronger
-/// than the tab strip's pinned 0.15 label dim — the strip label must stay readable
-/// as CONTENT, while the caption title is duplicated identity the OS itself dims.
+/// How far the caption title text blends toward the caption fill while unfocused: 0.45 lands
+/// near DWM's own inactive-caption text (roughly #999 on white). Far stronger than the tab
+/// strip's 0.15 label dim, since the strip label is content and the title duplicates identity.
 const CAPTION_TEXT_UNFOCUSED_DIM: f32 = 0.45;
 
 /// Resolve the caption tint into the exact `(DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR)`
@@ -1253,14 +1116,10 @@ fn caption_tint(
     (colorref_swap(bg), colorref_swap(ink_rgb))
 }
 
-/// The `(caption, text)` attribute pair last WRITTEN per HWND, so the per-frame
-/// upkeep ([`verify_chrome_appearance`]) costs a lock and a compare in the steady
-/// state and only pays the two `DwmSetWindowAttribute` calls when the desired
-/// state actually moved (a theme change, a material change, or a focus flip). A
-/// linear Vec, not a map: an aterm process has a handful of windows. Entries are
-/// never removed — a few bytes per window ever created — and staleness across an
-/// OS-recycled HWND value cannot mis-skip, because every event seam calls
-/// [`apply_caption_tint`] with `force`, which writes unconditionally.
+/// The `(caption, text)` attribute pair last written per HWND, so the per-frame upkeep
+/// ([`verify_chrome_appearance`]) costs a lock and a compare in the steady state. A linear Vec
+/// for a handful of windows; entries are never removed, and a recycled HWND cannot mis-skip,
+/// because every event seam calls [`apply_caption_tint`] with `force`.
 static CAPTION_TINT_APPLIED: Mutex<Vec<(isize, u64)>> = Mutex::new(Vec::new());
 
 /// The `(caption, text)` pair last written to `hwnd` ([`CAPTION_TINT_APPLIED`]),
@@ -1318,12 +1177,10 @@ pub(crate) fn note_caption_surface(window: &Window, surface: u32) {
     resync_chrome_appearance(window);
 }
 
-/// Resolve and write the caption tint for `window`. `force` (the event seams:
-/// attach, theme publish, config reload, OS flip) writes even when the cache says
-/// the state is current — those seams are rare and must also heal a caption some
-/// other process state clobbered; the per-frame caller passes `false` and relies
-/// on the cache. Best-effort: on Windows 10 both writes fail `E_INVALIDARG` and
-/// are dropped, leaving the caption immersive-dark-only as before.
+/// Resolve and write the caption tint for `window`. `force` (the event seams: attach, theme
+/// publish, config reload, OS flip) writes even when the cache says the state is current, to
+/// heal a clobbered caption; the per-frame caller relies on the cache. On Windows 10 both
+/// writes fail `E_INVALIDARG` and are dropped.
 fn apply_caption_tint(window: &Window, hwnd: isize, policy: WindowTheme, force: bool) {
     let (caption, text) = caption_tint(
         policy,
@@ -1354,39 +1211,20 @@ fn apply_caption_tint(window: &Window, hwnd: isize, policy: WindowTheme, force: 
 
 // ---- The reduced-transparency gate on the system backdrop ---------------------------
 //
-// H4's tail: `reduced_transparency` used to be set to `high_contrast` and read
-// NOWHERE except a native-view redraw hash — a dead pref that nonetheless invited
-// every reader to believe aterm honoured the setting. It is now a real preference
-// (High Contrast OR "Transparency effects" off, see `transparency_effects_enabled`)
-// with a real consumer: it is the one place aterm asks the compositor for a
-// see-through surface, and a user who turned translucency off means it.
-//
-// The gate is on ATERM's request, not a second-guess of DWM's own behaviour: DWM
-// already drops Acrylic to a solid fill when transparency is off, but Mica
-// (`DWMSBT_MAINWINDOW`) is a desktop-wallpaper TINT rather than a blur and survives
-// the switch — so "I turned transparency off and aterm's window is still sampling my
-// wallpaper" is a real, reachable complaint that only the app can answer.
-//
-// Rejected alternative: deleting the field. It is in the shared
-// `AppearancePreferences` that macOS fills from `reduce_transparency()` and native
-// views hash into their paint revision, so deleting it would have been a
-// cross-platform amputation to fix a Windows-side omission.
+// `reduced_transparency` (High Contrast, or "Transparency effects" off) gates the one place
+// aterm asks the compositor for a see-through surface. DWM already drops Acrylic to a solid
+// fill when transparency is off, but Mica (`DWMSBT_MAINWINDOW`) is a wallpaper tint that
+// survives the switch, so only the app can honour it.
 
-/// Windows has TWO independent sources for "do not use transparency": the
-/// Personalization ▸ Colours toggle, and High Contrast — which suppresses composition
-/// effects whether or not that toggle is set. Either one is enough, and this is where
-/// [`AppRtWindows::native_appearance_preferences`] combines them.
-///
-/// A named rule rather than an inline `||` so it can be asserted as a truth table:
-/// the machine running the tests has whatever settings it has, so a test that reads
-/// the live values can only ever exercise one row of it.
+/// Windows has two independent "no transparency" sources: the Personalization ▸ Colours
+/// toggle, and High Contrast (which suppresses composition effects regardless); either
+/// suffices. A named rule so it can be asserted as a truth table.
 fn reduced_transparency_from(high_contrast: bool, transparency_effects: bool) -> bool {
     high_contrast || !transparency_effects
 }
 
-/// The backdrop actually to apply, given what config asked for. `DWMSBT_NONE` is
-/// never gated (there is no transparency to reduce), so an ordinary opaque window
-/// takes exactly the path it always did.
+/// The backdrop actually to apply, given what config asked for. `DWMSBT_NONE` is never gated:
+/// there is no transparency to reduce.
 fn effective_backdrop(requested: u32) -> u32 {
     if requested != DWMSBT_NONE
         && crate::native_appearance::current_preferences().reduced_transparency
@@ -1397,15 +1235,10 @@ fn effective_backdrop(requested: u32) -> u32 {
     }
 }
 
-/// Resolve [`CHROME_BACKDROP_REQUESTED`] through [`effective_backdrop`], write it,
-/// and latch the result for the caption-tint gate.
-///
-/// Called from [`apply_chrome_appearance`] rather than only from
-/// `window_set_vibrancy`, because the inputs move independently: the CONFIG side
-/// changes on a reload, but the PREFERENCE side changes when the user flips a
-/// Windows Settings switch, which reaches this file through the settings hook and
-/// has no `AppRt` seam of its own. One `DwmSetWindowAttribute` on an event-driven
-/// path, and a no-op pre-22H2.
+/// Resolve [`CHROME_BACKDROP_REQUESTED`] through [`effective_backdrop`], write it, and latch the
+/// result for the caption-tint gate. Called from [`apply_chrome_appearance`] as well as
+/// `window_set_vibrancy`: the config side moves on a reload, the preference side on a Settings
+/// flip that reaches this file only through the settings hook. A no-op before 22H2.
 fn apply_backdrop(hwnd: isize) {
     let effective = effective_backdrop(CHROME_BACKDROP_REQUESTED.load(Ordering::Relaxed));
     CHROME_BACKDROP.store(effective, Ordering::Relaxed);
@@ -1425,21 +1258,17 @@ fn apply_backdrop(hwnd: isize) {
 ///
 /// Idempotent, so every seam that can plausibly have been clobbered may just call it.
 fn apply_chrome_appearance(window: &Window, policy: WindowTheme) {
-    // Refresh the High-Contrast latch HERE, on the rare event-driven path, so the
-    // per-frame guard can resolve from an atomic instead of an `SPI_GETHIGHCONTRAST`
-    // syscall.
+    // Refresh the High-Contrast latch here, on the rare event-driven path, so the per-frame
+    // guard resolves from an atomic instead of an `SPI_GETHIGHCONTRAST` syscall.
     let high_contrast = high_contrast_active();
     CHROME_HIGH_CONTRAST.store(high_contrast, Ordering::Relaxed);
     // The caption's side follows the surface it sits on, the same one its tint
     // takes ([`caption_surface_of`]), so fill and buttons cannot disagree.
     let resolved = resolve_chrome_theme(policy, caption_surface_of(hwnd_of(window)), high_contrast);
     {
-        // `set_theme` is `SetWindowTheme`, which SENDS `WM_THEMECHANGED` back to this
-        // very window — synchronously, on this thread, straight into
-        // [`aterm_subclass_wndproc`]. Without this guard the settings hook counted
-        // aterm's own write as an OS settings change and posted a second `Wake`, so
-        // every chrome apply cost an extra event-loop turn and the hook's "one Wake
-        // per burst" contract was false. See [`watch_os_settings_message`].
+        // `set_theme` is `SetWindowTheme`, which sends `WM_THEMECHANGED` back to this window
+        // synchronously, into [`aterm_subclass_wndproc`]; the guard keeps the settings hook
+        // from counting aterm's own write as an OS change (see [`watch_os_settings_message`]).
         let _no_self_wake = ChromeApplyGuard::new();
         window.set_theme(window_theme_to_winit(resolved));
     }
@@ -1479,28 +1308,20 @@ fn apply_chrome_appearance(window: &Window, policy: WindowTheme) {
     // explicitly so intent survives any style change; a silent no-op (E_INVALIDARG)
     // on Windows 10.
     dwm_set_u32(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND);
-    // The system backdrop, re-resolved through the live reduced-transparency
-    // preference. Here rather than only in `window_set_vibrancy` because the
-    // PREFERENCE half moves without any config change — flipping Windows'
-    // "Transparency effects" reaches this file through the settings hook, which
-    // re-runs exactly this function. Must precede the caption tint below: the tint
-    // gates on the EFFECTIVE backdrop, and suppressing Mica is what re-permits it.
+    // The system backdrop, re-resolved through the live reduced-transparency preference (the
+    // settings hook re-runs this function on a "Transparency effects" flip). Before the tint,
+    // which gates on the effective backdrop.
     apply_backdrop(hwnd);
-    // Caption tint (H3): this is the same seam every theme publish re-runs
-    // (`window_set_background_color` → `resync_chrome_appearance` → here), so a
-    // live theme edit re-tints the caption in the same breath that re-resolves
-    // immersive-dark. `force` because the event seams must also heal a tint that
-    // was clobbered outside our view.
+    // Caption tint: every theme publish re-runs this seam (`window_set_background_color` →
+    // `resync_chrome_appearance` → here). `force`: the event seams also heal a tint clobbered
+    // outside our view.
     apply_caption_tint(window, hwnd, policy, /* force= */ true);
 }
 
-/// Re-apply the caption appearance for `window` under the LATCHED config policy.
-/// The re-entry point for events that can invalidate an earlier resolution without
-/// passing through `window_set_appearance`: a terminal theme change (new background →
-/// possibly a new answer) and an OS light/dark flip (winit's own `WM_SETTINGCHANGE`
-/// handler re-themes the non-client area from the OS preference whenever the window's
-/// `preferred_theme` is `None`, which for `Auto` it always is, so our resolved caption
-/// must be re-asserted AFTER winit has had its say).
+/// Re-apply the caption appearance for `window` under the latched config policy: after a
+/// terminal theme change, and after an OS light/dark flip, where winit's `WM_SETTINGCHANGE`
+/// handler re-themes the non-client area from the OS preference (`preferred_theme` is `None`
+/// for `Auto`), so our caption is re-asserted after winit's.
 pub(crate) fn resync_chrome_appearance(window: &Window) {
     apply_chrome_appearance(
         window,
@@ -1508,13 +1329,9 @@ pub(crate) fn resync_chrome_appearance(window: &Window) {
     );
 }
 
-/// Does the caption need re-asserting, given the dark-mode value we WANT and the value
-/// `DWMWA_USE_IMMERSIVE_DARK_MODE` currently reads back as?
-///
-/// Split out as a pure function so the per-frame policy is testable without a window.
-/// `None` (attribute not gettable on this Windows build) deliberately answers `false`:
-/// with no evidence that anything was clobbered, re-writing the caption on every frame
-/// would be pure churn — a not-gettable build falls back to the event-driven seams.
+/// Does the caption need re-asserting, given the dark-mode value we want and what
+/// `DWMWA_USE_IMMERSIVE_DARK_MODE` reads back? `None` (not gettable on this build) answers
+/// `false`: with no evidence of a clobber, rewriting every frame is churn.
 fn chrome_reassert_needed(want_dark: bool, applied: Option<u32>) -> bool {
     match applied {
         Some(v) => (v != 0) != want_dark,
@@ -1522,8 +1339,7 @@ fn chrome_reassert_needed(want_dark: bool, applied: Option<u32>) -> bool {
     }
 }
 
-/// Per-frame guard that the caption on glass is still the one we resolved — the answer
-/// to the ONE clobber the event-driven seams structurally cannot see.
+/// Per-frame guard that the caption on glass is still the one we resolved.
 ///
 /// WHY A FRAME PATH AND NOT AN EVENT. winit's `WM_SETTINGCHANGE` handler
 /// (`crates/aterm-window/.../event_loop.rs`) calls `try_theme()` on EVERY such message when
@@ -1539,69 +1355,35 @@ fn chrome_reassert_needed(want_dark: bool, applied: Option<u32>) -> bool {
 /// reported defect (white caption over a near-black grid) coming back minutes later with
 /// nothing in the log to explain it.
 ///
-/// WHY THIS SURVIVES THE `WM_SETTINGCHANGE` HOOK. The §3.2 hook now exists (the aterm
-/// window subclass — see its block below), and it does re-resolve the caption on every
-/// settings broadcast. It still does not replace this guard, for a reason of ORDERING:
-/// the subclass runs BEFORE `CallWindowProcW` hands the message to winit, so aterm's
-/// re-assert would be written and then winit's own `WM_SETTINGCHANGE` arm would
-/// re-theme the non-client area on top of it. Posting a `Wake` instead (which is what
-/// the subclass does) fixes that — the re-resolve lands on the next loop turn, after
-/// winit is done — but the `Wake` is COALESCED, so within one burst the caption is
-/// re-asserted once and any later clobber in that same burst is unopposed until the
-/// next frame. This guard is that next frame. Keeping both is the cheap answer:
-/// event-driven for latency, frame-driven for the last word.
+/// It never requests a redraw. First the caption-tint upkeep ([`apply_caption_tint`] without
+/// `force`), which is how a focus flip reaches the caption (`on_focus` requests a redraw); it
+/// writes only when the desired state moved. Then the immersive-dark ladder:
+///  1. a resolved `Auto` outside High Contrast means the OS owns the caption: return. Under HC
+///     the deferral is an explicit immersive-dark off, defended like any override;
+///  2. `window.theme()` (a lock read, refreshed by winit on every `WM_SETTINGCHANGE`) agreeing
+///     with our resolution means a clobber writes what we want: return;
+///  3. only while overriding the desktop does a frame pay one `DwmGetWindowAttribute`, and only
+///     a disagreement writes.
 ///
-/// WHY THIS IS CHEAP ENOUGH TO RUN PER FRAME. It never requests a redraw (it only
-/// writes window attributes; re-introducing a wake loop here would be worse than the
-/// bug). First the CAPTION TINT upkeep — [`apply_caption_tint`] without `force` —
-/// which is how a FOCUS FLIP reaches the caption at all: `on_focus` requests a
-/// redraw, the redraw lands here, and the tint's unfocused text dim gets applied.
-/// That upkeep costs three relaxed atomics, winit's cached focus flag (a lock read),
-/// and a compare against the per-HWND last-applied cache; it pays its two
-/// `DwmSetWindowAttribute` calls only when the desired `(colour, focused)` state
-/// actually moved. Then the immersive-dark ladder, three progressively narrower gates:
-///  1. two relaxed atomic loads; a resolved `Auto` with no High-Contrast scheme (no
-///     published background yet) means the OS legitimately owns the caption —
-///     return. Under HIGH CONTRAST the deferral is now an EXPLICIT immersive-dark
-///     OFF (winit's own HC probe is dead — see the HC arm in
-///     [`apply_chrome_appearance`]), so HC keeps descending the ladder with
-///     `want_dark = false` and gets re-asserted like any other override.
-///  2. `window.theme()`, an uncontended lock read and NOT a syscall, is winit's
-///     `current_theme`, which it refreshes from the OS on every `WM_SETTINGCHANGE`. When
-///     it already agrees with our resolution, winit's clobber writes exactly the value we
-///     want and there is nothing to defend — return. This is the common case (a dark grid
-///     on a dark desktop), so a normal frame pays a handful of atomics and two lock reads.
-///  3. only while we are actively OVERRIDING the desktop does the frame pay one
-///     `DwmGetWindowAttribute` read, and only a disagreement writes.
-///
-/// HONEST LIMIT: gate 3 sees the clobber iff DWM keeps `DWMWA_USE_IMMERSIVE_DARK_MODE`
-/// and the undocumented `WCA_USEDARKMODECOLORS` winit writes in ONE per-window dark bit.
-/// They are widely interchangeable (winit gets dark captions on Win11 through WCA alone),
-/// but if a build kept them apart this guard would read back our own value, decline to
-/// write, and simply cost one read — never a regression, just no cure. And a window that
-/// never presents another frame is healed only when it does — which the §3.2 hook now
-/// covers, since its `Wake` re-resolves the caption without needing a frame.
+/// Gate 3 sees the clobber only if DWM keeps `DWMWA_USE_IMMERSIVE_DARK_MODE` and winit's
+/// `WCA_USEDARKMODECOLORS` in one per-window bit; otherwise it costs a read and cures nothing.
 pub(crate) fn verify_chrome_appearance(window: &Window) {
-    // Hoisted above the gates (it used to sit below them) because the tint upkeep
-    // needs it too; `hwnd_of` reads winit's stored handle — cheap, not a syscall.
+    // `hwnd_of` reads winit's stored handle, not a syscall.
     let Some(hwnd) = hwnd_of(window) else {
         return;
     };
     let policy = chrome_policy_from_code(CHROME_POLICY.load(Ordering::Relaxed));
     let high_contrast = CHROME_HIGH_CONTRAST.load(Ordering::Relaxed);
-    // Caption-tint upkeep FIRST and unconditionally: focus flips arrive on this
-    // path (see the fn doc), and the tint has gates of its own that are
-    // independent of the immersive-dark ladder's early returns below.
+    // Caption-tint upkeep first and unconditionally: focus flips arrive on this path (see the
+    // fn doc), and the tint's gates are independent of the ladder's early returns below.
     apply_caption_tint(window, hwnd, policy, /* force= */ false);
     let want_dark =
         match resolve_chrome_theme(policy, caption_surface_of(Some(hwnd)), high_contrast) {
             WindowTheme::Dark => true,
             WindowTheme::Light => false,
-            // The EXPLICIT High-Contrast deferral (immersive-dark OFF; winit's own HC
-            // probe is dead — see the HC arm in `apply_chrome_appearance`) is an
-            // override like any other and must survive winit's re-themes.
+            // The explicit High-Contrast deferral is an override like any other.
             WindowTheme::Auto if high_contrast => false,
-            WindowTheme::Auto => return, // the OS owns it; winit's re-theme IS the answer
+            WindowTheme::Auto => return, // the OS owns it; winit's re-theme is the answer
         };
     if matches!(window.theme(), Some(aterm_window::window::Theme::Dark)) == want_dark {
         return; // OS preference already agrees — a clobber cannot do damage
@@ -1611,62 +1393,42 @@ pub(crate) fn verify_chrome_appearance(window: &Window) {
     }
 }
 
-// ---- The aterm window subclass: end-session + the OS-settings hook (W0 §3.2) --------
+// ---- The aterm window subclass: end-session + the OS-settings hook ------------------------
 //
-// ONE subclass, two consumers. `docs/NATIVE_WINDOWS_DESIGN.md` §3.2 forbids stacking
-// `SetWindowLongPtrW` subclasses (a second one displaces the first and the chain
-// order becomes install-order-dependent), so everything that needs to see a SENT or
-// BROADCAST message shares the single proc below. The end-session lane landed first
-// and is documented in its own block further down; this block is the settings lane.
+// One subclass, two consumers: `docs/NATIVE_WINDOWS_DESIGN.md` §3.2 forbids stacking
+// `SetWindowLongPtrW` subclasses (a second displaces the first and the chain order depends on
+// install order). `WM_SETTINGCHANGE` is broadcast and `WM_QUERYENDSESSION` sent; Win32 delivers
+// both by calling the window procedure from inside the thread's message-retrieval call, so
+// neither enters the `GetMessage` stream winit's `with_msg_hook` sees.
 //
-// WHY A SUBCLASS AT ALL — the deferral this closes. `verify_chrome_appearance` and
-// `observe_reduce_motion` both used to say "needs the §3.2 hook", and the reason is a
-// delivery asymmetry: `WM_SETTINGCHANGE` is BROADCAST (`SendMessageTimeout` from the
-// setting's owner, or `HWND_BROADCAST`) and `WM_QUERYENDSESSION` is SENT, and Win32
-// delivers a sent message by calling the window procedure directly from inside
-// whatever message-retrieval call the thread is parked in. It never enters the
-// `GetMessage` stream, which is the only thing winit's `with_msg_hook` can see. So
-// the hook aterm already had is structurally incapable of carrying these — that is
-// why the message never arrived, not an oversight in how it was wired.
+// The settings lane watches:
+//   * `WM_SETTINGCHANGE`: the SPI-backed prefs (animations = Reduce Motion, High Contrast,
+//     wheel scroll lines) and shell/theme notifications ("ImmersiveColorSet", …);
+//   * `WM_SYSCOLORCHANGE`: the system palette the forced HC chrome is built from; switching
+//     between two HC schemes changes no accessibility preference, so only this sees it;
+//   * `WM_THEMECHANGED`: a visual-style change, including entering or leaving High Contrast;
+//   * `WM_DWMCOLORIZATIONCOLORCHANGED`: the accent colour moved.
 //
-// WHAT THIS CATCHES:
-//   * `WM_SETTINGCHANGE` — the SPI-backed prefs (client-area animations = Reduce
-//     Motion, High Contrast, wheel scroll lines) and the shell/theme notifications
-//     ("ImmersiveColorSet", "WindowsThemeElement", "Environment", …).
-//   * `WM_SYSCOLORCHANGE` — the system palette moved, i.e. exactly the input H4's
-//     forced chrome palette is built from. Not in §3.2's original list; it belongs
-//     here because switching BETWEEN two High-Contrast schemes changes every chrome
-//     colour while changing no accessibility PREFERENCE, so it is the one edge no
-//     `AppearancePreferences` comparison can detect.
-//   * `WM_THEMECHANGED` — a visual-style change (including entering/leaving High
-//     Contrast, which is a theme swap as far as uxtheme is concerned).
-//   * `WM_DWMCOLORIZATIONCOLORCHANGED` — the accent colour / colorization moved.
+// These arrive in bursts (one light/dark flip delivers several `WM_SETTINGCHANGE`s and a
+// `WM_THEMECHANGED`), so the proc does no work: it flips one atomic and posts one `Wake` on the
+// 0→1 edge, and the flag clears when the loop re-resolves (`App::resample_os_preferences` →
+// `note_os_settings_resample`). It does not filter by `lParam` section: the sections for
+// "Transparency effects" and the text scale are undocumented, and a false positive costs five
+// cheap reads and no repaint. The proc re-enters while `run_app` holds `&mut App` on this
+// thread, so it may touch only statics; `send_event` is a `PostMessage`, safe from a wndproc.
 //
-// WHY IT COALESCES. These broadcast REPEATEDLY: a single light/dark flip typically
-// delivers several `WM_SETTINGCHANGE`s plus a `WM_THEMECHANGED`, and the caption work
-// already measured trailing "ImmersiveColorSet" broadcasts landing AFTER the event
-// was handled. The proc therefore never does work itself — it flips one atomic and,
-// only on the 0→1 edge, posts ONE `Wake` — so a burst of eight messages costs one
-// event-loop turn. The flag is cleared when the loop actually re-resolves
-// (`App::resample_os_preferences` → [`note_os_settings_resample`]), which is what
-// makes the coalescing window "until the work is done" rather than a guessed timeout.
+// ---- End-session persistence (WM_QUERYENDSESSION / WM_ENDSESSION) -------------------------
 //
-// WHY IT DOES NOT FILTER BY SECTION. `WM_SETTINGCHANGE`'s `lParam` names the changed
-// area, and filtering to a whitelist would cut the false-positive rate (an Explorer
-// restart, `"Environment"`, `SPI_SETWORKAREA` on a monitor hotplug all broadcast).
-// Rejected: the strings for the two settings this hook exists to catch —
-// "Transparency effects" and the accessibility text scale — are not documented, both
-// are written through paths that do not obviously stamp a section at all, and the
-// cost asymmetry is stark. A false positive is five cheap reads and NO repaint (the
-// re-resolve only repaints when a sampled fact moved); a missed section is precisely
-// the bug this hook exists to remove, back in the field with nothing in the log.
+// A Windows shutdown, restart or sign-out sends WM_QUERYENDSESSION then WM_ENDSESSION to every
+// top-level window and then terminates the process: `run_app` never returns, so the graceful
+// `restore::write` never runs. The handler writes the session instead, from a layout snapshot
+// the event loop publishes every couple of seconds (`set_end_session_snapshot` from
+// `about_to_wait`, behind `end_session_snapshot_due`), because `run_app` holds the live `App`.
 //
-// WHY IT POSTS RATHER THAN RESOLVES. The proc re-enters while `run_app` still holds
-// `&mut App` on this very thread (run_app → GetMessage → sent-message dispatch →
-// here), so it may touch only statics — the same constraint the end-session handler
-// documents at length below. `EventLoopProxy::send_event` is a `PostMessage`, which
-// queues rather than dispatches, so it is safe from inside a wndproc and lands on the
-// next loop turn with the borrow released.
+// `SetWindowLongPtrW(GWLP_WNDPROC)`, not comctl32's `SetWindowSubclass`: importing any
+// comctl32 export makes the loader resolve it at start against the activation context, and
+// only the shipped `aterm.exe` carries the v6 manifest; test executables resolve classic 5.82.
+// (`TaskDialogIndirect` avoids the same trap through GetProcAddress; see lib.rs `win32`.)
 //
 // ---- End-session persistence (WM_QUERYENDSESSION / WM_ENDSESSION) -------------------
 //
@@ -1717,16 +1479,14 @@ pub(crate) fn verify_chrome_appearance(window: &Window) {
 // removes. (3) A hard crash gets no WM_ENDSESSION; that lane is the crash-marker
 // banner (`logging::take_crash_evidence`) + `RegisterApplicationRestart`, not this.
 
-/// The last layout snapshot the event loop published, plus its generation — the
-/// ONLY data the end-session handler touches. `None` until the first publish (or
-/// when session restore is configured off).
+/// The last layout snapshot the event loop published, plus its generation: the only data the
+/// end-session handler touches. `None` until the first publish, or with session restore off.
 static END_SESSION_SNAPSHOT: Mutex<Option<(crate::restore::RestoreManifest, u64)>> =
     Mutex::new(None);
 
-/// Monotonic generation of the published snapshot; [`END_SESSION_FLUSHED`] records
-/// the generation last written to disk so the flurry of per-window
-/// WM_QUERYENDSESSION + WM_ENDSESSION deliveries costs ONE durable write, not one
-/// per window per message.
+/// Monotonic generation of the published snapshot; [`END_SESSION_FLUSHED`] records the
+/// generation last written, so the per-window WM_QUERYENDSESSION + WM_ENDSESSION deliveries cost
+/// one durable write.
 static END_SESSION_GEN: AtomicU64 = AtomicU64::new(0);
 static END_SESSION_FLUSHED: AtomicU64 = AtomicU64::new(0);
 
@@ -1752,10 +1512,8 @@ const WM_THEMECHANGED: u32 = 0x031A;
 /// `WM_DWMCOLORIZATIONCOLORCHANGED` — the DWM accent / colorization colour moved.
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 
-/// Does this message mean "an OS appearance or accessibility setting may have
-/// moved"? Split out as a pure predicate so the coalescing policy is testable
-/// without a window, and so the list of watched messages is one readable place
-/// rather than a condition buried in the wndproc.
+/// Does this message mean an OS appearance or accessibility setting may have moved? The
+/// watched messages, in one place.
 fn is_os_settings_message(msg: u32) -> bool {
     matches!(
         msg,
@@ -1764,14 +1522,10 @@ fn is_os_settings_message(msg: u32) -> bool {
 }
 
 thread_local! {
-    /// Nesting depth of aterm's own chrome writes on THIS thread. Thread-local, not
-    /// an atomic, because that is the truth: [`apply_chrome_appearance`] and
-    /// [`aterm_subclass_wndproc`] both run on the winit main thread — and a
-    /// thread-local also means a unit test can hold the guard without racing the
-    /// rest of the suite.
-    ///
-    /// A depth rather than a flag so nesting (a chrome apply reached from inside
-    /// another) cannot end with the guard released early.
+    /// Nesting depth of aterm's own chrome writes on this thread. Thread-local because
+    /// [`apply_chrome_appearance`] and [`aterm_subclass_wndproc`] both run on the winit main
+    /// thread (and a test can hold the guard without racing the suite); a depth so nesting
+    /// cannot release the guard early.
     static CHROME_APPLY_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -1797,7 +1551,7 @@ fn applying_chrome() -> bool {
     CHROME_APPLY_DEPTH.with(std::cell::Cell::get) > 0
 }
 
-/// Should the subclass treat `msg` as an OS settings broadcast *right now*?
+/// Should the subclass treat `msg` as an OS settings broadcast right now?
 ///
 /// THE HOOK MUST NOT FEED ITSELF. [`apply_chrome_appearance`] calls winit's
 /// `Window::set_theme`, which is `try_theme` → `SetWindowTheme(hwnd, …)`
@@ -1812,22 +1566,9 @@ fn applying_chrome() -> bool {
 /// extra pass (nothing moved, so no second chrome write), but "one Wake per burst",
 /// the property this hook is built to provide, was simply not true.
 ///
-/// So: while aterm is writing chrome, `WM_THEMECHANGED` is OURS and is ignored.
-/// NOTHING ELSE is suppressed. The guard is held across one `SetWindowTheme` call on
-/// the main thread, and the only real signal that could land inside that window is a
-/// genuine OS `WM_THEMECHANGED` — which never travels alone: entering, leaving or
-/// switching a visual style or High-Contrast scheme also broadcasts
-/// `WM_SETTINGCHANGE` and `WM_SYSCOLORCHANGE`, both of which still count and still
-/// wake the loop.
-///
-/// Rejected alternatives. (a) Dropping `WM_THEMECHANGED` from the watch list
-/// entirely: it is the one message a bare visual-style swap is guaranteed to send,
-/// and the H4 work measured that swap re-theming the caption. (b) Making winit's
-/// `try_theme` idempotent: a real `WM_THEMECHANGED` means "themes changed, re-apply
-/// yours", so a cache there would skip exactly the re-application the OS is asking
-/// for. (c) Clearing the coalescer at the END of the re-sample instead: that
-/// re-opens the swallowed-trailing-broadcast hole `note_os_settings_resample`
-/// documents.
+/// Not chosen: dropping `WM_THEMECHANGED` from the list (it is the one message a bare
+/// visual-style swap sends), caching in winit's `try_theme` (a real `WM_THEMECHANGED` asks for
+/// re-application), re-arming at the end of the re-sample (that swallows a trailing broadcast).
 fn watch_os_settings_message(msg: u32) -> bool {
     is_os_settings_message(msg) && !(msg == WM_THEMECHANGED && applying_chrome())
 }
@@ -1839,25 +1580,19 @@ fn watch_os_settings_message(msg: u32) -> bool {
 /// could be stale.
 static SETTINGS_PROXY: Mutex<Option<EventLoopProxy<Wake>>> = Mutex::new(None);
 
-/// `true` while a settings `Wake` is posted-but-not-yet-serviced. THE coalescer:
-/// a burst of broadcasts flips this once and posts once. Cleared by
-/// [`note_os_settings_resample`] when the loop actually re-resolves.
+/// `true` while a settings `Wake` is posted but not yet serviced: the coalescer. Cleared by
+/// [`note_os_settings_resample`] when the loop re-resolves.
 static SETTINGS_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
 
-/// Settings broadcasts the subclass has SEEN, and `Wake`s it actually POSTED — the
-/// acceptance surface for this hook, reported by `aterm-ctl chrome` as
-/// `os_settings=seen/woke`.
-///
-/// Both, not one, because the interesting property is the RATIO: the hook is doing
-/// its job when a single Settings flip moves `seen` by several and `woke` by one.
-/// Two counters also make the hook verifiable WITHOUT touching the user's settings —
-/// any process can `SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, …)` and
-/// watch `seen` move, which proves the subclass is chained and receiving. A pair of
-/// relaxed increments on a message path that already does a `Vec` scan.
+/// Settings broadcasts the subclass has seen, and `Wake`s it posted, reported by
+/// `aterm-ctl chrome` as `os_settings=seen/woke`. The ratio is the property: one Settings flip
+/// moves `seen` by several and `woke` by one. Any process can
+/// `SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, …)` and watch `seen` move, which
+/// proves the subclass is chained.
 static SETTINGS_MSGS_SEEN: AtomicU64 = AtomicU64::new(0);
 static SETTINGS_WAKES_POSTED: AtomicU64 = AtomicU64::new(0);
 
-/// Post ONE settings `Wake`, or do nothing if one is already in flight.
+/// Post one settings `Wake`, or do nothing if one is already in flight.
 ///
 /// Runs inside the window procedure, so it touches only statics and a
 /// `PostMessage`-backed proxy send. On a failed send (the loop is gone) the flag is
@@ -1880,13 +1615,9 @@ fn queue_os_settings_wake() {
     }
 }
 
-/// THE coalescing rule: the first watched message of a burst claims the pending flag
-/// and gets to post; every later one finds it set and returns `false`.
-///
-/// Takes the flag by reference rather than reading [`SETTINGS_WAKE_PENDING`] directly
-/// so a test can drive a whole burst — messages, the loop's re-arm, and aterm's own
-/// re-entrant chrome write — against its OWN flag, with no process-global state and
-/// no window. See `one_settings_burst_costs_exactly_one_resample`.
+/// The coalescing rule: the first watched message of a burst claims the pending flag and posts;
+/// every later one finds it set. Takes the flag by reference so a test can drive a whole burst
+/// against its own flag (`one_settings_burst_costs_exactly_one_resample`).
 fn claim_os_settings_wake(pending: &AtomicBool) -> bool {
     !pending.swap(true, Ordering::AcqRel)
 }
@@ -1899,29 +1630,19 @@ fn os_settings_counters() -> (u64, u64) {
     )
 }
 
-/// The event loop is about to re-resolve the OS preferences: re-arm the coalescer so
-/// the NEXT broadcast posts again.
-///
-/// Called from `App::resample_os_preferences` (every platform's shared re-sample
-/// seam) BEFORE it reads anything, deliberately. Clearing first means a broadcast
-/// that races the read — the trailing "ImmersiveColorSet" the caption work measured,
-/// which lands after the setting itself has already changed — posts a second `Wake`
-/// and gets a second re-resolve, rather than being swallowed by a flag we had not
-/// cleared yet. One extra cheap no-op re-read beats a missed settings change.
+/// The event loop is about to re-resolve the OS preferences: re-arm the coalescer so the next
+/// broadcast posts again. Called from `App::resample_os_preferences` before it reads anything,
+/// so a broadcast racing the read (a trailing "ImmersiveColorSet" lands after the setting
+/// changed) posts a second `Wake` rather than being swallowed.
 pub(crate) fn note_os_settings_resample() {
     SETTINGS_WAKE_PENDING.store(false, Ordering::Release);
-    // The wheel-notch distance is an SPI-backed setting like the rest, and its TTL
-    // cache exists only because there was no invalidation signal. Now there is —
-    // dragging Settings ▸ Mouse ▸ "Lines to scroll at a time" broadcasts
-    // `WM_SETTINGCHANGE`, so drop the cache and let the next notch re-read. Not
-    // re-read HERE: this runs on a settings burst, the wheel may not be touched for
-    // hours, and an invalidation costs nothing while a read costs a syscall.
+    // The wheel-notch distance is SPI-backed too: drop its cache so the next notch re-reads
+    // (not re-read here: the wheel may go untouched for hours).
     *WHEEL_NOTCH_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-/// Publish the layout snapshot the end-session handler may write ([`Some`]), or
-/// retract it ([`None`] — session restore configured off, so an end-session must
-/// NOT write a manifest the user asked not to keep).
+/// Publish the layout snapshot the end-session handler may write ([`Some`]), or retract it
+/// ([`None`]: session restore is off, so an end-session must not write a manifest).
 pub(crate) fn set_end_session_snapshot(manifest: Option<crate::restore::RestoreManifest>) {
     let mut slot = END_SESSION_SNAPSHOT
         .lock()
@@ -1929,9 +1650,9 @@ pub(crate) fn set_end_session_snapshot(manifest: Option<crate::restore::RestoreM
     *slot = manifest.map(|m| (m, END_SESSION_GEN.fetch_add(1, Ordering::Relaxed) + 1));
 }
 
-/// Durably write the published snapshot — once per generation, skipping empty
-/// layouts (the graceful-exit path applies the same `is_empty` gate). Runs inside
-/// the wndproc, so it touches ONLY the statics above plus the filesystem.
+/// Durably write the published snapshot, once per generation, skipping empty layouts (the
+/// graceful-exit path applies the same `is_empty` gate). Runs inside the wndproc, so it touches
+/// only the statics above and the filesystem.
 fn flush_end_session_snapshot() {
     let slot = END_SESSION_SNAPSHOT
         .lock()
@@ -1952,20 +1673,11 @@ fn flush_end_session_snapshot() {
 /// OS-settings broadcasts into a single `Wake`, and forward other messages
 /// (including end-session and settings) to winit's original proc.
 ///
-/// WM_QUERYENDSESSION wants TRUE ("OK to end the session") — winit has no arm for
-/// it, so the chain lands in `DefWindowProc`, which returns exactly that; writing
-/// the manifest BEFORE forwarding means the answer never races the save.
-/// WM_ENDSESSION with `wparam == TRUE` ("the session IS ending — the process can
-/// be terminated any time after this returns") is the hard flush: a normal
-/// shutdown already wrote at QUERY time and the generation guard makes this a
-/// no-op, but a critical shutdown may skip the query phase entirely.
-///
-/// The settings messages are handled BEFORE forwarding for a different reason than
-/// end-session's: winit's own `WM_SETTINGCHANGE` arm re-themes the non-client area
-/// and may emit `ThemeChanged`, and posting first means the coalescer has already
-/// claimed the burst — so winit's event and ours cannot both schedule a re-resolve
-/// for the same flip. They are forwarded UNCHANGED either way; nothing here consumes
-/// a message, because winit's dark-mode tracking depends on seeing all of them.
+/// WM_QUERYENDSESSION wants TRUE, which `DefWindowProc` returns (winit has no arm); the manifest
+/// is written before forwarding so the answer never races the save. WM_ENDSESSION with
+/// `wparam == TRUE` is the hard flush for a critical shutdown that skips the query (otherwise
+/// the generation guard makes it a no-op). Settings messages are claimed before forwarding, so
+/// winit's `ThemeChanged` and our `Wake` cannot both schedule a re-resolve for one flip.
 unsafe extern "system" fn aterm_subclass_wndproc(
     hwnd: isize,
     msg: u32,
@@ -2020,11 +1732,8 @@ unsafe extern "system" fn aterm_subclass_wndproc(
 /// wndproc) happens only inside message-retrieval calls, none of which occur under
 /// this lock.
 ///
-/// The proxy is published ONCE — first writer wins — and before the HWND bail-out.
-/// There is one event loop per process, so every window's proxy addresses the same
-/// loop and a later one would be interchangeable; publishing ahead of the bail-out is
-/// what keeps the static warm even for a window that has no HWND yet, or whose
-/// `SetWindowLongPtrW` swap then fails.
+/// The proxy is published once (first writer wins: one event loop per process) and before the
+/// HWND bail-out, so the static is warm even for a window with no HWND yet or a failed swap.
 fn install_window_subclass(window: &Window, proxy: &EventLoopProxy<Wake>) {
     {
         let mut slot = SETTINGS_PROXY.lock().unwrap_or_else(|e| e.into_inner());
@@ -2065,38 +1774,27 @@ pub(crate) struct AppRtWindows {
 }
 
 impl AppRt for AppRtWindows {
-    /// Paint the window-class background brush the terminal's THEME background —
-    /// the white-flash fix. winit registers its window class with a NULL
-    /// `hbrBackground` (vendored winit `window.rs`), so between `set_visible` and
-    /// the first swapchain present the unpainted client area erases to WHITE — a
-    /// visible flash on every dark-theme launch (and the flash window covers the
-    /// whole GPU-init tail on a cold start). Setting a theme-bg `HBRUSH` on the
-    /// class makes `WM_ERASEBKGND` paint theme colour instead, so the window is
-    /// born looking like the terminal. Class-wide (all aterm windows share the
-    /// theme) and repeat-safe: the PREVIOUS brush we installed is deleted after
-    /// each swap (the first swap returns winit's null brush → nothing to delete).
-    /// COLORREF is 0x00BBGGRR, so the theme's 0x00RRGGBB is R/B-swapped.
+    /// Paint the window-class background brush the theme background. winit registers its class
+    /// with a NULL `hbrBackground`, so between `set_visible` and the first present the client
+    /// area erases to white, a flash on every dark launch; a theme-bg `HBRUSH` makes
+    /// `WM_ERASEBKGND` paint theme colour. Class-wide (all windows share the theme) and
+    /// repeat-safe: the previous brush we installed is deleted after each swap.
     fn window_set_background_color(&self, window: &Window, bg: u32) {
-        // Latch the terminal background for the caption resolver BEFORE anything can
-        // bail out: this is the only route by which the Windows arm learns the theme
-        // bg, and it must stay current even for a window with no HWND yet (headless /
-        // not-yet-realized), because the NEXT window to realize resolves from it.
-        // Masked to 24 bits so a caller passing a stray alpha byte can never look like
-        // the `CHROME_BG_UNKNOWN` sentinel.
+        // Latch the background for the caption resolver before any bail-out: this is the
+        // Windows arm's only route to the theme bg, and the next window to realize resolves
+        // from it. Masked to 24 bits so it can never equal `CHROME_BG_UNKNOWN`.
         CHROME_BG.store(bg & 0x00FF_FFFF, Ordering::Relaxed);
-        // Every publisher of this value (attach, `apply_theme_live`, the `reload_config`
-        // theme commit) is exactly a "the terminal background may have changed" event,
-        // so it is also the right place to re-run the `Auto` caption resolution — a
-        // dark→light theme edit must repaint the caption, not just the class brush.
+        // Every publisher of this value is a "background may have changed" event, so re-run
+        // the `Auto` caption resolution: a dark→light edit repaints the caption too.
         resync_chrome_appearance(window);
         let Some(hwnd) = hwnd_of(window) else {
             return;
         };
         let colorref = colorref_swap(bg);
-        // SAFETY: two documented leaf calls. The created brush is OWNED by the
-        // window class after the swap (the OS uses it for every later erase); the
-        // previously-installed brush (ours, from an earlier theme apply) is deleted
-        // exactly once here. A zero previous value is winit's null brush — skipped.
+        // SAFETY: two documented leaf calls. The window class owns the created brush after
+        // the swap (the OS uses it for every later erase); the previously installed brush
+        // (ours, from an earlier theme apply) is deleted exactly once here. A zero previous
+        // value is winit's null brush, skipped.
         unsafe {
             let brush = CreateSolidBrush(colorref);
             if brush == 0 {
@@ -2109,17 +1807,11 @@ impl AppRt for AppRtWindows {
         }
     }
 
-    /// L1 (early reveal): force the class-brush themed erase onto glass NOW.
-    ///
-    /// Between the early `set_visible` and the backend join's return, the
-    /// event-loop thread is blocked and processes no queued messages — the
-    /// freshly shown window would present its client area *unpainted* (white)
-    /// for the whole join, which is exactly the flash the class brush exists to
-    /// prevent. `RDW_ERASENOW` delivers `WM_ERASEBKGND` synchronously (a direct
-    /// same-thread wndproc call, no queue involved); winit does not intercept
-    /// that message, so `DefWindowProc` fills with the theme brush installed by
-    /// [`Self::window_set_background_color`] — which therefore MUST run first.
-    /// Best-effort like every chrome call here: no HWND yet → nothing to paint.
+    /// Force the class-brush themed erase onto glass now: during the early-reveal join the
+    /// event-loop thread processes no messages, so the shown window would stay unpainted.
+    /// `RDW_ERASENOW` delivers `WM_ERASEBKGND` synchronously and `DefWindowProc` fills with the
+    /// brush [`Self::window_set_background_color`] installed, which must run first. No HWND is a
+    /// no-op.
     fn window_flush_backdrop(&self, window: &Window) {
         let Some(hwnd) = hwnd_of(window) else {
             return;
@@ -2136,17 +1828,10 @@ impl AppRt for AppRtWindows {
         }
     }
 
-    /// Apply the native title-bar appearance: winit's `set_theme` for the uxtheme side,
-    /// an explicit `DWMWA_USE_IMMERSIVE_DARK_MODE` write (winit drives only the
-    /// undocumented `WCA_USEDARKMODECOLORS`, never that documented attribute, so the
-    /// value `aterm-ctl chrome` reads back has to come from us), and the rounded-corner
-    /// preference winit does not expose. Best-effort; a window with no `HWND` yet just
-    /// gets the winit theme.
-    ///
-    /// Config `Light`/`Dark` are hard overrides. `Auto` is resolved HERE, on Windows
-    /// only, against the terminal background rather than the OS preference — see the
-    /// "Auto-theme caption resolution" block above for why a light DWM caption over a
-    /// dark grid is a defect on this platform but not on macOS.
+    /// Apply the native title-bar appearance ([`apply_chrome_appearance`]): winit's
+    /// `set_theme`, an explicit `DWMWA_USE_IMMERSIVE_DARK_MODE`, and the rounded-corner
+    /// preference. `Light`/`Dark` are hard overrides; `Auto` resolves against the terminal
+    /// background (see "Auto-theme caption resolution" above).
     fn window_set_appearance(&self, window: &Window, theme: WindowTheme) {
         // Latch the policy so the background-publish and OS-flip seams can re-run this
         // same resolution later without the caller re-supplying it.
@@ -2154,12 +1839,9 @@ impl AppRt for AppRtWindows {
         apply_chrome_appearance(window, theme);
     }
 
-    /// INTENTIONAL no-op on Windows: the swapchain colour space (scRGB for the HDR
-    /// EDR present) is tagged in the renderer via wgpu `as_hal` at surface creation
-    /// (`aterm-gpu`), not through this window-level seam — the CAMetalLayer tag this
-    /// method models is a macOS concept. Report the effective source coordinates:
-    /// the renderer already confirmed scRGB before exposing an HDR surface;
-    /// Windows has no Display-P3 tag here, so that request remains ordinary sRGB.
+    /// No-op at the window level: the swapchain colour space (scRGB for the HDR present) is
+    /// tagged in `aterm-gpu` at surface creation. Reports the effective source coordinates: the
+    /// renderer confirmed scRGB before exposing an HDR surface, and Display-P3 stays sRGB here.
     fn window_set_surface_colorspace(
         &self,
         _window: &Window,
@@ -2191,40 +1873,23 @@ impl AppRt for AppRtWindows {
         None
     }
 
-    /// Install / update / remove the DWM **system backdrop** (`DWMWA_SYSTEMBACKDROP_TYPE`):
-    /// `background_material` maps to Mica (`UnderWindow`) / Mica-Alt (`Sidebar`) /
-    /// Acrylic (`Hud`), and `None` (the default) to `DWMSBT_NONE` — a plain opaque
-    /// window. This is `background_material`'s Windows DWM half.
+    /// Install / update / remove the DWM system backdrop (`DWMWA_SYSTEMBACKDROP_TYPE`):
+    /// `background_material` maps to Mica (`UnderWindow`), Mica Alt (`Sidebar`) or Acrylic
+    /// (`Hud`), and `None` (the default) to `DWMSBT_NONE`.
     ///
-    /// WHERE THE MATERIAL ACTUALLY SHOWS depends on the client presentation path
-    /// (`aterm-ctl chrome` → `client=`). The field's full grammar is
-    /// `visual | opaque | opaque(<reason>)` — the qualified form names the DECLINE
-    /// that put the client on the opaque path (`hdr_glow`, `no_gpu`,
-    /// `dcomp_unavailable`, `gpu_lost`, `not_at_launch`); see
-    /// [`ClientBackdropDecline`] for the code↔token map. A bare `opaque` means
-    /// nothing was declined — no material was ever configured:
-    ///   * `client=opaque` (the default HWND swapchain): the CAPTION only. The
-    ///     client area — window padding included — is the offscreen framebuffer,
-    ///     presented through a swapchain whose sole composite mode is Opaque, so
-    ///     it covers the backdrop completely. (An earlier version of this comment
-    ///     claimed the material showed in "caption/padding"; the padding half was
-    ///     false — H1 — because padding is interior to the framebuffer.)
-    ///   * `client=visual` (H1: material configured at launch, GPU renderer):
-    ///     the caption AND the client-area margins — the padding gutters and the
-    ///     chrome-bleed strip carry per-pixel alpha through the DirectComposition
-    ///     visual swapchain and the material really blends through them. The GRID
-    ///     BODY stays opaque either way (the ratified design; renderer clears it).
+    /// Where the material shows depends on the client presentation path (`aterm-ctl chrome` →
+    /// `client=visual | opaque | opaque(<reason>)`, the reason a [`ClientBackdropDecline`]
+    /// token; a bare `opaque` means no material was configured):
+    ///   * `client=opaque` (the default HWND swapchain): the caption only. The client area,
+    ///     padding included, is the framebuffer, presented opaque.
+    ///   * `client=visual` (material configured at launch, GPU renderer): the caption and the
+    ///     client-area margins (padding gutters, chrome-bleed strip), whose per-pixel alpha
+    ///     blends through the DirectComposition visual. The grid body stays opaque.
     ///
-    /// `translucent` (the M5 opacity flag) is not consulted here: Mica needs no
-    /// window-level opacity flip on Windows (the alpha lives in the presented
-    /// frame). Best-effort; a silent no-op pre-22H2.
-    ///
-    /// REDUCED TRANSPARENCY suppresses the material entirely — High Contrast, or
-    /// Settings ▸ Personalization ▸ Colours ▸ "Transparency effects" turned off. That
-    /// gate is applied where the attribute is WRITTEN ([`apply_backdrop`]), not here,
-    /// so the same resolution runs whether the config or the OS preference is what
-    /// moved; this method only latches the request. `aterm-ctl chrome` reports both
-    /// (`cfg_backdrop=` is what config asked for, `backdrop=` is what DWM has).
+    /// `translucent` is not consulted: the alpha lives in the presented frame. Reduced
+    /// transparency (High Contrast, or "Transparency effects" off) suppresses the material where
+    /// the attribute is written ([`apply_backdrop`]); this method only latches the request.
+    /// `cfg_backdrop=` is what config asked for, `backdrop=` what DWM has. A no-op before 22H2.
     fn window_set_vibrancy(
         &self,
         window: &Window,
@@ -2232,37 +1897,17 @@ impl AppRt for AppRtWindows {
         _translucent: bool,
         _bg: u32,
     ) {
-        // Latch the REQUEST unconditionally, before anything below can bail out, so
-        // the config's answer is on record even for a window this call cannot reach.
-        //
-        // (This used to claim it was latching what the caption-tint resolver reads,
-        // "before the hwnd bail-out". That stopped being true when the write moved
-        // into `apply_backdrop`: the tint gates on `CHROME_BACKDROP` — the EFFECTIVE
-        // value — which is written inside `apply_backdrop`, itself downstream of
-        // `apply_chrome_appearance`'s own `hwnd_of` bail-out. On a window with no
-        // HWND the effective latch is therefore NOT updated. Unreachable in practice,
-        // since a live winit Win32 window always has one, but the comment was selling
-        // a guarantee the refactor had removed.)
-        //
-        // The request and the live reduced-transparency preference are resolved
-        // together in `apply_backdrop`, reached through the `resync_chrome_appearance`
-        // below — see the "reduced-transparency gate" block above.
+        // Latch the request before anything can bail out, so config's answer is on record even
+        // for a window this call cannot reach. `apply_backdrop` (via `resync_chrome_appearance`
+        // below) resolves it against the live reduced-transparency preference and latches the
+        // effective `CHROME_BACKDROP`.
         CHROME_BACKDROP_REQUESTED.store(backdrop_for(material), Ordering::Relaxed);
-        // H1 honesty: a NON-none material reaching a window whose client path is
-        // the plain HWND swapchain (material turned on by a live reload after an
-        // opaque launch, or the GPU init failed) can only ever style the caption
-        // — the visual swapchain is an instance-level choice made at launch.
-        // Warn once so "I set Mica and only the title bar changed" has a printed
-        // answer naming the fix, instead of a silent visual shortfall. When the
-        // visual request was made and then WITHDRAWN this run (GPU init failed,
-        // DirectComposition unavailable at the first attach, device lost), the
-        // fix is NOT a restart — that arm already printed the real cause, so
-        // point at it instead of advising a relaunch that repeats the failure.
-        //
-        // Gated on the EFFECTIVE backdrop, not the configured one: under reduced
-        // transparency there is no material on the window at all, so telling the
-        // user it is "styling the caption only" would name the wrong cause and send
-        // them to restart aterm over an accessibility setting.
+        // A material on a window whose client path is the plain HWND swapchain can style only
+        // the caption: the visual swapchain is chosen at launch. Warn once, naming the fix; when
+        // the visual request was withdrawn this run (GPU init failed, DirectComposition
+        // unavailable, device lost), that arm already printed the cause, so point at it rather
+        // than advise a relaunch. Gated on the effective backdrop: under reduced transparency
+        // there is no material on the window at all.
         if effective_backdrop(backdrop_for(material)) != DWMSBT_NONE
             && !aterm_gpu::visual_swapchain_active()
         {
@@ -2274,11 +1919,8 @@ impl AppRt for AppRtWindows {
                          (client=opaque): the client-area backdrop path was withdrawn \
                          this run — see the diagnostic above"
                     );
-                    // The withdrawing arm already latched the REAL cause
-                    // (`no_gpu` / `dcomp_unavailable` / `gpu_lost`) and already
-                    // queued its own notice; first-writer-wins keeps that cause
-                    // and re-queueing here would only say "see above" to someone
-                    // who has no above.
+                    // The withdrawing arm already latched the cause (`no_gpu` /
+                    // `dcomp_unavailable` / `gpu_lost`) and queued its own notice.
                 } else {
                     crate::logging::stderr_line!(
                         "aterm-gui: background_material is styling the caption only \
@@ -2286,19 +1928,10 @@ impl AppRt for AppRtWindows {
                          is set at launch with the GPU renderer and hdr_glow off — restart \
                          aterm to see it in the padding"
                     );
-                    // The honesty half — and the reason this arm needs one at all:
-                    // it is the LIVE-RELOAD path. A user who edits
-                    // `background_material` into a running aterm gets a caption
-                    // tint change and nothing else, with no console anywhere.
-                    //
-                    // ONLY when nothing has already explained the shortfall. This
-                    // arm also fires at LAUNCH behind an `hdr_glow` decline (the
-                    // request was never made, so the material is "not active" by
-                    // the time the first window is chromed) — and stacking
-                    // "relaunch with the material set" under "hdr_glow blocks it"
-                    // would put the vaguer of the two sentences second and invite
-                    // a pointless relaunch. The latch is the same first-writer
-                    // rule; this reads it so the BANNER obeys it too.
+                    // This arm is the live-reload path: editing `background_material` into a
+                    // running aterm changes only the caption, with no console. Queue the notice
+                    // only when nothing has explained the shortfall: at launch this arm also
+                    // fires behind an `hdr_glow` decline, which must stay the one cause shown.
                     if client_backdrop_decline().is_none() {
                         crate::message_inbox::queue_message(
                             crate::message_reporters::backdrop_declined(
@@ -2313,23 +1946,15 @@ impl AppRt for AppRtWindows {
                 }
             });
         }
-        // A material change flips the tint gate in BOTH directions (`none` → Mica
-        // must clear the tint; Mica → `none` must restore it), so re-run the
-        // caption resolution under the latched policy.
+        // A material change flips the tint gate both ways (`none` → Mica clears the tint;
+        // Mica → `none` restores it), so re-run the caption resolution under the latched policy.
         resync_chrome_appearance(window);
     }
 
-    /// The work area of the monitor `window` sits on — `GetMonitorInfoW`'s
-    /// `rcWork`, i.e. the display rectangle MINUS the taskbar and any other
-    /// appbar — converted to logical points by the WINDOW's scale factor, which
-    /// is the same divisor winit applies to `outer_position()`, so the cascade
-    /// compares like with like.
-    ///
-    /// Without this the trait default (`None`) sent the new-window cascade to
-    /// the winit MONITOR bounds, which include the taskbar: a cascaded window
-    /// wrapped to a position partly underneath it. `MONITOR_DEFAULTTONEAREST`
-    /// keeps a window dragged half off-screen answering with the monitor it is
-    /// mostly on rather than failing.
+    /// The work area of `window`'s monitor (`GetMonitorInfoW`'s `rcWork`: the display minus the
+    /// taskbar and other appbars) in logical points by the window's scale factor, the divisor
+    /// winit applies to `outer_position()`. `MONITOR_DEFAULTTONEAREST` keeps a window half
+    /// off-screen answering with the monitor it is mostly on.
     fn window_work_area_pts(&self, window: &Window) -> Option<crate::app_window::WorkAreaPts> {
         let hwnd = hwnd_of(window)?;
         let mut info = MonitorInfo {
@@ -2352,13 +1977,11 @@ impl AppRt for AppRtWindows {
         work_area_pts_from_rect(&info.work, window.scale_factor())
     }
 
-    /// Un-minimize and raise this window for an `attach` forward. `SW_RESTORE`
-    /// first (a minimized window cannot take the foreground), then
-    /// `SetForegroundWindow`, whose cross-process refusal the FORWARDING
-    /// `aterm.exe` has already lifted with `AllowSetForegroundWindow(our pid)`.
-    /// Without that grant this degrades to the OS's taskbar flash rather than
-    /// stealing focus from whatever the user is typing into — which is exactly
-    /// the behaviour Windows wants, so no fallback hack belongs here.
+    /// Un-minimize and raise this window for an `attach` forward: `SW_RESTORE` first (a
+    /// minimized window cannot take the foreground), then `SetForegroundWindow`, whose
+    /// cross-process refusal the forwarding `aterm.exe` lifted with
+    /// `AllowSetForegroundWindow(our pid)`. Without that grant Windows flashes the taskbar
+    /// rather than stealing focus, as it should.
     fn window_bring_to_front(&self, window: &Window) -> bool {
         let Some(hwnd) = hwnd_of(window) else {
             return false;
@@ -2374,8 +1997,8 @@ impl AppRt for AppRtWindows {
     }
 
     /// The panel's EDR headroom for `window`'s monitor when Windows HDR is on
-    /// (`MaxLuminance / SDR-white`), or `1.0` (no headroom → the aurora pass is
-    /// provably inert) when HDR is off or any query fails. See [`crate::hdr_win`].
+    /// (`MaxLuminance / SDR-white`), or `1.0` (no headroom, so the aurora pass is inert) when
+    /// HDR is off or any query fails. See [`crate::hdr_win`].
     fn screen_edr_max(&self, window: &Window) -> f32 {
         crate::hdr_win::edr_max(window)
     }
@@ -2404,22 +2027,16 @@ impl AppRt for AppRtWindows {
         crate::notify::spawn_delivery(suppress, silent, own_alerts, center)
     }
 
-    /// Delegate to the shared menu module — `None` on Windows BY DESIGN:
-    /// docs/WINDOWS_PARAGON_DESIGN.md rejects a native menu bar; the own-rendered
-    /// command palette + keybindings are the command surface.
+    /// Delegate to the shared menu module: `None` on Windows by design
+    /// (docs/WINDOWS_PARAGON_DESIGN.md rejects a native menu bar; the own-rendered command
+    /// palette and keybindings are the command surface).
     fn install_menu(&self, proxy: &EventLoopProxy<Wake>) -> Option<menu::MenuHandle> {
         menu::install(proxy)
     }
 
-    /// Delegate to the shared toolbar module (the real in-memory tab-chrome model).
-    ///
-    /// Also chains the aterm wndproc subclass onto this window here — piggy-backed
-    /// because this is the ONE `AppRt` seam the Windows arm receives exactly once
-    /// per window at attach with BOTH the `&Window` and the `EventLoopProxy` in hand
-    /// (the alternative, `window_set_background_color`, re-runs on every theme
-    /// publish and carries no proxy; the install is idempotent either way, this is
-    /// just the honest cadence). The proxy is what the settings lane posts its
-    /// coalesced `Wake` through — see the subclass block above.
+    /// Delegate to the shared toolbar module, and chain the aterm wndproc subclass here: this
+    /// is the one seam reached once per window at attach with both the `&Window` and the
+    /// `EventLoopProxy` the settings lane posts through.
     fn install_toolbar(
         &self,
         window: &Window,
@@ -2463,30 +2080,23 @@ impl AppRt for AppRtWindows {
         crate::win32::confirm_proceed_cancel(title, body, proceed_label)
     }
 
-    /// A no-op — but NOT because Windows lacks the gesture class this hook exists
-    /// for. A USER-driven close routes through winit `CloseRequested` and is
-    /// confirmed there; the OS-driven end (shutdown / restart / sign-out), which
-    /// this macOS `terminate:` seam also covers there, arrives as a SENT
-    /// `WM_QUERYENDSESSION` that no winit event carries — on Windows it is
-    /// handled by the end-session wndproc chain installed per window at attach
-    /// (see `install_window_subclass`), which persists the session rather than
-    /// prompting: blocking a machine shutdown on a dialog is hostile, and with
-    /// the layout saved there is nothing left to warn about.
+    /// A no-op: a user-driven close is confirmed at winit `CloseRequested`, and the OS-driven
+    /// end (shutdown, restart, sign-out), which macOS's `terminate:` seam covers, arrives as a
+    /// sent `WM_QUERYENDSESSION` that the end-session subclass answers by saving the session
+    /// rather than prompting: blocking a shutdown on a dialog is hostile.
     fn install_quit_confirm(&self) {}
 
-    /// The OS Reduce-Motion preference, read from `SPI_GETCLIENTAREAANIMATION` (the
-    /// "Show animations in Windows" master switch): animations OFF ⇒ reduce motion.
-    /// Feeds [`crate::motion::MotionPolicy`]. Fail-safe to `false` (do not reduce) if
-    /// the query fails.
+    /// The OS Reduce-Motion preference, read from `SPI_GETCLIENTAREAANIMATION` (the "Show
+    /// animations in Windows" master switch): animations off ⇒ reduce motion. Feeds
+    /// [`crate::motion::MotionPolicy`]; `false` (do not reduce) if the query fails.
     fn reduce_motion(&self) -> bool {
         if !self.probe_preferences {
             return false;
         }
         let mut animations_enabled: i32 = 1;
-        // SAFETY: a single documented `SystemParametersInfoW` read into a local
-        // `BOOL`; `ui_param`/`fw_ini` are 0 (no set), and the out-pointer is valid
-        // for the call. Non-zero return = success; the `BOOL` is TRUE when
-        // client-area animations are ENABLED.
+        // SAFETY: a single documented `SystemParametersInfoW` read into a local `BOOL`;
+        // `ui_param`/`fw_ini` are 0 (no set), and the out-pointer is valid for the call.
+        // Non-zero return = success; the `BOOL` is true when client-area animations are on.
         let ok = unsafe {
             SystemParametersInfoW(
                 SPI_GETCLIENTAREAANIMATION,
@@ -2495,42 +2105,19 @@ impl AppRt for AppRtWindows {
                 0,
             )
         };
-        // Reduce motion when the query succeeded AND animations are disabled.
         ok != 0 && animations_enabled == 0
     }
 
-    /// The three OS appearance preferences the shared native-UI palette conditions
-    /// on, all read LIVE (H5): High Contrast, reduced transparency, and the
-    /// accessibility text scale.
+    /// The three OS appearance preferences the shared native-UI palette conditions on, read
+    /// live:
     ///
     /// Two of the three used to be fictions rather than merely stale —
     /// `reduced_transparency` was set to `high_contrast` and `text_scale` was
     /// hardcoded to `1.0`, so the real "Transparency effects" switch and the real
     /// `TextScaleFactor` were never read at all. They are now:
     ///
-    ///  * `reduced_transparency` = High Contrast **or** "Transparency effects" off
-    ///    ([`transparency_effects_enabled`]). Consumed by [`apply_backdrop`], which
-    ///    suppresses the Mica/Acrylic request — the pref is no longer dead.
-    ///  * `text_scale` = Settings ▸ Accessibility ▸ Text size ([`os_text_scale`]),
-    ///    clamped to `[0.85, 2.0]` by `AppearancePreferences::normalized`. HONEST
-    ///    SCOPE: its consumers are the NATIVE-VIEW surfaces — the settings app, the
-    ///    document/recovery pages, their toolbars (`native_settings.rs`,
-    ///    `native_app.rs`). The terminal grid does NOT scale with it (a terminal's
-    ///    type size is `font_size`, and the grid is content, not chrome), and neither
-    ///    does the tab strip's pixel band, whose label is pinned to the chrome base
-    ///    size. So this moves real pixels, but not the ones a user staring at the
-    ///    strip would expect it to.
-    ///
-    /// Publishing the forced chrome palette here as a documented side effect is what
-    /// makes every existing `install_preferences` seam — window attach, startup,
-    /// settings preview — also settle the High-Contrast chrome, with no new call at
-    /// each of those sites. It is also the ONE `SPI_GETHIGHCONTRAST` read: the
-    /// caption resolver's [`CHROME_HIGH_CONTRAST`] latch is refreshed from the same
-    /// answer, keeping the promise in that latch's doc that its readers can never
-    /// disagree. (That mattered from the H5 partial onward: focus-gain re-samples
-    /// preferences, so an HC flip made while aterm was in the background lands here
-    /// FIRST — without the store, the frame guard would keep defending a stale
-    /// non-HC caption until some other seam ran `apply_chrome_appearance`.)
+    /// Publishing the forced chrome palette here lets every `install_preferences` seam (attach,
+    /// startup, settings preview) also settle the High-Contrast chrome.
     fn native_appearance_preferences(&self) -> crate::native_appearance::AppearancePreferences {
         if !self.probe_preferences {
             return crate::native_appearance::AppearancePreferences::default();
@@ -2549,25 +2136,13 @@ impl AppRt for AppRtWindows {
         }
     }
 
-    /// Still `None` — and now for a POSITIVE reason rather than a deferral.
-    ///
-    /// `ReduceMotionObserver` models a platform object that must be kept alive for a
-    /// subscription to stay valid (macOS's `NSWorkspace` notification observer, which
-    /// is unregistered on drop). Windows has no such object: the change signal is a
-    /// broadcast window message, and it is already delivered — by the aterm window
-    /// subclass installed at attach (see the §3.2 block above), which coalesces the
-    /// burst and posts one `Wake::ReduceMotionChanged`. There is nothing for this
-    /// method to hand back and nothing whose lifetime needs holding, so returning
-    /// `None` is the accurate answer, not a missing feature.
-    ///
-    /// The live path, end to end: user flips a Settings switch → Windows broadcasts
-    /// `WM_SETTINGCHANGE`/`WM_SYSCOLORCHANGE`/`WM_THEMECHANGED` →
-    /// [`aterm_subclass_wndproc`] → one `Wake` → `App::resample_os_preferences` →
-    /// `AppRt::reduce_motion` + this method + [`resync_forced_chrome_palette`] +
-    /// [`resync_chrome_appearance`] → repaint only if a sampled fact moved. The
-    /// `ThemeChanged` and focus-gain seams from the H5 partial are KEPT as belt and
-    /// braces: they cost two reads on rare events and cover the window between
-    /// process start and the first `install_toolbar`.
+    /// `None`: `ReduceMotionObserver` models an object kept alive for a subscription (macOS's
+    /// workspace observer). Windows delivers the change as a broadcast window message to the
+    /// aterm subclass installed at attach, which coalesces the burst into one
+    /// `Wake::ReduceMotionChanged`; `App::resample_os_preferences` then re-reads
+    /// ([`resync_forced_chrome_palette`], `reduce_motion`, `native_appearance_preferences`,
+    /// [`resync_chrome_appearance`]) and repaints only if a sampled fact moved. The
+    /// `ThemeChanged` and focus-gain seams stay as a backstop before the first `install_toolbar`.
     fn observe_reduce_motion(&self, _proxy: &EventLoopProxy<Wake>) -> Option<ReduceMotionObserver> {
         None
     }
@@ -2641,9 +2216,9 @@ pub(crate) fn capture_window_bgrx(window: &Window) -> Result<(Vec<u8>, u32, u32)
         // unspecified, so it can never be treated as a best-effort success.
         let print_succeeded = PrintWindow(hwnd, mem, PW_RENDERFULLCONTENT) != 0;
 
-        // Win32 requires `hbmp` NOT to be selected into a DC while GetDIBits reads
-        // it. Restore the old object first; if that fails, destroy the DC (which
-        // releases its selected objects) before deleting the bitmap.
+        // Win32 requires `hbmp` not be selected into a DC while GetDIBits reads it. Restore
+        // the old object first; if that fails, destroy the DC (which releases its selected
+        // objects) before deleting the bitmap.
         if SelectObject(mem, old) == 0 {
             DeleteDC(mem);
             DeleteObject(bmp);
@@ -2736,11 +2311,9 @@ mod tests {
     use crate::native_appearance::AppearancePreferences;
     use crate::platform::AppRt;
 
-    /// The work area the cascade wraps against EXCLUDES the taskbar and is
-    /// denominated in the same logical points winit reports window positions in.
-    /// A 1920x1080 display with a 48 px taskbar at the bottom, at 150%: the
-    /// rectangle is 1280x688 points, not 1280x720 — the 32 points of difference
-    /// are exactly the strip a cascaded window used to wrap underneath.
+    /// The work area excludes the taskbar and is in the logical points winit reports window
+    /// positions in: a 1920x1080 display with a 48 px bottom taskbar at 150% is 1280x688
+    /// points, not 1280x720.
     #[test]
     fn the_work_area_drops_the_taskbar_and_lands_in_logical_points() {
         let taskbar_at_the_bottom = Rect {
@@ -2753,7 +2326,7 @@ mod tests {
         assert_eq!((area.x, area.y), (0.0, 0.0));
         assert_eq!(area.w, 1280.0);
         assert_eq!(area.h, 688.0);
-        // A taskbar docked LEFT moves the origin too, and a second monitor's
+        // A taskbar docked left moves the origin too, and a second monitor's
         // rectangle is offset in the virtual desktop.
         let docked_left_on_a_second_display = Rect {
             left: 1920 + 72,
@@ -2803,10 +2376,8 @@ mod tests {
         }
     }
 
-    /// The §3.2 settings hook watches exactly the four messages that can carry an OS
-    /// appearance or accessibility change, and NOTHING else — the wndproc is on the
-    /// path of every message this window ever receives, so a loose predicate here
-    /// would post a `Wake` on mouse moves.
+    /// The settings hook watches exactly the four appearance/accessibility messages: the
+    /// wndproc sees every message, so a loose predicate would post a `Wake` on mouse moves.
     #[test]
     fn the_settings_hook_watches_exactly_the_appearance_messages() {
         for msg in [
@@ -2842,33 +2413,15 @@ mod tests {
 
     /// THE INSTALLER IS THE OTHER END-SESSION CALLER, AND IT MUST STAY ONE.
     ///
-    /// `install.ps1` / `uninstall.ps1` stop a running aterm with `Stop-Process
-    /// -Force`, which is `TerminateProcess`: no message, no wndproc turn, no exit
-    /// path — so neither the graceful `restore::write` after `run_app` nor
-    /// [`flush_end_session_snapshot`] above ever runs, and on a machine where
-    /// "update" means re-running the script the layout was destroyed on every
-    /// install. The scripts therefore SEND `WM_QUERYENDSESSION` first and let this
-    /// file's subclass do the durable write.
-    ///
-    /// Five properties, and nothing about them is visible from either file alone:
-    ///
-    /// 1. The scripts spell the message as the SAME numeric constant this module
-    ///    defines. They cannot `use` it, so this is the join — change one and the
-    ///    installer would politely send some other message into the void.
-    /// 2. It is SENT at the call site. A posted message would still be queued when
-    ///    `TerminateProcess` lands, which is the original bug with extra steps.
-    /// 3. The ask comes BEFORE the force-kill, and the force-kill SURVIVES. An ask
-    ///    that runs afterwards saves nothing; dropping the kill would leave a
-    ///    build older than the subclass (or a hung pump) holding the exe's file
-    ///    lock forever.
-    /// 4. Neither script reaches for `CloseMainWindow()` (`WM_CLOSE`), the obvious
-    ///    alternative: on a multi-tab window that raises aterm's close-confirm
-    ///    TaskDialog and the installer would block on a modal nobody is watching.
-    /// 5. The two embedded helpers are BYTE-IDENTICAL. The duplication is forced —
-    ///    `install.ps1 -Register` copies uninstall.ps1 standalone into the install
-    ///    dir as the Apps & Features UninstallString, so it can share a module with
-    ///    nothing — and a fix applied to one copy only is the obvious way to half-
-    ///    repair this.
+    /// 1. The scripts spell the message as this module's numeric constant.
+    /// 2. It is sent, not posted: a posted message would still be queued when the kill lands.
+    /// 3. The ask precedes the force-kill, and the kill stays (an older build or a hung pump
+    ///    would otherwise keep the exe's file lock).
+    /// 4. Neither uses `CloseMainWindow()` (`WM_CLOSE`), which raises the multi-tab
+    ///    close-confirm dialog and would block the installer on a modal nobody watches.
+    /// 5. The two embedded helpers are byte-identical: `install.ps1 -Register` copies
+    ///    uninstall.ps1 standalone as the Apps & Features UninstallString, so they cannot
+    ///    share a module.
     #[test]
     fn the_windows_installer_asks_for_a_session_save_before_it_force_kills() {
         let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2887,10 +2440,9 @@ mod tests {
         };
         for name in ["install.ps1", "uninstall.ps1"] {
             let script = read(name);
-            // Comment-only lines are dropped first: both scripts EXPLAIN the
-            // force-kill and name the rejected `CloseMainWindow()` in prose, and a
-            // test that read the prose would assert the argument rather than the
-            // code. `#` is PowerShell's comment; `//` is the embedded C#'s.
+            // Comment-only lines are dropped first: both scripts explain the force-kill and
+            // name the rejected `CloseMainWindow()` in prose, which must not satisfy or fail
+            // the code assertions. `#` is PowerShell's comment; `//` is the embedded C#'s.
             let code = script
                 .lines()
                 .filter(|line| {
@@ -2905,10 +2457,9 @@ mod tests {
                 "{name} must declare `{declaration}` — the constant is the only join \
                  between the script's P/Invoke and this module's wndproc"
             );
-            // SENT, not posted: the durable write happens inside the wndproc turn, so
-            // the send RETURNING is what proves the manifest is on disk — no sleep
-            // guesses at it. With a hang abort, because a wedged pump must not stall
-            // an install.
+            // Sent, not posted: the durable write happens inside the wndproc turn, so the send
+            // returning proves the manifest is on disk. `SMTO_ABORTIFHUNG` keeps a wedged pump
+            // from stalling an install.
             assert!(
                 code.contains("SendMessageTimeoutW(hwnd, WM_QUERYENDSESSION"),
                 "{name} must SEND this message at the call site — the P/Invoke merely \
@@ -2943,9 +2494,8 @@ mod tests {
             );
         }
 
-        // The forced-duplicate P/Invoke, from the `using System;` line to the
-        // here-string terminator. Nothing but this equality keeps a fix applied to
-        // one script from leaving the other still destroying sessions.
+        // The duplicated P/Invoke, from `using System;` to the here-string terminator: only
+        // this equality keeps a fix to one script from missing the other.
         let embedded = |name: &str| -> String {
             let script = read(name);
             let start = script
@@ -2965,12 +2515,9 @@ mod tests {
         );
     }
 
-    /// ATERM'S OWN CHROME WRITE IS NOT NEWS FROM THE OS. `apply_chrome_appearance`
-    /// calls winit's `set_theme`, i.e. `SetWindowTheme`, which sends `WM_THEMECHANGED`
-    /// straight back at the window it just themed — onto the watch list, into the
-    /// coalescer, out as a second `Wake`. Only that one message, and only while the
-    /// guard is held: every other watched message keeps counting, because a real OS
-    /// burst that overlaps our write must still wake the loop.
+    /// aterm's own chrome write is not news from the OS: the `WM_THEMECHANGED` its
+    /// `SetWindowTheme` sends back is ignored while the guard is held; every other watched
+    /// message still counts.
     #[test]
     fn aterms_own_chrome_write_does_not_feed_the_settings_hook() {
         assert!(
@@ -3009,15 +2556,10 @@ mod tests {
         );
     }
 
-    /// THE HOOK'S HEADLINE CONTRACT, end to end: one OS settings burst costs exactly
-    /// one re-sample — INCLUDING the `WM_THEMECHANGED` that the re-sample's own chrome
-    /// write provokes.
-    ///
-    /// A model of the two halves, driven against a local flag so there is no window,
-    /// no event loop and no process-global state: the subclass side is
-    /// `watch_os_settings_message` + `claim_os_settings_wake`, the loop side is
-    /// `note_os_settings_resample`'s re-arm (the `store(false)`) followed by
-    /// `apply_chrome_appearance`'s guarded `SetWindowTheme`.
+    /// One OS settings burst costs exactly one re-sample, including the `WM_THEMECHANGED` the
+    /// re-sample's own chrome write provokes. Modelled against a local flag: the subclass side
+    /// is `watch_os_settings_message` + `claim_os_settings_wake`, the loop side
+    /// `note_os_settings_resample`'s re-arm, then the guarded `SetWindowTheme`.
     #[test]
     fn one_settings_burst_costs_exactly_one_resample() {
         let pending = AtomicBool::new(false);
@@ -3043,7 +2585,7 @@ mod tests {
         assert_eq!(wakes, 1, "a burst of six messages is one Wake");
 
         // The loop services that Wake. `note_os_settings_resample` re-arms the
-        // coalescer FIRST so a trailing broadcast is not swallowed…
+        // coalescer first so a trailing broadcast is not swallowed…
         pending.store(false, Ordering::Release);
         // …and then the re-sample writes chrome, whose `SetWindowTheme` sends
         // `WM_THEMECHANGED` back into the wndproc on this very thread.
@@ -3056,15 +2598,13 @@ mod tests {
             "aterm's own chrome write re-entered the hook and bought a second re-sample"
         );
 
-        // A genuinely NEW flip afterwards still gets its own Wake — the fix must not
-        // latch the hook shut.
+        // A new flip afterwards still gets its own Wake: the guard must not latch the hook shut.
         deliver(WM_SETTINGCHANGE, &mut wakes);
         assert_eq!(wakes, 2, "the next real burst still wakes the loop");
     }
 
-    /// The reduced-transparency gate: it suppresses a REQUESTED material and never
-    /// invents one, so an opaque window (the default) is byte-identical on both sides
-    /// of the preference.
+    /// The reduced-transparency gate suppresses a requested material and never invents one, so
+    /// an opaque window (the default) is identical on both sides of the preference.
     #[test]
     fn reduced_transparency_suppresses_the_backdrop_but_never_adds_one() {
         let install = |reduced| {
@@ -3103,38 +2643,31 @@ mod tests {
                 "transparency off: every translucent material collapses to none"
             );
         }
-        // The opaque default is not a material, so there is nothing to reduce — this
-        // is what keeps a stock config on exactly the path it was always on.
+        // The opaque default is not a material: nothing to reduce.
         assert_eq!(effective_backdrop(DWMSBT_NONE), DWMSBT_NONE);
 
         crate::native_appearance::install_preferences(previous);
     }
 
-    /// The OS palette is forced ONLY under High Contrast. Off HC the system colours
-    /// still exist and `GetSysColor` still answers — returning them anyway would
-    /// repaint every ordinary desktop's tab strip in `COLOR_BTNFACE`.
+    /// The OS palette is forced only under High Contrast: off HC `GetSysColor` still answers,
+    /// and forcing it would repaint every ordinary desktop's tab strip in `COLOR_BTNFACE`.
     #[test]
     fn the_chrome_palette_is_forced_only_under_high_contrast() {
-        // The diagnostic override would make the negative arm a lie; a test run with
-        // it set is testing a different thing, and should say so rather than fail
-        // mysteriously.
+        // The diagnostic override would make the negative arm a lie.
         if super::force_hc_chrome_env() {
             aterm_spec::host::could_not_run(
                 "the high-contrast chrome override is set here, so the negative arm cannot hold",
             );
         }
         assert_eq!(resolve_forced_chrome(false), None);
-        // Under HC the five slots are read; the VALUES are the live machine's, so
-        // assert only the shape (a real HC palette is asserted against fixtures in
-        // `chrome_band`, which needs no HC desktop).
+        // Under HC the five slots come from the live machine, so assert only the shape
+        // (`chrome_band` asserts real HC palettes against fixtures).
         assert!(resolve_forced_chrome(true).is_some());
     }
 
-    /// The two registry-backed preferences answer with the Windows DEFAULT on a
-    /// machine that never moved them, and their answers survive
-    /// `AppearancePreferences::normalized` (which is what actually reaches a
-    /// consumer). This runs against the live machine, so it asserts the CONTRACT —
-    /// in range, defaulting correctly — not a particular desktop's settings.
+    /// The two registry-backed preferences answer the Windows default on a machine that never
+    /// moved them, and survive `AppearancePreferences::normalized`. Against the live machine,
+    /// so it asserts the contract, not a desktop's settings.
     #[test]
     fn the_registry_backed_preferences_stay_in_contract() {
         let scale = os_text_scale();
@@ -3154,14 +2687,8 @@ mod tests {
             "the shared clamp bounds the OS value, got {}",
             normalized.text_scale
         );
-        // THE COMPOSITION RULE, as a truth table — deterministic, and independent of
-        // however the machine running this test happens to be configured. Either OS
-        // source is sufficient on its own: the Colours toggle, or High Contrast.
-        //
-        // (This used to compare `effective_backdrop_under(m, !transparent)` against an
-        // expression re-derived from `transparent` by the same rule — a private copy
-        // of `effective_backdrop`'s body in the test module, asserting against itself.
-        // It could not fail no matter what production did.)
+        // The composition rule as a truth table, independent of the test machine: either OS
+        // source suffices.
         for (hc, effects, want) in [
             (false, true, false),
             (false, false, true),
@@ -3175,11 +2702,10 @@ mod tests {
             );
         }
 
-        // …and the LIVE reads really are the two inputs that rule is applied to.
-        // `native_appearance_preferences` republishes the forced chrome palette as a
-        // documented side effect, and under `cfg(test)` that palette is thread-local:
-        // put back whatever this worker thread had, so a machine actually running High
-        // Contrast cannot leak an OS palette into the next test on this thread.
+        // …and the live reads are the two inputs that rule is applied to.
+        // `native_appearance_preferences` republishes the forced chrome palette, which under
+        // `cfg(test)` is thread-local: restore it so a machine running High Contrast cannot
+        // leak an OS palette into the next test on this thread.
         let saved_palette = crate::chrome_band::forced_chrome();
         let published = AppRtWindows {
             probe_preferences: true,
@@ -3197,13 +2723,9 @@ mod tests {
         assert_eq!(published.high_contrast, high_contrast_active());
     }
 
-    /// H1 HONESTY: the `client=opaque(...)` qualifier's code↔token mapping is
-    /// total and round-trips, and `0` stays "nothing declined" — the sentinel the
-    /// latch starts at, which must never decode to a reason and put a cause on a
-    /// row that has none. The LATCH itself (first-writer-wins) is a process-global
-    /// deliberately not poked from a test: writing it would leak a fake cause into
-    /// every other test's view of the chrome row, and `compare_exchange(0, …)` is
-    /// its own proof.
+    /// The `client=opaque(...)` code↔token map is total and round-trips, and `0` never decodes
+    /// to a reason. The first-writer-wins latch is process-global and deliberately not poked
+    /// from a test.
     #[test]
     fn the_client_decline_tokens_round_trip_and_zero_means_nothing_declined() {
         for reason in [
@@ -3228,14 +2750,12 @@ mod tests {
         }
         assert_eq!(ClientBackdropDecline::from_code(0), None);
         assert_eq!(ClientBackdropDecline::from_code(99), None);
-        // The exact string the acceptance check looks for on this machine, with
-        // hdr_glow at its default and a material configured.
+        // The default-config case's token.
         assert_eq!(ClientBackdropDecline::HdrGlow.token(), "hdr_glow");
     }
 
-    /// The material → DWM backdrop mapping is total and hits each system backdrop;
-    /// crucially the default (`None`) maps to `DWMSBT_NONE` so a stock config leaves
-    /// the window a plain opaque grid.
+    /// The material → DWM backdrop mapping is total; the default (`None`) maps to `DWMSBT_NONE`,
+    /// so a stock config leaves the window a plain opaque grid.
     #[test]
     fn material_maps_to_the_dwm_backdrop() {
         assert_eq!(backdrop_for(BackgroundMaterial::None), DWMSBT_NONE);
@@ -3263,11 +2783,8 @@ mod tests {
         );
     }
 
-    /// The defect this guards: with `window_theme = "auto"` and a LIGHT system theme,
-    /// DWM used to paint a white caption directly above aterm's near-black grid. On
-    /// Windows `Auto` therefore resolves against the TERMINAL background, not the OS
-    /// preference — a dark bg gets the immersive-dark caption whatever the desktop is
-    /// doing, and a light bg gets the light one.
+    /// On Windows `Auto` resolves against the terminal background, not the OS preference, so a
+    /// light desktop never paints a white caption over a dark grid.
     #[test]
     fn auto_resolves_the_caption_from_the_terminal_background() {
         // Ghostty/aterm-ish dark grounds → dark caption.
@@ -3288,13 +2805,9 @@ mod tests {
         }
     }
 
-    /// ACCESSIBILITY: under a Windows High Contrast scheme `Auto` refuses to resolve
-    /// from the terminal background — the HC palette, not the terminal, owns the
-    /// caption. (The returned `Auto` is no longer a delegation to winit's
-    /// `is_high_contrast()` guard, which is dead code — `cbSize: 0` — but the marker
-    /// `apply_chrome_appearance`'s HC arm turns into an EXPLICIT immersive-dark-off
-    /// write.) Explicit `Light`/`Dark` remain hard overrides (they bypassed the same
-    /// guard before this resolution existed, so nothing regresses for a user who typed one).
+    /// Under High Contrast `Auto` does not resolve from the terminal background: the HC palette
+    /// owns the caption (`apply_chrome_appearance`'s HC arm writes immersive-dark off). Explicit
+    /// `Light`/`Dark` remain hard overrides.
     #[test]
     fn high_contrast_returns_auto_to_the_os() {
         for bg in [0x00_0000, 0xff_ffff, 0x1e_1e2e] {
@@ -3314,11 +2827,9 @@ mod tests {
         }
     }
 
-    /// The per-frame guard writes ONLY on evidence that the caption was clobbered: a
-    /// readback that disagrees with the resolved answer. Agreement is the steady state
-    /// and must not write (that would be a caption re-theme every frame), and a build
-    /// where the attribute is not gettable must not write either — with no evidence,
-    /// churning is strictly worse than leaving it to the event-driven seams.
+    /// The per-frame guard writes only on a readback that disagrees with the resolved answer:
+    /// agreement is the steady state (a write would re-theme the caption every frame), and an
+    /// ungettable attribute is no evidence of a clobber.
     #[test]
     fn the_frame_guard_writes_only_on_a_disagreeing_readback() {
         assert!(
@@ -3338,9 +2849,7 @@ mod tests {
         assert!(!chrome_reassert_needed(false, None));
     }
 
-    /// Explicit config values stay HARD overrides: `Auto` is the only policy that ever
-    /// consults the background, so a user who asked for a light title bar over a dark
-    /// grid keeps getting one.
+    /// Explicit config values stay hard overrides: only `Auto` consults the background.
     #[test]
     fn explicit_light_and_dark_ignore_the_terminal_background() {
         for bg in [0x00_0000, 0xff_ffff, CHROME_BG_UNKNOWN] {
@@ -3355,9 +2864,8 @@ mod tests {
         }
     }
 
-    /// Before any background has been published there is nothing to match, so `Auto`
-    /// stays `Auto` and the OS preference keeps the window — the pre-fix behaviour,
-    /// retained so a not-yet-themed window is never pinned to a guess.
+    /// Before any background is published there is nothing to match, so `Auto` stays `Auto`
+    /// and a not-yet-themed window is never pinned to a guess.
     #[test]
     fn auto_without_a_published_background_stays_auto() {
         assert_eq!(
@@ -3396,10 +2904,8 @@ mod tests {
         );
     }
 
-    /// The wheel-notch decode: the ordinary case is a line count, the all-ones
-    /// sentinel is the "One screen at a time" slider position (NOT 4 294 967 295
-    /// lines, which is what banking it as a number would have meant), and an
-    /// explicit 0 — "wheel scrolling off" — is honoured rather than clamped up.
+    /// The wheel-notch decode: a line count, the all-ones "One screen at a time" sentinel, and
+    /// an explicit 0 ("wheel scrolling off") honoured rather than clamped up.
     #[test]
     fn wheel_notch_decodes_lines_and_the_page_sentinel() {
         assert_eq!(
@@ -3412,9 +2918,9 @@ mod tests {
         assert_eq!(wheel_notch_from_raw(WHEEL_PAGESCROLL), WheelNotch::Page);
     }
 
-    /// COLORREF is `0x00BBGGRR` while themes store `0x00RRGGBB`: the swap must move
-    /// R↔B, be its own inverse (one helper serves the write AND the introspection
-    /// readback), and drop any stray top byte.
+    /// COLORREF is `0x00BBGGRR` while themes store `0x00RRGGBB`: the swap moves R↔B, is its own
+    /// inverse (one helper serves the write and the introspection readback), and drops a stray
+    /// top byte.
     #[test]
     fn colorref_swap_reverses_r_and_b_and_is_an_involution() {
         assert_eq!(colorref_swap(0x11_1318), 0x18_1311);
@@ -3426,13 +2932,12 @@ mod tests {
         );
     }
 
-    /// H3 happy path: under the `Auto` policy with no backdrop and no HC scheme, the
-    /// caption fill IS the terminal background (R/B-swapped into COLORREF order) and
-    /// the focused title text is the full-strength ink for that background's side of
-    /// the light/dark split — white on a dark grid, black on a light one.
+    /// Under `Auto` with no backdrop and no HC scheme, the caption fill is the terminal
+    /// background in COLORREF order and the focused text is white on a dark grid, black on a
+    /// light one.
     #[test]
     fn caption_tint_paints_the_terminal_background_under_auto() {
-        // The live audit machine's dark default (#111318).
+        // A dark default (#111318).
         let (caption, text) = caption_tint(WindowTheme::Auto, 0x11_1318, DWMSBT_NONE, false, true);
         assert_eq!(
             caption, 0x18_1311,
@@ -3445,12 +2950,8 @@ mod tests {
         assert_eq!(text, 0x0000_0000, "light grid gets black title text");
     }
 
-    /// H3 gate 4: a pinned COLORREF kills DWM's own unfocused treatment, so the
-    /// resolver supplies the dim itself — on the TEXT only. The caption fill must
-    /// stay byte-identical across the focus flip (the grid beneath it does not dim,
-    /// and a caption that darkened alone would re-introduce the seam the tint
-    /// removes), while the text moves strictly toward the fill without reaching it
-    /// (dimmed, not erased).
+    /// A pinned COLORREF kills DWM's unfocused treatment, so the resolver dims the text only:
+    /// the fill holds across the focus flip, and the text moves toward it without reaching it.
     #[test]
     fn caption_text_dims_unfocused_while_the_fill_holds() {
         let bg = 0x11_1318;
@@ -3472,12 +2973,9 @@ mod tests {
         assert_eq!(text_unfocused, colorref_swap(expected_rgb));
     }
 
-    /// The other three gates, each of which must yield the FULL reset pair (both
-    /// attributes back to `DWMWA_COLOR_DEFAULT`, restoring DWM's palette and its
-    /// native dimming): a High Contrast scheme (the accessibility deferral), an
-    /// active backdrop material (a solid caption would paint over Mica), an
-    /// explicit `Light`/`Dark` policy (the user asked for the STOCK OS caption in
-    /// that variant), and a not-yet-published background (nothing to tint with).
+    /// Every other gate yields the full reset pair (DWM's palette and native dimming): High
+    /// Contrast, an active backdrop material, an explicit `Light`/`Dark` policy, and no
+    /// published background.
     #[test]
     fn caption_tint_defers_on_every_gate() {
         let default = (DWMWA_COLOR_DEFAULT, DWMWA_COLOR_DEFAULT);

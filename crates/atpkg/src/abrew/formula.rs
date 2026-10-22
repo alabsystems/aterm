@@ -962,12 +962,14 @@ impl Cask {
         }
         let sha_raw = s(v.get("sha256"));
         let mut artifacts = parse_artifacts(v.get("artifacts"));
-        // Only the complete one-field naked container and a plain
-        // `container nested:` naming a supported inner archive are
-        // data. A richer container must remain unsupported through
-        // artifact overrides.
+        // Only the complete one-field naked and dmg containers and a
+        // plain `container nested:` naming a supported inner archive
+        // are data. A richer container must remain unsupported
+        // through artifact overrides.
         let naked = matches!(v.get("container"), Some(Value::Object(fields))
             if fields.len() == 1 && fields.get("type").and_then(Value::as_str) == Some("naked"));
+        let dmg = matches!(v.get("container"), Some(Value::Object(fields))
+            if fields.len() == 1 && fields.get("type").and_then(Value::as_str) == Some("dmg"));
         let nested = match v.get("container") {
             Some(Value::Object(fields)) if fields.len() == 1 => fields
                 .get("nested")
@@ -983,7 +985,7 @@ impl Cask {
             _ => None,
         };
         let mut unsupported_constraints = None;
-        if !empty_metadata(v.get("container")) && !naked && nested.is_none() {
+        if !empty_metadata(v.get("container")) && !naked && !dmg && nested.is_none() {
             unsupported_constraints = unsupported_constraints.or(Some("container"));
             artifacts.push(Artifact::Other("unsupported container".to_string()));
         }
@@ -1329,9 +1331,14 @@ mod tests {
             Cask::from_api(&simple).unwrap().artifacts,
             [Artifact::App("Demo.app".into(), None)]
         );
+        // A plain one-field dmg container is admitted data now.
+        let dmg: Value = aterm_json::from_str(r#"{"token":"demo","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","container":{"type":"dmg"},"artifacts":[{"app":["Demo.app"]}]}"#).unwrap();
+        let dmg = Cask::from_api(&dmg).unwrap();
+        assert!(dmg.unsupported_constraints.is_none());
+        assert_eq!(dmg.artifacts, [Artifact::App("Demo.app".into(), None)]);
         for json in [
             r#"{"token":"demo","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","depends_on":{"macos":[">= :sonoma"]}}"#,
-            r#"{"token":"demo","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","container":{"type":"dmg"}}"#,
+            r#"{"token":"demo","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","container":{"type":"dmg","nested":"x"}}"#,
         ] {
             let value: Value = aterm_json::from_str(json).unwrap();
             assert!(

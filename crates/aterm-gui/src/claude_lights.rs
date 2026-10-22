@@ -1180,6 +1180,17 @@ pub(crate) struct WindowLights {
     /// [`App::settle_glass_hover`] asks the glass again once a paint moved
     /// what is under it.
     glass_hover_px: Option<(f64, f64)>,
+    /// THE GRID THE LISTS WERE LAID ON: the window's geometry when the last
+    /// paint recorded the chips', switches', facts' and lockups' cells
+    /// ([`crate::app_mouse::GlassGrid`]). Under any other — a re-grid since,
+    /// its frame not yet painted — they answer no pointer
+    /// ([`App::claude_glass_at`]), and the paint that lays them again asks
+    /// the glass where the pointer rests ([`App::settle_glass_hover`]).
+    drawn_at: Option<crate::app_mouse::GlassGrid>,
+    /// A paint after a re-grid moved the hover under a still pointer
+    /// ([`App::settle_glass_hover`]): the window's cursor is resolved again
+    /// once that frame is on the glass ([`App::refresh_glass_cursor_for_frame`]).
+    cursor_owed: bool,
     /// THE FACTS ON THE GLASS: one per fact of every bottom rule the last
     /// frame wrote ([`FactHit`]), cleared with the chips' hits, its buffer
     /// kept.
@@ -1808,6 +1819,13 @@ impl WindowLights {
             | u64::from(turning) << 1
             | u64::from(self.switch_hover == Some(session)) << 2
             | u64::from(self.mark_hovered(session)) << 3
+    }
+
+    /// The grid the lists were laid on, for a test to read or to forge — its
+    /// negative control: the last frame's lists stamped as a re-grid's.
+    #[cfg(test)]
+    pub(crate) fn drawn_at_mut(&mut self) -> &mut Option<crate::app_mouse::GlassGrid> {
+        &mut self.drawn_at
     }
 
     /// Whether the pointer rests on `session`'s top line's lockup: its name
@@ -4026,17 +4044,41 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<(u64, Option<Chip>)> {
-        let ws = self.windows.get(&wid)?;
-        if ws.claude_lights.hits.is_empty() {
+        if self.windows.get(&wid)?.claude_lights.hits.is_empty() {
             return None;
         }
-        let (row, col) = self.frame_cell_at(wid, x, y)?;
-        let hit = ws
+        self.chips_at_cell(wid, self.glass_cell_at(wid, x, y)?)
+    }
+
+    /// [`Self::claude_chips_at`] at frame cell `(row, col)` of the grid the
+    /// lists were laid on.
+    fn chips_at_cell(
+        &self,
+        wid: WindowId,
+        (row, col): (usize, usize),
+    ) -> Option<(u64, Option<Chip>)> {
+        let hit = self
+            .windows
+            .get(&wid)?
             .claude_lights
             .hits
             .iter()
             .find(|h| h.frame_row == row && h.col == col)?;
         (!self.chrome_owns_terminal_row(wid, hit.term_row)).then_some((hit.session, hit.chip))
+    }
+
+    /// The frame cell under window pixel `(x, y)` on the grid the glass's
+    /// lists were laid on — `None` when the window's grid is no longer that
+    /// one ([`crate::app_mouse::GlassGrid`]): after a re-grid, until the next
+    /// paint lays them again, the last frame's cells are not where the window
+    /// now puts them, so the pointer is told nothing is there rather than
+    /// what was (a switch drawn hovered columns from the pointer, a press on
+    /// a switch the glass no longer shows there).
+    pub(crate) fn glass_cell_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(usize, usize)> {
+        let drawn = self.windows.get(&wid)?.claude_lights.drawn_at?;
+        (self.glass_grid(wid)? == drawn)
+            .then(|| drawn.cell_at(x, y))
+            .flatten()
     }
 
     /// The pointer left the window: no chip is hovered any more.
@@ -4060,7 +4102,36 @@ impl App {
     /// or hovered switch on a line it is not on. A hover still under the
     /// pointer stands (the title's cells are the lockup's while it shows), so
     /// a frame at rest lets nothing go and asks for no frame.
-    pub(crate) fn settle_glass_hover(&mut self, wid: WindowId) {
+    ///
+    /// The paint laid its lists on `grid` (the window's [`crate::app_mouse::GlassGrid`]),
+    /// and they are stamped with it here. A paint whose grid is not the last
+    /// one's — a re-grid since (a window resize, a font zoom, a split) — has
+    /// moved every target from under the pointer at once, and no motion may
+    /// follow it: the glass is asked where the pointer rests, as a motion there
+    /// asks it ([`Self::track_claude_light_hover`]), so what is under it now
+    /// is hovered — a switch or a lockup the re-grid brought under a still
+    /// pointer answers it — and what was is let go; where that moved the
+    /// hover, the window's cursor is owed the same answer once the frame is
+    /// on the glass ([`Self::refresh_glass_cursor_for_frame`]).
+    pub(crate) fn settle_glass_hover(
+        &mut self,
+        wid: WindowId,
+        grid: Option<crate::app_mouse::GlassGrid>,
+    ) {
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        let regridded = std::mem::replace(&mut ws.claude_lights.drawn_at, grid) != grid;
+        if regridded && ws.pointer_position_known {
+            let (x, y) = ws.last_cursor_px;
+            let lights = &ws.claude_lights;
+            let was = (lights.hover, lights.switch_hover, lights.mark_hover);
+            let _ = self.track_claude_light_hover(wid, x, y);
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                let lights = &mut ws.claude_lights;
+                lights.cursor_owed |= (lights.hover, lights.switch_hover, lights.mark_hover) != was;
+            }
+        }
         let Some(lights) = self.windows.get(&wid).map(|ws| &ws.claude_lights) else {
             return;
         };
@@ -4091,6 +4162,22 @@ impl App {
         }
         if gone {
             redraw(ws);
+        }
+    }
+
+    /// THE CURSOR FOLLOWS THE GLASS'S HOVER: a frame whose paint moved the
+    /// hover under a still pointer ([`Self::settle_glass_hover`]) is on the
+    /// glass, and the window's cursor is resolved again where the pointer
+    /// rests, as a modifier edge resolves it ([`Self::update_hover_cursor`]):
+    /// the hand on the switch a re-grid brought under it, the pane's own
+    /// cursor where it took one away. Once per such move; any other present
+    /// reads one flag.
+    pub(crate) fn refresh_glass_cursor_for_frame(&mut self, wid: WindowId) {
+        let owed = self.windows.get_mut(&wid).is_some_and(|ws| {
+            std::mem::take(&mut ws.claude_lights.cursor_owed) && ws.pointer_position_known
+        });
+        if owed {
+            self.update_hover_cursor(wid);
         }
     }
 
@@ -4170,21 +4257,22 @@ impl App {
     /// What of the harness's glass is under window pixel `(x, y)`: a chip or
     /// the blank between two ([`Self::claude_chips_at`]), the top rule's
     /// switch, a fact of the bottom rule, or a top line's lockup — each only
-    /// where the last frame put it on the glass and no band claims its row
-    /// since.
+    /// where the last frame put it on the glass, on the grid the window
+    /// still has ([`Self::glass_cell_at`]), and no band claims its row since.
     pub(crate) fn claude_glass_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, GlassAt)> {
-        if let Some((session, chip)) = self.claude_chips_at(wid, x, y) {
-            return Some((session, GlassAt::Chip(chip)));
-        }
         let ws = self.windows.get(&wid)?;
         let lights = &ws.claude_lights;
-        if lights.border_toggles.is_empty()
+        if lights.hits.is_empty()
+            && lights.border_toggles.is_empty()
             && lights.fact_hits.is_empty()
             && lights.mark_hits.is_empty()
         {
             return None;
         }
-        let (row, col) = self.frame_cell_at(wid, x, y)?;
+        let (row, col) = self.glass_cell_at(wid, x, y)?;
+        if let Some((session, chip)) = self.chips_at_cell(wid, (row, col)) {
+            return Some((session, GlassAt::Chip(chip)));
+        }
         if let Some(b) = lights.border_toggles.iter().find(|b| {
             b.frame_row == row
                 && b.cols.contains(&col)
@@ -7187,10 +7275,9 @@ mod gesture_tests {
         }
     }
 
-    /// REGRESSION (review 2026-09-25): a light selected with ctrl+shift+tab
-    /// is let go by any mouse press, so clicking to another pane and back
-    /// leaves no selection armed to take the next Return — Return submits
-    /// Claude's prompt, as the person expects.
+    /// A light selected with ctrl+shift+tab is let go by any mouse press, so clicking to
+    /// another pane and back leaves no selection armed to take the next Return: Return
+    /// submits Claude's prompt.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_mouse_press_lets_a_keyboard_selection_go() {

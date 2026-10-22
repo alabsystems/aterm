@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! Derived TLA+: one source of truth for a state machine, two faithful backends.
+
+//! Derived TLA+: one authored model, two faithful backends.
 //!
-//! "Derived" here means the spec and the interpreter are generated from ONE
-//! AUTHORED model. It does not mean derived from the code: the model is written
-//! by a person (as a [`Model`] value or through `ty_model!`), so it can drift
-//! from the code it describes, and Tier 1 below is what ties them. Deriving a
-//! model from the code itself is Trust's job (its D-11(e); design only in the
-//! Trust repo's `docs/design/2026-09-29-descriptor-protocols-as-compiler-errors.md`).
+//! A [`Model`] is a Rust value describing a bounded state machine (constants, variables,
+//! guarded actions, invariants) over a small expression language [`Expr`]. A person writes it
+//! (directly or through `ty_model!`), so it can drift from the code it describes; Tier 1 below
+//! ties them. From that one source come both:
 //!
 //! A hand-written `.tla` spec can drift from the code and from the executable
 //! semantics a test checks; this module is the alternative (aterm commits none): a

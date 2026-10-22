@@ -597,6 +597,22 @@ fn is_status_row(row: &str) -> bool {
             .is_some_and(|r| r.ends_with(hint))
 }
 
+/// The status row's FIRST FRAME: `◇ Thinking`, the verb alone in column 0
+/// with no time and no Esc hint, drawn the moment a message is sent and
+/// standing 0.04-0.19 s before the row takes its time and hint (`◇ Working
+/// (0s · esc to interrupt)`). Measured on 1.4.10, 2026-10-22: five launches
+/// of five, the screen read at full rate after the first prompt's Enter
+/// ([`fixtures::BUSY_FIRST_FRAME`]); the forever lab's r10 ladder on
+/// `ba4e9e2bd3` read this frame as the harness's first point, a turn ended
+/// with no words, and the first reply then named two short turns. Only `◇`,
+/// the cycle's first glyph, as measured: `◆ Thinking` is a reply whose
+/// words are `Thinking`.
+fn is_status_first_frame(row: &str) -> bool {
+    row.strip_prefix(STATUS_GLYPHS[0])
+        .and_then(|r| r.strip_prefix(' '))
+        .is_some_and(|r| crate::text::trim_end(r) == const { anchor_text("muse.busy.first") })
+}
+
 /// A reply's head: `◆ <text>` in column 0 — no status row, and no
 /// question's head, which cycles the same glyphs while the question waits.
 fn is_reply_head(row: &str) -> bool {
@@ -834,9 +850,9 @@ enum Turn {
     /// away, its rows from `.0` down to `.1`, all indented, the last thing
     /// drawn.
     Tail(usize, usize),
-    /// The turn ended on Muse Code's own read rows ([`read_rows`]), from
-    /// `.0` down to `.1`, with no reply under them: it is over, and said no
-    /// words.
+    /// The turn ended on Muse Code's own indented tool rows ([`read_rows`]:
+    /// a read, a search), from `.0` down to `.1`, with no reply under them:
+    /// it is over, and said no words.
     Tool(usize, usize),
     /// THE TURN'S END SCROLLED AWAY UNDER CARDS (`/usage`, `/status`): no
     /// message, banner, reply or status row in sight above the open
@@ -865,6 +881,15 @@ fn turn(rows: &[String], top: usize) -> Turn {
     if rows[from..top].iter().any(|r| is_status_row(r)) {
         return Turn::Running;
     }
+    // The status row's first frame, the last row drawn over the composer:
+    // under a reply it would be no reply's, and nothing measured leaves it.
+    if (from..top)
+        .rev()
+        .find(|&i| !blank(&rows[i]))
+        .is_some_and(|i| is_status_first_frame(&rows[i]))
+    {
+        return Turn::Running;
+    }
     if user.is_none() && banner.is_some() {
         return Turn::Fresh;
     }
@@ -886,16 +911,17 @@ fn turn(rows: &[String], top: usize) -> Turn {
         };
     };
     // The reply is the last block: its head the last row in column 0, every
-    // row under it indented. An away recap or a turn's time drawn under it
-    // is Muse Code's own row, no part of the turn: the block above it is the
-    // turn's end.
+    // row under it indented — or a tool's outcome branch in column 0 right
+    // under its `◆` row ([`branch_at`]). An away recap or a turn's time
+    // drawn under it is Muse Code's own row, no part of the turn: the block
+    // above it is the turn's end.
     let mut last = last;
     loop {
         let head = (from..=last)
             .rev()
-            .find(|&i| leading_spaces(&rows[i]) == 0 && !blank(&rows[i]));
+            .find(|&i| leading_spaces(&rows[i]) == 0 && !blank(&rows[i]) && !branch_at(rows, i));
         // No head under the message: the turn may have ended on Muse
-        // Code's own read rows, with no reply under them.
+        // Code's own indented tool rows, with no reply under them.
         if head.is_none()
             && let Some(first) = user.and_then(|u| read_rows(rows, u, last, drawn))
         {
@@ -923,14 +949,21 @@ fn turn(rows: &[String], top: usize) -> Turn {
     }
 }
 
-/// MUSE CODE'S READ ROWS A TURN ENDED ON, no reply under them: the first of
-/// them, where every row drawn (`drawn`) under the person's message on row
-/// `user` (past the rows it wrapped onto, up to a blank row) down to `last`
-/// is a read row ([`read_row`]). Measured on 1.4.10 (2026-10-21, the lab's
-/// `tool-end` chain, [`fixtures::END_OF_TURN_READ_ROW`]): a turn whose one
-/// `read_file` call came back and whose reply held no words ends on `  Read
-/// README.md` above the composer. `None` where the message runs down to the
-/// rows with no blank between, and where any row there is another.
+/// MUSE CODE'S INDENTED TOOL ROWS A TURN ENDED ON, no reply under them: the
+/// first of them, where every row drawn (`drawn`) under the person's message
+/// on row `user` (past the rows it wrapped onto, up to a blank row) down to
+/// `last` is a read row ([`read_row`]) or a search row ([`search_row`]).
+/// Measured on 1.4.10 (2026-10-21, the lab's `tool-end` chain,
+/// [`fixtures::END_OF_TURN_READ_ROW`]; 2026-10-22, `lab muse-captures --only
+/// tool-row`, [`fixtures::TOOL_ROW_SEARCH`]): a turn whose one `read_file`
+/// or `search` call came back and whose reply held no words ends on `  Read
+/// README.md` or `  Searched "parser" (1 match)` above the composer. Of the
+/// other tools the lab called, none draws its row so: `write_file`,
+/// `edit_file`, `bash`, `read_memory`, `add_memory`, `get_goal` and
+/// `work_list` draw a `◆` row in column 0 ([`TOOL_HEADS`]), and
+/// `write_todos` draws nothing ([`fixtures::TOOL_ROW_TODOS`]). `None` where
+/// the message runs down to the rows with no blank between, and where any
+/// row there is another.
 fn read_rows(
     rows: &[String],
     user: usize,
@@ -940,7 +973,8 @@ fn read_rows(
     let gap = (user + 1..=last).find(|&i| blank(&rows[i]))?;
     let mut read = (gap..=last).filter(|&i| drawn(i)).peekable();
     let first = *read.peek()?;
-    read.all(|i| read_row(&rows[i])).then_some(first)
+    read.all(|i| read_row(&rows[i]) || search_row(&rows[i]))
+        .then_some(first)
 }
 
 /// Muse Code's READ ROW (measured on 1.4.10: `  Read /etc/hosts`, `  Read
@@ -952,6 +986,68 @@ fn read_row(row: &str) -> bool {
         && crate::text::trim(row)
             .strip_prefix(const { anchor_text("muse.tool.read") })
             .is_some_and(names_a_path)
+}
+
+/// Muse Code's SEARCH ROW (measured on 1.4.10, 2026-10-22: `  Searched
+/// "parser" (1 match)`, `  Searched "no-such-word-here" (no matches)`): two
+/// columns in, no `◆`, `Searched `, the pattern in double quotes, and its
+/// count in brackets — `(<n> match)`, `(<n> matches)` or `(no matches)`. A
+/// sentence two columns in that opens with `Searched ` is a row of a reply.
+fn search_row(row: &str) -> bool {
+    let Some(rest) = crate::text::trim(row)
+        .strip_prefix(const { anchor_text("muse.tool.searched") })
+        .filter(|_| leading_spaces(row) == 2)
+    else {
+        return false;
+    };
+    let Some((pattern, count)) = rest.rsplit_once(" (") else {
+        return false;
+    };
+    let quoted = pattern.len() >= 2 && pattern.starts_with('"') && pattern.ends_with('"');
+    let counted = count == "no matches)"
+        || count
+            .strip_suffix(" match)")
+            .or_else(|| count.strip_suffix(" matches)"))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    quoted && counted
+}
+
+/// A TOOL'S OUTCOME BRANCH in column 0 under its `◆` row (measured on
+/// 1.4.10: `└ approval aborted` under `◆ Edited … — denied`,
+/// [`fixtures::BOX_EDIT_DENIED`]; `└ memory file not found` under `◆ Read
+/// memory notes.md — failed`, [`fixtures::TOOL_ROW_READ_MEMORY`]; `└
+/// {"items":[],…}` under `◆ Used tool operation`,
+/// [`fixtures::TOOL_ROW_WORK_LIST`]): `└` and a blank, part of the block of
+/// the `◆` row above it. A card's bottom (`└──`) is no branch.
+fn is_outcome_branch(row: &str) -> bool {
+    row.starts_with("└ ")
+}
+
+/// Whether row `i` is a tool's outcome branch ([`is_outcome_branch`]) RIGHT
+/// UNDER ITS `◆` ROW, as every measured one is: part of that row's block. A
+/// `└ ` row with anything else over it (a blank, the person's message) is
+/// nothing known, and heads a block of its own.
+fn branch_at(rows: &[String], i: usize) -> bool {
+    is_outcome_branch(&rows[i]) && i > 0 && rows[i - 1].starts_with("◆ ")
+}
+
+/// Whether the `◆` block headed on row `head` is MUSE CODE'S OWN TOOL ROW by
+/// its shape: an outcome branch in column 0 right under its head
+/// ([`branch_at`]). The agent's reply draws every row under its head
+/// indented, and no measured reply has such a branch; Muse Code draws one
+/// under the rows of many tools, whose heads [`tool_row`] need not know —
+/// measured on 1.4.10: `◆ Monitor Watch the lab socket — failed` over `└
+/// network access denied`, `◆ Stopped terminal tool operation — failed`,
+/// `◆ Scheduled 7 3 * * *: lab probe`, `◆ Unscheduled 109c3489` and `◆
+/// Message not sent to lab-no-such-session · ✗ · not found · ctrl+o`, each
+/// over its branch ([`fixtures::BOX_NETWORK_DIGIT_APPROVED`],
+/// [`fixtures::END_OF_TURN_WORK_PANEL`]). A turn ended on one is over and
+/// said no words ([`said_tail`]), and the turn's other words pass it over
+/// ([`turn_said_before`]): read as a reply, Muse Code's own row and its
+/// tool's output were the agent's last words, a need, a question or a done
+/// claim read in them.
+fn branched(rows: &[String], head: usize) -> bool {
+    rows[head].starts_with("◆ ") && head + 1 < rows.len() && branch_at(rows, head + 1)
 }
 
 /// One of Muse Code's OWN rows under a turn's end (measured on 1.4.10): the
@@ -1244,20 +1340,38 @@ pub fn end_hidden(rows: &[String]) -> bool {
 
 /// The heads of Muse Code's own tool rows, which are no words of the agent
 /// (measured: `Ran command · <description> · ✓ · 2.3s · ctrl+o`, `Ran touch
-/// probe.txt — denied`, `Wrote .agents/probe-write.md (+1)`, `Edited
-/// .agents/probe-write.md — denied`).
+/// probe.txt — denied`, `Ran ls — failed`, `Wrote .agents/probe-write.md
+/// (+1)`, `Edited .agents/probe-write.md — denied`, `Edited README.md (+1
+/// −1)`).
 const TOOL_HEADS: [&str; 3] = [
     anchor_text("muse.tool.ran"),
     anchor_text("muse.tool.wrote"),
     anchor_text("muse.tool.edited"),
 ];
 
+/// The heads of Muse Code's other own tool rows, each with its one name and
+/// the row's own tail after it ([`names_a_path`]), measured on 1.4.10 (2026-10-22, `lab muse-captures
+/// --only tool-row`): `Read memory notes.md — failed`
+/// ([`fixtures::TOOL_ROW_READ_MEMORY`]), `Saved memory notes.md`
+/// ([`fixtures::TOOL_ROW_ADD_MEMORY`]), `Read goal goal — no effect ·
+/// ctrl+o` ([`fixtures::TOOL_ROW_GOAL`]) and `Used tool operation`
+/// ([`fixtures::TOOL_ROW_WORK_LIST`], and Esc on the tool-action box's
+/// `Used tool operation — denied`). Read as the agent's reply before, a turn
+/// ended on one said Muse Code's own row as its last words.
+const NAMED_TOOL_HEADS: [&str; 4] = [
+    anchor_text("muse.tool.read_memory"),
+    anchor_text("muse.tool.saved_memory"),
+    anchor_text("muse.tool.read_goal"),
+    anchor_text("muse.tool.used"),
+];
+
 /// Whether a reply's head row `head` (its `◆` and indent stripped) is Muse
-/// Code's own tool row ([`TOOL_HEADS`]), no word of the agent's. A `Ran `
-/// head is the binary's whatever follows (a command is any words). A
-/// `Wrote ` or `Edited ` head names a path ([`names_a_path`]), where the
-/// agent's own sentence goes on in words: `Wrote the parser module and its
-/// unit tests in this turn.` is the agent's report (measured 2026-10-20,
+/// Code's own tool row ([`TOOL_HEADS`], [`NAMED_TOOL_HEADS`]), no word of
+/// the agent's. A `Ran ` head is the binary's whatever follows (a command is
+/// any words). A `Wrote ` or `Edited ` head, and each of the others, names
+/// one path or name and the row's own tail alone ([`names_a_path`]), where
+/// the agent's own sentence goes on in words: `Wrote the parser module and
+/// its unit tests in this turn.` is the agent's report (measured 2026-10-20,
 /// `docs/measured/forever-lab-2026-10-20.md` P2: read as a tool row, it left
 /// the turn no last words, and a need, defense or done claim in it unread).
 fn tool_row(head: &str) -> bool {
@@ -1266,33 +1380,81 @@ fn tool_row(head: &str) -> bool {
         || [wrote, edited]
             .iter()
             .any(|h| head.strip_prefix(h).is_some_and(names_a_path))
+        || NAMED_TOOL_HEADS.iter().any(|h| {
+            head.strip_prefix(h)
+                .and_then(|rest| rest.strip_prefix(' '))
+                .is_some_and(names_a_path)
+        })
 }
 
-/// Whether the words after a `Wrote `/`Edited ` head are a tool row's (every
-/// one the 1.4.10 captures measured): a first word holding a `/`, a `.` or
-/// the cut's `…` (`.agents/probe-write.md (+1)`, a path cut at the row's
-/// end), a lone word, or one the row's own tail follows (`(+1)`, `— denied`).
+/// The OUTCOMES a tool row's tail names after its ` — ` (measured on
+/// 1.4.10: `Edited .agents/probe-write.md — denied`, `Read memory notes.md
+/// — failed`, `Read goal goal — no effect · ctrl+o`, `Invalid work ID —
+/// rejected · ctrl+o`).
+const TOOL_OUTCOMES: [&str; 4] = ["failed", "denied", "rejected", "no effect"];
+
+/// Whether the words after a tool row's head (`Wrote `, `Edited `, `Read `,
+/// and each of [`NAMED_TOOL_HEADS`] with its blank) are the row's own, as
+/// every one the 1.4.10 captures measured is: ONE TOKEN — a path, a path cut
+/// at the row's end (`…`), or a name, no blank in it — then only the row's
+/// own tail, each part optional and in this order: the diff's count (`(+1)`,
+/// `(+1 −1)`), an outcome ([`TOOL_OUTCOMES`]: `— denied`) and the expander
+/// (`· ctrl+o`): `.agents/probe-write.md (+1)`, `README.md (+1 −1)`,
+/// `.agents/a-protected-note-with-a-rather-lo… — denied`, `notes.md —
+/// failed`, `goal — no effect · ctrl+o`, `operation — denied · ctrl+o`. The
+/// agent's own sentence goes on in words, whatever its first word names
+/// (`notes.md with the parser layout. Shall I push the branch now?`), and is
+/// its reply: read as a tool row, its question, its need and its done claim
+/// were never read (`docs/measured/forever-lab-2026-10-20.md` P2, and the
+/// review of `b9/resid4-lab`, where a first word holding a `.` or a `/` was
+/// enough).
 fn names_a_path(rest: &str) -> bool {
-    let (first, after) = rest.split_once(' ').unwrap_or((rest, ""));
-    first.contains(['/', '.', '…'])
-        || after.is_empty()
-        || after.starts_with("(+")
-        || after.starts_with("— ")
+    let token = rest.split(' ').next().unwrap_or_default();
+    if token.is_empty() {
+        return false;
+    }
+    let mut tail = &rest[token.len()..];
+    if let Some(r) = tail.strip_prefix(" (") {
+        let Some((count, after)) = r.split_once(')') else {
+            return false;
+        };
+        let digits = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+        let counted = match count.split_once(' ') {
+            Some((added, removed)) => {
+                added.strip_prefix('+').is_some_and(digits)
+                    && removed.strip_prefix('−').is_some_and(digits)
+            }
+            None => count.strip_prefix('+').is_some_and(digits),
+        };
+        if !counted {
+            return false;
+        }
+        tail = after;
+    }
+    if let Some(r) = tail.strip_prefix(" — ") {
+        let Some(after) = TOOL_OUTCOMES.iter().find_map(|o| r.strip_prefix(o)) else {
+            return false;
+        };
+        tail = after;
+    }
+    tail.strip_prefix(" · ctrl+o").unwrap_or(tail).is_empty()
 }
 
 /// The agent's last words: the reply the last turn ended on, its `◆` and
 /// indent stripped, one line per row. `None` while a box is up or a turn
 /// runs, before any turn, where [`phase`] cannot say the turn ended, and
-/// where it ended on Muse Code's own row: a tool row, the interrupt, or a
-/// wall or a fault read off its notice ([`notice`]), a local command's rows
-/// under it aside.
+/// where it ended on Muse Code's own row: a tool row (by its head,
+/// [`tool_row`], or by its outcome branch, [`branched`]), the interrupt, or
+/// a wall or a fault read off its notice ([`notice`]), a local command's
+/// rows under it aside.
 #[must_use]
 pub fn said_tail(rows: &[String]) -> Option<String> {
-    let (_, lines) = ended(rows)?;
+    let (at, lines) = ended(rows)?;
     let head = *lines.first()?;
     let (_, message) = notice(rows)?;
     if head == const { anchor_text("muse.turn.interrupted") }
         || tool_row(head)
+        || branched(rows, at)
         || wall_of(&message).is_some()
         || is_fault(&message)
     {
@@ -1317,7 +1479,8 @@ pub fn said_whole(rows: &[String]) -> bool {
 /// before a tool call, say — oldest first, each as [`said_tail`] reads one
 /// (its `◆` and indent stripped, one line per row, blank rows left out),
 /// joined by a blank line. Muse Code's own blocks are passed over as
-/// [`said_tail`] passes them: a tool's row (`◆ Ran command · …`), the
+/// [`said_tail`] passes them: a tool's row (`◆ Ran command · …`, or any `◆`
+/// row with its outcome branch under it, [`branched`]), the
 /// interrupt, a wall, a fault, a recap or a turn's time
 /// ([`is_own_row_head`]), and its pointer to the panel and its abnormal-end
 /// warning under a reply. The turn is the rows under the person's last
@@ -1384,7 +1547,9 @@ fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
     };
     let (_, user, from) = scope(rows, f.top);
     let mut said = Vec::new();
-    for h in (from..head).filter(|&h| is_reply_head(&rows[h]) && !is_own_row_head(&rows[h])) {
+    for h in (from..head)
+        .filter(|&h| is_reply_head(&rows[h]) && !is_own_row_head(&rows[h]) && !branched(rows, h))
+    {
         // The block's rows: up to the next row in column 0.
         let end = (h + 1..head)
             .find(|&k| leading_spaces(&rows[k]) == 0 && !blank(&rows[k]))
@@ -3017,8 +3182,50 @@ pub mod fixtures {
     /// `forever --mode resid` chain `tool-end`, 2026-10-21).
     pub const END_OF_TURN_READ_ROW: &str =
         include_str!("fixtures/muse-1.4.10-R6427.1-lab-end-of-turn-read-row.txt");
+    /// THE TOOL ROWS (`lab muse-captures --only tool-row`, 2026-10-22): a
+    /// turn the stub answered with one call of a tool and, after its
+    /// result, a reply holding no words, so it ended on the call's own rows.
+    /// `search` draws `  Searched "parser" (1 match)` two columns in, no `◆`.
+    pub const TOOL_ROW_SEARCH: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-search.txt");
+    /// The same with no match: `  Searched "no-such-word-here" (no matches)`.
+    pub const TOOL_ROW_SEARCH_NONE: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-search-none.txt");
+    /// `write_file`: `◆ Wrote notes.txt (+1)` over its diff, `  1 +written
+    /// by the lab stub`.
+    pub const TOOL_ROW_WRITE: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-write.txt");
+    /// `edit_file`: `◆ Edited README.md (+1 −1)` over its diff.
+    pub const TOOL_ROW_EDIT: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-edit.txt");
+    /// `bash`, `ls`: `◆ Ran ls — failed` over `  └ environment failure: …`
+    /// (the jail's sandbox refuses Muse Code's own `sandbox-exec`).
+    pub const TOOL_ROW_BASH: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-bash.txt");
+    /// `read_memory` of a file not there: `◆ Read memory notes.md — failed`
+    /// over `└ memory file not found` in column 0.
+    pub const TOOL_ROW_READ_MEMORY: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-read-memory.txt");
+    /// `add_memory`: `◆ Saved memory notes.md`.
+    pub const TOOL_ROW_ADD_MEMORY: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-add-memory.txt");
+    /// `get_goal`: `◆ Read goal goal — no effect · ctrl+o`.
+    pub const TOOL_ROW_GOAL: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-goal.txt");
+    /// `work_list`: `◆ Used tool operation` over `└
+    /// {"items":[],"next_after_work_id":null}` in column 0.
+    pub const TOOL_ROW_WORK_LIST: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-work-list.txt");
+    /// `write_todos`: nothing under the message at all.
+    pub const TOOL_ROW_TODOS: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-todos.txt");
     /// A slow turn 3 s in: the status row over the open composer.
     pub const BUSY_1_4_10: &str = include_str!("fixtures/muse-1.4.10-R6427.1-busy-thinking.txt");
+    /// The status row's first frame (the lab, 2026-10-22): `◇ Thinking`
+    /// bare, 0.02 s after the first prompt's Enter, before the row takes its
+    /// time and Esc hint.
+    pub const BUSY_FIRST_FRAME: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-busy-first-frame.txt");
     /// Esc in that turn, 2 s later: the text received so far, `◆
     /// Interrupted · Report issues with /feedback`, and the footer's
     /// `interrupting run`.

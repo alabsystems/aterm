@@ -18,6 +18,7 @@
 //! set the canvas's `width` and `height` at once (which clears it), as
 //! wgpu's surface configure did.
 
+use super::GlPresentError;
 use super::device::GlDevice;
 use super::ffi;
 use super::resources::GlTexture;
@@ -98,7 +99,7 @@ impl GlCanvasSurface {
     /// Post the stand-in: size the canvas if it moved, then copy the
     /// stand-in into the drawing buffer with its rows flipped. `Err` names
     /// the GL failure; a lost context is latched on the device.
-    pub(crate) fn present(&mut self, dev: &GlDevice) -> Result<(), String> {
+    pub(crate) fn present(&mut self, dev: &GlDevice) -> Result<(), GlPresentError> {
         let standin = self
             .standin
             .as_ref()
@@ -133,6 +134,6 @@ impl GlCanvasSurface {
                 ffi::GL_NEAREST as u32,
             );
         }
-        cur.check("present blit")
+        cur.check("present blit").map_err(Into::into)
     }
 }

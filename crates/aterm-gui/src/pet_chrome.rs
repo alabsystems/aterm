@@ -20,7 +20,11 @@
 //!   (the harness tints the composer's whole upper rule) records only the
 //!   runs that carry words and marks ([`PetChrome::note_painted`]): its `─`
 //!   strokes are the program's own rule, ink to the pet, and walled whole
-//!   they kept the cat off the composer's first line.
+//!   they kept the cat off the composer's first line. A line the host does
+//!   not repaint is never written between its marks: on Codex's slab the
+//!   pad's own blanks between the CLI's lockup and the switch stay Codex's
+//!   (`claude_footer`'s `ComposedTop::glass`), and only the lockup and the
+//!   switch are held.
 //! * ONE FRAME LATE, NEVER LEFT STALE. The splices run after the pet's tick,
 //!   so a frame's pet reads the cells the previous frame painted ([`held`]).
 //!   Where a pass paints a different set than the one its pet read, the

@@ -238,7 +238,6 @@ mod scm {
         use std::io;
         use std::os::fd::RawFd;
 
-        /// `struct msghdr`.
         #[repr(C)]
         pub struct MsgHdr {
             msg_name: *mut core::ffi::c_void,
@@ -308,25 +307,19 @@ mod scm {
             }
         }
 
-        /// Control bytes the kernel actually wrote (not what was offered).
         pub fn control_len(msg: &MsgHdr) -> usize {
             msg.msg_controllen as usize
         }
 
-        /// Flags the kernel set on the received message (`MSG_CTRUNC`).
         pub fn msg_flags(msg: &MsgHdr) -> i32 {
             msg.msg_flags
         }
 
-        /// Read a `cmsg_len` out of the front of `bytes`, or `None` when the
-        /// buffer cannot even hold the field.
         pub fn read_cmsg_len(bytes: &[u8]) -> Option<usize> {
             let raw: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
             Some(u32::from_ne_bytes(raw) as usize)
         }
 
-        /// Write a `cmsg_len` at the front of `bytes` (a no-op on a buffer too
-        /// short to hold one — callers always pass the whole control buffer).
         pub fn write_cmsg_len(bytes: &mut [u8], value: usize) {
             if let Some(slot) = bytes.get_mut(..4) {
                 slot.copy_from_slice(&(value as u32).to_ne_bytes());

@@ -3,11 +3,9 @@
 
 //! Authoritative focused-content identity and optional terminal handles.
 //!
-//! A native tab must never inherit the terminal handles that happened to be
-//! active before it.  [`FrontContent`] names the focused leaf; a
-//! [`TerminalMirror`] exists if and only if that leaf is terminal. Terminal-only
-//! operations resolve through this optional capability; native content owns no
-//! placeholder terminal, invalid fd, sink, or session identity.
+//! A native tab must never inherit the terminal handles that were active before it.
+//! [`FrontContent`] names the focused leaf; a [`TerminalMirror`] exists if and only if that
+//! leaf is a terminal. Native content owns no placeholder terminal, fd, sink or session.
 
 use std::sync::{Arc, Mutex};
 
@@ -47,11 +45,8 @@ impl FrontContent {
         }
     }
 
-    /// The terminal SESSION behind this front, or `None` for native content —
-    /// the identity half of [`Self::native`]. Callers that need the session id
-    /// without a capability (the DEC 1004 focus-report account, which must name
-    /// a session it can no longer reach through the window) read it here rather
-    /// than re-matching the enum.
+    /// The terminal session behind this front, or `None` for native content: for callers that
+    /// need the id without a capability (the DEC 1004 focus-report account).
     #[must_use]
     #[inline]
     pub const fn terminal_session(self) -> Option<u64> {

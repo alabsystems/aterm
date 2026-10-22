@@ -8,7 +8,7 @@
 //! | `GET /v1/<name>` | the envelope, `ETag: "<seq>"`, `Cache-Control: no-store`; 404 if none |
 //! | `GET /v1/<name>?after=<n>` | at once if the held seq > n, else held up to the hold time for a newer one, else 204 |
 //! | `PUT /v1/<name>` | accepted (204) only if it verifies under the pin for `<name>` with a higher seq; wakes every long-poll; else 409/400/403 with a one-line reason |
-//! | `POST /v1/<name>/join` | one line `age1… <host> <code>[ proof=<b64>]`, queued (dedup by key, newest kept, at most 256 and 4 from one address, 7 days) |
+//! | `POST /v1/<name>/join` | one line `age1… <host> <code>[ proof=<b64>]` whose code is its key's, queued (dedup by key and address, newest kept, at most 256 and 4 from one address, 7 days) |
 //! | `GET /v1/<name>/join` | the queue, one line each |
 //!
 //! The pin for a name is the signer of the envelope it holds (a handoff chain from that key
@@ -54,16 +54,24 @@
 //!   answer names it), or when it would be a vault's first version here and comes from
 //!   another machine with no `--pin` for the name (refused before its body is read), 409 when
 //!   its seq is not newer; the store holds at most 64 vaults (507).
-//! - A join POST is refused (404) for a vault the server does not hold, and (429) when the
-//!   queue already holds 256 other keys, or 4 from the client's address. A POST of exactly a
-//!   request already queued changes nothing (its queue time stays); one from the same key
-//!   with another host, code or proof replaces it, but not within [`JOIN_CHANGE_GAP`] (10 s)
-//!   of the last change (429). A request counts against its address only while it was asked
-//!   since the vault's current version arrived: an admin's publish answers what it saw, a
-//!   machine it approved never asks again, and one still waiting asks again within the hour.
-//!   The listing's lines are `age1… <host> <code> <unix secs>[ proof=<b64>]`, the time it
-//!   was queued ([`crate::transport::parse_join_line`] reads them); the address a request
-//!   came from is kept in the store, never listed. A new request is logged; changes to one
+//! - A join POST is refused (404) for a vault the server does not hold, (400) when its code
+//!   is not its key's, and (429) when the queue already holds 256 requests, or 4 from the
+//!   client's address, all asked since the vault's current version arrived: once either holds
+//!   its cap, the longest queued request asked before that version gives way to the new one
+//!   (an admin's publish answers what it saw, a machine it approved never asks again, and one
+//!   still waiting asks again within the hour). A POST of exactly a request already queued,
+//!   from any address, keeps its place and the address it was queued from, and changes
+//!   nothing but its queue time, moved on at most hourly, so a machine still waiting never
+//!   ages out, its address changed or not; one for the same key from the same address with
+//!   another host or proof replaces it, but not within [`JOIN_CHANGE_GAP`] (10 s) of when its
+//!   own address last queued or changed it (429), which no re-post moves; one from another
+//!   address is queued beside it, so a host on the LAN can neither replace, hide nor hold off
+//!   another machine's request. The queue keeps the wall clock's times, but a time ahead
+//!   of the clock (stepped back since) holds no change off, and a request expires a week from
+//!   its time either way. The listing's lines are `age1… <host> <code> <unix secs>[
+//!   proof=<b64>]`, the time it was last asked, moved on at most hourly
+//!   ([`crate::transport::parse_join_line`] reads them); the address a request came from is
+//!   kept in the store, never listed. A new request is logged; changes to one
 //!   are logged at most hourly.
 //! - Every answer carries `Cache-Control: no-store` and `Connection: close`; one with a body
 //!   carries `Content-Type: text/plain; charset=utf-8` and `Content-Length`; a refusal's body
@@ -74,10 +82,13 @@
 //!   long-poll whose client went away ends within 5 s.
 //!
 //! [`serve`] returns `Ok`, stopping as [`Running::stop`] does, when its own program is
-//! replaced on disk, so launchd or systemd starts the new build. Its children (`dns-sd`,
-//! `caffeinate`) are killed when it returns. They stay in its process group, so launchd
-//! (which ends a job's process group with it) and a terminal's Ctrl-C end them too when the
-//! server is killed outright; `caffeinate -w` also watches the server's pid.
+//! replaced on disk, so launchd or systemd starts the new build, and on a stop signal
+//! (SIGTERM, SIGINT, SIGHUP: a `kill <pid>`, Activity Monitor's Quit, launchd or systemd
+//! stopping the job). Its children (`dns-sd`, `caffeinate`) are killed when it returns. They
+//! stay in its process group, so launchd (which ends a job's process group with it) and a
+//! terminal's Ctrl-C end them too when the server is killed outright; `caffeinate -w` also
+//! watches the server's pid. Only a SIGKILL of the server alone, outside a job, leaves
+//! `dns-sd` running.
 
 use crate::envelope::{self, MAX_ENVELOPE};
 use crate::transport::{JoinRequest, parse_join_line};
@@ -166,6 +177,9 @@ pub const JOIN_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 pub const JOIN_CHANGE_GAP: Duration = Duration::from_secs(10);
 /// How often the log notes changes to one queued join request.
 const JOIN_NOTE_EVERY_SECS: u64 = 60 * 60;
+/// How often a join request asked again unchanged moves its queue time on: each move rewrites
+/// the store, and a machine still waiting asks hourly, far inside [`JOIN_TTL_SECS`].
+const JOIN_REFRESH_EVERY_SECS: u64 = 60 * 60;
 /// The most vaults one server holds.
 pub const MAX_VAULTS: usize = 64;
 /// The mDNS service type advertised.
@@ -193,6 +207,18 @@ pub fn serve(options: Options) -> crate::Result<()> {
             "--advertise takes a host label: lowercase letters, digits and -",
         ));
     }
+    // Taken before any thread starts (each inherits the mask), so a `kill <pid>` stops the
+    // server as a replaced program does and its children end with it: `dns-sd` has no
+    // lifeline of its own.
+    let signalled = Arc::new(AtomicBool::new(false));
+    {
+        let signalled = Arc::clone(&signalled);
+        let main = std::thread::current();
+        aterm_uds::process::take_stop_signals("vault-stop", move |_| {
+            signalled.store(true, Ordering::SeqCst);
+            main.unpark();
+        });
+    }
     let listener = TcpListener::bind(options.listen)
         .map_err(|e| Error::new(format!("listening on {}: {e}", options.listen)))?;
     let running = start(listener, &options)?;
@@ -208,7 +234,7 @@ pub fn serve(options: Options) -> crate::Result<()> {
     if let Some(name) = &options.advertise {
         children.advertise(name, running.addr.port());
     }
-    let result = supervise(running, PROGRAM_EVERY, &program_stamp);
+    let result = supervise(running, PROGRAM_EVERY, &program_stamp, &signalled);
     drop(children);
     result
 }
@@ -223,7 +249,8 @@ fn program_stamp() -> Option<Stamp> {
     Some((meta.dev(), meta.ino(), meta.size(), meta.mtime()))
 }
 
-/// Run until the accept loop ends (its error is the result), or until `stamp`, read every
+/// Run until the accept loop ends (its error is the result), until `signalled` is raised (a
+/// stop signal; the thread that raises it unparks this one), or until `stamp`, read every
 /// `every`, differs from what it read at the start: this program was replaced on disk (an
 /// update), and a job keeps the image it started with. Then stop as [`Running::stop`] does,
 /// give the answers in flight up to [`DRAIN_DEADLINE`], and return `Ok`, so launchd or
@@ -232,14 +259,22 @@ fn supervise(
     running: Running,
     every: Duration,
     stamp: &dyn Fn() -> Option<Stamp>,
+    signalled: &AtomicBool,
 ) -> crate::Result<()> {
     let program = stamp();
     loop {
         if running.accept.as_ref().is_none_or(JoinHandle::is_finished) {
             return running.wait();
         }
-        if program.is_some() && stamp() != program {
-            note("this program was replaced on disk; exiting so the service starts the new one");
+        let stopping = if signalled.load(Ordering::SeqCst) {
+            Some("stopped by a signal")
+        } else if program.is_some() && stamp() != program {
+            Some("this program was replaced on disk; exiting so the service starts the new one")
+        } else {
+            None
+        };
+        if let Some(why) = stopping {
+            note(why);
             let shared = Arc::clone(&running.shared);
             running.stop();
             let started = Instant::now();
@@ -248,7 +283,7 @@ fn supervise(
             }
             return Ok(());
         }
-        std::thread::sleep(every);
+        std::thread::park_timeout(every);
     }
 }
 
@@ -471,6 +506,10 @@ struct Queued {
     /// The vault's seq when the request was last asked (queued, changed or asked again): it
     /// counts against its address while that is the seq held (0: never).
     asked: u64,
+    /// When its address last queued or changed it (unix secs; 0: not since the server
+    /// started): what the change gap reads. Asking again unchanged, from anywhere, never moves
+    /// it, so no re-post of a listed line holds off the machine's own change.
+    changed: u64,
     /// When the log last noted it (unix secs; 0: not since the server started).
     noted: u64,
 }
@@ -615,12 +654,14 @@ fn load_vault(path: &Path, name: &str) -> crate::Result<Held> {
     })
 }
 
-/// Drop requests older than [`JOIN_TTL_SECS`] (and any from the future past a day's skew).
+/// Drop requests queued more than [`JOIN_TTL_SECS`] from now either way: older, or ahead of a
+/// clock stepped back that far since.
 fn expire(queue: &mut Vec<Queued>, now: u64) {
     queue.retain(|queued| {
-        queued.request.time.is_some_and(|time| {
-            now.saturating_sub(time) <= JOIN_TTL_SECS && time <= now.saturating_add(86_400)
-        })
+        queued
+            .request
+            .time
+            .is_some_and(|time| time.abs_diff(now) <= JOIN_TTL_SECS)
     });
 }
 
@@ -672,6 +713,7 @@ fn parse_stored(text: &str) -> Vec<Queued> {
                 request,
                 peer: from,
                 asked: asked.unwrap_or(0),
+                changed: 0,
                 noted: 0,
             });
         }
@@ -1383,10 +1425,8 @@ fn read_body(
         else {
             return Err(Reply::text(408, "the body took too long"));
         };
-        if stream
-            .set_read_timeout(Some(left.min(tuning.body_stall)))
-            .is_err()
-        {
+        let wait = left.min(tuning.body_stall);
+        if stream.set_read_timeout(Some(wait)).is_err() {
             return Err(Reply::text(400, "the connection closed"));
         }
         let want = (length - body.len()).min(chunk.len());
@@ -1400,7 +1440,13 @@ fn read_body(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                return Err(Reply::text(408, "the body stalled"));
+                // A read that waited what was left of the deadline outran it.
+                let why = if wait == left {
+                    "the body took too long"
+                } else {
+                    "the body stalled"
+                };
+                return Err(Reply::text(408, why));
             }
             Err(_) => return Err(Reply::text(400, "the connection closed")),
         }
@@ -1624,6 +1670,13 @@ fn post_join(shared: &Shared, name: &str, body: &[u8], peer: IpAddr) -> Reply {
         Ok(_) => return Reply::text(400, "a join request is `age1… <host> <code>`"),
         Err(e) => return Reply::text(400, e.0),
     };
+    // Every client drops, unread, a line whose code is not its key's.
+    let code = crate::age::Recipient::parse(&request.recipient)
+        .ok()
+        .map(|key| crate::client::join_code(&key));
+    if code.as_deref() != Some(request.code.as_str()) {
+        return Reply::text(400, "a join request's code is not its key's");
+    }
     let now = (shared.tuning.now)();
     // One join request decided and stored at a time. `server_state` is held only to decide and to
     // swap the new queue in, so a slow disk holds up no GET, long-poll or PUT.
@@ -1674,49 +1727,70 @@ fn decide_join(
     };
     let mut queue = state.joins.get(name).cloned().unwrap_or_default();
     expire(&mut queue, now);
-    let previous = queue
-        .iter()
-        .position(|queued| queued.request.recipient == request.recipient)
-        .map(|at| queue.remove(at));
-    if let Some(previous) = &previous {
-        let asked = &previous.request;
-        if asked.host == request.host && asked.code == request.code && asked.proof == request.proof
-        {
-            // A machine asking again for exactly what it asked (the subscriber re-asks
-            // hourly) is told it is queued: no rewrite, no log line, its place and time stay.
-            // It counts against its address again, as one still waiting.
-            if let Some(held) = state.joins.get_mut(name).and_then(|queue| {
-                queue
-                    .iter_mut()
-                    .find(|queued| queued.request.recipient == request.recipient)
-            }) {
+    let same = |queued: &Queued| {
+        let asked = &queued.request;
+        asked.recipient == request.recipient
+            && asked.host == request.host
+            && asked.code == request.code
+            && asked.proof == request.proof
+    };
+    if let Some(at) = queue.iter().position(same) {
+        // A machine asking again for exactly what it asked (the subscriber re-asks hourly,
+        // from whatever address it has now) is told it is queued, with no log line, and keeps
+        // its place and the address it was queued from: it counts against that address again,
+        // as one still waiting, and asking from another address moves no request past that
+        // one's cap. Its time moves on at most hourly, asked from any address: a machine still
+        // waiting, its address changed or not, never ages out of the queue, where an admin
+        // opening the vault would not see it to hold it (`client::code_only_for`), and the
+        // store is rewritten for it at most hourly. Anyone can re-post a listed line, so the
+        // change gap reads [`Queued::changed`], which this never moves.
+        if now.saturating_sub(queue[at].request.time.unwrap_or(0)) < JOIN_REFRESH_EVERY_SECS {
+            if let Some(held) = state
+                .joins
+                .get_mut(name)
+                .and_then(|queue| queue.iter_mut().find(|queued| same(queued)))
+            {
                 held.asked = seq;
             }
             return Ok(Decided::Queued);
         }
+        queue[at].request.time = Some(now);
+        queue[at].asked = seq;
+        return Ok(Decided::Next(queue, None));
+    }
+    // A request replaces only the one its own address queued for the key; another address's
+    // is queued beside it. Anyone may post any key, so no host can replace or hide another's
+    // request, or hold its changes off with the gap. One from no known address (a store from
+    // before addresses were kept) is anyone's.
+    let ours = |queued: &Queued| {
+        queued.request.recipient == request.recipient && queued.peer.is_none_or(|at| at == peer)
+    };
+    let previous = queue.iter().position(ours).map(|at| queue.remove(at));
+    if let Some(previous) = &previous {
+        // A time ahead of the clock (it was stepped back since) holds nothing off.
         let gap = shared.tuning.join_change_gap;
-        if now.saturating_sub(asked.time.unwrap_or(0)) < gap.as_secs() {
+        if now
+            .checked_sub(previous.changed)
+            .is_some_and(|since| since < gap.as_secs())
+        {
             return Err(Reply::text(
                 429,
                 format!("this key's join request changed less than {gap:?} ago; ask again shortly"),
             ));
         }
     }
-    // What an admin's publish since answered (approved, or seen and left) is not held
-    // against the address until it is asked again. Nor is what was asked at a seq above the
-    // vault's: a version whose held key gave way (the removed admin's, with any seq) was
-    // replaced by one below it.
-    let from_peer = queue
-        .iter()
-        .filter(|queued| queued.peer == Some(peer) && queued.asked == seq)
-        .count();
-    if from_peer >= MAX_PEER_JOINS {
+    if !make_room(
+        &mut queue,
+        MAX_PEER_JOINS,
+        |queued| queued.peer == Some(peer),
+        seq,
+    ) {
         return Err(Reply::text(
             429,
             format!("your address already has {MAX_PEER_JOINS} join requests queued here"),
         ));
     }
-    if queue.len() >= MAX_JOINS {
+    if !make_room(&mut queue, MAX_JOINS, |_| true, seq) {
         return Err(Reply::text(
             429,
             format!("the join queue already holds {MAX_JOINS} requests"),
@@ -1740,9 +1814,37 @@ fn decide_join(
         },
         peer: Some(peer),
         asked: seq,
+        changed: now,
         noted,
     });
     Ok(Decided::Next(queue, line))
+}
+
+/// Make room in `queue` for one more request among those `counted` picks, once they number
+/// `cap`: the longest queued of them that a publish answered gives way (asked before version
+/// `seq`, or at a seq above it: a version whose held key gave way, the removed admin's with any
+/// seq, was replaced by one below it). An admin's publish answers what it saw, a machine it
+/// approved never asks again, and one still waiting asks again within the hour. `false` when
+/// every one of them was asked at `seq`.
+fn make_room(
+    queue: &mut Vec<Queued>,
+    cap: usize,
+    counted: impl Fn(&Queued) -> bool,
+    seq: u64,
+) -> bool {
+    if queue.iter().filter(|queued| counted(queued)).count() < cap {
+        return true;
+    }
+    match queue
+        .iter()
+        .position(|queued| counted(queued) && queued.asked != seq)
+    {
+        Some(at) => {
+            queue.remove(at);
+            true
+        }
+        None => false,
+    }
 }
 
 fn list_joins(shared: &Shared, name: &str) -> Reply {
@@ -2017,11 +2119,14 @@ mod tests {
         String::from_utf8_lossy(&answer).into_owned()
     }
 
+    /// Key `n`'s join code.
+    fn code(n: u8) -> String {
+        let key = crate::transport::test_recipient(n);
+        crate::client::join_code(&crate::age::Recipient::parse(&key).expect("a key"))
+    }
+
     fn join_line(n: u8, host: &str) -> String {
-        format!(
-            "{} {host} abcd-ef23-ghij-k234",
-            crate::transport::test_recipient(n)
-        )
+        format!("{} {host} {}", crate::transport::test_recipient(n), code(n))
     }
 
     fn queued(request: JoinRequest, peer: Option<IpAddr>) -> Queued {
@@ -2029,6 +2134,7 @@ mod tests {
             request,
             peer,
             asked: 1,
+            changed: 0,
             noted: 0,
         }
     }
@@ -2358,7 +2464,7 @@ mod tests {
     }
 
     #[test]
-    fn joins_asked_under_a_key_that_gave_way_count_against_no_address() {
+    fn joins_asked_under_a_key_that_gave_way_give_way_to_new_ones() {
         let old = signer_public(&OLD).expect("public");
         let real = envelope_with(
             &NEW,
@@ -2383,18 +2489,18 @@ mod tests {
         running.stop();
 
         // The build that retires OLD takes the vault back, whose seq is far below the one the
-        // four were asked at; they are still listed, and count again once asked again.
+        // four were asked at: they are still listed, and give way to what the address asks.
         let running = run_tuned(&options(root.path(), hold), retiring());
         put(&running, &real).expect("the held key gave way");
-        ask(&running, 5).expect("counted against nothing");
+        ask(&running, 5).expect("m1 gave way");
         assert_eq!(
             transport::list_joins(&url(&running)).expect("listed").len(),
-            5
+            4
         );
         running.stop();
         // And so after a restart, which reads the queue from its file.
         let running = run_tuned(&options(root.path(), hold), retiring());
-        ask(&running, 6).expect("still counted against nothing");
+        ask(&running, 6).expect("m2 gave way");
         running.stop();
     }
 
@@ -2492,10 +2598,7 @@ mod tests {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let running = run(&options(root.path(), Duration::from_millis(200)));
         put(&running, &envelope(&OLD, 1)).expect("first");
-        let line = format!(
-            "{} m22 abcd-ef23-ghij-k234",
-            crate::transport::test_recipient(1)
-        );
+        let line = join_line(1, "m22");
         // A page's simple POST (text/plain needs no preflight), from any origin.
         for header in [
             "Origin: https://example.com",
@@ -2547,23 +2650,15 @@ mod tests {
             changeable(),
         );
         let key = |n: u8| crate::transport::test_recipient(n);
-        let line = format!("{} m22 abcd-ef23-ghij-k234", key(1));
+        let line = join_line(1, "m22");
         let error = transport::post_join(&url(&running), &line).expect_err("no vault yet");
         assert!(error.0.contains("404"), "{error}");
         put(&running, &envelope(&OLD, 1)).expect("first");
 
         transport::post_join(&url(&running), &line).expect("queued");
-        transport::post_join(
-            &url(&running),
-            &format!("{} m3 wxyz-2345-wxyz-2345", key(2)),
-        )
-        .expect("queued");
+        transport::post_join(&url(&running), &join_line(2, "m3")).expect("queued");
         // The same key again replaces its request.
-        transport::post_join(
-            &url(&running),
-            &format!("{} m22b abcd-ef23-ghij-k234", key(1)),
-        )
-        .expect("again");
+        transport::post_join(&url(&running), &join_line(1, "m22b")).expect("again");
         let listed = transport::list_joins(&url(&running)).expect("listed");
         assert_eq!(listed.len(), 2, "{listed:?}");
         let requests: Vec<JoinRequest> = listed
@@ -2576,9 +2671,11 @@ mod tests {
 
         for bad in [
             "nonsense".to_owned(),
-            format!("{} M22 abcd-ef23-ghij-k234", key(3)),
-            format!("{} m22 abcd-ef23-ghij-k234 1", key(3)),
-            format!("{} m22 abcd-ef23-ghij-k234\nsecond line", key(3)),
+            join_line(3, "M22"),
+            format!("{} 1", join_line(3, "m22")),
+            format!("{}\nsecond line", join_line(3, "m22")),
+            // The code of another key.
+            format!("{} m22 {}", key(3), code(4)),
         ] {
             let answer = raw(
                 &running,
@@ -2626,15 +2723,23 @@ mod tests {
             .lock_server_state()
             .joins
             .insert("alab".to_owned(), queue);
-        let error = transport::post_join(
-            &url(&running),
-            &format!(
-                "{} m22 abcd-ef23-ghij-k234",
-                crate::transport::test_recipient(1)
-            ),
-        )
-        .expect_err("full");
+        let error = transport::post_join(&url(&running), &join_line(1, "m22")).expect_err("full");
         assert!(error.0.contains("429"), "{error}");
+        assert!(error.0.contains("already holds 256"), "{error}");
+
+        // Once a publish answered them, the longest queued gives way to a new key: a queue
+        // filled once is not shut to every new machine for a week.
+        put(&running, &envelope(&OLD, 2)).expect("a new version");
+        transport::post_join(&url(&running), &join_line(1, "m22")).expect("room made");
+        let state = running.shared.lock_server_state();
+        let queue = &state.joins["alab"];
+        assert_eq!(queue.len(), MAX_JOINS);
+        assert_eq!(
+            queue[0].request.host, "h1",
+            "h0, the longest queued, gave way"
+        );
+        assert_eq!(queue[MAX_JOINS - 1].request.host, "m22");
+        drop(state);
         running.stop();
     }
 
@@ -2643,10 +2748,7 @@ mod tests {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let running = run(&options(root.path(), Duration::from_millis(200)));
         put(&running, &envelope(&OLD, 4)).expect("first");
-        let line = format!(
-            "{} m22 abcd-ef23-ghij-k234",
-            crate::transport::test_recipient(1)
-        );
+        let line = join_line(1, "m22");
         transport::post_join(&url(&running), &line).expect("queued");
         running.stop();
 
@@ -2827,7 +2929,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_keeps_a_week_and_drops_the_future() {
+    fn expiry_keeps_a_week_either_side_of_the_clock() {
         let request = |time| {
             queued(
                 JoinRequest {
@@ -2845,10 +2947,23 @@ mod tests {
             request(now),
             request(now - JOIN_TTL_SECS),
             request(now - JOIN_TTL_SECS - 1),
+            // Queued before the clock was stepped back: two days, and a week, kept.
             request(now + 2 * 86_400),
+            request(now + JOIN_TTL_SECS),
+            request(now + JOIN_TTL_SECS + 1),
         ];
         expire(&mut queue, now);
-        assert_eq!(queue.len(), 2);
+        let times: Vec<Option<u64>> = queue.iter().map(|queued| queued.request.time).collect();
+        assert_eq!(
+            times,
+            [
+                now,
+                now - JOIN_TTL_SECS,
+                now + 2 * 86_400,
+                now + JOIN_TTL_SECS
+            ]
+            .map(Some)
+        );
     }
 
     #[test]
@@ -2998,7 +3113,49 @@ mod tests {
     }
 
     #[test]
-    fn a_join_asked_again_changes_nothing_and_a_new_proof_replaces_it() {
+    fn a_put_body_that_stalls_or_outruns_its_deadline_is_cut_with_408_and_frees_its_slot() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        // In each, only the clock under test can cut the body: the other is past the hang
+        // detector.
+        let stall = Tuning {
+            body_stall: Duration::from_millis(100),
+            body_deadline: 2 * HANG_DETECTOR,
+            ..Tuning::default()
+        };
+        let deadline = Tuning {
+            body_stall: 2 * HANG_DETECTOR,
+            body_deadline: Duration::from_millis(200),
+            ..Tuning::default()
+        };
+        let head = format!(
+            "PUT /v1/alab HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\nabc",
+            1 << 20
+        );
+        for (tuning, trickled, why) in [
+            (stall, false, "the body stalled"),
+            (deadline, true, "the body took too long"),
+        ] {
+            let running = run_tuned(&options(root.path(), Duration::from_millis(200)), tuning);
+            let stream = sent(&running, head.as_bytes());
+            // A byte now and then keeps a body from stalling, but buys it no time.
+            let mut writer = stream.try_clone().expect("clone");
+            let trickle = std::thread::spawn(move || {
+                while trickled && writer.write_all(b"a").is_ok() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            let answer = read_all(stream);
+            assert!(answer.starts_with("HTTP/1.1 408 "), "{why}: {answer}");
+            assert!(answer.contains(why), "{answer}");
+            trickle.join().expect("trickle");
+            until("the PUT slot is let go", || reading(&running) == 0);
+            put(&running, &envelope(&OLD, 1)).expect("the slot serves the next PUT");
+            running.stop();
+        }
+    }
+
+    #[test]
+    fn a_join_asked_again_keeps_its_place_moves_its_time_hourly_and_a_new_proof_replaces_it() {
         use std::os::unix::fs::MetadataExt;
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let running = run_tuned(
@@ -3009,51 +3166,242 @@ mod tests {
         let proof = |n: u8| crate::b64::encode_padded(&[n; 32]);
         let line = format!("{} proof={}", join_line(1, "m22"), proof(1));
         transport::post_join(&url(&running), &line).expect("queued");
+        transport::post_join(&url(&running), &join_line(2, "m2")).expect("one behind it");
         let joins = root.path().join("alab.joins");
         let inode = |path: &Path| std::fs::metadata(path).expect("joins").ino();
         let first = inode(&joins);
-        // As far as the server knows, it was queued an hour ago.
-        let earlier = now() - 3600;
-        running
-            .shared
-            .lock_server_state()
-            .joins
-            .get_mut("alab")
-            .expect("queue")[0]
-            .request
-            .time = Some(earlier);
+        let queued_at = |time: u64| {
+            running
+                .shared
+                .lock_server_state()
+                .joins
+                .get_mut("alab")
+                .expect("queue")[0]
+                .request
+                .time = Some(time);
+        };
+        let listed = || transport::list_joins(&url(&running)).expect("listed");
+        let hosts = |listed: &[String]| {
+            listed
+                .iter()
+                .map(|line| parse_join_line(line).expect("parses").host)
+                .collect::<Vec<_>>()
+        };
 
+        // Asked again within the hour of its queue time, it changes nothing, not even the store.
+        let recent = now() - (JOIN_REFRESH_EVERY_SECS - 60);
+        queued_at(recent);
         transport::post_join(&url(&running), &line).expect("asked again");
         assert_eq!(
-            transport::list_joins(&url(&running)).expect("listed"),
-            [format!(
-                "{} {earlier} proof={}",
-                join_line(1, "m22"),
-                proof(1)
-            )]
+            listed()[0],
+            format!("{} {recent} proof={}", join_line(1, "m22"), proof(1))
         );
         assert_eq!(inode(&joins), first, "the store was rewritten");
 
-        // Another proof from the same key replaces it, and so does another host.
+        // An hour on, its time moves on in its place, asked from any address (a Mac whose
+        // address changed asks from its new one), so a machine still waiting (it asks hourly)
+        // never ages out of the queue; it keeps the address it was queued from.
+        let earlier = now() - JOIN_REFRESH_EVERY_SECS;
+        queued_at(earlier);
+        let set_peer = |peer: Option<IpAddr>| {
+            running
+                .shared
+                .lock_server_state()
+                .joins
+                .get_mut("alab")
+                .expect("queue")[0]
+                .peer = peer;
+        };
+        let here = running.shared.lock_server_state().joins["alab"][0].peer;
+        let there: IpAddr = "192.0.2.7".parse().expect("address");
+        set_peer(Some(there));
+        transport::post_join(&url(&running), &line).expect("asked again, an hour on");
+        let now_listed = listed();
+        assert_eq!(hosts(&now_listed), ["m22", "m2"]);
+        let request = parse_join_line(&now_listed[0]).expect("parses");
+        assert_eq!(request.proof, Some(proof(1)));
+        assert!(
+            request.time.is_some_and(|time| time > earlier),
+            "{request:?}"
+        );
+        assert_ne!(inode(&joins), first, "the moved time was not stored");
+        let stored = std::fs::read_to_string(&joins).expect("store");
+        assert!(
+            stored.starts_with(&format!("peer {there} 1\n{}\n", now_listed[0])),
+            "{stored}"
+        );
+        let moved = inode(&joins);
+        set_peer(here);
+
+        // Another proof from the same key replaces it, and so does another host (from another
+        // address it would be queued beside it).
         transport::post_join(
             &url(&running),
             &format!("{} proof={}", join_line(1, "m22"), proof(2)),
         )
         .expect("a new proof");
-        let listed = transport::list_joins(&url(&running)).expect("listed");
-        assert_eq!(listed.len(), 1, "{listed:?}");
-        let request = parse_join_line(&listed[0]).expect("parses");
+        let now_listed = listed();
+        assert_eq!(hosts(&now_listed), ["m2", "m22"]);
+        let request = parse_join_line(&now_listed[1]).expect("parses");
         assert_eq!(request.proof, Some(proof(2)));
-        assert!(
-            request.time.is_some_and(|time| time > earlier),
-            "{request:?}"
-        );
-        assert_ne!(inode(&joins), first);
+        assert_ne!(inode(&joins), moved);
         transport::post_join(&url(&running), &join_line(1, "m22b")).expect("a new host");
+        let now_listed = listed();
+        assert_eq!(hosts(&now_listed), ["m2", "m22b"]);
+        let request = parse_join_line(&now_listed[1]).expect("parses");
+        assert_eq!(request.proof, None);
+        running.stop();
+    }
+
+    #[test]
+    fn another_address_can_neither_replace_nor_hide_a_queued_join_request() {
+        use std::sync::atomic::AtomicU64;
+        // The test's own clock, as in the change-gap test: no gap depends on the machine's pace.
+        const START: u64 = 1_800_000_000;
+        static CLOCK: AtomicU64 = AtomicU64::new(START);
+        fn clock() -> u64 {
+            CLOCK.load(Ordering::SeqCst)
+        }
+        let gap = JOIN_CHANGE_GAP.as_secs();
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run_tuned(
+            &options(root.path(), Duration::from_millis(200)),
+            Tuning {
+                now: clock,
+                ..Tuning::default()
+            },
+        );
+        put(&running, &envelope(&OLD, 1)).expect("first");
+        let machine: IpAddr = "192.0.2.10".parse().expect("address");
+        let stranger: IpAddr = "192.0.2.66".parse().expect("address");
+        let ask = |line: &str, from: IpAddr| {
+            post_join(&running.shared, "alab", line.as_bytes(), from).status
+        };
+        let proof = |n: u8| crate::b64::encode_padded(&[n; 32]);
+        let key = crate::transport::test_recipient(1);
+        let asked = format!("{} proof={}", join_line(1, "m30"), proof(1));
+        assert_eq!(ask(&asked, machine), 204);
+
+        // A stranger who read the key off the listing posts it with a code that is not its
+        // key's (refused), then, a gap on, with its code under another host and proof.
+        assert_eq!(ask(&format!("{key} m30 {}", code(2)), stranger), 400);
+        CLOCK.store(START + gap, Ordering::SeqCst);
+        assert_eq!(
+            ask(
+                &format!("{} proof={}", join_line(1, "evil"), proof(2)),
+                stranger
+            ),
+            204
+        );
         let listed = transport::list_joins(&url(&running)).expect("listed");
-        assert_eq!(listed.len(), 1, "{listed:?}");
-        let request = parse_join_line(&listed[0]).expect("parses");
-        assert_eq!((request.host.as_str(), request.proof), ("m22b", None));
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert_eq!(
+            listed[0],
+            format!("{} {START} proof={}", join_line(1, "m30"), proof(1)),
+            "the machine's request stands as it asked it"
+        );
+
+        // The stranger changing its own line every gap holds off none of the machine's
+        // changes: a corrected password lands at once.
+        CLOCK.store(START + 2 * gap, Ordering::SeqCst);
+        assert_eq!(
+            ask(
+                &format!("{} proof={}", join_line(1, "evil"), proof(3)),
+                stranger
+            ),
+            204
+        );
+        assert_eq!(
+            ask(
+                &format!("{} proof={}", join_line(1, "m30"), proof(4)),
+                machine
+            ),
+            204
+        );
+        // Moved to another address, the machine asks again for exactly what it asked: still
+        // one request of its own.
+        let moved: IpAddr = "192.0.2.11".parse().expect("address");
+        assert_eq!(
+            ask(
+                &format!("{} proof={}", join_line(1, "m30"), proof(4)),
+                moved
+            ),
+            204
+        );
+        let state = running.shared.lock_server_state();
+        let mine: Vec<&Queued> = state.joins["alab"]
+            .iter()
+            .filter(|queued| queued.request.host == "m30")
+            .collect();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].peer, Some(machine));
+        assert_eq!(mine[0].request.proof, Some(proof(4)));
+        drop(state);
+
+        // A stranger re-posting the machine's line an hour on moves its time, as the machine
+        // asking from a new address would, but not what the gap reads, so the machine's own
+        // change a moment later is not held off.
+        let hour = START + 2 * gap + JOIN_REFRESH_EVERY_SECS;
+        CLOCK.store(hour, Ordering::SeqCst);
+        let asked = format!("{} proof={}", join_line(1, "m30"), proof(4));
+        assert_eq!(ask(&asked, stranger), 204);
+        CLOCK.store(hour + 1, Ordering::SeqCst);
+        let asked = format!("{} proof={}", join_line(1, "m30"), proof(5));
+        assert_eq!(ask(&asked, machine), 204);
+
+        // Moved for good, the machine asking again hourly from its new address moves its time
+        // each hour, so it stays queued past the week a request lasts.
+        let mut at = hour + 1;
+        while at < hour + 1 + JOIN_TTL_SECS + 2 * JOIN_REFRESH_EVERY_SECS {
+            at += JOIN_REFRESH_EVERY_SECS;
+            CLOCK.store(at, Ordering::SeqCst);
+            assert_eq!(ask(&asked, moved), 204);
+            let listed = transport::list_joins(&url(&running)).expect("listed");
+            let refreshed = format!("{} {at} proof={}", join_line(1, "m30"), proof(5));
+            assert!(listed.contains(&refreshed), "{listed:?}");
+        }
+        let state = running.shared.lock_server_state();
+        assert_eq!(state.joins["alab"].len(), 1);
+        assert_eq!(state.joins["alab"][0].peer, Some(machine));
+        drop(state);
+        running.stop();
+    }
+
+    /// Two addresses asking for one key list it twice, and an open vault's approver lets it in
+    /// once, as the first line asked.
+    #[test]
+    fn a_key_two_addresses_ask_for_is_let_in_once() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&options(
+            &root.path().join("store"),
+            Duration::from_millis(200),
+        ));
+        let vault = format!("http://{}/v1/twice", running.addr);
+        let admin = crate::client::Paths::for_home(&root.path().join("ma"));
+        crate::client::create(&admin, &vault, None, Some("ma")).expect("create");
+        let opened = crate::client::admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
+        doc.set_open(true).expect("open");
+        crate::client::admin_publish(&admin, &opened, &doc).expect("publish");
+        let key = crate::transport::test_recipient(1);
+        for (host, from) in [("mb", "192.0.2.10"), ("evil", "192.0.2.66")] {
+            let line = format!("{key} {host} {}", code(1));
+            let from = from.parse().expect("address");
+            assert_eq!(
+                post_join(&running.shared, "twice", line.as_bytes(), from).status,
+                204
+            );
+        }
+        let done = crate::client::auto_approve(&admin).expect("approve");
+        assert_eq!(done.approved, ["mb"]);
+        let doc = crate::client::admin_open(&admin).expect("open").doc.clone();
+        let names: Vec<String> = doc
+            .machines()
+            .into_iter()
+            .filter(|machine| machine.recipient == key)
+            .map(|machine| machine.name)
+            .collect();
+        assert_eq!(names, ["mb"]);
         running.stop();
     }
 
@@ -3120,20 +3468,23 @@ mod tests {
         }
         assert!(ask(5).expect_err("a fifth").0.contains("429"));
 
-        // An admin publishes (approving m1 and m2, say): what it saw is no longer held
-        // against the address, though the queue still lists it.
+        // An admin publishes (approving m1 and m2, say): what it saw gives way, the longest
+        // queued first, to what the address asks next.
         put(&running, &envelope(&OLD, 2)).expect("a new version");
-        ask(5).expect("counted against nothing");
+        ask(5).expect("m1 gave way");
         // m3 and m4, still waiting, ask again as their subscribers do: they count again.
         ask(3).expect("asked again");
         ask(4).expect("asked again");
-        ask(6).expect("the fourth counted");
+        ask(6).expect("m2 gave way");
         let error = ask(7).expect_err("a fifth counted");
         assert!(error.0.contains("your address"), "{error}");
-        assert_eq!(
-            transport::list_joins(&url(&running)).expect("listed").len(),
-            6
-        );
+        // Never more than 4 from the address, however many versions it outlasts.
+        let hosts: Vec<String> = transport::list_joins(&url(&running))
+            .expect("listed")
+            .iter()
+            .map(|line| parse_join_line(line).expect("parses").host)
+            .collect();
+        assert_eq!(hosts, ["m3", "m4", "m5", "m6"]);
         running.stop();
     }
 
@@ -3201,6 +3552,53 @@ mod tests {
             held(&running).noted,
             START + JOIN_NOTE_EVERY_SECS,
             "an hour on, the change is noted"
+        );
+        running.stop();
+    }
+
+    #[test]
+    fn a_clock_stepped_back_holds_off_no_change_and_drops_no_request() {
+        use std::sync::atomic::AtomicU64;
+        const START: u64 = 1_800_000_000;
+        static CLOCK: AtomicU64 = AtomicU64::new(START);
+        fn clock() -> u64 {
+            CLOCK.load(Ordering::SeqCst)
+        }
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run_tuned(
+            &options(root.path(), Duration::from_millis(200)),
+            Tuning {
+                now: clock,
+                ..Tuning::default()
+            },
+        );
+        put(&running, &envelope(&OLD, 1)).expect("first");
+        transport::post_join(&url(&running), &join_line(1, "m22")).expect("queued");
+        transport::post_join(&url(&running), &join_line(2, "m23")).expect("queued");
+
+        // The server booted six hours fast, and NTP set it right: the person who mistyped
+        // the password joins again at once, and the change is taken.
+        let back = START - 6 * 60 * 60;
+        CLOCK.store(back, Ordering::SeqCst);
+        transport::post_join(&url(&running), &join_line(1, "m22b")).expect("changed at once");
+        let held = |running: &Running| running.shared.lock_server_state().joins["alab"].clone();
+        let hosts: Vec<(String, Option<u64>)> = held(&running)
+            .into_iter()
+            .map(|queued| (queued.request.host, queued.request.time))
+            .collect();
+        assert_eq!(
+            hosts,
+            [
+                ("m23".to_owned(), Some(START)),
+                ("m22b".to_owned(), Some(back))
+            ]
+        );
+
+        // Two days fast, set right: the requests queued meanwhile are still listed.
+        CLOCK.store(back - 2 * 86_400, Ordering::SeqCst);
+        assert_eq!(
+            transport::list_joins(&url(&running)).expect("listed").len(),
+            2
         );
         running.stop();
     }
@@ -3384,7 +3782,13 @@ mod tests {
             let look = looks.fetch_add(1, Ordering::SeqCst);
             Some((1, if look < 3 { 1 } else { 2 }, 0, 0))
         };
-        supervise(running, Duration::from_millis(1), &stamp).expect("a clean exit");
+        supervise(
+            running,
+            Duration::from_millis(1),
+            &stamp,
+            &AtomicBool::new(false),
+        )
+        .expect("a clean exit");
         assert!(looks.load(Ordering::SeqCst) >= 4);
         assert!(shared.stopping.load(Ordering::SeqCst));
         // The held long-poll was answered, not cut.
@@ -3395,6 +3799,68 @@ mod tests {
         until("every connection has closed", || {
             shared.active.load(Ordering::SeqCst) == 0
         });
+    }
+
+    /// What [`serve`]'s signal thread does on a stop signal: raise the flag and unpark the
+    /// supervisor, which stops the server so [`serve`] goes on to end its children. The flag
+    /// is raised here, not by a signal: a test process cannot take one, since the harness's
+    /// own threads leave the stop signals unblocked and the kernel may hand it to one of them,
+    /// whose default action ends the whole run.
+    #[test]
+    fn a_raised_stop_flag_stops_the_server_and_ends_it_cleanly() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&options(root.path(), 2 * HANG_DETECTOR));
+        put(&running, &envelope(&OLD, 1)).expect("first");
+        let target = source(&running);
+        let waiter = std::thread::spawn(move || transport::fetch(&target, Some(1), HANG_DETECTOR));
+        until_waiting(&running, 1);
+        let shared = Arc::clone(&running.shared);
+        let signalled = Arc::new(AtomicBool::new(false));
+        let supervisor = {
+            let signalled = Arc::clone(&signalled);
+            // The program never changes, and a pass waits past the hang detector: only the
+            // signal ends it.
+            std::thread::spawn(move || supervise(running, 2 * HANG_DETECTOR, &|| None, &signalled))
+        };
+        signalled.store(true, Ordering::SeqCst);
+        supervisor.thread().unpark();
+        until("the supervisor returns", || supervisor.is_finished());
+        supervisor
+            .join()
+            .expect("supervisor")
+            .expect("a clean exit");
+        assert!(shared.stopping.load(Ordering::SeqCst));
+        assert_eq!(
+            waiter.join().expect("waiter").expect("ended"),
+            Fetched::NoNewer
+        );
+    }
+
+    /// The children [`serve`] holds end when it lets them go, as it does once the supervisor
+    /// returns: `dns-sd` has no lifeline of its own and would go on advertising this Mac. A
+    /// stand-in `sleep` holds each slot; one left running ends by itself within the minute.
+    #[test]
+    fn letting_the_servers_children_go_ends_them() {
+        let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+        let sleep = sleep.to_str().expect("a UTF-8 path");
+        let children = Children::default();
+        let pids = {
+            let mut set = children.lock();
+            let caffeinate = quiet(sleep, &["60".to_owned()]).expect("a stand-in");
+            let dns_sd = quiet(sleep, &["60".to_owned()]).expect("a stand-in");
+            let pids = [caffeinate.id(), dns_sd.id()];
+            set.caffeinate = Some(caffeinate);
+            set.dns_sd = Some((dns_sd, Ipv4Addr::LOCALHOST));
+            pids
+        };
+        assert!(pids.iter().all(|&pid| aterm_uds::process::pid_alive(pid)));
+        drop(children);
+        for pid in pids {
+            assert!(
+                !aterm_uds::process::pid_alive(pid),
+                "{pid} outlived the server"
+            );
+        }
     }
 
     #[test]

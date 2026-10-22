@@ -93,15 +93,10 @@ const COLD_THEME_BG: u32 = 0x001A_1B26;
 /// next rAF after the wake.
 const PAGE_SETTLE_FRAME: Duration = Duration::from_micros(16_667);
 
-/// The cursor colour the pet's contrast sampler falls back to over blank
-/// glass. The engine snapshot leaves `RenderInput::cursor_color` as the
-/// `COLOR_UNSET` sentinel when the frame is not cursor-authoritative, and a
-/// sentinel is not a colour.
-///
-/// The fallback is the terminal's own resolution (`cursor_color()` else the
-/// default foreground, as the native call sites use), not the glow's resolved
-/// cursor colour, which is effect config and would tint the cat with the
-/// wake's palette. Masked to `0x00RRGGBB`.
+/// The cursor colour the pet's contrast sampler uses over blank glass, masked to `0x00RRGGBB`.
+/// A `COLOR_UNSET` snapshot colour (a frame that is not cursor-authoritative) falls back to the
+/// terminal's own resolution (`cursor_color()` else the default foreground), never the glow's
+/// cursor colour, which would tint the cat with the wake's palette.
 #[inline]
 #[must_use]
 const fn pet_contrast_cursor(input_cursor_color: u32, term_cursor_color: u32) -> u32 {
@@ -3591,11 +3586,9 @@ mod tests {
         }
     }
 
-    /// The pointer under host rows: a host that prepends rows above the grid
-    /// after `apply` draws the pet that much lower and hands pointer and
-    /// presses in frame px. With `set_host_rows_px`, a stroke across the drawn
-    /// body reaches the brain, a press on it pets, and the hit rect answers in
-    /// the same space; the emission itself does not move.
+    /// The pointer under host rows: with `set_host_rows_px`, a stroke across the drawn body
+    /// reaches the brain, a press on it pets, and the hit rect answers in frame px; the
+    /// emission itself does not move.
     #[test]
     fn pointer_under_host_rows_is_read_where_the_frame_draws_the_pet() {
         use crate::kitty_pet::PetAction;

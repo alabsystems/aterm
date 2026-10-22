@@ -1623,13 +1623,10 @@ impl SessionHandle {
     }
 }
 
-/// How many roster lifecycle records the store retains. Drop-oldest past this,
-/// exactly like [`crate::turn_ledger::LEDGER_CAP`] and
-/// [`crate::session_timeline::TIMELINE_CAP`] — a journal that grew without
-/// bound would be a leak, and a consumer that falls further behind than this
-/// has a documented, exact recovery path (see [`SessionStore::roster_since`]).
-/// 512 membership changes is many hundreds of tab open/closes; a 4 Hz consumer
-/// would have to miss ~2 minutes of continuous churn to fall out of it.
+/// How many roster lifecycle records the store retains, drop-oldest, like
+/// [`crate::turn_ledger::LEDGER_CAP`]. A consumer that falls further behind has an exact
+/// recovery path ([`SessionStore::roster_since`]); a 4 Hz consumer would have to miss about
+/// two minutes of continuous churn.
 pub(crate) const ROSTER_JOURNAL_CAP: usize = 512;
 
 /// A change to the registry's membership. State changes (`Spawning → Alive → Exited`) are not
@@ -1990,9 +1987,7 @@ impl SessionStore {
         );
     }
 
-    /// Mark the session with local id `local_id` as having a FROZEN PATH (see the
-    /// field): an adopted shell that predates the self-healing sessions, or
-    /// one the outgoing process carried as frozen. Idempotent; an unknown id is
+    /// Mark `local_id` as having a frozen PATH (see the field). Idempotent; an unknown id is
     /// remembered too (the registration may follow in the same spawn seam).
     pub(crate) fn mark_frozen_path(&mut self, local_id: u64) {
         self.frozen_path.insert(local_id);
@@ -2070,9 +2065,8 @@ impl SessionStore {
         self.journal_durable = durable;
     }
 
-    /// Mark the session with local id `local_id` as carrying the RE-KEY CHANNEL
-    /// (see the field). Idempotent; an unknown id is remembered too (the
-    /// registration may follow in the same spawn seam).
+    /// Mark `local_id` as carrying the re-key channel (see the field). Idempotent; an unknown
+    /// id is remembered too (the registration may follow in the same spawn seam).
     pub(crate) fn mark_rekey_channel(&mut self, local_id: u64) {
         self.rekey_channel.insert(local_id);
     }
@@ -2266,9 +2260,12 @@ impl SessionStore {
         false
     }
 
-    /// Update the live title (on relabel); a no-op if unknown or unchanged. A change is
-    /// recorded on the timeline (`title-change`, pct-encoded); the change gate keeps the ring
-    /// at relabel rate, never redraw rate.
+    /// Update the live title (on relabel); a no-op if unknown or unchanged.
+    /// It records nothing: since phase 6 (6F-8, ruling U13) the timeline's
+    /// `title-change` rows follow the session log's content-tier title
+    /// marks, every session's, from the drift flush
+    /// ([`crate::session_timeline::SessionTimeline::record_title`]), not
+    /// this front tab's relabel.
     pub(crate) fn set_title(&mut self, local_id: u64, title: &str) {
         if let Some(sid) = self.by_local.get(&local_id)
             && let Some(h) = self.by_id.get_mut(sid)
@@ -2276,14 +2273,6 @@ impl SessionStore {
         {
             h.title.clear();
             h.title.push_str(title);
-            h.ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .record(
-                    "title-change",
-                    format!("title={}", crate::control::pct_encode(title)),
-                );
         }
     }
 
@@ -2307,8 +2296,7 @@ impl SessionStore {
         &self.mirror
     }
 
-    /// Look up a handle by its stable [`SessionId`]. Total + fail-closed: an
-    /// unknown id returns `None`.
+    /// Look up a handle by its stable [`SessionId`].
     #[must_use]
     pub(crate) fn by_sid(&self, sid: &SessionId) -> Option<&SessionHandle> {
         self.by_id.get(sid)
@@ -2467,15 +2455,8 @@ impl SessionStore {
         }
     }
 
-    /// Every registered handle, BY REFERENCE and in no particular order.
-    ///
-    /// The zero-allocation read: unlike [`snapshot`](Self::snapshot) it clones
-    /// nothing and does not sort, so a caller that only wants to pick out the
-    /// handles matching a predicate (a `@*` subscription adopting the sessions
-    /// it is not yet watching) pays for what it takes and nothing else. Order is
-    /// unspecified BECAUSE it is `HashMap` order — a caller that needs a stable
-    /// listing wants `snapshot`, and saying so here keeps the two from being
-    /// confused.
+    /// Every registered handle, by reference and in `HashMap` order: unlike
+    /// [`snapshot`](Self::snapshot) it neither clones nor sorts.
     pub(crate) fn live_handles(&self) -> impl Iterator<Item = &SessionHandle> {
         self.by_id.values()
     }
@@ -2715,6 +2696,7 @@ fn handle_over(
         reset_lane: Default::default(),
         crash_journal: Default::default(),
         typed: Default::default(),
+        bells: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),
@@ -3849,10 +3831,8 @@ title = \"zsh\"
         assert!(landed.is_ok_and(|(_, moved)| moved), "lifted, it lands");
     }
 
-    /// The re-key channel rides per record like `frozen_path`: an old manifest
-    /// (no key) reads `false`, a marked session projects `rekey = true` and only
-    /// it, the wire round-trips, and a deregister forgets the mark — so a later
-    /// session reusing the local id is not taken for one with the channel.
+    /// The re-key channel rides per record: absent reads `false`, only a marked session
+    /// writes `rekey = true`, and a deregister forgets the mark.
     #[test]
     fn the_rekey_channel_rides_per_record_and_absent_reads_false() {
         let old_wire = "schema = 1
@@ -4125,8 +4105,14 @@ title = \"zsh\"
         store.register(h);
         assert!(store.mark_alive(4));
         assert!(!store.mark_alive(4), "no-op re-mark records nothing");
+        // The store's title records nothing; since phase 6 (6F-8, ruling
+        // U13) the `title-change` row is the drift flush's, its title mark's.
         store.set_title(4, "vim main.rs");
-        store.set_title(4, "vim main.rs"); // unchanged: nothing recorded
+        assert!(timeline.lock().unwrap().record_title("vim main.rs"));
+        assert!(
+            !timeline.lock().unwrap().record_title("vim main.rs"),
+            "unchanged: nothing recorded"
+        );
         store.set_state(4, SessionState::Exited);
         store.set_state(4, SessionState::Exited); // unchanged: nothing recorded
         store.deregister_local(4);

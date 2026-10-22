@@ -72,7 +72,7 @@ impl Scene {
         for _ in 0..30 {
             s.tick(100);
         }
-        // A local hop: a screen-wide relocation would carry the base home at once, with no flight.
+        // A local hop: a screen-wide relocation carries the base home at once.
         s.term.process(b"\x1b[9;43H");
         for _ in 0..80 {
             let frame = s.tick(16);
@@ -232,8 +232,7 @@ fn a_selection_arriving_midflight_preserves_the_arc_and_landing_cadence() {
         }
         frame = s.tick(16);
         // Ownership ends with the flight/recovery work. The follower may still emit Walk for the
-        // small home gap this frame; Sit comes on the resident's next tick, which consumes the
-        // handoff.
+        // small home gap this frame; the resident's next tick, which consumes the handoff, sits.
         if landed_body.is_none() && !s.brain.console_legacy_motion_pending() {
             assert!(frame.alpha > 0, "the completed landing stays visible");
             assert_eq!(frame.lift, 0.0, "the completed landing has grounded paws");

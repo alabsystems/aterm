@@ -26,9 +26,12 @@
 //! 3. **ping-pong**: A posts to B and B replies the moment it sees the message,
 //!    back to back (default 200 rounds): the round trip, its legs acked and
 //!    durable apart, each reply's wait for the inbox commit of the delivery it
-//!    answers, and the share of the window the bridge's one loop spent blocked
-//!    on broker replies, counted inside the bridge by its wait-tally seam
-//!    (`aterm_link::wait_tally`).
+//!    answers, and where the bridge's one loop spent the window — blocked on
+//!    broker replies, on the verb lane, on state-dir writes, parked, woken —
+//!    counted inside the bridge by its wait-tally seam (`aterm_link::wait_tally`,
+//!    v=2); then a paced sub-phase, each round 20 ms after the last, so each
+//!    finds the loop idle (`paced=`, default 50). With `bystanders=N`, N idle
+//!    sessions beside the messaging and ping-pong worlds' two.
 //! 4. **attach time**: a bridge starting with N sessions (default 1, 8, 32),
 //!    from its pid file to every session's presence row acked, and durable,
 //!    again; and, with the same restart, from the kill to a note queued at
@@ -69,6 +72,7 @@
 //!
 //! ```text
 //! targo --unverified verify perf fabric [--profile dev|opt] [--latency-samples N]
+//!     [--scenario all|messaging|pingpong|attach|handoff]
 //!     [--burst N] [--pingpong-rounds N] [--attach-sessions 1,8,32] [--attach-rounds N]
 //!     [--durability strict,ordered,relaxed] [--horizon-ms 1000,100] [--passes N]
 //!     [--retention on|off] [--log auto|off] [--retention-interval-ms N]
@@ -78,6 +82,8 @@
 //! `--durability` names the arms, each one run of this bench and one ledger
 //! entry, an ordered arm once per `--horizon-ms`; the bench itself runs one
 //! arm, `durability=<tier> [horizon_ms=<n>]` in [`spec::ENV`].
+//! `--scenario pingpong` boots only that scenario's world. The default, `all`,
+//! retains every phase; unselected JSON sections are null and have no tables.
 //!
 //! `--profile` picks the build: the dev code generation (the default) or the
 //! optimized `opt-test` one, both with the test seams compiled in ([`profile`]).

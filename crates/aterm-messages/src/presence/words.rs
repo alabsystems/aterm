@@ -74,9 +74,8 @@ struct CellWalk<V> {
     /// [`Self::opener`] holds the cell's one character.
     cell: String,
     /// The character that opened the current cell, not yet copied into
-    /// [`Self::cell`]: most cells hold nothing else, so it is copied only
-    /// when a character is measured against it, and a row of letters and
-    /// glyphs never touches the buffer.
+    /// [`Self::cell`]: copied only when a character is measured against it, so
+    /// a row of letters and glyphs never touches the buffer.
     opener: Option<char>,
     /// How many characters the current cell holds (0 before the first).
     held: usize,
@@ -96,13 +95,12 @@ impl<V: Host> CellWalk<V> {
         }
     }
 
-    /// Lay out `c` after everything kept so far. Printable ASCII opens a cell
-    /// of its own wherever it stands (the grid's bulk path never folds it),
-    /// and the glyphs pinned to [`text_presentation`] take one cell each;
-    /// a printing character opens its own after no cell or after a cell of
-    /// one ASCII character (the grid folds a character only into a cell
-    /// holding a ZWJ, a regional indicator or a wide emoji base); everything
-    /// else is measured.
+    /// Lay out `c` after everything kept so far. Printable ASCII and the
+    /// [`text_presentation`] glyphs open a one-cell cell wherever they stand
+    /// (the grid's bulk path never folds them); a printing character opens its
+    /// own after no cell or after a one-ASCII-character cell (the grid folds
+    /// only into a cell holding a ZWJ, a regional indicator or a wide emoji
+    /// base); everything else is measured.
     fn step(&mut self, c: char) -> CellStep {
         if c.is_ascii() || text_presentation(c) {
             self.open(c, None);

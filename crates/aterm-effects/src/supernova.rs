@@ -80,8 +80,8 @@ pub fn tier_of(draw: u64) -> SuperTier {
 /// The level escalates both decodes of the birth draw: the detonation chance
 /// rises [`COMBO_CHANCE_STEP`] points per level and the tier windows slide
 /// toward Nuke, until at level 5 every f-bomb detonates as a Nuke. Entries age
-/// out, so the ladder cools on its own. The level only picks which window table
-/// reads the high half, so determinism and the `chance_pct == 0` off-switch
+/// out, so the ladder cools on its own. Determinism and the `chance_pct == 0`
+/// off-switch hold, and level ≤ 1 matches the base ladder exactly.
 /// hold, and level ≤ 1 matches the base ladder exactly.
 pub const COMBO_WINDOW_MS: u64 = 30_000;
 /// Ring capacity for recent typed-f-bomb instants; the ladder saturates at

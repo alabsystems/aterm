@@ -7,15 +7,9 @@
 //! `None` unconditionally, and the three surfaces above split into two different
 //! kinds of wrong:
 //!
-//! * The command palette greyed its two picker rows out (`PaletteLive::
-//!   local_file_picker_available` was literally `cfg!(target_os = "macos")`) — the
-//!   HONEST half, but honest about a capability Windows actually has: both
-//!   document runtimes work here, and the socket can already drive them
-//!   (`open app markdown file:///…` renders the full viewer).
-//! * "Choose Image…" stayed ENABLED with no platform gate at all, so a click took
-//!   focus and hover, no dialog appeared, and the status line kept saying "No
-//!   wallpaper" — the one place the Windows build broke the repo's own
-//!   no-dead-click law.
+//! `IFileOpenDialog`, not `GetOpenFileName`: the Common Item Dialog is the shell's own picker
+//! (search, MRU, high-DPI, dark mode); `GetOpenFileName` has a fixed-size caller buffer a long
+//! UNC selection can overrun.
 //!
 //! This module closes both by supplying the missing capability rather than
 //! widening the disable.
@@ -51,9 +45,7 @@ use std::sync::OnceLock;
 
 use crate::win_ffi::{Apartment, Com, Guid, StepError, check, co_create, wide};
 
-// ---------------------------------------------------------------------------
 // GUIDs (from shobjidl_core.h)
-// ---------------------------------------------------------------------------
 
 /// `CLSID_FileOpenDialog` {DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}.
 const CLSID_FILE_OPEN_DIALOG: Guid = Guid {
@@ -70,10 +62,7 @@ const IID_IFILE_OPEN_DIALOG: Guid = Guid {
     data4: [0xBE, 0x02, 0x9D, 0x96, 0x95, 0x32, 0xD9, 0x60],
 };
 
-// ---------------------------------------------------------------------------
-// Vtables, in COM inheritance order. Slots before a called one are declared with
-// their real shapes and never invoked — their OFFSETS are load-bearing.
-// ---------------------------------------------------------------------------
+// Vtables, in COM inheritance order.
 
 /// `COMDLG_FILTERSPEC` — one row of the dialog's file-type combo.
 #[repr(C)]
@@ -84,11 +73,9 @@ struct FilterSpec {
 
 /// `IFileOpenDialog` (IUnknown → IModalWindow → IFileDialog → IFileOpenDialog).
 ///
-/// Truncated after `get_result`, the last slot this module calls — the four
-/// `IFileDialog` tail methods and the two `IFileOpenDialog` additions
-/// (`GetResults` / `GetSelectedItems`, the multi-select accessors this
-/// single-select picker has no use for) are never indexed, so leaving them off
-/// is sound. Everything BEFORE `get_result` must stay, in this order.
+/// Truncated after `get_result`, the last slot called; the `IFileDialog` tail and the
+/// multi-select `IFileOpenDialog` additions are never indexed. Everything before `get_result`
+/// must stay, in this order.
 #[repr(C)]
 struct IFileOpenDialogVtbl {
     query_interface:
@@ -150,27 +137,23 @@ struct IShellItem {
 /// the user dismisses the dialog. A DECISION, not a fault: it is the whole reason
 /// [`show_dialog`] returns `Result<Option<…>>` instead of `Result<…>`.
 const HRESULT_CANCELLED: i32 = 0x8007_04C7u32 as i32;
-/// `SIGDN_FILESYSPATH` — the display-name form that IS a filesystem path.
-/// Guaranteed to succeed for every item the dialog can return under
-/// [`FOS_FORCEFILESYSTEM`].
+/// `SIGDN_FILESYSPATH`: the display-name form that is a filesystem path, which succeeds for
+/// every item under [`FOS_FORCEFILESYSTEM`].
 const SIGDN_FILESYSPATH: u32 = 0x8005_8000;
 
-// FILEOPENDIALOGOPTIONS (shobjidl_core.h), the bits [`dialog_options`] speaks.
+// FILEOPENDIALOGOPTIONS (shobjidl_core.h), the bits `dialog_options` uses.
 /// Directories, not files, are the selectable items. Cleared:
 /// `setCanChooseDirectories(false)`.
 const FOS_PICKFOLDERS: u32 = 0x0000_0020;
-/// Refuse virtual items (a Zune track, a scanner page) that have no path.
-/// Set: the callers all want a path they can open with `std::fs`.
+/// Refuse virtual items (a scanner page) that have no path. Set: the callers open a path.
 const FOS_FORCEFILESYSTEM: u32 = 0x0000_0040;
-/// More than one item may be returned. Cleared:
-/// `setAllowsMultipleSelection(false)`.
+/// More than one item may be returned. Cleared: `setAllowsMultipleSelection(false)`.
 const FOS_ALLOWMULTISELECT: u32 = 0x0000_0200;
 /// The typed folder must exist.
 const FOS_PATHMUSTEXIST: u32 = 0x0000_0800;
-/// The typed file must exist — this is an OPEN panel, not a save panel.
+/// The typed file must exist: this is an open panel, not a save panel.
 const FOS_FILEMUSTEXIST: u32 = 0x0000_1000;
-/// Return the shortcut ITSELF rather than its target. Cleared:
-/// `setResolvesAliases(true)`.
+/// Return the shortcut itself rather than its target. Cleared: `setResolvesAliases(true)`.
 const FOS_NODEREFERENCELINKS: u32 = 0x0010_0000;
 
 #[link(name = "ole32")]
@@ -183,9 +166,7 @@ unsafe extern "system" {
     fn GetActiveWindow() -> isize;
 }
 
-// ---------------------------------------------------------------------------
-// The pure halves — everything a headless test can reach
-// ---------------------------------------------------------------------------
+// The pure halves: everything a headless test can reach.
 
 /// The document picker's file-type list. ONE unrestricted row, because the
 /// macOS document panel restricts nothing either: the Markdown/editor document
@@ -208,8 +189,8 @@ fn image_rows() -> [(String, String); 1] {
     )]
 }
 
-/// Owned `COMDLG_FILTERSPEC` rows: the wide buffers AND the array of pointers
-/// into them, kept together so the array cannot outlive its strings.
+/// Owned `COMDLG_FILTERSPEC` rows: the wide buffers and the array of pointers into them, kept
+/// together so the array cannot outlive its strings.
 struct FilterSpecs {
     /// Alive for the pointers in `specs`. Moving the outer `Vec` does not move
     /// these heap buffers, so the pointers stay valid across the move into `Self`.
@@ -243,57 +224,42 @@ impl FilterSpecs {
     }
 }
 
-/// The `FILEOPENDIALOGOPTIONS` this picker runs with, folded over whatever the
-/// freshly created dialog already defaults to (`GetOptions`) so the shell's own
-/// defaults — the ones we have no opinion about — survive.
+/// The `FILEOPENDIALOGOPTIONS` this picker runs with, folded over the dialog's own defaults
+/// (`GetOptions`) so the ones we have no opinion about survive.
 ///
-/// Every bit here is one line of the macOS `NSOpenPanel` setup, and the CLEARED
-/// three are the load-bearing half: without them a shell default (or a future
-/// Windows release changing one) would quietly hand the callers a folder, a list,
-/// or an unresolved `.lnk` where the macOS arm hands exactly one resolved file.
+/// Each bit mirrors a line of the macOS `NSOpenPanel` setup. The three cleared ones matter
+/// most: without them a shell default could hand the callers a folder, a list or an
+/// unresolved `.lnk` where macOS hands one resolved file.
 fn dialog_options(defaults: u32) -> u32 {
     (defaults | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST)
         & !(FOS_PICKFOLDERS | FOS_ALLOWMULTISELECT | FOS_NODEREFERENCELINKS)
 }
 
-/// Whether an `IModalWindow::Show` HRESULT is the user pressing Cancel (or Esc,
-/// or the ✕) rather than a fault. Exactly one value qualifies; everything else
-/// negative is a real failure and gets a warn line.
+/// Whether an `IModalWindow::Show` HRESULT is the user cancelling (Cancel, Esc, ✕) rather
+/// than a fault.
 fn is_cancelled(hr: i32) -> bool {
     hr == HRESULT_CANCELLED
 }
 
-/// A `PathBuf` from a NUL-terminated UTF-16 buffer — the shape `GetDisplayName`
-/// hands back.
+/// A `PathBuf` from a NUL-terminated UTF-16 buffer, the shape `GetDisplayName` returns.
 ///
-/// `OsString::from_wide` is the only correct decoder here: a shell path is
-/// UTF-16 that need not be well-formed Unicode (an unpaired surrogate in a
-/// filename is legal on NTFS), and `String::from_utf16_lossy` would replace it
-/// with U+FFFD and produce a path that does not open. This keeps UNC prefixes,
-/// spaces and non-ASCII names byte-exact.
+/// `OsString::from_wide`, because a shell path need not be well-formed Unicode (an unpaired
+/// surrogate is a legal NTFS filename) and a lossy decode would produce a path that does not
+/// open.
 fn path_from_nul_terminated(units: &[u16]) -> PathBuf {
     let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
     PathBuf::from(std::ffi::OsString::from_wide(&units[..end]))
 }
 
-// ---------------------------------------------------------------------------
 // The dialog
-// ---------------------------------------------------------------------------
 
-/// Whether this machine can actually PRODUCE a path from [`choose`] — the
-/// predicate behind the palette's File rows and Settings ▸ Wallpaper's button.
+/// Whether [`choose`] can produce a path on this machine: the predicate behind the palette's
+/// File rows and Settings ▸ Wallpaper's button.
 ///
-/// A real probe, not `cfg!(windows)`: it creates the very COM object [`choose`]
-/// would and releases it again. That is the difference between "this build was
-/// compiled for Windows" and "the shell's dialog will open here", and the two
-/// genuinely diverge — Server Core, a stripped/PE image, or a policy-locked
-/// profile all leave `CoCreateInstance` failing while the exe runs fine. Rows
-/// gated on this therefore stay honest instead of trading a dead click on one
-/// platform for a dead click on one configuration.
-///
-/// Cached in a `OnceLock`: shell class registration does not change under a
-/// running process, and this is called from paint-path code (the Settings page
-/// builder) on every repaint.
+/// A real probe, not `cfg!(windows)`: it creates and releases the COM object [`choose`]
+/// would. Server Core, a stripped image or a policy-locked profile leave `CoCreateInstance`
+/// failing while the exe runs. Cached: class registration does not change under a running
+/// process, and the Settings page builder calls this on every repaint.
 pub(crate) fn available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
@@ -309,13 +275,8 @@ pub(crate) fn available() -> bool {
 /// Present the shell open dialog and return exactly the one local path the user
 /// approved, or `None` for a cancel.
 ///
-/// The Windows arm of `menu::choose_local_file`; `title` and `prompt` carry the
-/// same meaning they do on macOS (`NSOpenPanel::setTitle` / `setPrompt`) — the
-/// dialog caption and the OK button's label.
-///
-/// Like the macOS panel this grants no directory and no multiple-file authority;
-/// the caller still canonicalizes, bounds, UTF-8-validates and mints the
-/// process-local document grant before reading the file.
+/// It grants no directory and no multiple-file authority; the caller still canonicalizes,
+/// bounds, UTF-8-validates and mints the document grant before reading the file.
 pub(crate) fn choose(title: &str, prompt: &str) -> Option<PathBuf> {
     choose_from(title, prompt, &ALL_FILES)
 }
@@ -345,24 +306,16 @@ fn choose_from<N: AsRef<str>, S: AsRef<str>>(
     }
 }
 
-/// The window the dialog is MODAL TO.
-///
-/// `GetActiveWindow()`, exactly as the close/quit `TaskDialogIndirect` confirm in
-/// `lib.rs` resolves its owner, and for the same reason: every route into the
-/// picker — the Settings button, a File menu row, a palette row, the socket's
-/// `invoke` — runs on the UI thread while the window that asked is the active
-/// one. Owning the dialog to it makes it properly modal (the window is disabled
-/// for the duration, so a second click cannot stack a second dialog) and centres
-/// it over that window instead of leaving a free-floating picker the user has to
-/// go find. A programmatic path with no active window falls back to `0`, an
+/// The window the dialog is modal to: `GetActiveWindow()`, as `lib.rs`'s `TaskDialogIndirect`
+/// confirm resolves its owner. Owning the dialog disables that window for the duration (no
+/// stacked second dialog) and centres the dialog over it; no active window gives `0`, an
 /// ownerless dialog that still blocks this thread.
 fn owner_window() -> isize {
     // SAFETY: a plain query of this thread's active window (may be 0).
     unsafe { GetActiveWindow() }
 }
 
-/// `Ok(None)` is a CANCEL — the user's answer, and the reason this is not a bare
-/// `Result<PathBuf, _>`. `Err` is a genuine failure the caller turns into one
+/// `Ok(None)` is a cancel, the user's answer; `Err` is a failure the caller turns into one
 /// warn line.
 unsafe fn show_dialog<N: AsRef<str>, S: AsRef<str>>(
     title: &str,
@@ -380,7 +333,7 @@ unsafe fn show_dialog<N: AsRef<str>, S: AsRef<str>>(
     let ptr = dialog.as_raw().cast::<IFileOpenDialog>();
     let vt = unsafe { &*(*ptr).vtbl };
 
-    // Options FIRST, folded over the shell's defaults (see `dialog_options`).
+    // Options first, folded over the shell's defaults (see `dialog_options`).
     let mut defaults = 0u32;
     check(
         unsafe { (vt.get_options)(ptr, &mut defaults) },
@@ -406,8 +359,7 @@ unsafe fn show_dialog<N: AsRef<str>, S: AsRef<str>>(
         "SetOkButtonLabel",
     )?;
 
-    // Blocks on the shell's own nested modal loop — the document-open pattern,
-    // the same shape `runModal` has on macOS and `MessageBoxW` has here.
+    // Blocks on the shell's own nested modal loop, like `runModal` on macOS.
     let hr = unsafe { (vt.show)(ptr, owner) };
     if is_cancelled(hr) {
         return Ok(None);
@@ -455,18 +407,9 @@ mod tests {
     };
     use std::path::PathBuf;
 
-    /// STRUCTURAL FENCE on the hand-rolled vtables, in the shape this crate
-    /// already uses for hand-packed FFI (`task_dialog_config_layout_matches_the_sdk`
-    /// pins `size_of` + `offset_of!` on TASKDIALOGCONFIG for the same reason).
-    ///
-    /// The module declares every slot BEFORE a called one so the offsets land,
-    /// but nothing verified that shape: a dropped or reordered declared-but-
-    /// uncalled slot compiles perfectly and silently turns a call like
-    /// `(vt.get_result)(…)` into a wild indirect call into the shell's vtable.
-    /// The parity audit's COM review found the fence missing and the layout
-    /// correct; this keeps the second half true.
-    ///
-    /// The counts are the documented COM inheritance chains:
+    /// Pins the hand-rolled vtables' shape, as `task_dialog_config_layout_matches_the_sdk`
+    /// does for TASKDIALOGCONFIG: a dropped or reordered uncalled slot compiles and turns a
+    /// call into a wild indirect call. The counts are the documented inheritance chains:
     ///   IFileOpenDialog = IUnknown(3) + IModalWindow(1) + IFileDialog(17) = 21
     ///   IShellItem      = IUnknown(3) + 3 = 6
     #[test]
@@ -484,7 +427,7 @@ mod tests {
             "IShellItem vtable is IUnknown(3) + BindToHandler/GetParent/GetDisplayName"
         );
 
-        // Every slot this module actually CALLS, pinned at its documented index.
+        // Every slot this module calls, pinned at its documented index.
         let slot = |bytes: usize| bytes / size_of::<usize>();
         assert_eq!(
             slot(offset_of!(IFileOpenDialogVtbl, release)),
@@ -572,9 +515,7 @@ mod tests {
         );
     }
 
-    /// Multi-row construction, including a non-ASCII label, survives the move
-    /// into the struct: the pointer array is built from the owned buffers, and
-    /// moving the outer `Vec` must not invalidate them.
+    /// Multi-row construction, with a non-ASCII label, survives the move into the struct.
     #[test]
     fn every_filter_row_round_trips_through_its_pointers() {
         let rows = [
@@ -609,9 +550,8 @@ mod tests {
         }
     }
 
-    /// The three bits the macOS panel explicitly turns OFF must come out off even
-    /// when the shell's defaults (or a hostile caller's) had them on — one
-    /// resolved file, never a folder and never a list.
+    /// The three bits the macOS panel turns off come out off even when the defaults had them
+    /// on: one resolved file, never a folder or a list.
     #[test]
     fn the_options_mirror_the_macos_panel() {
         let opts = dialog_options(0);
@@ -634,8 +574,7 @@ mod tests {
         assert_eq!(opts & FOS_NODEREFERENCELINKS, 0, "resolvesAliases(true)");
     }
 
-    /// Whatever else the freshly created dialog defaults to is none of our
-    /// business and must survive — we fold, we do not clobber.
+    /// The dialog's other defaults pass through: we fold, we do not clobber.
     #[test]
     fn unrelated_shell_defaults_survive() {
         // FOS_DONTADDTORECENT | FOS_FORCESHOWHIDDEN: two bits this module has no
@@ -648,9 +587,8 @@ mod tests {
         );
     }
 
-    /// Cancel is a DECISION. `HRESULT_FROM_WIN32(ERROR_CANCELLED)` — and only it
-    /// — turns into `Ok(None)`; every other failure stays a failure so it can be
-    /// reported rather than silently read as "the user said no".
+    /// Only `HRESULT_FROM_WIN32(ERROR_CANCELLED)` reads as a cancel; every other failure
+    /// stays a failure.
     #[test]
     fn only_error_cancelled_reads_as_a_cancel() {
         assert!(is_cancelled(0x8007_04C7u32 as i32), "ERROR_CANCELLED");
@@ -663,9 +601,7 @@ mod tests {
         );
     }
 
-    /// The path the shell hands back is UTF-16 that need not be well-formed, and
-    /// the shapes that break naive decoders are exactly the ones a terminal user
-    /// has: a UNC share, spaces, and non-ASCII names.
+    /// UNC shares, spaces and non-ASCII names round-trip exactly.
     #[test]
     fn shell_paths_round_trip_exactly() {
         for original in [
@@ -683,9 +619,7 @@ mod tests {
         }
     }
 
-    /// The scan stops at the FIRST NUL: a CoTaskMem buffer may be longer than its
-    /// string, and reading past the terminator would append allocator garbage to
-    /// the path.
+    /// The scan stops at the first NUL: a CoTaskMem buffer may be longer than its string.
     #[test]
     fn the_path_stops_at_the_terminator() {
         let mut units: Vec<u16> = r"C:\a.png".encode_utf16().collect();
@@ -695,9 +629,7 @@ mod tests {
         assert_eq!(path_from_nul_terminated(&units), PathBuf::from(r"C:\a.png"));
     }
 
-    /// An unpaired surrogate is a legal NTFS filename. `OsString::from_wide`
-    /// keeps it; `String::from_utf16_lossy` would substitute U+FFFD and produce a
-    /// path that does not open. The round trip must be byte-exact, not lossy.
+    /// An unpaired surrogate (a legal NTFS filename) survives byte-exact.
     #[test]
     fn a_lone_surrogate_survives_instead_of_becoming_a_replacement_char() {
         // "C:\" + U+D800 (unpaired high surrogate) + ".png", NUL-terminated.
@@ -715,10 +647,8 @@ mod tests {
         );
     }
 
-    /// The picker is genuinely reachable on the machine running this test — the
-    /// exact fact the palette's File rows and the Wallpaper button now gate on.
-    /// A probe, not a `cfg!`: if `CoCreateInstance(FileOpenDialog)` ever stopped
-    /// answering here, the rows would grey out and this would go red first.
+    /// The shell picker is available on the machine running this test: the probe the
+    /// palette's File rows and the Wallpaper button gate on.
     #[test]
     fn the_shell_picker_is_available_on_this_machine() {
         assert!(

@@ -159,12 +159,10 @@ fn a_double_click_on_an_rtl_word_copies_that_word() {
     );
 }
 
-/// A shift-click extends to the logical cell under the pointer, with the
-/// half-cell side flipped on an RTL cell: after sweeping visual 4..=5 (the
-/// last two letters of עולם, painted at its left end), a shift-click on the
-/// right half of the cell painting its first letter (visual 7) takes the
-/// whole word, and the highlight is the word's painted cells. Before the fix
-/// the click extended to logical 7, the last letter of שלום.
+/// A shift-click extends to the logical cell under the pointer, with the half-cell side flipped
+/// on an RTL cell: after sweeping visual 4..=5 (the last two letters of עולם, painted at its left
+/// end), a shift-click on the right half of visual 7 (its first letter) takes the whole word,
+/// and the highlight is the word's painted cells.
 #[test]
 fn a_shift_click_on_an_rtl_cell_extends_to_that_cell() {
     let (mut app, wid, term) = window_with(MIXED);

@@ -296,6 +296,36 @@ fn is_supported_auth_url(url: &str) -> bool {
             || url.starts_with("http://localhost:"))
 }
 
+fn contains_matching_email(text: &str, target: &str) -> bool {
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '<' | '>' | ',' | ';' | '"' | '\'' | '(' | ')' | '[' | ']' | ':'
+            )
+    })
+    .filter(|tok| tok.contains('@'))
+    .any(|tok| {
+        let cleaned = tok.trim_matches('.');
+        super::accounts::email_matches(cleaned, target)
+    })
+}
+
+fn unfold_rfc5322_headers(head: &str) -> Vec<String> {
+    let mut unfolded: Vec<String> = Vec::new();
+    for line in head.lines() {
+        if (line.starts_with(' ') || line.starts_with('\t'))
+            && let Some(prev) = unfolded.last_mut()
+        {
+            prev.push(' ');
+            prev.push_str(line.trim());
+        } else {
+            unfolded.push(line.to_owned());
+        }
+    }
+    unfolded
+}
+
 fn email_matches_target(raw_email: &str, target: &str) -> bool {
     let target_trimmed = target.trim();
     if target_trimmed.is_empty() {
@@ -304,33 +334,47 @@ fn email_matches_target(raw_email: &str, target: &str) -> bool {
     if let Ok(doc) = aterm_json::from_str::<Value>(raw_email)
         && let Some(to) = doc.get("to").and_then(Value::as_str)
     {
-        return to
-            .to_ascii_lowercase()
-            .contains(&target_trimmed.to_ascii_lowercase());
+        return contains_matching_email(to, target_trimmed);
     }
     let head = raw_email
         .split_once("\r\n\r\n")
         .or_else(|| raw_email.split_once("\n\n"))
         .map_or(raw_email, |(h, _)| h);
-    let mut saw_to_header = false;
-    for line in head.lines() {
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case("to")
-        {
-            saw_to_header = true;
-            if v.to_ascii_lowercase()
-                .contains(&target_trimmed.to_ascii_lowercase())
+    let mut saw_recipient_header = false;
+    for line in unfold_rfc5322_headers(head) {
+        if let Some((k, v)) = line.split_once(':') {
+            let key = k.trim();
+            if key.eq_ignore_ascii_case("to")
+                || key.eq_ignore_ascii_case("delivered-to")
+                || key.eq_ignore_ascii_case("x-original-to")
+                || key.eq_ignore_ascii_case("envelope-to")
             {
-                return true;
+                saw_recipient_header = true;
+                if contains_matching_email(v, target_trimmed) {
+                    return true;
+                }
             }
         }
     }
-    if saw_to_header {
+    if saw_recipient_header {
         return false;
     }
-    raw_email
-        .to_ascii_lowercase()
-        .contains(&target_trimmed.to_ascii_lowercase())
+    contains_matching_email(raw_email, target_trimmed)
+}
+
+fn is_non_auth_link(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    let path = lower.split('?').next().unwrap_or(&lower);
+    lower.contains("unsubscribe")
+        || lower.contains("email-preferences")
+        || path.ends_with(".png")
+        || path.ends_with(".jpg")
+        || path.ends_with(".jpeg")
+        || path.ends_with(".gif")
+        || path.ends_with(".svg")
+        || path.ends_with(".ico")
+        || path.ends_with(".css")
+        || path.ends_with(".js")
 }
 
 /// Extract a verification / magic-link URL from an incoming email message
@@ -349,6 +393,7 @@ pub fn extract_magic_link_from_email(
         for key in ["magic_url", "verify_url", "login_url", "url"] {
             if let Some(u) = doc.get(key).and_then(Value::as_str)
                 && is_supported_auth_url(u)
+                && !is_non_auth_link(u)
             {
                 return Some(u.to_owned());
             }
@@ -368,23 +413,28 @@ pub fn extract_magic_link_from_email(
                 })
                 .unwrap_or(after.len());
             let candidate = after[..end].trim_end_matches(['.', ',', ';']);
-            if is_supported_auth_url(candidate) && !urls.iter().any(|u| u == candidate) {
+            if is_supported_auth_url(candidate)
+                && !is_non_auth_link(candidate)
+                && !urls.iter().any(|u| u == candidate)
+            {
                 urls.push(candidate.to_owned());
             }
             rest = &after[end..];
         }
     }
+    let looks_like_auth = |u: &str| {
+        let lower = u.to_ascii_lowercase();
+        lower.contains("magic")
+            || lower.contains("verify")
+            || lower.contains("login")
+            || lower.contains("token=")
+            || lower.contains("auth")
+            || lower.contains("callback")
+    };
     urls.iter()
-        .find(|u| {
-            let lower = u.to_ascii_lowercase();
-            !lower.contains("unsubscribe")
-                && (lower.contains("magic")
-                    || lower.contains("verify")
-                    || lower.contains("login")
-                    || lower.contains("token=")
-                    || lower.contains("auth")
-                    || lower.contains("callback"))
-        })
+        .find(|u| provider_url(u) && looks_like_auth(u))
+        .or_else(|| urls.iter().find(|u| looks_like_auth(u)))
+        .or_else(|| urls.iter().find(|u| provider_url(u)))
         .or_else(|| urls.first())
         .cloned()
 }
@@ -527,13 +577,13 @@ pub fn parse_html_approval_action(
 }
 
 #[derive(Debug)]
-struct HttpResponse {
-    status: u16,
-    location: Option<String>,
-    body: String,
+pub(super) struct HttpResponse {
+    pub(super) status: u16,
+    pub(super) location: Option<String>,
+    pub(super) body: String,
 }
 
-fn parse_raw_http_response(
+pub(super) fn parse_raw_http_response(
     raw: &str,
     cookies: &mut BTreeMap<String, String>,
 ) -> Option<HttpResponse> {
@@ -547,7 +597,14 @@ fn parse_raw_http_response(
         let proto = parts.next()?;
         let code_str = parts.next()?;
         let status: u16 = code_str.parse().ok()?;
-        if proto.starts_with("HTTP/") && status == 100 && rest.starts_with("HTTP/") {
+        if proto.starts_with("HTTP/")
+            && (status == 100
+                || (status == 200
+                    && first_line
+                        .to_ascii_lowercase()
+                        .contains("connection established")))
+            && rest.starts_with("HTTP/")
+        {
             current = rest;
             continue;
         }
@@ -653,7 +710,7 @@ fn https_curl_exchange(
         cmd.args(["-b", &cookie_hdr.join("; ")]);
     }
     if let Some(body) = form_body {
-        cmd.args(["--data", body]);
+        cmd.args(["--data-raw", body]);
     }
     cmd.arg(url);
     let out = cmd.output().map_err(|_| "failed running curl")?;
@@ -807,7 +864,7 @@ fn follow_until_page_or_callback(
     Err("too many OAuth redirects")
 }
 
-fn poll_mailbox_for_magic_link(
+pub(super) fn poll_mailbox_for_magic_link(
     mailbox_dir: &Path,
     target_email: Option<&str>,
     timeout: Duration,
@@ -895,7 +952,7 @@ pub fn authorize_with_mailbox(
 /// The real flow with its two effects passed as capabilities. Tests replace
 /// both, so exercising the complete admission/redirect/form path reads no
 /// mailbox and starts no curl, callback listener or browser.
-fn authorize_using(
+pub(super) fn authorize_using(
     authorize_url: &str,
     target_email: Option<&str>,
     magic_link: impl FnOnce(Option<&str>) -> Result<String, &'static str>,
@@ -921,7 +978,7 @@ fn authorize_using(
 
     let magic_url = magic_link(email.as_deref())?;
 
-    let consent_page = match follow_until_page_or_callback(
+    let mut page = match follow_until_page_or_callback(
         &flow,
         exchange,
         "GET",
@@ -933,21 +990,30 @@ fn authorize_using(
         StepOutcome::Page { url, body } => (url, body),
     };
 
-    let (method, action_url, form_body) =
-        parse_html_approval_action(&consent_page.1, &consent_page.0)
-            .ok_or("magic-link response contained no OAuth approval action")?;
-
-    match follow_until_page_or_callback(
-        &flow,
-        exchange,
-        &method,
-        &action_url,
-        &mut cookies,
-        form_body.as_deref(),
-    )? {
-        StepOutcome::CallbackDelivered => Ok(()),
-        StepOutcome::Page { .. } => Err("OAuth approval did not redirect to callback listener"),
+    for step in 0..4 {
+        let Some((method, action_url, form_body)) = parse_html_approval_action(&page.1, &page.0)
+        else {
+            return Err(if step == 0 {
+                "magic-link response contained no OAuth approval action"
+            } else {
+                "OAuth approval did not redirect to callback listener"
+            });
+        };
+        match follow_until_page_or_callback(
+            &flow,
+            exchange,
+            &method,
+            &action_url,
+            &mut cookies,
+            form_body.as_deref(),
+        )? {
+            StepOutcome::CallbackDelivered => return Ok(()),
+            StepOutcome::Page { url, body } => {
+                page = (url, body);
+            }
+        }
     }
+    Err("OAuth approval did not redirect to callback listener")
 }
 
 /// `aterm-open-url <url>` (the argv0 alias, `crates/aterm`'s router): when

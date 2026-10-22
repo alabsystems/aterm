@@ -1286,17 +1286,10 @@ mod tests {
         fn pop_layer(&mut self) {}
     }
 
-    /// The flatness metric: the maximum number of distinct straight colours
-    /// inside any single horizontal or vertical run of CONSTANT alpha
-    /// (α ≥ 128, run length ≥ 8 px). Chosen because it is immune to the two
-    /// ways a first-stop-flattened render can still amass distinct colours
-    /// glyph-wide — layer-over-layer alpha compositing (each overlap region
-    /// blends its own shade) and coverage/premultiply artefacts (both scale
-    /// rgb per ALPHA, so under constant alpha a flat region stays ONE colour).
-    /// A flattened render is piecewise-constant within such a run (1 colour,
-    /// rarely 2-3 at a region coincidence); a per-pixel gradient sweeps many.
-    /// α ≥ 128 rather than = 255 because Fluent glyphs like 🔥 are built
-    /// entirely from less-than-fully-opaque gradient stops.
+    /// The most distinct colours in any horizontal or vertical run of constant alpha
+    /// (α ≥ 128, ≥ 8 px). Compositing and coverage artefacts scale rgb per alpha, so a flat
+    /// fill stays one colour (rarely 2-3) within such a run while a gradient sweeps many.
+    /// α ≥ 128, not 255: Fluent glyphs such as 🔥 use only translucent stops.
     fn max_constant_alpha_run_spread(rgba: &[u8], w: usize, h: usize) -> usize {
         let px = rgba.as_chunks::<4>().0;
         assert_eq!(px.len(), w * h);

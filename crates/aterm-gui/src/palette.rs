@@ -734,10 +734,8 @@ impl PaletteState {
                     row.checked = Some(live.rain_on);
                     row.enabled = live.terminal_front;
                 }
-                // Process-wide: the checkmark answers "is the promotable kitty
-                // (program cat on glass, else the launch kitty) the pin?", and
-                // the launch kitty exists whether or not a terminal is
-                // frontmost, so the row stays enabled everywhere.
+                // Process-wide: the launch kitty exists with no front terminal, so the row
+                // stays enabled everywhere.
                 MenuAction::FavouriteKitty => {
                     row.checked = Some(live.kitty_favourited);
                 }

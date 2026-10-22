@@ -80,8 +80,7 @@ pub(crate) fn ensure_control_dir(dir: &Path) -> std::io::Result<()> {
     ensure_private_dir(dir)
 }
 
-/// Pid liveness via `OpenProcess` (see [`aterm_uds::process::pid_alive`] —
-/// access-denied mirrors `EPERM`'s "alive").
+/// Pid liveness via [`aterm_uds::process::pid_alive`] (access-denied counts as alive).
 pub(crate) fn pid_alive(pid: u32) -> bool {
     aterm_uds::process::pid_alive(pid)
 }

@@ -1,0 +1,12 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (144x50, aterm 0.111.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · launched with --trust-workspace (`lab muse`), the first prompt sent the moment the composer stood and Enter 0.3 s later, as the forever lab's chains type it, the screen read at full rate: the first frame after the Enter, 0.02 s after it, the turn's STATUS ROW drawn bare (`◇ Thinking`, no time and no Esc hint) for 0.04-0.19 s before `◇ Working (0s · esc to interrupt)` (five launches of five, 2026-10-22; the forever lab's r10 ladder read this frame as the harness's first point) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ FOREVERLAB-LADDER. write the parser for this repository and land it
+
+◇ Thinking
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

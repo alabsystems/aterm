@@ -821,6 +821,65 @@ pub fn asleep_since_boot() -> Option<std::time::Duration> {
     None
 }
 
+/// HOW LONG THIS MACHINE HAS BEEN AWAKE SINCE IT BOOTED, in milliseconds, read
+/// once on the clock a sleep stops (what Rust's `Instant` reads), so two
+/// readings in one boot never go backwards and their difference is the time
+/// awake between them, whatever the wall clock did.
+///
+/// * Apple: `mach_absolute_time`, scaled by `mach_timebase_info`.
+/// * Linux: `CLOCK_MONOTONIC`.
+///
+/// `None` where it is not wired (Windows, the BSDs, 32-bit Linux). The count
+/// starts over at a boot, as [`asleep_since_boot`]'s does.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+// Skip: bottoms out at the `mach_*` FFI calls.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn awake_ms() -> Option<u64> {
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    let mut base = Timebase { numer: 0, denom: 0 };
+    // SAFETY: one writable `mach_timebase_info_data_t` that outlives the call.
+    if unsafe { mach_timebase_info(&raw mut base) } != 0 || base.denom == 0 {
+        return None;
+    }
+    // SAFETY: a side-effect-free getter with no arguments.
+    let ticks = unsafe { mach_absolute_time() };
+    let ns = u128::from(ticks) * u128::from(base.numer) / u128::from(base.denom);
+    u64::try_from(ns / 1_000_000).ok()
+}
+
+/// See the Apple twin.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    target_pointer_width = "64"
+))]
+#[must_use]
+pub fn awake_ms() -> Option<u64> {
+    const CLOCK_MONOTONIC: i32 = 1;
+    linux_clock_ns(CLOCK_MONOTONIC).map(|ns| ns / 1_000_000)
+}
+
+/// See the Apple twin: not wired here.
+#[cfg(not(any(
+    target_vendor = "apple",
+    all(
+        any(target_os = "linux", target_os = "android"),
+        target_pointer_width = "64"
+    )
+)))]
+#[must_use]
+pub fn awake_ms() -> Option<u64> {
+    None
+}
+
 /// THE MACHINE'S LAST SLEEP on the wall clock, as the kernel recorded it:
 /// when it went to sleep and when it woke, unix milliseconds — the one sleep
 /// whose place a process that was not watching can still read.

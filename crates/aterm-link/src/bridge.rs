@@ -317,7 +317,7 @@ const LINK_MOVE_GAP: Duration = Duration::from_millis(250);
 /// and re-offering them is free because `deliver` is idempotent on `off=`.
 const REFILL_FLOOR_SPAN: u64 = 4096;
 
-/// How often the roster and the LOCAL observations are re-read.
+/// How often the roster and the local observations are re-read.
 ///
 /// FROM A DEADLINE, NOT FROM AN IDLE ARM: the run loop parks on the mailbox
 /// only until the nearest deadline ([`idle_wait`]) and this round has
@@ -380,7 +380,7 @@ fn roster_refresh() -> Duration {
 /// park only ends early when aterm goes away, which is all it waits for.
 const UNSERVED_PARK: Duration = Duration::from_secs(60);
 
-/// How often the retained presence rows under THIS node are swept for ghosts.
+/// How often the retained presence rows under this node are swept for ghosts.
 ///
 /// A minute, not [`ROSTER_REFRESH`]'s two seconds: this is a `Last` walk of a
 /// whole subtree, and the thing it looks for cannot appear between two roster
@@ -424,10 +424,9 @@ const CONFIRM_ROWS: u32 = 32;
 /// How many backlog `Fetch` pages the WHOLE bridge may walk per replay
 /// interval (one round, [`roster_refresh`]: two seconds in a shipped bridge).
 ///
-/// The scheduling loop is single-threaded and takes fleet halts and addressed
-/// mail. Four pages PER SESSION still let a large roster block it for minutes.
-/// Four pages in total bound that delay independently of roster size. A deeper
-/// backlog takes more intervals; the durable topic cursors survive a restart.
+/// The loop is single-threaded and also takes fleet halts and addressed mail; a total bound,
+/// not a per-session one, keeps a large roster from blocking it. A deeper backlog takes more
+/// intervals; the durable topic cursors survive a restart.
 const SAY_REPLAY_PAGES: usize = 4;
 
 /// How many records one backlog `Fetch` page asks the broker for
@@ -464,8 +463,8 @@ impl SayReplay {
         }
     }
 
-    /// The next owed sid strictly after the last one, wrapping once. Spending
-    /// the page HERE makes a failed Fetch count toward the same bound.
+    /// The next owed sid strictly after the last one, wrapping once. Spending the page here
+    /// makes a failed Fetch count toward the same bound.
     fn take(&mut self, owed: &BTreeSet<String>) -> Option<String> {
         if self.pages_left == 0 {
             return None;
@@ -570,99 +569,55 @@ fn floors_of(by_topic: &BTreeMap<String, VecDeque<(u64, u64)>>) -> BTreeMap<Stri
         .collect()
 }
 
-/// How long a `state=live` row under this node must have gone unhosted, AS
-/// OBSERVED BY THIS BRIDGE, before its presence is retired.
+/// How long a `state=live` row under this node must have gone unhosted, as observed by this
+/// bridge, before its presence is retired.
 ///
-/// Measured against this bridge's own sight of the roster rather than the
-/// row's `t=`, because `t=` is when the row was last WRITTEN and presence is
-/// published on change: a session that has been quietly busy for an hour has
-/// an hour-old row and is perfectly alive. Five minutes is two orders of
-/// magnitude past the two-second round that would have retired an ordinary
-/// exit, so anything still standing at the end of it was published by an
-/// incarnation that never got to say goodbye.
+/// Measured against this bridge's sight of the roster, not the row's `t=`: presence is
+/// published on change, so a quietly busy session has an old row. Five minutes is far past the
+/// two-second round that retires an ordinary exit.
 const GHOST_AFTER: Duration = Duration::from_secs(300);
 
 /// How many of this node's own acked offsets the self-lane check remembers.
 const SELF_ACK_KEEP: usize = 4096;
 
-/// The kinds an unlisted principal may not speak AS. A `task` or a `control`
-/// from a principal that is neither a human nor named on `--accept-from` is
-/// delivered `kind=note demoted=<k>`: a stranger may put words in front of an
-/// agent, never an instruction (§8.4).
+/// The kinds an unlisted principal may not speak as: a `task` or `control` from a principal
+/// that is neither a human nor named on `--accept-from` is delivered `kind=note demoted=<k>`
+/// (§8.4).
 ///
-/// EVERY `h-*` IS ACCEPTED WITHOUT BEING LISTED — see
-/// [`Bridge::classify_kind`], where the predicate lives and argues itself.
-/// `h-` is a CAP-FORCED `<src>` segment, so a principal can only speak as a
-/// human if the broker's own grant binds it to one; the carve-out is why a
-/// human's `task` or `control` arrives as itself rather than demoted on a node
-/// whose operator listed nobody.
-/// `--accept-from` therefore adds NON-human principals to the set, and adds
-/// nothing for a human who is already in it.
-///
-/// `answer` is deliberately not here — an answer's authority is the `re=` the
-/// receiver itself minted, so it is answerable by whoever the asker asked.
+/// Every `h-*` is accepted unlisted ([`Bridge::classify_kind`] has the argument): `h-` is a
+/// cap-forced `<src>` segment, so only the broker's grant makes a principal a human, and
+/// `--accept-from` adds non-human principals. `answer` is not here: its authority is the `re=`
+/// the receiver minted.
 const DEMOTE_UNLESS_ACCEPTED: [&str; 2] = ["task", "control"];
 
-/// The kinds that ARE a verdict, and therefore may never earn one.
+/// The kinds that are a verdict, and so never earn one.
 ///
-/// `notify_sender_undeliverable` publishes a refused record's verdict onto a
-/// lane the fabric actually drains — which is what makes the verdict useful, and
-/// what makes it a record like any other: it is addressed, delivered, and
-/// refusable. Nothing exempted a verdict from being answered with a verdict, so
-/// two saturated per-sender quotas closed the loop: the refusal of a
-/// `kind=undeliverable` published another `kind=undeliverable` under the same
-/// `from=` that was already at quota, forever, two durable `fsync`ed records per
-/// round trip on an append-forever log. A `post` is an ordinary `Scoped` verb, so
-/// 65 of them from any in-session client armed it with no capability at all
-/// (§8.5's stated adversary).
-///
-/// The property pinned here is the narrow one: A VERDICT NEVER GENERATES A
-/// VERDICT. The refusal is still recorded as an `ev`, so the fate of the notice
-/// is on the log; what does not happen is another notice.
+/// A refused record's verdict ([`Bridge::notify_sender_undeliverable`]) is itself an addressed,
+/// refusable record: answering a refused verdict with another lets two saturated per-sender
+/// quotas loop forever on an append-only log. The refusal is still recorded as an `ev`.
 const VERDICT_KINDS: [&str; 2] = ["undeliverable", "expired"];
 
-/// The kinds that WAIT for a reply, and so are the only ones a `dl=` is a
-/// deadline FOR. The same two `post` turns `--wait` on by default for.
+/// The kinds that wait for a reply, so the only ones a `dl=` is a deadline for (the same two
+/// `post` waits for by default).
 const WAITING_KINDS: [&str; 2] = ["ask", "task"];
 
-/// How many NEW inbox lanes on one other node this process opens to answer
-/// that node: a verdict ([`Bridge::sender_lane`]) or a receipt
-/// ([`Bridge::receipt_lane`]) to a session this node has never written to.
+/// How many new inbox lanes on one other node this process opens to answer that node: a
+/// verdict ([`Bridge::sender_lane`]) or a receipt ([`Bridge::receipt_lane`]) to a session this
+/// node has never written to.
 ///
-/// THE SESSION IN SUCH A LANE IS THE OTHER NODE'S WORD. A node's record names
-/// the session it spoke for in its body (`from=`), and the lane
-/// `/f/<F>/in/<node>/<sid>/<self>` is a subject on THIS node's unreclaimed
-/// budget (the module header). Unbounded, a peer that rotated `from=` had this
-/// node mint one subject per refused record, or per receipt, at no cost to its
-/// own. Answering no first contact at all would leave the ordinary case
-/// without a verdict: a remote session's first message refused `ERR too large`
-/// or `ERR quota` would get only an `unnotified` here, and its `post
-/// --wait-ack` would read `expired`, not refused. So a lane the bus already
-/// holds is free, and this many more per node are opened
-/// ([`Bridge::may_answer_on`]); past them the answer is recorded unsent on the
-/// local session's own face, `reason=lane-cap` ([`NoLane::Capped`]).
+/// The session in such a lane is the other node's word (its record's `from=`), and the lane
+/// `/f/<F>/in/<node>/<sid>/<self>` spends a subject from this node's unreclaimed budget (the
+/// module header), so unbounded, a peer rotating `from=` could drain it. A lane the bus already
+/// holds is free; past this many new ones per node ([`Bridge::may_answer_on`]) the answer is
+/// recorded unsent on the local session's face, `reason=lane-cap` ([`NoLane::Capped`]), and the
+/// asker's `post --wait-ack` reads `expired`. Verdicts and receipts share the count.
 ///
-/// 64 IS THE ENDPOINT'S PER-PEER ALLOWANCE (`SENDER_QUOTA`, aterm-gui
-/// `fabric.rs`), counted on the same cap-forced half, though that one bounds
-/// ring rows, which free up again, and this one spends subjects, which never
-/// do. A hostile node costs at most 64 lanes of two leaves each
-/// (`undeliverable`, `ack`), 128 of the 4096, per bridge process.
-///
-/// HONEST TRAFFIC PAYS IT TOO. Verdicts and receipts share the 64: once they
-/// are spent on one node, a verdict or a receipt to any further session of it
-/// this node has not written to is recorded `unnotified`/`unacked …
-/// reason=lane-cap` and retired, never sent later, and the asker's `post
-/// --wait-ack` reads `expired`. That holds for the rest of the process.
-///
-/// IN MEMORY, PER PROCESS, against a budget that survives restarts. Nothing a
-/// peer sends restarts this process (it reconnects to the broker in place),
-/// but every new bridge starts the count again: an aterm relaunch, a seamless
-/// update, the supervisor relaunching a bridge that exited. So the outage
-/// above ends at the next one, and a hostile peer gets 64 lanes per bridge
-/// lifetime, paced by events it cannot cause. A count kept on disk would make
-/// the outage permanent: every receipt to a new asker from a long-lived peer
-/// stopped for good once its 64th was answered, though a receipt to a
-/// first-contact asker is the ordinary case.
+/// 64 matches the endpoint's per-peer allowance (`SENDER_QUOTA`, aterm-gui `fabric.rs`). A
+/// hostile node costs at most 64 lanes of two leaves each (`undeliverable`, `ack`), 128 of the
+/// 4096, per bridge process. The count is in memory on purpose: every new bridge (an aterm
+/// relaunch, an update, a supervisor relaunch) starts it again and nothing a peer sends
+/// restarts this process, whereas a count on disk would stop receipts to new askers from a
+/// long-lived peer for good.
 const NEW_LANES_PER_NODE: usize = 64;
 
 /// Why a verdict ([`Bridge::sender_lane`]) or a receipt
@@ -2204,11 +2159,19 @@ pub struct Bridge {
     ring_kept: Option<String>,
     attachment: Attachment,
     fault: Fault,
-    /// The loop's waits on the broker, counted where it blocks
-    /// ([`Bridge::observe`], [`Bridge::settle_one`]) and written at its idle
+    /// The loop's time, counted where it spends it — its waits on the broker
+    /// ([`Bridge::observe`], [`Bridge::settle_one`]), its verb-lane round trips
+    /// ([`Bridge::ctl_request`]), its park, a post's path — with the mailbox's
+    /// wakes and the state dir's writes copied in, and written at its idle
     /// moments for the fabric bench's ping-pong arm. Off unless the development
     /// seam [`crate::wait_tally::SEAM`] is set ([`crate::wait_tally`]).
     waits: Recorder,
+    /// When the loop took the item it is handling, while the tally is on.
+    taken_at: Option<Instant>,
+    /// While a `post` event's drain runs and the tally is on, when the loop
+    /// took that event: each fresh post it publishes counts the span
+    /// ([`crate::wait_tally::Row::PostPublish`]).
+    post_event: Option<Instant>,
     /// The verb connection to aterm (fd 3, or the observer socket).
     ctl: Ctl,
     /// The push connection to aterm (fd 4), moved into the constructor beside
@@ -2983,6 +2946,11 @@ impl Bridge {
         // Like the pid file: opened by the lock's holder alone, so the tally in
         // the dir is the bridge that holds it.
         let waits = Recorder::from_env(state.root());
+        // Its rows the mailbox and the state dir keep: counted from the start,
+        // and only while it is on.
+        let mailbox = Arc::new(Mailbox::default());
+        mailbox.stamp(waits.on());
+        state.time_ops(waits.on());
         let log_witness = state.log_witness().unwrap_or_default();
         let acked = state.self_acked_log();
         let mirror = mirror_run::MirrorRun::new(cfg.log, &state, fx.now(), || fx.alias_key());
@@ -3013,6 +2981,8 @@ impl Bridge {
             attachment,
             fault,
             waits,
+            taken_at: None,
+            post_event: None,
             ctl,
             push,
             conn: None,
@@ -3081,7 +3051,7 @@ impl Bridge {
             quarantine_unread: false,
             pin_unreconciled: None,
             recovery_owed: false,
-            mailbox: Arc::new(Mailbox::default()),
+            mailbox,
             cfg,
             fx,
             _state_lock: state_lock,
@@ -3114,8 +3084,12 @@ impl Bridge {
     /// framed and alive, so it is an error the caller records and carries on
     /// from. Only the former ends the process.
     fn ctl_request(&mut self, line: &str) -> io::Result<Reply> {
+        let started = self.waits.starts();
         let ctl = &mut self.ctl;
         let reply = self.fx.lane(|| ctl.request(line));
+        if started.is_some() {
+            self.waits.note(crate::wait_tally::lane_row(line), started);
+        }
         note_ctl_loss(&self.ctl, &self.mailbox, reply.as_ref().err());
         reply
     }
@@ -9748,6 +9722,10 @@ impl Bridge {
             }
         };
         let drain = parse_drain(&drained);
+        self.waits.count(
+            crate::wait_tally::Row::DrainPosts,
+            u64::try_from(drain.posts.len()).unwrap_or(u64::MAX),
+        );
         // THE REPLAYS NOTHING QUEUED CARRIES are settled before the posts
         // are tried (sim item S7, [`Bridge::release_replays`]).
         self.release_replays(&drain);
@@ -10254,6 +10232,10 @@ impl Bridge {
             journaled,
         }));
         self.send_pipelined(seq, &face, &encoded, then);
+        if self.post_event.is_some() {
+            self.waits
+                .note(crate::wait_tally::Row::PostPublish, self.post_event);
+        }
         true
     }
 
@@ -11134,7 +11116,11 @@ impl Bridge {
                     self.fault.fired(&self.state);
                     return;
                 }
+                // A POST'S PATH, for the wait tally: from this event's take to
+                // each fresh post's publish written ([`Bridge::send_post`]).
+                self.post_event = self.taken_at;
                 self.drain_outbox();
+                self.post_event = None;
             }
             "fetch" => {
                 if self.fault == Fault::SkipRosterOutboxWhileMarked {
@@ -13268,8 +13254,18 @@ impl Bridge {
             // has read the rest ([`Bridge::park_and_take`]), so a reader
             // waiting for the cursor to pass a message reads the waits that
             // delivering it cost.
-            self.waits.idle(self.committed);
+            self.tally_idle();
         }
+    }
+
+    /// AN IDLE MOMENT'S TALLY WRITE ([`crate::wait_tally::Recorder::idle`]), with
+    /// the rows the mailbox and the state dir keep copied in.
+    fn tally_idle(&mut self) {
+        let (mailbox, state) = (&self.mailbox, &self.state);
+        self.waits.idle(self.committed, |t| {
+            mailbox.copy_wakes(t);
+            state.copy_dir_rows(t);
+        });
     }
 
     /// PARK FOR ONE ITEM AND HANDLE IT ([`Bridge::take_one`]) — and, while acks
@@ -13285,7 +13281,7 @@ impl Bridge {
         let (go_on, took) = self.take_one(park);
         if go_on && !took && owed {
             self.settle_acks();
-            self.waits.idle(self.committed);
+            self.tally_idle();
         }
         go_on
     }
@@ -13298,7 +13294,12 @@ impl Bridge {
         {
             self.parked = Some(wait);
         }
+        let parked = self.waits.starts();
         let item = self.fx.take(&self.mailbox, wait);
+        if parked.is_some() {
+            self.waits.note(crate::wait_tally::Row::Park, parked);
+            self.taken_at = self.waits.starts();
+        }
         let took = item.is_some();
         self.in_round = took;
         let go_on = match item {
@@ -13347,6 +13348,18 @@ impl Bridge {
         };
         self.in_round = false;
         (go_on, took)
+    }
+}
+
+/// THE WAIT TALLY, TURNED ON IN A TEST: the recorder writing to `path`, and the
+/// rows the mailbox and the state dir keep, as the constructor turns them on
+/// when the seam is set.
+#[cfg(test)]
+impl Bridge {
+    pub(crate) fn tally_to(&mut self, path: &std::path::Path) {
+        self.waits = Recorder::at(path).expect("a fresh tally file");
+        self.mailbox.stamp(true);
+        self.state.time_ops(true);
     }
 }
 
@@ -13655,7 +13668,7 @@ struct DeliverLine<'a> {
     off: u64,
     /// The kind the endpoint is told, after [`Bridge::classify_delivery`].
     kind: &'a str,
-    /// The kind it CLAIMED, when that classification demoted it.
+    /// The kind it claimed, when that classification demoted it.
     demoted: Option<&'a str>,
     /// An answer that arrived after its ask was recorded expired. Never true
     /// for a broadcast: a shout answers no ask.
@@ -22329,6 +22342,185 @@ mod tests {
         }
     }
 
+    /// **THE WAIT TALLY'S STATE-DIR ROWS COUNT WHAT THE DIR DID** (v=2,
+    /// [`crate::wait_tally`]): drains of local posts with the tally on, and
+    /// each kind row's count is the dir's own count of that operation
+    /// ([`crate::state::FileOps`]) — two replaces, two unlinks and an append a
+    /// post — each call row a post's, and the verb lane's peeks and
+    /// retirements the drains' and the posts'. NEGATIVE CONTROL: the same
+    /// drains with the tally off count every operation in the dir and none in
+    /// the tally's rows.
+    #[cfg(unix)]
+    #[test]
+    fn the_tallys_state_dir_rows_count_what_the_dir_did_and_an_off_tally_counts_none() {
+        use crate::wait_tally::{Row, Tally, FILE};
+        const A: &str = "s-a";
+        const B: &str = "s-b";
+        for on in [true, false] {
+            let (lane, mut bridge, _socket, _face, _broker) = local_pair_world("tally-dir");
+            let path = bridge.state.root().join(FILE);
+            if on {
+                bridge.tally_to(&path);
+            }
+            let before = bridge.state.ops();
+            let (drains, per_drain) = (3u64, 2u64);
+            let mut next = 1;
+            for _ in 0..drains {
+                *lane.outbox.lock().unwrap() = Some(
+                    (next..next + per_drain)
+                        .map(|id| format!("post sid={A} id={id} to=@{B} kind=note len=4\nping"))
+                        .collect(),
+                );
+                next += per_drain;
+                bridge.drain_outbox();
+            }
+            let posts = drains * per_drain;
+            let spent = bridge.state.ops() - before;
+            // (The first post's sequence block is one more replace: the
+            // cross-check below takes the dir's count whatever it is.)
+            assert_eq!(
+                (spent.unlinks, spent.appends),
+                (2 * posts, posts),
+                "on={on}: what a local post costs the dir"
+            );
+            assert!(spent.replaces >= 2 * posts, "on={on}");
+            bridge.tally_idle();
+            if !on {
+                assert!(!path.exists(), "an off tally writes nothing");
+                let mut kept = Tally::default();
+                bridge.state.copy_dir_rows(&mut kept);
+                assert_eq!(kept, Tally::default(), "and its dir counts nothing");
+                continue;
+            }
+            let t = Tally::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let n = |r: Row| t.row(r).count;
+            assert!(t.dir, "a test build counts the dir");
+            assert_eq!(
+                (n(Row::DirReplace), n(Row::DirUnlink), n(Row::DirAppend)),
+                (spent.replaces, spent.unlinks, spent.appends),
+                "each kind row is the dir's own count"
+            );
+            for row in [
+                Row::SetPostPin,
+                Row::SetInFlight,
+                Row::ClearInFlight,
+                Row::ClearPostSeq,
+                Row::AppendSelfAcked,
+            ] {
+                assert_eq!(n(row), posts, "{row:?}: one a post");
+            }
+            assert_eq!(n(Row::LaneOutbox), drains, "a peek a drain");
+            assert_eq!(n(Row::LaneSessions), drains, "a roster read a drain");
+            assert_eq!(n(Row::LaneSent), posts, "a retirement a post");
+            assert_eq!(
+                (n(Row::DrainPosts), t.row(Row::DrainPosts).total),
+                (drains, posts),
+                "each peek's posts"
+            );
+            assert!(
+                t.row(Row::SetPostPin).total <= t.row(Row::DirReplace).total,
+                "a call row is inside its kind's"
+            );
+            assert_eq!(
+                n(Row::PostPublish),
+                0,
+                "no `post` event ran these drains: the path is an event's"
+            );
+        }
+    }
+
+    /// **A `post` EVENT'S PATH IS TIMED TO EACH PUBLISH ITS DRAIN WRITES, AND
+    /// THE EVENT IS COUNTED BY HOW IT FOUND THE LOOP** (wait tally v=2,
+    /// [`crate::wait_tally::Row::PostPublish`] and the mailbox's wake rows),
+    /// through the loop's own rounds: a `post` event queued before the round
+    /// takes it is a queued event, and its drain's two fresh posts two paths;
+    /// one pushed from another thread once the loop is parked is a wake, and
+    /// its one post one more path. NEGATIVE CONTROL: a roster `fetch` event's
+    /// drain publishes a post too, and times no path, though its event is
+    /// counted queued like any other.
+    #[cfg(unix)]
+    #[test]
+    fn a_post_events_path_is_timed_to_each_publish_and_its_event_counted_as_a_wake_or_queued() {
+        use crate::wait_tally::{Row, Tally, FILE};
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+        assert!(bridge.refresh_sessions().is_ok());
+        let (socket, _broker, _server) = serve_log(&lane, "tally-path");
+        bridge.cfg.broker = socket;
+        bridge.conn = Some(bridge.connect().unwrap().0.into());
+        let node = bridge.node.clone();
+        bridge
+            .indexed_subjects
+            .insert(subject::post_lane("f", &node, "s-b", &node, "note"));
+        lane.retire_from_outbox();
+        let path = bridge.state.root().join(FILE);
+        bridge.tally_to(&path);
+        let outbox = |ids: std::ops::Range<u64>| {
+            *lane.outbox.lock().unwrap() = Some(
+                ids.map(|id| queued_note("s-a", id, "@s-b", "ping"))
+                    .collect(),
+            );
+        };
+        let tally = |bridge: &mut Bridge| {
+            run_rounds(bridge);
+            bridge.settle_acks();
+            bridge.tally_idle();
+            Tally::parse(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        };
+        let rows = |t: &Tally| {
+            [Row::PostPublish, Row::QueuedEvent, Row::WakeEvent].map(|row| t.row(row).count)
+        };
+
+        // QUEUED: the event waits in the mailbox for the loop's round.
+        outbox(1..3);
+        bridge.mailbox.push_event("EVENT 1 post 1".to_string());
+        let queued = tally(&mut bridge);
+        assert_eq!(
+            rows(&queued),
+            [2, 1, 0],
+            "a path a fresh post, a queued event"
+        );
+
+        // NEGATIVE CONTROL: a `fetch` drains as well, and is no post's path.
+        outbox(3..4);
+        bridge.mailbox.push_event("EVENT 1 fetch off=9".to_string());
+        let fetched = tally(&mut bridge);
+        assert_eq!(rows(&fetched), [2, 2, 0], "a fetch's drain times no path");
+
+        // A WAKE: pushed once the loop is parked on its mailbox.
+        assert_eq!(
+            bridge.conn.as_ref().map(Link::unacked),
+            Some(0),
+            "PRECONDITION: nothing owed, so the park is the whole wait"
+        );
+        outbox(4..5);
+        let mailbox = bridge.mailbox_handle();
+        let pusher = std::thread::spawn(move || {
+            aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the loop parked on its mailbox",
+                || mailbox.parked().then_some(()),
+            );
+            mailbox.push_event("EVENT 1 post 4".to_string());
+        });
+        assert!(bridge.round(aterm_spec::wait::MUST_HAPPEN));
+        pusher.join().expect("the pusher");
+        let woke = tally(&mut bridge);
+        assert_eq!(rows(&woke), [3, 2, 1], "a wake, and its post's path");
+        assert_eq!(
+            retirements(&lane)
+                .iter()
+                .filter(|(_, _, off)| off.is_some())
+                .count(),
+            4,
+            "every post landed: {:?}",
+            retirements(&lane)
+        );
+        assert!(
+            woke.row(Row::PostPublish).total > 0,
+            "a path is timed, not only counted"
+        );
+    }
+
     /// **`acked` IS WRITTEN WHOLE WHEN AN APPEND COULD NOT BE TRUSTED.** A
     /// write that fails keeps the in-flight entry it would have ended, and
     /// the next write REPLACES the log with the set rather than append after
@@ -24134,7 +24326,7 @@ mod tests {
     #[test]
     fn the_wait_tally_counts_the_commit_and_the_ack_the_loop_waited_on_and_an_off_one_counts_nothing(
     ) {
-        use crate::wait_tally::{Tally, FILE};
+        use crate::wait_tally::{Row, Tally, FILE};
         const SID: &str = "s-tally";
         for on in [true, false] {
             let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
@@ -24143,7 +24335,7 @@ mod tests {
             let path = bridge.state.root().join(FILE);
             assert!(!bridge.waits.on(), "off unless the seam is set");
             if on {
-                bridge.waits = Recorder::at(&path).unwrap();
+                bridge.tally_to(&path);
             }
             let read = || Tally::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
 
@@ -24156,21 +24348,37 @@ mod tests {
                 assert!(!path.exists(), "and writes nothing");
                 continue;
             }
+            let counts = |t: &Tally, r: Row| t.row(r).count;
             assert_eq!(
-                (counted.requests, counted.commits, counted.acks),
+                (
+                    counts(&counted, Row::Request),
+                    counts(&counted, Row::Commit),
+                    counts(&counted, Row::Ack)
+                ),
                 (0, 1, 1),
                 "the burst's one commit is the one wait, a pipelined ack"
             );
-            assert!(counted.commit_ns <= counted.ack_ns);
+            assert!(counted.row(Row::Commit).total <= counted.row(Row::Ack).total);
             let written = read();
             assert_eq!(
-                written,
-                Tally {
-                    committed: records[3].0,
-                    ..counted
-                },
+                written.committed, records[3].0,
                 "written at the idle moment, past the commit"
             );
+            for row in [Row::Request, Row::Commit, Row::Ack, Row::LaneDeliver] {
+                assert_eq!(written.row(row), counted.row(row), "{row:?}");
+            }
+            // THE V=2 ROWS: the burst's four deliveries on the verb lane, and
+            // its four records taken off the mailbox, queued before the loop
+            // ran, so each waited behind the loop's work and none was a wake.
+            assert_eq!(counts(&written, Row::LaneDeliver), 4);
+            assert_eq!(
+                (
+                    counts(&written, Row::QueuedRecord),
+                    counts(&written, Row::WakeRecord)
+                ),
+                (4, 0)
+            );
+            assert!(counts(&written, Row::Park) >= 4, "a take per record");
 
             bridge.in_round = true;
             bridge.publish_ev("tallied");
@@ -24178,10 +24386,15 @@ mod tests {
             run_rounds(&mut bridge);
             let waited = read().since(&written).unwrap();
             assert_eq!(
-                (waited.requests, waited.commits, waited.acks),
+                (
+                    waited.row(Row::Request).count,
+                    waited.row(Row::Commit).count,
+                    waited.row(Row::Ack).count
+                ),
                 (0, 0, 1),
                 "a pipelined ack, read at the idle moment"
             );
+            assert!(waited.at_ns > 0, "the bridge's own clock moved");
         }
     }
 

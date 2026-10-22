@@ -503,10 +503,8 @@ mod tests {
         assert_eq!(decompose(-1, 8), (-1, 7), "negative px borrows a full row");
     }
 
-    /// PROVE (2), position law: the ease reaches the target EXACTLY at
-    /// `elapsed >= dur`, starts exactly at `start`, moves monotonically
-    /// toward the target, and never oversteps — over a start/target × step
-    /// cadence lattice (both directions, zero-length glides included).
+    /// (2) Position law: exact start and target, monotone, no overstep, over start/target
+    /// pairs in both directions × step cadences.
     #[test]
     fn glide_converges_monotonically_and_exactly() {
         let cases: [(i64, i64); 6] = [

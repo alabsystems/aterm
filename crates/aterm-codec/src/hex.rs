@@ -4,13 +4,12 @@
 //! Hexadecimal encode and decode shared by the workspace.
 //!
 //! Encoding writes two digits per byte, high nibble first, lowercase unless the
-//! name says `upper`; decoding accepts either case. Each function uses shapes
-//! the Trust verifier discharges locally (branch-table digits, div/rem split,
-//! shift-or combine), with no `fmt` machinery.
+//! name says `upper`; decoding accepts either case. No `fmt` machinery: each
+//! function uses shapes the Trust verifier discharges locally.
 //!
-//! `aterm_uds::rand::hex_encode` is a separate copy: `aterm-uds` has no
-//! dependencies and its encoder is proved by `rand_kani_proofs`. A few
-//! Trust-verified crates keep local copies for their own proofs and say so.
+//! `aterm_uds::rand::hex_encode` is a separate copy because `aterm-uds` has no
+//! dependencies. A few Trust-verified crates keep local copies for their own
+//! proofs and say so.
 
 /// Lowercase hex digit for a nibble (the low four bits of `n`; every caller
 /// passes a value already `<= 15`).
@@ -188,8 +187,7 @@ mod tests {
     use super::*;
     use std::fmt::Write as _;
 
-    /// Every byte and every digit against the std spellings the call sites
-    /// used before they shared this module.
+    /// Every byte and every digit against the std spellings.
     #[test]
     fn every_byte_and_digit_matches_std() {
         let all: Vec<u8> = (0..=255).collect();

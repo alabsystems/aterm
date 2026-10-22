@@ -3765,11 +3765,10 @@ pub fn engine_rows_in(mappings: &str, commit: Option<&str>) -> EngineRows {
     }
 }
 
-/// A promotable attestation of `commit`: its source is `commit`, and `pub publish`
-/// would promote it (`public_clone` passed, or skipped on a source-only repo) — it names
-/// the engine commit that staged it ([`attested_engine`]), which promote requires too
-/// ("names an unavailable or incompatible engine commit"), so an attestation that names
-/// none is staged again rather than carried to a publish that refuses it.
+/// A promotable attestation of `commit`: its source is `commit`, `public_clone` passed (or
+/// was skipped on a source-only repo), and it names the engine commit that staged it
+/// ([`attested_engine`]), which promote also requires; one that names none is staged
+/// again rather than carried to a publish that refuses it.
 #[must_use]
 pub fn attestation_promotes(json: &str, commit: &str) -> bool {
     let Ok(a) = aterm_json::from_str::<aterm_json::Value>(json) else {
@@ -3850,8 +3849,7 @@ pub fn staging_moved_from(listing: &str, attested: &str) -> Option<String> {
 #[must_use]
 pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
     interrupt::install();
-    // every relative path flag, anchored ONCE, where the release was started: the steps
-    // run from the clone's root, and so does the re-exec as R's own cutter
+    // relative path flags anchored once, where the release was started
     let opts = match std::env::current_dir() {
         Ok(cwd) => opts.anchored(&cwd),
         Err(_) => opts.clone(),

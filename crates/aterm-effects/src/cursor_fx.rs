@@ -1353,9 +1353,8 @@ impl CursorFx {
             &rainbow_cfg,
             &mut self.glow_scratch,
         );
-        // The rainbow owns the caret: with the rainbow live on a blinking block
-        // the shape is pinned steady, typing or idle. Reduced motion / load shed
-        // leave `fill` None, restoring the plain blink.
+        // The rainbow owns the caret; on a blinking block the shape is pinned
+        // steady. Reduced motion / load shed leave `fill` None, restoring the blink.
         let twinkle_cursor = rainbow_frame.fill.is_some() && rainbow_cfg.blinking;
         let rainbow_owns_caret = rainbow_frame.fill.is_some();
         let glow_fp = glow_fp ^ rainbow_frame.fp.rotate_left(23);

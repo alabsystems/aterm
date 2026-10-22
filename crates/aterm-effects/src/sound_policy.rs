@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The sound-cue policy: how the cues the cursor family and the word engine
-//! record become synth events. The trail-sound gain law (real focus × the
-//! music master × volume), the sing-along riff's and the curse bonk's laws
-//! beside it, and the two drains that map cues onto
+//! The sound-cue policy: the gain laws for trail sound, the sing-along riff and
+//! the curse bonk, and the drains that map engine cues onto
 //! [`crate::trail_sound::SoundEvent`]s with the policy stamped on each.
 //!
-//! The policy is a pure function of the host's knobs and the engines' cues,
-//! so every host shares it (`docs/DESIGN-host-boundary-2026-08-30.md` §3.1).
-//! The sink stays the host's (the native app's `TrailAudio` queue; a web
-//! page drops the events), as does the input clock each event is stamped with.
+//! A pure function of the host's knobs and the engines' cues, so every host
+//! shares it (`docs/DESIGN-host-boundary-2026-08-30.md` §3.1). The sink and the
+//! input clock stay the host's (the native app's `TrailAudio` queue; a web page
+//! drops the events).
 
 /// THE SYNTH VOICES, and which of a window's policies each one obeys. The
 /// host resolves every voice's gain through [`voice_gain`], and Settings
@@ -151,8 +149,8 @@ pub fn fold_window_audibility(
     shed_env: f32,
     win_focused: bool,
 ) {
-    // Read BEFORE the fold below: the one point at which the three meanings
-    // of a zero `intensity` are still separable.
+    // Read before the fold: the one point where the three meanings of a zero
+    // `intensity` are still separable.
     let lit = user_lit(cfg);
     cfg.intensity *= motion_amplitude * shed_env;
     cfg.audible = win_focused && lit;
@@ -243,9 +241,8 @@ pub struct TrailSoundPolicy {
     /// The window's cached tone-of-typing verdict (`tone_infer`), resolved
     /// by the host like gain (knob off ⇒ the neutral `Technical` identity).
     pub tone: crate::tone::Tone,
-    /// The `trail_sound_bed` knob (default on): off, no event feeds the
-    /// synth's bed layer, so the ambient texture contributes zero samples
-    /// while the notes keep playing (owner, 2026-09-09).
+    /// The `trail_sound_bed` knob (default on): off, nothing feeds the synth's
+    /// bed layer, so the ambient texture is silent while the notes play.
     pub bed: bool,
 }
 
@@ -283,9 +280,9 @@ pub fn trail_sound_event(
     }
 }
 
-/// Drain every visual spawn cue and optionally emit its allocation-free sound
-/// twin. Both single-pane and split-pane composition route through this seam,
-/// so muting never leaves a backlog and layouts cannot silently lose audio.
+/// Drain every visual spawn cue, emitting its sound twin unless muted. Single-
+/// and split-pane composition both route through here, and the queue drains
+/// either way, so muting never leaves a backlog.
 #[allow(clippy::too_many_arguments)] // Explicit policy axes keep cue emission allocation-free.
 #[inline]
 pub fn drain_trail_sound_cues(
@@ -307,11 +304,11 @@ pub fn drain_trail_sound_cues(
     emitted
 }
 
-/// Resolve curse-bonk policy: the music master (`trail_sounds`), the
-/// profanity `bonk` knob, raw window focus (a background recording may
-/// animate, never speak), the motion policy (a Reduced window pushes no
-/// events, matching the glow engine's intensity-0 silence), and the shared
-/// `trail_sound_volume`. Per-class and master sparkle gates need no
+/// Resolve curse-bonk policy: [`trail_sound_gain`] over the music master and
+/// the `bonk` knob, silenced in a Reduced-motion window (matching the glow
+/// engine's intensity-0 silence). The master gates the bonk as the Sound box's
+/// footnote (`prefs::group_footnote`) promises; the terminal bell
+/// (`lib.rs::on_bell`) is the one exception. Per-class sparkle gates need no
 /// re-check: the engine records cues only for words it decorates.
 ///
 /// The bonk is a synth voice, so the master gates it as the Music effects
@@ -345,9 +342,9 @@ pub fn bonk_sound_gain(
 pub struct CurseDrain {
     /// Bonk events handed to the sink this drain (0 while muted).
     pub emitted: usize,
-    /// Distinct profanity locations this tick. A typed cue and its supernova
-    /// detonation at the same word are one visual wince, while `fuck fuck`
-    /// produces two beats. This remains independent of sound policy.
+    /// Distinct profanity locations this tick, independent of sound policy: a
+    /// typed cue and its supernova detonation at one word are one wince, while
+    /// `fuck fuck` is two.
     pub wince_hits: u8,
 }
 
@@ -359,8 +356,7 @@ pub struct CurseDrain {
 pub fn drain_curse_bonk_cues(
     decos: &mut crate::word_decorations::WordDecorations,
     style: crate::cursor_glow::GlowStyle,
-    // The `trail_sound_style` override — the bonk's clash SHAPE is
-    // style-agnostic, but its register anchor follows the speaking palette.
+    // The `trail_sound_style` override: its palette anchors the bonk's register.
     voice: crate::trail_sound::SoundVoice,
     cols: u16,
     gain: Option<f32>,
@@ -387,9 +383,8 @@ pub fn drain_curse_bonk_cues(
             continue;
         }
         emit(crate::trail_sound::SoundEvent {
-            // The active trail style keys the bonk's clash register (its
-            // palette anchor), so the wrong note is wrong against the melody
-            // playing; the gesture itself is style-agnostic.
+            // The trail style keys the clash register, so the wrong note is
+            // wrong against the melody playing.
             style,
             voice,
             kind: crate::trail_sound::SoundGesture::Words(crate::trail_sound::WordGesture::Bonk),
@@ -405,8 +400,8 @@ pub fn drain_curse_bonk_cues(
             // The bonk is tone-blind (the wrong note is wrong in every mood,
             // and its path is byte-pinned): always the neutral identity.
             tone: crate::tone::Tone::Technical,
-            // Word gestures never feed the bed (punctuation must not swell
-            // the ambience); carried off so the event states the policy it gets.
+            // Word gestures never feed the bed: punctuation must not swell
+            // the ambience.
             bed: false,
             shifted: false, // a bonk is punctuation over the text, not a typed glyph
         });
@@ -419,11 +414,7 @@ pub fn drain_curse_bonk_cues(
 mod bonk_gain_tests {
     use super::bonk_sound_gain;
 
-    /// The policy resolver: the music master, raw focus, the bonk knob, the
-    /// reduced-motion demotion and the shared volume each silence
-    /// independently; the survivor passes the volume through as the event
-    /// gain. Every `None` case flips exactly one term away from the audible
-    /// precondition.
+    /// Each `None` case flips one term of the audible precondition.
     #[test]
     fn bonk_gain_policy_gates_master_focus_knob_motion_and_volume() {
         assert_eq!(

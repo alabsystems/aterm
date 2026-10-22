@@ -385,9 +385,31 @@ pub fn in_build_dir(path: &Path, exists: &dyn Fn(&Path) -> bool) -> bool {
     false
 }
 
+/// Whether `path` is a copy that goes away: on a mounted disk image (`/Volumes/…`), in
+/// Gatekeeper's App Translocation copy (`/AppTranslocation/`), or under a temporary directory
+/// (the system's, `/tmp` or `/var/tmp`, as spelled or resolved). The rule
+/// `atpkg::stub::lasting` holds the app's own subscriber install to.
+pub fn transient(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let temp = [
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/var/tmp"),
+    ];
+    text.starts_with("/Volumes/")
+        || text.contains("/AppTranslocation/")
+        || temp
+            .iter()
+            .flat_map(|root| [root.canonicalize().ok(), Some(root.clone())])
+            .flatten()
+            // A temporary directory that is the root itself (`TMPDIR=/`) holds everything.
+            .any(|root| root.parent().is_some() && path.starts_with(&root))
+}
+
 /// The executable a job should run, given the running one (`exe`, canonical): the bundle's
 /// `Contents/MacOS` executable when `exe` lies inside an `.app` (the outermost one), else
-/// `exe`. Refuses a build in a cargo target directory ([`in_build_dir`]).
+/// `exe`. Refuses a build in a cargo target directory ([`in_build_dir`]) and a copy that goes
+/// away ([`transient`]).
 pub fn service_program(exe: &Path, exists: &dyn Fn(&Path) -> bool) -> crate::Result<PathBuf> {
     if !exe.is_absolute() {
         return Err(Error::new(format!(
@@ -400,6 +422,15 @@ pub fn service_program(exe: &Path, exists: &dyn Fn(&Path) -> bool) -> crate::Res
             "{} is a build in a cargo target directory, which aterm frees when nobody uses it, \
              so a job running it would stop starting; install aterm, or pass --program <the \
              aterm a lasting job should run>",
+            exe.display()
+        )));
+    }
+    if transient(exe) {
+        return Err(Error::new(format!(
+            "{} is on a disk image, an App Translocation copy or in a temporary directory, which \
+             goes away, so a job running it would stop starting; run aterm from where it is \
+             installed (move aterm.app to /Applications), or pass --program <the aterm a \
+             lasting job should run>",
             exe.display()
         )));
     }
@@ -1120,6 +1151,36 @@ mod tests {
         assert!(build.0.contains("cargo target directory"), "{build}");
         assert!(build.0.contains("--program"), "{build}");
         assert!(service_program(Path::new("aterm"), &none).is_err());
+    }
+
+    #[test]
+    fn a_copy_that_goes_away_is_never_a_services_program() {
+        let none = |_: &Path| false;
+        let temp = std::env::temp_dir().join("x").join("aterm");
+        let resolved = std::env::temp_dir()
+            .canonicalize()
+            .expect("the temporary directory")
+            .join("aterm");
+        for path in [
+            Path::new("/Volumes/aterm/aterm.app/Contents/MacOS/aterm"),
+            Path::new("/private/var/folders/x/AppTranslocation/Y/d/aterm.app/Contents/MacOS/aterm"),
+            Path::new("/tmp/aterm"),
+            Path::new("/var/tmp/x/aterm"),
+            &temp,
+            &resolved,
+        ] {
+            let refused = service_program(path, &none).unwrap_err();
+            assert!(refused.0.contains("goes away"), "{refused}");
+            assert!(refused.0.contains("--program"), "{refused}");
+        }
+        for path in [
+            "/Applications/aterm.app/Contents/MacOS/aterm",
+            "/Users//x/.local/bin/aterm",
+            "/Users//x/Volumes/aterm",
+            "/tmpfoo/aterm",
+        ] {
+            assert!(!transient(Path::new(path)), "{path}");
+        }
     }
 
     #[test]

@@ -1378,47 +1378,10 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     write_json_with_flush(path, value, durable_directory)
 }
 
-#[cfg(not(test))]
 fn durable_directory(directory: &Path) -> std::io::Result<()> {
     use aterm_machines::port::System as _;
     let sys = aterm_machines::port::Live::new();
     sys.durable_dir(directory)
-}
-
-/// [`durable_directory`] under this crate's own unit tests: a plain `fsync(2)`
-/// ([`aterm_durable::seam::durable_fsync`], which the counting seam records as durable)
-/// in place of `F_FULLFSYNC`. It is still a real flush of the same directory at the same
-/// point, so a test sees the same files, renames and errors; what it drops is the
-/// drive-cache barrier, which only orders the disk against a power loss and holds up
-/// most flushes, creates and renames on the volume while it runs
-/// (`docs/measured/flush-wait-2026-10-21.md`). A record's flush walks every ancestor of
-/// its directory, so the setup tests' fault sweeps made one full flush per ancestor per
-/// write: alone, `every_owned_write_boundary_recovers_the_same_revision_including_mismatched_prefixes`
-/// took 19.3 s wall for 0.39 s CPU, and the whole `--lib` run 14.1-14.2 s.
-#[cfg(test)]
-fn durable_directory(directory: &Path) -> std::io::Result<()> {
-    aterm_durable::seam::durable_fsync(&std::fs::File::open(directory)?)
-}
-
-#[cfg(not(test))]
-fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-    aterm_machines::port::write_atomic(path, bytes, mode)
-}
-
-/// [`write_atomic`] under this crate's own unit tests: `aterm_machines::port::write_atomic`'s
-/// steps with [`durable_directory`]'s plain `fsync(2)` for both of its flushes. The setup
-/// tests' fault sweeps write records through it on every retry: alone,
-/// `a_workstation_stage_that_never_verifies_disrupts_twice_across_worker_retries` spent most
-/// of its 2.7 s in those two full flushes, and 9.6 s beside the rest of the `--lib` run.
-#[cfg(test)]
-fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-    aterm_machines::port::write_atomic_with(
-        path,
-        bytes,
-        mode,
-        aterm_durable::seam::durable_fsync,
-        durable_directory,
-    )
 }
 
 fn flush_record_with(
@@ -1447,7 +1410,8 @@ fn write_json_with_flush(
         .ok_or("doctor record has no parent directory")?;
     std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     let bytes = aterm_json::to_vec(value).map_err(|e| e.to_string())?;
-    write_atomic(path, &bytes, 0o600).map_err(|e| format!("{}: {e}", path.display()))?;
+    aterm_machines::port::write_atomic(path, &bytes, 0o600)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     flush_record_with(path, flush)
 }
 
@@ -1565,17 +1529,12 @@ fn execute_pass(host: &mut dyn Host, root: &Path, action: Action) -> Result<Pass
     }
     // The shared item set supplies exact typed before-images. The recovery
     // record is durable before any preference changes, without another policy.
+    // The shared items' own writes need no relaunch record here: each relaunches what
+    // reads it under its own durable marker (aterm-machines' `init_activation`), so a
+    // pass that ends between those writes and that relaunch makes the next one relaunch
+    // each reader once, not once for the marker and again for this record.
     if !before.is_empty() {
         save_backup(&report.backup, &saved)?;
-    }
-    let mut activation = previous_activation.clone();
-    for setting in &before {
-        if !activation.contains(&setting.target) {
-            activation.push(setting.target.clone());
-        }
-    }
-    if full_profile {
-        save_pending_refresh(root, &activation)?;
     }
     // An explicit repair also supersedes an earlier completion/restoration.
     // Failed account work must remain retryable until the shared pass verifies it.
@@ -1596,16 +1555,41 @@ fn execute_pass(host: &mut dyn Host, root: &Path, action: Action) -> Result<Pass
         .filter(|attempt| !attempt.verified)
         .map(|attempt| attempt.item.clone())
         .collect();
+    let activated: Vec<Target> = attempts
+        .iter()
+        .filter(|attempt| attempt.verified)
+        .flat_map(|attempt| attempt.preferences.iter().map(|saved| saved.target.clone()))
+        .collect();
     let rollback: Vec<Saved> = attempts
         .into_iter()
         .filter(|attempt| !attempt.verified)
         .flat_map(|attempt| attempt.preferences)
         .collect();
     // An older pass's activation record, and the keys this rollback rewrote: an item
-    // that verified activated its own writes, and nothing else changed.
-    let mut reload = previous_activation;
+    // that verified activated its own writes, and nothing else changed. A key of the
+    // older record that an item of this pass wrote again and verified was relaunched for
+    // after that write, which read whatever the record was kept for.
+    let mut reload: Vec<Target> = previous_activation
+        .into_iter()
+        .filter(|target| !activated.contains(target))
+        .collect();
     if !rollback.is_empty() {
+        // The rollback's writes are the doctor's own: recorded before they are made, so
+        // a pass that ends among them relaunches their readers on the next. A record that
+        // cannot be saved does not keep the originals from coming back: this pass still
+        // relaunches their readers, and the report says so.
         let mut errors = Vec::new();
+        if full_profile {
+            let mut record = reload.clone();
+            for previous in &rollback {
+                if !record.contains(&previous.target) {
+                    record.push(previous.target.clone());
+                }
+            }
+            if let Err(why) = save_pending_refresh(root, &record) {
+                errors.push(format!("record the relaunch after it: {why}"));
+            }
+        }
         let mut restored = Vec::new();
         let mut refused = Vec::new();
         for previous in rollback.iter().rev() {
@@ -1885,24 +1869,12 @@ fn clear_pending_refresh(root: &Path) -> Result<(), String> {
 fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> bool {
     let mut refreshed = true;
     let mut refused = Vec::new();
-    for (process, affected) in [
-        (
-            "Dock",
-            targets
-                .iter()
-                .any(|t| t.domain == "com.apple.dock" || t.domain == "com.apple.WindowManager"),
-        ),
-        (
-            "Finder",
-            targets.iter().any(|t| t.domain == "com.apple.finder"),
-        ),
-        (
-            "NotificationCenter",
-            targets
-                .iter()
-                .any(|t| t.domain == "com.apple.notificationcenterui"),
-        ),
-    ] {
+    // The processes that read each target's domain: the table the shared items' own
+    // relaunch reads ([`aterm_machines::init_activation::readers`]).
+    for process in aterm_machines::init_activation::RELAUNCHED {
+        let affected = targets
+            .iter()
+            .any(|t| aterm_machines::init_activation::readers(&t.domain).contains(&process));
         if !affected {
             continue;
         }
@@ -1970,6 +1942,12 @@ mod tests {
         journal_refuses: bool,
         /// An apply pass of the preference group panics, as a process that dies there.
         dies_in_preferences: bool,
+        /// An apply pass of the preference group panics once its items wrote, as a process
+        /// that dies before they relaunch what reads them.
+        dies_after_item_writes: bool,
+        /// The doctor's own writes (a rollback, a Restore) panic, as a process that dies
+        /// among them.
+        dies_in_doctor_writes: bool,
         restarts: Vec<String>,
         account_passes: usize,
         attempts: Vec<Attempt>,
@@ -1995,6 +1973,21 @@ mod tests {
                 .iter()
                 .filter(|event| event.starts_with("write ") || event.starts_with("restart "))
                 .count()
+        }
+
+        /// Write `target` as a shared item or the doctor does.
+        fn put(&mut self, target: &Target, value: Option<&PValue>) -> Result<(), String> {
+            self.writes.push(target.clone());
+            self.events.push(format!("write {}", target.describe()));
+            match value {
+                Some(value) => {
+                    self.values.insert(target.clone(), value.clone());
+                }
+                None => {
+                    self.values.remove(target);
+                }
+            }
+            Ok(())
         }
 
         /// How a pass holds `item`, if it does.
@@ -2365,17 +2358,11 @@ mod tests {
             Ok(self.values.get(target).cloned())
         }
         fn write(&mut self, target: &Target, value: Option<&PValue>) -> Result<(), String> {
-            self.writes.push(target.clone());
-            self.events.push(format!("write {}", target.describe()));
-            match value {
-                Some(value) => {
-                    self.values.insert(target.clone(), value.clone());
-                }
-                None => {
-                    self.values.remove(target);
-                }
-            }
-            Ok(())
+            assert!(
+                !self.dies_in_doctor_writes,
+                "the process ends among the doctor's own writes"
+            );
+            self.put(target, value)
         }
         fn preference_changes(&mut self) -> Result<Vec<Saved>, String> {
             self.preference_passes += 1;
@@ -2451,7 +2438,7 @@ mod tests {
                                 let before = self.values.get(&target).cloned();
                                 // The engine journals each item before its apply.
                                 self.events.push(format!("journal {item}"));
-                                self.write(&target, Some(&value))?;
+                                self.put(&target, Some(&value))?;
                                 self.runtime_changed = true;
                                 let written_back = self.written_back.contains(&target);
                                 if written_back {
@@ -2488,6 +2475,12 @@ mod tests {
                         detail,
                     });
                 }
+                assert!(
+                    !(apply
+                        && group == WorkstationGroup::Preferences
+                        && self.dies_after_item_writes),
+                    "the process ends after its items' writes, before they relaunch their readers"
+                );
             }
             if matches!(group, WorkstationGroup::Accounts | WorkstationGroup::All)
                 && !WorkstationGroup::Accounts
@@ -3157,10 +3150,11 @@ mod tests {
 
     /// A held retry changes nothing, so it leaves no activation record naming the held
     /// item's keys: a pass that dies part way (a quit, a crash, an update relaunch) does
-    /// not make the next process relaunch the Dock for a key nobody wrote. Negative
-    /// control: backing up a held item's keys (the hold dropped from the fake's
-    /// `preference_changes`, as from `Workstation::preference_changes`, which
-    /// aterm-machines' `a_held_item_has_no_before_images` pins) leaves the Dock key there.
+    /// not make the next process relaunch the Dock for a key nobody wrote. No pass records
+    /// its items' keys for a relaunch (their own markers do,
+    /// `a_pass_that_ends_after_its_items_wrote_leaves_their_relaunch_to_them`), and a held
+    /// item's keys are not backed up either (aterm-machines'
+    /// `a_held_item_has_no_before_images`).
     #[test]
     fn a_held_retry_that_dies_part_way_leaves_nothing_to_relaunch() {
         let root = aterm_tempfile::tempdir().expect("scratch");
@@ -3183,6 +3177,77 @@ mod tests {
         host.dies_in_preferences = false;
         automatic_pass(&mut host, root.path(), BUILD, at(2)).expect("the next process");
         assert_eq!(host.restarts, ["Dock"], "{:?}", host.events);
+    }
+
+    /// A pass that ends after its items wrote and before they relaunch what reads them
+    /// leaves that relaunch to the items: each keeps a durable marker from before its
+    /// first write, so the next pass's item relaunches each reader once. The doctor keeps
+    /// no record of those keys to relaunch for again. Negative control: recording every
+    /// backed-up key before the items run makes the next pass relaunch the Dock a second
+    /// time.
+    #[test]
+    fn a_pass_that_ends_after_its_items_wrote_leaves_their_relaunch_to_them() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let mut host = Fake {
+            dies_after_item_writes: true,
+            ..Fake::default()
+        };
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute(&mut host, root.path(), Action::Apply)
+        }));
+        assert!(died.is_err(), "the pass died after its items' writes");
+        assert!(
+            pending_refresh(root.path()).unwrap().is_empty(),
+            "{:?}",
+            pending_refresh(root.path())
+        );
+        host.dies_after_item_writes = false;
+        let report = execute(&mut host, root.path(), Action::Apply).expect("the next process");
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert!(host.restarts.is_empty(), "{:?}", host.events);
+    }
+
+    /// The doctor's own rollback writes are recorded before they are made: a pass that
+    /// ends among them makes the next relaunch what reads the keys it was putting back.
+    /// Negative control: no record before the rollback leaves the Dock unrelaunched.
+    #[test]
+    fn a_pass_that_ends_in_its_rollback_relaunches_their_readers_on_the_next() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let dock = wanted()[0].0.clone();
+        let mut host = Fake {
+            failing: vec![dock.clone()],
+            dies_in_doctor_writes: true,
+            ..Fake::default()
+        };
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute(&mut host, root.path(), Action::Apply)
+        }));
+        assert!(died.is_err(), "the pass died in its rollback");
+        assert_eq!(pending_refresh(root.path()).unwrap(), [dock]);
+        assert!(host.restarts.is_empty());
+        host.dies_in_doctor_writes = false;
+        host.failing.clear();
+        let report = execute(&mut host, root.path(), Action::Apply).expect("the next process");
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert_eq!(host.restarts, ["Dock"], "{:?}", host.events);
+        assert!(pending_refresh(root.path()).unwrap().is_empty());
+    }
+
+    /// A key of an older pass's relaunch record that an item of this pass writes again
+    /// and verifies was relaunched for after that write, by the item: the doctor does not
+    /// relaunch its reader again, and the record is cleared. Negative control: reloading
+    /// the whole record relaunches the Dock a second time.
+    #[test]
+    fn a_recorded_key_an_item_rewrites_and_verifies_is_not_relaunched_for_again() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let dock = wanted()[0].0.clone();
+        save_pending_refresh(root.path(), std::slice::from_ref(&dock)).unwrap();
+        let mut host = Fake::default();
+        let report = execute(&mut host, root.path(), Action::Apply).expect("apply");
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert!(host.writes.contains(&dock));
+        assert!(host.restarts.is_empty(), "{:?}", host.events);
+        assert!(pending_refresh(root.path()).unwrap().is_empty());
     }
 
     /// A journal that refuses a line never keeps an original from coming back: a rollback

@@ -2051,7 +2051,18 @@ pub(super) fn twin_version(twin: &Path) -> Option<String> {
 /// against one that never does (a quarantined download at a first-run dialog,
 /// a wrapper waiting on a lock), which would otherwise hold `sweep.lock` and
 /// every Claude upgrade on the machine.
+///
+/// A test waits the one-minute hang detector instead: the build it probes is a
+/// stand-in script it just wrote, and on a loaded host that exec waits on the
+/// system, not on the script (macOS assesses each new executable's first exec,
+/// one scan at a time machine-wide: a fresh script took 5.4 s behind 40 queued
+/// scans, against 0.01 s for one already run), so a five-second bound read the
+/// queue and failed the probe of a build that starts. A test that wants the
+/// bound's own answer names one ([`version_within`], `build_start::probe_within`).
+#[cfg(not(test))]
 const VERSION_WAIT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const VERSION_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// What one `<exe> --version` probe found ([`version_within`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5115,12 +5126,11 @@ pub const OWN_WORK_RESTAMP_S: u64 = upgrade_status::OWN_WORK_HOLD_S / 4;
 /// still has the whole bound once the hand lifts, less this.
 pub const HAND_RESTAMP_S: u64 = STALE_S / 5;
 
-/// A BUILD THAT FAILED TO START FOR A CONVERSATION ([`St::failed_start`]):
-/// the build — its version and its install ([`Source`]'s word) — the instant
-/// the stop's rest counts from ([`St::failed_at`], which a stop that repeats
-/// sets later: the rest ends [`upgrade::RETRY_S`] past it) and the stop in a
-/// row ([`St::stop_streak`]). What a new process of the conversation keeps
-/// ([`St::keep_stop`]) and a restart on its own program carries
+/// A build that failed to start for a conversation ([`St::failed_start`]): its
+/// version and install ([`Source`]'s word), the instant the stop's rest counts
+/// from ([`St::failed_at`]; the rest ends [`upgrade::RETRY_S`] past it) and the
+/// stop in a row ([`St::stop_streak`]). What a new process of the conversation
+/// keeps ([`St::keep_stop`]) and a restart on its own program carries
 /// ([`St::kept_by_restart`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct FailedStart {
@@ -5535,13 +5545,10 @@ impl St {
         true
     }
 
-    /// WHAT A PROCESS HAS ANSWERED, to carry onto the next build's record
-    /// while the same process is still behind: the stops in a row (the
-    /// notices it left unanswered — a whole round given up on is the digest's
-    /// premise — and any other stop that repeats), the wait log (the evidence
-    /// of why it has not moved), the first time each wait was seen, the last
-    /// look that saw its work, the day's asks at the end of that work and the
-    /// goal in force.
+    /// What a process has answered, carried onto the next build's record while
+    /// the same process is behind: the stops in a row, the wait log, the first
+    /// time each wait was seen, the last look that saw its work, the day's asks
+    /// at the end of that work and the goal in force.
     fn history(&self) -> History {
         History {
             // The stop in a row, whatever its reason: every `Failed` reason is

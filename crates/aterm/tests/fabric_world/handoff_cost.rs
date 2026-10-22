@@ -143,7 +143,7 @@ fn a_handoff_flushes_nothing_and_the_quit_after_it_flushes_the_run() {
     // THE SUCCESSOR, on the same state dir in the same boot.
     let before = log_len(&w);
     let gui = w.gui.insert(World::relaunch_gui(&w));
-    w.token = World::wait_for_token_of(&w.ctl_sock, gui, &w.gui_log);
+    w.token = World::wait_for_owned_token_of(&w.ctl_sock, gui, &w.gui_log);
     w.wait_ready();
     let began = said(&w, before, "aterm-link: the run record says a bridge runs");
     eprintln!("MEASURED handoff, the successor's start: {began:?}");

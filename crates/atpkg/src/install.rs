@@ -1788,12 +1788,9 @@ mod tests {
         seal(dir.join("slip-18.tar.zst"), tar)
     }
 
-    /// The three facts every staging test needs: a scratch root, a good archive, and the
-    /// artifact whose sha256 + tree_root HONESTLY describe that archive.
-    ///
-    /// The tree_root is learned by extracting once through the same extractor the real stage
-    /// uses, not by asking `verify_and_stage` for it — a fixture that got its expected value
-    /// out of the function under test can be satisfied by a function that checks nothing.
+    /// A scratch root, a good archive, and the artifact whose sha256 and tree_root describe
+    /// it, learned through the extractor, never from `verify_and_stage` (a fixture fed by
+    /// the function under test is satisfied by one that checks nothing).
     struct Bundle {
         dir: crate::testdir::Dir,
         archive: PathBuf,
@@ -2087,9 +2084,8 @@ mod tests {
         }
     }
 
-    /// Scratch left by a KILLED earlier run is swept by the next stage of that build —
-    /// the process that owned it cannot come back (every mutating verb holds the store
-    /// lock), so its debris is ours to reclaim.
+    /// Scratch a killed earlier run left is swept by the next stage of that build: every
+    /// mutating verb holds the store lock, so its owner cannot come back.
     #[test]
     fn a_new_stage_sweeps_scratch_left_by_a_killed_run() {
         let b = bundle("sweep");

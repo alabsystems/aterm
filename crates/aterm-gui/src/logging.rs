@@ -164,17 +164,12 @@ fn flush_at_exit() {
     unsafe { atexit(flush_queued_at_exit) };
 }
 
-/// Route `aterm_objc`'s exception-containment reports into `aterm.log`.
-///
-/// A containment is an `NSException` raised inside a declared Objective-C method (or
-/// block, dispatch trampoline, the `sendEvent:` override) that `aterm_objc::exception`
-/// caught instead of aborting. Each is an error record naming the method, the
-/// exception's class, name and reason, and its call stack on one line; the same line
-/// also goes to stderr through the crate's default sink in case the file logger is
-/// off or not yet up.
-///
-/// Installed right after [`init`], before any window exists. [`crate::App`] reads the
-/// count every turn and treats a change as an event (redraw, modifier re-read).
+/// Route `aterm_objc`'s exception-containment reports into `aterm.log`: an `NSException`
+/// raised inside a declared Objective-C method (or block, dispatch trampoline, the
+/// `sendEvent:` override) that `aterm_objc::exception` caught. Each is an error record with
+/// the method, the exception's class, name and reason, and its call stack on one line; the
+/// crate's default sink also writes it to stderr in case the file logger is off or not yet up.
+/// Installed right after [`init`], before any window exists.
 #[cfg(target_os = "macos")]
 pub(crate) fn install_objc_containment_sink() {
     aterm_objc::exception::set_sink(objc_containment_sink);

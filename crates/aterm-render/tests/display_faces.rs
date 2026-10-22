@@ -470,9 +470,8 @@ fn only_a_bundled_face_is_ever_a_display_face() {
     assert!(renderer.display_faces().is_empty());
 }
 
-/// The proportional faces really do take the fit — a guard against the whole
-/// policy silently going inert (e.g. a future asset swap that changes the byte
-/// identity the registry lookup depends on).
+/// The proportional faces take the fit, so an asset swap that changes the bytes the registry
+/// lookup matches cannot leave the policy inert.
 #[test]
 fn proportional_display_faces_are_fitted() {
     for id in ["chunky", "engraved", "bubble"] {
@@ -486,9 +485,8 @@ fn proportional_display_faces_are_fitted() {
     }
 }
 
-/// The `display:` scheme is exact: every registry id resolves under the scheme,
-/// while bare ids, unknown ids, and real family names never match — an installed
-/// font named like a face cannot be shadowed.
+/// The `display:` scheme is exact: every registry id resolves under it; bare ids, unknown
+/// ids and real family names never match, so an installed font cannot be shadowed.
 #[test]
 fn display_scheme_resolution_is_exact() {
     for font in DISPLAY_FACES {

@@ -32,12 +32,10 @@ use aterm_phase::{QuestionDialog, QuestionFocus, QuestionForm};
 /// is one), then Tab, the text and Enter.
 const MAX_DECLINE_STEPS: u32 = 3 + 3;
 
-/// How many fresh reads after a decline keystroke may still show the box as
-/// it was keyed (its effect not drawn yet) before the box is handed over
-/// ([`Session::press_decline`]). Each is a wait for the next change (at most
-/// [`STRAY_SETTLE`]) and a settle: about ten seconds on a box that holds
-/// still. The keystroke is never written again: one not drawn may still be
-/// in flight.
+/// How many fresh reads after a decline keystroke may still show the box as keyed before it is
+/// handed over ([`Session::press_decline`]): each waits for a change (at most [`STRAY_SETTLE`])
+/// and a settle, about 12 s in all on a box that holds still. The keystroke is never written
+/// again: one not drawn may still be in flight.
 const MAX_DECLINE_UNSEEN_READS: u32 = 5;
 
 /// Why a decline is not carried out on a host that stamps no person's input.
@@ -99,10 +97,9 @@ fn keystroke_name(step: &DeclineStep) -> &'static str {
     }
 }
 
-/// Whether a read's person stamp lets a question key go (R1): no person
-/// ever keyed the session, or they have been quiet at least `grace`
-/// (`[harness] human_grace_s`). A host that sends no stamp is judged by the
-/// loop's stand-in on the decision read (`approval_loop.rs`), not here.
+/// Whether a read's person stamp lets a question key go: no person ever keyed the session, or
+/// they have been quiet at least `grace` (`[harness] human_grace_s`). A host that sends no stamp
+/// is judged by the loop's stand-in on the decision read (`approval_loop.rs`).
 fn person_quiet(human: HumanInput, grace: Duration) -> bool {
     match human {
         HumanInput::Ago(ms) => u128::from(ms) >= grace.as_millis(),
@@ -120,9 +117,8 @@ enum Keyed {
 
 /// Where [`Session::move_focus`] left the answer.
 enum Moved {
-    /// Every move seen landing: the read that showed the last, and its
-    /// dialog (`steps` 0: the decision read's).
-    /// (Boxed: a read and a dialog dwarf every other variant.)
+    /// Every move seen landing: the read that showed the last and its dialog (`steps` 0: the
+    /// decision read's). Boxed: they dwarf the other variant.
     Landed {
         now: Box<Screen>,
         dialog: Box<QuestionDialog>,
@@ -193,10 +189,9 @@ fn read_back(rows: &[String], first: &QuestionDialog, text: &str) -> Back {
     }
 }
 
-/// How long the screen had held still when an `await idle <ms>` answered
-/// `waited`: `ms` when it latched (the server measures the window from the
-/// wait's arming, so a latch is `ms` of quiet at least), `None` when it ran
-/// out or the host has no such wait.
+/// How long the screen had held still when an `await idle <ms>` answered `waited`: `ms` when
+/// it latched (the server measures from the wait's arming), `None` when it ran out or the host
+/// has no such wait.
 fn latched_for(waited: Wait, ms: &str) -> Option<Duration> {
     matches!(waited, Wait::Latched)
         .then(|| ms.parse().ok().map(Duration::from_millis))
@@ -248,14 +243,10 @@ impl<C: Ctl> Session<'_, C> {
             AnswerTarget::Option(n) => option_label(&first, n).map(str::to_string),
             AnswerTarget::Button | AnswerTarget::ReviewSubmit | AnswerTarget::OwnText(_) => None,
         };
-        // An Enter that submits a policy text (on the field, single-select, or
-        // on a multi-select's button while its row holds text) goes only while
-        // the text is the loop's own (module docs of `policy/question.rs`, the
-        // policy text): judged on the decision read, before any key, so an
-        // answer it refuses moves nothing. An Enter on a single-select's option
-        // submits no text, whatever the field holds (a controller's answer,
-        // `aterm drive answer`). The recommended decider never decides such an
-        // Enter, so under `recommended` this asks nothing.
+        // An Enter that submits a policy text (on the field, or on a multi-select's button
+        // while its row holds text) goes only while the text is the loop's own, judged on the
+        // decision read before any key. An Enter on a single-select's option submits no text,
+        // whatever the field holds.
         let submits_text = match target {
             AnswerTarget::OwnText(_) => true,
             AnswerTarget::Button => {
@@ -289,21 +280,17 @@ impl<C: Ctl> Session<'_, C> {
         if dialog.focus() != want || !same_label {
             return unconfirmed("the focus did not land on the option it was moved to");
         }
-        // Under a text priority, the free-text row as the decision read it
-        // (pristine on a tab that falls back, the loop's own text on a text
-        // answer, the ownership rule judged on it above) is what the Enter
-        // goes on: a field that changed since (a person's keys, a multi-select
-        // row unticked) gets no Enter. Under `recommended` nothing more is
-        // asked.
+        // Under a text priority the Enter goes only on the free-text row as the decision read
+        // it (pristine where the tab falls back, the loop's own text on a text answer): a field
+        // changed since, by a person's keys or an unticked row, gets none.
         if self.text_word().is_some() && field_of(&dialog) != field_of(&first) {
             return unconfirmed("the free-text row changed since the decision read");
         }
         let Some(row) = focus_row(&dialog, want).filter(|&r| r < now.rows.len()) else {
             return unconfirmed("the focused row is not on the rows read");
         };
-        // An Enter that submits the policy text is fenced on the person like
-        // the text itself: a read with no count cannot fence it, and gets no
-        // Enter (the text was written on a read that had one).
+        // The Enter on a typed answer is fenced on the person as the text was: a read with no
+        // count gets none.
         if submits_text && now.human_seq.is_none() {
             return unconfirmed(
                 "the read carried no person count to fence the Enter on a typed answer",
@@ -326,14 +313,11 @@ impl<C: Ctl> Session<'_, C> {
         self.question.deciding.filter(|w| w.text().is_some())
     }
 
-    /// The ownership rule (module docs of `policy/question.rs`, the policy
-    /// text): why the text in `dialog`'s free-text row is not the loop's own
-    /// for priority `own`, or `None` when it is: the loop remembers writing
-    /// exactly that priority's text into this question
-    /// ([`approval_loop::QuestionMemory::typed`]), it is the dialog's latched
-    /// word and the word decided on, the field reads it back byte for byte on
-    /// the reader's one-space join, and on a multi-select its row reads
-    /// ticked.
+    /// The ownership rule (`policy/question.rs`): why the text in `dialog`'s free-text row is
+    /// not the loop's own for priority `own`, or `None` when it is: the loop remembers writing
+    /// exactly that text into this question ([`approval_loop::QuestionMemory::typed`]), `own` is
+    /// both the latched and the deciding word, the field reads it back byte for byte, and a
+    /// multi-select's row reads ticked.
     fn not_own(
         &self,
         dialog: &QuestionDialog,
@@ -365,13 +349,10 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// O4: a tab's first key waits for it to have been drawn, still, about a
-    /// second ([`QUESTION_FIRST_KEY_IDLE`], once per question), since 2.1.282
-    /// refuses keys inside a typeahead window after a dialog mounts; the
-    /// person's stamp is asked again after it (`status`'s `human_ms=`), since
-    /// a person may have keyed during the wait. `Some` to stop there
-    /// ([`Press::Yielded`]). The key after the wait is still fenced on the
-    /// generation decided on.
+    /// A tab's first key waits for it to have held still about a second
+    /// ([`QUESTION_FIRST_KEY_IDLE`], once per question): Claude Code refuses keys inside a
+    /// typeahead window after a dialog mounts. The person stamp is asked again after the wait
+    /// (`status`'s `human_ms=`); `Some` stops there ([`Press::Yielded`]).
     fn first_key_wait(
         &mut self,
         first: &QuestionDialog,
@@ -390,15 +371,12 @@ impl<C: Ctl> Session<'_, C> {
             .then_some(Pressing::Done(Press::Yielded { seq: seen.seq })))
     }
 
-    /// Move the focus `steps` rows in `first`'s focus order (down when
-    /// positive), one key in flight: each move fenced on the read it was
-    /// decided on and guarded on the focused row as drawn, its effect seen on
-    /// a settled read before the next ([`Moved::Landed`] with that read and
-    /// its dialog; `steps` 0 lands on `seen` itself). A move not seen yet is
-    /// waited for once more (`await idle 2000`); still not seen, nothing is
-    /// re-sent ([`Press::Unseen`]). A move that landed anywhere but one row
-    /// on, a dialog no longer the same question, or a person keying since
-    /// (the stamp on the read inside the move), stops it ([`Moved::Stopped`]).
+    /// Move the focus `steps` rows in `first`'s focus order (down when positive), one key in
+    /// flight: each move fenced on the read before it, guarded on the focused row, and seen
+    /// landing on a settled read before the next ([`Moved::Landed`]; `steps` 0 lands on `seen`).
+    /// A move not seen after one more `await idle 2000` is not re-sent ([`Press::Unseen`]); one
+    /// that landed anywhere but one row on, a dialog no longer the same question, or a person
+    /// keying since stops it ([`Moved::Stopped`]).
     fn move_focus(
         &mut self,
         steps: i32,
@@ -466,9 +444,8 @@ impl<C: Ctl> Session<'_, C> {
                 return unconfirmed("the focus did not land on the row it was moved to");
             }
             dialog = d;
-            // The next key is fenced on this read: a person who keyed since
-            // the decision read (its own stamp says so) gets the dialog, and
-            // nothing more is sent until they are quiet (R1).
+            // A person who keyed since the decision read stops the press; nothing more is
+            // sent until they are quiet.
             if !person_quiet(now.human, grace) {
                 return Ok(Moved::Stopped(Pressing::Done(Press::Yielded {
                     seq: now.seq,
@@ -543,10 +520,8 @@ impl<C: Ctl> Session<'_, C> {
         let at = match self.question_text(&guard, text, &now, &key, priority)? {
             Keyed::Written(at) => at,
             Keyed::Not(p) => {
-                // No answer came: the text may be in the field or on its way.
-                // Its write is the loop's last, whose effect no read has shown
-                // (R3a): the box read unchanged after the reconnect is the text
-                // not taken, never written twice.
+                // No answer: the text may be in the field or on its way. Pending, so a box
+                // read unchanged after the reconnect is the text not taken, never re-sent.
                 if matches!(p, Pressing::Lost { .. }) {
                     self.question_pending(&now, QuestionFocus::FreeText, PendingKind::Text, false);
                 }
@@ -578,10 +553,9 @@ impl<C: Ctl> Session<'_, C> {
                     return Ok(Pressing::Done(Press::Typed { seq: back.seq }));
                 }
                 Back::Short | Back::Empty | Back::Other(_) if !waited => {
-                    // Still drawing, not read yet, or read mid-redraw (a
-                    // loaded machine's read can catch the dialog half drawn
-                    // and read it as another): once more, after the screen
-                    // held still. Only reads: nothing is written again.
+                    // Still drawing, not read yet, or caught mid-redraw (a loaded machine can
+                    // read the dialog half drawn): one more read once the screen holds still.
+                    // Nothing is written again.
                     waited = true;
                     still = latched_for(self.wait(&["idle", IDLE_MS], WAIT_STEP)?, IDLE_MS);
                     back = self.screen()?;
@@ -665,18 +639,13 @@ impl<C: Ctl> Session<'_, C> {
         Ok(self.written_or_not(&r, now.seq))
     }
 
-    /// The policy text `text` of `priority`, written into the free-text row
-    /// guarded by `guard` on `now` (`send if-human=<now's person count>
-    /// if-gen=<now's generation> if=<guard> -- <text>`, one write, whose bytes
-    /// carry no digit and no newline per `policy/question.rs`'s text rules),
-    /// and remembered as the loop's own for question `key`
-    /// ([`approval_loop::QuestionMemory::typed`]) whenever it may have been
-    /// written: `OK`, a partial or failed write, no answer. A write the server
-    /// did not make (`skipped`: a person keyed since the read,
-    /// [`Press::Yielded`]; the screen moved, [`Press::Changed`]; no row,
-    /// [`Press::Skipped`]; `ERR busy …`, `ERR halted`) is not remembered, so
-    /// the loop may decide again. Never unfenced: a read with no person count
-    /// (`"human_seq"`) or no generation writes nothing.
+    /// Write `priority`'s policy text into the free-text row `guard` names on `now`, in one
+    /// `send if-human=<count> if-gen=<generation> if=<guard> -- <text>` (the text carries no
+    /// digit and no newline, `policy/question.rs`). It is remembered as the loop's own for
+    /// question `key` ([`approval_loop::QuestionMemory::typed`]) whenever it may have been
+    /// written: `OK`, a partial or failed write, no answer; never on a skip, `ERR busy …` or
+    /// `ERR halted`, which write nothing, so the loop may decide again. A read with no person
+    /// count or no generation writes nothing.
     fn question_text(
         &mut self,
         guard: &str,
@@ -728,9 +697,8 @@ impl<C: Ctl> Session<'_, C> {
         Ok(keyed)
     }
 
-    /// A fenced write the server answered `OK …`: [`Keyed::Written`] with its
-    /// seq (the dialog's word latched), or why it wrote nothing:
-    /// `reason=person` ([`Press::Yielded`]), `reason=changed`
+    /// A fenced write the server answered `OK …`: [`Keyed::Written`] (the dialog's word
+    /// latched), or a skip: `reason=person` ([`Press::Yielded`]), `reason=changed`
     /// ([`Press::Changed`]), no row matched ([`Press::Skipped`]).
     fn written_or_not(&mut self, r: &CtlReply, seen: u64) -> Keyed {
         let at = r.seq().unwrap_or(seen);
@@ -754,16 +722,12 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Remember the question write just made on `now` with the focus at
-    /// `focus` ([`approval_loop::QuestionPending`]), a focus move, an Enter,
-    /// or the policy text (`kind`), `waited` when the screen already held
-    /// still after it. A key written on the very box and focus a pending key
-    /// of its kind was written on is a retry, counted in `retries` here when
-    /// it goes, never when the loop decides to send it, so the next key the
-    /// dialog does not show waits the press back-off (or, in `supervise`'s one
-    /// look, is handed over). A policy text is never retried: its pending
-    /// write is handed over when the box shows it not taken
-    /// (`approval_loop.rs`, `decide_box`).
+    /// Remember the question write just made on `now` with the focus at `focus`
+    /// ([`approval_loop::QuestionPending`]); `waited` when the screen already held still after
+    /// it. A write of the same kind on the box and focus of the pending one is a retry, counted
+    /// here when it goes, so the next key the dialog does not show waits the press back-off (in
+    /// `supervise`'s one look, is handed over). A policy text is never retried: its pending
+    /// write is handed over when the box shows it not taken (`approval_loop.rs`, `decide_box`).
     fn question_pending(
         &mut self,
         now: &Screen,
@@ -963,10 +927,8 @@ impl<C: Ctl> Session<'_, C> {
             if r.skipped() {
                 return Ok(Pressing::Done(Press::Skipped { seq: at }));
             }
-            // The move drawn and settled, then read: a redraw arrives in
-            // several writes (clear, then rows), so a read at the first change
-            // can see a dialog half drawn and no focus. Both waits bounded,
-            // never a sleep.
+            // Settled before the read: a redraw arrives in several writes, so a read at the
+            // first change can see the dialog half drawn, with no focus.
             self.wait(&["seq", &at.to_string()], STRAY_SETTLE)?;
             self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?;
             now = self.screen()?;
@@ -981,10 +943,9 @@ impl<C: Ctl> Session<'_, C> {
             .flatten()
         });
         let Some(focused) = focused.filter(|o| o.label == label) else {
-            // The same dialog, the focus where it was: the keys went nowhere
-            // (a dialog drawn before its input is live takes none). Read and
-            // decided again, like a screen that moved; a focus that moved
-            // elsewhere is the manager's.
+            // Same dialog, focus unmoved: the keys went nowhere (a dialog drawn before its
+            // input is live takes none), so read and decide again. A focus that moved elsewhere
+            // is the manager's.
             if before.is_some() && focused_on(&now.rows) == before {
                 return Ok(Pressing::Done(Press::Changed { seq: now.seq }));
             }
@@ -1043,8 +1004,7 @@ impl<C: Ctl> Session<'_, C> {
         seen: &Screen,
         grace: Duration,
     ) -> Result<Pressing, Fail> {
-        // What the decline cannot confirm is handed over, never tried again:
-        // Tab toggles the input, so a keystroke is never written twice.
+        // Handed over, never retried: Tab toggles the input.
         let unconfirmed = |why: &str| {
             Ok(Pressing::Unconfirmed {
                 why: why.to_string(),
@@ -1113,16 +1073,14 @@ impl<C: Ctl> Session<'_, C> {
             let Some(generation) = now.generation.clone() else {
                 return unconfirmed("the read carried no screen generation to fence on");
             };
-            // Remembered before it goes: a keystroke whose answer never came
-            // (a lost connection) may have been written, and is never written
-            // again; one the server refused or skipped was not.
+            // Remembered before it goes: a keystroke whose answer never came may have been
+            // written; one the server refused or skipped was not.
             self.decline.pending = Some(approval_loop::DeclinePending {
                 key: key.clone(),
                 step: step.clone(),
                 unseen: 0,
             });
-            // The person fence (R3b): a person who keyed since this read
-            // skips the keystroke, `OK skipped reason=person`.
+            // A person who keyed since this read skips it (`OK skipped reason=person`).
             let person = now.human_seq.map(|n| format!("if-human={n}"));
             let (r, sent) = match &step {
                 DeclineStep::Type { guard } => {
@@ -1358,10 +1316,8 @@ impl<C: Ctl> Session<'_, C> {
         Ok(self.written_or_not(r, seen))
     }
 
-    /// `key [if-human=<n>] if-gen=<generation> if=<guard> <key>`: the
-    /// server's reply, and the arguments as sent (for a refusal's reason).
-    /// The decline's keystrokes and the accounts probe's Enter
-    /// ([`Self::probe_type`]) are pressed so: fenced three ways.
+    /// `key [if-human=<n>] if-gen=<generation> if=<guard> <key>`: the server's reply, and the
+    /// arguments as sent (for a refusal's reason).
     pub(super) fn fenced_key(
         &mut self,
         guard: &str,
@@ -1395,11 +1351,9 @@ impl<C: Ctl> Session<'_, C> {
         Ok((r, args))
     }
 
-    /// A fenced press the server did not take, as the loop's [`Pressing`]
-    /// (`None`: it answered `OK …`, pressed or skipped): not served, lost;
-    /// `halted`; `busy`/`rate`; anything else, a usage line included, is
-    /// [`Pressing::Unconfirmed`], since this path never retries without its
-    /// fence.
+    /// A fenced press the server did not take, as a [`Pressing`] (`None` on `OK …`, pressed or
+    /// skipped): not served is lost; `halted`; `busy`/`rate`; anything else, a usage line
+    /// included, is [`Pressing::Unconfirmed`], since a fenced press never retries unfenced.
     pub(super) fn refused_press(
         &mut self,
         r: &CtlReply,
@@ -1416,8 +1370,7 @@ impl<C: Ctl> Session<'_, C> {
         } else if r.is_err("busy") || r.is_err("rate") {
             Pressing::Refused { why }
         } else {
-            // Refused outright (a usage error): the same press would be
-            // refused again.
+            // A usage error: the same press would be refused again.
             Pressing::Unconfirmed { why, retry: false }
         }))
     }

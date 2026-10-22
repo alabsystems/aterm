@@ -1,13 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Staging directory resolution under `~/Library/Application Support/aterm`.
-//!
-//! The `Updates/` layout (and its `download/`, `staged/aterm.app`, lock + marker
-//! files) is `.app`-specific, so it stays here. The private-dir creation itself is
-//! delegated to [`aterm_update_core::ensure_private_dir`], which reuses the same
-//! ownership predicate as `aterm-gui`'s `control_auth` so the two cannot drift on
-//! what "private" means: owned by us, mode `0700`, never group/other-writable.
+//! The `.app` staging layout under `~/Library/Application Support/aterm/Updates/`. Private-dir
+//! creation is [`aterm_update_core::ensure_private_dir`].
 
 use std::path::PathBuf;
 
@@ -30,8 +25,8 @@ pub struct Staging {
     pub staged_app: PathBuf,
     /// The "ready" marker — written last; its presence is the sole ready signal.
     pub ready: PathBuf,
-    /// Human/operator-readable status record (last check, outcome, staged build).
-    /// Observability surface for a silent updater — `cat` it to see what happened.
+    /// Human-readable status record (last check, outcome, staged build): `cat` it to see
+    /// what the silent updater did.
     pub status: PathBuf,
 }
 

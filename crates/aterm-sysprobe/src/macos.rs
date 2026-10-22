@@ -1185,7 +1185,8 @@ pub(crate) fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
 /// build reads it. Other users' processes answer no CPU time or footprint
 /// unprivileged (`proc_pid_rusage` is same-uid); the thermal notify level,
 /// `kern.sched_recommended_cores` and the per-process GPU lane are not read
-/// by this build.
+/// by this build. The coalitions are `yes` when this process passes their
+/// self-check, and unsupported by this OS build when it does not.
 pub(crate) fn caps() -> crate::Caps {
     use crate::{Cap, Why};
     crate::Caps {
@@ -1204,6 +1205,11 @@ pub(crate) fn caps() -> crate::Caps {
         proc_memory_others: Cap::No(Why::NeedsPrivilege("root")),
         throttle: Cap::No(Why::NotRead),
         volume: Cap::Yes,
+        coalitions: if crate::coalitions::self_check(std::process::id()).is_ok() {
+            Cap::Yes
+        } else {
+            Cap::No(Why::Unsupported)
+        },
         capacity: crate::CapSource::Host,
     }
 }

@@ -67,16 +67,16 @@ pub use ladder::{Outcome, Report, Severity};
 pub use scope::Scope;
 pub use toolchain::{Toolchain, is_executable_file};
 
-/// Exit codes. FAILED and COULD-NOT-RUN stay apart: a broken environment is
+/// Exit codes. Failed and could-not-run stay apart: a broken environment is
 /// not a finding about the tree.
 pub mod exit {
     /// Every check that ran passed.
     pub const PASS: i32 = 0;
-    /// A check FAILED — a real finding about the tree.
+    /// A check failed: a finding about the tree.
     pub const FAILED: i32 = 1;
     /// Usage error.
     pub const USAGE: i32 = 2;
-    /// COULD NOT RUN — nothing was decided; the output says why.
+    /// Could not run: nothing was decided; the output says why.
     pub const COULD_NOT_RUN: i32 = 3;
 }
 

@@ -166,8 +166,7 @@ mod pure_tests {
     }
 }
 
-/// The sweep over a real directory: markers of any shape, and a link where `landing/`
-/// should be — unlinked, its target untouched.
+/// The sweep over a real directory.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

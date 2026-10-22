@@ -1381,23 +1381,15 @@ fn test_prepare_unknown_returns_none() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let base = dir.path().join("si");
     assert!(prepare_into(ShellType::Unknown, &base).unwrap().is_none());
-    // An unknown shell must not litter the cache dir with scripts — on
-    // Windows the old fallback wrote them to C:\tmp on every spawn.
     assert!(
         !base.exists(),
         "prepare_into(Unknown) must not create the cache directory"
     );
 }
 
-// NOTE: the two tests that exercised prepare_zsh/prepare_fish with the
-// relevant env var REMOVED (`ZDOTDIR`, `XDG_DATA_DIRS`) do not live here:
-// this unit binary runs its tests on parallel threads, and mutating the
-// process environment races every sibling test that calls `prepare_into`
-// (which reads those vars). They live in the separate `shell_suite` binary
-// instead (tests/prepare_zsh_unset_zdotdir.rs and
-// tests/prepare_fish_xdg_default.rs), where `aterm_log::env::scoped_unset`'s
-// lock serialises them. Do NOT add env-mutating tests to this file — add them
-// to `shell_suite`, through `scoped_unset`.
+// No env-mutating tests here: this binary runs tests on parallel threads that call
+// `prepare_into`, which reads the environment. They go in the `shell_suite` binary,
+// through `aterm_log::env::scoped_unset`.
 
 // ─── fish ──────────────────────────────────────────────────────────────
 
@@ -1685,11 +1677,10 @@ fn fish_shell() -> Option<&'static str> {
 // forge nonced marks. Each script captures it into a shell-local at source time and unsets
 // the env var at once.
 
-/// #8015 through PS1: the prompt hook appends `;id=<nonce>` to PS1, and a PS1
-/// that bash imported from its environment (or a user's rc exported) keeps the
-/// export attribute, so every child the tab started read the nonce from
-/// `$PS1`. The hook drops the attribute at each prompt; a user's later
-/// `export PS1` is undone at the next one.
+/// The prompt hook appends `;id=<nonce>` to PS1, and a PS1 bash imported from its
+/// environment (or a user's rc exported) keeps the export attribute, so every child would
+/// read the nonce from `$PS1`. The hook drops the attribute at each prompt, undoing a
+/// later `export PS1` at the next one.
 #[cfg(unix)]
 #[test]
 fn test_bash_children_never_inherit_the_nonce_through_ps1() {
@@ -1814,10 +1805,8 @@ fn test_powershell_script_is_ascii() {
     );
 }
 
-/// Each run has its own hidden console, so the probe reads that console's code
-/// page and the switch cannot leak into the next run or the test runner's
-/// console. Outside aterm the script leaves both encodings exactly as a bare
-/// pwsh on a fresh console has them.
+/// Each run has its own hidden console, so the probe reads that console's code page and the
+/// switch cannot leak across runs. Outside aterm both encodings stay as a bare pwsh has them.
 #[cfg(windows)]
 #[test]
 fn test_powershell_speaks_utf8_only_inside_an_aterm_tab() {
@@ -2403,17 +2392,9 @@ fn test_wsl_launcher_emits_real_osc_133_marks() {
 //
 // Two defects with one root, both fish-only, both invisible to bash and zsh.
 //
-// THE GLUE RULE. In fish, a string written next to a command substitution is a
-// CARTESIAN PRODUCT over the substitution's output LINES, and a command that
-// prints nothing produces a ZERO-ELEMENT list — so the product is zero
-// arguments and the ENTIRE argument disappears. bash and zsh interpolate a
-// possibly-empty parameter and cannot reproduce any of it.
-//
-// THE PALETTE RULE. Every `ATERM_PROMPT_*_COLOR` is a palette INDEX (bash spells
-// it `\[\033[38;5;${hc}m\]`). fish's `set_color` takes colour NAMES or hex only,
-// answers `set_color: Unknown color "4"` on stderr, and emits nothing — which,
-// via the glue rule, also deleted `printf` arguments and slid the prompt layout
-// sideways.
+// The palette rule: every `ATERM_PROMPT_*_COLOR` is a palette index (bash spells it
+// `\[\033[38;5;${hc}m\]`). fish's `set_color` takes names or hex only, so the fish prompt
+// writes the SGR escape itself.
 
 /// fish's OSC 7 stays a well-formed `file://` URI with the resolved host EMPTY:
 /// the pre-fix failure was a wrong NUMBER OF ARGUMENTS — the host glued to a
@@ -2514,7 +2495,7 @@ fn test_fish_fallback_prompt_survives_a_missing_hostname() {
 }
 
 // ---------------------------------------------------------------------------
-// THE MULTIPLEXER BOUNDARY (screen / tmux)
+// The multiplexer boundary (screen / tmux)
 //
 // aterm hosts ONE session per PTY; start `screen` or `tmux` in it and every pane
 // lives inside that SAME session. Measured with GNU screen 4.09.01 before any of
@@ -4073,12 +4054,11 @@ fn test_hook_naming_an_agents_dir_that_appears_later_is_fronted_live() {
     }
 }
 
-/// The same three orders in fish, when installed: the owner's scenario — with
-/// the hook REWRITTEN under the live shell and re-sourced (fish reads the hook's
-/// text with `read -z` and compares; residual R1 of 2026-09-16, closed); the hook
-/// and an empty agents/ at spawn with the twin landing later (fish keeps no
-/// command hash, so this is the order check plus PATH's own walk); and the hook
-/// first, the dirs later (the re-probe).
+/// The same three orders in fish, when installed: the tab-already-open scenario, with the
+/// hook rewritten under the live shell and re-sourced (fish reads the hook's text with
+/// `read -z` and compares); the hook and an empty agents/ at spawn with the twin landing
+/// later (fish keeps no command hash, so this is the order check plus PATH's own walk);
+/// and the hook first, the dirs later (the re-probe).
 #[cfg(unix)]
 #[test]
 fn test_fish_already_running_session_shell_picks_up_the_managed_dirs_live() {

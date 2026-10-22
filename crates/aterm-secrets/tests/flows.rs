@@ -30,6 +30,9 @@ fn synthetic(label: &str) -> String {
 
 struct Lab {
     root: aterm_tempfile::TempDir,
+    /// The server's socket, kept so a restart listens at the same address with no moment
+    /// another test could be handed its port: each server listens on a copy.
+    socket: std::net::TcpListener,
     server: Option<Running>,
     url: String,
     hold: Duration,
@@ -75,11 +78,13 @@ impl Lab {
 
     fn tuned(vault: &str, hold: Duration, gap: Duration) -> Lab {
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let server = start(listener, root.path().join("store"), hold, gap);
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let copy = socket.try_clone().expect("a copy of the socket");
+        let server = start(copy, root.path().join("store"), hold, gap);
         let url = format!("http://{}/v1/{vault}", server.addr);
         Lab {
             root,
+            socket,
             server: Some(server),
             url,
             hold,
@@ -89,13 +94,11 @@ impl Lab {
 
     /// The server's Mac lost its store: a new server, empty, at the same address.
     fn restart_empty(&mut self) {
-        let server = self.server.take().expect("running");
-        let addr = server.addr;
-        server.stop();
+        self.server.take().expect("running").stop();
         let store = self.root.path().join("store");
         std::fs::remove_dir_all(&store).expect("store removed");
-        let listener = std::net::TcpListener::bind(addr).expect("the same address again");
-        self.server = Some(start(listener, store, self.hold, self.gap));
+        let copy = self.socket.try_clone().expect("a copy of the socket");
+        self.server = Some(start(copy, store, self.hold, self.gap));
     }
 
     /// A machine's home, with its `~/.secrets` absent.
@@ -1412,20 +1415,162 @@ fn an_edit_saved_over_an_open_vault_that_let_a_machine_go_keeps_it_out() {
         assert!(current.remove_machine(name, false).expect("remove"));
         current.add_code_only(key).expect("code-only");
     }
-    // ...and the person's text, which began with both in, deletes mb and keeps mc.
+    // ...and the person's text, which began with both in, deletes mb and leaves mc be.
     let mut edited = base.clone();
     assert!(edited.remove_machine("mb", false).expect("remove"));
     client::keep_admitted(&base, &current, &mut edited).expect("merge");
     assert_eq!(
         edited.code_only(),
-        std::slice::from_ref(&mb),
-        "mb's line is kept; mc, a machine of the saved text, needs none"
+        [mb, mc.clone()],
+        "both lines are kept: mc, which the text left as it began, is let go too"
     );
     assert!(
-        edited
+        !edited
             .machines()
             .iter()
             .any(|machine| machine.recipient == mc)
+    );
+}
+
+#[test]
+fn an_edit_saved_over_another_admins_changes_to_who_is_in_keeps_them() {
+    let (ma, mb, mc, md) = (new_key(), new_key(), new_key(), new_key());
+    let mut base = Document::new_vault("ma", &ma);
+    for (name, key) in [("mb", &mb), ("mc", &mc), ("md", &md)] {
+        base.add_machine(name, key).expect("add");
+    }
+    base.add_admin("mb").expect("admin");
+    base.set_entry(&Audience::Hosts(vec!["mc".into()]), "own", b"synthetic-own")
+        .expect("mc's own section");
+    base.set_join_password(Some(b"synthetic-join-password-one"))
+        .expect("password");
+    // While the person edits, another admin removes mb from [admins], revokes mc with its
+    // section, makes md an admin, and renews the join password...
+    let mut current = base.clone();
+    assert!(current.remove_admin("mb").expect("demote"));
+    assert!(current.remove_machine("mc", true).expect("revoke"));
+    current.add_admin("md").expect("admin");
+    current
+        .set_join_password(Some(b"synthetic-join-password-two"))
+        .expect("renew");
+    // ...and the person's text changes an entry and nothing of who is in.
+    let mut edited = base.clone();
+    edited
+        .set_entry(&Audience::Everyone, "note", b"synthetic-note")
+        .expect("set");
+    assert!(
+        client::keep_admitted(&base, &current, &mut edited)
+            .expect("merge")
+            .is_empty()
+    );
+    let names: Vec<String> = edited.machines().into_iter().map(|m| m.name).collect();
+    assert_eq!(names, ["ma", "mb", "md"]);
+    assert_eq!(edited.admins(), ["ma", "md"]);
+    assert!(
+        aterm_secrets::text::merge_for("mc", edited.entries())
+            .expect("merges")
+            .iter()
+            .all(|entry| entry.name != "own")
+    );
+    assert!(edited.entry(&Audience::Everyone, "note").is_some());
+    let password = |doc: &Document| doc.join_password().map(|p| p.as_slice().to_vec());
+    assert_eq!(password(&edited), password(&current));
+    // What the person changed themselves stands: a password of their own, md deleted.
+    let mut edited = base.clone();
+    edited
+        .set_join_password(Some(b"synthetic-join-password-mine"))
+        .expect("theirs");
+    assert!(edited.remove_machine("md", false).expect("remove"));
+    client::keep_admitted(&base, &current, &mut edited).expect("merge");
+    assert_eq!(
+        password(&edited),
+        Some(b"synthetic-join-password-mine".to_vec())
+    );
+    assert_eq!(edited.admins(), ["ma"]);
+    // A name another key took is the person's to give: refused, naming the key, until the
+    // text says.
+    let rekeyed = new_key();
+    let spelled = |doc: &Document, key: &str| {
+        let text = String::from_utf8(doc.render().as_slice().to_vec()).expect("utf-8");
+        Document::parse(&text.replace(&format!("mc = {mc}"), &format!("mc = {key}")))
+            .expect("valid")
+    };
+    let current = spelled(&base, &rekeyed);
+    let mut edited = base.clone();
+    let error = client::keep_admitted(&base, &current, &mut edited).expect_err("refused");
+    assert!(error.0.contains(&rekeyed), "{error}");
+    let mut edited = spelled(&base, &rekeyed);
+    assert!(
+        client::keep_admitted(&base, &current, &mut edited)
+            .expect("the text gives mc the new key")
+            .is_empty()
+    );
+    assert!(
+        aterm_secrets::text::merge_for("mc", edited.entries())
+            .expect("merges")
+            .iter()
+            .any(|entry| entry.name == "own")
+    );
+}
+
+#[test]
+fn an_edit_that_lands_after_a_revocation_keeps_the_machine_out() {
+    let lab = Lab::new("revoked");
+    let admin = lab.home("ma");
+    let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
+    let password = client::admin_open(&admin)
+        .expect("open")
+        .doc
+        .join_password()
+        .expect("create makes a join password");
+    let machine = lab.home("mb");
+    let pinned = format!("{}#{}", lab.url, created.signer);
+    join_with(&machine, &pinned, "mb", Some(password.as_slice())).expect("join");
+    assert_eq!(
+        client::auto_approve(&admin).expect("approve").approved,
+        ["mb"]
+    );
+    applied(client::sync(&machine, None).expect("mb is in"));
+    // The edit begins; meanwhile another admin revokes mb, which renews the join password.
+    let began = client::admin_open(&admin).expect("open");
+    let base = began.doc.clone();
+    {
+        let other = client::admin_open(&admin).expect("open");
+        let mut doc = other.doc.clone();
+        assert!(doc.remove_machine("mb", false).expect("remove"));
+        let done = client::admin_publish(&admin, &other, &doc).expect("revoke");
+        assert!(done.password_renewed);
+    }
+    let mut edited = base.clone();
+    edited
+        .set_entry(&Audience::Everyone, "note", b"synthetic-note")
+        .expect("set");
+    assert!(
+        client::admin_publish(&admin, &began, &edited).is_err(),
+        "the save lands on a vault that moved"
+    );
+    let fresh = client::admin_open(&admin).expect("reopen");
+    let renewed = fresh.doc.join_password().expect("renewed");
+    client::keep_admitted(&base, &fresh.doc, &mut edited).expect("merge");
+    client::admin_publish(&admin, &fresh, &edited).expect("publish");
+    let after = client::admin_open(&admin).expect("open").doc.clone();
+    assert!(after.machines().iter().all(|machine| machine.name != "mb"));
+    assert_eq!(
+        after.join_password().map(|p| p.as_slice().to_vec()),
+        Some(renewed.as_slice().to_vec()),
+        "not the password mb joined with"
+    );
+    assert!(after.entry(&Audience::Everyone, "note").is_some());
+    assert_eq!(
+        client::sync(&machine, None).expect("sync"),
+        SyncOutcome::NotIn
+    );
+    // The request mb joined with, which the server keeps, is not approved again.
+    assert!(
+        client::auto_approve(&admin)
+            .expect("approve")
+            .approved
+            .is_empty()
     );
 }
 
@@ -1587,6 +1732,110 @@ fn a_join_with_the_password_says_how_to_fix_a_mistyped_one_before_it_waits() {
         );
         assert_eq!(line.contains("--password-stdin"), !interactive, "{line}");
     }
+}
+
+/// A machine admitted under another name than it asked for (another machine holds that one:
+/// two Macs with one default name, or a Mac set up again) never learns it, so what it says of
+/// itself names it by its code. An admin command's refusal there names `admins add <code>`,
+/// which reaches its key, never the key that holds the name it asked for; and a word shaped
+/// like a code is never read as a name, which any machine may ask for.
+#[test]
+fn a_machine_admitted_under_another_name_is_named_by_its_code() {
+    let lab = Lab::new("names");
+    let admin = lab.home("ma");
+    let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
+    let pinned = format!("{}#{}", lab.url, created.signer);
+    let password = client::admin_open(&admin)
+        .expect("open")
+        .doc
+        .join_password()
+        .expect("create makes a join password");
+    let first = lab.home("mb");
+    join_with(&first, &pinned, "mb", Some(password.as_slice())).expect("join");
+    assert_eq!(
+        client::auto_approve(&admin).expect("approve").approved,
+        ["mb"]
+    );
+    let second = lab.home("mb-again");
+    let JoinOutcome::Pending { code, host } =
+        join_with(&second, &pinned, "mb", Some(password.as_slice())).expect("join")
+    else {
+        panic!("a machine not in the vault waits for approval");
+    };
+    assert_eq!(host, "mb");
+    assert_eq!(
+        client::auto_approve(&admin).expect("approve").approved,
+        ["mb-2"]
+    );
+    applied(client::sync(&second, None).expect("sync"));
+
+    let refused = client::admin_open(&second)
+        .expect_err("not an admin")
+        .to_string();
+    assert!(
+        refused.contains(&format!("aterm secrets admins add {code}")),
+        "{refused}"
+    );
+    assert!(!refused.ends_with("admins add mb"), "{refused}");
+
+    // What the admin runs reaches the machine that showed the code.
+    let vault = client::admin_open(&admin).expect("open");
+    let named = client::machine_named(&vault.doc, &code.to_uppercase()).expect("its code");
+    assert_eq!(named, "mb-2");
+    let mut doc = vault.doc.clone();
+    doc.add_admin(&named).expect("admin");
+    client::admin_publish(&admin, &vault, &doc).expect("publish");
+    applied(client::sync(&second, None).expect("sync"));
+    client::admin_open(&second).expect("an admin now");
+    assert!(
+        client::admin_open(&first).is_err(),
+        "the machine that holds the name it asked for is not"
+    );
+
+    // A name passes through; a code no machine's key has is refused, even when a machine is
+    // so named (an older approver let one in under a code-shaped name): typed for a machine
+    // not yet in, it would reach that one.
+    let shaped = "aaaa-bbbb-cccc-dddd";
+    assert!(client::machine_named(&doc, shaped).is_err());
+    doc.add_machine(shaped, &new_key())
+        .expect("a valid machine name");
+    assert_eq!(client::machine_named(&doc, "mb").expect("a name"), "mb");
+    assert!(client::machine_named(&doc, shaped).is_err());
+}
+
+/// A MACHINE THAT ASKS TO BE CALLED BY ANOTHER'S CODE (an open vault's queue is anyone's to
+/// read, codes and all) is let in under another name: a code stays the name of one key, so
+/// what an admin types to reach the machine that showed it (`admins add`, `revoke`, `set
+/// --for`) never reaches the one that asked for it, on this build or an older one.
+#[test]
+fn a_machine_asking_for_another_machines_code_as_its_name_is_let_in_under_another() {
+    let lab = Lab::new("squat");
+    let admin = lab.home("ma");
+    let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
+    let pinned = format!("{}#{}", lab.url, created.signer);
+    let opened = client::admin_open(&admin).expect("open");
+    let mut doc = opened.doc.clone();
+    doc.set_open(true).expect("open");
+    client::admin_publish(&admin, &opened, &doc).expect("publish");
+
+    let mac = lab.home("mb");
+    let JoinOutcome::Pending { code, .. } = join_unattended(&mac, &pinned, "mb").expect("join")
+    else {
+        panic!("a machine not in the vault waits for approval");
+    };
+    let squatter = lab.home("mx");
+    join_unattended(&squatter, &pinned, &code).expect("any machine name may be asked for");
+    let mut approved = client::auto_approve(&admin).expect("approve").approved;
+    approved.sort_unstable();
+    assert_eq!(approved, ["machine", "mb"]);
+    let doc = client::admin_open(&admin).expect("open").doc.clone();
+    assert!(doc.machines().iter().all(|machine| machine.name != code));
+    assert_eq!(client::machine_named(&doc, &code).expect("its code"), "mb");
+    assert_eq!(
+        client::free_name(&doc, &code),
+        "machine-2",
+        "a code is never a new machine's name"
+    );
 }
 
 #[test]

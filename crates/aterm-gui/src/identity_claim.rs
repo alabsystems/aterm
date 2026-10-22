@@ -1080,12 +1080,10 @@ mod tests {
         );
     }
 
-    /// The candidate registration (`register_handoff_candidate`, bound to
-    /// `HandoffAddressOwner`'s `Launch` and `Reject`): while it lives, an adopted
-    /// id whose entry names that pid is served here, and its drop clears only its
-    /// own pid. Negative controls: without a registration the same entry is
-    /// refused, as is an entry naming any other live process, and adoption
-    /// still reads the candidate's entry as a holder.
+    /// The candidate registration (bound to `HandoffAddressOwner`'s `Launch` and `Reject`):
+    /// while it lives, an adopted id whose entry names that pid is served here, and its drop
+    /// clears only its own pid. Negative controls: unregistered, the same entry is refused, as
+    /// is one naming any other live process, and adoption still reads the candidate as a holder.
     #[cfg(unix)]
     #[test]
     fn a_handoff_candidate_registration_is_exactly_its_own() {

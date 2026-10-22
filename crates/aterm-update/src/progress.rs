@@ -1,40 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LIVE PROGRESS of the updater's own check, for a host that wants to SHOW it
-//! (the aterm window's update status bar).
+//! Live progress of the updater's own check, for a host that shows it (the window's update
+//! status bar).
 //!
-//! The updater downloads a release container by shelling `curl` into
-//! `Updates/download/<name>.part` and blocks until it exits, so no byte ever
-//! passes through this process. A sibling thread stats the growing `.part` against the release
-//! asset's DECLARED size and reports through one process-wide observer. The
-//! observer is installed once by the host ([`set_progress_observer`]); every
-//! lane that runs a check in this process (the background loop, a manual
-//! "Check for Updates") reports through it, so the host never has to know which
-//! thread is downloading.
+//! The download shells `curl` into `Updates/download/<name>.part`, so no byte passes through
+//! this process: a sibling thread stats the growing `.part` and reports through one
+//! process-wide observer the host installs once ([`set_progress_observer`]). Every lane that
+//! runs a check in this process reports through it.
 //!
 //! # What is (and is not) reported
 //!
-//! Only the phases a user would wait on: a download, the verify/stage that
-//! follows it, and how that ended. A check that finds nothing to do — the
-//! common case, every few minutes — reports NOTHING, so a host that reserves
-//! screen space for a live report never moves for a routine check. Nor is a
-//! sibling PROCESS's download visible here (a terminal session running its own
-//! loop may win the cross-process stage lock): this is an in-process channel,
-//! best-effort by design, and the durable record stays `status.toml`.
-//!
-//! # Honesty
-//!
-//! * `bytes_total` is the asset's size as the download host answers a HEAD
-//!   for it ([`watch_download`]'s size probe, run BESIDE the download, never
-//!   before it), and `0` until that answer lands or when it
-//!   never does (offline, refused, a size past the download's own bound). A
-//!   host renders `0` as "unknown", never divides by it. The size only draws
-//!   the meter: what is installed is proved by the digest, as before.
-//! * `bytes_done` is the `.part` file's size and can DROP: curl `--retry`
-//!   truncates its sink between attempts. A host clamps and moves on.
-//! * A report is emitted on a worker thread; the observer must be cheap and must
-//!   never block (the host posts an event-loop message).
+//! * `bytes_total` is the asset's size from a HEAD run beside the download, `0` until it
+//!   lands or when it never does; a host renders `0` as unknown. The digest, not this size,
+//!   proves what is installed.
+//! * `bytes_done` is the `.part` size and can drop: curl `--retry` truncates its sink between
+//!   attempts.
+//! * Reports arrive on a worker thread; the observer must be cheap and never block.
 
 #[cfg(any(target_os = "macos", test))]
 use std::path::Path;
@@ -71,11 +53,10 @@ pub enum Progress {
     /// A check that had begun downloading failed. `detail` is the same sentence
     /// `status.toml` records.
     Failed { detail: String },
-    /// The release this check had begun downloading is WITHHELD on this machine —
-    /// its signer was revoked, it was yanked, or it crash-looped here and was
-    /// quarantined — while the download ran. No failure and nothing to retry: the
-    /// next check refuses it before any download. `detail` is the `held: …` sentence
-    /// `status.toml` records.
+    /// The release being downloaded was withheld on this machine while the download ran (signer
+    /// revoked, yanked, or quarantined after crash-looping here). Nothing to retry: the next
+    /// check refuses it before downloading. `detail` is the `held: …` sentence `status.toml`
+    /// records.
     Withheld { detail: String },
 }
 
@@ -84,10 +65,9 @@ pub type ProgressNotify = Box<dyn Fn(Progress) + Send + Sync>;
 
 static OBSERVER: OnceLock<ProgressNotify> = OnceLock::new();
 
-/// Whether the CURRENT check has reported a download — the wrapper's gate for
-/// turning an `Err` into a [`Progress::Failed`] report (a check that never got
-/// as far as bytes has nothing on screen to answer for). One check runs at a
-/// time per process (`check_lane`), so a process-wide flag is exact.
+/// Whether the current check has reported a download: only then does the wrapper turn an `Err`
+/// into a [`Progress::Failed`] report. One check runs at a time per process (`check_lane`), so
+/// a process-wide flag is exact.
 #[cfg(any(target_os = "macos", test))]
 static DOWNLOAD_BEGAN: AtomicBool = AtomicBool::new(false);
 
@@ -97,18 +77,16 @@ pub fn set_progress_observer(observer: ProgressNotify) {
     let _ = OBSERVER.set(observer);
 }
 
-/// Report one step: the heartbeat of a check in flight, and the host's observer
-/// when one is installed (the window; a terminal session has none).
+/// Report one step: download and verify steps re-stamp the heartbeat of a check in flight, and
+/// the host's observer, if installed, gets every step (a terminal session has none).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn report(p: Progress) {
     if let Progress::Downloading { .. } = &p {
         DOWNLOAD_BEGAN.store(true, Ordering::Relaxed);
     }
-    // A check that is moving bytes is alive: a container on a slow link
-    // can take hours inside one check, and without this stamp the watchdog would
-    // judge that honest download against a budget sized for everything else a
-    // check does. Only a check in flight is re-stamped (`beat_progress`), so a
-    // manual check's download never vouches for a checker that is stuck elsewhere.
+    // A check moving bytes is alive: a slow-link download can take hours, past the watchdog's
+    // budget for everything else a check does. Only a check in flight is re-stamped
+    // (`beat_progress`), so a manual check's download never vouches for a stuck checker.
     if matches!(p, Progress::Downloading { .. } | Progress::Verifying { .. }) {
         crate::checker_watch::WATCH.beat_progress();
     }
@@ -124,20 +102,17 @@ pub(crate) fn take_download_began() -> bool {
     DOWNLOAD_BEGAN.swap(false, Ordering::Relaxed)
 }
 
-/// Watch a growing `<dest>` (the curl sink) at 10 Hz while the download of
-/// `url` runs, reporting [`Progress::Downloading`] on every change of its size
-/// or of the known total; the guard stops and joins the poller on drop.
+/// Watch the growing `dest` (the curl sink) at 10 Hz while `url` downloads, reporting
+/// [`Progress::Downloading`] whenever its size or the known total changes; the guard stops and
+/// joins the poller on drop.
 ///
-/// The first report (0 of an unknown total) is emitted synchronously, so a host sees
-/// the download begin even if curl finishes before the first poll. The total comes
-/// from [`asset_size`], a HEAD of the same asset run on its own thread BESIDE the
-/// download — the download never waits for it, and a probe still in flight when the
-/// download ends is simply not waited for.
+/// The first report (0 of unknown) is synchronous, so a host sees the download begin even if
+/// curl finishes before the first poll. The total comes from [`asset_size`], a HEAD on its own
+/// thread beside the download, never waited for.
 ///
-/// THE POLLER RUNS WITH NO OBSERVER TOO: its reports re-stamp the checker's heartbeat
-/// while bytes move ([`report`]), and both machine-wide locks' holder beats live off
-/// that heartbeat, so a terminal session's slow download must not read as a stopped
-/// holder. Only the size probe, which draws nothing without a host, is left out.
+/// The poller runs with no observer too: its reports re-stamp the checker's heartbeat
+/// ([`report`]), which both machine-wide locks' holder beats live off, so a terminal session's
+/// slow download does not read as a stopped holder. Only the size probe is skipped then.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn watch_download(dest: &Path, version: &str, url: &str) -> DownloadWatch {
@@ -317,8 +292,7 @@ mod tests {
         (seen, Arc::new(move |p| into.lock().unwrap().push(p)))
     }
 
-    /// Wait until a report matches — a report that must come, so a minute's
-    /// hang detector, never a latency budget.
+    /// Wait until a report matches; the minute is a hang detector.
     fn wait_for(seen: &std::sync::Mutex<Vec<Progress>>, want: &Progress) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
@@ -367,12 +341,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A host that does not say keeps the total unknown (the busy comet), and
-    /// a probe still waiting on the network never holds the download's end: the
-    /// probe here answers only once the test lets it, AFTER the watch has
-    /// dropped, so a drop that waited for it could not return before its gate's
-    /// two minutes ran out — and the probe is seen still waiting when the drop
-    /// is back.
+    /// A silent probe leaves the total unknown, and dropping the watch never waits for a probe
+    /// still in flight.
     #[test]
     fn a_silent_or_slow_size_probe_leaves_the_total_unknown() {
         let dir = std::env::temp_dir().join(format!("aterm-update-slow-{}", std::process::id()));

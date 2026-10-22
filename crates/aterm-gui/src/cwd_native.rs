@@ -122,8 +122,8 @@ fn netbios_name() -> Option<&'static str> {
 
 /// Convert one RFC 8089 URI path to a native path for the host platform.
 ///
-/// Off Windows this is the identity — see the module docs for why that must be
-/// unconditional and not merely "usually true".
+/// Off Windows this is the identity (see the module docs). On Windows exactly two shapes are
+/// rewritten:
 ///
 /// On Windows three shapes are rewritten and nothing else is:
 ///
@@ -242,8 +242,7 @@ fn msys_drive(path: &str) -> Option<(char, &str)> {
     }
 }
 
-/// The drive letter of a `/C:/…`-shaped URI path, or `None` for any other
-/// string.
+/// The drive letter of a `/C:/…`-shaped URI path, or `None` for any other string.
 ///
 /// Byte 3 must be a separator or the end, so the POSIX directory `/C:extra` is not a drive
 /// root. The letter must be ASCII alphabetic; comparing bytes before indexing at 3 never

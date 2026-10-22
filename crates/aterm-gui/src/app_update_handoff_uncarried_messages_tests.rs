@@ -5,11 +5,9 @@ use aterm_messages::{Hold, Message, PROGRESS_GRACE, STALE_TAILED, Severity, tags
 
 use crate::App;
 
-/// The rows a handoff did not carry end with the parent (ruling 441 (d)), the
-/// host's half: the park notes the ids its carry handed over, and the Commit's
-/// close ends every other live row, and only those. The engine's own test
-/// hands `close_uncarried` the carry's ids itself, so a park that noted none
-/// (the Commit then closing the carried rows too) would fail nothing there.
+/// Rows the handoff did not carry end with the parent: the park notes the carried ids and
+/// the Commit's close ends every other live row, and only those. The engine's own test
+/// passes `close_uncarried` the ids itself, so only this one catches a park that noted none.
 #[test]
 fn the_park_notes_its_carry_and_the_commit_closes_only_the_rest() {
     let mut parent = App::headless_for_test();

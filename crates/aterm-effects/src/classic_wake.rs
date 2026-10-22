@@ -89,8 +89,7 @@ struct Ring {
     life: f32,
 }
 
-/// The classic wake's animation state, self-contained and touched by no other
-/// style.
+/// The classic wake's animation state; no other style touches it.
 #[derive(Default)]
 pub struct ClassicWake {
     sparks: Vec<Spark>,
@@ -2315,8 +2314,7 @@ mod tests {
         assert_eq!(fp, 0, "nothing in flight, nothing spawned");
     }
 
-    /// A coordinate-space change (a split-pane transition) must not let the
-    /// next tick draw a comet from a position in the space that just died.
+    /// After a coordinate-space change the next tick draws no comet from the old space.
     #[test]
     fn reset_forgets_the_cursor_so_no_cross_space_comet_spawns() {
         let (g, c) = (geom(), cfg());

@@ -1,23 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LIVE: an interactive shell that fails at start keeps its pane (audit #7
-//! finding 49). An rc file that runs `exit 1`, or a shell whose dylib moved and
-//! aborts, used to close its only pane — and with it the window and aterm — with
-//! nothing saying why. Now the pane stays, with one line naming the shell and how
+//! An interactive shell that fails at start keeps its pane: an rc file that runs `exit 1`,
+//! or a shell whose dylib moved, would otherwise close its only pane, and with it the window
+//! and aterm, with nothing saying why. The pane stays with one line naming the shell and how
 //! it ended, and the instance keeps running.
 //!
 //! The real binary (`launch_isolation::aterm_executable`) under a scratch world
 //! (`support/launch_isolation.rs`), its shell a stub script given by `--shell`:
 //!
-//! * `exit 3` at start: the instance stays up, `text` shows
-//!   `[zsh ended at start: exit 3]`, and `ls` still lists the session;
-//! * a `SIGKILL` at start (no crash report): `[fish ended at start: signal 9]`;
-//! * a shell that asks for the device attributes as it starts (fish and
-//!   powerlevel10k query at startup), reads aterm's answer, then `exit 1`:
-//!   `[fish ended at start: exit 1]` — aterm's reply is not anyone's input;
-//! * NEGATIVE CONTROLS: `exit 0` at start, and `-e false`, still end the
-//!   instance by themselves, as they did before.
+//! * `exit 3` at start: the instance stays up, `text` shows `[zsh ended at start: exit 3]`,
+//!   and `ls` still lists the session;
+//! * a SIGKILL at start: `[fish ended at start: signal 9]`;
+//! * a shell that asks for the device attributes as it starts (as fish and powerlevel10k
+//!   do), reads aterm's answer, then exits 1: `[fish ended at start: exit 1]`, since aterm's
+//!   reply is not anyone's input;
+//! * NEGATIVE CONTROLS: `exit 0` at start, and `-e false`, still end the instance.
 //!
 //! Every wait is for its causal event; the ceiling is for a broken build.
 
@@ -38,22 +36,11 @@ use std::time::{Duration, Instant};
 const CEILING: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(50);
 
-/// A stub shell called `name` under `root/bin` that runs `body`, already run
-/// once.
-///
-/// THE FIRST EXEC IS PAID HERE (2026-09-30), the repo's rule since bc2918c70
-/// (`aterm-verify`'s `tests/common` `run_once`, `aterm-cli`'s `manual.rs`):
-/// the first exec of a file this process wrote waits on macOS's assessment of
-/// it, one file at a time machine-wide, and later execs do not — 111 ms
-/// against 4.6 ms at load 11.7 here, many seconds with the assessor busy. The
-/// app keeps the pane only when the shell's PTY closed within 2 s of its
-/// spawn (`aterm-gui`'s `app_tabs.rs` `SHELL_START_WINDOW`), so a stub whose
-/// FIRST exec is that spawn spends the window in the assessor's queue: a
-/// whole-tree run of 2026-09-30 failed both kept-pane cases at 2.6 s and
-/// 2.9 s ("the instance ended with its shell"), and main's own two-at-a-time
-/// run of 2026-09-29 passed them at 2.05 s. An installed shell is not a fresh
-/// file, so this is also the faithful case. The run's status is not read:
-/// `exit 3` and `kill -KILL $$` end it as they will end the pane's.
+/// A stub shell called `name` under `root/bin` that runs `body`, already run once: the first
+/// exec of a file this process wrote waits on macOS's assessment of it (seconds with the
+/// assessor busy) and later execs do not, and an installed shell is not a fresh file either.
+/// The pre-run's status is not read: `exit 3` and `kill -KILL $$` end it as they will end
+/// the pane's.
 fn stub_shell(root: &Path, name: &str, body: &str) -> PathBuf {
     let dir = root.join("bin");
     std::fs::create_dir_all(&dir).expect("the stub's directory");
@@ -211,8 +198,8 @@ fn ends_by_itself(prefix: &str, extra: impl FnOnce(&Path, &mut Command)) {
     assert!(status.success(), "a clean quit: {status}");
 }
 
-/// NEGATIVE CONTROL: a shell that exits 0 at start closes its pane, and the
-/// last pane ends the instance, as before.
+/// NEGATIVE CONTROL: a shell that exits 0 at start closes its pane, and the last pane ends
+/// the instance.
 #[test]
 fn a_shell_that_exits_0_at_start_ends_the_instance_as_before() {
     ends_by_itself("atsx0", |root, cmd| {

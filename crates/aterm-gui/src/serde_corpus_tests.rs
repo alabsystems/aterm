@@ -5,21 +5,20 @@
 //! derived through registry serde (docs/AUDIT-third-party-2026-10-15.md, SP.3);
 //! since the switch (SP.6) the first-party serde must answer each the same:
 //!
-//! - `aterm.toml` ([`Config`]): container `default`, unknown keys ignored, the
-//!   one `alias`, the `skip`ped `[harness]`, a hand-written `FontList`;
+//! - `aterm.toml` ([`Config`]): container `default`, unknown keys ignored, the one
+//!   `alias`, the `skip`ped `[harness]`, a hand-written `FontList`;
 //! - the restore layout ([`RestoreManifest`]): internally tagged enums, a
 //!   `deny_unknown_fields` tag, an untagged lenient reader;
-//! - the seamless handoff manifest ([`SessionHandoff`]): nine lenient
-//!   `deserialize_with` readers that turn a bad value into "unreadable", never
-//!   a refused manifest;
-//! - the checkpoint meta ([`CheckpointMeta`]), JSON whose bytes are hashed
-//!   into the adoption proof;
-//! - the `FIELDS` list the derive hands `deserialize_struct`, read by the
-//!   config language's probe (`reader_fields`).
+//! - the seamless handoff manifest ([`SessionHandoff`]): lenient `deserialize_with`
+//!   readers that turn a bad value into "unreadable", never a refused manifest;
+//! - the checkpoint meta ([`CheckpointMeta`]), JSON whose bytes are hashed into the
+//!   adoption proof;
+//! - the `FIELDS` list the derive hands `deserialize_struct`, read by the config
+//!   language's probe (`reader_fields`).
 //!
-//! State written by old builds is the bytes every shipped producer wrote,
-//! `tests/fixtures/handoff/v*/` (the cross-version guard's fixtures): each
-//! manifest, layout and meta there is read and written back out.
+//! Old builds' state is the bytes every shipped producer wrote under
+//! `tests/fixtures/handoff/v*/`: each manifest, layout and meta there is read and
+//! written back out.
 
 #[path = "../../aterm-json/test_support/serde_corpus.rs"]
 mod answers;
@@ -45,10 +44,9 @@ fn mutate(base: &str, edits: &[(&str, &str)]) -> String {
     doc
 }
 
-/// A [`Config`] written out (it has no `Serialize`): its `{:#?}` with every
-/// `None` field left out (an absent line IS `None`), on one line. The
-/// `skip`ped `[harness]` is always its default here (`Config::parse` reads it
-/// by line, not through serde), so it is said once, not printed.
+/// A [`Config`] written out (it has no `Serialize`): its `{:#?}` on one line, `None`
+/// fields left out. The `skip`ped `[harness]` is always its default here
+/// (`Config::parse` reads it by line, not through serde), so it is said once.
 fn config_answer(config: &Config) -> String {
     let harness = if config.harness == crate::app_config::HarnessPolicy::default() {
         "harness=default"
@@ -326,15 +324,15 @@ fn derived_field_lists_answer_as_recorded() {
     record_tables::<atpkg::manifest::Index>(&mut corpus, "Index", &mut Vec::new());
     // Under `flatten` the derive asks for a map, not a struct: no FIELDS.
     corpus.record("Status/(root)", fields_at::<atpkg::status::Status>(&[]));
-    // NEGATIVE CONTROL: not a derived table at all.
+    // Negative control: not a derived table at all.
     corpus.record("Vec<String>/(root)", fields_at::<Vec<String>>(&[]));
     corpus.record("Config/keybindings", fields_at::<Config>(&["keybindings"]));
     corpus.record("Config/font_px", fields_at::<Config>(&["font_px"]));
     corpus.finish();
 }
 
-/// A layout shaped like a 0.104.0 crash journal (2026-10-15, values made up),
-/// with a Settings leaf carrying an unsaved draft.
+/// A layout shaped like a 0.104.0 crash journal (values made up), with a Settings
+/// leaf carrying an unsaved draft.
 const LAYOUT: &str = r#"schema = 2
 
 [[windows]]
@@ -1061,9 +1059,8 @@ fn checkpoint_metas_answer_as_recorded() {
     corpus.finish();
 }
 
-/// A fixture as its producer wrote it. A Windows checkout under
-/// `core.autocrlf` hands it over CRLF; the producers escape a carriage return
-/// in JSON and TOML alike, so a raw CRLF is only ever the checkout's.
+/// A fixture as its producer wrote it. The producers escape a carriage return in JSON
+/// and TOML alike, so a raw CRLF is only a Windows `core.autocrlf` checkout's.
 fn checkout_text(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()))
@@ -1181,9 +1178,8 @@ fn shipped_state_corpus(release: Option<(&str, &Path)>) -> (Corpus, [usize; 3], 
     (corpus, [manifests, layouts, metas], refused)
 }
 
-/// THE BYTES OLD BUILDS WROTE: every handoff manifest, layout and checkpoint
-/// meta each shipped release's producer committed under `tests/fixtures/
-/// handoff/`, read by this build's models and written back out.
+/// Every handoff manifest, layout and checkpoint meta each shipped release's producer
+/// committed under `tests/fixtures/handoff/`, read by this build's models and written back.
 #[test]
 fn state_written_by_shipped_producers_answers_as_recorded() {
     let (corpus, [manifests, layouts, metas], _) = shipped_state_corpus(None);

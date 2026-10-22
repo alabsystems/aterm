@@ -403,15 +403,10 @@ fn every_style_keeps_a_timestamp_only_relayout_dark() {
     }
 }
 
-/// The rainbow ribbon drains without a visible step.
-///
-/// Walks a real typing run all the way out at 60 fps and measures, per
-/// frame, the brightest cell that vanished and how many vanished at once. A
-/// draining ease leaves only cells already near the raster floor; a drain
-/// that deletes the cells it selects, or a `settled_at` cliff, removes cells
-/// at full body coverage. Measured in per-cell coverage rather than relative
-/// to the ribbon's peak, so the bar is independent of how brightness is
-/// distributed along the ribbon.
+/// The rainbow ribbon drains without a visible step: walking a typing run out
+/// at 60 fps, no frame removes a cell still carrying body coverage, nor more
+/// than one cell at once. Measured per cell, so the bar is independent of how
+/// brightness is distributed along the ribbon.
 #[test]
 fn rainbow_ribbon_vanishes_without_a_visible_step() {
     let g = geom();

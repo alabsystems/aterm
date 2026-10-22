@@ -44,8 +44,8 @@ pub(crate) const LEDGER_CAP: usize = 512;
 /// harness's records like any other.
 pub(crate) const HARNESS_SHARE: usize = LEDGER_CAP / 2;
 
-/// The submitted-text is bounded in the record so a pathological multi-megabyte
-/// `turn` payload cannot bloat the ring; the full text still reached the PTY.
+/// The record's bound on submitted text, so a multi-megabyte `turn` payload cannot bloat the
+/// ring; the full text still reached the PTY.
 const MAX_TEXT: usize = 512;
 
 /// One completed turn, in the order `cmd_turn` finished it.
@@ -170,13 +170,11 @@ impl TurnBy {
     }
 }
 
-/// A position in a session's alt-screen archive (`aterm_core`'s `AltArchive`):
-/// the archive's host-assigned `origin` and its newest index `last` (0 = nothing
-/// archived yet). Printed `<origin>:<last>` — the exact token `offscreen
-/// since=` accepts. A self-update handoff carries the archive with its origin,
-/// so a mark minted before it still reads the rows after it; a mark from
-/// another origin (a restart, a handoff that could not carry the archive)
-/// reads from the start of the new archive instead of from an unrelated index.
+/// A position in a session's alt-screen archive (`aterm_core`'s `AltArchive`): its
+/// host-assigned `origin` and newest index `last` (0: nothing archived yet), printed
+/// `<origin>:<last>`, the token `offscreen since=` accepts. A handoff carries the archive with
+/// its origin, so an older mark still reads the rows after it; a mark from another origin
+/// reads from the start of the new archive.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ArchMark {
     /// The archive's origin (unique per aterm process that started an archive, kept by a
@@ -767,14 +765,9 @@ mod tests {
         }
     }
 
-    /// DIFFERENTIAL: the `partition_point` seek must agree with the linear
-    /// filter it replaced, for EVERY watermark — including the two that the
-    /// events digest and its GAP frame actually depend on (a watermark below
-    /// the retained low-water must still yield everything; a watermark at or
-    /// above the high must yield nothing). Ids are deliberately GAPPY here:
-    /// turn ids come from a process-global counter, so a single session's
-    /// ledger is sparse, and a seek that assumed contiguity would pass a dense
-    /// fixture and be wrong in production.
+    /// The `partition_point` seek agrees with a linear filter for every watermark, including
+    /// below the low-water and at or past the high. Ids are sparse, as one session's are (turn
+    /// ids come from a process-global counter).
     #[test]
     fn since_seek_matches_the_linear_filter_for_every_watermark() {
         let mut l = TurnLedger::default();

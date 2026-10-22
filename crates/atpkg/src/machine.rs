@@ -902,10 +902,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&prefix);
     }
 
-    /// THE PASSES CARRY ONLY AN EDIT (Phase 3): a machine that never applied the `[machine]`
-    /// table reads "changed"; recording it makes the same table unchanged (and a second
-    /// record writes nothing); an edit — even one that lands on a default — reads changed
-    /// again. No prefix, no stamp: a stamp never creates the store.
+    /// A never-applied table reads changed; recording it makes it unchanged (and a second
+    /// record writes nothing); an edit, even onto a default, reads changed again. No
+    /// prefix, no stamp: a stamp never creates the store.
     #[test]
     fn the_applied_table_is_recorded_and_an_edit_reads_as_changed() {
         let p = std::env::temp_dir().join(format!("atpkg-machine-applied-{}", std::process::id()));

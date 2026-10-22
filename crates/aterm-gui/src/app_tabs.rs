@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tab + session-view management: the windows/pool/focus_order-mutating cluster
-//! moved as ONE unit so the invariant-maintaining set stays cohesive. Open/
-//! switch/cycle/move/close tabs, detach/migrate a tab to a new window, the
-//! tab-strip title/fingerprint/hit-test helpers, session teardown, the close
-//! outcome funnel, and the live structural-invariant oracle. A verbatim
-//! inherent-impl split of `App`.
+//! Tab and session-view management: open, switch, cycle, move and close tabs,
+//! detach a tab to a new window, tab-strip titles and fingerprints, session
+//! teardown, the close-outcome funnel and the live structural-invariant oracle.
+//! The code that mutates windows, the pool and `focus_order` lives together here
+//! so its invariants stay in one place.
 
 use aterm_window::event_loop::ActiveEventLoop;
 
@@ -20,26 +19,19 @@ use crate::{
 /// A shell that drew a prompt or was written to within it did start
 /// ([`App::shell_failed_at_start`]).
 ///
-/// A HANG DETECTOR, not a latency budget (2026-10-01). It was 2 s, and the
-/// child's own start counts against it — exec, rc, exit — which a loaded
-/// machine starves: measured at load ~70-90, a shell that fails at once took
-/// 2.0-4.9 s from fork to EOF (aterm's reader, loop and status reads all
-/// prompt), was judged a later exit, closed the only tab and quit the instance
-/// silently (78 of 128 stressed runs of `shell_exit_at_start_live_headless`) —
-/// the very quit this exists to stop; a slow zsh rc can do the same unloaded.
-/// The trade is lopsided: a pane wrongly kept (an untyped shell with no
-/// integration that dies within the window) costs one ⌘W; a wrong close loses
-/// the window.
+/// A hang detector, not a latency budget: the child's exec, rc and exit count
+/// against it, and on a loaded machine a shell that fails at once can take
+/// seconds; judged a later exit, it would close the only tab and quit the
+/// instance. A pane wrongly kept costs one ⌘W; a wrong close loses the window.
 pub(crate) const SHELL_START_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The most the exit path's FIRST look ([`ExitLook::First`]) waits for the
-/// status of a shell that may have failed at start
+/// The most the exit path's first look ([`ExitLook::First`]) waits off unix for
+/// the status of a shell that may have failed at start
 /// ([`App::unstarted_shell`]): its PTY can close a moment before the kernel
 /// retires the process. It waits whether the exit turns out clean or not, since
 /// nothing knows until the status is in. Every other exit is one non-blocking
-/// look. Not on unix, where the reader's gather waits for the retirement off
-/// the UI thread before it posts the exit (`spawn::SHELL_RETIRE_WAIT`), and
-/// every look is a non-blocking one.
+/// look. On unix the reader waits for the retirement off the UI thread before it
+/// posts the exit (`spawn::SHELL_RETIRE_WAIT`), so every look is non-blocking.
 #[cfg(not(unix))]
 const SHELL_START_STATUS_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
@@ -57,29 +49,12 @@ pub(crate) enum ExitLook {
     Retry,
 }
 
-/// Whether a native close preflight is allowed to take over the screen when a
-/// reducer answers [`crate::native_app::CloseReadiness::Blocked`].
-///
-/// THIS EXISTS BECAUSE A BLOCKED CLOSE HAS TWO VERY DIFFERENT AUDIENCES, and
-/// until now both got the same, maximally intrusive treatment.
-/// `surface_native_close_recovery` switches the active tab, moves keyboard focus,
-/// re-fronts the window and REPLACES `window.overlay` with a Close Recovery
-/// palette (destroying whatever overlay the user had open). For a person who just
-/// pressed Cmd-W or Quit that is exactly right: they asked a question and the
-/// blocker is the answer, shown where they are already looking.
-///
-/// For BACKGROUND POLICY it is a focus hijack. The automatic update lane re-probes
-/// `prepare_all_native_shutdown` on a schedule for as long as a blocker persists
-/// (`app_native.rs`, `PREFLIGHT_BLOCK_COOLDOWN`), so an Interactive probe there
-/// meant a user with one unsaved Settings draft had their tab switched, their
-/// focus stolen and a palette thrown over their work every couple of hours,
-/// forever, for an update that is merely WAITING. Owner instruction: "a user who
-/// is simply busy must not have their tabs switched, their focus stolen, or a
-/// recovery panel reopened on a schedule."
-///
-/// The safety answer is identical under both — `Quiet` runs the same reducer and
-/// returns the same `Ok(false)`/`Err` — so nothing downstream becomes more
-/// permissive. Only the screen is left alone.
+/// Whether a native close preflight may take over the screen when a reducer
+/// answers [`crate::native_app::CloseReadiness::Blocked`]; the verdict is the same
+/// either way. `surface_native_close_recovery` switches the active tab, moves focus,
+/// re-fronts the window and replaces `window.overlay` with a Close Recovery palette:
+/// right for a person who pressed Cmd-W or Quit, a focus hijack for background
+/// policy (the update lane re-probes `prepare_all_native_shutdown` on a schedule).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClosePreflightVisibility {
     /// A person asked for this close: surface the reducer's recovery commands on
@@ -113,10 +88,9 @@ pub(crate) fn inject_launch_line(
 
 /// Decide whether a background tab's new title epoch changes visible tab chrome.
 ///
-/// The epoch remains the cheapest gate for ordinary PTY output. Once it changes,
-/// compare the live title with the exact title last sent through
-/// [`App::refresh_window_tabs`]. Busy-spinner phase changes keep that stable chrome
-/// title and therefore avoid the expensive all-tab title/tooltip/metadata rebuild.
+/// The epoch is the cheap gate; once it moves, the live title is compared with
+/// the title last sent through [`App::refresh_window_tabs`], so a busy-spinner
+/// phase change skips the all-tab title/tooltip/metadata rebuild.
 #[must_use]
 pub(crate) fn background_title_refresh_needed(
     cached_epoch: Option<u64>,
@@ -134,22 +108,19 @@ pub(crate) fn background_title_refresh_needed(
 /// Resolve the terminal-owned rungs of a tab label from one captured snapshot.
 ///
 /// The presentation/`"aterm"` fallback is window-local, so callers apply it
-/// only when this returns `None`. Keeping this ordering in one pure seam makes
-/// the title-drift fast path compare effective chrome with effective chrome:
-/// an OSC spinner hidden beneath an operator-pinned title cannot manufacture
-/// an expensive all-tab refresh.
+/// only when this returns `None`. One pure seam keeps the title-drift fast path
+/// comparing effective chrome with effective chrome: an OSC spinner under an
+/// operator-pinned title cannot trigger an all-tab refresh.
 #[must_use]
 pub(crate) fn resolved_terminal_title_rung(
     user_title: Option<&str>,
     live_title: &str,
     live_cwd: Option<&str>,
 ) -> Option<String> {
-    // A stock prompt's `user@host:` says only where the user already is, and
-    // it says it identically in every tab; ConPTY's program-path title says
-    // only which shell was launched. Dropped here (never for another host, and
-    // never a title a program chose), an OSC title that carried NOTHING else is
-    // now empty and falls through to the cwd rung below — the rung that
-    // actually tells tabs apart.
+    // A stock prompt's `user@host:` is the same in every tab and ConPTY's
+    // program-path title names only the shell; `informative` drops both (never
+    // for another host, never a title a program chose), so a title carrying
+    // nothing else falls through to the cwd rung, which tells tabs apart.
     let live_title = crate::tab_label::informative(live_title);
     user_title
         .filter(|title| !title.is_empty())
@@ -161,11 +132,10 @@ pub(crate) fn resolved_terminal_title_rung(
 /// Make the keep-stale tab-title cache agree with the exact snapshot that
 /// caused an effective chrome refresh.
 ///
-/// `refresh_window_tabs` performs its own nonblocking terminal read. If that
-/// second read contends after the drift epoch has been consumed, it must fall
-/// back to this captured value rather than resurrecting the prior label
-/// indefinitely. A coalesced spinner phase (`needs_refresh == false`) keeps the
-/// intentionally stable cache untouched.
+/// `refresh_window_tabs` does its own nonblocking terminal read; if that read
+/// contends after the drift epoch was consumed, it falls back to this captured
+/// value rather than keeping the prior label. A coalesced spinner phase
+/// (`needs_refresh == false`) leaves the cache alone.
 pub(crate) fn synchronize_captured_title_cache(
     cache: &mut std::collections::HashMap<u64, String>,
     session: u64,
@@ -191,10 +161,9 @@ thread_local! {
     /// `App::post_herald_notice` would have queued for the notifier.
     pub(crate) static HERALD_POSTS: std::cell::RefCell<Vec<crate::status_item::HeraldNotice>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    /// Why the notifier's queue refuses this thread's NEXT herald post
+    /// Why the notifier's queue refuses this thread's next herald post
     /// (test-only): `App::post_herald_notice` takes it and returns it as its
-    /// `Err`, recording nothing — the full queue a test cannot otherwise
-    /// fill without running the notifier.
+    /// `Err`, recording nothing, for the full queue a test cannot otherwise fill.
     pub(crate) static HERALD_REFUSAL: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
     /// The windows `App::raise_window` brought forward on this thread
@@ -283,10 +252,9 @@ mod background_title_tests {
         ));
     }
 
-    /// The strip's title rung never paints ConPTY's program path (audit
-    /// 2026-09-22: a fresh split pane's chip read the full `pwsh.exe` path):
-    /// the path falls through to the cwd rung, `cmd.exe`'s running command
-    /// survives it, and a title a program chose is untouched.
+    /// The strip's title rung never paints ConPTY's program path: the path falls
+    /// through to the cwd rung, `cmd.exe`'s running command survives it, and a
+    /// title a program chose is untouched.
     #[test]
     fn a_console_program_path_falls_through_to_the_cwd() {
         let pwsh = "C:\\Program Files\\WindowsApps\\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe\\pwsh.exe";
@@ -391,10 +359,10 @@ pub(crate) fn align_terminal_projection_to_active(
     }
 }
 
-/// Remove one terminal projection entry. [`TabIndex::close`] deliberately keeps
-/// the historical last-terminal behavior (it reports whole-window closure and
-/// does not mutate), so a mixed window whose last terminal closes while native
-/// tabs survive needs the explicit zero-entry representation here.
+/// Remove one terminal projection entry. [`TabIndex::close`] reports
+/// whole-window closure for the last entry without mutating, so a mixed window
+/// whose last terminal closes while native tabs survive needs the explicit
+/// zero-entry representation here.
 fn remove_terminal_projection(ws: &mut WindowState, projection_index: usize) {
     if ws.tabs.count == 1 {
         debug_assert_eq!(projection_index, 0);
@@ -446,32 +414,26 @@ pub(crate) fn cancel_pending_close(ws: &mut WindowState) {
     }
 }
 
-/// How far [`App::close_session_by_id`] got — NOT the wire verdict. A last-tab
-/// close only FLAGS its window (`pending_close`); the teardown that retires the
-/// session, and journals its exit, runs on a caller holding an
-/// `ActiveEventLoop`. Reading the store between those two moments says the
-/// session is still registered, which is why the answer is
-/// [`App::close_session_verdict`] AFTER the escalation and never before it.
+/// How far [`App::close_session_by_id`] got, not the wire verdict. A last-tab
+/// close only flags its window (`pending_close`); the teardown that retires the
+/// session and journals its exit runs on a caller holding an `ActiveEventLoop`,
+/// so the answer is [`App::close_session_verdict`] after the escalation, never
+/// before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CloseProgress {
     /// The session left the registry inside the close: nothing is pending.
     Retired,
-    /// The close dropped window `.0`'s LAST tab, so THAT window's teardown was
-    /// deferred behind its `pending_close`. The id rides along because it is the
-    /// only thing that tells the deferred outcomes apart afterwards: a
-    /// teardown that never ran leaves the window (and its still-attached tab)
-    /// standing, while one that ran and left the session alive did so because
-    /// another viewer holds it (or, with no viewer left to name, the session
-    /// simply outlived it) — and the verdict must not report the first when
-    /// it is looking at the second.
+    /// The close dropped window `.0`'s last tab, so its teardown was deferred
+    /// behind `pending_close`. The id tells the deferred outcomes apart: a
+    /// teardown that never ran leaves the window and its tab standing; one that
+    /// ran and left the session alive did so because another viewer holds it, or
+    /// the session outlived it.
     Deferred(WindowId),
 }
 
-/// The wire refusal of a busy PANE close — a pane whose close would hang up its
-/// own foreground job, in a tab that survives it. Its own sentence, not
-/// [`crate::app_window::WIRE_CLOSE_REFUSED`], because that one names the
-/// last-tab confirm and there is no last tab here: the tab stands, the sibling
-/// panes stand, only the aimed pane's job stood in the way.
+/// The wire refusal of a busy pane close: the aimed pane's foreground job would
+/// be hung up, in a tab that survives. Not
+/// [`crate::app_window::WIRE_CLOSE_REFUSED`], which names the last-tab confirm.
 pub(crate) const WIRE_PANE_CLOSE_REFUSED: &str = "close refused (a running job in that pane)";
 
 /// The flagless wire `tab` verb's refusal when no window is front.
@@ -499,10 +461,9 @@ struct ConnectedPlan {
     origin_folder: Option<crate::spawn_folder::PaneFolder>,
 }
 
-/// One canonical terminal-view occurrence.  `layouts` is deliberately absent:
-/// heterogeneous tabs have no terminal-only projection, so session lifecycle
-/// must resolve through stable tab/view identity first and consult the legacy
-/// projection only after proving the whole tab is terminal-backed.
+/// One canonical terminal-view occurrence, by stable tab/view identity. A mixed
+/// tab has no terminal-only projection; `terminal_only` says whether the legacy
+/// projection may be consulted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TerminalViewLocation {
     tab_id: crate::tab_model::TabId,
@@ -535,14 +496,12 @@ pub(crate) fn end_wall_ms(end: crate::harness_glass::EndGlass, told: Option<i64>
         .unwrap_or(0)
 }
 
-/// The `home`-relative suffix of `path`: `Some("")` when `path` IS the home
-/// directory, `Some("/sub")` (the `/`-prefixed remainder) when it lives under
-/// it, `None` otherwise. Matches on a component boundary exactly like the zsh
-/// integration's precmd (`aterm_shell_integration.zsh` matches `$HOME` with a
-/// trailing `/`): a SIBLING like `/Users//foobar` under `home=/Users//foo` must
-/// never abbreviate to `~bar`. An empty `home` never matches — an unset/empty
-/// `$HOME` must not turn every path into `~<path>`. Pure (explicit `home`) so
-/// the boundary cases are provable without touching process env.
+/// The `home`-relative suffix of `path`: `Some("")` when `path` is the home
+/// directory, `Some("/sub")` below it, `None` otherwise. Matches on a component
+/// boundary like the zsh integration's precmd (`aterm_shell_integration.zsh`):
+/// `/Users//foobar` under `home=/Users//foo` never abbreviates to `~bar`. An empty
+/// `home` never matches, so an unset `$HOME` cannot turn every path into
+/// `~<path>`.
 pub(crate) fn home_relative_suffix<'p>(path: &'p str, home: &str) -> Option<&'p str> {
     if home.is_empty() {
         return None;
@@ -551,10 +510,9 @@ pub(crate) fn home_relative_suffix<'p>(path: &'p str, home: &str) -> Option<&'p 
     (rest.is_empty() || rest.starts_with('/')).then_some(rest)
 }
 
-/// The process `$HOME`, read ONCE and cached for the process lifetime. The tab
-/// label path runs per tab per repaint-fingerprint recompute; `env::var` scans
-/// the whole environ block, so the hot path must not pay it repeatedly (and
-/// `$HOME` legitimately never changes mid-run). `None` when unset or empty.
+/// The process `$HOME`, read once and cached: the tab label runs per tab per
+/// fingerprint recompute, and `env::var` scans the whole environ block. `None`
+/// when unset or empty.
 pub(crate) fn cached_home() -> Option<&'static str> {
     static HOME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     HOME.get_or_init(|| std::env::var("HOME").ok().filter(|home| !home.is_empty()))
@@ -593,27 +551,15 @@ impl App {
             self.chrome_labels.retire(session);
             self.retire_session_status(session);
             self.retire_presence(session);
-            // The owner's upgrade view hands over only LIVE tabs' rows, and
-            // the host looks again only when a supervised tab or a step moves
-            // it: a closed tab's row (a holder the host does not supervise)
-            // stood until the next timed look, and its record kept offering
-            // words for a session that was gone (ruling 315, day eight E3).
+            // The upgrade view lists only live tabs' rows, and the host looks
+            // again only when a supervised tab or a step moves it: ask for a
+            // look now so a closed tab's row does not stand until the next one.
             crate::harness_host::look_at_upgrades_soon();
-            // These caches can carry authored descriptions, status activity,
-            // cwd/title text, and debounce deadlines. The final view is the
-            // lifecycle boundary: erase them immediately instead of waiting for
-            // the lazy >64-entry reaper or a future drift sweep. A non-final
-            // detach preserves every entry for the remaining shared view.
             self.session_chrome.remove(&session);
             self.session_chrome_retry.remove(&session);
-            // The parked predictive-echo link estimate dies with the session too —
-            // the entry describes a link that no longer exists, and without this the
-            // map would accumulate one entry per closed tab for the process lifetime.
             self.link_estimates.remove(&session);
-            // The parked find origin names an absolute row in a grid that is about to
-            // stop existing; without this the map would grow one entry per closed tab
-            // per window for the process lifetime. `retain`, not `remove`, because the
-            // key carries the window a shared session's find was opened in.
+            // `retain`: the key also names the window a shared session's find
+            // was opened in.
             self.find_origins.retain(|(entry, _), _| *entry != session);
             self.session_chrome_expiry.cancel_session(session);
             self.title_drift.forget(session);
@@ -629,19 +575,11 @@ impl App {
         dropped
     }
 
-    /// AN ADOPTED SHELL THAT LEAVES THE POOL BEFORE THE ADOPTION PROOF
-    /// DEGRADES THE HANDOFF (round eight, finding 58). The proof names every
-    /// adopted session still pooled, and the parked parent expects every shell
-    /// it handed, so a successor that lost one — a co-view window whose glass
-    /// would not attach, a tab whose leaves were rolled back, an unconsumed
-    /// bootstrap — could only prove a subset: filed `AdoptionMismatch`, a
-    /// STRUCTURAL verdict on the new build, for what was this machine's
-    /// moment. It withholds the proof instead, as a terminal window that
-    /// failed to open always has: the parent times out, rolls back and resumes
-    /// every shell from its own descriptors (the dropped one's included,
-    /// `Session::drop` before Commit), and the attempt is filed transient.
-    /// Past the proof (`handoff_ready` taken) a drop changes no proof, and
-    /// nothing is said.
+    /// An adopted shell that leaves the pool before the adoption proof degrades the
+    /// handoff: a proof missing one handed shell would be filed `AdoptionMismatch`, a
+    /// structural verdict on the new build. Withholding the proof instead makes the parent
+    /// time out, roll back, resume every shell from its own descriptors and file the
+    /// attempt transient. Past the proof (`handoff_ready` taken) a drop changes nothing.
     fn note_handed_shell_lost(&mut self, local_id: u64) {
         if self.handoff_ready.is_none() || self.handoff_degraded {
             return;
@@ -682,10 +620,10 @@ impl App {
             })
     }
 
-    /// Collapse one terminal leaf out of a heterogeneous canonical tree.  Such a
-    /// tab necessarily survives: by definition it also contains at least one
-    /// native leaf.  Ownership is retired in view -> pool -> registry order and
-    /// the terminal-only compatibility projection remains untouched.
+    /// Collapse one terminal leaf out of a heterogeneous canonical tree. Such a
+    /// tab survives: it also holds at least one native leaf. Ownership is retired
+    /// in view -> pool -> registry order; the terminal-only compatibility
+    /// projection is untouched.
     fn close_heterogeneous_terminal_view(
         &mut self,
         window: WindowId,
@@ -766,12 +704,11 @@ impl App {
         self.closed_view_record_for(window, tab.id, tab.focus)
     }
 
-    /// The reopen record for closing leaf `view` of tab `tab_id` in `window`: what
-    /// Cmd-W keeps for the FOCUSED leaf of the ACTIVE tab, for ANY leaf — the wire
-    /// `close` aims by session at a pane that need not be focused nor in the
-    /// active tab, and a pane it closes must be as reopenable as one Cmd-W closed.
-    /// `None` for a single-leaf tab (that close is a whole-tab record,
-    /// `retain_closed_tab`) and for a leaf the tab does not hold.
+    /// The reopen record for closing leaf `view` of tab `tab_id` in `window`, for
+    /// any leaf: the wire `close` aims by session at a pane that need not be
+    /// focused or in the active tab, and leaves it as reopenable as Cmd-W does.
+    /// `None` for a single-leaf tab (a whole-tab record, `retain_closed_tab`) and
+    /// for a leaf the tab does not hold.
     fn closed_view_record_for(
         &self,
         window: WindowId,
@@ -824,9 +761,9 @@ impl App {
     ) -> Option<crate::tab_model::TabPresentation> {
         match self.view_store.get(view).copied()? {
             crate::tab_model::View::Terminal(terminal) => {
-                // The leaf carries its OWN session's status so the aggregate can
-                // OR it with its siblings' — a busy background pane stays visible
-                // instead of being hidden by whichever pane happens to be focused.
+                // The leaf carries its own session's status so the aggregate can
+                // OR it with its siblings': the focused pane never hides a busy
+                // background one.
                 let indicators = self.session_status_indicators(terminal.session);
                 let session = self.pool.get(terminal.session)?;
                 let title = term_lock(&session.term).title().to_string();
@@ -898,7 +835,7 @@ impl App {
         }
     }
 
-    /// Every tab that VIEWS this session, addressed by leaf rather than by
+    /// Every tab that views this session, addressed by leaf rather than by
     /// focus: a split's background pane owns indicator state of its own.
     pub(crate) fn tabs_viewing_session(
         &self,
@@ -1184,12 +1121,11 @@ impl App {
     }
 
     /// Attach one view of an existing native app instance and append it as the
-    /// active stable tab in `wid`.  The terminal compatibility vectors are
-    /// deliberately untouched: native leaves do not fabricate a PTY/session.
+    /// active stable tab in `wid`. The terminal compatibility vectors are
+    /// untouched: a native leaf has no PTY or session.
     ///
-    /// Every fallible step rolls back the preceding ownership edges. Stable IDs
-    /// already minted during a failed attempt remain burned, as required for
-    /// stale-event safety.
+    /// Every fallible step rolls back the preceding ownership edges; stable IDs
+    /// minted during a failed attempt stay burned, for stale-event safety.
     pub(crate) fn install_native_tab(
         &mut self,
         wid: WindowId,
@@ -1220,8 +1156,7 @@ impl App {
         };
         let tab = crate::tab_model::Tab::new(tab_id, view, presentation);
         let Some(ws) = self.windows.get_mut(&wid) else {
-            // The event loop is single-threaded, but keep the transaction robust
-            // if window ownership is ever made asynchronous.
+            // Unreachable on the single-threaded loop; rolled back all the same.
             self.native_runtime.remove_view(view);
             self.view_store.remove(view);
             return Err(NativeTabInstallError::UnknownWindow);
@@ -1273,10 +1208,9 @@ impl App {
         }
     }
 
-    /// Attach another view of an existing native app as a sibling of the
-    /// focused canonical leaf: the content-agnostic split the mixed-leaf tests
-    /// build their layouts with (no shipping command duplicates a native view
-    /// yet). It never fabricates a terminal compatibility tree.
+    /// Attach another view of an existing native app as a sibling of the focused
+    /// canonical leaf, for the mixed-leaf tests (no shipping command duplicates a
+    /// native view). It never fabricates a terminal compatibility tree.
     #[cfg(test)]
     pub(crate) fn split_active_with_native(
         &mut self,
@@ -1405,10 +1339,9 @@ impl App {
             return None;
         }
         let removed = self.view_store.remove(view)?;
-        // `ViewId` is process-unique, so retiring its stable ownership edge also
-        // retires every retained raster keyed by that identity.  Usually there is
-        // exactly one such entry.  Scanning all windows additionally cleans a
-        // source-window cache left behind by a tab migration before the next paint.
+        // `ViewId` is process-unique, so retiring its edge also retires every
+        // raster keyed by it; scanning every window also cleans a source-window
+        // cache a tab migration left behind.
         for window in self.windows.values_mut() {
             window.leaf_render_cache.remove(&view);
         }
@@ -1438,9 +1371,9 @@ impl App {
         }
     }
 
-    /// Whether the visible tab strip is enabled (`tab_strip_rows > 0`). GLOBAL. The
-    /// whole strip path (splice + paint + hit-test) is gated on this; `false` is the
-    /// byte-identical no-strip path.
+    /// Whether the visible tab strip is enabled (`tab_strip_rows > 0`), for every
+    /// window. The whole strip path (splice, paint, hit-test) is gated on it;
+    /// `false` is the byte-identical no-strip path.
     pub(crate) fn tab_strip_enabled(&self) -> bool {
         self.tab_strip_rows > 0
     }
@@ -1465,41 +1398,26 @@ impl App {
         self.tab_strip_rows.saturating_add(self.message_band_rows)
     }
 
-    /// One title per TAB (top-level) of window `wid`, for the strip labels: each
-    /// tab's label is its presentation title for native content, or — for terminal
-    /// content — the session's USER title (`meta set title`, the operator's name
-    /// for the session, which OUTRANKS everything below), then the focused pane's
-    /// live terminal title (OSC 0/2), falling back to the session's shell-reported
-    /// cwd (OSC 7 / OSC 633 `P;Cwd=`, `$HOME`-abbreviated to `~…` exactly like
-    /// the zsh integration's OSC 0 form) when no program has set a title. A
-    /// terminal tab with none of those falls back to the tab presentation and
-    /// finally `"aterm"`; native tabs keep their presentation title untouched.
-    /// [`Self::refill_strip_titles`] is the in-place mirror of this fallback
-    /// chain and MUST stay byte-identical whenever the try-lock wins.
+    /// One title per top-level tab of window `wid`, for the strip labels. A native
+    /// tab's is its presentation title; a terminal tab's is the session's user
+    /// title (`meta set title`), then the focused pane's OSC 0/2 title, then its
+    /// `~`-abbreviated shell-reported cwd, then the presentation title, then
+    /// `"aterm"`. [`Self::refill_strip_titles`] mirrors this chain and must stay
+    /// byte-identical when the try-lock wins.
     ///
-    /// TRY-LOCK ONLY (the `refill_strip_titles` discipline): this runs on the main
-    /// thread — from `sync_window` on every tab mutation, including the tab SWITCH
-    /// itself, and from the `Wake::Output` title-drift arm during background floods.
-    /// A blocking `term_lock` here parks the UI behind whichever session's reader
-    /// thread is mid-`process()` — under sustained PTY flood that mutex is held
-    /// back-to-back and tab switching froze until the flooding program quit. On
-    /// contention the per-window `tab_title_cache` supplies the last-read label
-    /// (self-correcting: the title-drift epoch handler re-runs this on the next
-    /// output wake), and a never-read session falls back to the presentation title.
-    /// Title and cwd are read under the ONE term try-lock per tab. (The user-title
-    /// read is a separate LEAF mutex on the session ctx, taken-and-dropped BEFORE
-    /// the term lock; it is contended only by an actual `meta set`, and when it
-    /// hits, the term lock is skipped entirely.)
+    /// Try-lock only: this runs on the main thread on every tab mutation and title
+    /// drift, and a blocking `term_lock` would park the UI behind a reader
+    /// mid-`process()`. On contention the per-window `tab_title_cache` supplies
+    /// the last label (the drift handler re-runs this on the next output wake).
+    /// The user title is a separate leaf mutex, dropped before the term lock.
     pub(crate) fn tab_titles(&mut self, wid: WindowId) -> Vec<String> {
         let Some(ws) = self.windows.get(&wid) else {
             return Vec::new();
         };
-        // Pass 1 (immutable borrows): resolve each tab to its fallback plus, for
-        // terminal tabs, the session id and a freshly resolved label (`None` on
-        // contention, `Some` even when empty — an empty live label must MISS the
-        // cache and fall back, not resurrect a stale one). The label chain is the
-        // byte-identical twin of `refill_strip_titles`: user title, then (under
-        // the term try-lock) the live OSC title, then the `~`-abbreviated cwd.
+        // Pass 1 (immutable borrows): each tab's fallback plus, for terminal
+        // tabs, the session id and a fresh label (`None` on contention; `Some`
+        // even when empty, so an empty live label misses the cache instead of
+        // resurrecting a stale one).
         let read: Vec<_> = ws
             .tab_set
             .tabs()
@@ -1518,9 +1436,8 @@ impl App {
                 let Some(s) = self.pool.get(view.session) else {
                     return (fallback, None, None);
                 };
-                // TOP RUNG: the operator's `meta set title` (leaf lock, dropped
-                // before the term lock is ever taken; contended only by an actual
-                // `meta set`). When it hits, the term try-lock is skipped.
+                // Top rung: the operator's `meta set title`; when it hits, the
+                // term try-lock is skipped.
                 let user_title = s
                     .ctx
                     .meta
@@ -1593,16 +1510,11 @@ impl App {
             .collect()
     }
 
-    /// Stamp each tab's §4 connection role onto its presentation from the live
-    /// edge tables ([`crate::connections::roles_by_local`] — the §4.1 predicate
-    /// over the registry, tables only, no liveness qualifier). Runs inside
-    /// [`Self::refresh_window_tabs`] — the one funnel every structural change,
-    /// prompt relabel, and connect/disconnect repaint flows through — so both
-    /// strip renderers read the mark out of the same canonical presentation
-    /// snapshot as every other indicator, and a stale mark cannot outlive the
-    /// next strip push. `tab_connection_badge = false` stamps `None`: the MARK
-    /// is quieted, the connections themselves (and their non-visual `chrome`/
-    /// `edges` surfaces) are untouched.
+    /// Stamp each tab's connection role onto its presentation from the live edge
+    /// tables ([`crate::connections::roles_by_local`], no liveness qualifier). It runs
+    /// inside [`Self::refresh_window_tabs`], so both strip renderers read the mark from
+    /// one presentation snapshot. `tab_connection_badge = false` stamps `None`: only
+    /// the mark is quieted, not the connections.
     fn stamp_tab_connection_roles(&mut self, wid: WindowId) {
         let roles = if self.config.tab_connection_badge_or_default() {
             crate::connections::roles_by_local(&self.store)
@@ -1612,9 +1524,8 @@ impl App {
         let Some(ws) = self.windows.get(&wid) else {
             return;
         };
-        // OR-fold panes per tab (the `aggregate_presentations` discipline): a
-        // background pane's direction never hides behind the focused pane's —
-        // outbound + inbound across a split reads as Both.
+        // OR-fold panes per tab, as `aggregate_presentations` does: outbound and
+        // inbound across a split read as Both.
         let per_tab: Vec<Option<crate::tab_model::TabConnRole>> = ws
             .tab_set
             .tabs()
@@ -1667,25 +1578,22 @@ impl App {
         metadata
     }
 
-    /// The per-tab chrome EXTENSIONS (hover tooltip + right-click context-menu
-    /// model, session-metadata stage 2) paired by index with
-    /// [`Self::tab_titles`] — `titles` MUST be that same freshly-computed `Vec`
-    /// (the composed identity line opens with the exact chip label). Terminal
-    /// tabs compose from live session facts via the epoch-gated
+    /// The per-tab chrome extensions (hover tooltip and right-click menu model)
+    /// paired by index with [`Self::tab_titles`]; `titles` must be that same fresh
+    /// `Vec` (the identity line opens with the exact chip label). Terminal tabs
+    /// compose from live session facts via the epoch-gated
     /// [`Self::composed_session_chrome`]; native tabs pass their presentation
-    /// tooltip through unchanged (their menus stay empty — native surfaces own
-    /// richer affordances of their own). The composed tooltip is ALSO written
-    /// back onto the tab's [`crate::tab_model::TabPresentation::tooltip`], the
-    /// one cross-platform field every presentation consumer already reads —
-    /// terminal tabs stop being the only kind whose tooltip slot stays `None`.
+    /// tooltip through with an empty menu. The composed tooltip is also written
+    /// back onto [`crate::tab_model::TabPresentation::tooltip`], the field every
+    /// presentation consumer reads.
     pub(crate) fn tab_chrome_ext(
         &mut self,
         wid: WindowId,
         titles: &[String],
     ) -> Vec<crate::session_chrome::TabChromeExt> {
-        // Bound the cache: sessions close over a long process life, and nothing
-        // else prunes their composed chrome. Rare (only past the bound), and the
-        // live-id set is collected FIRST so the retain closure borrows no field.
+        // A backstop bound on the cache (`detach_session_view` drops a closed
+        // session's entry). The live-id set is collected first so the retain
+        // closure borrows no field.
         if self.session_chrome.len() > 64 {
             let live: std::collections::HashSet<u64> = self.pool.iter().map(|s| s.id).collect();
             self.session_chrome.retain(|sid, _| live.contains(sid));
@@ -1776,11 +1684,11 @@ impl App {
         Some(now + std::time::Duration::from_millis(remaining_ms))
     }
 
-    /// Advance one expired session's fan-out by at most one real window scan.
-    /// The cache entry is removed on admission; the first consuming window
-    /// recomposes it, and later consuming windows reuse the fresh value while
-    /// receiving it in their native toolbar. The `(session, after_window)`
-    /// cursor retains all remaining fan-out work across event-loop turns.
+    /// Advance one expired session's fan-out by at most
+    /// [`crate::session_chrome::EXPIRY_WINDOW_SCAN_BUDGET`] window scans. The
+    /// cache entry is removed on admission; the first consuming window recomposes
+    /// it and later ones reuse the fresh value. The `(session, after_window)`
+    /// cursor keeps the remaining fan-out across event-loop turns.
     pub(crate) fn advance_session_chrome_expiry(
         &mut self,
         now_ms: u64,
@@ -1940,13 +1848,11 @@ impl App {
         else {
             return chrome::TabChromeExt::default();
         };
-        // Read the connections epoch BEFORE any fact is gathered: a mutation
-        // racing this compose then leaves the cached entry already stale, so
-        // the next refresh recomposes — never the inverse (fresh epoch over
-        // stale facts, which would serve a revoked menu for 30 s, §2.4).
+        // Read the connections epoch before gathering any fact: a mutation
+        // racing this compose leaves the cached entry stale, so the next refresh
+        // recomposes; never a fresh epoch over stale facts (a revoked menu).
         let connections_revision = self.connections.revision();
-        // The same order for the upgrade view's revision (gap #21): read
-        // before the row it composes from.
+        // The upgrade view's revision too, read before the row it composes from.
         let upgrade_revision = self.upgrade_view.revision();
         let activity_revision = self.session_status_revision(session);
         let high_id = ctx
@@ -1969,12 +1875,12 @@ impl App {
         {
             return c.ext.clone();
         }
-        // Tab Subject & Status owns the live activity line, and says nothing when
-        // it has nothing honest to say (RFC §11).
+        // The session status text is the activity line; with nothing honest to
+        // say it shows none.
         let activity = self.session_status_text(session);
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        // The tab TOOLTIP's `cwd: …` line, so it takes the native form — the
-        // reported defect showed `cwd: /C:/Users//m6-an` here.
+        // The tooltip's `cwd: …` line takes the native form, not the engine's
+        // `/C:/…` URI path.
         let native_cwd = |t: &aterm_core::terminal::Terminal| {
             use crate::cwd_native::ReportedCwd as _;
             t.native_working_directory()
@@ -1992,9 +1898,9 @@ impl App {
                     .get(&session)
                     .map(|cached| cached.ext.clone())
                     .unwrap_or_default();
-                // Reuse the already deadline-driven, bounded title/cwd retry lane.
-                // Do not advance the chrome cache epochs: the retry must miss and
-                // recompose with a consistent terminal snapshot once available.
+                // Reuse the bounded title/cwd retry lane without advancing the
+                // chrome cache epochs, so the retry misses and recomposes from a
+                // consistent terminal snapshot.
                 if let Some(window) = self.windows.get_mut(&retry_window) {
                     window.tab_title_epochs.remove(&session);
                 }
@@ -2114,13 +2020,13 @@ impl App {
             in_any: bool,
             in_write: bool,
         }
-        // Keyed by the sid STRING (SessionId is not Ord); BTreeMap gives the
-        // stable listing order.
+        // Keyed by the sid string (`SessionId` is not `Ord`); the BTreeMap gives
+        // the stable listing order.
         let mut peers: std::collections::BTreeMap<String, (aterm_session::SessionId, Halves)> =
             std::collections::BTreeMap::new();
         for edge in edges {
             if edge.src == edge.dst {
-                continue; // self-loops spell no connection (§1.5)
+                continue; // self-loops spell no connection
             }
             let (peer, outbound) = if edge.src == *sid {
                 (edge.dst.clone(), true)
@@ -2171,14 +2077,12 @@ impl App {
             .collect()
     }
 
-    /// Full hover/accessibility context paired by index with [`Self::tab_titles`].
-    /// Settings uses this for the active route (for example
-    /// `Settings · Cursor & Motion`), while documents retain their full URI/path even
-    /// when the compact title chip truncates. Kept separate from `TabStripMetadata` so
-    /// the every-frame semantic paint fingerprint remains allocation-free and `Copy`.
-    /// Read AFTER [`Self::tab_chrome_ext`] on the refresh path, so terminal tabs
-    /// report the freshly-composed session tooltip it wrote back onto the
-    /// presentation.
+    /// Full hover/accessibility context paired by index with [`Self::tab_titles`]:
+    /// Settings' active route (`Settings · Cursor & Motion`), a document's full
+    /// URI/path when the chip truncates. Kept out of `TabStripMetadata` so the
+    /// every-frame paint fingerprint stays allocation-free and `Copy`. Read after
+    /// [`Self::tab_chrome_ext`] on the refresh path, so terminal tabs report the
+    /// session tooltip it just wrote back onto the presentation.
     pub(crate) fn tab_tooltips(&self, wid: WindowId) -> Vec<Option<String>> {
         self.windows.get(&wid).map_or_else(Vec::new, |ws| {
             ws.tab_set
@@ -2203,39 +2107,13 @@ impl App {
         })
     }
 
-    /// A cheap fingerprint of the VISIBLE tab strip — tab count, active index, and a
-    /// hash of every tab's title — folded into the redraw [`RepaintKey`] so a tab
-    /// switch / open / close / title change repaints the strip even when the terminal
-    /// grid below is unchanged. Always `0` when the strip is disabled, keeping the
-    /// key byte-identical to the pre-strip path. Computed from ALREADY-READ titles —
-    /// no extra term locks: the redraw hot path reads the per-tab titles ONCE
-    /// (`tab_titles`) and feeds the SAME `Vec` to both this and `splice_tab_strip_with`,
-    /// instead of locking every tab's terminal twice per present (once to hash, once
-    /// to paint).
-    /// Byte-identical to hashing `tab_titles(wid)`: same count + active + title bytes.
-    /// Full shipping fingerprint: live titles plus canonical icon/dirty/closable
-    /// metadata. A save, app-kind change, or close-policy change therefore invalidates
-    /// the cached strip even when its visible title stays byte-identical.
-    ///
-    /// It also carries `wid`'s live IN-GRID rename field. That field is painted INTO
-    /// the strip, so unless its text and caret move this number, two independent
-    /// caches swallow every keystroke: the RepaintKey early-out (this value) and the
-    /// painted-row cache (`last_strip_fp`, which keys on this value). A NATIVE edit
-    /// is deliberately absent — AppKit paints that one, and folding it in would
-    /// repaint the in-grid strip for a field that is not on it.
-    ///
-    /// And it carries the strip's POINTER HOVER — which chip reveals its `✕`, and
-    /// whether the `+` or the trailing version label wears the hover wash — for
-    /// the same reason: each is painted into the strip and dirties no terminal
-    /// cell, so with this value standing still the RepaintKey early-out swallowed
-    /// the frame `track_strip_hover` asks for, and a wash reached the glass only
-    /// with the next unrelated present (a blink flip, output) — never, with the
-    /// cursor not blinking. Measured 2026-10-01 on Windows (a release build,
-    /// `cursor_blink = false`): after `pointer move` onto the version label,
-    /// `chrome` said `hovered=true` while the window still showed bare band
-    /// 1.5 s later, and after `pointer leave` the stale wash stayed. Hashed only
-    /// while something is lit, so a resting strip's value is byte-identical to
-    /// the one before hover was folded in.
+    /// A cheap fingerprint of the visible tab strip, folded into the redraw
+    /// [`crate::RepaintKey`] so a tab change repaints the strip over an unchanged grid;
+    /// `0` when the strip is disabled. It hashes the already-read titles, count, active
+    /// index and metadata, plus the in-grid rename field and the pointer hover, which
+    /// dirty no terminal cell: without them the RepaintKey early-out and the row cache
+    /// (`last_strip_fp`) would swallow keystrokes and hover washes. Hover is hashed only
+    /// while lit; a native rename edit is absent (AppKit paints it).
     pub(crate) fn tab_strip_fingerprint_from_parts(
         &self,
         wid: WindowId,
@@ -2259,15 +2137,11 @@ impl App {
             edit.tab.hash(&mut h);
             edit.text.hash(&mut h);
             edit.cursor.hash(&mut h);
-            // IME-2: while the rename field owns an in-flight composition, the
-            // strip's rename well paints the preedit spliced into the display
-            // text (`splice_tab_strip_with`) — its bytes + caret are part of
-            // what the rows show, so they must move this fingerprint or the
-            // strip row cache (and the RepaintKey's strip term) would keep
-            // serving pre-composition rows while a CJK user types a tab name.
-            // Hashed only under a live rename edit: with no rename field the
-            // preedit never reaches the strip, and the fingerprint stays
-            // byte-identical to the pre-IME value.
+            // While the rename field owns an in-flight composition the strip
+            // paints the preedit spliced into the display text
+            // (`splice_tab_strip_with`), so its bytes and caret move this value
+            // or the row cache would serve pre-composition rows. Only under a
+            // live rename edit: otherwise the preedit never reaches the strip.
             if let Some(ws) = self.windows.get(&wid)
                 && !ws.preedit.is_empty()
             {
@@ -2300,15 +2174,12 @@ impl App {
         h.finish() | 1
     }
 
-    /// "Move Tab to New Window" (Cmd-Shift-N / Window ▸ Move Tab to New Window): pull
-    /// the frontmost window's ACTIVE tab OUT into a brand-new in-process window. The
-    /// view MOVES — the existing `Session` is never spawned, dropped, or duplicated
-    /// (the pool's view-count stays 1), so there is zero PTY churn. This is the
-    /// logical half: it does everything EXCEPT attach the OS surface, returning the
-    /// new window's id (or `None` if the move was refused), so it is headless-testable.
-    ///
-    /// Refused (returns `None`) when the source window has only ONE tab — detaching
-    /// the sole tab would just relocate the window, a no-op.
+    /// "Move Tab to New Window" (Cmd-Shift-N): pull the frontmost window's active
+    /// tab into a new in-process window. The view moves; the `Session` is never
+    /// spawned, dropped or duplicated, so there is no PTY churn. The logical half
+    /// (everything except the OS surface), so it is headless-testable. Returns the
+    /// new window's id, or `None` when the source has one tab (detaching it would
+    /// only relocate the window).
     pub(crate) fn detach_active_tab_logical(&mut self) -> Option<WindowId> {
         let wid_a = self.frontmost_window?;
         // Canonical identity chooses the tab. A terminal tab additionally owns one
@@ -2327,10 +2198,9 @@ impl App {
             };
             (stable_tab, terminal_index, tree, ws.rows, ws.cols)
         };
-        // Resolve the moved tab's canonical focused leaf independently of the
-        // all-terminal compatibility projection. This preserves a terminal-
-        // focused heterogeneous tab while a native-focused/native-only tab owns
-        // no placeholder terminal capability.
+        // Resolve the focused leaf from canonical identity, not the terminal
+        // projection: a terminal-focused heterogeneous tab keeps its terminal,
+        // and a native-focused tab gets no placeholder terminal.
         let focused_view = stable_tab.focus;
         let (front_content, active_terminal) = match self.view_store.get(focused_view).copied()? {
             crate::tab_model::View::Terminal(terminal) => {
@@ -2357,9 +2227,9 @@ impl App {
                 None,
             ),
         };
-        // Remove the whole canonical tab from A and, only for terminal content,
-        // its matching compatibility tree. NO `pool.detach`: every stable view
-        // moves to B and every live session keeps the same view count.
+        // Remove the whole canonical tab from A and, for terminal content only,
+        // its compatibility tree. No `pool.detach`: every stable view moves to B
+        // and every live session keeps its view count.
         if let Some(ws) = self.windows.get_mut(&wid_a) {
             if let Some(index) = terminal_index {
                 ws.layouts.remove(index);
@@ -2368,7 +2238,7 @@ impl App {
             ws.tab_set.remove(stable_tab.id);
             align_terminal_projection_to_active(ws, &self.view_store);
         }
-        // Build window B holding the EXISTING stable tab. Its terminal projection
+        // Build window B holding the existing stable tab. Its terminal projection
         // is present iff the moved tab itself is terminal.
         let wid_b = WindowId(self.next_window_id);
         self.next_window_id += 1;
@@ -2389,11 +2259,10 @@ impl App {
         );
         self.windows.insert(wid_b, Box::new(ws_b));
         self.frontmost_window = Some(wid_b);
-        // Re-mirror BOTH: A's active tab changed (it lost its old active), and B is
-        // the new frontmost (also re-points the global control/notify handle to B).
-        // A moved terminal's reader thread remains stamped with old window A, but
-        // output routing resolves its live view and therefore finds B. Native
-        // content has no reader/PTY stamp at all.
+        // Re-mirror both: A lost its active tab, and B is the new frontmost (which
+        // re-points the global control/notify handle). A moved terminal's reader
+        // stays stamped with window A, but output routing resolves its live view
+        // and finds B.
         self.sync_window(wid_a);
         self.sync_active_session(); // frontmost = B
         debug_assert!(
@@ -2408,7 +2277,7 @@ impl App {
     /// winit OS-window attach for the new window. A refused move (single-tab source)
     /// is a silent no-op.
     pub(crate) fn detach_active_tab(&mut self, el: &ActiveEventLoop) {
-        // Capture the SOURCE window BEFORE the move (the logical step re-points
+        // Capture the source window before the move (the logical step re-points
         // frontmost to the new window), so a rollback can return the tab to it.
         let wid_a = self.frontmost_window;
         let Some(wid_b) = self.detach_active_tab_logical() else {
@@ -2419,14 +2288,12 @@ impl App {
         }
     }
 
-    /// Undo a `detach_active_tab_logical` when the new window's OS surface failed
-    /// (el-free). Detach is a PURE view-move (no `pool.attach`/`detach`), so the
-    /// moved session is window B's SOLE view; `close_window_logical(B)` would detach
-    /// it (views 1→0) and DESTROY the live shell. Instead REVERSE the move: return
-    /// the tab's pane tree to source window A (no pool churn → the session survives),
-    /// then drop the empty, never-shown B. (Contrast the share/create rollbacks,
-    /// where `close_window_logical` is correct: the shared view survives at 2→1, and
-    /// a fresh window's brand-new session has no other home.)
+    /// Undo a `detach_active_tab_logical` when the new window's OS surface failed.
+    /// Detach is a pure view-move, so the moved session is B's sole view and
+    /// `close_window_logical(B)` would destroy the live shell; instead the tab and
+    /// its pane tree return to source window A, then the never-shown B is dropped.
+    /// (The share/create rollbacks use `close_window_logical`: a shared view
+    /// survives, and a fresh window's new session has no other home.)
     pub(crate) fn detach_rollback_logical(&mut self, wid_a: Option<WindowId>, wid_b: WindowId) {
         let returned = self.windows.remove(&wid_b).and_then(|ws_b| {
             Some((
@@ -2451,39 +2318,22 @@ impl App {
         }
         self.winit_to_window.retain(|_, &mut v| v != wid_b);
         self.focus_order.retain(|w| *w != wid_b);
-        // Drop B's native toolbar handle too (matching close_window_logical), so a
-        // failed Move-Tab-to-New-Window doesn't leak a retained AppKit ToolbarHandle for
-        // the never-shown window.
+        // Drop B's native toolbar handle too, as `close_window_logical` does, so a
+        // failed move does not leak an AppKit `ToolbarHandle`.
         self._toolbars.remove(&wid_b);
         self.frontmost_window = wid_a;
         self.sync_active_session();
     }
 
-    /// "Move Tab to Next Window" (Cmd-Shift-M / Window ▸ Move Tab to Next Window): move
-    /// the frontmost window's ACTIVE tab into the NEXT EXISTING window (BTreeMap id
-    /// order, wrapping to the first), and follow it there (the destination becomes
-    /// frontmost). Unlike `detach_active_tab` — which MOVES the view into a BRAND-NEW
-    /// window — this targets an EXISTING window, so it never attaches a winit OS
-    /// surface and needs no `ActiveEventLoop`: it is fully headless-safe and the
-    /// keyboard/menu paths call it directly (no `Wake` round-trip).
-    ///
-    /// It is a PURE view-move: the `Session` is never spawned, dropped, or duplicated,
-    /// so the pool's view-count stays unchanged (zero PTY churn). If the source window
-    /// held ONLY that one tab it becomes empty and is CLOSED — a "merge the source's
-    /// last tab into the next window". A no-op with fewer than two windows (nowhere to
-    /// move the tab).
-    ///
-    /// Returns the REASON it declined rather than `()`. Every bail below is a
-    /// state the user can actually be in, and the menu seam
-    /// (`invoke_menu_action_by_name`) used to answer OK for all of them — a
-    /// silent success for work that never happened. Key-path callers, for which
-    /// a refusal has nowhere to go, discard it explicitly.
+    /// "Move Tab to Next Window" (Cmd-Shift-M): move the frontmost window's active
+    /// tab into the next existing window (id order, wrapping) and follow it there.
+    /// A pure view-move (no PTY churn) that needs no OS surface or `ActiveEventLoop`;
+    /// a source left with no tabs is closed. Returns why it declined, so the menu
+    /// seam (`invoke_menu_action_by_name`) refuses instead of answering OK.
     pub(crate) fn migrate_active_tab_to_next_window(&mut self) -> Result<(), &'static str> {
         let Some(wid_a) = self.frontmost_window else {
             return Err("no window is focused");
         };
-        // The next window after A in id order, wrapping to the first. Every window is
-        // now a normal mixed-tab host; there is no Settings-only accessory kind.
         let dest = self
             .windows
             .range((std::ops::Bound::Excluded(wid_a), std::ops::Bound::Unbounded))
@@ -2494,7 +2344,6 @@ impl App {
             return Err("there is no other window to move the tab to");
         };
         if wid_b == wid_a {
-            // never move a tab onto its own window (also: sole terminal window)
             return Err("there is no other window to move the tab to");
         }
         // Pull A's canonical active tab. A terminal tab additionally moves its
@@ -2514,7 +2363,6 @@ impl App {
             }
             (stable_tab, terminal_index, tree)
         };
-        // Whether A will be canonically empty after the move.
         let source_now_empty = self
             .windows
             .get(&wid_a)
@@ -2527,7 +2375,7 @@ impl App {
             ws.tab_set.remove(stable_tab.id);
             align_terminal_projection_to_active(ws, &self.view_store);
         }
-        // Append the EXISTING stable tab to B. Only terminal content extends the
+        // Append the existing stable tab to B. Only terminal content extends the
         // compatibility projection. No pool count changes: the view moved.
         if let Some(ws) = self.windows.get_mut(&wid_b) {
             if let Some(tree) = tree.as_ref() {
@@ -2539,14 +2387,9 @@ impl App {
                 .expect("moved tab id is process-unique");
             align_terminal_projection_to_active(ws, &self.view_store);
         }
-        // Focus follows the moved tab: the destination becomes frontmost.
         self.frontmost_window = Some(wid_b);
-        // Resize the moved panes to B's grid: a migrate to a DIFFERENT-sized window
-        // must SIGWINCH the moved panes' engines + PTYs to B's cell geometry, or they
-        // keep A's stale grid (no reflow, no SIGWINCH). `resize_panes` no-ops per pane
-        // when the dims already match (so it's free when A and B are the same size)
-        // and re-lays + SIGWINCHes otherwise — mirroring how `apply_close_outcome`
-        // pairs `resize_panes(wid)` with `sync_window(wid)`.
+        // Resize the moved panes to B's grid, or they keep A's (no reflow, no
+        // SIGWINCH); `resize_panes` is a per-pane no-op when the dims match.
         if tree.is_some() {
             self.resize_panes(wid_b);
         }
@@ -2565,12 +2408,10 @@ impl App {
         }
         // Frontmost = B: re-point the global control/notify handle onto B's active tab.
         self.sync_active_session();
-        // Raise B's OS surface so macOS KEY focus follows the logical frontmost. Without
-        // it, when the SOURCE window survives (had >1 tab) it keeps OS key focus while B
-        // is logical-frontmost — typed keys route to the still-focused A while Cmd-W /
-        // Cmd-T act on the unseen B (and can even arm the foreground-job confirm in B's
-        // invisible titlebar). No-op headless (no os_window); the follow-on
-        // WindowEvent::Focused(true) reconciles with the already-set frontmost.
+        // Raise B's OS surface so macOS key focus follows the logical frontmost:
+        // otherwise a surviving source keeps key focus, and typed keys go to A
+        // while Cmd-W / Cmd-T act on the unseen B. No-op headless; the follow-on
+        // `WindowEvent::Focused(true)` agrees with the frontmost already set.
         if let Some(w) = self.windows.get(&wid_b).and_then(|ws| ws.os_window.clone()) {
             w.focus_window();
         }
@@ -2583,32 +2424,21 @@ impl App {
         Ok(())
     }
 
-    /// "Open Active Session in New Window" (Cmd-Shift-O / Window ▸ Open Session in New
-    /// Window): show the frontmost window's ACTIVE session in a SECOND window, so the
-    /// same live terminal grid is visible in two windows at once ("watch a log in one,
-    /// type in another"). Unlike `detach_active_tab` this ADDS a view rather than
-    /// MOVING one: the source window keeps its tab, and a fresh window is built viewing
-    /// the SAME pooled session (no spawn). The pool's view-count goes 1→2, so the PTY
-    /// stays open until BOTH viewers detach (each `close_window_logical` of a viewing
-    /// tab drops one view); the `pool.attach` here is paired with exactly one future
-    /// `pool.detach`. This is the logical half (everything EXCEPT the OS-window attach),
-    /// returning the new window's id (or `None` if no session is in view), so it is
-    /// headless-testable.
+    /// "Open Active Session in New Window" (Cmd-Shift-O): show the frontmost
+    /// window's active session in a second window too. Unlike `detach_active_tab`
+    /// this adds a view: the source keeps its tab, and a fresh window views the
+    /// same pooled session (no spawn). The pool's view count rises by one, so the
+    /// PTY stays open until both viewers detach; this `pool.attach` pairs with
+    /// exactly one future `pool.detach`. The logical half (everything except the
+    /// OS window), returning the new window's id, or `None` with no session in
+    /// view.
     pub(crate) fn open_active_session_in_new_window_logical(&mut self) -> Option<WindowId> {
         let wid_a = self.frontmost_window?;
         // Sharing is terminal-only. Native focus has no PTY-backed capability,
         // including inside a heterogeneous tab.
         let s = self.front_terminal(wid_a)?.session;
-        // Share the FOCUSED pane's session as a fresh SINGLE-PANE tab in B. A
-        // shared (views>1) session is always a full single-pane tab on each side —
-        // it is never split (split-spawned panes are always views=1), so B holds a
-        // single-leaf pane tree on the focused session.
         let (rows, cols) = self.windows.get(&wid_a).map(|ws| (ws.rows, ws.cols))?;
-        // Bump the view count: the session is now displayed by TWO windows. The PTY
-        // stays open until BOTH detach (views back to 0).
         self.pool.attach(s);
-        // Build window B viewing the SAME pooled session (no spawn). Clone the mirror
-        // Arcs from the pool.
         let Some(sess) = self.pool.get(s) else {
             self.detach_session_view(s); // unwind the attach on the impossible miss
             return None;
@@ -2642,12 +2472,10 @@ impl App {
         self.windows.insert(wid_b, Box::new(ws_b));
         self.install_window_config_assets(wid_b);
         self.frontmost_window = Some(wid_b);
-        // Re-mirror BOTH viewers: B is the new frontmost (also re-points the global
-        // control/notify handle to B). A is unchanged — it still displays `s`. NOTE:
-        // `s`'s reader thread stamps its `Wake::Output` with ONE owning window, but the
-        // `Output` arm routes via `windows_displaying(s)` — now BOTH A and B, since both
-        // canonically contain `s` — so the shared session's output repaints both viewers
-        // with no re-stamp (the multi-viewer fan-out is now genuinely exercised).
+        // B is the new frontmost (which re-points the global control/notify
+        // handle); A still displays `s`. The reader stamps `Wake::Output` with one
+        // owning window, but the `Output` arm routes via `windows_displaying(s)`,
+        // which now names both, so output repaints both viewers.
         self.sync_active_session(); // frontmost = B
         debug_assert!(
             self.structural_invariants_ok(),
@@ -2665,38 +2493,33 @@ impl App {
             return;
         };
         if !self.headless && !self.attach_os_window(el, wid) {
-            // GPU surface failed: drop the new viewer. `close_window_logical` detaches
-            // its SHARED view (views N→N-1), so the session survives in the original
-            // window — no black orphan, no lost session.
+            // GPU surface failed: drop the new viewer. `close_window_logical`
+            // detaches its shared view, so the session survives in the original
+            // window.
             self.close_window_logical(wid);
         }
     }
 
-    /// Test-only: append a stub `session` as a NEW tab of EXISTING window `wid` and
-    /// switch to it — the shipping [`Self::install_tab_session`] body a tab lands
-    /// through ([`Self::install_new_tab`]), fed a stub session instead of a real PTY. `session.id` MUST
-    /// equal `self.next_session_id` (the test builds it that way), which is then
-    /// bumped. Used to stage multi-tab windows; the appended terminal becomes the
-    /// window's canonical front capability.
+    /// Test-only: append a stub `session` as a new tab of existing window `wid`
+    /// and switch to it, through the [`Self::install_tab_session`] body a tab
+    /// lands through ([`Self::install_new_tab`]). `session.id` must equal
+    /// `self.next_session_id`, which is then bumped.
     #[cfg(test)]
     pub(crate) fn push_stub_tab(&mut self, wid: WindowId, session: crate::Session) {
         self.install_new_tab(wid, session);
     }
 
-    /// Test-only: split window `wid`'s ACTIVE tab into a 2-pane vertical split,
-    /// spawning a fresh stub session for the new (now-focused) pane — the shipping
-    /// [`Self::install_split_session`] body a split lands through
-    /// ([`Self::install_split_pane`]), fed a stub
-    /// session instead of a real PTY (the pre-spawn refusals are the caller's to
-    /// stage). Returns the new pane's session id.
+    /// Test-only: split window `wid`'s active tab vertically, spawning a stub
+    /// session for the new focused pane, through the [`Self::install_split_session`]
+    /// body a split lands through ([`Self::install_split_pane`]); the pre-spawn
+    /// refusals are the caller's to stage. Returns the new pane's session id.
     #[cfg(test)]
     pub(crate) fn split_active_stub_tab(&mut self, wid: WindowId) -> u64 {
         self.split_active_stub_tab_dir(wid, pane::SplitDir::Vertical)
     }
 
-    /// [`Self::split_active_stub_tab`] in a named direction — the minimum-pane
-    /// tests need the audit's ALTERNATING gesture (left/right, top/bottom, …),
-    /// which is what drove the tree deep enough to mint off-grid panes.
+    /// [`Self::split_active_stub_tab`] in a named direction: the minimum-pane
+    /// tests alternate directions to drive the tree deep.
     #[cfg(test)]
     pub(crate) fn split_active_stub_tab_dir(&mut self, wid: WindowId, dir: pane::SplitDir) -> u64 {
         self.split_active_stub_tab_dir_with_sink(
@@ -2706,11 +2529,10 @@ impl App {
         )
     }
 
-    /// [`Self::split_active_stub_tab_dir`] with a caller-provided sink for the NEW
-    /// pane's session, so a test can observe bytes crossing that pane's own egress
-    /// boundary — a window-level mirror reports silence for a session the window
-    /// is showing but not fronting, which is exactly the DEC 1004 focus-report
-    /// case (the pane that LOST the keyboard is the one with something to say).
+    /// [`Self::split_active_stub_tab_dir`] with a caller-provided sink for the new
+    /// pane's session, so a test can observe bytes crossing that pane's own
+    /// egress: a window-level mirror is silent for a session the window shows but
+    /// does not front, the DEC 1004 focus-report case.
     #[cfg(test)]
     pub(crate) fn split_active_stub_tab_dir_with_sink(
         &mut self,
@@ -2783,13 +2605,9 @@ impl App {
         (sid, view)
     }
 
-    /// Cmd-T: open a new tab — a fresh shell session in the SAME window — and
-    /// switch to it. Spawns the session via the factory (its own PTY/engine/policy/
-    /// OSC52/reader + a FRESH shell-integration nonce) at the current grid size. A
-    /// spawn failure is logged and ignored (the existing tabs survive); it does NOT
-    /// take down the window, unlike a fatal session-0 failure at startup.
+    /// Cmd-T: open a new tab (a fresh shell session in the frontmost window) and
+    /// switch to it. A spawn failure is logged and the existing tabs survive.
     pub(crate) fn open_tab(&mut self) {
-        // Cmd-T / menu open in the FRONTMOST window.
         if let Some(front) = self.frontmost_window {
             self.open_tab_in(front);
         }
@@ -2831,15 +2649,13 @@ impl App {
         Ok(())
     }
 
-    /// Resolve + validate a CONNECTED spawn's origin and place BEFORE anything
-    /// is created (design §6 `spawn connected=` / the §2.3 presets) — the
-    /// headless-testable half of [`Self::spawn_connected_session`] (the spawn
-    /// itself needs the event loop). Returns the origin's local id and, for
-    /// `place=tab`, the window hosting it (the newborn lands beside the
-    /// origin). `place=window` under headless is the NEW `ERR headless` reply
-    /// (design §1.4#7): the `Wake::CreateWindow` arm silently ignores, but a
-    /// reply-bearing, authority-minting spawn must refuse honestly — and
-    /// BEFORE any create. `place=tab` stays headless-legal (tabs are logical).
+    /// Resolve and validate a connected spawn's origin and place before anything
+    /// is created: the headless-testable half of
+    /// [`Self::spawn_connected_session`]. Returns the origin's local id and, for
+    /// `place=tab`, the window hosting it (the newborn lands beside the origin).
+    /// `place=window` refuses under headless: the `Wake::CreateWindow` arm would
+    /// ignore it silently, and a reply-bearing, authority-minting spawn must
+    /// refuse before any create. `place=tab` stays headless-legal.
     pub(crate) fn connected_spawn_precheck(
         &self,
         place: crate::connections::ConnectedSpawnPlace,
@@ -2849,9 +2665,8 @@ impl App {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
             match g.by_sid(origin) {
                 None => return Err("no such session".to_string()),
-                // A dead origin can neither drive nor be driven; its table's
-                // nonce already fails closed — refuse honestly (the `connect`
-                // verb's rule).
+                // A dead origin can neither drive nor be driven (its table's
+                // nonce already fails closed): refuse, as `connect` does.
                 Some(h) if matches!(h.state, session_store::SessionState::Exited) => {
                     return Err("exited".to_string());
                 }
@@ -2891,11 +2706,10 @@ impl App {
         self.pool.get(local).and_then(Self::session_folder)
     }
 
-    /// Mint a CONNECTED spawn's `both` session connection through the ONE mint
-    /// path ([`crate::connections::connect_in`], design §1.4#2): controlled ⇒
-    /// the origin drives the newborn (`src=origin, dst=newborn`); controller ⇒
-    /// the newborn drives the origin. Split from the spawn so the mint half is
-    /// unit-testable against registered stub sessions (no PTY, no event loop).
+    /// Mint a connected spawn's `both` connection through the one mint path
+    /// ([`crate::connections::connect_in`]): controlled means the origin drives
+    /// the newborn (`src=origin, dst=newborn`), controller the reverse. Split from
+    /// the spawn so it is unit-testable against registered stub sessions.
     pub(crate) fn mint_connected(
         &self,
         kind: crate::connections::ConnectedSpawnKind,
@@ -2985,7 +2799,6 @@ impl App {
             // A controlled window's first session is its origin's child.
             Place::Window => self.open_window_off_loop(ask, lineage_parent, then),
             Place::Tab => {
-                // Precheck resolved the hosting window for every Tab place.
                 let host = host.expect("tab precheck resolves a host window");
                 self.open_off_loop(host, crate::tab_spawn::SpawnPlace::Tab, ask, then);
             }
@@ -3495,18 +3308,13 @@ impl App {
         }
     }
 
-    /// Post one herald notification through `notify.rs`'s bounded queue — the
-    /// consent notice's path: `try_send`, dropped when full. `Err` says why
-    /// the queue refused it, for the herald's one `aterm.log` line
-    /// ([`crate::status_item::herald_log_line`] makes it a `warn`) — never
-    /// logged here with the body, which can carry a box's command (a bug
-    /// report attaches the log). Not behind `allow_notifications`: that
-    /// opt-in guards PROGRAM-originated escapes, and this text is aterm's
-    /// own — behind `desktop_alerts` instead, which [`Self::herald_session`]
-    /// checks before calling here (and the delivery thread again, for every
-    /// [`crate::notify::NotifyMsg::herald`]). Under `cfg(test)` the notice is recorded instead (and counts as
-    /// queued, unless a test armed `HERALD_REFUSAL`), so no test ever runs a
-    /// notifier subprocess.
+    /// Post one herald notification through `notify.rs`'s bounded queue (`try_send`,
+    /// dropped when full). `Err` says why the queue refused it; the body is never
+    /// logged, since it can carry a box's command. Gated by `desktop_alerts`
+    /// (checked by [`Self::herald_session`] and the delivery thread), not
+    /// `allow_notifications`, which guards program-originated escapes. Under
+    /// `cfg(test)` the notice is recorded instead (queued unless a test armed
+    /// `HERALD_REFUSAL`).
     fn post_herald_notice(
         &self,
         notice: &crate::status_item::HeraldNotice,
@@ -4320,16 +4128,9 @@ impl App {
     /// ([`Self::focus_session_window`]) — a raise from the wire and a raise from
     /// a menu row cannot drift, de-miniaturize belt included.
     ///
-    /// SPEC (design §9: the window-routing obligations): this real seam IS the
-    /// `WindowRouting.RaiseSession` action — a pure focus re-point of
-    /// `frontmost` onto an already-allocated id (the host window's), minting
-    /// and destroying nothing and never exiting. The `#[refines]` keeps
-    /// `window_routing` fully bound now that the act exists; Tier-1 drives this
-    /// seam in `window_routing_conformance` (headless, the OS-focus half is a
-    /// windowed concern, so the projected step may be the model-admitted
-    /// `frontmost' = frontmost` stutter). PROJECTION
-    /// (`aterm_gui::App::project_window_routing`): the
-    /// `window_routing_conformance::project` tuple.
+    /// This is the `WindowRouting.RaiseSession` action: a focus re-point of
+    /// `frontmost` onto an existing window, minting and destroying nothing; headless,
+    /// the projected step may be the model-admitted `frontmost' = frontmost` stutter.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -4356,43 +4157,17 @@ impl App {
         self.focus_session_window(session)
     }
 
-    /// Close the PANE showing `session` — its tab only when that pane was the
-    /// tab's last — reporting how far the close got.
+    /// Close the pane showing `session` (its tab only when it was the tab's last pane),
+    /// reporting how far the close got. A split pane takes the Cmd-W collapse
+    /// ([`Self::close_split_pane_by_id`]); a tab's only pane takes `close_tab_at`, where
+    /// the last-tab deferral lives. A close that leaves its window standing is guarded
+    /// by the pane's own job ([`Self::pane_close_hangs_up_a_job`]); a window-exiting
+    /// close keeps `close_tab_at`'s confirm.
     ///
-    /// ONE PANE, NOT THE TAB. Measured 2026-09-22 (audit): in a tab split three
-    /// ways, `@<pane> close` answered `OK closed s-…` and the WHOLE tab went —
-    /// `panes` lost the tab (15 → 14), both siblings answered `ERR no such
-    /// session`, and `exits` had three `ctl-close` rows within 4 ms. One close on
-    /// one pane killed three shells: the verb ran the tab strip's ✕
-    /// (`close_tab_at`, every pane as a unit — right when a tab had one pane, and
-    /// never revisited once it could hold three), and because that close never
-    /// exits a window with other tabs, no busy guard stood between it and the
-    /// siblings' jobs. A split pane now takes the Cmd-W collapse
-    /// ([`Self::close_split_pane_by_id`]), which retires that pane alone; the
-    /// whole-tab path is kept for the tab whose ONE pane this is, where the two
-    /// closes are the same close and the last-tab deferral below lives.
-    ///
-    /// THE GUARD IS THE PANE'S. Every close here that leaves its window standing
-    /// — a split collapse, a terminal leaf beside a native view, the one pane of
-    /// a tab that is not the window's last — reads the job of the pane being
-    /// closed ([`Self::pane_close_hangs_up_a_job`]) and nothing else, before
-    /// anything moves. The close that exits the window keeps the window-exit
-    /// confirm inside `close_tab_at`, which reads a window holding exactly this
-    /// pane: the same guard, in the last-tab confirm's words.
-    ///
-    /// DIFF (like spawn): the store is the evidence — if the session is gone
-    /// afterward the close happened; if it survives, a guard refused it and we
-    /// say so. The one case that diff cannot read is a LAST-tab
-    /// close: it is DEFERRED (the window teardown that retires the session needs
-    /// an `ActiveEventLoop` the close paths do not hold), so the session is still
-    /// registered here through no fault of its own. That is
-    /// [`CloseProgress::Deferred`], not a refusal — answer it with
-    /// [`Self::close_session_verdict`] after running the escalation, or an idle
-    /// session gets `ERR close refused (a running job armed the last-tab
-    /// confirm)` for a close that had simply not happened yet. A session that
-    /// survives a pane that DID go is held by another view of it, and the reply
-    /// names that viewer ([`Self::surviving_session_reason`]) rather than a
-    /// refusal nothing raised.
+    /// The store is the evidence: a session gone afterwards was closed; one still there
+    /// was refused or is held by another view ([`Self::surviving_session_reason`]). A
+    /// last-tab close is [`CloseProgress::Deferred`]: answer it with
+    /// [`Self::close_session_verdict`] after the escalation.
     pub(crate) fn close_session_by_id(&mut self, session: u64) -> Result<CloseProgress, String> {
         let found = self.windows.keys().find_map(|wid| {
             self.terminal_view_location(*wid, session)
@@ -4421,7 +4196,6 @@ impl App {
         } else if self.close_tab_at(wid, location.canonical_index)
             && let Some(ws) = self.windows.get_mut(&wid)
         {
-            // The tab's one pane: closing it IS closing the tab.
             ws.pending_close = true; // last tab → the window closes with it
             deferred = Some(wid);
         }
@@ -4448,18 +4222,14 @@ impl App {
             .is_some_and(|tab| tab.root.len() > 1)
     }
 
-    /// The wire `close` of one pane of a SPLIT terminal tab: the Cmd-W collapse
-    /// ([`Self::close_active_tab`]) aimed by session instead of by focus, so the
-    /// pane need not be focused nor its tab active. It shares the gesture's code
-    /// path — [`pane::PaneTree::close_pane`], then [`Self::apply_close_outcome`]
-    /// (the sibling grows into the space with its shell untouched; the view, the
-    /// pool and the registry retire in that order) — and its reopen record, so a
-    /// pane the wire closed collapses, tears down and comes back exactly as one
-    /// Cmd-W closed. The tab survives by construction (a sibling remains), so
-    /// nothing here can exit the window; the busy guard is the PANE's own and
-    /// ran in the caller before this. `Ok(())` = the pane collapsed; whether its
-    /// session then left the registry is the caller's diff. `Err` = it did not,
-    /// and why.
+    /// The wire `close` of one pane of a split terminal tab: the Cmd-W collapse
+    /// ([`Self::close_active_tab`]) aimed by session instead of focus. It shares
+    /// the gesture's path ([`pane::PaneTree::close_pane`], then
+    /// [`Self::apply_close_outcome`]: the sibling grows into the space; view, pool
+    /// and registry retire in that order) and its reopen record. A sibling
+    /// remains, so this never exits the window; the pane's busy guard ran in the
+    /// caller. `Ok(())` = the pane collapsed (whether its session left the
+    /// registry is the caller's diff); `Err` = it did not, and why.
     fn close_split_pane_by_id(
         &mut self,
         wid: WindowId,
@@ -4473,9 +4243,9 @@ impl App {
                 view: location.view,
             },
         )) {
-            // QUEUED onto the pending handoff's teardown and applied once that
-            // cancellation lands; the pane is still here right now, so the reply
-            // must not read as "closed" (`close_tab_at` says the same of a tab).
+            // Queued onto the pending handoff's teardown, applied once that
+            // cancellation lands; the pane is still here, so the reply must not
+            // read as closed.
             return Err(
                 "close deferred (a pending update handoff is being cancelled first)".to_string(),
             );
@@ -4486,9 +4256,9 @@ impl App {
             return Err("session view changed during close".to_string());
         };
         let recovery = self.closed_view_record_for(wid, location.tab_id, location.view);
-        // `close_pane` falls back to the FOCUSED pane when the session it is handed
-        // is not in the tree. Aimed by session, a projection that has lost this
-        // session must close nothing, never whichever pane happens to have focus.
+        // `close_pane` falls back to the focused pane when the session it is
+        // handed is not in the tree; aimed by session, a projection that lost this
+        // session must close nothing.
         let outcome = self.windows.get_mut(&wid).and_then(|ws| {
             let tree = ws.layouts.get_mut(tab)?;
             tree.contains(session).then(|| tree.close_pane(session))
@@ -4501,11 +4271,10 @@ impl App {
         };
         // `Collapsed` never closes the window: the bool is the `LastPane` arm's.
         let _ = self.apply_close_outcome(wid, tab, outcome);
-        // The arm REFUSES the retirement when the closed leaf survived the
-        // re-projection (the ownership-order seam it documents): the pane, its
-        // view and its PTY are all still here, so say so rather than leave the
-        // caller's diff to blame a co-viewer. It is the same `ViewId` the close
-        // aimed at — a Cmd-Shift-O twin of the session is a different view.
+        // The arm refuses the retirement when the closed leaf survived the
+        // re-projection: the pane, its view and its PTY are still here, so say so
+        // rather than let the caller's diff blame a co-viewer. (A Cmd-Shift-O twin
+        // of the session is a different `ViewId`.)
         if self.view_store.get(location.view).is_some() {
             return Err("close refused (the pane is still open)".to_string());
         }
@@ -4515,24 +4284,20 @@ impl App {
         Ok(())
     }
 
-    /// Whether closing the pane showing `session` would hang up a foreground JOB:
-    /// the session is busy by the one predicate every close path reads
-    /// (`session_foreground_busy`: the PTY's foreground pgrp, or the shell's open
-    /// 133;C block) AND this pane holds its last pool view, so the collapse drops
-    /// the `Session` and its PTY master with it. A Cmd-Shift-O co-viewed session
-    /// keeps running in its other viewer — closing this pane only detaches a
-    /// view — so it never counts, exactly as `window_has_foreground_job` counts
-    /// only the sessions a window close would actually SIGHUP.
+    /// Whether closing the pane showing `session` would hang up a foreground job: the
+    /// session is busy (`session_foreground_busy`: the PTY's foreground pgrp, or an
+    /// open 133;C block) and this pane holds its last pool view, so the collapse drops
+    /// the PTY master. A co-viewed session keeps running in its other viewer and never
+    /// counts, as in `window_has_foreground_job`.
     fn pane_close_hangs_up_a_job(&self, session: u64) -> bool {
         self.pool.views(session).is_some_and(|views| views <= 1)
             && self.session_foreground_busy(session)
     }
 
     /// [`Self::pane_close_hangs_up_a_job`] for every pane of window `wid`'s tab
-    /// `i` at once — the whole-tab close `tab close` makes. Read from the
-    /// canonical tree, so a terminal leaf beside a native view counts as well.
-    /// A session is at risk when this tab holds ALL its pool views (a twin in
-    /// another tab or window keeps it alive), the rule `window_has_foreground_job`
+    /// `i` at once: the whole-tab close `tab close` makes. Read from the canonical
+    /// tree, so a terminal leaf beside a native view counts. A session is at risk
+    /// when this tab holds all its pool views, the rule `window_has_foreground_job`
     /// applies to a window. An index no tab holds hangs up nothing.
     fn tab_close_hangs_up_a_job(&self, wid: WindowId, i: usize) -> bool {
         let Some(tab) = self.windows.get(&wid).and_then(|ws| ws.tab_set.tab_at(i)) else {
@@ -4575,15 +4340,10 @@ impl App {
         !(busy && self.close_confirm == crate::app_window::CloseConfirm::WireRefuseBusy)
     }
 
-    /// Why a close that DID retire its pane in window `wid` left `session`
-    /// registered: another pool view still holds it (one close per viewer).
-    /// Another WINDOW is worded as the last-tab path words it
-    /// ([`Self::deferred_close_reason`]), so a driver matching on the reply
-    /// meets one spelling of that fact. A view in the SAME window is the one
-    /// the wire cannot otherwise tell apart — a Cmd-Shift-O share moved back
-    /// with Cmd-Shift-M leaves two tabs of one window on one session — and "another
-    /// window" would send the caller looking for a window that is not there.
-    /// The last arm is that path's last arm for a pane: registered, shown nowhere.
+    /// Why a close that did retire its pane in window `wid` left `session` registered:
+    /// another pool view still holds it (one close per viewer). Worded as
+    /// [`Self::deferred_close_reason`] words it, so a driver meets one spelling; a view
+    /// in the same window is named as another tab.
     fn surviving_session_reason(&self, wid: WindowId, session: u64) -> String {
         if self
             .windows
@@ -4598,11 +4358,10 @@ impl App {
         }
     }
 
-    /// The wire verdict of a close whose [`CloseProgress`] is known, read AFTER
-    /// the caller ran the deferred teardown (`escalate_pending_close`). The
-    /// store is still the evidence: a `Deferred` close that retired its session
-    /// is `OK closed`, and one that did not says WHICH of the three deferred
-    /// outcomes it is looking at (see [`Self::deferred_close_reason`]) instead
+    /// The wire verdict of a close whose [`CloseProgress`] is known, read after
+    /// the caller ran the deferred teardown (`escalate_pending_close`). A
+    /// `Deferred` close that retired its session is `OK closed`; one that did not
+    /// names which deferred outcome it is ([`Self::deferred_close_reason`]) instead
     /// of blaming the last-tab confirm, which never fired.
     pub(crate) fn close_session_verdict(
         &self,
@@ -4616,27 +4375,13 @@ impl App {
         }
     }
 
-    /// Why a DEFERRED close left `session` registered, worded from what this
-    /// process can actually SEE rather than from the one case that was first
-    /// implemented.
-    ///
-    /// The distinction is load-bearing because a Cmd-Shift-O co-viewed session
-    /// takes the SAME path as a stuck teardown: `close_session_by_id` aims at
-    /// the LOWEST window id holding the session, that window's teardown runs to
-    /// completion, and the session is STILL registered — `close_window_logical`
-    /// deregisters only when its `detach_session_view` dropped the last pool
-    /// view, and the other window's view is still attached. Answering "the
-    /// window teardown has not run" there states a falsehood about a teardown
-    /// that did run, and points the caller at a window that no longer exists.
-    ///
-    /// So: another window holding the session is the reason the close did not
-    /// take, whether or not the teardown is also outstanding — it is the one
-    /// that survives the escalation and the one the caller must act on. Failing
-    /// that, the deferred window still being here IS the outstanding teardown (a
-    /// native or document shutdown barrier held `close_window`). The last arm is
-    /// neither: the window is gone and no window shows the session, so a pool
-    /// view outlived every viewer — reported as what it is instead of borrowing
-    /// one of the other two explanations.
+    /// Why a deferred close left `session` registered, from what this process can see.
+    /// `close_window_logical` deregisters only when its `detach_session_view` dropped
+    /// the last pool view, so another window holding the session (a Cmd-Shift-O
+    /// co-view) is the reason first, whether or not the teardown is also outstanding.
+    /// Else the deferred window still standing is the outstanding teardown (a native or
+    /// document shutdown barrier held `close_window`); else a pool view outlived every
+    /// viewer.
     fn deferred_close_reason(&self, window: WindowId, session: u64) -> String {
         if self
             .windows
@@ -4661,13 +4406,12 @@ impl App {
             .is_some()
     }
 
-    /// Open a new tab in window `owner` (window-aware: the tab-strip `+` of a
-    /// non-frontmost window opens there, not in the frontmost). The new session is
-    /// stamped with `owner` so its output/exit/bell route back to THIS window.
-    ///
-    /// TRUST anchor: the `NewTab` action of the ty-proven `tab_strip` machine
-    /// (`tab_strip_model()`) — appends a tab and re-syncs the owner's native strip,
-    /// once the shell spawned off the loop is up ([`Self::install_tab_session`]).
+    /// Open a new tab in window `owner` (the tab-strip `+` of a non-frontmost
+    /// window opens there). The new session is stamped with `owner` so its
+    /// output, exit and bell route back to it. Refines the `tab_strip` machine's
+    /// `NewTab` action (`tab_strip_model()`): the tab is appended and the owner's
+    /// native strip re-synced once the shell spawned off the loop is up
+    /// ([`Self::install_tab_session`]).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -4680,25 +4424,22 @@ impl App {
         self.open_tab_in_cwd(owner, None);
     }
 
-    /// [`open_tab_in`] with an optional CWD override. `None` keeps the default:
-    /// inherit the focused pane's cwd so a Cmd-T tab opens where the user is.
-    ///
-    /// The shell is spawned off the event loop ([`crate::tab_spawn`]): this turn
-    /// books the tab, and the tab is appended when its session comes back.
+    /// [`Self::open_tab_in`] with an optional cwd override. `None` inherits the
+    /// focused pane's cwd, so a Cmd-T tab opens where the user is. The shell
+    /// spawns off the event loop ([`crate::tab_spawn`]): this turn books the tab,
+    /// which is appended when its session comes back.
     pub(crate) fn open_tab_in_cwd(&mut self, owner: WindowId, cwd_override: Option<&str>) {
         self.open_tab_off_loop(owner, cwd_override, crate::tab_spawn::TabSpawnThen::Nothing);
     }
 
-    /// Install an already-spawned `session` as a NEW last tab of window `owner` and
-    /// switch to it — what a tab spawned off the loop lands as
+    /// Install an already-spawned `session` as a new last tab of window `owner`
+    /// and switch to it, as a tab spawned off the loop lands
     /// ([`Self::install_tab_session`] under the focused pane's parent), for the
-    /// headless tests that drive that SAME body with a stub session
-    /// (`push_stub_tab`). `session.id` must be the minted `next_session_id`, which
-    /// this bumps.
+    /// headless tests that drive that same body with a stub (`push_stub_tab`).
+    /// `session.id` must be the minted `next_session_id`, which this bumps.
     ///
-    /// The new tab moves the owner's front session, so when `owner` is the front
-    /// window the global control/notify handle follows it here, in the seam that
-    /// moved it (`active_handle_model`; Tier-1: `active_handle_conformance`).
+    /// When `owner` is the front window the global control/notify handle follows
+    /// the new tab (`active_handle_conformance`).
     #[cfg(test)]
     pub(crate) fn install_new_tab(&mut self, owner: WindowId, session: crate::Session) {
         debug_assert_eq!(
@@ -4710,7 +4451,7 @@ impl App {
         self.install_tab_session(owner, session, parent);
     }
 
-    /// The family-tree parent of a tab opened in `owner`: the FOCUSED pane's
+    /// The family-tree parent of a tab opened in `owner`: the focused pane's
     /// session of that window (a user-opened tab is a child of the pane it was
     /// opened from).
     pub(crate) fn new_tab_parent(&self, owner: WindowId) -> Option<aterm_session::SessionId> {
@@ -4756,8 +4497,8 @@ impl App {
         behind: Option<usize>,
     ) {
         let id = session.id;
-        // P1.1: register in the process-wide registry (additive index) so a
-        // cross-session `@<selector>` verb can reach this tab.
+        // Register in the process-wide registry so a cross-session
+        // `@<selector>` verb can reach this tab.
         Self::register_session(&self.store, &session, parent);
         let layout = pane::PaneTree::new(id);
         let tab = crate::register_terminal_tab(&mut self.tab_ids, &mut self.view_store, &layout)
@@ -4793,10 +4534,10 @@ impl App {
         }
     }
 
-    /// Switch window `wid` to tab `i` (window-aware: a tab-strip CLICK targets the
-    /// clicked window, which may not be the frontmost). Re-mirrors that window; when
-    /// it is the frontmost, also re-points the global control/notify handles
-    /// (`sync_active_session`), matching the keyboard/menu `switch_tab` behavior.
+    /// Switch window `wid` to tab `i` (a tab-strip click targets the clicked
+    /// window, which may not be the frontmost). Re-mirrors that window; when it is
+    /// the frontmost, also re-points the global control/notify handles
+    /// (`sync_active_session`), as the keyboard/menu `switch_tab` does.
     pub(crate) fn switch_tab_in(&mut self, wid: WindowId, i: usize) {
         let Some((tab_id, terminal_index, already_active)) =
             self.windows.get(&wid).and_then(|ws| {
@@ -4831,11 +4572,9 @@ impl App {
     }
 
     /// Cmd-Shift-] / Cmd-Shift-[: cycle to the next/previous tab, wrapping. No-op
-    /// with a single tab.
-    ///
-    /// TRUST anchor: the `SelectTab` action of the ty-proven `tab_strip` machine
-    /// (`tab_strip_model()`) — the DETERMINISTIC wrap the model encodes (vs the
-    /// arbitrary-index `switch_tab_in`); re-syncs the strip selection in lockstep.
+    /// with a single tab. Refines the `tab_strip` machine's `SelectTab` action: the
+    /// deterministic wrap the model encodes, unlike the arbitrary-index
+    /// `switch_tab_in`.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -4851,10 +4590,10 @@ impl App {
         self.cycle_tab_in(wid, forward);
     }
 
-    /// [`Self::cycle_tab`] on an explicit window — the aimed `@<sid> tab next|prev`
-    /// (design S3) cycles the window hosting the session, front or not. The same
-    /// deterministic wrap; re-mirrors like [`Self::switch_tab_in`] (the global
-    /// handles follow only when `wid` IS the front window).
+    /// [`Self::cycle_tab`] on an explicit window: the aimed `@<sid> tab next|prev`
+    /// cycles the window hosting the session, front or not. Re-mirrors like
+    /// [`Self::switch_tab_in`] (the global handles follow only when `wid` is the
+    /// front window).
     pub(crate) fn cycle_tab_in(&mut self, wid: WindowId, forward: bool) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
@@ -4883,14 +4622,12 @@ impl App {
         self.palette_sync_native_scope(wid);
     }
 
-    /// Apply a control-socket `tab` verb ([`TabAction`]) to the FRONT window and
-    /// return the resulting `(active_index, tab_count)` for the verb's reply. Driven
-    /// by [`Wake::TabCmd`] on the main loop (the sole `App` mutator). Each action
-    /// reuses the EXISTING command path — `New` => [`Self::open_tab`] (same as File ▸
-    /// New Tab / the toolbar "+"), `Select(n)` => [`Self::switch_tab`], `Next`/`Prev`
-    /// => [`Self::cycle_tab`] — so the verb adds no parallel tab logic. With no front
-    /// window it REFUSES rather than reporting the `(0, 0)` it used to, which a
-    /// caller reads as a tab count.
+    /// Apply a control-socket `tab` verb ([`TabAction`]) to the front window and
+    /// return `(active_index, tab_count)` for the reply. Driven by
+    /// [`crate::Wake::TabCmd`] on the main loop. Each action reuses the existing
+    /// command path (`New` => [`Self::open_tab`], `Select(n)` =>
+    /// [`Self::switch_tab`], `Next`/`Prev` => [`Self::cycle_tab`]). With no front
+    /// window it refuses.
     pub(crate) fn apply_tab_cmd(&mut self, action: TabAction) -> Result<(usize, usize), String> {
         match self.frontmost_window {
             Some(front) => self.apply_tab_cmd_in(front, action),
@@ -4898,42 +4635,28 @@ impl App {
         }
     }
 
-    /// [`Self::apply_tab_cmd`] on an explicit window — the aimed `@<sid> tab …`
-    /// (design S3) drives the window hosting the session, front or not. Each
-    /// action reuses the window-aware command path its front-window twin
-    /// delegates to (`open_tab_in` / `switch_tab_in` / `cycle_tab_in` /
-    /// `close_tab_via_verb` / `move_tab`), so the aimed verb adds no
-    /// parallel tab logic either; an unknown `wid` reports `(0, 0)`.
+    /// [`Self::apply_tab_cmd`] on an explicit window: the aimed `@<sid> tab …` drives
+    /// the window hosting the session, front or not. An unknown `wid` reports `(0, 0)`.
     ///
-    /// REFUSALS REACH THE WIRE. This used to return the post-state pair and
-    /// nothing else, so `cmd_tab` minted `OK <active> <count>` from it no matter
-    /// what happened — and two different declines hid behind that OK. An
-    /// out-of-range index was a silent no-op whose reply, for `move`, is
-    /// BYTE-IDENTICAL to an honoured move; and a tab host that refused the close
-    /// (a native document waiting on a durable checkpoint) had its reason dropped
-    /// by `close_tab_at`, whose `bool` means "was the last canonical tab", not
-    /// "it closed". The GUI user was told both times, through the tab's attention
-    /// indicator and banner; the socket caller was told `OK`.
-    ///
-    /// The index checks are done HERE rather than inside each command path
-    /// because those paths are shared with the keyboard, menu and tab-strip
-    /// gestures, where a stale index IS an ordinary no-op and must stay one. It
-    /// is only the wire that needs to hear about it.
+    /// Refusals reach the wire: an out-of-range index, or a refusal a tab host raised
+    /// through `pending_action_refusal` (a native document waiting on a durable
+    /// checkpoint), is an `Err`, never an `OK` identical to success. The index checks
+    /// live here because for keyboard, menu and strip gestures a stale index is an
+    /// ordinary no-op.
     pub(crate) fn apply_tab_cmd_in(
         &mut self,
         wid: WindowId,
         action: TabAction,
     ) -> Result<(usize, usize), String> {
-        // An unknown window keeps its documented `(0, 0)`: the aimed verb
-        // resolves the window before it gets here (`hosting_window`), so this is
-        // an internal contract, not a wire answer.
+        // The aimed verb resolves the window first (`hosting_window`), so an
+        // unknown one is an internal contract, not a wire answer.
         let Some(count) = self.windows.get(&wid).map(|ws| ws.tab_set.len()) else {
             return Ok((0, 0));
         };
         let no_such = |i: usize| crate::control::no_such_tab(i, count);
-        // A refusal raised anywhere beneath this action lands in the same channel
-        // the menu `invoke` seam uses; clear it first so an EARLIER action's
-        // refusal is never reported against this one.
+        // A refusal raised anywhere beneath this action lands in the channel the
+        // menu `invoke` seam uses; clear it first so an earlier action's refusal
+        // is never reported against this one.
         self.pending_action_refusal = None;
         match action {
             // The wire verb counts the new tab once it lands
@@ -4978,27 +4701,20 @@ impl App {
         }))
     }
 
-    /// Close window `wid`'s tab `which` (or its ACTIVE tab when `None`) for the
-    /// `tab close [N]` verb and the native × button's [`Wake::CloseTab`]. `wid` is
-    /// the front window for the flagless verb and the window hosting `@<sid>` for
-    /// the aimed one (design S3). Reuses [`Self::close_tab_at`] (the SAME whole-tab
-    /// close the renderer strip's `✕` and the tab-strip click take); if that was
-    /// the window's LAST tab it flags THAT window's `pending_close` so the `Wake`
-    /// handler's `escalate_pending_close(el)` tears the window down (the verb /
-    /// button paths have no `ActiveEventLoop`), exactly like a tab-strip close.
+    /// Close window `wid`'s tab `which` (or its active tab) for the `tab close [N]`
+    /// verb: `wid` is the front window for the flagless verb and the window hosting
+    /// `@<sid>` for the aimed one. Takes [`Self::close_tab_at`], the strip `✕`'s
+    /// whole-tab close; a last tab flags `pending_close` so the `Wake` handler's
+    /// `escalate_pending_close(el)` tears the window down.
     ///
-    /// A tab that is NOT the window's last gets the `close` verb's pane guard
-    /// first ([`Self::pane_close_allowed`] over [`Self::tab_close_hangs_up_a_job`]):
-    /// `close_tab_at` guards only the close that exits the window, so on a busy
-    /// non-last tab `tab close N` answered `OK` and hung up the job that `close`
-    /// of the same pane refuses (review of the 2026-09-22 guard). Refused, it
+    /// A tab that is not the window's last first gets the `close` verb's pane guard
+    /// ([`Self::pane_close_allowed`] over [`Self::tab_close_hangs_up_a_job`]), since
+    /// `close_tab_at` guards only the close that exits the window. Refused, it
     /// answers [`crate::app_window::WIRE_TAB_CLOSE_REFUSED`] and nothing moves.
     pub(crate) fn close_tab_via_verb(&mut self, wid: WindowId, which: Option<usize>) {
-        // Exit-ledger attribution: a control-socket `tab close`. The wire bracket
-        // (`App::tab_cmd_bracketed`) has already opened the scope with the
-        // caller, and the outermost scope wins, so this `by=-` stands only for a
-        // caller that brought none; the native ✕'s `Wake::CloseTab` takes
-        // `close_tab_at`.
+        // Exit-ledger attribution: a control-socket `tab close`. The outermost scope
+        // wins, so under the wire bracket (`App::tab_cmd_bracketed`) this `by=-`
+        // stands only for a caller that brought none.
         let _closing = session_store::CloseAttribution::enter(
             session_store::ExitReason::CtlClose,
             session_store::ExitActor::Unknown,
@@ -5027,16 +4743,14 @@ impl App {
         }
     }
 
-    /// Reorder window `wid`'s canonical tab from index `from` to index `to`, keeping
-    /// the same stable tab selected (drag-to-reorder must not silently switch tabs).
-    /// A terminal move also reorders its `layouts` projection when its relative
+    /// Reorder window `wid`'s canonical tab from index `from` to `to`, keeping the
+    /// same stable tab selected. A terminal move also reorders `layouts` when its
     /// position among terminal tabs changes; a native move never touches that
-    /// projection. Out-of-range `from`/`to`, a stale/unknown window, or `from == to`
-    /// are no-ops. Re-mirrors the window (the native strip re-tracks via
-    /// `sync_window`).
+    /// projection. Out-of-range indexes, an unknown window or `from == to` are
+    /// no-ops.
     ///
-    /// INVARIANT preserved: `tabs.count == layouts.len()` remains the exact
-    /// terminal-only projection, while `tab_set` remains the canonical mixed order.
+    /// Invariant: `tabs.count == layouts.len()` stays the exact terminal-only
+    /// projection, while `tab_set` stays the canonical mixed order.
     pub(crate) fn move_tab(&mut self, wid: WindowId, from: usize, to: usize) {
         let views = &self.view_store;
         let Some(ws) = self.windows.get_mut(&wid) else {
@@ -5074,7 +4788,7 @@ impl App {
         }
     }
 
-    /// Windows showing this session as some tab's FOCUS — the tabs whose label
+    /// Windows showing this session as some tab's focus: the tabs whose label
     /// and composed tooltip are built from it.
     pub(crate) fn windows_with_focused_session(&self, session: u64) -> Vec<WindowId> {
         self.windows
@@ -5106,32 +4820,14 @@ impl App {
         }
     }
 
-    /// Re-sync window `wid`'s NATIVE toolbar tab strip to the app's current tab
-    /// state: rebuild the view-based strip's per-tab views (one per tab, splitting the
-    /// band into equal shares with the active one accented — or, at exactly one tab,
-    /// the single centred window TITLE band) from [`Self::tab_titles`] + the
-    /// window's active index, via [`toolbar::set_window_tabs`]. Called from
-    /// [`Self::sync_window`] so the strip tracks EVERY tab mutation (open / close /
-    /// switch / detach / migrate / reorder). A no-op off macOS and for a window with no
-    /// toolbar handle (headless / a window whose toolbar failed to install).
-    ///
-    /// Returns the `(titles, metadata)` snapshot it just pushed to the strip, so
-    /// a caller that also needs the repaint fingerprint feeds
-    /// [`Self::tab_strip_fingerprint_from_parts`] THESE vectors instead of
-    /// recomputing them. That is exactly the invariant that function's own doc
-    /// asks for ("reads the per-tab titles ONCE and feeds the SAME `Vec` to
-    /// both"): `tab_titles` takes each tab's session meta lock and a terminal
-    /// `try_lock`, clones its presentation fallback, resolves and allocates the
-    /// title rung, and presents the label — none of which should happen
-    /// twice per refresh, and doing it once also makes the pushed chrome and the
-    /// redraw decision describe ONE snapshot rather than two possibly divergent
-    /// reads. Callers that only want the push (`sync_window`, the reorder path,
-    /// the chrome-expiry sweep) just drop the tuple.
-    ///
-    /// NOTE the returned pair deliberately excludes the active index: the one
-    /// this function computes is `tab_set.active_index()` (over ALL tabs) while
-    /// the strip fingerprint's callers use `ws.tabs.active` (the TERMINAL
-    /// projection index). Those diverge the moment a native tab exists.
+    /// Re-sync window `wid`'s native toolbar strip with [`Self::tab_titles`] and
+    /// the active index (via [`crate::platform::AppRt::set_toolbar_tabs`]); called
+    /// from [`Self::sync_window`] on every tab mutation, a no-op without a toolbar
+    /// handle. Returns the `(titles, metadata)` it pushed, so a caller that needs
+    /// the repaint fingerprint ([`Self::tab_strip_fingerprint_from_parts`]) reuses
+    /// that one snapshot instead of reading every tab again. The pair has no
+    /// active index: this one counts all tabs, while the fingerprint's callers use
+    /// `ws.tabs.active` (the terminal projection).
     pub(crate) fn refresh_window_tabs(
         &mut self,
         wid: WindowId,
@@ -5175,9 +4871,8 @@ impl App {
         // terminal tab (see `composed_session_chrome`), and the strip receives
         // titles/metadata/chrome as ONE consistent snapshot.
         let ext = self.tab_chrome_ext(wid, &chrome_titles);
-        // The §4 connection mark rides the same consistent snapshot: stamped
-        // from the live edge tables here, so `metadata` below carries it to
-        // both strips (and into the in-grid fingerprint) at once.
+        // The connection mark rides the same snapshot: `metadata` below carries it
+        // to both strips and the in-grid fingerprint.
         self.stamp_tab_connection_roles(wid);
         let metadata = self.tab_strip_metadata(wid);
         // WHO DRIVES (owner surfaces §5, S9): the team marks ride the titles
@@ -5197,26 +4892,23 @@ impl App {
             .get(&wid)
             .and_then(|ws| ws.tab_set.active_index())
             .unwrap_or(0);
-        // The canonical STABLE id per tab, paired with `titles` — the strip
-        // stamps these on its chips so a right-click captures the clicked tab's
-        // identity at menu-pop time (a positional index would re-bind to
-        // whatever tab a mid-menu close/reorder moved into the slot).
+        // The canonical stable id per tab, paired with `titles`: the strip stamps
+        // these on its chips so a right-click captures the clicked tab's identity
+        // at menu-pop time (a positional index would re-bind to whatever tab a
+        // mid-menu close or reorder moved into the slot).
         let ids: Vec<crate::tab_model::TabId> =
             self.windows.get(&wid).map_or_else(Vec::new, |ws| {
                 ws.tab_set.tabs().iter().map(|tab| tab.id).collect()
             });
-        // Shadow what the native strip is being told to render BEFORE the push, so a
-        // tab mutation that forgets to call this fn leaves the recorded strip state
-        // stale — the only way a headless test can witness the strip↔model desync the
-        // `tab_strip` machine proves can't happen. (`titles.len()` == tab count.)
+        // Shadow what the native strip is told to render, so a headless test can
+        // witness a strip↔model desync (`titles.len()` == tab count).
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.strip_shadow.set((titles.len(), active));
-            // This is the strip's exact title vector (the toolbar below receives
-            // its whole-string projection). Cache it at the existing push point so
-            // a later background spinner phase can be rejected before
-            // `refresh_window_tabs` takes every tab's terminal lock and allocates
-            // another title/tooltip/metadata set. Structural refreshes also land
-            // here, ensuring the first post-switch phase is coalescible.
+            // The strip's exact title vector (the toolbar gets its capped
+            // projection), cached at the push point so a later background spinner
+            // phase is rejected before `refresh_window_tabs` takes every tab's
+            // terminal lock. Structural refreshes land here too, so the first
+            // post-switch phase is coalescible.
             ws.tab_title_epochs
                 .retain(|sid, _| label_sessions.contains(&Some(*sid)));
             ws.tab_chrome_titles
@@ -5229,11 +4921,10 @@ impl App {
                         .clone_from(title);
                 }
             }
-            // The drift cache above is correctly keyed by SESSION, but that key
-            // cannot faithfully shadow chrome when two distinct tabs view the
-            // same pooled session and resolve different fallbacks under parser
-            // contention. Inspection is tab-addressed, so retain and update the
-            // exact per-tab vector handed to the toolbar independently.
+            // The drift cache is keyed by session, which cannot shadow chrome when
+            // two tabs view one pooled session and resolve different fallbacks
+            // under contention; inspection is tab-addressed, so the exact per-tab
+            // vector handed to the toolbar is kept too.
             ws.tab_chrome_titles_by_tab
                 .retain(|tab_id, _| ids.contains(tab_id));
             for ((tab_id, session), title) in ids
@@ -5280,25 +4971,14 @@ impl App {
         (titles, metadata)
     }
 
-    /// Repaint everything a session's USER metadata feeds, after a change has
-    /// ALREADY been stored and recorded. Shared by the control socket's
-    /// `Wake::MetaChanged` arm and the in-process GUI rename commit, so the two
-    /// can never drift on what a pin change invalidates.
-    ///
-    /// The user title is the TOP tab-label rung, so every window labeling a tab
-    /// with this session re-reads its strip: the native (macOS) toolbar push,
-    /// plus a redraw when either the in-grid strip changed OR this is the
-    /// focused session (its metadata also feeds the native OS title even when
-    /// `tab_strip_rows = 0`, and `apply_title` runs on the redraw path including
-    /// its nothing-changed early-out). This is the exact refresh pair the
-    /// epoch-gated title/cwd drift path runs, minus the epoch gate (a pin change
-    /// is rare and every caller already gates on an ACTUAL change).
-    ///
-    /// ORDERING: the `meta-change` timeline record must already have landed —
-    /// [`crate::session_timeline::apply_meta_value`] takes it under the meta
-    /// guard, before this runs. Refreshing first would let `composed_session_chrome`
-    /// re-cache stale tooltip/context-menu text under an unmoved `high_id` key,
-    /// which for a quiet session with a pinned label never expires.
+    /// Repaint everything a session's user metadata feeds, after the change was
+    /// stored and recorded; shared by the `Wake::MetaChanged` arm and the GUI
+    /// rename commit. Every window labeling a tab with this session re-reads its
+    /// strip, and redraws when the in-grid strip changed or this is the focused
+    /// session (whose metadata also feeds the OS title). The `meta-change`
+    /// timeline record must already have landed
+    /// ([`crate::session_timeline::apply_meta_value`]), or
+    /// `composed_session_chrome` re-caches stale text under an unmoved `high_id`.
     pub(crate) fn refresh_meta_dependent_chrome(&mut self, session: u64) {
         let label_windows: Vec<WindowId> = self
             .windows
@@ -5316,9 +4996,7 @@ impl App {
             .collect();
         for wid in label_windows {
             let focused = self.focused_session_id(wid) == Some(session);
-            // Same snapshot the strip was just pushed — see
-            // `refresh_window_tabs`; recomputing it here doubled the
-            // per-tab meta-lock + term-try-lock + compose round trips.
+            // The snapshot the strip was just pushed (see `refresh_window_tabs`).
             let (titles, metadata) = self.refresh_window_tabs(wid);
             let active = self.windows.get(&wid).map_or(0, |ws| ws.tabs.active);
             let fp = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, active);
@@ -5335,14 +5013,13 @@ impl App {
         }
     }
 
-    /// Cmd-W: close the FOCUSED pane of the FRONTMOST window's active tab. Returns
-    /// `Some(window)` — the window whose last tab just closed — iff that was the LAST
-    /// pane of the LAST tab, so the caller escalates to closing THAT window (the
-    /// frontmost), not whichever window an input event was stamped for. Returns
-    /// `None` otherwise. Closing a pane in a SPLIT tab collapses the split onto its
-    /// sibling (the sibling — and its reader thread — survive); closing the only pane
-    /// of a non-last tab closes the tab. Honors `--hold` ONLY for the implicit close
-    /// on a session's own EOF (see `close_session`); an explicit Cmd-W always closes.
+    /// Cmd-W: close the focused pane of the frontmost window's active tab. Returns
+    /// `Some(window)` iff that was the last pane of the last tab, so the caller
+    /// closes that window (the frontmost), not whichever window an input event
+    /// was stamped for. A split collapses onto its sibling, which keeps its
+    /// reader; the only pane of a non-last tab closes the tab. `--hold` applies
+    /// only to the implicit close on a session's own EOF (`close_session`); Cmd-W
+    /// always closes.
     pub(crate) fn close_active_tab(&mut self) -> Option<WindowId> {
         // Exit-ledger attribution: Cmd-W / menu Close, by the human.
         let _closing = session_store::CloseAttribution::enter(
@@ -5424,17 +5101,13 @@ impl App {
         let recovery = self.closed_view_record_for_active(window);
         let outcome = self.active_tree_mut(window).map(|t| t.close_focused())?;
         let collapsed = matches!(outcome, pane::CloseOutcome::Collapsed { .. });
-        // `true` = the frontmost window's last tab closed → tell the caller WHICH
-        // window to escalate-close (always the frontmost we operated on).
         let closes_window = self.apply_close_outcome(window, tab, outcome);
         if collapsed && let Some(recovery) = recovery {
             self.retain_closed_view(recovery);
         }
         if closes_window {
-            // Same deferral as `close_tab_at`: the caller sets `pending_close`
-            // and the window tears down a later turn, so carry the Cmd-W / menu
-            // Close attribution (the live `CloseAttribution` scope opened at the
-            // top of this fn) onto the window for the deregister to re-enter.
+            // The caller sets `pending_close` and the window tears down a later
+            // turn, outside this fn's attribution scope.
             self.stash_deferred_close_attribution(window);
         }
         closes_window.then_some(window)
@@ -5534,10 +5207,10 @@ impl App {
         self.close_tab_at(window, index)
     }
 
-    /// Focus the exact leaf that refused a close and expose only the typed
-    /// recovery commands returned by its reducer. Keeping this in the tab host
-    /// makes every close entry point (including background/control targets)
-    /// converge on one visible, generation-bound recovery surface.
+    /// Focus the exact leaf that refused a close and offer only the recovery
+    /// commands its reducer returned. Every close entry point (background and
+    /// control targets included) converges here on one generation-bound recovery
+    /// surface.
     fn surface_native_close_recovery(
         &mut self,
         wid: WindowId,
@@ -5598,13 +5271,6 @@ impl App {
         match readiness {
             crate::native_app::CloseReadiness::Ready => Ok(true),
             crate::native_app::CloseReadiness::Blocked { recovery } => {
-                // THE VERDICT IS THE SAME EITHER WAY; ONLY THE SCREEN DIFFERS.
-                // A Quiet probe still runs the reducer and still reports
-                // `Ok(false)`, so no caller gets a weaker safety answer — it
-                // simply declines to answer a question nobody asked by taking
-                // the user's tab, focus, window and overlay. See
-                // [`ClosePreflightVisibility`] for why that distinction is
-                // load-bearing rather than cosmetic.
                 if visibility == ClosePreflightVisibility::Interactive {
                     self.surface_native_close_recovery(wid, tab, view, native, recovery)?;
                 }
@@ -5620,11 +5286,7 @@ impl App {
         wid: WindowId,
         scope: crate::native_app::CloseScope,
     ) -> Result<bool, String> {
-        // Every caller of THIS entry point is a person closing a window (Cmd-W,
-        // the close button, a control-socket close on the user's behalf), so the
-        // recovery surface is the answer to their request. Only the process-wide
-        // barrier below is reachable from background policy, so only it takes a
-        // visibility argument.
+        // Every caller is a person closing a window.
         self.prepare_window_native_shutdown_with(wid, scope, ClosePreflightVisibility::Interactive)
     }
 
@@ -5662,15 +5324,11 @@ impl App {
         Ok(true)
     }
 
-    /// Process-wide counterpart of [`Self::prepare_window_native_shutdown`].
-    /// Every window/view remains live; under
-    /// [`ClosePreflightVisibility::Interactive`] the first blocker is also focused
-    /// and surfaced. Quit and update-relaunch feed their distinct semantic scope
-    /// into this same reducer-owned barrier.
-    ///
-    /// `visibility` is explicit at this seam and nowhere else because this is the
-    /// ONLY close barrier background policy can reach: the automatic update lane
-    /// re-probes it on a cooldown and must stay invisible while doing so.
+    /// Process-wide counterpart of [`Self::prepare_window_native_shutdown`]: every
+    /// window and view stays live; under [`ClosePreflightVisibility::Interactive`]
+    /// the first blocker is also focused and surfaced. Quit and update-relaunch feed
+    /// their own scope in. The only close barrier background policy reaches (the
+    /// update lane re-probes it), so the only one that takes a `visibility`.
     pub(crate) fn prepare_all_native_shutdown(
         &mut self,
         scope: crate::native_app::CloseScope,
@@ -5703,10 +5361,10 @@ impl App {
     }
 
     /// Close one focused leaf of a heterogeneous tab as a host transaction.
-    /// Native readiness/document durability is proven before topology changes;
-    /// terminal ownership is detached only after the canonical tree has a live
-    /// repaired focus. The tab necessarily survives because this is called only
-    /// for a multi-leaf tree.
+    /// Native readiness and document durability are proven before topology
+    /// changes; terminal ownership is detached only after the canonical tree has a
+    /// live repaired focus. The tab survives: this is called only for a
+    /// multi-leaf tree.
     pub(crate) fn close_focused_mixed_leaf(&mut self, wid: WindowId) -> Result<(), String> {
         let recovery = self
             .closed_view_record_for_active(wid)
@@ -5882,8 +5540,6 @@ impl App {
             (tab, was_last)
         };
         if was_last {
-            // Deferred last-tab close (native/heterogeneous tab): carry the
-            // gesture's attribution for the later `close_window` teardown.
             self.stash_deferred_close_attribution(wid);
         }
         for view in tab.root.leaves() {
@@ -6135,11 +5791,10 @@ impl App {
         self.closed_recovery.views.has_candidate(now_ms) && !self.windows.is_empty()
     }
 
-    /// Close the PANE holding session `id` in window `window` (its reader hit EOF).
-    /// With `--hold`, the pane is KEPT so the final output stays visible (the user
-    /// closes it with Cmd-W). Returns `true` iff the app should now exit (the last
-    /// pane of the last tab of the last window closed and `--hold` is off). A
-    /// `Wake::Exit` for an already-closed/unknown session is a no-op.
+    /// Close the pane holding session `id` in window `window` (its reader hit
+    /// EOF). With `--hold` the pane is kept so the final output stays visible.
+    /// Returns `true` iff that was the window's last pane, so the caller closes
+    /// the window. An unknown or already-closed session is a no-op.
     pub(crate) fn close_session(&mut self, window: WindowId, id: u64) -> bool {
         if self.hold {
             return false; // keep the window/pane open after the command exits
@@ -6256,9 +5911,8 @@ impl App {
         }
         let mut to_close = Vec::new();
         for o in owners {
-            // `close_session` intentionally leaves a last-tab occurrence intact for
-            // `close_window_logical`; do not report or attempt that window twice if a
-            // malformed/restored tree ever supplied another snapshot occurrence.
+            // `close_session` leaves a last-tab occurrence intact for
+            // `close_window_logical`; never report a window twice.
             if to_close.contains(&o) {
                 continue;
             }
@@ -6305,20 +5959,16 @@ impl App {
 
     /// The start of a fresh interactive shell that may have failed at start: it
     /// closed its PTY within [`SHELL_START_WINDOW`] of its spawn, never drew a
-    /// prompt (no shell-integration prompt mark), and no input was driven into
-    /// its PTY since the spawn — no key, paste, report or control verb's bytes
-    /// (`SinkWriter::driven_input`). aterm's own replies to the shell's queries
-    /// do not count: fish and powerlevel10k ask for DA, the cursor position and
-    /// colours as they start, and a shell whose rc fails after asking still
-    /// failed at start. `None` for everything else: a `-e` command or a shell
-    /// adopted across an update (neither records a start), a later exit, a
-    /// shell someone typed into or that got to its prompt, and every pane under
-    /// `--hold` (which keeps every pane its own way).
+    /// prompt (no shell-integration prompt mark), and no input was driven into its
+    /// PTY since (`SinkWriter::driven_input`; aterm's own replies to the shell's
+    /// DA, cursor-position and colour queries do not count). `None` for everything
+    /// else: a `-e` command or a shell adopted across an update (neither records a
+    /// start), a later exit, a shell someone typed into or that reached its
+    /// prompt, and every pane under `--hold`.
     ///
-    /// Measured to the reader's EOF stamp (`Session::pty_closed_at`), not to
-    /// now, so the delay between the close and this exit handler (aterm's own
-    /// cold launch, a busy loop) never counts. The child's own slow start does,
-    /// which is why the window is a hang detector ([`SHELL_START_WINDOW`]).
+    /// Measured to the reader's EOF stamp (`Session::pty_closed_at`), not to now,
+    /// so the delay before this exit handler runs never counts; the child's own
+    /// slow start does.
     fn unstarted_shell<'s>(
         &self,
         pooled: &'s crate::Session,
@@ -6344,11 +5994,11 @@ impl App {
     /// How `session`'s child ended, for every reader on the exit path: the
     /// classifier, the exit ledger and the failed-start line all read this one
     /// status. A child an earlier look reaped answers with what that look kept
-    /// (`Session::child_exit`); otherwise this reaps without blocking — on
-    /// unix the reader posted the exit only once the shell was collectable
-    /// (or `spawn::SHELL_RETIRE_WAIT` passed), so the UI thread never waits
-    /// here; elsewhere a [`ExitLook::First`] look at a shell that may have
-    /// failed at start ([`Self::unstarted_shell`]) tries again for at most
+    /// (`Session::child_exit`); otherwise this reaps without blocking. On unix
+    /// the reader posts the exit only once the shell is collectable (or
+    /// `spawn::SHELL_RETIRE_WAIT` passed), so the UI thread never waits here;
+    /// elsewhere a [`ExitLook::First`] look at a shell that may have failed at
+    /// start ([`Self::unstarted_shell`]) tries again for at most
     /// `SHELL_START_STATUS_WAIT`. `None`: no status (an adopted session with no
     /// exit witness, a child not yet reapable, or one this process cannot wait for).
     pub(crate) fn exit_status(&self, session: u64, look: ExitLook) -> Option<aterm_pty::ChildExit> {
@@ -6413,11 +6063,11 @@ impl App {
         true
     }
 
-    /// A click in window `wid`'s tab strip at column `col`: resolve it against that
-    /// window's cached segments ([`WindowState::tab_segments`]) and SWITCH / CLOSE /
-    /// open a tab. A click on bare strip background is ignored. The CLOSE of the last
-    /// tab signals the window to close via `ws.pending_close` (the mouse handler has
-    /// no `ActiveEventLoop`), mirroring Cmd-W. Repaints after any state change.
+    /// A click in window `wid`'s tab strip at column `col`: resolve it against the
+    /// window's cached segments ([`WindowState::tab_segments`]) and switch, close
+    /// or open a tab. Bare strip background is caption space on Windows and
+    /// otherwise a no-op. Closing the last tab flags `ws.pending_close` (the mouse
+    /// handler has no `ActiveEventLoop`), as Cmd-W does.
     ///
     /// A SECOND press on the same chip within [`crate::multi_click_ms`] opens the
     /// inline rename editor — the in-grid twin of the macOS strip's
@@ -6430,15 +6080,14 @@ impl App {
             return;
         };
         let Some(hit) = tab_bar::hit_test(&segs, col) else {
-            // Bare strip background is not a chip, so it breaks the chip streak —
-            // and it is still "away" from the field, so it commits an open rename.
-            // Both must happen whatever else the press becomes below.
+            // Bare strip background breaks the chip streak and, being away from
+            // the field, commits an open rename, whatever else the press becomes.
             let now = std::time::Instant::now();
             let band_repeat = self.windows.get(&wid).is_some_and(|ws| {
                 ws.strip_band_press
                     .is_some_and(|at| now.duration_since(at).as_millis() <= crate::multi_click_ms())
             });
-            // `clear_strip_press` also clears the BAND streak (any other press
+            // `clear_strip_press` also clears the band streak (any other press
             // breaks a band double-click), so the repeat test above runs first
             // and the first-press re-arm below runs after.
             self.clear_strip_press(wid);
@@ -6501,9 +6150,8 @@ impl App {
             return;
         };
         match hit {
-            // Target the CLICKED window, not the frontmost — Close already does, so
-            // Select/NewTab must too (a click on a non-front window's strip must act
-            // on THAT window even if focus hasn't transferred yet).
+            // Target the clicked window, not the frontmost: a click on a
+            // non-front window's strip acts on it before focus transfers.
             tab_bar::TabHit::Select(i) => {
                 let tab = self
                     .windows
@@ -6520,24 +6168,20 @@ impl App {
                     })
                 });
                 // A click on the chip already being edited is not leaving the
-                // field (read BEFORE the arm below, which needs it too).
+                // field (read before the arm below, which needs it too).
                 let editing_this = self
                     .inline_rename_edit(wid)
                     .map(|edit| edit.tab)
                     .is_some_and(|edited| Some(edited) == tab);
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.strip_press = tab.map(|tab| (now, tab));
-                    // A chip press is not part of a BAND double-click either.
+                    // A chip press is not part of a band double-click either.
                     ws.strip_band_press = None;
-                    // DRAG-TO-REORDER arms HERE and travels with the pointer from
-                    // here ([`App::advance_strip_drag`]): the press still selects,
-                    // exactly as Explorer / Edge / Windows Terminal do, and only
-                    // motion reorders. NOT on the repeat press — that one opens
-                    // the inline rename editor, and a rename gesture must not also
-                    // be able to reshuffle the strip out from under the field —
-                    // and NOT while that editor is already OPEN on this chip: a
-                    // stale (past the double-click window) press there is "keep
-                    // editing", and the same reshuffle-under-the-field hazard.
+                    // Drag-to-reorder arms here and travels with the pointer
+                    // ([`App::advance_strip_drag`]): the press still selects and
+                    // only motion reorders. Not on the repeat press, which opens
+                    // the rename editor, nor while that editor is open on this
+                    // chip: a rename must not have the strip reshuffled under it.
                     ws.strip_drag = match (repeat || editing_this, tab) {
                         (false, Some(tab)) => Some(crate::app_mouse::StripDrag {
                             tab,
@@ -6546,8 +6190,8 @@ impl App {
                         _ => None,
                     };
                 }
-                // A click on a DIFFERENT chip is a click away and COMMITS, matching
-                // the macOS `Wake::SelectTab` arm and every other exit.
+                // A click on a different chip is a click away and commits, as
+                // the macOS `Wake::SelectTab` arm and every other exit do.
                 if !editing_this {
                     self.settle_rename_edit(wid);
                 }
@@ -6563,27 +6207,18 @@ impl App {
                 self.settle_rename_edit(wid);
                 self.open_tab_in(wid);
             }
-            // The leading `↻` update alert (off-macOS chrome — menu-adjacent there):
-            // ONE CLICK applies the staged build (the owner's "click-upgrade" ask; the
-            // old click-to-details flow was the "too many clicking" complaint), unless
-            // it is on hold (`latched_activation_trial_spent`), which opens the details
-            // like an empty stage. With nothing actually staged it falls back to the
-            // details overlay — never a blind restart, never a dead click. Details stay
-            // reachable via the App menu's "Check for Updates…".
+            // The leading `↻` update alert (off-macOS): applies the staged build,
+            // or opens the details overlay when it is on hold
+            // (`latched_activation_trial_spent`) or nothing is staged.
             tab_bar::TabHit::Update => {
                 self.clear_strip_press(wid);
                 self.settle_rename_edit(wid);
                 self.apply_update_or_details();
             }
-            // The trailing VERSION LABEL (Windows): a button, committed on the
-            // press like the `+` and the `↻`, and never caption — no window drag,
-            // no maximize. It posts the menu action the macOS Version menu's
-            // About row fires (`menu::version_slot_click`: Settings ▸ About, or
-            // the update details where an updater has a staged build to
-            // describe), through the palette's own path — `Wake::MenuAction` →
-            // `dispatch_menu_action` → `fence_menu_action` — so it is fenced and
-            // rename-diverted exactly as a menu choice is. A second press posts
-            // it again, which focuses the same Settings tab.
+            // The trailing version label (Windows): committed on the press, never
+            // caption. It posts what the macOS Version menu's About row fires
+            // (`menu::version_slot_click`) through `Wake::MenuAction`, so it is
+            // fenced and rename-diverted like a menu choice.
             tab_bar::TabHit::Version { attention, .. } => {
                 self.clear_strip_press(wid);
                 self.settle_rename_edit(wid);
@@ -6698,17 +6333,13 @@ impl App {
         }
     }
 
-    /// C5 — the composed CONTEXT-MENU model for tab `index` of `wid`, or an
-    /// empty vec when that tab has no menu (a native app tab; an out-of-range
-    /// index). One call into the SAME epoch-gated
-    /// [`Self::composed_session_chrome`] the strip's tooltips and the `chrome`
-    /// verb's `tab-menu` lines already read, so the popup can never show an item
-    /// the introspection mirror does not — the whole point of a single composer.
-    ///
-    /// It resolves the label through [`Self::tab_titles`] rather than reading
-    /// the presentation directly because the composer's first identity line IS
-    /// the chip label, and `tab_titles` is the one place that chain (user title
-    /// ▸ OSC title ▸ `~`-relative cwd) is resolved.
+    /// The composed context-menu model for tab `index` of `wid`, or empty when the
+    /// tab has none (a native app tab, an out-of-range index). One call into the
+    /// epoch-gated [`Self::composed_session_chrome`] that the strip's tooltips and
+    /// the `chrome` verb's `tab-menu` lines read, so the popup never shows an item
+    /// the introspection mirror does not. The label comes from
+    /// [`Self::tab_titles`] because the composer's first identity line is the chip
+    /// label.
     pub(crate) fn tab_context_menu_model(
         &mut self,
         wid: WindowId,
@@ -6724,9 +6355,9 @@ impl App {
             return Vec::new();
         };
         let titles = self.tab_titles(wid);
-        // The menu header paints the label WHOLE — the same projection
-        // `refresh_window_tabs` hands the tooltip composer, so the two callers
-        // of one chrome cache agree on the label they key it with.
+        // The menu header paints the label whole, the projection
+        // `refresh_window_tabs` hands the tooltip composer, so both callers of one
+        // chrome cache key it with the same label.
         let label = crate::chrome_label::capped_label(titles.get(index).map_or("", String::as_str));
         // Its timeline rows aged as the card opens (`TabMenuEntry::shown_at`).
         crate::session_chrome::menu_shown_at(
@@ -6786,11 +6417,8 @@ impl App {
         if entries.is_empty() {
             return false;
         }
-        // A chip press is a press AWAY from an open rename field, and it breaks
-        // both strip double-click streaks — the same bookkeeping the LEFT chip
-        // path does, for the same reasons (a right press between two left
-        // presses must not complete a double-click, and a name typed into the
-        // field you then right-click is kept, not dropped).
+        // As on the left chip path: a press away from an open rename (which
+        // commits it) and a break in both double-click streaks.
         self.clear_strip_press(wid);
         self.settle_rename_edit(wid);
         if self
@@ -6801,9 +6429,8 @@ impl App {
         {
             self.switch_tab_in(wid, index);
         }
-        // Seeded to the first enabled action only for a KEYBOARD open: a card
-        // that pops with a row already lit under a pointer that has not moved is
-        // an invitation to activate the wrong thing on the next click.
+        // Seeded to the first enabled action only for a keyboard open: a row lit
+        // under a pointer that has not moved invites activating the wrong thing.
         let highlight = keyboard
             .then(|| crate::tab_menu::first_selectable(&entries, entries.len()))
             .flatten();
@@ -6830,25 +6457,16 @@ impl App {
         true
     }
 
-    /// C5 — the KEYBOARD entry point (the Menu key by default; Shift+F10 too
-    /// under `tab_menu_chord = "on"`): pop the context menu for the window's
-    /// ACTIVE tab, anchored at that chip's own left edge rather than at a
-    /// pointer that was never involved.
+    /// The keyboard entry point (the Menu key; Shift+F10 too under
+    /// `tab_menu_chord = "on"`): pop the context menu for the window's active tab,
+    /// anchored at that chip's left edge. The Menu key is the default because no
+    /// legacy keyboard mode delivers it to an application; Shift+F10 is terminfo
+    /// `kf22`, so it is claimed only when a config asks. Returns whether a menu
+    /// opened, so the chord can fall through (a native app tab, no strip, no tabs).
     ///
-    /// This is what makes the popup usable without a mouse, and it is not a
-    /// nicety: a surface that has a right-click menu but no keyboard route to
-    /// it is unreachable for anyone driving by keyboard. The Menu key is the
-    /// default spelling because no legacy keyboard mode delivers it to an
-    /// application; Shift+F10 (the OS-wide Windows chord) is terminfo `kf22`,
-    /// so it is claimed only when a config asks. Returns whether a menu opened,
-    /// so the caller can let the chord fall through when it did not (a native
-    /// app tab, no strip, no tabs).
-    ///
-    /// Its real callers are the two in-grid-strip chord arms (Windows and
-    /// Linux) — `on_key`'s and the convergence seam's `tab_menu_input_event` —
-    /// which is what makes `aterm ctl key menu` exercise the same path the
-    /// physical key does. ⇧F10 is not a menu chord on macOS, whose chips pop a
-    /// native `NSMenu` instead.
+    /// Called from the in-grid strip chord arms (Windows and Linux) and
+    /// `tab_menu_input_event`, so `aterm ctl key menu` takes the physical key's
+    /// path. macOS chips pop a native `NSMenu` instead.
     pub(crate) fn open_active_tab_context_menu(&mut self, wid: WindowId) -> bool {
         let Some(index) = self
             .windows
@@ -6861,11 +6479,9 @@ impl App {
         self.open_tab_context_menu(wid, index, anchor, true)
     }
 
-    /// C5 — the chip's own start column, read off the SAME laid-out segments
-    /// the strip painted, so a card opened without a pointer still lines up
-    /// with the tab it belongs to. A window whose segments have not been laid
-    /// out yet (no frame drawn) falls back to column 0 — flush left, still
-    /// under the band.
+    /// The chip's start column from the laid-out segments the strip painted, so a
+    /// card opened without a pointer lines up with its tab. Before any frame is
+    /// drawn it falls back to column 0, still under the band.
     fn tab_chip_anchor_col(&self, wid: WindowId, index: usize) -> u16 {
         self.windows
             .get(&wid)
@@ -6888,11 +6504,10 @@ impl App {
         self.open_tab_context_menu(wid, index, anchor, false)
     }
 
-    /// C5 — dismiss any open tab context menu on `wid`. Returns whether one was
-    /// actually open (callers use it to decide whether the dismissing gesture
-    /// was consumed). Requests the repaint that ERASES the card; the
-    /// `RepaintKey`'s `tab_menu_fp` term is what keeps that frame from being
-    /// swallowed by the settled-screen early-out.
+    /// Dismiss any open tab context menu on `wid`. Returns whether one was open
+    /// (callers use it to decide whether the dismissing gesture was consumed).
+    /// Requests the repaint that erases the card; the `RepaintKey`'s
+    /// `tab_menu_fp` term keeps that frame from the settled-screen early-out.
     pub(crate) fn close_tab_menu(&mut self, wid: WindowId) -> bool {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;
@@ -6910,25 +6525,14 @@ impl App {
         true
     }
 
-    /// C5 — activate entry `i` of the open menu on `wid` and dismiss the card.
-    ///
-    /// The chosen action is POSTED as [`crate::Wake::TabMenuAction`] rather than
-    /// dispatched inline, for two reasons that both matter:
-    ///   * `App::dispatch_tab_menu_action` needs an `&ActiveEventLoop` (the
-    ///     `Close Tab` arm escalates a last-tab close into a window teardown),
-    ///     and neither the mouse nor the key handler has one;
-    ///   * it puts this popup on the byte-same path the macOS `NSMenu` relay
-    ///     already uses, carrying the STABLE `TabId` captured at pop time — so
-    ///     the two platforms share one dispatcher, one targeting rule, and one
-    ///     "the tab went away, log it and drop the action" fallback.
-    ///
-    /// A no-op (beyond the dismiss) when `i` is not a live action row; the
-    /// caller has already hit-tested, this is the belt.
-    ///
-    /// An agent-upgrade row (gap #21) needs no event loop: it is dispatched
-    /// here, through the one dispatcher the macOS relay's
-    /// `Wake::TabMenuUpgrade` reaches too ([`App::dispatch_tab_menu_upgrade`]),
-    /// with the pop-time tab and the session and build the card showed.
+    /// Activate entry `i` of the open menu on `wid` and dismiss the card. The
+    /// action is posted as [`crate::Wake::TabMenuAction`], not dispatched inline:
+    /// `App::dispatch_tab_menu_action` needs an `&ActiveEventLoop` (Close Tab can
+    /// tear the window down) that the mouse and key handlers lack, and the macOS
+    /// `NSMenu` relay posts the same event with the pop-time `TabId`, so both
+    /// platforms share one dispatcher. An agent-upgrade row needs no event loop
+    /// and is dispatched here ([`App::dispatch_tab_menu_upgrade`]). A row that is
+    /// not a live action only dismisses.
     pub(crate) fn activate_tab_menu_entry(&mut self, wid: WindowId, i: usize) {
         let upgrade = self.windows.get(&wid).and_then(|ws| {
             let menu = ws.tab_menu.as_ref()?;
@@ -7009,10 +6613,10 @@ impl App {
         }
     }
 
-    /// Cancel a live edit whose TAB has gone away. The in-grid twin of the macOS
-    /// strip's `sync_rename_overlay`, and never a commit: the user was naming
-    /// something that no longer exists. Without it a background close or a
-    /// `tab close` verb would leave an invisible field owning the keyboard.
+    /// Cancel a live edit whose tab has gone away: the in-grid twin of the macOS
+    /// strip's `sync_rename_overlay`, and never a commit. Without it a background
+    /// close or a `tab close` verb would leave an invisible field owning the
+    /// keyboard.
     pub(crate) fn reap_stale_rename_edit(&mut self, wid: WindowId) {
         let Some(tab) = self.inline_rename_edit(wid).map(|edit| edit.tab) else {
             return;
@@ -7022,12 +6626,12 @@ impl App {
         }
     }
 
-    /// Stash the CURRENT close gesture's attribution on window `wid`, at the
-    /// moment a last-tab close is DEFERRED (the window's teardown, and the
-    /// exit-journalling deregistration, run a later turn with no
-    /// [`session_store::CloseAttribution`] scope open). Read back and re-entered
-    /// by [`crate::App::close_window_logical`]. A no-op if the window is already
-    /// gone. See [`crate::WindowState::pending_close_attribution`].
+    /// Stash the current close gesture's attribution on window `wid` when a
+    /// last-tab close is deferred: the teardown and its exit-journalling
+    /// deregistration run a later turn with no [`session_store::CloseAttribution`]
+    /// scope open, and without this the exit journals `reason=unknown by=-`.
+    /// [`crate::App::close_window_logical`] re-enters it; a no-op if the window is
+    /// gone.
     pub(crate) fn stash_deferred_close_attribution(&mut self, wid: WindowId) {
         let attribution = session_store::current_close_attribution();
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -7035,17 +6639,16 @@ impl App {
         }
     }
 
-    /// Close the ENTIRE tab at index `i` of window `wid` (every pane in it), as a
-    /// unit — the tab strip's close `x` closes a whole tab, unlike Cmd-W which closes
-    /// one pane. DRAINS each of the tab's panes' sessions and `pool.detach`es each
-    /// (the last view closes that PTY master), drops its pane tree, and keeps
-    /// the terminal projection aligned when applicable. Returns `true` iff that was
-    /// the LAST canonical tab (the caller signals the window to close). Out-of-range
-    /// `i` is a no-op (returns `false`).
+    /// Close the entire tab at index `i` of window `wid` (every pane in it), as
+    /// the strip's ✕ does, unlike Cmd-W, which closes one pane. Detaches each
+    /// pane's session (the last view closes that PTY master), drops its pane tree
+    /// and keeps the terminal projection aligned. Returns `true` iff that was the
+    /// last canonical tab (the caller signals the window to close); an
+    /// out-of-range `i` returns `false`.
     ///
-    /// TRUST anchor: the `Close` action of the ty-proven `tab_strip` machine
-    /// (`tab_strip_model()`) — shrinks the tab set and MUST re-sync the clicked
-    /// window's native strip (the non-front-window re-sync this fn now performs).
+    /// Refines the `tab_strip` machine's `Close` action (`tab_strip_model()`): it
+    /// shrinks the tab set and must re-sync the clicked window's native strip,
+    /// front or not.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -7080,11 +6683,9 @@ impl App {
                 tab: tab_id,
             },
         )) {
-            // DEFERRED, not done: the mutation is queued onto the pending
-            // handoff's teardown and applied once that cancellation lands. The
-            // tab count a caller reads right now is the UNCHANGED one, so
-            // answering `OK <active> <count>` would read as "closed, and here is
-            // the state". Say what actually happened instead.
+            // Deferred, not done: queued onto the pending handoff's teardown and
+            // applied once that cancellation lands. The tab count is unchanged
+            // now, so `OK <active> <count>` would read as closed.
             self.pending_action_refusal = Some(
                 "tab close deferred: a pending update handoff is being cancelled first".to_string(),
             );
@@ -7101,19 +6702,11 @@ impl App {
             return match self.close_active_native_tab_keeping(wid, front) {
                 Ok(()) => canonical_count == 1,
                 Err(why) => {
-                    // Keep the refused tab selected: its app-owned banner and
-                    // the exact recovery palette explain why topology stayed
-                    // intact. Restoring the prior tab made close look inert.
+                    // Keep the refused tab selected: its banner and recovery
+                    // palette explain why topology stayed intact.
                     self.resync_active_or_window(wid);
-                    // AND SAY WHY, for the seams that mint a reply. `bool` here
-                    // means "was the last canonical tab", never "it closed" (see
-                    // this function's own doc), so every caller that treated
-                    // `false` as a quiet no-op threw this sentence away — and
-                    // `tab close` answered `OK <active> <count>` over it while
-                    // the GUI user got the banner. The two refusals this arm
-                    // collapses ("waiting for a durable checkpoint" and the
-                    // update-child rollback deferral) are distinct and both
-                    // actionable, so the reason travels rather than the bool.
+                    // Hand the reason to the reply seams: the `bool` means "was the
+                    // last canonical tab", never "it closed".
                     self.pending_action_refusal = Some(why);
                     false
                 }
@@ -7143,30 +6736,21 @@ impl App {
             .get(&wid)
             .and_then(|window| window.tab_set.get(tab_id))
             .and_then(|tab| self.tab_restore_descriptor(tab));
-        // Preserve the historical last-tab handoff: the caller closes the whole
-        // window, whose teardown drains this terminal and its views exactly once.
+        // The last tab: the caller closes the whole window, whose teardown drains
+        // this terminal and its views exactly once.
         if exits_window {
             if let Some(tab) = recovery {
                 self.retain_closed_tab(wid, i, tab);
             }
-            // The window's deregistration runs a LATER turn (the caller sets
-            // `pending_close`; `escalate_pending_close`/`close_window` tears it
-            // down), after this gesture's `CloseAttribution` scope has dropped.
-            // Carry the reason/actor on the window so `close_window_logical` can
-            // re-enter it around the deregister — otherwise the exit journals
-            // `reason=unknown by=-`.
+            // The teardown runs a later turn, outside this gesture's scope.
             self.stash_deferred_close_attribution(wid);
             return true;
         }
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;
         };
-        // Drain EVERY pane's session of the removed tab and detach each (NOT a Vec
-        // remove): DETACH the pool view FIRST (the last view drops the Session,
-        // closing its PTY master), and deregister from the process-wide registry
-        // ONLY when that detach actually dropped the session. A shared (Cmd-Shift-O)
-        // session still viewed in another window keeps its single store entry while a
-        // view remains; a genuinely-closed id then fail-closes a later @<selector>.
+        // Detach each pane's view, deregistering only a session that detach dropped
+        // (as `teardown_session` does).
         let closing = ws.layouts[projection_index].sessions();
         ws.layouts.remove(projection_index);
         remove_terminal_projection(ws, projection_index);
@@ -7181,12 +6765,9 @@ impl App {
         if let Some(tab) = recovery {
             self.retain_closed_tab(wid, i, tab);
         }
-        // Re-sync the CLICKED window — its active index shifted when the tab was
-        // removed. Mirror `open_tab_in`'s owner-sync: the global handles follow the
-        // FRONT window, but a NON-front window must still re-sync its OWN mirror +
-        // native tab strip (`sync_window` → `refresh_window_tabs`), or it keeps a
-        // PHANTOM segment past the closed tab. (Proven by `tab_strip` + its Tier-1
-        // conformance: closing a tab in a non-front window must not desync its strip.)
+        // A non-front window must still re-sync its own mirror and native strip, or
+        // it keeps a phantom segment past the closed tab (the `tab_strip`
+        // conformance pins this).
         if self.frontmost_window == Some(wid) {
             self.sync_active_session();
         } else {
@@ -7195,10 +6776,8 @@ impl App {
         false
     }
 
-    /// Live structural oracle for the window/session model (debug builds only;
-    /// `debug_assert`-ed after each tab mutation, mirroring how the engine fuzz
-    /// harness wires grid invariants as an always-on oracle). It must hold at
-    /// every STABLE point:
+    /// Live structural oracle for the window/session model, `debug_assert`-ed
+    /// after each tab mutation. It holds at every stable point:
     ///   - there is always ≥1 logical window and `frontmost_window` names one;
     ///   - every non-closing window has ≥1 canonical tab;
     ///   - `tabs`/`layouts` are an exact terminal-only projection and may both be
@@ -7207,32 +6786,19 @@ impl App {
     ///     mirror id equals `layouts[tabs.active].focus()`; and
     ///   - every pane's session is owned by the pool (resolvable).
     ///
-    /// This is the CODE-LEVEL shadow of the ty-proven `window_routing_model`'s
+    /// The code-level shadow of `window_routing_model`'s
     /// `ExitIffEmpty`/`FrontmostLive`/`FrontmostAllocated` (crates/aterm-spec).
     //
-    // NOT `#[cfg(debug_assertions)]`: the `debug_assert!` call sites type-check
-    // their condition in release too (the macro only gates EXECUTION, not
-    // compilation), so a debug-only definition fails the release build with
-    // E0599 — and those same call sites keep it live for the dead-code lint.
+    // Not `#[cfg(debug_assertions)]`: `debug_assert!` type-checks its condition
+    // in release too, so a debug-only definition fails the release build (E0599).
     pub(crate) fn structural_invariants_ok(&self) -> bool {
         self.structural_invariant_violation().is_none()
     }
 
-    /// The same oracle as [`Self::structural_invariants_ok`], but NAMING the first
-    /// clause that is false — and the values that make it false — instead of only
-    /// reporting that one was. Every `debug_assert!` on the bool passes this as its
-    /// panic message, so a trip arrives as a diagnosis rather than as a fact still
-    /// to be diagnosed.
-    ///
-    /// An oracle over a model this wide is only worth the sentence it can produce
-    /// when it fires: it guards eleven distinct relationships across `tab_set`,
-    /// `layouts`, `tabs`, `front_content`, `active_terminal`, `window_focus`, the
-    /// view store, the session pool and the native runtime, and it fires at seams
-    /// (`sync_active_session`, `close_window_logical`, session restore) reached
-    /// from every tab add/switch/cycle/close — so a bare bool names neither the
-    /// broken relationship nor the window it broke in. The message costs a passing
-    /// frame nothing: `assert!` evaluates its format arguments ONLY on the failing
-    /// branch.
+    /// The oracle of [`Self::structural_invariants_ok`], naming the first false
+    /// clause and the values that make it false. Every `debug_assert!` on the bool
+    /// passes this as its panic message, so a trip arrives as a diagnosis; it is
+    /// formatted only on failure.
     pub(crate) fn structural_invariant_violation(&self) -> Option<String> {
         let Some(fid) = self.frontmost_window else {
             return Some("frontmost_window is None: no window holds the front".to_string());
@@ -7442,11 +7008,11 @@ impl App {
     }
 
     /// Apply a [`pane::CloseOutcome`] from tab `tab` of window `wid`, keeping the
-    /// pool, `layouts`, and `tabs` consistent, and re-mirror the focused pane.
-    /// Returns `true` iff that was the last pane of the last tab of the last window
-    /// (caller signals the window to close). Detaching the removed view drops the
-    /// `Session` (closing its PTY master) iff it was the last view; every OTHER pane
-    /// is untouched.
+    /// pool, `layouts` and `tabs` consistent, and re-mirror the focused pane.
+    /// Returns `true` iff that was the last pane of the window's last tab (the
+    /// caller signals the window to close). Detaching the removed view drops the
+    /// `Session` (closing its PTY master) iff it was the last view; every other
+    /// pane is untouched.
     pub(crate) fn apply_close_outcome(
         &mut self,
         wid: WindowId,
@@ -7471,25 +7037,18 @@ impl App {
                                 == Some(closed_session)
                         })
                 });
-                // Re-project while the retiring focused view still resolves. The
-                // canonical terminal-tab classifier intentionally consults `tab.focus`;
-                // deleting that identity first made the surviving split tab disappear
-                // from the terminal projection exactly during collapse.
+                // Re-project while the retiring focused view still resolves: the
+                // canonical terminal-tab classifier consults `tab.focus`, so
+                // deleting that identity first would drop the surviving split tab
+                // from the terminal projection.
                 let synced = self.sync_tab_model_from_layout(wid, tab);
                 debug_assert!(synced);
-                // OWNERSHIP ORDER — topology first, identity second. A `ViewId` may
-                // only be retired once the canonical tree has stopped naming it: a
-                // leaf that outlives its `ViewStore` entry is UNRESOLVABLE, and
-                // `active_visible_content_route` fails closed on exactly that, which
-                // returns from `redraw_window` before any present and freezes the
-                // window for the rest of its life (`pane::PaneTree::close_pane`
-                // documents the release-only elision that used to reach this state).
-                // So a re-projection that still names the leaf means the topology
-                // change did NOT happen: refuse the whole retirement — the session
-                // keeps its view and its PTY — rather than trade a live pane for a
-                // dead window. `close_focused_mixed_leaf` proves the same order on
-                // the heterogeneous side: it refuses to detach ownership unless the
-                // tree removal returned `Removed`.
+                // Ownership order: topology first, identity second. A leaf that
+                // outlives its `ViewStore` entry is unresolvable:
+                // `active_visible_content_route` fails closed on it and
+                // `redraw_window` never presents the window again. So a re-projection
+                // that still names the leaf refuses the whole retirement (the session
+                // keeps its view and PTY). `close_focused_mixed_leaf` keeps this order.
                 let orphaned = closed_view.is_some_and(|view| {
                     self.windows
                         .get(&wid)
@@ -7511,29 +7070,25 @@ impl App {
                 // The tab survives (a sibling remained). Detach just the closed
                 // pane's view; the sibling's reader thread stays alive.
                 self.teardown_session(outcome.closed());
-                // The active tab's geometry changed (a sibling grew); the closed
-                // tab may not be the active one (background EOF), but re-laying the
-                // active tab is cheap and correct. Resize panes to the new layout.
-                // This pass is the COLLAPSE the split's take-back hold judges
-                // (`crate::split_regrid_hold`): a sibling a split shrank inside
-                // the quiet does not grow straight back to its pre-split grid.
+                // Re-lay the active tab (the closed one may be a background tab,
+                // but this is cheap). This pass is the collapse the split's
+                // take-back hold judges (`crate::split_regrid_hold`): a sibling a
+                // split shrank inside the quiet does not grow straight back to its
+                // pre-split grid.
                 self.split_regrid_cause = crate::split_regrid_hold::RelayCause::Collapse;
                 self.resize_panes(wid);
                 self.split_regrid_cause = crate::split_regrid_hold::RelayCause::Other;
-                // The active pane MOVED (the focused pane collapsed onto its sibling);
-                // re-point the global handle, not just the per-window mirror, so a
-                // control verb can't keep driving the just-closed pane's session.
+                // The focused pane collapsed onto its sibling: re-point the global
+                // handle too, so a control verb cannot keep driving the closed
+                // pane's session.
                 self.resync_active_or_window(wid);
-                // A pane CLOSED: retire its effect state (episodes, done marks,
+                // A pane closed: retire its effect state (episodes, done marks,
                 // parked grid) so a departed pane leaves nothing resident. The
-                // surviving panes keep theirs — the collapse only resizes them.
+                // surviving panes keep theirs.
                 self.reset_pane_space_decorations(wid);
                 false
             }
             pane::CloseOutcome::LastPane { .. } => {
-                // That pane was the tab's only one → the tab closes. `tabs.close`
-                // returns true iff it was the LAST tab (caller signals the window to
-                // close; the last window closing exits the app).
                 let Some((stable_id, canonical_last)) = self.windows.get(&wid).and_then(|ws| {
                     Some((
                         terminal_tab_id_at(&ws.tab_set, &self.view_store, tab)?,
@@ -7545,9 +7100,8 @@ impl App {
                 if canonical_last {
                     return true;
                 }
-                // Detach EVERY pane's view of the removed tab (a LastPane close has
-                // exactly one, but draining `sessions()` is robust and explicit),
-                // then drop the tab's tree.
+                // Detach every pane's view of the removed tab (a LastPane close
+                // has exactly one), then drop the tab's tree.
                 let drained: Vec<u64> = self
                     .windows
                     .get(&wid)
@@ -7566,21 +7120,19 @@ impl App {
                 for sid in drained {
                     self.teardown_session(sid);
                 }
-                // The active TAB changed (the closed tab's neighbor became active);
-                // re-point the global handle so verbs follow the close-induced switch.
+                // The active tab changed (the closed tab's neighbor became active);
+                // re-point the global handle so verbs follow the switch.
                 self.resync_active_or_window(wid);
                 false
             }
         }
     }
 
-    /// Tear down exactly the session `id`: DETACH its pool view (which drops its
-    /// `Session` — closing its PTY master, ending its reader thread — iff it was the
-    /// LAST view) FIRST, then deregister from the process-wide registry (P1.1) ONLY
-    /// when that detach actually dropped the session. A REFCOUNTED (Cmd-Shift-O
-    /// shared) session still live in another window must NOT be deregistered while a
-    /// view remains: `pool.detach` returns `true` iff the view count hit 0. A later
-    /// `@<selector>` to a genuinely-closed id fail-closes (unknown -> Deny).
+    /// Tear down session `id`: detach its pool view first (the last view drops its
+    /// `Session`, closing its PTY master and ending its reader), then deregister
+    /// only when that detach dropped the session. A shared (Cmd-Shift-O) session
+    /// still viewed elsewhere stays registered: `pool.detach` returns `true` iff
+    /// the view count hit 0. A later `@<selector>` to a closed id fail-closes.
     pub(crate) fn teardown_session(&mut self, id: u64) {
         self.split_regrid_holds.forget(id);
         if self.detach_session_view(id) {
@@ -7620,7 +7172,7 @@ impl App {
     ) {
         #[cfg(target_os = "macos")]
         self.withdraw_askpass_session(id);
-        // The exit ledger's tale: the gesture that started this close said why.
+        // The close gesture's attribution, for the exit ledger.
         let (reason, by) = session_store::current_close_attribution();
         // THE CLOSED-SESSION INDEX's input (`session_log::ClosedLogs`): the
         // session's ctx, read under the store's read lock and released, with
@@ -7711,9 +7263,8 @@ impl App {
                 crate::task_launch::retire_task_file(&stable);
             }
             crate::proxy::unpublish_session(&stable);
-            // Through the App's own store handle (the process singleton in a
-            // real run) so the §2.4 freshness bump lands where the chrome
-            // cache reads it — private-store tests included.
+            // Through the App's own store handle, so the freshness bump lands
+            // where the chrome cache reads it, private-store tests included.
             crate::connections::sweep_session_closed_in(&self.connections, &stable, &self.store);
             // The sweep dissolves edges with NO wake funnel of its own: the
             // marks and menus recompose through the close path's later strip
@@ -8095,19 +7646,9 @@ mod mixed_tab_tests {
         );
     }
 
-    /// Address a real temp-dir file the way the SHIPPING code does.
-    ///
-    /// A hand-rolled `format!("file://{}", path.display())` is malformed on
-    /// Windows: `C:\Users\...` lands straight after the authority slashes, so
-    /// `C:` is parsed as the authority and the backslashes are never escaped.
-    /// The document host rejects that with "malformed file URI" before a single
-    /// byte is read, which is a fixture defect and not a product one — every
-    /// product seam that turns a path into a URI (the file picker in
-    /// `app_input::open_local_document_path`, the drag-and-drop seam in
-    /// `lib::drop_file`, the config editor in `app_documents`) already funnels
-    /// through this same encoder, which emits `file:///C:/Users/...` with
-    /// percent-escapes. Tests must use it too, or they test a URI no user can
-    /// ever produce.
+    /// Address a real temp-dir file as the shipping code does: a hand-rolled
+    /// `format!("file://{}", …)` is malformed on Windows (`C:` parses as the
+    /// authority), and the document host rejects it.
     fn file_uri(path: &std::path::Path) -> String {
         crate::native_document_host::path_to_file_uri(path).unwrap()
     }
@@ -8270,23 +7811,15 @@ mod mixed_tab_tests {
         }
     }
 
-    /// THE `tab` VERB SAYS WHEN IT DID NOTHING. Every `tab` action funnelled
-    /// through one post-state read, so `cmd_tab` minted `OK <active> <count>`
-    /// whatever happened. Two declines hid behind that: an out-of-range index
-    /// (for `move`, the OK is BYTE-IDENTICAL to an honoured move), and a tab host
-    /// that refused the close.
-    ///
-    /// Each refusal is paired with its POSITIVE control in the same test, because
-    /// "always refuses" would pass a one-sided version of this and be a worse bug
-    /// than the silence it replaces.
+    /// An out-of-range `tab` action refuses instead of reporting
+    /// `OK <active> <count>` (for `move`, identical to an honoured move); each
+    /// refusal has its in-range positive control.
     #[test]
     fn an_out_of_range_tab_action_refuses_instead_of_reporting_ok() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        // `open_tab_in` cannot stage this: it needs a real `proxy` to spawn a
-        // PTY and returns having done NOTHING under the headless harness, which
-        // left the fixture with one tab and no destination for the move below.
-        // `push_stub_tab` is the harness's own second-tab idiom.
+        // `open_tab_in` spawns nothing headless (no `proxy`); `push_stub_tab`
+        // stages the second tab.
         app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
         let count = app.windows[&wid].tab_set.len();
         assert!(count >= 2, "two tabs so a real move has somewhere to go");
@@ -8310,7 +7843,6 @@ mod mixed_tab_tests {
         )
         .expect_err("moving to an index no tab holds must refuse");
 
-        // POSITIVE CONTROLS: the same verbs, in range, must still act.
         assert_eq!(
             app.apply_tab_cmd_in(wid, TabAction::Select(0)),
             Ok((0, count)),
@@ -8321,7 +7853,6 @@ mod mixed_tab_tests {
             Ok((1, count)),
             "an in-range move still reports the state"
         );
-        // ...and a close in range really closes.
         let after = app
             .apply_tab_cmd_in(wid, TabAction::Close(Some(0)))
             .expect("an in-range close acts");
@@ -8514,9 +8045,9 @@ mod mixed_tab_tests {
         assert_eq!(survivor.focus, native_view);
         assert_eq!(app.active_native_view(wid), Some((instance, native_view)));
 
-        // Tier-1 bind: the shipping EOF path is an admitted Close transition of
-        // the existing derived pane-tree machine.  The dangling-focus negative
-        // control proves this is not a vacuous leaf-count assertion.
+        // The shipping EOF path is an admitted `Close` transition of the derived
+        // pane-tree machine; the dangling-focus negative control keeps this from
+        // being a vacuous leaf-count check.
         let model = pane_tree_model();
         let after = project(survivor);
         assert!(model.successors("Close", &before).contains(&after));
@@ -8537,9 +8068,8 @@ mod mixed_tab_tests {
             app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Vertical);
         let background_tab = app.windows[&wid].tab_set.active_id().unwrap();
 
-        // Stage a genuinely separate foreground tab. Reopening Settings now
-        // correctly finds and focuses the nonfocused Settings leaf above, so
-        // it can no longer be abused as a way to manufacture this tab.
+        // Stage a separate foreground tab (reopening Settings would only focus
+        // the Settings leaf above).
         let foreground_session = app.next_session_id;
         app.push_stub_tab(wid, crate::stub_session(foreground_session));
         let foreground_tab = app.windows[&wid].tab_set.active_id().unwrap();
@@ -8562,9 +8092,8 @@ mod mixed_tab_tests {
         let original_view = app.windows[&source].tab_set.active().unwrap().focus;
 
         // Keep a native sibling in the source, share T0 into B (Cmd-Shift-O), then
-        // move B's shared tab back into A (Cmd-Shift-M).  A now owns two distinct
-        // stable terminal views of the same pooled session with Settings between
-        // them; the old WindowId-deduped exit path retired only the first one.
+        // move B's shared tab back into A (Cmd-Shift-M): A then owns two stable
+        // terminal views of one pooled session, with Settings between them.
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
         let (settings_instance, settings_view) = app.active_native_view(source).unwrap();
         app.switch_tab_in(source, 0);
@@ -9358,12 +8887,9 @@ mod mixed_tab_tests {
     }
 }
 
-/// Boundary proofs for the `~` cwd abbreviation (the tab-label form of a
-/// session cwd — see [`home_relative_suffix`] / [`App::tab_titles`]). Pure
-/// (explicit `home`), so every component-boundary case is provable without
-/// touching the process environment; the App-level fallback-order tests in
-/// `app_restore.rs` cover the same helper wired through `tab_titles` against
-/// the REAL `$HOME`.
+/// Boundary cases for the `~` cwd abbreviation ([`home_relative_suffix`]), with no
+/// process environment touched; `app_restore_tests.rs` covers it through
+/// [`App::tab_titles`] against the real `$HOME`.
 #[cfg(test)]
 mod home_abbreviation_tests {
     use super::home_relative_suffix;
@@ -9406,11 +8932,10 @@ mod session_chrome_app_tests {
     use crate::menu::MenuAction;
     use crate::session_chrome::TabMenuEntry;
 
-    /// The composed chrome reflects live session facts, the menu carries the
-    /// pinned actions with honest enabled bits (a stub has no cwd ⇒ `Copy CWD`
-    /// greys), a bare live session composes no tooltip (its `alive` state and
-    /// `spawned` event are no news), and one fact beyond the label composes a
-    /// tooltip that is FED THROUGH the tab's presentation.
+    /// The composed chrome reflects live session facts: the menu carries the
+    /// pinned actions with honest enabled bits (a stub has no cwd, so `Copy CWD`
+    /// greys), a bare live session composes no tooltip, and one fact beyond the
+    /// label composes a tooltip fed through the tab's presentation.
     #[test]
     fn composed_chrome_reaches_presentation_and_menu_actions_are_honest() {
         let mut app = App::headless_for_test();
@@ -9467,9 +8992,9 @@ mod session_chrome_app_tests {
         );
     }
 
-    /// The gather cuts the rows the chrome leaves out BEFORE its cap: a burst
-    /// of agent verdict moves and typing after a directory change still shows
-    /// the change and the start in the tab menu.
+    /// The gather cuts the rows the chrome leaves out before its cap: a burst of
+    /// agent verdict moves and typing after a directory change still shows the
+    /// change and the start in the tab menu.
     #[test]
     fn session_chrome_gather_cuts_agent_moves_before_the_tail_cap() {
         let mut app = App::headless_for_test();
@@ -9593,7 +9118,7 @@ mod session_chrome_app_tests {
         // While the menu tracks: a control-socket `tab move` relocates tab 0
         // to the end. Order is now sessions 1,2,0 — position 1 changed hands.
         app.move_tab(wid, 0, 2);
-        // Dispatch re-resolves the POP-TIME id: same session, new position.
+        // Dispatch re-resolves the pop-time id: same session, new position.
         let index = app
             .tab_index_for_id(wid, popped)
             .expect("the clicked tab still exists");
@@ -9603,8 +9128,8 @@ mod session_chrome_app_tests {
             Some(popped_sid.clone()),
             "the action lands on the SAME session the menu was popped on"
         );
-        // The old frozen index now names a DIFFERENT live session — the exact
-        // wrong-tab close / wrong-sid copy the stable id exists to prevent.
+        // The frozen index now names another live session: the wrong-tab close
+        // the stable id prevents.
         assert_ne!(
             app.tab_session_id_text(wid, 1),
             Some(popped_sid),
@@ -9650,8 +9175,8 @@ mod session_chrome_app_tests {
                 .contains("\u{21e5}"),
             "no connection line before any connection exists"
         );
-        // Mint A → B through the App's OWN store (what the menu paths and —
-        // via the shared singleton — the wire `connect` verb do).
+        // Mint A → B through the App's own store, as the menu paths and the wire
+        // `connect` verb do.
         assert!(crate::connections::connect_in(
             &app.connections,
             &a_sid,
@@ -9809,8 +9334,8 @@ mod session_chrome_app_tests {
         let popped = app.windows[&wid].tab_set.tabs()[1].id;
         let neighbor_sid = app.tab_session_id_text(wid, 2);
         // Mid-menu, the clicked tab's shell exits (`Wake::Exit` → whole-tab
-        // close). The old index 1 is STILL in range — it now names session 2.
-        // (`close_tab_at` returns `true` only for a LAST-tab window close.)
+        // close). The old index 1 is still in range: it now names session 2.
+        // (`close_tab_at` returns `true` only for a last-tab window close.)
         assert!(!app.close_tab_at(wid, 1), "two tabs survive the close");
         assert_eq!(app.windows[&wid].tab_set.len(), 2, "clicked tab is gone");
         assert_eq!(
@@ -9825,14 +9350,9 @@ mod session_chrome_app_tests {
         );
     }
 
-    /// REGRESSION (orphan controller release): a `mouse press` arriving off the
-    /// card DISMISSES it and is consumed — and because the dismiss CLOSES the
-    /// card, the matching RELEASE finds no menu open and would fall through to
-    /// a tracking TUI as half a press pair, the same defect the consumed-press
-    /// key sets exist to prevent. The dismissing button is latched so its
-    /// release is swallowed with it; a button that was never eaten is not.
-    /// Runs on both in-grid-strip platforms: the dismiss rule is the same
-    /// state machine on each.
+    /// A press off the card dismisses it and is consumed, and so is its release:
+    /// with the card closed, that release would otherwise reach a tracking TUI as
+    /// half a press pair. Only the latched button is swallowed.
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn a_controller_press_that_dismisses_the_card_swallows_its_own_release() {
@@ -9882,10 +9402,10 @@ mod session_chrome_app_tests {
     }
 }
 
-/// THE IN-GRID STRIP'S CLICK STREAK — the service AppKit provides on macOS
-/// (`event.clickCount() == 2`) and winit does not, so off macOS the strip has to
-/// keep its own. These drive `handle_tab_strip_click` against real laid-out
-/// segments, so they pin the mapping from a column to a gesture, not just the FSM.
+/// The in-grid strip's click streak, which AppKit provides on macOS
+/// (`clickCount() == 2`) and winit does not. These drive `handle_tab_strip_click`
+/// against real laid-out segments, so they pin the column-to-gesture mapping, not
+/// just the FSM.
 #[cfg(test)]
 mod rename_strip_click_tests {
     use super::*;
@@ -9990,9 +9510,8 @@ mod rename_strip_click_tests {
         assert_eq!(app.rename_edit_session(wid), None, "a stale press");
     }
 
-    /// CLICKING ANOTHER CHIP IS A CLICK AWAY, and clicking away keeps what you
-    /// typed — the in-grid twin of the macOS `Wake::SelectTab` fix. Clicking the
-    /// chip you are ALREADY editing is not leaving the field, so it keeps editing.
+    /// Clicking another chip is a click away and commits what was typed; clicking
+    /// the chip being edited keeps editing.
     #[test]
     fn selecting_another_chip_commits_while_the_edited_chip_keeps_editing() {
         let (mut app, wid) = app_with_two_tabs();
@@ -10032,13 +9551,10 @@ mod rename_strip_click_tests {
         assert!(app.windows[&wid].strip_press.is_none(), "streak broken");
     }
 
-    /// THE VERSION LABEL IS A BUTTON, NOT CAPTION (Windows). A press on it arms
-    /// neither double-click streak — not the chip's (rename) and not the bare
-    /// band's (maximize) — so it can never drag or maximize the window; it
-    /// switches, opens and closes no tab; and like every press away from an
-    /// open rename it settles the edit. The `Wake::MenuAction` it posts cannot
-    /// be built in libtest (a headless App has no event-loop proxy): the drive
-    /// against a real window proves Settings ▸ About opens.
+    /// The version label is a button, not caption (Windows): a press arms neither
+    /// double-click streak, so it never drags or maximizes the window; it opens,
+    /// closes and switches no tab; and it settles an open rename. The
+    /// `Wake::MenuAction` it posts needs the event-loop proxy a headless App lacks.
     #[cfg(windows)]
     #[test]
     fn a_version_press_is_a_button_not_caption() {
@@ -10087,13 +9603,11 @@ mod rename_strip_click_tests {
         crate::tray_raster::clear_ui_fonts_for_test();
     }
 
-    /// W2: the BARE band keeps its own double-click streak — the FSM behind the
-    /// Windows caption reflexes (press-drag, double-click-maximize) on the
-    /// strip's background. Headless has no OS window, so the drag/maximize
-    /// calls themselves are natural no-ops here; the FSM is the half with rules
-    /// worth pinning: a first band press ARMS, a repeat within the interval
-    /// CONSUMES (so a triple-click starts over instead of re-toggling), a chip
-    /// press in between DISARMS, and a stale press re-arms as a fresh first.
+    /// The bare band keeps its own double-click streak, the FSM behind the
+    /// Windows caption reflexes (headless, the drag/maximize calls are no-ops): a
+    /// first band press arms, a repeat within the interval consumes (a
+    /// triple-click starts over), a chip press in between disarms, and a stale
+    /// press re-arms as a fresh first.
     #[test]
     fn bare_band_presses_keep_their_own_double_click_streak() {
         let (mut app, wid) = app_with_two_tabs();
@@ -10112,9 +9626,7 @@ mod rename_strip_click_tests {
             "the repeat is consumed — a third press is a fresh gesture"
         );
 
-        // A chip press between two band presses breaks the pair (and the
-        // symmetric case — band between chips — is what keeps the rename
-        // double-click honest; `clear_strip_press` covers both).
+        // A chip press between two band presses breaks the pair.
         app.handle_tab_strip_click(wid, band);
         assert!(app.windows[&wid].strip_band_press.is_some());
         app.handle_tab_strip_click(wid, chip_col(&app, wid, 0));
@@ -10133,9 +9645,7 @@ mod rename_strip_click_tests {
         );
     }
 
-    /// A TAB THAT VANISHES mid-edit cancels — never a commit, because the user was
-    /// naming something that no longer exists. The in-grid twin of the macOS
-    /// strip's `sync_rename_overlay`, driven from the same structural refresh.
+    /// A tab that vanishes mid-edit cancels the edit, never commits it.
     #[test]
     fn a_vanished_tab_reaps_the_editor_instead_of_leaving_a_modal() {
         let (mut app, wid) = app_with_two_tabs();
@@ -10690,11 +10200,9 @@ mod status_glance_tests {
         assert_eq!(take_asks(), 0, "turning it off asks nothing");
     }
 
-    /// `herald_session` hands a refusal back to the herald (review,
-    /// 2026-09-28): a notice the notifier's queue refused told nobody, so it
-    /// stays owed — due again once [`crate::status_item::NOTIFY_RETRY`] has
-    /// passed — where it used to be counted told and lost. NEGATIVE CONTROL:
-    /// a notice the queue took is owed no more.
+    /// A notice the notifier's queue refused stays owed, due again once
+    /// [`crate::status_item::NOTIFY_RETRY`] has passed. Negative control: a
+    /// notice the queue took is owed no more.
     #[test]
     fn a_refused_herald_notice_stays_owed() {
         let take_posts = || HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()));
@@ -10726,8 +10234,7 @@ mod status_glance_tests {
     }
 
     /// Disabled transitions cannot spend the instance burst or leave a later
-    /// session's notification owed. The previous producer-side check ran after
-    /// `note`, so the fourth session silently armed the presence timer anyway.
+    /// session's notification owed.
     #[test]
     fn desktop_alerts_off_never_arms_rate_limited_herald_retries() {
         let mut app = App::headless_for_test();
@@ -10881,7 +10388,7 @@ mod tab_context_menu_tests {
         assert!(app.windows[&wid].tab_menu.is_none());
     }
 
-    /// Windows' rule: right-clicking a BACKGROUND tab selects it, because every
+    /// Windows' rule: right-clicking a background tab selects it, because every
     /// action on the card reads as being about the tab you are looking at.
     #[test]
     fn right_clicking_a_background_tab_selects_it_first() {
@@ -10943,11 +10450,10 @@ mod connected_spawn_tests {
             .clone()
     }
 
-    /// The §6 precheck contract: `place=window` under headless is the NEW
-    /// `ERR headless` refusal (checked BEFORE any create — the wire wrapper
-    /// formats this exact `Err` body as `ERR headless: use place=tab`); `place=tab` stays
-    /// headless-legal and resolves the window hosting the origin; an unknown
-    /// or Exited `of=` fails closed.
+    /// `place=window` under headless refuses before any create (the wire formats
+    /// this `Err` as `ERR headless: use place=tab`); `place=tab` is headless-legal
+    /// and resolves the window hosting the origin; an unknown or exited `of=`
+    /// fails closed.
     #[test]
     fn precheck_refuses_headless_window_and_dead_origins_but_allows_tabs() {
         let app = App::headless_for_test();
@@ -10977,11 +10483,10 @@ mod connected_spawn_tests {
         );
     }
 
-    /// The mint half of a CONTROLLED spawn: the origin gains a `both`
-    /// connection over the newborn — three rows in the NEWBORN's table, all
-    /// `src=origin`, exactly the set the `edges` verb (and the §4 roles fold)
-    /// reads. A CONTROLLER spawn inverts: the rows land in the ORIGIN's table
-    /// with the newborn as src.
+    /// The mint half of a controlled spawn: the origin gains a `both` connection
+    /// over the newborn, three rows in the newborn's table, all `src=origin`, as
+    /// the `edges` verb and the roles fold read them. A controller spawn inverts:
+    /// the rows land in the origin's table with the newborn as src.
     #[test]
     fn mint_connected_writes_a_both_connection_in_the_right_direction() {
         let mut app = App::headless_for_test();
@@ -11011,12 +10516,12 @@ mod connected_spawn_tests {
         for op in [Op::ReadScreen, Op::WriteInput, Op::Signal] {
             assert!(ops.contains(&op), "missing {op:?} in {ops:?}");
         }
-        // The §4 roles fold sees it (the marks read exactly these tables).
+        // The roles fold sees it (the marks read these tables).
         let roles = crate::connections::roles_by_local(&app.store);
         assert!(roles[&0].outbound && !roles[&0].inbound);
         assert!(roles[&41].inbound && !roles[&41].outbound);
 
-        // CONTROLLER inverts src/dst: rows in the ORIGIN's table.
+        // Controller inverts src/dst: rows in the origin's table.
         let supervisor = register_stub(&mut app, 42);
         assert_eq!(
             app.mint_connected(ConnectedSpawnKind::Controller, &origin, &supervisor, "test"),
@@ -11357,14 +10862,12 @@ mod exit_attribution_tests {
         feed(app, session, &bytes);
     }
 
-    /// **SPLIT, THEN CLOSE AT ONCE, IS NO NET-ZERO FLAP.** Confirmed 2026-09-29
-    /// by two skeptics: `@<claude> spawn split=h` answers after the Claude pane
-    /// shrank N -> ~N/2, and an `@<new> close` straight after grew it back to N
-    /// within ~8 ms. With one byte of the program's output between the halves
-    /// the alternate screen kept ~N/2 demoted rows, and a `SIGWINCH` handler
-    /// reading N (the size it last drew) never repainted. The shrink stays
-    /// immediate; the take-back waits until the shrink has stood the quiet, so
-    /// the program reads and draws the shrunk size first.
+    /// A split closed at once is no net-zero flap: a pane shrunk from N rows to
+    /// ~N/2 and grown straight back, with the program's output between the halves,
+    /// keeps ~N/2 demoted rows on the alternate screen, and a `SIGWINCH` handler
+    /// reading N (the size it last drew) never repaints. The shrink is immediate;
+    /// the take-back waits until the shrink has stood the quiet, so the program
+    /// draws the shrunk size first.
     #[test]
     fn a_split_closed_at_once_holds_the_siblings_take_back_for_the_quiet() {
         use crate::split_regrid_hold::SPLIT_REGRID_QUIET;
@@ -11448,10 +10951,10 @@ mod exit_attribution_tests {
         assert_eq!(app.split_regrid_hold_deadline(), None);
     }
 
-    /// The split's own NEW pane is never held: it was spawned at the window's
-    /// full grid, a size its program never drew, so the resize away from it is
-    /// no shrink. Closing the ORIGINAL pane at once grows the newborn to the
-    /// whole rect straight away, and no wake is armed.
+    /// The split's new pane is never held: it was spawned at the window's full
+    /// grid, a size its program never drew, so the resize away from it is no
+    /// shrink. Closing the original pane at once grows the newborn to the whole
+    /// rect straight away, and no wake is armed.
     #[test]
     fn the_newborn_pane_of_a_split_is_never_held() {
         let mut app = App::headless_for_test();
@@ -11471,9 +10974,9 @@ mod exit_attribution_tests {
         assert_eq!(app.split_regrid_hold_deadline(), None);
     }
 
-    /// A pane ZOOM inside the quiet is no take-back, even though the zoomed
-    /// pane's target is exactly its pre-split grid: it applies at once — for
-    /// the original pane and for the newborn — and ends the hold.
+    /// A pane zoom inside the quiet is no take-back, though the zoomed pane's
+    /// target is its pre-split grid: it applies at once, for the original pane
+    /// and the newborn, and ends the hold.
     #[test]
     fn a_zoom_inside_the_quiet_is_not_withheld() {
         let mut app = App::headless_for_test();
@@ -11487,7 +10990,7 @@ mod exit_attribution_tests {
         assert_eq!(grid(&app, new), full, "the newborn's zoom applies at once");
         app.toggle_pane_zoom();
 
-        // The ORIGINAL pane, whose zoom target is its pre-split grid.
+        // The original pane, whose zoom target is its pre-split grid.
         assert_eq!(grid(&app, 0), shrunk);
         assert!(
             app.split_regrid_holds.get(0).is_some(),
@@ -11505,12 +11008,9 @@ mod exit_attribution_tests {
         assert_eq!(grid(&app, 0), shrunk, "unzoom restores the split");
     }
 
-    /// **ONE PANE, NOT THE TAB.** Measured 2026-09-22 (audit): `@<pane> close` on
-    /// one pane of a three-pane tab answered `OK closed s-…` and the whole tab
-    /// went — `panes` lost the tab, both siblings answered `ERR no such session`,
-    /// `exits` had three `ctl-close` rows within 4 ms. The verb now runs the Cmd-W
-    /// collapse: the aimed pane retires, its siblings keep their sessions, their
-    /// PTYs and their tab, and the ledger has exactly one row, the wire's.
+    /// A `close` on one pane of a split runs the Cmd-W collapse: the aimed pane
+    /// retires, its siblings keep their sessions, PTYs and tab, and the ledger
+    /// has exactly one row, the wire's.
     #[test]
     fn a_ctl_close_on_one_pane_of_a_split_retires_only_that_pane() {
         let mut app = App::headless_for_test();
@@ -11618,10 +11118,10 @@ mod exit_attribution_tests {
         assert!(app.structural_invariants_ok());
     }
 
-    /// The aim is the SESSION, not the focus: a pane that is neither focused nor
-    /// in the active tab closes in place — its tab's projection is found by
-    /// stable id, as the EOF path finds it — the keyboard stays on the pane it
-    /// had, and the active tab does not move.
+    /// The aim is the session, not the focus: a pane neither focused nor in the
+    /// active tab closes in place (its tab's projection found by stable id, as the
+    /// EOF path finds it), focus stays where it was, and the active tab does not
+    /// move.
     #[test]
     fn a_ctl_close_aims_at_the_pane_not_at_the_focus_or_the_active_tab() {
         let mut app = App::headless_for_test();
@@ -11655,14 +11155,11 @@ mod exit_attribution_tests {
         assert!(app.structural_invariants_ok());
     }
 
-    /// THE GUARD IS THE PANE'S. A `close` on a split pane running a job is
-    /// refused on the wire, in a sentence that names the pane and not a last-tab
-    /// confirm the tab never armed; the pane, its session and its sibling stay.
-    /// A SIBLING's job never refuses a close: the collapse leaves it running, so
-    /// the idle pane beside it closes. Once that pane is alone in the window's
-    /// last tab the same job is the last-tab confirm's — `close`'s other
-    /// sentence — and the close proceeds (defers, being a last tab) the moment
-    /// the job finishes. WINDOWED (`headless = false`): the headless
+    /// A `close` on a busy split pane is refused in the pane's words, not the
+    /// last-tab confirm's, and nothing moves; a sibling's job never refuses a
+    /// close, since the collapse leaves it running. Alone in the window's last
+    /// tab, the same job is the last-tab confirm's, and the close proceeds
+    /// (defers) once the job finishes. Windowed (`headless = false`): the headless
     /// short-circuit never confirms and would keep a dead guard green.
     #[test]
     fn a_ctl_close_of_a_busy_pane_is_refused_and_a_busy_sibling_never_refuses_one() {
@@ -11716,11 +11213,9 @@ mod exit_attribution_tests {
         assert!(app.windows[&wid].pending_close);
     }
 
-    /// The pane guard covers the one pane of a tab that is NOT the window's
-    /// last: that close is the tab's, it never exits the window, so the
-    /// window-exit confirm inside `close_tab_at` never reads it — and before the
-    /// pane guard nothing did, so a busy background tab's job was hung up with
-    /// `OK closed`. Refused in the pane's words, nothing moves; the same close
+    /// The pane guard covers the one pane of a tab that is not the window's last:
+    /// that close never exits the window, so the window-exit confirm inside
+    /// `close_tab_at` never reads it. Refused in the pane's words; the same close
     /// retires the tab once the job is done.
     #[test]
     fn a_ctl_close_of_a_busy_tab_that_is_not_the_last_is_refused() {
@@ -11934,11 +11429,10 @@ mod exit_attribution_tests {
         assert!(app.windows[&wid].pending_close_attribution.is_none());
     }
 
-    /// A Cmd-Shift-O co-viewed pane: its collapse detaches THIS window's view,
-    /// the other window's keeps the session registered, and the reply names that
-    /// viewer in the last-tab path's own words — one close per viewer. Such a
-    /// pane is never busy either: the collapse hangs nothing up, its job runs on
-    /// in the other viewer.
+    /// A Cmd-Shift-O co-viewed pane: its collapse detaches this window's view, the
+    /// other window's keeps the session registered, and the reply names that
+    /// viewer in the last-tab path's words. Such a pane is never busy: its job
+    /// runs on in the other viewer.
     #[test]
     fn a_ctl_close_of_a_co_viewed_pane_collapses_it_and_names_the_other_viewer() {
         let mut app = App::headless_for_test();
@@ -11976,11 +11470,9 @@ mod exit_attribution_tests {
         );
     }
 
-    /// The same fact for a co-viewed tab that is not its window's last: the
-    /// tab went, the other window's view keeps the session, and the reply says
-    /// so. It used to blame a last-tab confirm that never fired — `close
-    /// refused (a running job armed the last-tab confirm)` over an idle tab
-    /// that had in fact closed.
+    /// The same for a co-viewed tab that is not its window's last: the tab went,
+    /// the other window's view keeps the session, and the reply says so rather
+    /// than blaming a last-tab confirm that never fired.
     #[test]
     fn a_ctl_close_of_a_co_viewed_tab_names_the_other_viewer_not_a_refusal() {
         let mut app = App::headless_for_test();
@@ -12002,7 +11494,7 @@ mod exit_attribution_tests {
         assert!(app.session_registered(c));
     }
 
-    /// Two tabs of ONE window can show one session (a Cmd-Shift-O share moved
+    /// Two tabs of one window can show one session (a Cmd-Shift-O share moved
     /// back with Cmd-Shift-M). Closing the pane in one leaves the session in the
     /// other, and the reply names a tab, not "another window" that is not there.
     #[test]
@@ -12035,10 +11527,8 @@ mod exit_attribution_tests {
         assert!(app.structural_invariants_ok());
     }
 
-    /// A pane the wire closed is as reopenable as one Cmd-W closed: the collapse
-    /// keeps the same closed-view record (`closed_view_record_for`, the FOCUSED
-    /// leaf's record generalised to the aimed one) — for a pane that was not
-    /// even focused.
+    /// A pane the wire closed is as reopenable as one Cmd-W closed, focused or not
+    /// (`closed_view_record_for`).
     #[test]
     fn a_ctl_closed_pane_leaves_the_reopen_record_cmd_w_leaves() {
         let mut app = App::headless_for_test();
@@ -12060,13 +11550,10 @@ mod exit_attribution_tests {
         );
     }
 
-    /// A ctl `tab close` of a SINGLE-tab window defers the window teardown
-    /// (`close_tab_at`'s `exits_window` branch returns true without
-    /// deregistering; the caller flags `pending_close`), so the deregistration
-    /// runs a later turn — after the gesture's `CloseAttribution` scope has
-    /// dropped. The attribution is stashed on the window and re-entered by
-    /// `close_window_logical`, so the exit journals `reason=ctl-close`, not the
-    /// `reason=unknown by=-` it silently lost before this fix.
+    /// A ctl `tab close` of a single-tab window defers the teardown to a later
+    /// turn, after the gesture's `CloseAttribution` scope dropped; the attribution
+    /// stashed on the window and re-entered by `close_window_logical` journals
+    /// `reason=ctl-close`, not `reason=unknown by=-`.
     #[test]
     fn a_last_tab_ctl_close_journals_ctl_close() {
         let mut app = App::headless_for_test();
@@ -12083,15 +11570,10 @@ mod exit_attribution_tests {
         assert_eq!(reason, ExitReason::CtlClose);
     }
 
-    /// `@<sid> close` of a window's LAST tab: the tab close is DEFERRED (the
-    /// window teardown that retires the session needs an `ActiveEventLoop`), so
-    /// the store-diff the verb answers from cannot be read until the escalation
-    /// has run. It used to be read immediately, which made an idle last-tab
-    /// close answer `ERR close refused (a running job armed the last-tab
-    /// confirm)` — for a close that was not refused and had not yet happened —
-    /// and, because the `Wake::CloseSession` arm never escalated, never happen
-    /// at all: nothing was journalled and the tab stayed open. The progress is
-    /// `Deferred`, and the verdict is `OK` only once the teardown really ran.
+    /// `@<sid> close` of a window's last tab is deferred (the teardown needs an
+    /// `ActiveEventLoop`), so the store diff cannot be read until the escalation
+    /// ran: the progress is `Deferred`, and the verdict is `OK` only once the
+    /// teardown ran.
     #[test]
     fn a_last_tab_ctl_close_is_deferred_not_refused_and_answers_after_the_teardown() {
         let mut app = App::headless_for_test();
@@ -12185,14 +11667,11 @@ mod exit_attribution_tests {
         );
     }
 
-    /// The SAME deferred shape, on a session a second window also displays
-    /// (Cmd-Shift-O): the two must not get the same answer. `close_session_by_id`
-    /// aims at the LOWEST window id holding the session, that window's teardown
-    /// runs in full, and the session is registered afterwards anyway — the other
-    /// window's pool view is still attached, so `close_window_logical` never
-    /// reached its deregister. Answering "the window teardown has not run" here
-    /// states a falsehood about a teardown that ran, and names a window that no
-    /// longer exists; the reply must name the co-viewer instead.
+    /// The same deferred shape on a session a second window also displays
+    /// (Cmd-Shift-O) gets a different answer: `close_session_by_id` aims at the
+    /// lowest window id holding the session, that window's teardown runs in full,
+    /// and the other window's view keeps the session registered. The reply names
+    /// the co-viewer, not a teardown that has not run.
     #[test]
     fn a_deferred_close_of_a_co_viewed_session_names_the_other_window() {
         let mut app = App::headless_for_test();
@@ -12216,10 +11695,10 @@ mod exit_attribution_tests {
             CloseProgress::Deferred(WindowId(0)),
             "the close aims at the LOWEST window id holding the session"
         );
-        // Both facts hold before the escalation — the teardown is outstanding AND
-        // a second window holds the session — and the co-viewer is the one that
-        // survives the teardown, so it is the one named. (The wire never reads
-        // here: `Wake::CloseSession` escalates before taking the verdict.)
+        // Before the escalation both facts hold (the teardown is outstanding and a
+        // second window holds the session); the co-viewer survives the teardown,
+        // so it is the one named. (The wire never reads here: `Wake::CloseSession`
+        // escalates first.)
         assert_eq!(
             app.close_session_verdict(session, progress),
             Err("close deferred (another window still displays this session)".to_string()),
@@ -12301,19 +11780,15 @@ mod exit_attribution_tests {
     }
 }
 
-/// THE DAILY GESTURE: closing a split pane must never stop the window painting.
+/// Closing a split pane must never stop the window painting.
 ///
 /// A canonical leaf that outlives its `ViewStore` entry is unresolvable, so
-/// [`App::active_visible_content_route`] fails closed — and `redraw_window`
-/// returns on that `None` BEFORE it reaches the present, for the rest of the
-/// window's life. Every test here therefore ends at the same seam the frame path
-/// enters: resolve the route, then run the layout preparation `redraw_window`
-/// performs with it.
-///
-/// The freeze itself was a release-only state (`PaneTree::close_pane` carried
-/// its leaf removal inside a `debug_assert_eq!`, which a shipped build compiles
-/// away); these hold the invariant that made the elision fatal: both trees
-/// shrink, every leaf resolves, the route survives.
+/// [`App::active_visible_content_route`] fails closed and `redraw_window` returns
+/// before the present for the rest of the window's life. Each test ends at the
+/// seam the frame path enters: resolve the route, then run the layout preparation
+/// `redraw_window` performs with it, and holds that both trees shrink, every leaf
+/// resolves and the route survives. The leaf removal must not live inside a
+/// `debug_assert!`, which a release build compiles away.
 #[cfg(test)]
 mod pane_close_render_seam_tests {
     use super::*;
@@ -12411,13 +11886,10 @@ mod pane_close_render_seam_tests {
         }
     }
 
-    /// What the `pane` verb is allowed to say, and it is only ever true: focus
-    /// moved, or there was no pane that way.
-    ///
-    /// The bool comes from the traversal itself rather than from a second look at
-    /// the layout afterwards, so `moved=1` and the focus actually changing are one
-    /// fact. Both refusal shapes are covered — a single-pane tab, and an edge pane
-    /// with no neighbour in the requested direction.
+    /// What the `pane` verb says is only ever true: focus moved, or there was no
+    /// pane that way. The bool comes from the traversal itself, so `moved=1` and
+    /// the focus changing are one fact; both refusal shapes (a single-pane tab,
+    /// an edge pane) are covered.
     #[test]
     fn pane_focus_reports_only_whether_focus_actually_moved() {
         let mut app = App::headless_for_test();
@@ -12436,7 +11908,7 @@ mod pane_close_render_seam_tests {
             );
         }
 
-        // Split: focus lands on the new pane, so LEFT has a neighbour and moves…
+        // Split: focus lands on the new pane, so Left has a neighbour and moves...
         let split = app.split_active_stub_tab(wid);
         assert_eq!(app.windows[&wid].layouts[0].focus(), split);
         assert!(
@@ -12448,7 +11920,7 @@ mod pane_close_render_seam_tests {
             0,
             "moved=1 means the focused pane really changed"
         );
-        // …and from the leftmost pane, LEFT is an edge: no move, focus unchanged.
+        // ...and from the leftmost pane, Left is an edge: no move, focus unchanged.
         assert!(!app.focus_pane_in(wid, pane::FocusDir::Left));
         assert_eq!(
             app.windows[&wid].layouts[0].focus(),
@@ -12473,8 +11945,7 @@ mod pane_close_render_seam_tests {
         let before = canonical_leaves(&app, wid);
         assert_eq!(before.len(), 2);
 
-        // The pane tree keeps BOTH leaves while the outcome claims a collapse —
-        // the exact contradiction a shipped `close_pane` used to report.
+        // The pane tree keeps both leaves while the outcome claims a collapse.
         let refused = app.apply_close_outcome(wid, 0, pane::CloseOutcome::Collapsed { closed });
 
         assert!(!refused, "a refused close never closes the window");
@@ -12491,23 +11962,23 @@ mod pane_close_render_seam_tests {
     }
 }
 
-/// A SHELL THAT FAILS AT START KEEPS ITS PANE (audit #7 finding 49). An rc file
-/// that runs `exit 1`, or a shell whose dylib moved and aborts, used to take its
-/// tab with it — the last tab its window, the last window aterm — with nothing
-/// saying why. These drive the reader-EOF path (`Wake::Exit`'s el-free half:
-/// classify, retire the input watch, `exit_session_logical`) over a REAL child
-/// running a stub shell, so the status the path reaps is the kernel's.
+/// A shell that fails at start keeps its pane: an rc file's `exit 1`, or a shell
+/// whose moved dylib aborts, would otherwise take its tab with it (the last tab
+/// its window, the last window aterm) with nothing saying why. These drive the
+/// reader-EOF path (`Wake::Exit`'s el-free half: classify, retire the input
+/// watch, `exit_session_logical`) over a real child running a stub shell, so the
+/// status the path reaps is the kernel's.
 #[cfg(all(test, unix))]
 mod shell_start_exit_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// Run `script` under `/bin/sh -c` as this process's child and wait —
-    /// WITHOUT reaping — until it has exited, so the exit path finds the zombie
-    /// the way a real shell leaves one. `/bin/sh` and never a script written
-    /// for the test: a freshly written executable's first exec waits on the
-    /// system's code-policy check, which under load has outlasted the minute
-    /// (2026-10-02). A minute is a hang detector, not a budget.
+    /// Run `script` under `/bin/sh -c` as this process's child and wait, without
+    /// reaping, until it has exited, so the exit path finds the zombie as a real
+    /// shell leaves one. `/bin/sh`, never a script written for the test: a freshly
+    /// written executable's first exec waits on the system's code-policy check,
+    /// which under load can outlast the minute. The minute is a hang detector,
+    /// not a budget.
     fn run_to_zombie(script: &str) -> i32 {
         let child = aterm_uds::spawnfd::command("/bin/sh")
             .args(["-c", script])
@@ -12588,7 +12059,7 @@ mod shell_start_exit_tests {
         let mut session = crate::stub_session_with_sink(id, sink);
         session.pid = pid;
         // A shell this process spawned, as `spawn_session` records one: only
-        // its own child is waited for (round seven, finding 25).
+        // its own child is waited for.
         session.shell_identity = aterm_pty::record_spawned_shell(pid);
         // The driven input is read at the spawn, before anything can write.
         session.shell_start = start.map(|(name, at)| crate::spawn::ShellStart {
@@ -12848,9 +12319,9 @@ mod shell_start_exit_tests {
         );
     }
 
-    /// THE BUG: an rc file's `exit 3` within moments of the spawn. The pane
-    /// stays, the line names the shell and the code, and the classifier still
-    /// publishes the failure.
+    /// An rc file's `exit 3` moments after the spawn: the pane stays, the line
+    /// names the shell and the code, and the classifier still publishes the
+    /// failure.
     #[test]
     fn a_shell_that_exits_3_at_start_keeps_its_pane_with_the_line() {
         let at = Instant::now();
@@ -12953,10 +12424,9 @@ mod shell_start_exit_tests {
         }
     }
 
-    /// THE REVIEW'S CASE: a shell that started and was used. An rc file whose
-    /// last line leaves `$?` at 1 (`[ -f ~/.fzf.zsh ] && source ~/.fzf.zsh`
-    /// with no such file), then a Ctrl-D within 2 s: zsh exits 1, and the tab
-    /// closes as the person asked.
+    /// A shell that started and was used: an rc file whose last line leaves `$?`
+    /// at 1 (`[ -f ~/.fzf.zsh ] && source ~/.fzf.zsh` with no such file), then a
+    /// Ctrl-D: zsh exits 1, and the tab closes as the person asked.
     #[test]
     fn a_shell_that_got_input_closes_as_before_even_on_exit_1() {
         let at = Instant::now();
@@ -12984,11 +12454,9 @@ mod shell_start_exit_tests {
         }
     }
 
-    /// THE QUERY CASE: fish (or zsh under powerlevel10k) asks for the device
-    /// attributes as it starts, aterm's reply writer answers, and then its rc
-    /// fails with `exit 1`. The answer is aterm's, not anyone's input: the
-    /// pane stays with the line, where it used to close (and with one tab
-    /// quit aterm) as if someone had typed into the shell.
+    /// fish (or zsh under powerlevel10k) asks for the device attributes as it
+    /// starts, aterm's reply writer answers, then its rc fails with `exit 1`. The
+    /// answer is aterm's, not anyone's input: the pane stays with the line.
     #[test]
     fn a_shell_that_was_only_answered_keeps_its_pane() {
         let at = Instant::now();
@@ -13102,8 +12570,8 @@ mod shell_start_exit_tests {
         assert!(!log_close_due(&app, id), "the log knows no close is coming");
     }
 
-    /// A CO-VIEWED shell that fails at start stays in EVERY window that shows
-    /// it, and its one engine carries the line once.
+    /// A co-viewed shell that fails at start stays in every window that shows it,
+    /// and its one engine carries the line once.
     #[test]
     fn a_shared_shell_that_fails_at_start_stays_in_every_viewer() {
         let at = Instant::now();
@@ -13126,16 +12594,11 @@ mod shell_start_exit_tests {
         );
     }
 
-    /// AN ADOPTED SESSION NEVER WAITS FOR ITS PID (round seven of the update
-    /// audit, finding 25). Its shell's parent was the old build, so the number
-    /// it carries is not this process's child — unless the kernel reissued it
-    /// to one of ours after the shell exited, which is exactly when a `waitpid`
-    /// on it reaps a stranger: the stand-in here is OUR zombie (exit 3) sitting
-    /// under the adopted session's pid. The exit path must answer "unknown"
-    /// and leave the zombie to its owner, whose own wait still reads 3.
-    ///
-    /// RED before the fix: the exit path reaped the stand-in, booked exit 3 as
-    /// the adopted session's, and the owner's `waitpid` read `ECHILD`.
+    /// An adopted session never waits for its pid: its shell's parent was the old
+    /// build, so the pid is this process's child only if the kernel reissued it to
+    /// one of ours, exactly when a `waitpid` would reap a stranger. Here our zombie
+    /// (exit 3) stands under the adopted pid: the exit path answers unknown and
+    /// leaves it to its owner, whose wait still reads 3.
     #[test]
     fn an_adopted_session_never_reaps_the_child_its_freed_pid_now_names() {
         let pid = run_to_zombie("exit 3");
@@ -13170,16 +12633,11 @@ mod shell_start_exit_tests {
         );
     }
 
-    /// AN ADOPTED SESSION'S EXIT IS READ FROM ITS KERNEL WITNESS (round seven
-    /// of the update audit, finding 26). The shell is alive when the session
-    /// takes it and is never this process's to wait for — here its parent (the
-    /// test, standing in for launchd) reaps it before the exit path looks, so
-    /// `waitpid` could not answer even if it were asked. The watch
-    /// `adopted_exit_watch` registered at the adoption still reads exit 5, and
-    /// the classifier, the ledger and every later look agree on it.
-    ///
-    /// RED before the fix: `exit_code=-` and `Outcome::None` — every session
-    /// alive across an update ended with an unknown status.
+    /// An adopted session's exit is read from its kernel witness: the shell is
+    /// never this process's to wait for, and here its parent (the test, standing
+    /// in for launchd) reaps it before the exit path looks. The watch
+    /// `adopted_exit_watch` registered at adoption still reads exit 5, and the
+    /// classifier, the ledger and every later look agree on it.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn an_adopted_shell_s_exit_status_comes_from_its_exit_watch() {

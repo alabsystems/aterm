@@ -430,13 +430,11 @@ pub enum Intent {
         /// The lossless stable session identity, preserved through handoff.
         session: String,
     },
-    /// THE OWNER'S WORD on the live agent upgrade in tab `tab` — the row's
-    /// press of what `aterm harness upgrade <tab> --now|--defer|--skip`
-    /// writes, written by the host in-process, on the same path. `to` is
-    /// the build the row was drawn for: the host writes the word only while
-    /// the tab's upgrade still moves to it, so a press on a row that moved
-    /// on lands on nothing. Not [`Intent::ends_with_row`]: a record keeps
-    /// it, and Settings ▸ Messages offers it while that upgrade stands.
+    /// The owner's word on the live agent upgrade in tab `tab`: what `aterm harness
+    /// upgrade <tab> --now|--defer|--skip` writes, written by the host in-process. The host
+    /// writes it only while the tab's upgrade still moves to `to`, the build the row was
+    /// drawn for, so a press on a row that moved on lands on nothing. A record keeps it:
+    /// Settings ▸ Messages offers it while that upgrade stands.
     AgentUpgrade {
         /// The tab the agent runs in (`s-<hex>`).
         tab: String,
@@ -445,11 +443,9 @@ pub enum Intent {
         /// Which word.
         word: UpgradeWord,
     },
-    /// END THE SESSIONS THE PTY KEEPER KEPT (keeper design §5.3 step 7): the
-    /// recovery row's one decision — close every tab whose shell the keeper
-    /// held through the last run's crash and this launch reattached (each is
-    /// hung up and released, as a tab close does). Consequential, and it ends
-    /// with the row.
+    /// Close every tab whose shell the PTY keeper held through the last run's crash and
+    /// this launch reattached (each hung up and released, as a tab close does): the
+    /// recovery row's one decision.
     EndRecovered,
 }
 

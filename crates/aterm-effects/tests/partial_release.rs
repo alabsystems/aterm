@@ -6,8 +6,9 @@
 //! The content witness releases a cell whose glyph went and stands nowhere
 //! else. A partial release leaves like an erase's suffix: the named cells are
 //! stamped onto the retract and counted, the cohort's clock is untouched, and
-//! they stay restorable inside the melt, so a composer that blanks a tail on
-//! one frame and restores it on the next keeps its light. A release naming
+//! exact identities stay restorable, dark after the melt, until the original
+//! run expires or editing revokes them. A composer that restores a delayed
+//! repaint therefore keeps its light. A release naming
 //! every standing cell is the text gone whole, and the cohort leaves.
 //!
 //! Driven at the host seam through a real [`Terminal`], as
@@ -220,9 +221,9 @@ fn a_suffix_the_program_cleared_leaves_and_the_prefix_stands() {
     assert_eq!(h.retired(), 8, "eight cells whose text went, counted once");
     h.idle(FADE_MS);
     assert_eq!(
-        h.cells(5).len(),
-        3,
-        "past the melt the suffix is out of the pool"
+        h.live(5),
+        vec![0, 1, 2],
+        "past the melt only the prefix owns light; the suffix keeps dark redraw custody"
     );
     assert!(
         h.lit_cols(5).iter().all(|&c| c < 3),
@@ -231,7 +232,10 @@ fn a_suffix_the_program_cleared_leaves_and_the_prefix_stands() {
     );
     // A glyph landing under the standing prefix is replaced text, counted once more.
     h.program(b"\x1b[6;1HXXX\x1b[6;4H");
-    assert_eq!(h.leaving(5), vec![0, 1, 2]);
+    assert!(
+        h.live(5).is_empty(),
+        "the replaced prefix no longer owns light"
+    );
     assert_eq!(h.retired(), 11);
 }
 
@@ -259,9 +263,9 @@ fn a_trailing_space_after_a_suffix_the_program_cleared_leaves_with_it() {
     assert_eq!(h.retired(), 6, "six cells whose text went, counted once");
     h.idle(FADE_MS);
     assert_eq!(
-        h.cells(5).len(),
-        6,
-        "past the melt the suffix and its tail are out of the pool"
+        h.live(5),
+        (0..6).collect::<Vec<u16>>(),
+        "past the melt only the prefix owns light; the suffix and tail keep dark redraw custody"
     );
     assert!(
         h.lit_cols(5).iter().all(|&c| c < 6),

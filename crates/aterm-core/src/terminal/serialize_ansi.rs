@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Replayable ANSI serialization of a [`Terminal`]: the one body behind both
-//! web bindings' `serialize` / `serialize_scrollback` (aterm-wasm's CPU
-//! `AtermTerminal` and aterm-gpu-web's `AtermGpuTerminal`).
+//! Replayable ANSI serialization of a [`Terminal`], shared by both web bindings'
+//! `serialize` / `serialize_scrollback` (aterm-wasm and aterm-gpu-web).
 
 use std::fmt::Write as _;
 

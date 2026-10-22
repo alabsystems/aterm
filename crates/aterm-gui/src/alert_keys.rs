@@ -357,11 +357,9 @@ mod macos {
         Some(ConfirmKeyWatch { monitor })
     }
 
-    /// The next [`PasteConfirm::id`]. Monotonic and never reused, so an answer posted
-    /// by an OLD sheet's completion handler can never be mistaken for the answer to a
-    /// newer one (which is what stops a stale answer from tearing down a live sheet's
-    /// key interceptor). Ids are minted on the main thread; the atomic is simply the
-    /// least-ceremony counter with no `App` field to thread through.
+    /// The next [`PasteConfirm::id`]. Never reused, so an old sheet's late answer is never
+    /// taken for a newer one's and cannot tear down a live sheet's key interceptor. Minted on
+    /// the main thread; the atomic is just a counter with no `App` field to thread through.
     pub(crate) fn next_confirm_id() -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

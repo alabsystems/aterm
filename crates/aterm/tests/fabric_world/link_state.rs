@@ -224,9 +224,9 @@ fn a_broker_path_nothing_listens_on_is_stalled_and_never_connected() {
 /// life of the process, reporting nothing; the endpoint said `connected`.
 #[test]
 fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
-    // NOT under the world's own `/tmp/atl-<tag>-<pid>`: the harness wipes that
-    // directory as it boots, and a stub socket inside it is gone before the
-    // bridge dials — which reads as `no-socket`, a different test.
+    // NOT under the world's own scratch: that directory is made as the world
+    // boots, and the stub must be listening before then, or the bridge's dial
+    // reads `no-socket`, a different test.
     let dir = format!("/tmp/atl-stub13-{}", std::process::id());
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("stub dir");

@@ -304,6 +304,137 @@ pub(super) fn archive_supported(name: &str) -> bool {
         .any(|ext| lower.ends_with(ext))
 }
 
+/// Whether a download name names a macOS disk image.
+pub(super) fn is_dmg(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".dmg")
+}
+
+/// Bounded copy of a mounted image's tree into `dir`, under the
+/// same entry/byte ceilings and in-root symlink vetting as archive
+/// extraction. A symlink the vetting refuses (the customary
+/// `Applications -> /Applications` Finder alias) is skipped, not
+/// followed and not fatal; the cask artifact census still judges
+/// what must be present afterwards. Anything that is not a
+/// directory, regular file or symlink is a hard refusal.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn copy_mounted_tree(src_root: &Path, dir: &Path) -> Result<(), String> {
+    use crate::install::{MAX_ENTRIES, UNSIGNED_SIZE_CAP};
+    std::fs::create_dir_all(dir).map_err(|e| format!("abrew: {e}"))?;
+    let mut entries: u64 = 0;
+    let mut bytes: u64 = 0;
+    let mut stack: Vec<std::path::PathBuf> = vec![std::path::PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        let src_dir = src_root.join(&rel);
+        let read = std::fs::read_dir(&src_dir).map_err(|e| format!("abrew: {e}"))?;
+        for entry in read {
+            let entry = entry.map_err(|e| format!("abrew: {e}"))?;
+            entries += 1;
+            if entries > MAX_ENTRIES {
+                return Err("abrew: dmg entry limit exceeded".to_string());
+            }
+            let kind = entry.file_type().map_err(|e| format!("abrew: {e}"))?;
+            let rel_path = rel.join(entry.file_name());
+            let dst = dir.join(&rel_path);
+            if kind.is_dir() {
+                std::fs::create_dir_all(&dst).map_err(|e| format!("abrew: {e}"))?;
+                if let Ok(meta) = entry.metadata() {
+                    let _ = std::fs::set_permissions(&dst, meta.permissions());
+                }
+                stack.push(rel_path);
+            } else if kind.is_symlink() {
+                let target = std::fs::read_link(entry.path()).map_err(|e| format!("abrew: {e}"))?;
+                if matches!(
+                    crate::extract::vet_symlink(dir, &rel_path, &target, 0),
+                    Ok(Some(_))
+                ) {
+                    super::prefix::symlink_file(&target, &dst)?;
+                }
+            } else if kind.is_file() {
+                let meta = entry.metadata().map_err(|e| format!("abrew: {e}"))?;
+                bytes = bytes.saturating_add(meta.len());
+                if bytes > UNSIGNED_SIZE_CAP {
+                    return Err("abrew: dmg size limit exceeded".to_string());
+                }
+                std::fs::copy(entry.path(), &dst)
+                    .map_err(|e| format!("abrew: cannot stage payload: {e}"))?;
+                std::fs::set_permissions(&dst, meta.permissions())
+                    .map_err(|e| format!("abrew: {e}"))?;
+            } else {
+                return Err(format!(
+                    "abrew: dmg contains a nonregular entry: {}",
+                    rel_path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Detach backstop: a mounted image must never outlive the copy,
+/// even on a panic path.
+#[cfg(target_os = "macos")]
+struct MountGuard(std::path::PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Drop for MountGuard {
+    fn drop(&mut self) {
+        let _ = aterm_uds::spawnfd::command("/usr/bin/hdiutil")
+            .args(["detach", "-force", "-quiet"])
+            .arg(&self.0)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .output();
+    }
+}
+
+/// Extract a disk image by mounting it read-only and copying the
+/// payload out under the bounded, vetted copy above. No license is
+/// ever agreed to (stdin is /dev/null: an image that demands one
+/// fails the attach and delegates), nothing on the image runs, and
+/// the image is always detached. Attach failures read
+/// "dmg attach failed" so the caller can delegate them; copy
+/// vetting failures are hard errors.
+#[cfg(target_os = "macos")]
+pub(super) fn extract_dmg(dmg: &Path, dir: &Path) -> Result<(), String> {
+    let mount = aterm_tempfile::tempdir().map_err(|e| format!("abrew: dmg attach failed: {e}"))?;
+    let out = aterm_uds::spawnfd::command("/usr/bin/hdiutil")
+        .args([
+            "attach",
+            "-readonly",
+            "-nobrowse",
+            "-noautoopen",
+            "-mountpoint",
+        ])
+        .arg(mount.path())
+        .arg(dmg)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .output()
+        .map_err(|e| format!("abrew: dmg attach failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "abrew: dmg attach failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let guard = MountGuard(mount.path().to_path_buf());
+    let copied = copy_mounted_tree(mount.path(), dir);
+    let detached = aterm_uds::spawnfd::command("/usr/bin/hdiutil")
+        .args(["detach", "-quiet"])
+        .arg(mount.path())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .output();
+    drop(guard);
+    copied?;
+    match detached {
+        Ok(o) if o.status.success() => Ok(()),
+        _ => Err("abrew: dmg detach failed".to_string()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn extract_dmg(_dmg: &Path, _dir: &Path) -> Result<(), String> {
+    Err("abrew: dmg attach failed: disk images need macOS".to_string())
+}
+
 /// Extract through atpkg's entry-by-entry path and symlink admission. The
 /// unsigned-payload byte and entry ceilings are shared with vendor installs.
 /// Copy one already-verified regular cache file (naked cask payloads).
@@ -451,6 +582,60 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
         assert_eq!(std::fs::read(&partial).unwrap(), b"another operation");
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mounted_tree_copy_skips_escaping_alias_and_keeps_in_root_links() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let src = tmp.path().join("mnt");
+        let dst = tmp.path().join("out");
+        std::fs::create_dir_all(src.join("Demo.app/Contents")).unwrap();
+        std::fs::write(src.join("Demo.app/Contents/Info.plist"), b"plist").unwrap();
+        super::super::prefix::symlink_dir(Path::new("/Applications"), &src.join("Applications"))
+            .unwrap();
+        super::super::prefix::symlink_file(
+            Path::new("Demo.app/Contents/Info.plist"),
+            &src.join("alias"),
+        )
+        .unwrap();
+        copy_mounted_tree(&src, &dst).unwrap();
+        assert_eq!(
+            std::fs::read(dst.join("Demo.app/Contents/Info.plist")).unwrap(),
+            b"plist"
+        );
+        assert!(
+            std::fs::symlink_metadata(dst.join("Applications")).is_err(),
+            "escaping Finder alias not copied"
+        );
+        assert_eq!(std::fs::read(dst.join("alias")).unwrap(), b"plist");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dmg_mount_copy_detaches_and_stages_app() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let src = tmp.path().join("image");
+        std::fs::create_dir_all(src.join("Demo.app/Contents/MacOS")).unwrap();
+        std::fs::write(src.join("Demo.app/Contents/MacOS/demo"), b"bin").unwrap();
+        let made = aterm_uds::spawnfd::command("/usr/bin/hdiutil")
+            .args(["create", "-quiet", "-srcfolder"])
+            .arg(&src)
+            .arg(tmp.path().join("demo.dmg"))
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "hdiutil create fixture");
+        let out = tmp.path().join("payload");
+        extract_dmg(&tmp.path().join("demo.dmg"), &out).unwrap();
+        assert_eq!(
+            std::fs::read(out.join("Demo.app/Contents/MacOS/demo")).unwrap(),
+            b"bin"
+        );
+        // A garbage image fails the attach (delegable), never copies.
+        std::fs::write(tmp.path().join("junk.dmg"), b"not an image").unwrap();
+        let err = extract_dmg(&tmp.path().join("junk.dmg"), &tmp.path().join("nope")).unwrap_err();
+        assert!(err.contains("dmg attach failed"), "{err}");
     }
 
     #[test]

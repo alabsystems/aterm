@@ -179,6 +179,9 @@ fn make_fifo(path: &Path) -> io::Result<()> {
 /// an aterm window's boot apply may replace the image, which must then find the lifeline at
 /// the same number, so the window checks before the apply and adopts after it.
 ///
+/// For a launch that must refuse a bad lifeline before work that cannot wait for the adoption:
+/// an aterm window's boot apply may replace the image, which must then find the lifeline at
+/// the same number, so it adopts after the apply and checks before it.
 /// # Errors
 /// Exactly [`adopt`]'s.
 pub fn check(number: RawFd) -> io::Result<()> {

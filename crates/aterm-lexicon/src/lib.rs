@@ -78,11 +78,10 @@ impl Class {
     }
 }
 
-/// Interned language identifier: an index into the [`Lexicon`]'s language
-/// table ([`Lexicon::lang_code`] resolves it back to the TOML `lang` code).
-/// Ids are assigned in first-appearance TOML order across ALL well-formed
-/// entries — before the `ambiguous` language gating — so a given build input
-/// yields the same ids regardless of the configured `languages`.
+/// Interned language identifier: an index into the [`Lexicon`]'s language table
+/// ([`Lexicon::lang_code`] resolves it). Assigned in first-appearance TOML order across all
+/// well-formed entries, before `ambiguous` gating, so ids do not depend on the configured
+/// `languages`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct LangId(pub u16);
 

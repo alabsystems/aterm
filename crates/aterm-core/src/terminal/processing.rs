@@ -187,9 +187,7 @@ impl Terminal {
             // so the alt-screen archive sees each committed frame; otherwise one
             // `advance_fast` over the whole input (see `alt_archive.rs`).
             self.advance_parser_archiving(input);
-            // RIS side effects the handler cannot reach. The parser is not reset
-            // here: ESC c already left it in Ground, and a reset after the slice
-            // would drop a half-parsed sequence that bytes after the RIS began.
+            // RIS side effects, as in the gated branch above.
             if self.transient.pending_parser_reset {
                 self.finish_ris_batch();
             }

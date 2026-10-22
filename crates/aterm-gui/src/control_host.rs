@@ -305,6 +305,7 @@ mod tests {
             reset_lane: Default::default(),
             crash_journal: Default::default(),
             typed: Default::default(),
+            bells: Default::default(),
             update_parked: Default::default(),
             witness: Default::default(),
             fenced_writes: Default::default(),

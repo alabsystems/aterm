@@ -515,7 +515,7 @@ pub(crate) fn default_state_dir() -> String {
     "./aterm-link-state".to_string()
 }
 
-/// `aterm link broker <socket> [log]` — run the bus this instance's bridge talks to.
+/// `aterm link broker`: run the bus this instance's bridge talks to, on one of two listeners.
 ///
 /// A Unix socket created world-connectable — nothing chmods it and no peer uid
 /// is checked — so who can connect is bounded by the 0700 directory you put it

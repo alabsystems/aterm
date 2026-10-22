@@ -16,12 +16,9 @@
 //                         bounded state instead of wedging
 //
 // Not modelled: a resize while the window is open. With the store out,
-// `resize_offloading_scrollback` detaches nothing, so it is a plain
-// `Grid::resize` with `scrollback_detached_for_reflow` set (`aterm-wasm`'s
-// `resize`, aterm-gui's `cross_resize`), which stages rows into `lazy_buffer`
-// with no PTY scroll-off (`adjust_row_count`, `finalize_reflow`,
-// `prepend_ring_scrollback_lines`). Adding a resize step goes with the
-// `StagedWithinProduced` note below.
+// `resize_offloading_scrollback` detaches nothing, so it is a plain `Grid::resize`
+// that stages rows into `lazy_buffer` with no PTY scroll-off (see
+// `StagedWithinProduced`).
 //
 // `Buggy=0` is the shipped logic; `Buggy=1` loses window output, resurrects
 // erased history, exposes stale deferred settings and loses staged output on a
@@ -226,12 +223,11 @@ fn offload_window_model() -> Model {
             // resets the produced debt (`Erase`) or hands staged rows on
             // (`AttachReplacement`, `Abort`) empties the buffer in the same step.
             //
-            // Scope: this alphabet only. Resize shedding stages rows without
-            // `Produce` (see the file header), so the real `lazy_buffer` can exceed
-            // the window's scroll-off. Never lower this to a runtime `debug_assert!`
-            // on `lazy_buffer.len()` (a height shrink inside a window trips it while
-            // correct); model a resize/shed step as Produce-like, bumping `produced`
-            // and `retained` together.
+            // This alphabet only: resize shedding stages rows without `Produce`, so
+            // the real `lazy_buffer` can exceed the window's scroll-off. Do not lower
+            // this to a `debug_assert!` on `lazy_buffer.len()` (a height shrink inside
+            // a window trips it while correct). A resize step added here must bump
+            // `produced` and `retained` together; bumping only `retained` refutes this.
             invariant StagedWithinProduced: retained <= produced;
             invariant ErasedStaysErased: resurrected <= 0;
             // The window closes: an Abort that forgets `detached' = 0` leaves both set.

@@ -29,8 +29,8 @@ mod artifact;
 mod buildplan;
 mod bundle;
 mod changelog;
-// The release channel: the one release object a cut publishes onto, its exact asset
-// set, and the order and PATCH that make it the head.
+// The release channel: the one release object a cut publishes onto, its asset set, and
+// the order that makes it the head.
 mod channel;
 // The one clean-tree judge: which paths of a checkout differ from its HEAD.
 mod clean;
@@ -47,10 +47,9 @@ mod dev_app;
 // survive a rebuild.
 mod dev_identity;
 mod dmg;
-// The cutter's durability flushes, in one place (and a plain fsync under its tests).
+// The cutter's durability flushes.
 mod durable;
-// The release's own handoff fixtures: written before its claim, landed on main after
-// its cut, so the next cut finds them.
+// The release's own handoff fixtures, landed on main after its cut for the next cut.
 mod fixtures;
 mod gates;
 // `ship hook`: the publication engine's pre-promote, post-promote and transforms hooks.
@@ -64,8 +63,7 @@ mod ledger;
 // publish.rs: it touches no secret and no upload.
 mod machines;
 mod manifest_out;
-// One command from fresh checkout to publishing machine: seed the roster pair from the
-// channel release, drive the atpkg-keys join in-process, audit the Apple/token stack.
+// `ship provision`: fresh checkout to publishing machine in one command.
 mod provision;
 mod publish;
 // `ship release`: the one release command, a journaled, resumable step machine over the

@@ -301,9 +301,8 @@ fn lay_carries_strict_into_every_row_stub() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A second `lay` over a laid directory writes NOTHING: every stub and the marker keep
-/// their inodes, whatever tag they carry — the steady-state pass and every session
-/// spawn converge.
+/// A second `lay` over a laid directory writes nothing: every stub and the marker keep
+/// their inodes, whatever tag they carry.
 #[cfg(unix)]
 #[test]
 fn a_second_lay_writes_nothing() {
@@ -514,17 +513,12 @@ fn escape_walk_skips_every_reroute_directory_not_just_its_own() {
     let _ = std::fs::remove_dir_all(&upstream_dir);
 }
 
-/// A COPY OF A STUB IS A STUB (review, 2026-09-24). `cp <prefix>/reroute/* ~/bin/`
-/// copies every stub and — the glob skips a dotfile — no [`DIR_MARKER_FILE`], and a
-/// copy has its own inode, so `-ef "$0"` never matched it: with `reroute : ~/a (a copy)
-/// : ~/b (a link to the stub) : upstream` the stub exec'd the copy, the copy exec'd the
-/// link (the stub again, under `$0 = ~/b/<name>`), which exec'd the copy, forever —
-/// and two copies the same (measured: `cargo` spun 16 s until killed, and `claude`
-/// outside aterm too). The walk has to know a stub the way [`upstream_on_path`] does,
-/// by what it SAYS. Entered by the stub, the copy or the second entry, a TABLE name
-/// under the escape and an agent program outside aterm reach the user's own copy
-/// behind both — or, with none, exit 127 with their own line — and the Rust walk
-/// agrees.
+/// A copy of a stub is a stub: `cp <prefix>/reroute/* ~/bin/` copies every stub but not the
+/// dotfile [`DIR_MARKER_FILE`], and a copy has its own inode, so with
+/// `reroute : ~/a (a copy) : ~/b (a link) : upstream`, or two copies, an inode test would
+/// exec stub, copy and link in a loop. Entered by the stub, the copy or the second entry, a
+/// TABLE name under the escape and an agent program outside aterm reach the user's own copy
+/// behind both (or exit 127 with their own line), and the Rust walk agrees.
 #[cfg(unix)]
 #[test]
 fn escape_walk_never_ping_pongs_between_a_copy_and_a_link() {

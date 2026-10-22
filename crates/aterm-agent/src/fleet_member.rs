@@ -33,7 +33,11 @@
 //!   (minted at this machine's first join, the issuer's at `init`;
 //!   `<state>/fleet-node-key`): the issuer binds this machine's node id to
 //!   its key at its first registration and refuses another key for it after,
-//!   and this machine binds the issuer's node to the key it proved. That dial
+//!   and this machine binds the issuer's node to the key it proved. A join
+//!   again of the fleet this machine holds is answered by that issuer under
+//!   that key, or refused before anything is sent: another holder of the
+//!   secret would become its issuer, whose book names the key of every
+//!   member, so moving to a new issuer is `leave`, then `join`. That dial
 //!   is also the first connection this machine makes into the LAN, which on
 //!   a Mac is when the local-network consent is asked, while the person is
 //!   at the machine. An issuer joins nothing until it leaves: its fleet's
@@ -86,7 +90,7 @@ use aterm_net::fleet::{
 };
 use aterm_net::fleet_member::{
     self as member, BookRead, BookUnread, CODE_FILE, ISSUER_BOOK_FILE, JoinCode, Keyring,
-    NODE_KEY_FILE, PEERS_FILE, Peer, Recorded, Registration, Target, Unreached, Via, target_of,
+    NODE_KEY_FILE, PEERS_FILE, Peer, Recorded, Registration, Unreached, Via, target_of,
 };
 use aterm_uds::atomic_file::ConfigFile;
 
@@ -735,6 +739,21 @@ fn issued_code(places: &Places, path: &Path) -> Result<JoinCode, Failure> {
 /// fails after the issuer has answered (a write of the key, the book or
 /// aterm.toml) says that the issuer lists this machine, what this machine
 /// holds of the fleet, and that a join again with the same code finishes it.
+///
+/// A JOIN AGAIN OF THE SAME FLEET REACHES THE ISSUER THIS MACHINE BINDS: where
+/// it holds the code's secret and its book binds its issuer's node to a key
+/// ([`bound_issuer`]), the machine that answers must prove that node under
+/// that key ([`register_with`]). Whoever else holds the secret and answers at
+/// the code's host and port would otherwise be recorded as the issuer, and
+/// its book then names every member's key. A first join, and a join of
+/// another fleet's code (a rotated secret among them), record whoever
+/// answers, as before. Such a join takes the fleet this machine held out of
+/// its book before it writes the new key, and puts it back when that write
+/// fails, so the key held here and the issuer its book binds are never of
+/// two fleets: a join of another fleet that fails after the issuer recorded
+/// it is finished by a join again with that code, which finds no issuer of
+/// the old fleet to hold it to once the new key is held, and leaves the old
+/// fleet whole while it is not.
 fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure> {
     let code = JoinCode::parse(code_text).map_err(failed)?;
     let secret = FleetSecret::new(&code.secret).map_err(failed)?;
@@ -799,8 +818,14 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         key: Some(me.key()),
     };
     let keys = Keyring::read(&places.state);
-    let (joined, at, issuer_key) = match register_with(&code, (&secret, &me), &keys, &registration)
-    {
+    // A join again of the fleet held here answers to the issuer it binds.
+    let bound = (!regrant).then(|| bound_issuer(places)).flatten();
+    let (joined, at, issuer_key) = match register_with(
+        &code,
+        (&secret, &me),
+        (&keys, bound.as_ref()),
+        &registration,
+    ) {
         Ok(registered) => registered,
         Err(why) => {
             aterm_uds::stdout::print(format_args!("{out}"));
@@ -812,14 +837,58 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
     let held = aterm_net::fleet::read_key_file(&places.state).ok();
     let same_fleet = held.as_ref() == Some(&secret);
     let replaced = std::fs::symlink_metadata(places.state.join(KEY_FILE)).is_ok() && !same_fleet;
-    member::write_key_file(&places.state, &code.secret).map_err(|e| {
-        unfinished(
+    // Another fleet's secret goes, and with it the registrations the book
+    // held under it — its issuer among them — before the key is replaced: a
+    // book never binds an issuer of another fleet than the key held here,
+    // which a join again of that key's fleet must reach ([`bound_issuer`]).
+    let taken_out: Vec<Peer> = if same_fleet {
+        Vec::new()
+    } else {
+        member::update_peers(&places.state, |book| {
+            let (kept, gone) = std::mem::take(book)
+                .into_iter()
+                .partition(|peer| peer.via == Via::Manual);
+            *book = kept;
+            Ok(gone)
+        })
+        .map_err(|why| {
+            unfinished(
+                &out,
+                &issuer_at,
+                why,
+                "the fleet's key was not written, and the book is as it was",
+            )
+        })?
+    };
+    if let Err(e) = member::write_key_file(&places.state, &code.secret) {
+        // The key held here is still the old fleet's, so what the book held
+        // of that fleet goes back beside it: a key with no issuer bound would
+        // read no copy of its book, and hold a join again of its fleet to no
+        // issuer.
+        let put_back = member::update_peers(&places.state, |book| {
+            let missing: Vec<Peer> = taken_out
+                .iter()
+                .filter(|peer| !book.contains(peer))
+                .cloned()
+                .collect();
+            book.extend(missing);
+            Ok(())
+        });
+        let holds = match put_back {
+            Ok(()) => "the fleet's key was not written, and the book is as it was".to_owned(),
+            Err(why) => format!(
+                "the fleet's key was not written, and the book no longer names the issuer or \
+                 the members of the fleet this machine held, which could not be put back \
+                 ({why})"
+            ),
+        };
+        return Err(unfinished(
             &out,
             &issuer_at,
             format!("{KEY_FILE}: {e}"),
-            "the fleet's key was not written",
-        )
-    })?;
+            &holds,
+        ));
+    }
     let issuer = Peer {
         node: Some(joined.issuer.node.clone()),
         key: issuer_key,
@@ -832,12 +901,7 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         via: Via::Issuer,
     };
     member::update_peers(&places.state, |book| {
-        // Another fleet's secret is gone, and with it the registrations the
-        // book held under it; and one issuer: a machine that joined another
-        // fleet before keeps no issuer of that one.
-        if !same_fleet {
-            book.retain(|peer| peer.via == Via::Manual);
-        }
+        // One issuer: the one that recorded this machine now.
         book.retain(|peer| peer.via != Via::Issuer);
         member::record(book, issuer)
     })
@@ -934,6 +998,17 @@ enum JoinFailed {
     /// It answered as this node, which this machine binds to a key, and
     /// proved none: an older aterm, or not that node.
     Unproved(String),
+    /// A join again of the fleet this machine holds, whose book binds its
+    /// issuer `bound` to a key: the machine that answered proved another
+    /// node (`proved`) — another holder of the fleet's secret, never taken
+    /// as the issuer — or none, which is that too, or the bound issuer
+    /// without its node key (lost, or an older aterm). Nothing was sent it.
+    OtherIssuer {
+        /// The issuer this machine's book binds.
+        bound: String,
+        /// The node the machine that answered proved, when it proved one.
+        proved: Option<String>,
+    },
     /// It was; the exchange failed, or the issuer refused (its words).
     Registration(String),
 }
@@ -951,6 +1026,23 @@ impl std::fmt::Display for JoinFailed {
                 f,
                 "it answered as node {}, which this machine binds to a node key, and proved none",
                 short(node)
+            ),
+            Self::OtherIssuer {
+                bound,
+                proved: Some(node),
+            } => write!(
+                f,
+                "another node answered for the issuer this Mac binds (node {}): it proved node {}",
+                short(bound),
+                short(node)
+            ),
+            Self::OtherIssuer {
+                bound,
+                proved: None,
+            } => write!(
+                f,
+                "the machine that answered for the issuer this Mac binds (node {}) proved no node",
+                short(bound)
             ),
             Self::Registration(why) => f.write_str(why),
         }
@@ -978,6 +1070,15 @@ enum Advice {
     /// The machine that answered claims a node this machine binds to a key,
     /// and did not prove that key.
     IssuerKey,
+    /// A join again of the fleet this machine holds reached another node
+    /// than the issuer it binds: `leave`, then `join`, moves it to a new
+    /// issuer on purpose.
+    BoundIssuer,
+    /// A join again of the fleet this machine holds reached a machine that
+    /// proved no node: another holder of the secret, or the issuer it binds
+    /// running an older aterm or without its node key, which `init` there
+    /// mints again.
+    BoundUnproved,
     /// The issuer binds this machine's node id to a node key it did not
     /// prove: the issuer's words say how a person there lets it join afresh.
     NodeBound,
@@ -997,6 +1098,8 @@ impl JoinFailed {
             Self::Registration(words) if words.contains(member::BEFORE_KEYS) => Advice::BeforeKeys,
             Self::Registration(words) if words.contains(member::REBIND) => Advice::NodeBound,
             Self::OtherKey(_) | Self::Unproved(_) => Advice::IssuerKey,
+            Self::OtherIssuer { proved: None, .. } => Advice::BoundUnproved,
+            Self::OtherIssuer { .. } => Advice::BoundIssuer,
             Self::Dial(Unreached::NotFleet(_)) => Advice::PastTheLan,
             Self::Dial(e) if e.not_permitted() => Advice::Sandbox,
             Self::Dial(e) if e.no_route() => Advice::LocalNetwork,
@@ -1050,6 +1153,25 @@ fn not_recorded(issuer_at: &str, why: &JoinFailed) -> String {
              Another machine answers at that host, or the issuer lost its node key (a \
              reinstall) or runs an older aterm (update it). If it is the issuer, `aterm fleet \
              peers rm <its node>` here takes the old binding out; then join again."
+        ),
+        // Another holder of the secret, where the issuer this machine joined
+        // before was: never taken as the issuer on its word.
+        Advice::BoundIssuer => format!(
+            "the issuer at {issuer_at} is not the one this machine binds: {why}\n  {NOTHING} \
+             This machine joined this fleet before, and a join again is answered by the issuer \
+             it joined, under the node key it bound then. To move this machine to a new issuer \
+             on purpose, run `aterm fleet leave` here, then `aterm fleet join` with the code."
+        ),
+        // No proof says which machine it was: another holder of the secret,
+        // or the bound issuer without its key, whose remedy is there.
+        Advice::BoundUnproved => format!(
+            "the issuer at {issuer_at} is not the one this machine binds: {why}\n  {NOTHING} \
+             This machine joined this fleet before, and a join again is answered by the issuer \
+             it joined, under the node key it bound then. If it is that issuer, it runs an \
+             older aterm (update it there) or lost its node key (a reinstall: `aterm fleet \
+             init` there mints one, and `aterm fleet peers rm <its node>` here then takes the \
+             old binding out); join again after. To move this machine to a new issuer on \
+             purpose, run `aterm fleet leave` here, then `aterm fleet join` with the code."
         ),
         Advice::NodeBound => format!(
             "the issuer at {issuer_at} did not record this machine: {why}\n  {NOTHING} The \
@@ -1120,19 +1242,33 @@ fn not_an_issuer(places: &Places, code: &JoinCode) -> Result<(), Failure> {
     }))
 }
 
+/// The issuer this machine's book binds a key to — its first `via=issuer`
+/// entry's node, with the key its join bound — or `None` when it binds none
+/// (no issuer, one from before node keys, a book that cannot be read): what
+/// a join again of the same fleet must reach ([`register_with`]).
+fn bound_issuer(places: &Places) -> Option<(String, NodeKey)> {
+    member::read_peers(&places.state)
+        .ok()?
+        .into_iter()
+        .find(|peer| peer.via == Via::Issuer)
+        .and_then(|issuer| issuer.node.zip(issuer.key))
+}
+
 /// Dial the issuer `code` names for a `join`, proving `me`, and register;
 /// the issuer's answer, the address it answered at, and the node key it
 /// proved when it proved the node it answered as. One that proves a node
-/// `keys` (this machine's book) binds to another key is sent nothing; one
-/// that answers as a node `keys` bind and proved none is refused here. The
-/// dial and the registration's exchange share [`JOIN_WITHIN`] (the exchange
-/// at least a second of it), the exchange under a wall-clock watchdog
-/// ([`member::register_by`]): an issuer that sends its answer a byte at a
-/// time holds the join no longer.
+/// `keys` (this machine's book) binds to another key is sent nothing, and
+/// so, where `bound` is the issuer a join again of the same fleet must
+/// reach ([`bound_issuer`]), is one that proves no node or another than
+/// that one; one that answers as a node `keys` bind and proved none is
+/// refused here. The dial and the registration's exchange share
+/// [`JOIN_WITHIN`] (the exchange at least a second of it), the exchange
+/// under a wall-clock watchdog ([`member::register_by`]): an issuer that
+/// sends its answer a byte at a time holds the join no longer.
 fn register_with(
     code: &JoinCode,
     (secret, me): (&FleetSecret, &NodeIdentity),
-    keys: &Keyring,
+    (keys, bound): (&Keyring, Option<&(String, NodeKey)>),
     registration: &Registration,
 ) -> Result<(member::Joined, IpAddr, Option<NodeKey>), JoinFailed> {
     let started = Instant::now();
@@ -1149,6 +1285,17 @@ fn register_with(
         && keys.bound(&proof.node).is_some_and(|key| key != proof.key)
     {
         return Err(JoinFailed::OtherKey(proof.node.clone()));
+    }
+    if let Some((node, key)) = bound
+        && reached
+            .peer
+            .as_ref()
+            .is_none_or(|proof| proof.node != *node || proof.key != *key)
+    {
+        return Err(JoinFailed::OtherIssuer {
+            bound: node.clone(),
+            proved: reached.peer.as_ref().map(|proof| proof.node.clone()),
+        });
     }
     let deadline = (started + JOIN_WITHIN).max(Instant::now() + Duration::from_secs(1));
     let joined = member::register_by(&mut reached, registration, deadline)
@@ -1323,7 +1470,8 @@ struct Known {
     /// `[fleet]` as aterm.toml says it.
     table: FleetTable,
     /// The keys its book and its whole copy bind ([`Keyring::of`]): a copy
-    /// a person's entry stands for still binds its node's key.
+    /// left out for its book's entry of that node still binds the node's key
+    /// where that entry binds none.
     keys: Keyring,
 }
 
@@ -1333,9 +1481,11 @@ struct Known {
 /// as, an address for the one a member registered from) — then its copy of
 /// its issuer's book ([`issuer_copies`], [`member::with_copies`]). So a
 /// person's entry, in the book or in aterm.toml, stands for a copy at its
-/// place, and a copy the next book drops never takes a configured peer with
-/// it; and the keys, gathered before any copy is left out, hold what answers
-/// that person's entry to the copy's key.
+/// place that names no node, and a copy the next book drops never takes a
+/// configured peer with it; a copy that names a node is read beside it, its
+/// place being what its registrant said; and the keys, gathered before any
+/// copy is left out, hold what answers that person's entry as a copy's node
+/// to that copy's key.
 fn known_peers(places: &Places) -> Result<Known, Failure> {
     let config = ConfigFile::open(&places.config).map_err(failed)?;
     let table = fleet_table(text_of(&config)?).map_err(failed)?;
@@ -1850,7 +2000,7 @@ fn allow(places: &Places, args: &[String]) -> Result<String, Failure> {
 /// now, never the one a copy from before a `peers rm` and a join again there
 /// held. The word is resolved among the peers that keyring binds
 /// ([`bound_peer`]), so a person's `[[fleet.peers]]` entry at a copy's
-/// place, which a read dials in the copy's stead, never hides its node.
+/// place, which a read dials beside the copy, never hides its node.
 ///
 /// # Errors
 /// A word that names no peer, or a peer with no node or one bound to no key.
@@ -1913,11 +2063,11 @@ enum Bound {
 /// ([`member::bound_peers`]) — and only then among the peers a read dials
 /// (`known`, [`known_peers`]), which say what else it names: a node bound to
 /// no key, or one only a person's entry stands for. So a person's entry at a
-/// copy's place — which a read dials in the copy's stead
-/// ([`member::with_copies`]) — never hides the copy's node, by any word that
-/// entry answers to (its own `host:port` among them): it names the node
-/// bound at its place ([`Peer::same_place`]), and is named by hand only
-/// where none is.
+/// copy's place — which a read dials beside the copy
+/// ([`member::with_copies`]), both answering to the place's name — never
+/// hides the copy's node, by any word that entry answers to (its own
+/// `host:port` among them): it names the node bound at its place
+/// ([`Peer::same_place`]), and is named by hand only where none is.
 ///
 /// # Errors
 /// `what` names more than one peer of either list, or a person's entry at the
@@ -2083,7 +2233,11 @@ fn leave(places: &Places, args: &[String]) -> Result<String, Failure> {
 /// copy of its issuer's book — and every member its issuer's book adds now
 /// ([`member::read_whole`], the book kept, [`keep_book`]); or the one
 /// `ask.host` names (a name, a node id, an address; one this machine does not
-/// know is dialled as `host[:port]` itself, [`member::survey_all`]). All
+/// know is dialled as `host[:port]` itself, [`member::survey_all`]) —
+/// resolved first among the peers a key binds ([`member::bound_peers`]), as
+/// a drive's word is, so a person's entry at the place of a Mac that joined,
+/// which a read dials beside that Mac's copy, never makes its name name two
+/// peers. All
 /// asked at once over the fleet port, each under the one deadline
 /// `ask.within` (the first [`member::AT_ONCE`] dials share it; a peer past
 /// them waits for a free place and is given the deadline of its own). Each
@@ -2140,7 +2294,7 @@ fn drive_fleet_in(
          `aterm fleet join` again mints it",
     )?;
     // The keys every peer this machine knows binds, gathered before a copy
-    // is left out for a person's entry at its place ([`Known::keys`]).
+    // is left out for the book's entry of its node ([`Known::keys`]).
     let known = known_peers(places).map_err(failure_words)?;
     let keys = known.keys;
     let book: Vec<Peer> = known.peers.into_iter().map(|(peer, _)| peer).collect();
@@ -2211,19 +2365,25 @@ fn survey_fleet_in(
         // The keys every peer this machine knows binds: a host it does not
         // know is still held to the key of the node it claims.
         let keys = &known.keys;
-        let peer = match member::find(&book, what)? {
-            Some(at) => book.swap_remove(at),
-            None => {
-                let (host, port) = member::parse_host_port(what, Some(member::DEFAULT_PORT))
-                    .map_err(|why| {
-                        format!(
-                            "`{}` is no peer this machine knows (`aterm fleet peers`), and no \
-                             host: {why}",
-                            aterm_codec::tty::one_line(what, 80)
-                        )
-                    })?;
-                manual_peer(host, port)
-            }
+        // A node a key binds first, by any word its entry answers to: a
+        // person's entry at its place answers to its name too.
+        let mut bound = member::bound_peers(&places.state);
+        let peer = match member::find(&bound, what)? {
+            Some(at) => bound.swap_remove(at),
+            None => match member::find(&book, what)? {
+                Some(at) => book.swap_remove(at),
+                None => {
+                    let (host, port) = member::parse_host_port(what, Some(member::DEFAULT_PORT))
+                        .map_err(|why| {
+                            format!(
+                                "`{}` is no peer this machine knows (`aterm fleet peers`), and \
+                                 no host: {why}",
+                                aterm_codec::tty::one_line(what, 80)
+                            )
+                        })?;
+                    manual_peer(host, port)
+                }
+            },
         };
         raise_open_files();
         let read = member::survey_all(
@@ -2251,12 +2411,11 @@ fn survey_fleet_in(
         "survey",
     );
     let dropped = keep_book(places, &book_read, own.as_deref());
-    let targets: Vec<Target> = reads.iter().map(|read| target_of(&read.peer)).collect();
     let (entries, answers): (Vec<Peer>, Vec<_>) =
         reads.into_iter().map(|read| (read.peer, read.read)).unzip();
     let mut peers: Vec<aterm_ctl::PeerSurvey> = entries
         .iter()
-        .zip(once_per_node(&targets, answers))
+        .zip(once_per_node(&entries, answers))
         .filter_map(|(peer, read)| Some(peer_survey(peer, read?)))
         .collect();
     peers.extend(
@@ -2293,50 +2452,96 @@ fn fault_of(why: &Unreached) -> aterm_ctl::PeerFault {
     }
 }
 
-/// ONE MACHINE, ONE BLOCK: `read`, one answer for each of `targets`, with
+/// ONE MACHINE, ONE BLOCK: `read`, one answer for each of `entries`, with
 /// every answer from a node another answer is kept for taken out (`None`,
 /// in its place) — two entries that name one machine (a person's
 /// `[[fleet.peers]]` or `peers add` by another name than it joined with, a
 /// book entry by name beside one by address) are read once, never twice for
-/// the budget and the count of machines. The answer kept for a node is the
-/// first whose target holds that node, which the read checked the reply
-/// against ([`member::read_whole`]); only with none, the first. A target a
-/// person named holds no node, so its answerer says which node it is, and
-/// an answer that claims a member's node never hides that member's checked
-/// one. An answer that names no node, and a peer that did not answer, are
-/// kept.
+/// the budget and the count of machines. Two answers are one node's only
+/// when they name it alike: both proved it, or both are its claim
+/// ([`member::Surveyed::proven`]). So an unproven answer never collapses into
+/// a proven one: a Mac that claims a node it did not prove — this Mac's own,
+/// read beside this Mac's proven answer through a place its book names by
+/// hand, which the menu bar's glance drops as this Mac — is listed as its
+/// claim, never dropped with it; one Mac two entries reached as the book
+/// binds it anew is proven by both, the read judging each answer by the
+/// keys it ends with ([`member::read_whole`]). The answer kept for a node is
+/// the first whose entry holds that node, which the read checked the reply
+/// against; only with none, the first. An entry a person named holds no
+/// node, so its answerer says which node it is, and an answer that claims a
+/// member's node never hides that member's checked one. An answer that names
+/// no node is kept.
+///
+/// A PEER THAT DID NOT ANSWER IS SAID ONCE AT ITS PLACE: a failure through an
+/// entry that names no node, at the place of an entry that names one
+/// ([`Peer::same_place`]: a person's `lab-mini` beside the copy of the
+/// `lab-mini.local` that joined, both read) which failed the same way AT THE
+/// SAME ADDRESS ([`Unreached::at`], and its reason word for word), is that
+/// node's failure, and taken out; every other failure is kept. So a Mac
+/// asleep at the address both dials tried is one row "not answering". A
+/// node's place is what its registrant said and its address may be one DHCP
+/// has given another Mac since, so a place alone never folds a failure: one
+/// at another address, of another kind, or at none (a name that did not
+/// resolve, a deadline) is the person's own row — a Mac at a place its
+/// registrant claimed never hides the absence of the one a person named
+/// there. No failure is folded into an answer, nor one node's into
+/// another's.
 fn once_per_node(
-    targets: &[Target],
+    entries: &[Peer],
     read: Vec<Result<member::Surveyed, Unreached>>,
 ) -> Vec<Option<Result<member::Surveyed, Unreached>>> {
+    // The node an answer names, and whether it proved it.
     let node_of = |answer: &Result<member::Surveyed, Unreached>| match answer {
         Ok(member::Surveyed {
-            node: Some(node), ..
-        }) => Some(node.clone()),
+            node: Some(node),
+            proven,
+            ..
+        }) => Some((node.clone(), *proven)),
         _ => None,
     };
     let checked = |at: usize, node: &str| {
-        targets
+        entries
             .get(at)
-            .is_some_and(|target| target.node.as_deref() == Some(node))
+            .is_some_and(|entry| entry.node.as_deref() == Some(node))
     };
-    // Each node's kept answer: where it is in `read`.
-    let mut kept: Vec<(String, usize)> = Vec::new();
+    // A failure through an entry that names no node, where one that names a
+    // node at its place failed the same way at the same address.
+    let same_failure = |ours: &Unreached, theirs: &Unreached| {
+        ours.at().is_some() && ours.at() == theirs.at() && ours.to_string() == theirs.to_string()
+    };
+    let folded: Vec<bool> = entries
+        .iter()
+        .zip(&read)
+        .map(|(by_hand, ours)| match ours {
+            Err(ours) if by_hand.node.is_none() => {
+                entries.iter().zip(&read).any(|(entry, theirs)| {
+                    entry.node.is_some()
+                        && entry.same_place(by_hand)
+                        && matches!(theirs, Err(theirs) if same_failure(ours, theirs))
+                })
+            }
+            _ => false,
+        })
+        .collect();
+    // Each node's kept answer, proven or claimed: where it is in `read`.
+    let mut kept: Vec<((String, bool), usize)> = Vec::new();
     for (at, answer) in read.iter().enumerate() {
-        let Some(node) = node_of(answer) else {
+        let Some(named) = node_of(answer) else {
             continue;
         };
-        match kept.iter_mut().find(|(seen, _)| *seen == node) {
-            None => kept.push((node, at)),
-            Some((seen, first)) if !checked(*first, seen) && checked(at, seen) => *first = at,
+        match kept.iter_mut().find(|(seen, _)| *seen == named) {
+            None => kept.push((named, at)),
+            Some(((node, _), first)) if !checked(*first, node) && checked(at, node) => {
+                *first = at;
+            }
             Some(_) => {}
         }
     }
     read.into_iter()
         .enumerate()
         .map(|(at, answer)| {
-            let other = node_of(&answer).is_some_and(|node| !kept.contains(&(node, at)));
-            (!other).then_some(answer)
+            let other = node_of(&answer).is_some_and(|named| !kept.contains(&(named, at)));
+            (!other && folded.get(at) != Some(&true)).then_some(answer)
         })
         .collect()
 }

@@ -112,10 +112,9 @@ impl PredRows {
     }
 }
 
-/// The JS-visible surface. Each crate expands it onto its own terminal
-/// type, under its own export attribute, with `web_terminal_impl!`: the
-/// attribute names the JS class after the impl's type, which this shared
-/// file cannot spell.
+/// The JS-visible surface, which each crate's `web_terminal_impl!` expands onto its
+/// own terminal type under its own export attribute: the attribute names the JS class
+/// after the impl's type, which this shared file cannot spell.
 macro_rules! bind {
     ($terminal:ident, $export:ident) => {
         #[cfg_attr(target_arch = "wasm32", $export)]
@@ -373,10 +372,10 @@ macro_rules! bind {
                     .map_or_else(Vec::new, |(row, col)| vec![u32::from(row), u32::from(col)])
             }
 
-            /// Milliseconds until the oldest pending guess self-expires (the glitch
-            /// flush), or `undefined` when none is pending. Arm ONE timer for this and
-            /// call [`predict_overlay`](Self::predict_overlay) + repaint there, so a
-            /// stale ghost is erased even when no further input or output arrives.
+            /// Milliseconds until the oldest pending guess self-expires, or `undefined` when
+            /// none is pending. Arm one timer for it and call
+            /// [`predict_overlay`](Self::predict_overlay) + repaint there, so a stale ghost is
+            /// erased even when no input or output arrives.
             pub fn predict_next_deadline_ms(&self) -> Option<f64> {
                 self.predict
                     .next_deadline()

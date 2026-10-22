@@ -8,6 +8,7 @@ use crate::baseline::Baseline;
 use crate::model::{Effect, HostFacts, PValue, Probe, Read, User};
 use crate::port::System;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub mod apps;
 pub mod aterm;
@@ -56,6 +57,30 @@ impl Ctx {
             .any(|c| c.eq_ignore_ascii_case(sha256))
             .then(|| self.cache_dir.join(sha256.to_ascii_lowercase()))
     }
+}
+
+/// What makes the changes of several items felt at once, handed the `System` and context
+/// on each call as the items are: [`crate::engine::Bound`] makes it an
+/// [`aterm_converge::Activation`], whose contract it keeps (the engine applies every item
+/// that names it, runs it once, then reads them back).
+pub trait Activation: Send + Sync {
+    /// Stable id, unique within a run: its journal line's.
+    fn id(&self) -> String;
+
+    /// What awaits it, as its journal line's `from` and `to`, or `None` when nothing does.
+    /// Must change nothing.
+    ///
+    /// # Errors
+    /// One line when what awaits it cannot be read.
+    fn pending(&self, sys: &dyn System, ctx: &Ctx) -> Result<Option<(String, String)>, String>;
+
+    /// Make the applied changes felt, returning once they are, with each item (by id)
+    /// whose part of it did not take effect and why
+    /// ([`aterm_converge::Activation::activate`]).
+    ///
+    /// # Errors
+    /// One line when none of it took effect; what awaits it stays for the next run.
+    fn activate(&self, sys: &dyn System, ctx: &Ctx) -> Result<Vec<(String, String)>, String>;
 }
 
 /// One setting the engine probes, plans, applies and verifies, handed the `System` and
@@ -111,6 +136,13 @@ pub trait Item: Send + Sync {
     /// When the change is felt.
     fn effect(&self) -> Effect {
         Effect::Now
+    }
+
+    /// The [`Activation`] this item's change shares with the other items whose writes one
+    /// consumer reads ([`aterm_converge::Item::activation`]): the engine reads the item
+    /// back only after it ran. `None`, the default: `apply` makes the change felt itself.
+    fn activation(&self) -> Option<Arc<dyn Activation>> {
+        None
     }
 
     /// Ids of items that must end `Ok` or `Changed` before this one may apply (Command

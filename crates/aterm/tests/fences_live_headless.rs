@@ -1,28 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless conformance for the WRITE FENCES and the SUPERVISOR KEY,
-//! driven through the one `aterm` binary against a real headless instance.
+//! Live-headless conformance for the write fences and the supervisor key, driven through the
+//! one `aterm` binary against a real headless instance.
 //!
-//! * THE SWAP SCENARIO. A FAKE WORKER (a POSIX `sh` script in raw mode that
-//!   appends every byte it reads to a key log) draws approval box A on a
-//!   fresh alternate screen; the test reads `status gen= seq= hash=`; the
-//!   worker LEAVES AND RE-ENTERS the alternate screen and draws box B with the
-//!   same number of writes — the review's live reproduction, where box B read
-//!   the same `seq=` as A. `key if-gen=<A's gen> 1` and `key if-fp=<A's hash>
-//!   1` must answer `OK skipped reason=changed` and the key log must stay
-//!   EMPTY; the retired `if-seq=` is refused. NEGATIVE CONTROLS: `seq=`
-//!   really does repeat (the fence it used to be would have pressed), and the
-//!   fence built from B's own generation presses and the `1` reaches the log —
-//!   so the log can see a press, and the skip is the fence deciding.
-//! * THE SUPERVISOR KEY. `meta set supervisor <holder>` on a persistent
-//!   connection shows in `sessions` and `status` while that connection lives
-//!   and clears when it closes; a `ttl=` claim outlives its one-shot client.
-//!   Two attention owners set and clear independently over the wire.
+//! * The swap scenario: a fake worker (a POSIX `sh` script in raw mode that appends every byte
+//!   it reads to a key log) draws approval box A on a fresh alternate screen, then leaves and
+//!   re-enters it and draws box B with the same number of writes, so B reads A's `seq=`.
+//!   `key if-gen=<A's gen> 1` and `key if-fp=<A's hash> 1` answer `OK skipped reason=changed`
+//!   and the key log stays empty; the retired `if-seq=` is refused. Negative controls: `seq=`
+//!   does repeat, and a fence from B's own generation presses and the `1` reaches the log.
+//! * The supervisor key: `meta set supervisor <holder>` on a persistent connection shows in
+//!   `sessions` and `status` while that connection lives and clears when it closes; a `ttl=`
+//!   claim outlives its one-shot client. Two attention owners set and clear independently.
 //!
-//! ISOLATION: scratch HOME/XDG roots, a private control socket, a config with
-//! every automatic lane off, `--no-reroute`, `SHELL=/bin/sh`
-//! (`support/launch_isolation.rs`). A headless instance opens no window.
+//! Isolation is `support/launch_isolation.rs`'s.
 
 #![cfg(unix)]
 
@@ -44,8 +36,8 @@ fn boot(tag: &str) -> Instance {
     )
 }
 
-/// How long a wait for something that MUST happen may take before it is read
-/// as a hang (AGENTS.md: a hang detector is a minute, never a latency budget).
+/// How long a wait for something that must happen may take before it is read as a hang
+/// (AGENTS.md).
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
 
@@ -120,8 +112,8 @@ fn await_match(inst: &Instance, sid: &str, re: &str) {
     );
 }
 
-/// THE SWAP SCENARIO, live: a fence built from box A's stamp never presses
-/// into box B, and the worker receives nothing.
+/// The swap scenario: a fence built from box A's stamp never presses into box B, and the
+/// worker receives nothing.
 #[test]
 fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
     let inst = boot("k");
@@ -159,15 +151,11 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
         "PRECONDITION: the worker is up and has received nothing"
     );
 
-    // Box B's `await match` is ARMED OVER BOX A, before the worker is let go:
-    // box B arrives on a re-entered alternate screen at box A's own `seq=`,
-    // and the observation kernel used to key change on `(seq, alt screen)`,
-    // neither of which moves — this wait answered `OK timeout` while `text`
-    // showed box B. It keys on the screen generation now. The worker draws
-    // box B only once the go file exists, and the go file is created only
-    // after the server reports the wait ARMED — `who`'s `watchers=` counts
-    // the subscriber the await registers right after it arms its watcher —
-    // so the watcher is armed over box A, never evaluated at arm over box B.
+    // Box B's `await match` is armed over box A, before the worker is let go: box B arrives on
+    // a re-entered alternate screen at box A's own `seq=`, so the observation must key change
+    // on the screen generation, not `(seq, alt screen)`. The go file is created only once
+    // `who`'s `watchers=` counts the await's subscriber (registered right after it arms), so
+    // the watcher is armed over box A, never evaluated at arm over box B.
     assert_eq!(
         watchers(&inst, &sid),
         0,
@@ -181,9 +169,8 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
                 "await",
                 "match",
                 "rm.-rf./tmp/work",
-                // This wait must outlive the arm backstop below: a loaded full
-                // workspace run can take longer than ten seconds to observe
-                // the watcher even though the same test passes alone.
+                // Outlives the arm backstop below: a loaded run can take over ten
+                // seconds to see the watcher.
                 "timeout=150000",
             ],
         );
@@ -197,18 +184,10 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
             })
         })
     };
-    // Armed, or the waiter ended without arming: the two events that decide
-    // it. A wall-clock bound alone read a client starved of its spawn under a
-    // loaded lane as "never armed" (red 1 in 4 on a loaded lane, green 3/3
-    // alone); the backstop is only for a server that neither arms nor answers.
-    //
-    // Every `who` sample is kept — when it started, how long the call took,
-    // what it read — and a failure prints them. This red was seen once in a
-    // whole-workspace test run (the await answered its own 150 s `OK timeout`
-    // while no sample had seen it armed, and the 120 s backstop never fired)
-    // and never alone or under a 24-way CPU stress, so the next one has to
-    // explain itself: slow calls say the client was starved, fast zeros say
-    // the server never counted the watcher.
+    // Armed, or the waiter ended without arming: the two events that decide it; the backstop
+    // is only for a server that neither arms nor answers. Every `who` sample is kept (when it
+    // started, how long it took, what it read) and a failure prints them: slow calls say the
+    // client was starved, fast zeros say the server never counted the watcher.
     let started = Instant::now();
     let armed_by = started + Duration::from_secs(120);
     let mut samples: Vec<(Duration, Duration, usize)> = Vec::new();
@@ -302,7 +281,7 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
         "a fence on the replaced box must deliver nothing"
     );
 
-    // NEGATIVE CONTROL: B's own generation presses, and the log sees it.
+    // Negative control: B's own generation presses, and the log sees it.
     let reply = ctl_ok(
         &inst,
         &[&format!("@{sid}"), "key", &format!("if-gen={gen_b}"), "1"],
@@ -442,10 +421,9 @@ fn supervisor_until(inst: &Instance, sid: &str, want: &str) -> String {
     panic!("supervisor={want} not reached; last row: {row}");
 }
 
-/// THE SUPERVISOR KEY, live: shown while its persistent connection lives,
-/// cleared when it closes; a `ttl=` claim outlives its one-shot client, and a
-/// connection-bound one-shot claim is gone with its client. Plus two attention
-/// owners over the wire.
+/// The supervisor key: shown while its persistent connection lives, cleared when it closes; a
+/// `ttl=` claim outlives its one-shot client, and a connection-bound one-shot claim is gone
+/// with its client. Plus two attention owners over the wire.
 #[test]
 fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes() {
     let inst = boot("v");
@@ -486,19 +464,16 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
     );
     assert!(request(&mut conn, &format!("@{sid} meta")).contains(" supervisor=sup-live"));
 
-    // The connection closes: the claim goes with it. Shut down, then dropped:
-    // the server sees the close by reading EOF, which a close alone delivers only
-    // once every copy of this descriptor is gone — and std makes a connected
-    // socket close-on-exec non-atomically on macOS, so a sibling test's spawn can
-    // carry a copy into an `aterm` that outlives the wait below (the fd-copy
-    // sweep of 2026-09-27). `shutdown` acts on the socket, copies and all.
+    // The connection closes: the claim goes with it. Shut down, then dropped: the server sees
+    // the close by reading EOF, which a close alone delivers only once every copy of the
+    // descriptor is gone, and std makes a connected socket close-on-exec non-atomically on
+    // macOS, so a sibling test's spawn can carry a copy. `shutdown` acts on the socket.
     let _ = conn.get_ref().shutdown(std::net::Shutdown::Both);
     drop(conn);
     supervisor_until(&inst, &sid, "-");
 
-    // A `ttl=` claim from a one-shot client outlives the client. Its ttl
-    // outlives the wait for the roster to show it (it was 30 s, under that
-    // wait), and it is unset below, not left to lapse.
+    // A `ttl=` claim from a one-shot client outlives the client; its ttl outlives the roster
+    // wait, and it is unset below.
     ctl_ok(
         &inst,
         &[
@@ -513,26 +488,20 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
     supervisor_until(&inst, &sid, "sup-ttl");
     ctl_ok(&inst, &[&format!("@{sid}"), "meta", "unset", "supervisor"]);
     supervisor_until(&inst, &sid, "-");
-    // …and a one-shot claim WITHOUT ttl= is bound to a connection that has
-    // already closed by the time anyone can read it. Such a claim has no
-    // expiry of its own: one its connection's end did not release would stand
-    // past the hang detector.
+    // …and a one-shot claim without `ttl=` is bound to a connection already closed by the time
+    // anyone reads it; with no expiry of its own, one its connection's end did not release
+    // would stand past the hang detector.
     ctl_ok(
         &inst,
         &[&format!("@{sid}"), "meta", "set", "supervisor", "sup-once"],
     );
     supervisor_until(&inst, &sid, "-");
 
-    // A `ttl=` claim nobody renews LAPSES, and the lapse is recorded — the
-    // `meta-change field=supervisor value=-` a dead supervisor never writes
-    // itself — by the instance's own timer. Both ends are read off the
-    // TIMELINE, which keeps them after the lease is gone. A roster poll cannot
-    // witness this claim: it is shown for 400 ms from the instant the server
-    // takes it (`live_supervisor` filters on the expiry), and one poll has to
-    // fit this client's exit, the next `aterm ctl`'s spawn and `sessions`' own
-    // main-thread hop (allowed 500 ms) inside that window. On a loaded machine
-    // it misses, and every later poll reads `-`. The `sup-ttl` claim above is the
-    // roster's witness for a `ttl=` claim, and that it outlives its client.
+    // A `ttl=` claim nobody renews lapses, and the instance's own timer records the lapse
+    // (`meta-change field=supervisor value=-`). Both ends are read off the timeline, which
+    // keeps them after the lease is gone: a roster poll cannot reliably catch a 400 ms claim
+    // (`live_supervisor` filters on the expiry). The `sup-ttl` claim above is the roster's
+    // witness.
     let changes = || -> Vec<String> {
         ctl_ok(&inst, &[&format!("@{sid}"), "timeline"])
             .lines()
@@ -558,8 +527,8 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
         std::thread::sleep(Duration::from_millis(50));
         since = changes().split_off(before);
     }
-    // Claimed (recorded only when a claim moves the SHOWN holder), then
-    // lapsed, the lapse recorded exactly once — and the roster agrees.
+    // Claimed (recorded only when a claim moves the shown holder), then lapsed, the lapse
+    // recorded exactly once, and the roster agrees.
     assert_eq!(
         since,
         ["value=sup-dies", "value=-"],
@@ -592,10 +561,8 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
 struct Recording<C> {
     inner: C,
     requests: Vec<String>,
-    /// Once a `key` has gone out, every later `await` answers `ERR exited`
-    /// — the session gone, as the engine's own mock ends a watch — so the
-    /// loop ends after its press instead of at its budget, and the budget can
-    /// be one only a hang reaches.
+    /// Once a `key` has gone out, every later `await` answers `ERR exited` (the session gone),
+    /// so the loop ends after its press instead of at its budget.
     end_after_press: bool,
 }
 
@@ -638,10 +605,8 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
     let go = inst.tmp.join("go");
     let keylog = inst.tmp.join("keys.log");
     std::fs::write(&script, FAKE_WORKER).expect("write the fake worker");
-    // The engine judges a box only in a session whose FOREGROUND program is
-    // an agent (`status program=`): the fake worker runs under the name
-    // `claude`, in a job of its own, as a real one does (the form
-    // agent_verdict_live_headless uses).
+    // The engine judges a box only when the foreground program is an agent (`status
+    // program=`), so the fake runs as `claude` in a job of its own.
     type_line(
         &inst,
         &sid,
@@ -655,7 +620,7 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
     await_match(&inst, &sid, "ls.-la./tmp/work");
     await_match(&inst, &sid, "Esc.to.cancel");
     await_program(&inst, &sid, "claude");
-    // PRECONDITION: the server's own read carries the generation.
+    // Precondition: the server's own read carries the generation.
     let json = ctl_ok(&inst, &[&format!("@{sid}"), "text", "--json"]);
     assert!(
         json.contains("\"gen\":\""),
@@ -667,12 +632,9 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
         requests: Vec::new(),
         end_after_press: true,
     };
-    // The budget is a hang discriminator, the [`HANG`] minute: the loop ends
-    // once it has pressed (`end_after_press`). It was 4 s, spent on read,
-    // settle, read, status, `help key` and the press — each a round trip to the
-    // live instance's main thread — so a contended gate returned before the
-    // press, and the fence assertion failed on a correct engine (the
-    // load-sensitive test audit of 2026-09-27).
+    // The budget is a hang detector ([`HANG`]); the loop ends once it has pressed
+    // (`end_after_press`). Each step (read, settle, read, status, `help key`, the press) is a
+    // round trip to the live instance's main thread.
     let opts = SuperviseOpts {
         max: HANG,
         ..SuperviseOpts::default()

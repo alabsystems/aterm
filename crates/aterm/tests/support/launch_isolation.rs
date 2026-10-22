@@ -3,17 +3,14 @@
 
 //! Private host state for tests that launch the real window or session entry.
 //!
-//! ISOLATION IS A SCRATCH HOME AND A SCRATCH CONFIG, never an environment veto
-//! (2026-09-23). The update system's user-facing environment knobs are gone
-//! (`ATPKG_DISABLE`, `ATERM_NO_AUTO_UPDATE`, `ATERM_NO_AUTO_APPLY`, `ATERM_NO_REROUTE`;
-//! owner: "NOT ENV VARS those are for development"), so a launch is kept off the
-//! machine the way a person keeps it off theirs: `$HOME` is private (so the package
-//! prefix, its reroute stubs and the `Updates/` ledger all live under it), and
-//! `$XDG_CONFIG_HOME/aterm/aterm.toml` switches every automatic lane off —
-//! [`CONFIG_OFF`]. The reroute's escape is the `--no-reroute` FLAG ([`NO_REROUTE`]),
-//! which a caller adds to its window/session argv (before any `-e`/`--` payload), and a
-//! window's private socket is the `--control-sock` FLAG ([`control_sock`]): no
-//! environment variable selects a socket, the grid or headless mode (2026-09-24).
+//! Isolation is a scratch home and a scratch config, never an environment veto (the update
+//! system has no user-facing environment knobs): `$HOME` is private, so the package prefix,
+//! its reroute stubs and the `Updates/` ledger all live under it, and
+//! `$XDG_CONFIG_HOME/aterm/aterm.toml` switches every automatic lane off ([`CONFIG_OFF`]).
+//! The reroute's escape is the `--no-reroute` flag ([`NO_REROUTE`]), which a caller adds to
+//! its window/session argv before any `-e`/`--` payload, and a window's private socket is
+//! the `--control-sock` flag ([`control_sock`]): no environment variable selects a socket,
+//! the grid or headless mode.
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
@@ -22,15 +19,15 @@
 use std::path::Path;
 use std::process::Command;
 
-/// The flag that starts a window or session with the upstream Rust names restored
-/// — nothing laid under the scratch prefix, no launchd lane. A caller that does not
-/// study the reroute adds it; the environment can no longer say it.
+/// The flag that starts a window or session with the upstream Rust names restored: nothing
+/// laid under the scratch prefix, no launchd lane. A caller that does not study the reroute
+/// adds it.
 #[allow(dead_code)]
 pub const NO_REROUTE: &str = "--no-reroute";
 
-/// The window flag that binds its control socket at `<root>/run/aterm/aterm.sock` —
-/// the one path every window test dials (its token is named after it:
-/// `aterm.sock.token`). A WINDOW flag: the session takes no socket.
+/// The window flag that binds its control socket at `<root>/run/aterm/aterm.sock`, the one
+/// path every window test dials (its token is `aterm.sock.token`). The session takes no
+/// socket.
 #[allow(dead_code)]
 pub fn control_sock(root: &Path) -> [std::ffi::OsString; 2] {
     [
@@ -82,17 +79,16 @@ pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
 #[allow(dead_code)]
 pub const HARNESS_OFF: &str = "[harness]\nenabled = false\n";
 
-/// Arm `cmd` — a `--headless` launch — with a LIFELINE (`aterm_uds::lifeline`): the
-/// instance shuts down when this test process goes, however it goes. A `Drop` that
-/// kills the child runs on a panic, but not when the runner is SIGKILLed, a
-/// `timeout` fires or a person presses Ctrl-C twice — and an instance left behind
-/// then runs for days holding a shell (gap #36: eleven days, measured). Call it
-/// after `.stdin(..)` and before any `-e` payload, and keep the value alive as long
+/// Arm `cmd`, a `--headless` launch, with a lifeline (`aterm_uds::lifeline`): the instance
+/// shuts down when this test process goes, however it goes. A `Drop` that kills the child
+/// runs on a panic, but not when the runner is SIGKILLed, a `timeout` fires or a person
+/// presses Ctrl-C twice, and an instance left behind would run for days holding a shell.
+/// Call it after `.stdin(..)` and before any `-e` payload, and keep the value alive as long
 /// as the instance should run (the booted instance holds it).
 ///
 /// # Panics
-/// The lifeline's FIFO could not be made in `root`: a scratch world this test
-/// cannot write to is a broken fixture, not a reason to boot an unwatched instance.
+/// The lifeline's FIFO could not be made in `root`: a scratch world this test cannot write
+/// to is a broken fixture, not a reason to boot an unwatched instance.
 ///
 /// Unix only, like `aterm_uds::lifeline`: this file is also included by a Windows
 /// test twin (`protected_spawn.rs`), and `verify cells` compiles it there.
@@ -103,13 +99,10 @@ pub fn lifeline(cmd: &mut Command, root: &Path) -> aterm_uds::lifeline::Lifeline
         .unwrap_or_else(|e| panic!("arm the instance's lifeline in {}: {e}", root.display()))
 }
 
-/// Whether the control socket at `sock` is LISTENING: a connect the kernel
-/// takes into the backlog, dropped at once (the server's own
-/// `control_auth::socket_is_live` probe). The socket FILE is not that signal:
-/// `bind(2)` creates it before `listen(2)`, and a client that dials in between
-/// is refused (`ECONNREFUSED`). Boots that read the file as readiness failed
-/// their first `aterm ctl` call, "Connection refused", about once in ten runs
-/// of the supervise suite at a load average near 40 (2026-09-24).
+/// Whether the control socket at `sock` is listening: a connect the kernel takes into the
+/// backlog, dropped at once (the server's own `control_auth::socket_is_live` probe). The
+/// socket file is not that signal: `bind(2)` creates it before `listen(2)`, and a client
+/// that dials in between is refused (`ECONNREFUSED`).
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn control_listening(sock: impl AsRef<Path>) -> bool {
@@ -236,11 +229,10 @@ mod aterm_under_test;
 pub use aterm_under_test::aterm_executable;
 
 pub fn apply(cmd: &mut Command, root: &Path) {
-    // Isolated from this process's descriptors as well, before any hook a caller
-    // adds: the launch holds its stdio (the lifeline on stdin) and nothing else.
-    // A std child on a std without the SP-1 strip keeps any descriptor another
-    // test thread had open unflagged at the spawn — a pipe between its `pipe()`
-    // and its `F_SETFD` — and an instance holds it as long as its test runs.
+    // Isolated from this process's descriptors too, before any hook a caller adds: the
+    // launch holds its stdio (the lifeline on stdin) and nothing else. On a std without
+    // Trust's SP-1 strip, a child keeps any descriptor another test thread had open unflagged
+    // at the spawn (a pipe between its `pipe()` and its `F_SETFD`), for as long as its test runs.
     {
         use aterm_uds::spawnfd::InheritNothing as _;
         cmd.inherit_nothing();

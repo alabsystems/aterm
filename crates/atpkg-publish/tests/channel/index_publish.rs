@@ -133,8 +133,8 @@ fn request(rig: &Rig, out: &str, upload: bool, delta: Delta) -> IndexRequest {
     }
 }
 
-/// A re-run by the publisher still holding baseline 21 (the shell's `BASELINE=`): the
-/// signed quad of the head, on disk, byte-identical to the one the channel serves.
+/// A re-run by the publisher still holding baseline 21 (`--baseline QUAD-DIR`): the signed
+/// quad of the head, on disk, byte-identical to the one the channel serves.
 fn rerun(rig: &Rig, out: &str) -> IndexRequest {
     let base = rig.path("held-21");
     rig.quad_dir(&base, &Doc::new(21, &[("ay", 5)]));
@@ -195,7 +195,7 @@ fn a_dry_run_over_a_quad_on_disk_makes_no_host_call_and_signs_the_next_number() 
         assert!(rig.path("out").join(f).is_file(), "{f}");
     }
 
-    // Over the channel head, a dry run only READS the index repo.
+    // Over the channel head, a dry run only reads the index repo.
     let (r, _) = publish(
         rig_with_head(&rig),
         &request(&rig, "out2", false, Delta::default()),
@@ -230,7 +230,7 @@ fn upload_needs_the_channel_token_before_anything_is_signed() {
 
 #[test]
 fn the_baseline_must_be_published_on_the_download_host() {
-    // A quad on disk whose release is a DRAFT, absent, or behind a private repo.
+    // A quad on disk whose release is a draft, absent, or behind a private repo.
     let rig = Rig::new("idx-base");
     let doc = Doc::new(21, &[("ay", 5)]);
     let dir = rig.path("base");
@@ -558,7 +558,7 @@ fn a_moved_pin_may_not_silently_drop_a_darwin_target() {
     r.unwrap_or_else(|e| panic!("{e}\n{}", log.text()));
     assert!(!rig.path("allowed/.triple-gate").exists());
 
-    // The row kept, the new manifest on the PUBLIC owner: passes without a word.
+    // The row kept, the new manifest on the public owner: passes without a word.
     let rig = live("idx-triple-kept");
     rig.lay_pack("alabsystems", "ay", 6, &[MAC, MAC_X86]);
     let (r, log) = publish(&rig, &request(&rig, "out", true, move6()));
@@ -669,9 +669,9 @@ fn a_vendor_yank_with_no_pin_behind_it_reaches_the_clients_policy() {
     assert!(policy.is_yanked("muse", v("1.4.9-R6297.1")));
 }
 
-/// A LAPSED head is the channel every client refuses, and re-signing it is the recovery:
-/// it is a baseline like any other (from the channel or on disk), and only CARRYING its
-/// horizon is refused — naming the flag that re-signs it.
+/// A lapsed head is the channel every client refuses, and re-signing it is the recovery: it is
+/// a baseline like any other (from the channel or on disk), and only carrying its horizon is
+/// refused, naming the flag that re-signs it.
 #[test]
 fn a_lapsed_head_is_re_signed_with_a_new_horizon_and_never_carried() {
     const LAPSED: &str = "2026-01-01T00:00:00Z";

@@ -40,41 +40,12 @@
 use std::ffi::{CStr, c_int, c_void};
 use std::sync::Arc;
 
+use super::GlPresentError;
 use super::device::{EglBinding, GlDevice, GlShared, WindowSystem};
 use super::ffi::{self, EGLConfig, EGLSurface, EGLint, EglWindowFns, GLXDrawable};
 use super::resources::GlTexture;
 use crate::SurfacePresentFailure;
 use crate::device_layer::TexelFormat;
-
-/// A failed GL post and its frontend disposition. Only a window bind that has
-/// not reached the device-loss threshold may retry; other GL failures keep
-/// their validation disposition (a latched loss is recovered before retrying).
-#[derive(Debug)]
-pub(crate) struct GlPresentError {
-    pub(crate) kind: SurfacePresentFailure,
-    detail: String,
-}
-
-impl From<String> for GlPresentError {
-    fn from(detail: String) -> Self {
-        Self {
-            kind: SurfacePresentFailure::Validation,
-            detail,
-        }
-    }
-}
-
-impl From<&str> for GlPresentError {
-    fn from(detail: &str) -> Self {
-        detail.to_owned().into()
-    }
-}
-
-impl std::fmt::Display for GlPresentError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.detail)
-    }
-}
 
 /// The native window a surface is made on.
 #[derive(Clone, Copy, Debug)]

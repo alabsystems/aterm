@@ -157,6 +157,40 @@ fn mailbox_links_and_approval_keep_their_recipient_origin_and_callback() {
         None,
         "must ignore emails addressed to a different account"
     );
+    for spoofed_to in [
+        "From: Claude <no-reply@claude.ai>\r\nTo: <not-m15-3@example.test>\r\n\r\nhttps://claude.ai/magic?token=spoof1\r\n",
+        "From: Claude <no-reply@claude.ai>\r\nTo: <m15-3@example.test.evil.example>\r\n\r\nhttps://claude.ai/magic?token=spoof2\r\n",
+    ] {
+        assert_eq!(
+            extract_magic_link_from_email(spoofed_to, Some("m15-3@example.test")),
+            None,
+            "substring recipient spoofing must not match target account: {spoofed_to}"
+        );
+    }
+    let folded_eml = concat!(
+        "From: Claude <no-reply@claude.ai>\r\n",
+        "To: Claude Fleet Member\r\n",
+        " \t<m15-3@example.test>\r\n\r\n",
+        "https://claude.ai/magic?token=folded_ok\r\n"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(folded_eml, Some("m15-3@example.test")).as_deref(),
+        Some("https://claude.ai/magic?token=folded_ok"),
+        "RFC 5322 folded To header must match recipient"
+    );
+    let unsubscribe_only_eml = concat!(
+        "From: Claude <no-reply@claude.ai>\r\n",
+        "To: <m15-3@example.test>\r\n\r\n",
+        "<html><body>",
+        "<img src=\"https://claude.ai/static/logo.png\">",
+        "<a href=\"https://claude.ai/unsubscribe?id=123\">Unsubscribe</a>",
+        "</body></html>\r\n"
+    );
+    assert_eq!(
+        extract_magic_link_from_email(unsubscribe_only_eml, Some("m15-3@example.test")),
+        None,
+        "notification email with only unsubscribe and asset links must never be clicked"
+    );
     assert_eq!(
         extract_magic_link_from_email(raw_eml, Some("m15-3@example.test")).as_deref(),
         Some("https://claude.ai/magic?token=abc123&state=st_99")
@@ -251,6 +285,32 @@ fn mailbox_links_and_approval_keep_their_recipient_origin_and_callback() {
         "no provider cookie at local callback"
     );
     assert_eq!(requests[3].3, None, "no consent body at local callback");
+
+    // Two-step magic-link confirmation form -> OAuth scope approval form -> callback,
+    // including an HTTP proxy `200 Connection established` preamble on the magic-link hop.
+    let confirm_magic = concat!(
+        "HTTP/1.1 200 Connection established\r\nProxy-Agent: test\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nSet-Cookie: magic_ok=1; Path=/\r\n\r\n",
+        "<form method=\"POST\" action=\"/magic/confirm\">",
+        "<input name=\"nonce\" value=\"n_77\"></form>"
+    );
+    let (result2, requests2) = run(
+        &authorize,
+        "https://claude.ai/magic?token=mail",
+        &[begin, confirm_magic, consent, landing, success],
+    );
+    assert_eq!(result2, Ok(()));
+    assert_eq!(requests2.len(), 5);
+    assert_eq!(requests2[2].0, "POST");
+    assert_eq!(requests2[2].1, "https://claude.ai/magic/confirm");
+    assert_eq!(requests2[2].3.as_deref(), Some("nonce=n_77"));
+    assert_eq!(
+        requests2[2].2.get("magic_ok").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(requests2[3].0, "POST");
+    assert_eq!(requests2[3].1, "https://claude.ai/oauth/approve");
+    assert!(requests2[4].2.is_empty());
 
     // Neither an email nor an HTTP response can expand the origin admitted
     // by the authorize request. Refusal happens before the transport call.

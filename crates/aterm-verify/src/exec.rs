@@ -1308,8 +1308,8 @@ mod tests {
 
     #[test]
     fn the_flag_moves_the_ceiling_and_only_a_typed_word_removes_it() {
-        // Anything unreadable is refused (the command line makes it a usage
-        // error): the direction of failure is fixed at "keep the backstop".
+        // Anything unreadable is refused (a usage error on the command line), so a typo keeps
+        // the ceiling.
         for junk in ["", "  ", "45m", "soon", "-5", "NaN", "1e400", "4e9"] {
             assert_eq!(
                 parse_ceiling(junk),

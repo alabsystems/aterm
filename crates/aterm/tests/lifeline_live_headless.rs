@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LIVE: a headless instance armed with a LIFELINE ends with the process that
-//! started it, and `aterm doctor` names an instance no control socket reaches
-//! (gap #36 — a `./aterm-before --headless` whose harness died had run for eleven
-//! days holding a shell, reachable by no `aterm ctl ls`).
+//! A headless instance armed with a lifeline ends with the process that started it, and
+//! `aterm doctor` names an instance no control socket reaches.
 //!
 //! Every instance here is the real binary (`launch_isolation::aterm_executable`) under a scratch
 //! world (`support/launch_isolation.rs`) and is itself armed with a lifeline, so a
@@ -26,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-/// The ceiling on any one wait. Generous: a debug binary booting on a loaded
-/// machine, and a wait that is met ends the moment it is.
+/// The ceiling on any one wait: a debug binary booting on a loaded machine. A met wait ends
+/// at once.
 const CEILING: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(20);
 
@@ -143,11 +141,9 @@ fn ctl(root: &Path, sock: &Path, args: &[&str], stdin: &[u8]) -> Output {
     })
 }
 
-/// THE CONTRACT, end to end on the real binary. While the lifeline is held the
-/// instance serves — a shell answers a typed command through the socket, after
-/// the whole boot. Once it is cut the instance quits the ordinary way: exit 0,
-/// its socket file unlinked by the teardown (the backstop would leave it), and
-/// its shell hung up.
+/// While the lifeline is held the instance serves (a shell answers a typed command through
+/// the socket); once it is cut the instance quits the ordinary way: exit 0, its socket file
+/// unlinked by the teardown (the backstop would leave it), and its shell hung up.
 #[test]
 fn a_held_lifeline_keeps_the_instance_and_a_cut_one_ends_it_cleanly() {
     let world = world("cut");
@@ -231,10 +227,10 @@ fn a_killed_launcher_takes_its_instance_with_it() {
     let root = world.0.clone();
     let sock = root.join("run/aterm/aterm.sock");
     let log = root.join("gui.log");
-    // The script holds the FIFO read-write on fd 9 (the one writer), the instance
-    // reads it as stdin, and the script prints the instance's pid and waits on it.
-    // The FIFO's name stays until the world is removed: the subshell opens it
-    // AFTER the fork, so an `rm` here would race that open and could win.
+    // The script holds the FIFO read-write on fd 9 (the one writer), the instance reads it as
+    // stdin, and the script prints the instance's pid and waits on it. The FIFO's name stays
+    // until the world is removed: the subshell opens it after the fork, so an `rm` here would
+    // race that open.
     let script = r#"
         mkfifo "$1/lifeline" || exit 1
         exec 9<>"$1/lifeline"
@@ -295,15 +291,13 @@ fn a_killed_launcher_takes_its_instance_with_it() {
         || !alive(pid),
         || read_log(&log),
     );
-    // Gone, and reaped by launchd: the number is free for any process now, and a
-    // SIGKILL sent to it later could land on one this test never started.
+    // Gone and reaped: the pid is free for any process now, so the guard must not signal it.
     std::mem::forget(guard);
 }
 
-/// THE CENSUS on real processes: `aterm doctor`, run in B's world, names A — whose
-/// socket lives where B's rendezvous directory never looks — and not B, whose
-/// per-instance socket it publishes. Both are reported, neither is touched: each
-/// is still running after the doctor has spoken.
+/// On real processes, `aterm doctor` run in B's world names A, whose socket lives where B's
+/// rendezvous directory never looks, and not B, whose per-instance socket it publishes. Both
+/// are only reported: each still runs after the doctor has spoken.
 #[test]
 fn the_doctor_names_an_unreachable_instance_and_not_a_reachable_one() {
     let world_a = world("ca");

@@ -220,13 +220,11 @@ fn kill_all(pids: &[i32], masters: &[i32]) {
     }
 }
 
-/// R3 — the capture over REAL sessions, in its window and tab places
-/// (the ones `Reopened::lost` counts): tab 0 is a stub with no process
-/// (skipped), tab 1 a shell at its prompt (NEGATIVE CONTROL: no entry),
-/// tab 2 a foreground `sleep` (named for its group), tab 3 a `sleep &`
-/// (R2: unnamed), tab 4 `sleep` as the session root as `aterm -e` runs it
-/// (R1: named), tab 5 a shell that `exec`ed `sleep` while the sweep's
-/// name still says the shell (R1: unnamed).
+/// The capture over real sessions, by window and tab (the places `Reopened::lost` counts): tab 0
+/// a stub with no process (skipped), tab 1 a shell at its prompt (negative control: no entry),
+/// tab 2 a foreground `sleep` (named for its group), tab 3 a `sleep &` (unnamed), tab 4 `sleep`
+/// as the session root as `aterm -e` runs it (named), tab 5 a shell that `exec`ed `sleep` while
+/// the sweep's name still says the shell (unnamed).
 #[test]
 fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
     let home = aterm_tempfile::tempdir().expect("scratch home");

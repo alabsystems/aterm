@@ -647,11 +647,10 @@ fn an_integrated_zsh_whose_rc_left_the_tty_raw_takes_ctrl_c_at_its_first_prompt(
     }
 }
 
-/// A user whose rc defines `stty` as a FUNCTION (or `reset` as an ALIAS) keeps
-/// zsh's adopting behaviour (a frozen tty would silently undo what their
-/// definition does): the tty is not frozen, and the repair still runs after a
-/// FAILED command — a raw child's SIGKILL and `exit 1` leave the next command
-/// sane, `stty -ixon` included.
+/// A user whose rc defines `stty` as a function (or `reset` as an alias) keeps zsh's
+/// adopting behaviour (a frozen tty would silently undo what their definition does): the
+/// tty is not frozen, and the repair still runs after a failed command, so a raw child's
+/// SIGKILL and `exit 1` leave the next command sane, `stty -ixon` included.
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_with_its_own_stty_is_repaired_not_frozen() {
@@ -1786,12 +1785,10 @@ fn an_integrated_bash_with_an_array_prompt_command_reports_only_typed_lines() {
     sh.finish();
 }
 
-/// The user's `$_` reaches the user's code as in bare bash: `mkdir -p d && cd
-/// "$_"` enters d, a command reads the last argument of the one before it, and so
-/// does the user's PROMPT_COMMAND. The DEBUG trap's own command is the last one
-/// bash runs before each of the user's, and called bare it left `$_` reading
-/// `__aterm_preexec` (`cd: __aterm_preexec: No such file or directory`); the
-/// user's PROMPT_COMMAND read the last argument of a command of aterm's.
+/// The user's `$_` reaches the user's code as in bare bash: `mkdir -p d && cd "$_"` enters
+/// d, and a command (and the user's PROMPT_COMMAND) reads the last argument of the one
+/// before it. The DEBUG trap's own command is the last one bash runs before each of the
+/// user's, so called bare it would leave `$_` reading `__aterm_preexec`.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_the_users_last_argument() {

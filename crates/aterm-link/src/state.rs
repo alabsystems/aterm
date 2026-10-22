@@ -972,6 +972,12 @@ pub struct StateDir {
     /// unlink failed takes that copy for the file's, so the recovery tried
     /// again at each attach moves each file once.
     quarantine_tried: std::sync::Mutex<BTreeMap<String, QuarantineCopy>>,
+    /// THE WAIT TALLY'S DIR ROWS ([`crate::wait_tally::Kept`]): each write's
+    /// time at the disk door, by kind and by the call that made it, while the
+    /// bridge's recorder is on ([`StateDir::time_ops`]). Compiled only with
+    /// debug assertions: a released bridge has no tally to read it.
+    #[cfg(any(test, debug_assertions))]
+    times: crate::wait_tally::Kept,
     /// TEST-ONLY: what this dir's writers did to the filesystem ([`FileOps`]).
     #[cfg(test)]
     ops: std::sync::Mutex<FileOps>,
@@ -1648,6 +1654,8 @@ impl StateDir {
             undurable: std::sync::Mutex::default(),
             floor_admitted: std::sync::atomic::AtomicBool::new(false),
             quarantine_tried: std::sync::Mutex::default(),
+            #[cfg(any(test, debug_assertions))]
+            times: crate::wait_tally::Kept::default(),
             #[cfg(test)]
             ops: std::sync::Mutex::default(),
             #[cfg(test)]
@@ -1736,6 +1744,34 @@ impl StateDir {
         Ok(())
     }
 
+    /// Count this dir's writes for the wait tally from now on (`true`), or no
+    /// more: the bridge turns it on with its recorder ([`crate::wait_tally`]).
+    /// Nothing at all without debug assertions.
+    pub(crate) fn time_ops(&self, _on: bool) {
+        #[cfg(any(test, debug_assertions))]
+        self.times.turn_on(_on);
+    }
+
+    /// Copy this dir's rows into the wait tally ([`crate::wait_tally::Kept`]).
+    pub(crate) fn copy_dir_rows(&self, _t: &mut crate::wait_tally::Tally) {
+        #[cfg(any(test, debug_assertions))]
+        self.times.copy_into(_t);
+    }
+
+    /// A span of `row` this dir counts for the wait tally when the guard
+    /// drops, on every way out of the call that holds it (`let _timed = …`;
+    /// never `let _ =`, which drops it at once). Off, it reads no clock;
+    /// without debug assertions it is nothing.
+    #[cfg(any(test, debug_assertions))]
+    fn timed(&self, row: crate::wait_tally::Row) -> crate::wait_tally::Timer<'_> {
+        self.times.timer(row)
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn timed(&self, _row: crate::wait_tally::Row) -> std::marker::PhantomData<&'_ ()> {
+        std::marker::PhantomData
+    }
+
     /// Count one operation ([`FileOps`]); nothing at all outside a test build.
     fn count(&self, _note: impl FnOnce(&mut FileOps)) {
         #[cfg(test)]
@@ -1752,6 +1788,7 @@ impl StateDir {
     /// door ([`crate::fx::Disk`]): `std::fs::remove_file`, its error as it is.
     fn remove_path(&self, path: &Path) -> io::Result<()> {
         let w = crate::fx::Write::Remove { path };
+        let _timed = self.timed(crate::wait_tally::Row::DirUnlink);
         self.disk.before(w)?;
         std::fs::remove_file(path)?;
         self.disk.after(w)?;
@@ -2186,6 +2223,7 @@ impl StateDir {
     }
 
     pub(crate) fn set_post_pin(&self, sid: &str, id: u64, pin: &PublishPin) -> io::Result<()> {
+        let _timed = self.timed(crate::wait_tally::Row::SetPostPin);
         self.write(&format!("sent/{sid}.{id}"), &pin.render())
     }
 
@@ -2457,6 +2495,7 @@ impl StateDir {
             flush,
             mode,
         };
+        let _timed = self.timed(crate::wait_tally::Row::DirReplace);
         self.disk.before(w)?;
         std::fs::create_dir_all(parent)?;
         let (tmp, mut f) = crate::enable::create_temp_beside(&target, mode)?;
@@ -2981,6 +3020,7 @@ impl StateDir {
     /// writes the set whole next time.
     pub(crate) fn append_self_acked(&self, off: u64) -> io::Result<()> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let _call = self.timed(crate::wait_tally::Row::AppendSelfAcked);
         self.count(|ops| ops.appends += 1);
         let path = self.path("acked");
         let line = AckedLog::render(std::iter::once(off));
@@ -2988,6 +3028,7 @@ impl StateDir {
             path: &path,
             bytes: line.as_bytes(),
         };
+        let _timed = self.timed(crate::wait_tally::Row::DirAppend);
         self.disk.before(w)?;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -3082,6 +3123,7 @@ impl StateDir {
     ///
     /// Any I/O failure; the caller must not publish then.
     pub(crate) fn set_in_flight(&self, entry: &InFlight) -> io::Result<()> {
+        let _timed = self.timed(crate::wait_tally::Row::SetInFlight);
         self.replace(
             &format!("inflight/{}", entry.pin.seq),
             &entry.render(),
@@ -3107,6 +3149,7 @@ impl StateDir {
     /// sim item S7) — after a move that took the record, the next attach would
     /// publish it again.
     pub(crate) fn clear_in_flight(&self, seq: u64) -> io::Result<()> {
+        let _timed = self.timed(crate::wait_tally::Row::ClearInFlight);
         match self.unlink(&format!("inflight/{seq}")) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -3161,6 +3204,7 @@ impl StateDir {
         self.refused_by_a_test(rel)?;
         let path = self.path(rel);
         let w = crate::fx::Write::Flush { path: &path, flush };
+        let _timed = self.timed(crate::wait_tally::Row::DirFlush);
         self.disk.before(w)?;
         let file = match std::fs::OpenOptions::new()
             .read(true)
@@ -3206,6 +3250,7 @@ impl StateDir {
         finish: fn(io::Result<()>) -> io::Result<()>,
     ) -> io::Result<()> {
         let w = crate::fx::Write::SyncDir { path: dir, flush };
+        let _timed = self.timed(crate::wait_tally::Row::DirFlush);
         self.disk.before(w)?;
         self.count(|ops| match flush {
             aterm_durable::Flush::Durable => ops.fsyncs += 1,
@@ -3748,9 +3793,12 @@ impl StateDir {
         }
         let flush = aterm_durable::Flush::Durable;
         let w = crate::fx::Write::Flush { path: &path, flush };
-        self.disk.before(w)?;
-        self.flush_opened(&file, flush)?;
-        self.disk.after(w)?;
+        {
+            let _timed = self.timed(crate::wait_tally::Row::DirFlush);
+            self.disk.before(w)?;
+            self.flush_opened(&file, flush)?;
+            self.disk.after(w)?;
+        }
         self.flush_dir_as(path.parent().unwrap_or(&self.root), flush)?;
         self.quarantine_copy_current(copy)
     }
@@ -3782,6 +3830,7 @@ impl StateDir {
             flush: Some(aterm_durable::Flush::Durable),
             mode: 0o600,
         };
+        let _timed = self.timed(crate::wait_tally::Row::DirReplace);
         self.disk.before(w)?;
         let (tmp, mut file) = crate::enable::create_temp_beside(&target, 0o600)?;
         let staged = (|| {
@@ -4749,6 +4798,7 @@ impl StateDir {
     /// Forget a retired post's sequence; called only once the endpoint has
     /// acknowledged the retirement.
     pub fn clear_post_seq(&self, sid: &str, id: u64) {
+        let _timed = self.timed(crate::wait_tally::Row::ClearPostSeq);
         let _ = self.unlink(&format!("sent/{sid}.{id}"));
     }
 

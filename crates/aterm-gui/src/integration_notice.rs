@@ -403,7 +403,7 @@ mod tests {
             .collect()
     }
 
-    /// A shell spawned WITH the re-key channel heals at its next prompt by
+    /// A shell spawned with the re-key channel heals at its next prompt by
     /// itself: a record, never a row. And a closed tab takes its row with it.
     #[test]
     fn a_channel_tab_is_a_record_and_a_closed_tab_takes_its_row() {

@@ -315,13 +315,11 @@ mod tests {
     }
 }
 
-/// The machine's actions with no unit-drivable code, each waived by name. Bound
-/// elsewhere are `Capture` (`HandoffEnv::capture`), `Dial`/`ClaimFail`
-/// (`handoff_rendezvous::claim_incoming`), `ClaimOk` (`ClaimedIntake::install`),
-/// `TakeOwned` (`seamless::take_incoming_from`), `Adopt`
-/// (`seamless::take_commit_fd_from`) and, from P2, `SpawnWarm`
-/// (`crate::warm_order`), `Reshape` (`crate::warm_miss_px`) and `Rewarm`
-/// (`crate::warm_config_moved`), all driven by
+/// The machine's actions with no unit-drivable code, each waived by name. Bound elsewhere are
+/// `Capture` (`HandoffEnv::capture`), `Dial`/`ClaimFail` (`handoff_rendezvous::claim_incoming`),
+/// `ClaimOk` (`ClaimedIntake::install`), `TakeOwned` (`seamless::take_incoming_from`), `Adopt`
+/// (`seamless::take_commit_fd_from`), `SpawnWarm` (`crate::warm_order`), `Reshape`
+/// (`crate::warm_miss_px`) and `Rewarm` (`crate::warm_config_moved`), all driven by
 /// `seamless::handoff_env_conformance`.
 #[cfg(any(test, debug_assertions))]
 #[aterm_spec_anchor::spec_unmodeled(

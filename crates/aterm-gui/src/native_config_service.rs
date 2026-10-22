@@ -1255,8 +1255,7 @@ fn line_hunks(base: &[&str], other: &[&str]) -> Option<Vec<LineHunk>> {
     Some(hunks)
 }
 
-/// Append one semantic TOML key segment to the identity used by
-/// `ConfigSnapshot::values`.
+/// Append one semantic TOML key segment to the identity used by `ConfigSnapshot::values`.
 ///
 /// `packages.include` (two segments) and `"packages.include"` (one) must not collide, or an
 /// unknown value could impersonate a registered setting; `aterm_toml::edit::Key` quotes a

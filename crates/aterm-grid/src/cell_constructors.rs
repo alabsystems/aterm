@@ -19,12 +19,9 @@ impl Cell {
         }
     }
 
-    /// Fast path: a styled cell from an ASCII byte, with no char translation or
-    /// width check.
-    ///
-    /// # Preconditions (caller must verify)
-    /// - `byte` is printable ASCII (0x20..=0x7E)
-    /// - `colors` is already packed (no RGB overflow needed)
+    /// A styled cell from an ASCII byte, with no char translation or width check.
+    /// Preconditions: `byte` is printable ASCII (0x20..=0x7E) and `colors` needs no
+    /// RGB overflow.
     #[must_use]
     #[inline]
     pub const fn from_ascii_styled(byte: u8, colors: PackedColors, flags: CellFlags) -> Self {

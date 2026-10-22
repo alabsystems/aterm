@@ -163,6 +163,17 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+/// A directory of the test's own for the broker it serves, short enough for a
+/// socket's `sun_path` and held for the test's life (declared before the world,
+/// so it goes after it). The world's scratch is an exclusive directory the
+/// harness names when it boots, after `boot_at` needs this path.
+fn sock_dir(tag: &str) -> aterm_tempfile::TempDir {
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("atl-{tag}-"))
+        .tempdir_in("/tmp")
+        .expect("the broker's socket dir")
+}
+
 /// The fault seam for a world whose sessions are `to` (the escalated one)
 /// and another: every full flush fails, and only `to`'s `note` lane owes one.
 fn fault(to: &str, also: &str) -> String {
@@ -198,7 +209,8 @@ fn post(w: &World, from: &str, to: &str, text: &str) {
 #[test]
 fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
     let tag = "poison";
-    let sock = format!("/tmp/atl-{tag}-{}/b.sock", std::process::id());
+    let dir = sock_dir(tag);
+    let sock = dir.path().join("b.sock").to_string_lossy().into_owned();
     let w = World::boot_at(tag, &[], &[], Some(&sock));
     let (a, b) = w.two_sessions();
     let sup = Supervised::new(&w, fault(&a, ""));
@@ -299,7 +311,8 @@ fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
 #[test]
 fn with_the_exit_switched_off_posts_stay_refused_and_the_link_reads_poisoned() {
     let tag = "poistay";
-    let sock = format!("/tmp/atl-{tag}-{}/b.sock", std::process::id());
+    let dir = sock_dir(tag);
+    let sock = dir.path().join("b.sock").to_string_lossy().into_owned();
     let w = World::boot_at(tag, &[], &[], Some(&sock));
     let (a, b) = w.two_sessions();
     let sup = Supervised::new(&w, fault(&a, "stay"));
@@ -372,7 +385,8 @@ fn replies_to(w: &World, sid: &str, off: u64, kind: &str) -> Vec<String> {
 #[test]
 fn a_reply_and_a_verdict_made_while_the_poisoned_broker_is_down_land_after_its_restart() {
     let tag = "poisrep";
-    let sock = format!("/tmp/atl-{tag}-{}/b.sock", std::process::id());
+    let dir = sock_dir(tag);
+    let sock = dir.path().join("b.sock").to_string_lossy().into_owned();
     let w = World::boot_at(tag, &[], &[], Some(&sock));
     let (a, b) = w.two_sessions();
     let sup = Supervised::new(&w, fault(&a, ""));

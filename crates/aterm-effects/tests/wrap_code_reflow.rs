@@ -1160,9 +1160,7 @@ fn a_scrub_over_the_word_keeps_the_word_lit_when_it_wraps_down() {
     assert_rewrap_clean(&cc, wrap, 2..=21, "scrub");
 }
 
-// ---------------------------------------------------------------------------
-// B4 — a token the box hard-breaks moved nothing down.
-// ---------------------------------------------------------------------------
+// B4: a token the box hard-breaks moved nothing down.
 
 /// B4: the hand walks Left to the start of row 1 (an arrival at (16, 2)) and types one unbroken
 /// token glued to `hello`. The 60th key fills row 1's last text column and the box breaks the

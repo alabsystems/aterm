@@ -3,13 +3,11 @@
 
 //! Bounded admission for config-referenced visual-effect files.
 //!
-//! A manifest path is not proof that its target is a normal file: a FIFO can
-//! park `open`, a device can produce an unbounded stream, and a pathname can be
-//! swapped between a metadata check and a second open.  This module opens once,
-//! makes that open non-blocking where the platform exposes the flag, checks the
-//! opened handle itself, and reads at most the caller's limit plus one sentinel
-//! byte.  Unix and Windows also refuse a final-component link/reparse point;
-//! config authors should name the actual feed file.
+//! A manifest path is no proof of a normal file: a FIFO can park `open`, a device can stream
+//! without end, and a path can be swapped between a metadata check and a second open. So: one
+//! open, non-blocking where the platform has the flag, checks on the opened handle, and a read
+//! of at most the limit plus one sentinel byte. Unix and Windows refuse a final-component
+//! link/reparse point.
 
 use std::io::{self, Read as _};
 use std::path::Path;
@@ -90,11 +88,8 @@ fn note_open_attempt(path: &Path) {
     });
 }
 
-/// Maximum accepted size of a user-supplied Sparkle Words lexicon override.
-///
-/// The override is parsed and merged on config admission, so matching the
-/// 256-KiB Toy Pack ceiling leaves generous room for authored entries while
-/// placing a hard bound on both file I/O and parser input.
+/// Maximum size of a user-supplied Sparkle Words lexicon override: the Toy Pack ceiling
+/// ([`crate::spec::MAX_TOY_PACK_BYTES`]), a hard bound on file I/O and parser input.
 pub const MAX_SPARKLE_LEXICON_BYTES: usize = 256 * 1024;
 
 #[inline]
@@ -123,9 +118,8 @@ fn not_regular() -> io::Error {
     )
 }
 
-/// Open `path` once and prove that the handle which will be read is a regular
-/// file. `O_NONBLOCK` prevents a planted writerless FIFO from parking `open`;
-/// `O_NOFOLLOW` closes the final-component replacement/link ambiguity.
+/// Open `path` once and prove the handle is a regular file. `O_NONBLOCK` keeps a writerless
+/// FIFO from parking `open`; `O_NOFOLLOW` refuses a final-component link.
 #[cfg(unix)]
 fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -198,9 +192,8 @@ fn check_observed_size(observed_len: u64, max_bytes: usize) -> io::Result<usize>
 
 /// Read a same-handle regular file into a bounded byte vector.
 ///
-/// Metadata provides an early rejection only. The `max + 1` sentinel read is
-/// still authoritative, so a regular file which grows after `fstat` cannot
-/// exceed the allocation or enter a parser truncated at the limit.
+/// Metadata only rejects early: the `max + 1` sentinel read is authoritative, so a file that
+/// grows after `fstat` cannot exceed the allocation or reach a parser truncated at the limit.
 pub fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
     let (file, observed_len) = open_regular(path)?;
     let reserve_len = check_observed_size(observed_len, max_bytes)?;
@@ -258,12 +251,8 @@ fn invalid_utf8() -> io::Error {
     )
 }
 
-/// Hash an admitted UTF-8 feed without allocating its full contents.
-///
-/// This uses the exact same open/regular-file/size/UTF-8 admission rules as
-/// [`read_bounded_regular_utf8`]. Reads stop at `max + 1`, and UTF-8 split
-/// across two read buffers is carried explicitly, so fingerprints cannot wait
-/// for a FIFO writer or allocate in proportion to an oversized path.
+/// Hash an admitted UTF-8 feed without allocating its contents, under the same admission rules
+/// as [`read_bounded_regular_utf8`]. UTF-8 split across read buffers is carried over.
 pub fn fingerprint_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Result<u64> {
     let (mut file, observed_len) = open_regular(path)?;
     let _ = check_observed_size(observed_len, max_bytes)?;

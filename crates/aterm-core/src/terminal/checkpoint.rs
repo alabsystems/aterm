@@ -329,10 +329,10 @@ impl ShellIntegrationPosture {
 
 /// A scoped, round-trippable projection of a live [`Terminal`].
 ///
-/// Equality is *structural*: `checkpoint() == from_checkpoint(&c).checkpoint()`
-/// is the re-checkpoint identity proven by the round-trip test. The grid bodies
-/// are stored as `serialize_lines`-encoded bytes (scrollback-then-visible); all
-/// other captured fields are stored by value.
+/// Equality is structural: `checkpoint() == from_checkpoint(&c).checkpoint()`
+/// is the identity the round-trip test proves. The grid bodies are
+/// `serialize_lines` bytes (scrollback, then visible); everything else is by
+/// value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalCheckpoint {
     /// Grid rows (visible).
@@ -342,15 +342,11 @@ pub struct TerminalCheckpoint {
     /// Main-grid body: `serialize_lines(grid.checkpoint_lines())`
     /// (scrollback-then-visible).
     pub grid: Vec<u8>,
-    /// How many of `grid`'s leading line records are scrollback rather than
-    /// visible rows. `grid` therefore holds `history_lines + rows` records.
-    ///
-    /// Carried explicitly so the consumer can bound its allocation from the
-    /// authenticated meta before decoding any bytes. `0` is the visible-only
-    /// projection and the default for a checkpoint without the field.
-    ///
-    /// The alternate grid always carries `0`: the live alt screen keeps no
-    /// scrollback, and `restore_grid` rebuilds it with a zero-length ring.
+    /// How many of `grid`'s leading line records are scrollback (`grid` holds
+    /// `history_lines + rows` records), carried so the consumer can bound its
+    /// allocation from the authenticated meta before decoding. `0` is the
+    /// visible-only projection and the default. The alternate grid always has
+    /// `0`: it keeps no scrollback.
     pub history_lines: u32,
     /// Main-grid cursor/region/wrap/tab projection.
     pub cursor: GridCursorRepr,
@@ -630,21 +626,16 @@ impl Terminal {
     }
 
     /// The seamless-handoff projection: the visible screen plus at most
-    /// `max_history` lines of the most recent scrollback, at a capture cost of
-    /// `O((rows + max_history) × cols)`. `max_history == 0` is
-    /// [`Self::checkpoint_visible`].
-    ///
-    /// Restore needs no counterpart: `restore_grid` reads the last `rows`
-    /// lines as the visible grid and pushes everything before them into an
-    /// unlimited scrollback.
+    /// `max_history` lines of the newest scrollback, at a capture cost of
+    /// `O((rows + max_history) × cols)`. `restore_grid` needs no counterpart: it
+    /// reads the last `rows` lines as the visible grid and pushes the rest into
+    /// an unlimited scrollback.
     ///
     /// `None` only when the parser holds a partial sequence no carry can hold
-    /// ([`Self::partial_sequence_uncarried`]); any other partial state rides
-    /// in [`TerminalCheckpoint::parser`].
-    ///
-    /// This and [`Self::checkpoint_carry_abandoning_partial`] are the only
-    /// projections that carry the authorized shell-integration nonce
-    /// ([`TerminalCheckpoint::shell_integration_nonce`]), so the adopted shell
+    /// ([`Self::partial_sequence_uncarried`]); any other partial state rides in
+    /// [`TerminalCheckpoint::parser`]. This and
+    /// [`Self::checkpoint_carry_abandoning_partial`] are the only projections
+    /// that carry the authorized shell-integration nonce, so the adopted shell
     /// keeps signing its marks across the update.
     #[must_use]
     pub fn checkpoint_carry(&self, max_history: usize) -> Option<TerminalCheckpoint> {
@@ -1015,11 +1006,10 @@ impl Terminal {
         self.checkpoint_bounded(bound, bound)
     }
 
-    /// `inactive_max_history` bounds the inactive grid (`alt_grid`) separately
-    /// from the active one, because the two have different consumers. The
-    /// seamless-handoff wire pins the inactive blob to exactly `rows` records
-    /// (see [`Self::checkpoint_carry`]); an in-memory full checkpoint has no
-    /// such wire and keeps everything.
+    /// `inactive_max_history` bounds the inactive grid (`alt_grid`) apart from
+    /// the active one: the handoff wire pins the inactive blob to exactly `rows`
+    /// records (see [`Self::checkpoint_carry`]); an in-memory checkpoint keeps
+    /// everything.
     fn checkpoint_bounded(
         &self,
         max_history: usize,
@@ -1032,13 +1022,11 @@ impl Terminal {
         self.project_bounded(max_history, inactive_max_history, self.parser_is_ground())
     }
 
-    /// The projection itself, with no parser precondition: `parser_ground` is
-    /// what the checkpoint records about a parser whose state it does not
-    /// carry. [`Self::checkpoint_bounded`] records the live state (and asserts
-    /// it is Ground); [`Self::checkpoint_carry_abandoning_partial`] records
-    /// `true`, because the partial sequence it leaves out is cancelled in the
-    /// copy. A carried parser ([`TerminalCheckpoint::parser`]) is recorded
-    /// `false` either way: the restore continues it.
+    /// The projection with no parser precondition: `parser_ground` is what the
+    /// checkpoint records about a parser state it does not carry (the live
+    /// state from [`Self::checkpoint_bounded`]; `true` from
+    /// [`Self::checkpoint_carry_abandoning_partial`], whose left-out sequence is
+    /// cancelled in the copy). A carried parser is recorded `false` either way.
     fn project_bounded(
         &self,
         max_history: usize,
@@ -1166,12 +1154,10 @@ impl Terminal {
     /// [`Self::restore_checkpoint`].
     #[must_use]
     pub fn from_checkpoint(c: &TerminalCheckpoint) -> Terminal {
-        // Which slot holds the alternate buffer (no scrollback ring) varies:
         // `grid` is the active buffer and `alt_grid` the saved one, so the
-        // active grid is the alt buffer iff on the alt screen, and the saved
-        // grid iff not (a saved alt buffer under 1047/1049 exit semantics).
-        // Keying off the slot alone would drop the saved main buffer's
-        // scrollback when captured under 1049.
+        // alternate buffer (no scrollback ring) is the active grid iff on the
+        // alt screen. Keying off the slot alone would drop the saved main
+        // buffer's scrollback when captured under 1049.
         let on_alt = c.modes.alternate_screen;
         let mut active_grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt);
         active_grid.continue_absolute_numbering(c.absolute_row_counter);
@@ -1318,12 +1304,11 @@ impl Terminal {
     /// would have captured, leaving host bindings and auth state untouched, so it
     /// composes with the spawn path's `configure_*` wiring.
     pub fn restore_checkpoint(&mut self, c: &TerminalCheckpoint) {
-        // Scrollback retention is this process's config, not the checkpoint's.
-        // The host's config reached `self` before this adopt, but
+        // Scrollback retention is this process's config, not the checkpoint's:
         // `restore_grid` hands the rebuilt grid an unlimited store so the
-        // carried history is not dropped on the way in, and `apply_config`
-        // only re-applies on change. So read the configured limit here, while
-        // the host's grids are still installed, and re-impose it below.
+        // carried history survives the way in, and `apply_config` re-applies
+        // only on change, so read the limit while the host's grids are still
+        // installed and re-impose it below.
         let configured_scrollback_limit = self.scrollback_line_limit();
         // The grids are replaced, so every generation stamp the cached search
         // index (and any budgeted-search cursor) was keyed against restarts;
@@ -1343,10 +1328,8 @@ impl Terminal {
             _ => None,
         };
         self.modes = c.modes;
-        // Re-imposed after `modes` is the adopted session's: the setter
-        // targets the primary-content grid (`alt_grid` while the alternate
-        // screen is up), which is only correct once the restored modes are in
-        // place.
+        // Re-imposed once `modes` is the adopted session's: the setter targets
+        // the primary-content grid (`alt_grid` while the alternate screen is up).
         self.set_scrollback_line_limit(configured_scrollback_limit);
         self.cursor_save.main = c.saved_cursor_main.map(SavedCursorRepr::into_saved);
         self.cursor_save.alt = c.saved_cursor_alt.map(SavedCursorRepr::into_saved);
@@ -1398,11 +1381,11 @@ impl Terminal {
         // `from_checkpoint`).
         self.restore_parser_carry(c.parser.as_ref());
         self.arm_carried_sync_window();
-        // In-place hydration swaps the entire coordinate lineage underneath
-        // existing host consumers. Preserve the cumulative clocks but publish
-        // one fail-closed epoch edge so cursor effects/search-adjacent caches
-        // cannot remain attached to pre-restore cells. A freshly constructed
-        // `from_checkpoint` terminal needs no edge: consumers baseline it.
+        // In-place hydration swaps the coordinate lineage under existing host
+        // consumers: keep the cumulative clocks but publish one fail-closed
+        // epoch edge, so cursor effects and search-adjacent caches cannot stay
+        // attached to pre-restore cells (`from_checkpoint` needs none:
+        // consumers baseline a fresh terminal).
         self.content_scroll_state.invalidate();
         self.transient.sync_end_caret = None;
         // Hydration replaced both grids and `modes.alternate_screen`, so the
@@ -1937,7 +1920,7 @@ mod tests {
         t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
         t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07");
 
-        // --- alt screen: enter 1049, write into alt, then we keep alt active ---
+        // --- alt screen: enter 1049 and write into it; alt stays active ---
         t.process(b"\x1b[?1049h");
         t.process(b"ALT-SCREEN-CONTENT\r\n");
 
@@ -1985,7 +1968,7 @@ mod tests {
         let (rows, cols) = (12u16, 40u16);
         let t = build_rich_terminal(rows, cols);
 
-        // Sanity: we actually captured non-default state.
+        // Non-default state was captured.
         assert!(t.modes.alternate_screen, "alt screen active at capture");
         assert!(t.secure_keyboard_entry, "secure input captured");
         assert_eq!(
@@ -2000,7 +1983,6 @@ mod tests {
         );
 
         let c0 = t.checkpoint();
-        // Sanity: the colour and shell projections are non-trivial.
         assert_eq!(c0.color.palette.len(), 2, "two OSC 4 overrides");
         assert!(c0.color.foreground.is_some() && c0.color.cursor.is_some());
         assert_eq!(c0.color.stack_overrides.len(), 1, "one XTPUSHCOLORS entry");
@@ -2244,7 +2226,6 @@ mod tests {
         let c0 = t.checkpoint();
         let mut h = Terminal::from_checkpoint(&c0);
 
-        // Same styled write to both (move home, set a fresh distinctive style).
         let seq = b"\x1b[H\x1b[1;3;38;2;1;2;3;48;5;9mQ\x1b[0m";
         t.process(seq);
         h.process(seq);
@@ -2258,7 +2239,6 @@ mod tests {
             "post-hydration styled cell identical (char, flags, fg, bg)"
         );
 
-        // And re-checkpoints still agree after the identical follow-on writes.
         assert_eq!(
             t.checkpoint(),
             lineage_taken(h.checkpoint()),
@@ -2268,15 +2248,13 @@ mod tests {
 
     #[test]
     fn checkpoint_alt_screen_toggle_on_hydrated() {
-        // Toggle alt-screen off on the hydrated terminal and confirm it tracks
-        // the source doing the same — the main grid (saved under alt at capture)
-        // must come back identically.
+        // Leaving the alt screen on the hydrated terminal brings back the main
+        // grid (saved under alt at capture) exactly as the source's.
         let (rows, cols) = (10u16, 30u16);
         let mut t = build_rich_terminal(rows, cols);
         let c0 = t.checkpoint();
         let mut h = Terminal::from_checkpoint(&c0);
 
-        // Exit alt screen on both.
         t.process(b"\x1b[?1049l");
         h.process(b"\x1b[?1049l");
 
@@ -2302,9 +2280,7 @@ mod tests {
 
     #[test]
     fn checkpoint_roundtrips_decslrm_horizontal_margins() {
-        // DECSLRM margins are not recoverable from any other captured field, so
-        // the projection carries them; otherwise a checkpoint under DECLRMM
-        // (mode 69) restores full-width margins and diverges.
+        // DECSLRM margins are recoverable from no other captured field.
         let (rows, cols) = (10u16, 40u16);
         let mut t = Terminal::new(rows, cols);
         // Enable DECLRMM (mode 69), then set non-default horizontal margins
@@ -2313,8 +2289,7 @@ mod tests {
         t.process(b"\x1b[5;30s");
         assert!(t.parser_is_ground());
 
-        // Sanity: the live grid actually holds the margins we set (1-based DECSLRM
-        // 5..=30 maps to 0-based 4..=29).
+        // 1-based DECSLRM 5..=30 is 0-based 4..=29.
         let live = t.grid().horizontal_margins();
         assert_eq!((live.left, live.right), (4, 29), "margins set on live grid");
 
@@ -2393,7 +2368,6 @@ mod tests {
         let mut h = Terminal::from_checkpoint(&c0);
         assert!(h.modes.alternate_screen, "hydrated is on the alt screen");
 
-        // Scroll both well past `rows` lines.
         for i in 0..(rows as usize * 3) {
             let line = format!("s{i}\r\n");
             t.process(line.as_bytes());
@@ -3481,7 +3455,7 @@ mod tests {
             "the program's exit puts its caller's title back, across the update"
         );
 
-        // The in-memory projection round-trips it too (the ship gate's identity).
+        // The in-memory projection round-trips it too.
         let rebuilt = Terminal::from_checkpoint(&t.checkpoint());
         assert_eq!(rebuilt.checkpoint(), t.checkpoint());
         assert_eq!(rebuilt.title(), "vim main.rs");

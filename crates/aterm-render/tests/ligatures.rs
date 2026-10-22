@@ -46,9 +46,7 @@ fn render(mode: LigatureMode, text: &[u8]) -> aterm_render::Frame {
     r.render_input(&input)
 }
 
-/// The headline gate: ligated "a => b != c" inks differently than the same text
-/// with ligatures off. If the renderer ignored shaping, the two frames would be
-/// byte-identical — so a difference proves the ligature glyph reached the pixels.
+/// Ligated "a => b != c" inks differently from the same text with ligatures off.
 #[test]
 fn ligated_render_differs_from_unligated() {
     let text = b"a => b != c";
@@ -170,10 +168,8 @@ fn selection_before_ligature_preserves_unselected_ligature() {
     );
 }
 
-/// A ligature run must BREAK on an SGR STYLE change: in `a=>` where `=>` is bold
-/// vs not, the two ligated renders must differ; and a style change mid-operator
-/// ('=' plain, '>' bold) must prevent a single ligature spanning the style
-/// boundary — so that render differs from the uniform-bold one too.
+/// A ligature run breaks on an SGR style change: plain and bold `=>` differ, and `=` plain
+/// with `>` bold matches neither.
 #[test]
 fn ligature_breaks_on_style_change() {
     // Uniform plain "=>", uniform bold "=>", and a split "=>" ('=' plain, '>' bold).
@@ -220,12 +216,9 @@ fn italic_ligature_differs_from_regular() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// WIRE-FONTFEAT-OPENTYPE: the user's `font_features` (ss01/cv01/zero/stylistic
-// sets) must actually reach the shaper (`aterm_font::shape`), not be silently
-// dropped. These tests drive the SHARED feature-list seam plus an end-to-end shape
-// against the embedded DejaVu Sans Mono face (always present — no SKIP).
-// ---------------------------------------------------------------------------
+// The user's `font_features` (ss01/cv01/zero/stylistic sets) reach the shaper
+// (`aterm_font::shape`), checked through the shared feature-list seam and an end-to-end
+// shape on DejaVu.
 
 use aterm_types::text_shaping::{FontFeature, FontFeatureSet};
 
@@ -248,12 +241,9 @@ fn shape_gids(bytes: &[u8], s: &str, features: &[FontFeature]) -> Vec<u32> {
     out.glyph_infos().iter().map(|i| i.glyph_id).collect()
 }
 
-/// The renderer resolves `TextShapingConfig.font_features` (the per-font Vec the
-/// config round-trips) into its feature array. A config with an `ss01` feature on
-/// the PRIMARY font (`font_id == 0`) must yield a built array whose shape of a
-/// stylistic-set input differs from the no-feature config — proving the Vec is
-/// applied, not carried-and-dropped. We assert at the seam: setting the config
-/// changes what the renderer shapes.
+/// The renderer resolves `TextShapingConfig.font_features` into its feature array: a
+/// primary-font (`font_id == 0`) feature changes shaping, one scoped to another font does
+/// not.
 #[test]
 fn renderer_applies_config_font_features() {
     // A config carrying a primary-font 'dlig' feature.
@@ -438,12 +428,9 @@ fn frame(r: &mut Renderer, text: &[u8], rows: usize, cols: usize) -> aterm_rende
     r.render_input(&input)
 }
 
-/// M4 — the RASTER half reaches pixels: a merged `fi` rendered with the flag ON
-/// inks DIFFERENTLY than (a) the same text with the flag OFF (which draws the
-/// separate `f`/`i` cmap glyphs) and (b) ligatures disabled — so the sliced wide
-/// glyph really reached the framebuffer. And the flag-OFF frame is BYTE-IDENTICAL
-/// to the ligatures-off frame: with the collapse declined the run is exactly the
-/// plain per-cell path.
+/// A merged `fi` with the flag on inks differently from the flag off (separate `f`/`i`
+/// glyphs) and from ligatures disabled; with the flag off the frame is byte-identical to
+/// ligatures disabled.
 #[test]
 fn merged_ligature_slices_reach_pixels() {
     let (bytes, _gid, _n) = merged_ligature_font();

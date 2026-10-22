@@ -1129,17 +1129,15 @@ fn codesign_exit_refusal(
     }
 }
 
-/// Extract the signing **Team Identifier** from a bundle. `codesign -dv` writes its
-/// descriptive output to **stderr**, hence the merge; we scan for the
-/// `TeamIdentifier=...` line. A `not set` value (ad-hoc / unsigned) is rejected.
+/// Extract the signing Team Identifier from a bundle (`codesign -dv` writes it to stderr,
+/// hence both streams). A `not set` value (ad-hoc / unsigned) is rejected.
 pub fn team_id(app: &Path) -> Result<String, String> {
     parse_team_id(&codesign_display(app, "codesign -d (team id)")?)
 }
 
-/// The code-signing identifier `app` is signed with (`codesign -d`'s
-/// `Identifier=`): the identifier a code requirement's `identifier "…"` clause
-/// tests. A display, not a verification — read it from a bundle a check has
-/// just passed. A run that ended on a moment is a passing refusal, as for
+/// The code-signing identifier `app` is signed with (`codesign -d`'s `Identifier=`), which a
+/// requirement's `identifier "…"` clause tests. A display, not a verification: read it from a
+/// bundle a check has just passed. A run that ended on a moment is a passing refusal, as for
 /// [`team_id`].
 pub fn signing_identifier(app: &Path) -> Result<String, String> {
     parse_signing_identifier(&codesign_display(app, "codesign -d (identifier)")?)
@@ -1192,9 +1190,8 @@ fn parse_signing_identifier(text: &str) -> Result<String, String> {
     Ok(identifier.to_string())
 }
 
-/// Pure parser for the `TeamIdentifier=` line of `codesign -dv` output, split out
-/// so the pin-matching logic is unit-testable without invoking codesign. Rejects a
-/// missing or `not set` (ad-hoc/unsigned) identifier — fail closed.
+/// Pure parser for the `TeamIdentifier=` line of `codesign -dv` output. Fails closed on a
+/// missing or `not set` (ad-hoc/unsigned) identifier.
 fn parse_team_id(text: &str) -> Result<String, String> {
     let team = text
         .lines()
@@ -1221,9 +1218,8 @@ fn spctl_from(out: &std::process::Output) -> Result<(), String> {
     spctl_verdict(out.status, &String::from_utf8_lossy(&out.stderr))
 }
 
-/// What one ended `spctl` run says: a pass, its rejection, or — when a signal ended
-/// it — no verdict at all, a passing refusal (as liable to jetsam on a loaded desk
-/// as `codesign`).
+/// What one ended `spctl` run says: a pass, its rejection, or, when a signal ended it, no
+/// verdict, a passing refusal (`spctl` is as liable to jetsam on a loaded desk as `codesign`).
 fn spctl_verdict(status: std::process::ExitStatus, stderr: &str) -> Result<(), String> {
     if status.success() {
         Ok(())
@@ -1276,7 +1272,7 @@ mod tests {
         .message;
         assert!(crate::is_passing_refusal(&copy), "{copy}");
 
-        // CONTROL: `false` ran and refused — the verdict shape, with no key.
+        // Control: `false` ran and refused, the verdict shape, with no key.
         let refused = output_bounded(&mut Command::new("/usr/bin/false"), "a refusing helper")
             .expect("the helper ran to an exit");
         assert!(!refused.status.success());
@@ -1397,11 +1393,9 @@ mod tests {
             }
         };
         aterm_spec::verify::prove_and_catch_scalar(&model, "bounded helper cleanup");
-        /// A child that never exits (`exit` 0) counts the looks at it made once
-        /// the cleanup's `deadline` had passed. One such look is the loop's own
-        /// last (a poll that woke past the deadline, then saw it gone); a second
-        /// is a cleanup that renewed its deadline, and the fake answers it with
-        /// an error so a cleanup that would wait forever ends, and fails.
+        /// A child that never exits (`exit` 0) counts its looks after `deadline`. One is the
+        /// loop's own last; a second means the cleanup renewed its deadline, and the fake
+        /// answers it with an error so the cleanup ends and the test fails.
         struct FakeChild {
             exit: u8,
             kill_error: bool,
@@ -1447,10 +1441,9 @@ mod tests {
                 };
                 let stopped = stop_helper_before(&mut child, deadline);
                 assert_eq!(child.kills, 1);
-                // The cleanup ends at its deadline, never a renewed one: at most
-                // the one look that found it passed — read off the calls, not a
-                // clock, so a loaded machine cannot fail it — and inside a
-                // minute's hang detector.
+                // The cleanup ends at its deadline, never a renewed one: at most the one look
+                // that found it passed (counted by calls, not a clock), inside a minute's
+                // hang detector.
                 assert!(
                     child.late <= 1,
                     "cleanup must not wait unboundedly after a failed kill: {} looks past \
@@ -1515,9 +1508,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    /// The TAIL of the child's stderr comes back with its status. A
-    /// child that floods stderr is drained past the pipe's capacity rather than
-    /// wedged against the poll loop, and only its last bytes are kept.
+    /// The tail of the child's stderr comes back with its status; a child that floods stderr
+    /// is drained past the pipe's capacity, and only its last bytes are kept.
     #[cfg(unix)]
     #[test]
     fn status_bounded_keeps_the_tail_of_stderr_without_wedging_on_a_flood() {
@@ -1645,8 +1637,8 @@ mod tests {
         );
         assert!(crate::is_passing_refusal(&structural), "{structural}");
 
-        // CONTROL: a verdict on the bytes stays a verdict, on either lane — the
-        // tamper verdicts measured on a modified ad hoc signed bundle included.
+        // Control: a verdict on the bytes stays a verdict on either lane, the tamper verdicts
+        // measured on a modified ad hoc signed bundle included.
         let verdicts = [
             (
                 Some(3),
@@ -2072,8 +2064,8 @@ mod tests {
             let refusal = unread.expect_err("an unreadable bundle has no team id");
             assert!(crate::is_passing_refusal(&refusal), "{refusal}");
         }
-        // CONTROL: readable, the platform-signed executable carries no Developer ID
-        // team (measured: `TeamIdentifier=not set`), the verdict it always was.
+        // Control: readable, the platform-signed executable has no Developer ID team
+        // (`TeamIdentifier=not set`), a verdict.
         let refusal = team_id(&root.path().join("aterm.app")).expect_err("no team id");
         assert!(!crate::is_passing_refusal(&refusal), "{refusal}");
     }

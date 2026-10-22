@@ -88,11 +88,9 @@ pub const TELL_S: u64 = 90 * 60;
 /// no reset is named, and in the ask flow, the notice still holds and the owner is told.
 pub const LIMIT_GRACE_S: u64 = 3_600;
 
-/// The quiet move's chance past [`LIMIT_GRACE_S`]: under the quiet flow a tab
-/// whose limit row named its reset moves once the grace ends (its loop offers
-/// the point within a step, or the host looks within [`super::LATER`]), so
-/// the tell ([`Row::limit_told_at`]) waits this much longer, marking only a
-/// move that had its chance and did not go.
+/// The quiet move's chance past [`LIMIT_GRACE_S`]: a tab whose limit row named its reset moves
+/// once the grace ends (its loop offers the point within a step, or the host looks within
+/// [`super::LATER`]), so the tell ([`Row::limit_told_at`]) waits this much longer.
 pub const QUIET_MOVE_S: u64 = 10 * 60;
 
 const _: () = assert!(QUIET_MOVE_S >= super::LATER[super::LATER.len() - 1].as_secs());
@@ -322,7 +320,7 @@ pub struct Row {
     pub session: String,
     /// The aterm tab (`s-<hex>`), empty until a step has visited it.
     pub tab: String,
-    /// The build it runs, and the one it is being moved to.
+    /// The build it runs.
     pub from: String,
     /// The target version.
     pub to: String,
@@ -365,11 +363,9 @@ pub struct Row {
     /// When the move happened: its relaunch line typed (`St::relaunched_at`; `0`: an older
     /// record, or no relaunch yet).
     pub moved_at: u64,
-    /// Until when the model named by the carry-on's answer is awaited
-    /// ([`St::confirming`], `relaunch::MODEL_WAIT`; `0`: nothing owed). Until
-    /// then a done row with no `done_at` reads
-    /// `restarting/<to>/continued/<age>`, and after it `done`, aged from then
-    /// ([`Self::restarting`], [`Self::finished_at`]).
+    /// Until when the model named by the carry-on's answer is awaited ([`St::confirming`],
+    /// `relaunch::MODEL_WAIT`; `0`: nothing owed). Until then a done row with no `done_at` reads
+    /// `restarting/<to>/continued/<age>`, after it `done`, aged from then.
     pub confirm_by: u64,
     /// [`Row::stall`] at the moment the row was read — carried so a summary
     /// that crosses [`STALLED_AFTER_S`] differs from the last one and is sent.
@@ -509,11 +505,10 @@ pub struct Row {
     /// no credits, not a usage window. Naming no reset, it is the account
     /// holder's to lift ([`Self::spend_held`]).
     pub limit_spend: bool,
-    /// The machine's awake clock as the row was read ([`awake_since`]; `0`
-    /// unknown or hand-built). No row reads `unwatched` within
-    /// [`WAKE_GRACE_S`] of it ([`Self::unwatched`]). Carried like
-    /// [`Self::stalled`]; a later reader keeps the later clock, and the
-    /// window's host folds in its own watch's start ([`View::note_look`]).
+    /// The machine's awake clock as the row was read ([`awake_since`]; `0` unknown or
+    /// hand-built): no row reads `unwatched` within [`WAKE_GRACE_S`] of it. Carried like
+    /// [`Self::stalled`]; a later reader keeps the later clock, and the window's host folds in
+    /// its own watch's start ([`View::note_look`]).
     pub awake_since: u64,
     /// The conversation runs where no aterm host watches it: a `--status` row
     /// standing only by a live holder proven in no tab ([`Self::standing`]'s
@@ -533,13 +528,10 @@ pub struct Row {
     /// apply this by one rule ([`Self::set_aside`]; `--status` reads the claim,
     /// the switch and the Autopilot from the instance, [`status_rows`]).
     pub aside: String,
-    /// The flow the row is read under: the quiet upgrade (`[harness]
-    /// upgrade_ask = false`, the default: nothing asked, the move made at an
-    /// idle point) or, `false`, the ask flow and hand-built rows. Taken from
-    /// the reader's current setting ([`Self::in_flow`], [`read_rows`]), never
-    /// the record. Under it an announced round is judged as pending
-    /// ([`Self::asks_on_its_own`]), and a limit past its named reset is the
-    /// quiet move's before it is told ([`Self::limit_told_at`]).
+    /// The flow the row is read under: the quiet upgrade (`[harness] upgrade_ask = false`, the
+    /// default) or, `false`, the ask flow and hand-built rows. Taken from the reader's setting
+    /// ([`Self::in_flow`]), never the record. Under it an announced round is judged as pending,
+    /// and a limit past its named reset is the quiet move's before it is told.
     pub quiet: bool,
     /// A restart in flight whose agent was read gone, held again ([`Self::held_again`]): its
     /// conversation live again (the owner's own line, typed in a tab no worker visits), or, for a
@@ -980,13 +972,10 @@ impl Row {
         behind_words(self.behind_since, now)
     }
 
-    /// The age in the words this entry says at `now` ([`Self::behind_for`]):
-    /// only an `overdue` stall (row or record) says how long it has been
-    /// behind, and an `unwatched` one how long nothing has checked it
-    /// ([`Self::age_from`]); every other kind says [`stall_reason`] with no
-    /// age, so `None`. [`Self::behind_said`] carries it and the window compares
-    /// entries by it. An `overdue` age counts in hours, then days: at most one
-    /// wake an hour.
+    /// The age this entry says at `now`: how long an `overdue` stall has been behind, or how
+    /// long nothing has checked an `unwatched` one ([`Self::age_from`]); `None` for other kinds.
+    /// Carried in [`Self::behind_said`], which the window compares entries by. It counts in
+    /// hours, then days: at most one wake an hour.
     #[must_use]
     pub fn age_said(&self, now: u64) -> Option<String> {
         self.age_from(now)
@@ -1083,17 +1072,10 @@ impl Row {
         self.wait == "limited" && self.limit_spend && self.limit_until == 0
     }
 
-    /// Since when no look has read a record the move is still owed on
-    /// ([`unwatched_since`] of [`Self::watch_at`], [`Self::looked_at`],
-    /// [`Self::awake_since`]). `None` while looked at, within the wake grace,
-    /// and for records no watch is for: a restart under way (bounded by
-    /// `stuck`, [`STALE_S`]), a finished move, or one that stopped after its
-    /// agent was gone ([`Self::failed_after_exit`]).
-    ///
-    /// Aterm's own fault, always told ([`Self::stall`] `unwatched`, ahead of
-    /// every kind but a paused goal and the owner's hold; never a record,
-    /// [`Self::asks_on_its_own`]). It shows the owner when the model's
-    /// `WF(Watch)` assumption (the host's timer fires) fails.
+    /// Since when no look has read a record the move is still owed on ([`unwatched_since`]);
+    /// `None` while looked at, within the wake grace, and for records no watch is for
+    /// ([`Self::watch_owed`]). Aterm's own fault, always told: it shows the owner when the
+    /// model's `WF(Watch)` assumption (the host's timer fires) fails.
     #[must_use]
     pub fn unwatched(&self, now: u64) -> Option<u64> {
         if !self.watch_owed() {
@@ -1652,13 +1634,10 @@ impl Row {
             && (!self.held_by.is_empty() || (self.work_seen && !self.now_moves()))
     }
 
-    /// Whether this row's phase is one a live process must still hold for it
-    /// to mean anything ([`Self::standing`]). A finished move and a restart
-    /// in flight are not — a record, and a move bounded by
-    /// [`super::STALE_S`] whose old process is meant to be gone — and nor is
-    /// a move that failed after its agent was seen gone
-    /// ([`Self::failed_after_exit`]): the agent a holder would be is gone by
-    /// construction.
+    /// Whether this row's phase is one a live process must still hold for it to mean anything
+    /// ([`Self::standing`]): not a finished move, a restart in flight (bounded by
+    /// [`super::STALE_S`], its old process meant to be gone), or a move that failed after its
+    /// agent was seen gone.
     fn held_by_a_process(&self) -> bool {
         matches!(
             self.phase,

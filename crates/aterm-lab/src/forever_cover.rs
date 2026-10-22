@@ -2188,9 +2188,62 @@ pub(super) fn judge_rewrap(seen: &Seen, t0: i64) -> Verdict {
     else {
         return Verdict::Unobserved("no back-off decided before the resize".into());
     };
-    let first_due = backoff_due(fl);
     let until = seen.cover.turn_ms.unwrap_or(seen.end_ms);
-    let inside = |t: i64| t > tr && t < until;
+    let w = not_judged_again(seen, t0, (tr, until), fl, "the resize");
+    let said = format!(
+        "the first point's back-off +{} ({}); resized at +{} ({}); {} read(s) journaled in the {} to the orchestrator's turn",
+        at(t0, *tf),
+        crate::util::one_line(fl, 100),
+        at(t0, tr),
+        crate::util::one_line(how, 120),
+        w.reads,
+        at(0, until - tr)
+    );
+    if !w.bad.is_empty() {
+        return Verdict::Fail(format!("{said}: {}", w.bad.join("; ")));
+    }
+    if w.read_points.is_empty() {
+        return Verdict::Unobserved(format!(
+            "{said}: no point read after the resize and before the orchestrator's turn"
+        ));
+    }
+    if until - tr < 20_000 {
+        return Verdict::Unobserved(format!("{said}: watched under 20 s after the resize"));
+    }
+    Verdict::Pass(format!(
+        "{said}: nothing judged again, nothing typed, the first point's back-off told again at each of the {} point(s) read",
+        w.read_points.len()
+    ))
+}
+
+/// What the harness did between a drive of the screen and the end of its
+/// watch ([`not_judged_again`]).
+struct AfterDrive {
+    /// The readings journaled there (`EVENT …`).
+    reads: usize,
+    /// When each point was read there (`EVENT idle`/`question`).
+    read_points: Vec<i64>,
+    /// What says the judged point was judged again, or its back-off moved
+    /// or dropped.
+    bad: Vec<String>,
+}
+
+/// F1'S LAW BETWEEN A DRIVE OF THE SCREEN AND THE END OF ITS WATCH (`(from,
+/// until)`, open at both ends), the first point's back-off `fl` decided
+/// before it: no point record (`point@v1`: nothing judged again), no act,
+/// every back-off journaled there the first point's own (its one short
+/// turn and its due), and THAT BACK-OFF TOLD AGAIN AT EVERY POINT READ THERE
+/// ([`same_backoff`] after each `EVENT idle`/`question`, before the next).
+/// `what` names the drive in what it says (`the resize`, `the scroll`).
+fn not_judged_again(
+    seen: &Seen,
+    t0: i64,
+    (from, until): (i64, i64),
+    fl: &str,
+    what: &str,
+) -> AfterDrive {
+    let first_due = backoff_due(fl);
+    let inside = |t: i64| t > from && t < until;
     let reads = seen
         .journal
         .iter()
@@ -2216,7 +2269,7 @@ pub(super) fn judge_rewrap(seen: &Seen, t0: i64) -> Verdict {
         })
         .collect();
     // Every point read there, and whether the first point's back-off was
-    // told again at it (before the next point read, or the turn).
+    // told again at it (before the next point read, or the watch's end).
     let read_points: Vec<i64> = seen
         .journal
         .iter()
@@ -2240,19 +2293,10 @@ pub(super) fn judge_rewrap(seen: &Seen, t0: i64) -> Verdict {
             })
             .map(|line| (te, next, line))
     });
-    let said = format!(
-        "the first point's back-off +{} ({}); resized at +{} ({}); {} read(s) journaled in the {} to the orchestrator's turn",
-        at(t0, *tf),
-        crate::util::one_line(fl, 100),
-        at(t0, tr),
-        crate::util::one_line(how, 120),
-        reads,
-        at(0, until - tr)
-    );
     let mut bad = Vec::new();
     if let Some(r) = points.first() {
         bad.push(format!(
-            "JUDGED AGAIN: {} point record(s) after the resize, the first +{} ({})",
+            "JUDGED AGAIN: {} point record(s) after {what}, the first +{} ({})",
             points.len(),
             at(t0, r.ts),
             crate::util::one_line(&r.reason, 90)
@@ -2279,21 +2323,128 @@ pub(super) fn judge_rewrap(seen: &Seen, t0: i64) -> Verdict {
             next_at = at(t0, *next),
         ));
     }
-    if !bad.is_empty() {
-        return Verdict::Fail(format!("{said}: {}", bad.join("; ")));
+    AfterDrive {
+        reads,
+        read_points,
+        bad,
     }
-    if read_points.is_empty() {
+}
+
+/// F1 BY A SCROLL, LIVE: A JUDGED TURN'S OPENER SCROLLED INTO SIGHT FROM THE
+/// HISTORY, NOTHING SUBMITTED. `tall-scroll`'s first reply, taller than the
+/// screen ([`scroll_reply`]), judged (its back-off decided) with its opener
+/// above the screen; then the wheel turned up over its tab a row a notch
+/// until the opener was in sight ([`Cover::scrolled`]). From the FIRST notch
+/// to the end of the watch ([`SCROLL_WATCH_MS`]), F1's law
+/// ([`not_judged_again`]): nothing judged again, nothing typed, the first
+/// point's back-off told again at every point read — the reads during the
+/// notches included, among them the one of the screen the opener first came
+/// into sight on, inside the last notch's wait (judged from the last notch,
+/// a point judged again there went unchecked: the review of `b9/resid4-lab`,
+/// and `r4-f3`'s Gemini CLI turned 11 notches over some 3.6 s). A PASS wants
+/// a point read after the last notch, the opener in sight. UNOBSERVED where the
+/// opener was in sight before the wheel (no history to bring back), where
+/// the agent takes no wheel (the notches scrolled the tab's viewport, which
+/// the harness never reads: it reads the live screen, `text --json`; a turn
+/// judged again after them still FAILs), where the wheel never brought it
+/// into sight, and where the harness read no point on the scrolled screen.
+pub(super) fn judge_scrolled(seen: &Seen, t0: i64) -> Verdict {
+    let Some(sc) = seen.cover.scrolled.as_ref() else {
+        return Verdict::Unobserved(
+            "the wheel was never turned (its first point's back-off never decided, or an act came first)"
+                .into(),
+        );
+    };
+    let how = format!(
+        "{} notch(es) up from +{} to +{} ({}; lines {}){}",
+        sc.notches,
+        at(t0, sc.from),
+        at(t0, sc.at),
+        sc.modes,
+        sc.history,
+        sc.refused
+            .as_deref()
+            .map_or_else(String::new, |r| format!(", refused: {r}"))
+    );
+    if sc.before {
         return Verdict::Unobserved(format!(
-            "{said}: no point read after the resize and before the orchestrator's turn"
+            "{how}: the opener was in sight before the wheel (the reply did not push it into the history)"
         ));
     }
-    if until - tr < 20_000 {
-        return Verdict::Unobserved(format!("{said}: watched under 20 s after the resize"));
+    if let Some(vp) = sc.viewport.as_deref() {
+        // the agent took no wheel: whatever the viewport shows, the harness
+        // reads the live screen; anything judged again after it still fails
+        let again = seen
+            .journal
+            .iter()
+            .find(|(t, l)| *t > t0 && *t < sc.from && backoff_named(l))
+            .map(|(_, fl)| not_judged_again(seen, t0, (sc.from, seen.end_ms), fl, "the scroll"));
+        if let Some(w) = again.filter(|w| !w.bad.is_empty()) {
+            return Verdict::Fail(format!("{how}: {}", w.bad.join("; ")));
+        }
+        return Verdict::Unobserved(format!(
+            "{how}: the agent takes no wheel, so it scrolled the tab's viewport ({vp}), the opener {} there, and the live screen {}: the harness reads the live screen (`text --json`), which no viewport's scroll moves, so an opener scrolled into a person's sight there is out of the harness's on this renderer",
+            if sc.after { "in sight" } else { "not in sight" },
+            if sc.moved {
+                "moved (the agent's own drawing)"
+            } else {
+                "unmoved"
+            }
+        ));
+    }
+    if !sc.after {
+        return Verdict::Unobserved(format!(
+            "{how}: the wheel brought the opener into sight at no notch; the screen's last rows: {}",
+            last_rows(&sc.rows, 4)
+        ));
+    }
+    let Some((tf, fl)) = seen
+        .journal
+        .iter()
+        .find(|(t, l)| *t > t0 && *t < sc.from && backoff_named(l))
+    else {
+        return Verdict::Unobserved(format!("{how}: no back-off decided before the wheel"));
+    };
+    let until = seen.end_ms;
+    let w = not_judged_again(seen, t0, (sc.from, until), fl, "the scroll");
+    let in_sight = w.read_points.iter().filter(|&&t| t > sc.at).count();
+    let held = match sc.held {
+        Some(true) => ", still in sight 10 s later",
+        Some(false) => ", out of sight 10 s later",
+        None => "",
+    };
+    let said = format!(
+        "the first point's back-off +{} ({}); {how}: the opener in sight{held}; {} read(s) journaled from the first notch, in the {} watched after it",
+        at(t0, *tf),
+        crate::util::one_line(fl, 100),
+        w.reads,
+        at(0, until - sc.from)
+    );
+    if !w.bad.is_empty() {
+        return Verdict::Fail(format!("{said}: {}", w.bad.join("; ")));
+    }
+    if in_sight == 0 {
+        return Verdict::Unobserved(format!(
+            "{said}: no point read on the scrolled screen, whose last rows were {}",
+            last_rows(&sc.rows, 4)
+        ));
+    }
+    if until - sc.at < 20_000 {
+        return Verdict::Unobserved(format!("{said}: watched under 20 s after the scroll"));
     }
     Verdict::Pass(format!(
-        "{said}: nothing judged again, nothing typed, the first point's back-off told again at each of the {} point(s) read",
-        read_points.len()
+        "{said}: nothing judged again, nothing typed, the first point's back-off told again at each of the {} point(s) read ({in_sight} after the last notch)",
+        w.read_points.len()
     ))
+}
+
+/// The last `n` of `rows`, joined with ` / `, each cut to 80 characters.
+fn last_rows(rows: &[String], n: usize) -> String {
+    rows[rows.len().saturating_sub(n)..]
+        .iter()
+        .map(|r| crate::util::one_line(r, 80))
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 /// SAME WORDS, ANOTHER OPENER (F1 of the review; T1's submission count): the

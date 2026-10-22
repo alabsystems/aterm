@@ -1,11 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE PACKAGE LOG — `packages.log`, beside `aterm.log` in the one per-user log directory
-//! ([`aterm_types::dirs::logs_dir`]: `~/Library/Logs/aterm` on macOS). Phase 4 of
-//! `docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`: updates are silent, so what
-//! they did must be reviewable somewhere that does not interrupt anyone — Settings ▸
-//! Packages' Activity reads this file, and a person can open it.
+//! The package log: `packages.log`, beside `aterm.log` in the per-user log directory
+//! ([`aterm_types::dirs::logs_dir`]). Updates are silent, so what they did is reviewable here
+//! without interrupting anyone; Settings ▸ Packages' Activity reads it (Phase 4 of
+//! `docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`).
 //!
 //! WRITTEN BY ATPKG ITSELF, so every lane records into it with no plumbing of its own: the
 //! window's pass children, the terminal session's detached pass (whose stdio is
@@ -35,26 +34,22 @@
 //! milliseconds ([`start_pass_clock`]), so one pass reads as a timeline finer than its
 //! seconds-wide stamps.
 //!
-//! THE LINE: `<RFC 3339 UTC>\t<kind>\tpid=<pid>\t<key>=<value>…\n`. A tab can never occur
-//! inside a value — every control character is replaced — so the separator cannot be
-//! forged, and [`parse_line`] reads it back without an escape grammar. The grammar is
-//! shared: any record written with [`render_record`] reads back with [`parse_record`] and
-//! [`read_records`], so every reader parses it one way.
+//! A line is `<RFC 3339 UTC>\t<kind>\tpid=<pid>\t<key>=<value>…\n`. No value can hold a tab
+//! (every control character is replaced), so [`parse_line`] needs no escapes; any record
+//! from [`render_record`] reads back with [`parse_record`].
 //!
-//! THE RULES:
-//! * one `write(2)` per line on an `O_APPEND` descriptor opened for that line, so two
-//!   processes appending at once interleave whole lines, never halves;
-//! * no secrets: a URL keeps its scheme and host (never its userinfo, query or fragment), a
-//!   credential — a token-shaped word, the value after `Authorization:`/`Bearer`/`token=`
-//!   and their kin — is replaced, and every control, line-separator, zero-width and bidi
-//!   character is stripped (`sanitize`); a value is capped;
-//! * bounded: past [`ROTATE_AT_BYTES`] the file is rotated to `packages.log.1` …
-//!   `packages.log.5` ([`KEEP_ROTATED`]), and only by a process that holds the store lock
-//!   ([`crate::lock::held_by_this_process`]) — two rotators would rename each other's
-//!   fresh file over the history — so a line written without it only ever appends;
-//! * a write that fails is dropped: the log never fails, slows or blocks a pass;
-//! * the file records THE store — the one `aterm.toml` configures. A pass over another
-//!   prefix (a test's scratch store) writes nothing here.
+//! Rules:
+//! * one `write(2)` per line on an `O_APPEND` descriptor opened for it, so concurrent
+//!   appenders interleave whole lines;
+//! * no secrets: a URL loses its userinfo, query and fragment, a credential is replaced, and
+//!   control, line-separator, zero-width and bidi characters are stripped
+//!   ([`sanitize_capped`]); values are capped;
+//! * bounded: past [`ROTATE_AT_BYTES`] the file rotates to `packages.log.1` … `.5`
+//!   ([`KEEP_ROTATED`]), only by a holder of the store lock
+//!   ([`crate::lock::held_by_this_process`]): two rotators would rename each other's fresh
+//!   file over the history;
+//! * a failed write is dropped: the log never fails, slows or blocks a pass;
+//! * only the configured store is recorded; a pass over another prefix writes nothing.
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -109,16 +104,15 @@ fn log_dir() -> Option<PathBuf> {
     aterm_types::dirs::logs_dir()
 }
 
-/// Under test the log is wherever the test bound it ([`test_bind`]) — never the developer's
-/// own `~/Library/Logs`, which a unit test's scratch store must not write into.
+/// Under test the log is wherever the test bound it ([`test_bind`]), never the developer's
+/// own log directory.
 #[cfg(test)]
 fn log_dir() -> Option<PathBuf> {
     test_bind::get().map(|(dir, _)| dir)
 }
 
-/// Whether events about `layout`'s store belong in this log: it is THE store, the one the
-/// configured `[packages]` table resolves (read once per process — atpkg is a short-lived
-/// verb, and a window never writes here).
+/// Whether events about `layout`'s store belong in this log: it is the store the configured
+/// `[packages]` table resolves (read once per process; atpkg is a short-lived verb).
 #[cfg(not(test))]
 pub(crate) fn records(layout: &Layout) -> bool {
     static BOUND: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -170,7 +164,7 @@ pub struct Transition {
     pub program: String,
     /// The build it ran before, in words (`2.1.278`, `build 4790`); `None` when none.
     pub from: Option<String>,
-    /// The build it runs now, when that MOVED; `None` when it did not move or is gone.
+    /// The build it runs now, when that moved; `None` when it did not move or is gone.
     pub to: Option<String>,
     /// Where its builds come from ([`crate::state::source_words`]).
     pub source: String,
@@ -231,7 +225,7 @@ pub enum Event<'a> {
         /// The newest index found (`atpkg-index-<n>`), or why none was.
         found: &'a str,
     },
-    /// A rustup seam's entry REPLACED a stale foreign link
+    /// A rustup seam's entry replaced a stale foreign link
     /// (`crate::seam::Attached::ReplacedStale`).
     Seam {
         /// The seam, `rustup:<name>`.
@@ -247,9 +241,8 @@ pub enum Event<'a> {
     },
 }
 
-/// Append `event` about `layout`'s store — when that store is the one this log records
-/// ([`records`]). Rotates first when due and this process holds `layout`'s store lock.
-/// Every failure is dropped: the log never fails a pass.
+/// Append `event` about `layout`'s store when this log records it ([`records`]), rotating
+/// first when due and this process holds the store lock. Every failure is dropped.
 pub fn append(layout: &Layout, event: &Event<'_>) {
     if !records(layout) {
         return;
@@ -335,20 +328,18 @@ mod pass_clock {
     }
 }
 
-/// Log every program transition between the record as it stood (`before`) and as it is
-/// written (`after`) — [`crate::status::write`]'s one hook, which every row writer of every
-/// lane goes through (it asks [`records`] before it reads `before`).
+/// Log every program transition from `before` to `after`: [`crate::status::write`]'s hook,
+/// which every row writer goes through (it asks [`records`] before reading `before`).
 pub(crate) fn note_rows(layout: &Layout, before: Option<&Status>, after: &Status) {
     for transition in transitions(before, after) {
         append(layout, &Event::Program(&transition));
     }
 }
 
-/// The transitions from `before` to `after`, in program order. A row is a TRANSITION when
-/// its build moved (installed, updated, rolled back, removed), when it became not current
-/// or its reason changed ([`crate::state::not_current`]), or when it became current again.
-/// A re-pin of the same build (`pinned by index 43` → `44`), a rebuilt record's `active`
-/// row, and a bookkeeping row (`*index*`, `*toolset*`: the pass-end says those) are not.
+/// The transitions from `before` to `after`, in program order: a moved build (installed,
+/// updated, rolled back, removed), a row that became not current or changed its reason
+/// ([`crate::state::not_current`]), or one current again. Not a re-pin of the same build,
+/// a rebuilt record's `active` row, or a bookkeeping row (`*index*`, `*toolset*`).
 #[must_use]
 pub fn transitions(before: Option<&Status>, after: &Status) -> Vec<Transition> {
     let empty = std::collections::BTreeMap::new();
@@ -386,8 +377,8 @@ fn transition(
     let why1 = crate::state::not_current(s1);
     let reason = why1.map_or_else(String::new, |(_, why)| why.to_string());
     let (result, to) = match (b0, b1) {
-        // A first row that already says what is wrong (a live build with no row yet, whose
-        // first pass failed) is that, not an install.
+        // A first row that already says what is wrong (a live build whose first pass failed)
+        // is that, not an install.
         (None, Some(_)) => why1.map_or(("installed", words(b1)), |(r, _)| (r, None)),
         (Some(_), None) => (why1.map_or("removed", |(r, _)| r), None),
         (Some(a), Some(b)) if b > a => ("updated", words(b1)),
@@ -514,11 +505,10 @@ fn render_at(unix: i64, pid: u32, t_ms: Option<u64>, event: &Event<'_>) -> Strin
     render_record(unix, kind, pid, &fields, MAX_VALUE_CHARS)
 }
 
-/// One line of THE GRAMMAR, `\n` included: the stamp (`-` for an unreadable clock —
-/// `now_unix`'s fail-closed `i64::MAX` — or one before the epoch, never a formatted lie),
-/// `kind`, the pid, then each field as `\t<key>=<value>` — every value [`sanitize_capped`]
-/// to `max_chars`, an empty one left out. `kind` and the keys are the caller's own words
-/// (`[a-z-]`), never text from outside.
+/// One line of the grammar, `\n` included: the stamp (`-` for a clock before the epoch or
+/// `now_unix`'s fail-closed `i64::MAX`), `kind`, the pid, then `\t<key>=<value>` per field,
+/// each value [`sanitize_capped`] to `max_chars` and an empty one left out. `kind` and the
+/// keys are the caller's own `[a-z-]` words, never outside text.
 #[must_use]
 pub fn render_record(
     unix: i64,
@@ -556,13 +546,10 @@ fn push_field(line: &mut String, key: &str, value: &str, max_chars: usize) {
     line.push_str(&value);
 }
 
-/// A value as a line may carry it: every control character (C0 — tab and newline among
-/// them — DEL, C1) and the Unicode line and paragraph separators become a space, and every
-/// bidi control and zero-width character is dropped, so no value can forge a field, a line
-/// or a reordered or hidden display; a URL keeps its scheme and host and loses its
-/// userinfo, query and fragment ([`redact_urls`]); a credential becomes `[redacted]`
-/// ([`redact_tokens`]); runs of spaces fold; and the whole is capped at
-/// [`MAX_VALUE_CHARS`].
+/// A value as a line may carry it: control characters (C0, DEL, C1) and the Unicode line and
+/// paragraph separators become spaces, bidi controls and zero-width characters are dropped,
+/// URLs lose userinfo, query and fragment ([`redact_urls`]), credentials become `[redacted]`
+/// ([`redact_tokens`]), runs of spaces fold, and the whole is capped at [`MAX_VALUE_CHARS`].
 #[cfg(test)]
 #[must_use]
 pub(crate) fn sanitize(value: &str) -> String {
@@ -621,8 +608,8 @@ fn is_zero_width(c: char) -> bool {
 }
 
 /// Every `scheme://…` in `text` cut to `scheme://host/path`: the userinfo (`user:pass@`) is
-/// dropped from the authority, and a query or fragment (`?…`, `#…` — signed download URLs
-/// carry their credentials there) becomes `?…`. Stops at whitespace or a quote.
+/// dropped, and a query or fragment (where signed download URLs carry credentials) becomes
+/// `?…`. Stops at whitespace or a quote.
 fn redact_urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -656,19 +643,16 @@ fn redact_urls(text: &str) -> String {
 /// What a redacted credential reads as.
 const REDACTED: &str = "[redacted]";
 
-/// Every CREDENTIAL in `text` replaced by `[redacted]`, word by word (words split on
-/// spaces; the controls are spaces by now):
+/// Every credential in `text` replaced by `[redacted]`, word by word (split on spaces; the
+/// controls are spaces by now):
 ///
-/// * a word shaped like a token ([`is_secret_shaped`]) — GitHub's, Anthropic's and OpenAI's
-///   `sk-…`, GitLab's, Slack's, npm's, an AWS key id, or a long random-looking run;
-/// * the value of a credential-named key, glued (`token=…`, `password:…`, `"api_key":"…"`)
-///   or as the next word (`token: …`) — [`is_credential_key`];
-/// * the word after `Bearer` or `token`, and after `Authorization:` its scheme word (kept,
-///   when it is one) AND the credential after it — `Authorization: Bearer [redacted]`,
-///   where hiding only the next word used to redact `Bearer` and print the token.
+/// * a token-shaped word ([`is_secret_shaped`]);
+/// * the value of a credential-named key ([`is_credential_key`]), glued (`token=…`,
+///   `"api_key":"…"`) or as the next word (`token: …`);
+/// * the word after `Bearer` or `token`; after `Authorization:`, a scheme word is kept and
+///   the credential after it hidden (`Authorization: Bearer [redacted]`).
 ///
-/// Heuristic, and conservative: a secret some error echoes in another shape can still
-/// pass, which is why the log is `0600` and nothing reads it but its owner.
+/// Heuristic: a secret echoed in another shape can still pass, so the log is `0600`.
 fn redact_tokens(text: &str) -> String {
     /// What the words that follow owe the redactor.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -752,9 +736,8 @@ fn redact_tokens(text: &str) -> String {
     out
 }
 
-/// Whether `key` (lowercase, unquoted) names a credential: a token, a secret, a password,
-/// an API key. A bare `key` counts only glued with `=` (`key=…`): `the refused key: x` is
-/// prose atpkg writes.
+/// Whether `key` (lowercase, unquoted) names a credential. A bare `key` counts only glued
+/// with `=` (`key=…`): `the refused key: x` is prose atpkg writes.
 fn is_credential_key(key: &str, equals: bool) -> bool {
     const NAMES: [&str; 12] = [
         "token",
@@ -784,11 +767,10 @@ fn is_credential_key(key: &str, equals: bool) -> bool {
         .any(|suffix| key.ends_with(suffix))
 }
 
-/// Whether `word` looks like a credential by its shape alone: a known token prefix (GitHub,
-/// `sk-` — Anthropic, OpenAI —, GitLab, Slack, npm), an AWS access key id, or a long
-/// random-looking run — 32 or more of `[A-Za-z0-9_-]` with upper case, lower case and a
-/// digit. Hex is never one: digests and tree roots are what a refusal quotes, and are no
-/// secret.
+/// Whether `word` looks like a credential by shape alone: a known token prefix (GitHub, `sk-`,
+/// GitLab, Slack, npm), an AWS access key id, or a run of 32 or more `[A-Za-z0-9_-]` with
+/// upper case, lower case and a digit. Hex never is: digests and tree roots are what a
+/// refusal quotes.
 fn is_secret_shaped(word: &str) -> bool {
     const INSIDE: [&str; 6] = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"];
     const LEADING: [(&str, usize); 8] = [
@@ -824,9 +806,9 @@ fn is_secret_shaped(word: &str) -> bool {
     aws || random
 }
 
-/// Append `line` to `<dir>/packages.log`: the directory made private (`0700`) when missing,
-/// the file rotated first when `may_rotate` and it is due ([`rotate_if_due`]), then ONE
-/// write on an `O_APPEND` descriptor opened for this line (`0600`, never through a link).
+/// Append `line` to `<dir>/packages.log`: the directory made private when missing, the file
+/// rotated first when `may_rotate` and due ([`rotate_if_due`]), then one write on an
+/// `O_APPEND` descriptor opened for this line (`0600`, never through a link).
 ///
 /// # Errors
 /// The directory, the rotation's renames, the open or the write failed.
@@ -873,7 +855,7 @@ pub fn rotated_path(path: &Path, n: u32) -> PathBuf {
 
 /// Rotate `path` when it is a regular file of at least [`ROTATE_AT_BYTES`]: `.4` → `.5` …
 /// `.1` → `.2`, then the file → `.1` (the oldest, `.5`, is replaced). `true` when it
-/// rotated. The caller holds the store lock — see the module doc.
+/// rotated. The caller holds the store lock (see the module doc).
 ///
 /// # Errors
 /// A rename failed (a missing rotated file is not a failure).
@@ -934,9 +916,8 @@ pub fn parse_line(line: &str) -> Option<Entry> {
     })
 }
 
-/// Any line of THE GRAMMAR ([`render_record`]) read back, whatever its kind (a kind is
-/// `[a-z-]`, non-empty); `None` for a torn or foreign line. [`parse_line`] is this for
-/// the package log's own kinds.
+/// Any line of the grammar ([`render_record`]) read back, whatever its `[a-z-]` kind; `None`
+/// for a torn or foreign line. [`parse_line`] is this for the package log's own kinds.
 #[must_use]
 pub fn parse_record(line: &str) -> Option<Entry> {
     let mut parts = line.trim_end_matches(['\n', '\r']).split('\t');
@@ -968,7 +949,7 @@ pub fn parse_record(line: &str) -> Option<Entry> {
     })
 }
 
-/// The newest `max` events of the log in `dir`, NEWEST FIRST: the tail of `packages.log`,
+/// The newest `max` events of the log in `dir`, newest first: the tail of `packages.log`,
 /// then of `packages.log.1` when that is not enough. Each file is read from at most
 /// [`TAIL_READ_BYTES`] before its end; a line cut by that window, or torn, is skipped.
 #[must_use]
@@ -1013,10 +994,8 @@ pub fn tail_of(max: usize, keep: impl Fn(&Entry) -> bool) -> Vec<Entry> {
     log_dir().map_or_else(Vec::new, |dir| read_tail_of(&dir, max, keep))
 }
 
-/// Every record ([`parse_record`]) in the last `read_bytes` of `path`, OLDEST FIRST — a
-/// line cut by that window, torn or foreign is skipped. Empty when the file is absent;
-/// `Err` when it is there and cannot be read (not a regular file, or the read failed).
-/// Bounded by `read_bytes` whatever the file's size.
+/// Every record ([`parse_record`]) in the last `read_bytes` of `path`, oldest first; a line
+/// cut by that window, torn or foreign is skipped. Empty when the file is absent.
 ///
 /// # Errors
 /// `path` exists but is not a regular file, or opening, seeking or reading it failed.
@@ -1088,8 +1067,8 @@ mod tests {
         }
     }
 
-    /// THE LINE SHAPE: a stamp, a kind, the pid, then `key=value` fields separated by tabs,
-    /// one line, empty fields left out — and it reads back field for field.
+    /// A stamp, a kind, the pid, then tab-separated `key=value` fields on one line, empty
+    /// fields left out; it reads back field for field.
     #[test]
     fn a_line_is_one_tab_separated_record_that_reads_back() {
         let t = transition();
@@ -1154,8 +1133,8 @@ mod tests {
         );
         assert!(start.starts_with("-\tpass-start\t"), "{start}");
         assert_eq!(parse_line(&start).unwrap().at, None);
-        // A warm ([`crate::warm`]) reads back too — its outcome keeps its own `=`, and
-        // its build is the version the program line names.
+        // A warm reads back too: its outcome keeps its own `=`, and its build is the
+        // version the program line names.
         let warm = render(
             1_790_000_000,
             9,
@@ -1199,8 +1178,8 @@ mod tests {
         }
     }
 
-    /// SANITISING: no value forges a field or a line, reorders the display, or carries a
-    /// credential — and a long one is capped.
+    /// No value forges a field or a line, reorders the display or carries a credential, and
+    /// a long one is capped.
     #[test]
     fn values_lose_controls_bidi_credentials_and_length() {
         let forged = sanitize("ok\tresult=installed\nfake line\u{1b}[31m");
@@ -1218,8 +1197,8 @@ mod tests {
             sanitize("auth failed (ghp_abcdef123) with Bearer xyz and token ghs_q"),
             "auth failed [redacted] with Bearer [redacted] and token [redacted]"
         );
-        // Review of Phase 4 (2026-09-23): the header's scheme AND its credential, the
-        // credential-named keys glued or spaced, `sk-` keys and a long random run.
+        // The header's scheme and its credential, credential-named keys glued or spaced,
+        // `sk-` keys and a long random run.
         for (raw, clean) in [
             (
                 "fetch failed: Authorization: Bearer sk-ant-abc123secret",
@@ -1286,8 +1265,8 @@ mod tests {
         assert_eq!(entry.get("reason"), Some("error: a b c https://h/x?…"));
     }
 
-    /// ROTATION: at 1 MiB the file becomes `.1`, the older ones shift, `.5` is the last
-    /// kept — and a writer that does not hold the store lock only appends.
+    /// At 1 MiB the file becomes `.1`, the older ones shift, `.5` is the last kept; a writer
+    /// without the store lock only appends.
     #[test]
     fn the_log_rotates_at_its_bound_keeping_five() {
         let dir = scratch("rotate");
@@ -1333,10 +1312,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// THE SHARED GRAMMAR: any `[a-z-]` kind renders and reads back through
-    /// `render_record`/`parse_record` (any record written this way), a
-    /// caller's own cap bounds each value, and `parse_line` still admits only the package
-    /// log's own kinds.
+    /// Any `[a-z-]` kind round-trips through `render_record`/`parse_record` under the
+    /// caller's cap; `parse_line` admits only the package log's own kinds.
     #[test]
     fn the_grammar_is_shared_by_any_kind_with_its_own_cap() {
         let long = "e".repeat(1000);
@@ -1390,8 +1367,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // TWO PROCESSES APPENDING AT ONCE is pinned in `tests/packages_log_lanes.rs`, its own test
-    // binary: see the note there on why it may not run beside this crate's lock tests.
+    // Concurrent appenders are pinned in `tests/packages_log_lanes.rs`, its own test binary
+    // (the note there says why it may not run beside this crate's lock tests).
 
     /// The tail reads newest first across the rotation boundary, bounded by `max`.
     #[test]
@@ -1441,9 +1418,8 @@ mod tests {
         }
     }
 
-    /// WHAT IS A TRANSITION: a build that moved, a row that became (or stopped being) not
-    /// current or changed its reason — never a re-pin of the same build, a rebuilt
-    /// record's `active`, or a bookkeeping row.
+    /// A transition is a moved build or a change into, out of or within not-current; never a
+    /// re-pin of the same build, a rebuilt record's `active`, or a bookkeeping row.
     #[test]
     fn transitions_are_moves_and_changes_of_reason() {
         use crate::state;
@@ -1559,16 +1535,16 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert_eq!((t[0].result, t[0].reason.as_str()), ("refused", refused));
         assert!(transitions(Some(&once), &once).is_empty());
-        // No record before: an installed row is an install, one that says what is wrong
-        // is that.
+        // No record before: an installed row is an install, one that says what is wrong is
+        // that.
         let fresh = transitions(None, &once);
         let result_of = |p: &str| fresh.iter().find(|t| t.program == p).map(|t| t.result);
         assert_eq!(result_of("claude"), Some("refused"));
         assert_eq!(result_of("ay"), Some("installed"));
     }
 
-    /// THE HOOK: a row written through `status::write` for THE store lands in the log, and
-    /// one for any other store does not.
+    /// A row written through `status::write` for the bound store lands in the log; one for
+    /// any other store does not.
     #[test]
     fn a_status_write_for_the_bound_store_logs_its_transitions() {
         let dir = scratch("hook");

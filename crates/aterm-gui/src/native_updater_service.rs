@@ -895,10 +895,9 @@ impl NativeUpdaterService {
         true
     }
 
-    /// Take a newer "last check completed" time from a reconcile: the window's own
-    /// background checks write only the ledger, so this is how "Checked 12 min ago"
-    /// stays true between the checks this reducer runs. Never moves backwards. Returns
-    /// whether it changed — the caller republishes on `true`.
+    /// Take a newer "last check completed" time from a reconcile (background checks write
+    /// only the ledger). Never moves backwards; returns whether it changed, and the caller
+    /// republishes on `true`.
     pub(crate) fn note_checked_at(&mut self, checked_at: Option<i64>) -> bool {
         match checked_at {
             Some(at) if self.snapshot.checked_at.is_none_or(|held| at > held) => {
@@ -2091,10 +2090,9 @@ mod tests {
         assert!(installed_at(newer).backs_activation(running, newer, &commit));
     }
 
-    /// The ledger's persistent verdict reaches the snapshot while a stage is HELD
-    /// (an apply-class streak builds then, and `finish_check` cannot run): once, with
-    /// the attention badge on the false→true edge, idempotent on repeats (no revision
-    /// churn), and cleared when the ledger heals.
+    /// While a stage is held `finish_check` cannot run, so the verdict arrives by reconcile:
+    /// badged once on the false→true edge, idempotent on repeats, cleared when the ledger
+    /// heals.
     #[test]
     fn absorbing_a_persistent_failure_while_staged_badges_once_and_is_idempotent() {
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
@@ -2305,10 +2303,8 @@ mod tests {
         }
     }
 
-    /// A staged DOWNLOAD retires in favour of an activation (the App calls this when
-    /// the bundle under the executable turns out newer than the process); an
-    /// activation already in place, an in-flight apply, and an empty reducer are
-    /// all left alone.
+    /// Nothing else: an activation already in place, an in-flight apply and an empty reducer
+    /// keep their state.
     #[test]
     fn a_download_stage_retires_for_activation_but_nothing_else_does() {
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);

@@ -42,9 +42,8 @@ fn the_tracker_keeps_the_normal_frame_through_a_maximize_and_restore() {
             "not maximized ({shown:?}): the frame as shown, never the tracked one"
         );
     }
-    // A maximized window whose normal origin was never observed (Wayland
-    // reports none) persists NO origin — the window manager places it —
-    // rather than the maximized frame's corner.
+    // A maximized window whose normal origin was never observed (Wayland reports none)
+    // persists no origin, so the window manager places it, rather than the maximized corner.
     let unplaced = super::NormalFrame {
         origin: None,
         ..frame
@@ -209,11 +208,8 @@ fn recovery_authority_comes_only_from_typed_restore_fields() {
     assert_eq!(super::recovery_capability(&unsafe_uri), None);
 }
 
-/// Address a temp-dir file the way the SHIPPING seams do. The hand-rolled
-/// `format!("file://{}")` this replaced is malformed on Windows — `C:\…`
-/// lands where the authority goes, so the document host refuses it with
-/// "malformed file URI" before a byte is read (a fixture defect, not a
-/// product one: `app_tabs::mixed_tab_tests::file_uri` has the account).
+/// Address a temp-dir file the way the shipping seams do: a hand-rolled `format!("file://{}")`
+/// is malformed on Windows (`C:\…` lands in the authority).
 fn file_uri(path: &std::path::Path) -> String {
     crate::native_document_host::path_to_file_uri(path).unwrap()
 }
@@ -263,8 +259,8 @@ fn capture_reflects_the_live_layout() {
     assert_eq!(w.tabs.len(), 2);
     assert_eq!(w.tabs[0].leaf_count(), 2, "tab 0 kept its split");
     assert_eq!(w.tabs[1].leaf_count(), 1);
-    // Focus tagging: `split_focused` moved focus to the NEW pane (session 1), the
-    // second tree-order leaf of tab 0.
+    // Focus tagging: `split_focused` moved focus to the new pane (session 1), the second
+    // tree-order leaf of tab 0.
     let leaves = w.tabs[0].leaves();
     assert!(
         matches!(leaves[1], restore::PaneLayout::Leaf { focused: true, .. }),
@@ -280,21 +276,13 @@ fn capture_reflects_the_live_layout() {
     assert_eq!(m, back);
 }
 
-/// A COLD RESTORE BRINGS EVERY WINDOW BACK AT ITS OWN FRAME. A desk of two
-/// windows of different sizes quits: window 0 at 29×100, window 1 at
-/// 40×120 dragged a few px inside one cell. The quit's layout crosses its
-/// file's TOML, and the next launch — window 0 at its row's grid
-/// (`main_entry`), window 1 created from its row
-/// (`create_window_internal_connected`), which takes the row's frame, then
-/// first attached (`attach_os_window`) — brings window 1 back at its own
-/// grid and at the size it had. After a zoomed quit the launch's
-/// configured font no longer fits that size to the saved grid, so window 1
-/// keeps its grid at the grid's exact frame. A row an older build wrote
-/// (no size) still inherits the front window's grid.
-///
-/// FAILS WITHOUT THE FIX: the durable capture wrote no size, the row gave
-/// no frame, and window 1 came back at the front window's grid (29×100,
-/// not 40×120).
+/// A cold restore brings every window back at its own frame. A desk of two windows quits:
+/// window 0 at 29×100, window 1 at 40×120 dragged a few px inside one cell. Across the quit
+/// layout's TOML, the next launch (window 0 at its row's grid, window 1 created from its row,
+/// then first attached) brings window 1 back at its own grid and size. After a zoomed quit the
+/// configured font no longer fits that size to the saved grid, so window 1 keeps its grid at
+/// the grid's exact frame. A row an older build wrote (no size) inherits the front window's
+/// grid.
 #[test]
 fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
     use crate::app_window::CarriedFrame;
@@ -380,9 +368,8 @@ fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
     assert_eq!(grid(&next, w1), (29, 100), "the front window's grid");
 }
 
-/// Drive session 0's engine with raw escape bytes, exactly as a PTY would.
-/// The tab-label tests below all report titles/cwds this way so they prove
-/// the REAL OSC 0/2/7 ingestion path, not a state poke.
+/// Drive session 0's engine with raw escape bytes, as a PTY would, so the tab-label tests below
+/// prove the real OSC 0/2/7 ingestion path.
 fn feed_session0(app: &App, bytes: &[u8]) {
     let s = app.pool.get(0).expect("session 0");
     crate::term_lock(&s.term).process(bytes);
@@ -495,9 +482,8 @@ fn restore_leaf_reseeds_user_metadata_onto_the_respawned_session() {
         "a leaf with no metadata never clears live metadata"
     );
 
-    // Every question-policy word reseeds as written — the priority words
-    // `long-term` and `short-term` too (an older build's sanitizer drops
-    // them; this one keeps them).
+    // Every question-policy word reseeds as written, the priority words `long-term` and
+    // `short-term` too.
     for word in crate::session_timeline::QUESTIONS_POLICY_WORDS {
         let leaf = restore::TerminalLeafRestore {
             questions: Some(word.to_string()),
@@ -641,9 +627,8 @@ fn restored_and_legacy_raw_metadata_is_sanitized_before_chrome() {
     );
 }
 
-/// The last-window close DECIDES to exit and stashes the manifest BEFORE the
-/// teardown drains `windows`/`pool` — the seam the post-loop writer depends on
-/// (after `close_window_logical` there is nothing left to capture).
+/// The last-window close decides to exit and stashes the manifest before the teardown drains
+/// `windows`/`pool`: after `close_window_logical` the post-loop writer has nothing to capture.
 #[test]
 fn last_window_close_stashes_the_quit_capture() {
     let mut app = App::headless_for_test();
@@ -1099,16 +1084,10 @@ fn restored_terminal(local: u64, title: &str) -> restore::RestoredSplitTree {
     ))
 }
 
-/// THE ALIASING REGRESSION. Reproduced from a cold launch on 2026-08-26: open
-/// three tabs, split the MIDDLE one, quit, relaunch. Capture walks the tabs in
-/// tree order, so the four shells persist as the DESCENDING run `0, 1, 3, 2`
-/// — and the old `restore_terminal_leaf` treated "the pool already holds id 2"
-/// as recognition, even though that id belonged to the fresh shell this same
-/// pass had just forked for the split. The third tab grafted itself onto the
-/// split's new pane: three tabs came back over three shells instead of four,
-/// CHARLIE's saved shell was never started, and typing in the third tab
-/// appeared in the second. The manifest's ids are a DEAD process's namespace;
-/// nothing here may consult them for a live handle.
+/// Three tabs with the middle one split persist as the descending run `0, 1, 3, 2` (capture
+/// walks tabs in tree order). The manifest's ids are a dead process's namespace: a restore that
+/// took "the pool already holds id 2" as recognition would graft the third tab onto the split's
+/// freshly forked pane, four leaves over three shells, typing in one tab showing in another.
 #[test]
 fn a_descending_leaf_run_restores_every_tab_onto_its_own_shell() {
     let mut app = App::headless_for_test();
@@ -1178,10 +1157,8 @@ fn a_descending_leaf_run_restores_every_tab_onto_its_own_shell() {
     }
     assert!(app.restored_window_sessions_are_distinct(wid));
 
-    // Each respawned leaf also carries ITS OWN operator title, so the saved
-    // work contexts stayed separate all the way to the tab strip. (Tab 0's
-    // shell is the grafted bootstrap, which keeps the live session it already
-    // had rather than being re-seeded.)
+    // Each respawned leaf carries its own operator title (tab 0's shell is the grafted
+    // bootstrap, skipped here).
     let titles = sessions
         .iter()
         .skip(1)
@@ -1401,12 +1378,10 @@ fn recursive_editor_restore_clamps_utf8_view_offsets() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// The ADOPTION-SIDE RE-MINT (design §1.4#6): carried tokenless triples
-/// become live rows + a rebuilt `ConnectionRecord` through the one
-/// kind-bounded helper — while a lone push half, an op the vocabulary
-/// cannot spell, and a triple whose endpoint did not survive the swap are
-/// all dropped fail-soft (authority only ever shrinks). One-shot: the
-/// carry drains, so a second pass is a no-op.
+/// Carried tokenless triples re-mint as live rows and a rebuilt `ConnectionRecord` through the
+/// one kind-bounded helper, while a lone push half, an op the vocabulary cannot spell, and a
+/// triple whose endpoint did not survive the swap drop fail-soft (authority only shrinks).
+/// One-shot: the carry drains, so a second pass is a no-op.
 #[test]
 fn remint_carried_connections_remints_kinds_and_drops_the_unmintable() {
     let carry = |src: &str, dst: &str, op: &str| crate::session_store::ConnectionCarry {
@@ -1424,13 +1399,13 @@ fn remint_carried_connections_remints_kinds_and_drops_the_unmintable() {
         )
     };
     app.pending_conn_carry = vec![
-        // A full `both` set a → b: re-mints as ONE Both connection.
+        // A full `both` set a → b: re-mints as one Both connection.
         carry(a.as_str(), b.as_str(), "read-screen"),
         carry(a.as_str(), b.as_str(), "signal"),
         carry(a.as_str(), b.as_str(), "write-input"),
-        // A lone push half b → a: NEVER rounded up to a full seat — drops.
+        // A lone push half b → a: never rounded up to a full seat; drops.
         carry(b.as_str(), a.as_str(), "write-input"),
-        // An op no connection can spell (§1.4#2): drops.
+        // An op no connection can spell: drops.
         carry(a.as_str(), b.as_str(), "config-write"),
         // An endpoint that did not survive the swap: drops.
         carry("s-gone", b.as_str(), "read-screen"),
@@ -1453,7 +1428,7 @@ fn remint_carried_connections_remints_kinds_and_drops_the_unmintable() {
     };
     assert_eq!(rows.len(), 3, "both = 3 ops, nothing widened: {rows:?}");
     assert!(rows.iter().all(|e| e.src == a && e.dst == b));
-    // a's table stays EMPTY: the lone half was dropped, not widened.
+    // a's table stays empty: the lone half was dropped, not widened.
     let a_rows = {
         let ctx = {
             let g = app.store.read().unwrap();
@@ -1466,7 +1441,7 @@ fn remint_carried_connections_remints_kinds_and_drops_the_unmintable() {
         a_rows.is_empty(),
         "the lone push half must not mint: {a_rows:?}"
     );
-    // The record store was REBUILT (dissolution stays pair-precise).
+    // The record store was rebuilt (dissolution stays pair-precise).
     {
         let records = app.connections.records();
         assert_eq!(records.len(), 1);
@@ -1480,9 +1455,8 @@ fn remint_carried_connections_remints_kinds_and_drops_the_unmintable() {
     assert_eq!(app.connections.records().len(), 1);
 }
 
-/// A one-window, one-terminal-leaf layout whose leaf carries `leaf`'s USER
-/// fields — the shape `capture_restore_manifest` writes for a window that
-/// holds a single session.
+/// A one-window, one-terminal-leaf layout whose leaf carries `leaf`'s user fields, as
+/// `capture_restore_manifest` writes a window holding a single session.
 fn single_leaf_window(leaf: restore::TerminalLeafRestore) -> restore::WindowLayout {
     restore::WindowLayout {
         rows: 24,
@@ -1533,8 +1507,8 @@ fn bare_leaf() -> restore::TerminalLeafRestore {
     }
 }
 
-/// A LEGACY (mirror-only) layout whose one tab is `native`: no terminal
-/// tab and no recursive tree.
+/// A legacy (mirror-only) layout whose one tab is `native`: no terminal tab and no recursive
+/// tree.
 fn legacy_native_window(native: restore::NativeTabRestore) -> restore::WindowLayout {
     restore::WindowLayout {
         native_tabs: vec![native],
@@ -1550,9 +1524,8 @@ fn updates_settings() -> restore::NativeTabRestore {
     }
 }
 
-/// Mark pool session `session` as the shell a seamless handoff ADOPTED
-/// under the parent's id `parent_id` — what `spawn_session` records from
-/// the `Adopted` handle.
+/// Mark pool session `session` as the shell a seamless handoff adopted under the parent's id
+/// `parent_id`, as `spawn_session` records from the `Adopted` handle.
 fn adopt_as(app: &mut App, session: u64, parent_id: u64) {
     app.pool
         .sessions
@@ -1562,9 +1535,8 @@ fn adopt_as(app: &mut App, session: u64, parent_id: u64) {
         .handoff_local_id = Some(parent_id);
 }
 
-/// The live USER metadata of pool session `session`, read the way `@<sid>
-/// meta` reads it: resolve the sid through the registry, then lock the
-/// handle's ctx.
+/// The live user metadata of pool session `session`, read the way `@<sid> meta` reads it:
+/// resolve the sid through the registry, then lock the handle's ctx.
 fn registry_meta(app: &App, session: u64) -> crate::session_timeline::SessionMeta {
     let sid = app
         .pool
@@ -1706,12 +1678,10 @@ fn sids_cleared(mut manifest: restore::RestoreManifest) -> restore::RestoreManif
     manifest
 }
 
-/// The graft stores the leaf's USER fields EXACTLY over anything a driver
-/// did not write: an unset leaf field is unset on the session afterwards
-/// even when the session held a value — as it does on a cold restore when
-/// an earlier graft's tab failed to build and handed the bootstrap on to
-/// the next terminal leaf. (`stale` is assigned raw, the way that earlier
-/// graft stored it: no driver wrote it.)
+/// The graft stores the leaf's user fields exactly over anything a driver did not write: an
+/// unset leaf field is unset on the session afterwards even when the session held a value, as
+/// on a cold restore when an earlier graft's tab failed to build and handed the bootstrap on.
+/// (`stale` is assigned raw, as that earlier graft stored it: no driver wrote it.)
 #[test]
 fn a_graft_leaves_every_field_the_leaf_does_not_carry_unset() {
     use crate::session_timeline::SessionMeta;
@@ -1750,12 +1720,10 @@ fn a_graft_leaves_every_field_the_leaf_does_not_carry_unset() {
     );
 }
 
-/// The bootstrap window presents BEFORE the deferred restore runs, so its
-/// session's tooltip is already composed and cached by the time the graft
-/// seeds it. An icon-only seed moves no label, activity or connection
-/// revision the cache is keyed on; it recomposes only because the graft
-/// records its `meta-change`, which moves the timeline high-water mark.
-/// (Seeded without that record, the tooltip stayed without the icon.)
+/// The bootstrap window presents before the deferred restore runs, so its session's tooltip is
+/// already cached when the graft seeds it. An icon-only seed moves no label, activity or
+/// connection revision the cache keys on; it recomposes only because the graft records a
+/// `meta-change`, which moves the timeline high-water mark.
 #[test]
 fn a_graft_recomposes_the_chrome_the_first_present_cached() {
     let mut app = App::headless_for_test();
@@ -1789,12 +1757,10 @@ fn a_graft_recomposes_the_chrome_the_first_present_cached() {
     );
 }
 
-/// A driver's `aterm ctl @<sid> meta set|unset` on pool session `session`:
-/// resolve the sid through the registry the way the control socket does,
-/// then take the write door the verb's handler takes (`cmd_meta` calls
-/// `write_session_meta` for a set and `apply_meta_value` for an unset,
-/// which is what `write_session_meta` does with a `Clear`). `Ok` is the
-/// `OK` the verb answers.
+/// A driver's `aterm ctl @<sid> meta set|unset` on pool session `session`: resolve the sid
+/// through the registry as the control socket does, then take the verb's write door
+/// (`cmd_meta`: `write_session_meta` for a set, `apply_meta_value` for an unset, which is what
+/// a `Clear` does). `Ok` is the verb's `OK`.
 fn driver_meta(
     app: &App,
     session: u64,
@@ -1823,14 +1789,12 @@ fn driver_meta(
     );
 }
 
-/// A WRITE THE SUCCESSOR ANSWERED `OK` IS NEVER UNDONE BY ITS OWN RESTORE.
-/// A handoff child binds its control socket in `main_entry` — repointing
-/// `aterm.sock` and the adopted session's graph entry at itself — but runs
-/// the deferred restore only after its first present, so a `meta set` can
-/// land on the adopted bootstrap before the graft reaches it. On a cold
-/// restore the bootstrap shell's own startup can do the same. The graft
-/// keeps every field such a write touched — set, or cleared even where the
-/// clear moved nothing — and fills only the others from the leaf.
+/// A write the successor answered `OK` is never undone by its own restore. A handoff child
+/// binds its control socket in `main_entry` but runs the deferred restore only after its first
+/// present, so a `meta set` can land on the adopted bootstrap before the graft reaches it; on a
+/// cold restore the bootstrap shell's own startup can do the same. The graft keeps every field
+/// such a write touched (set, or cleared even where the clear moved nothing) and fills only the
+/// others from the leaf.
 #[test]
 fn a_graft_keeps_every_field_a_driver_wrote_before_the_restore_reached_it() {
     use crate::session_timeline::{MetaEdit, MetaField, SessionMeta};
@@ -1877,20 +1841,18 @@ fn a_graft_keeps_every_field_a_driver_wrote_before_the_restore_reached_it() {
     }
 }
 
-/// THE LEAF MUST NAME THE SHELL IT IS GRAFTED ONTO. A tab split between a
-/// native view and a terminal has no entry in the legacy `tabs` mirror (the
-/// capture writes only all-terminal tabs there), so when such a tab comes
-/// first, the mirror's first leaf and the recursive tree's first terminal
-/// leaf — the one the graft fills — name different shells. `main_entry` adopted
-/// window 0's bootstrap by the mirror; with the graft carrying identity,
-/// that stamped one shell's role on another shell's live sid.
+/// The leaf must name the shell it is grafted onto. A tab split between a native view and a
+/// terminal has no entry in the legacy `tabs` mirror (only all-terminal tabs go there), so when
+/// such a tab comes first, the mirror's first leaf and the recursive tree's first terminal leaf
+/// (the one the graft fills) name different shells. Picking window 0's bootstrap by the mirror
+/// would stamp one shell's role on another shell's live sid.
 #[test]
 fn a_graft_carries_a_leaf_only_onto_the_shell_that_leaf_names() {
     use crate::session_timeline::{MetaEdit, MetaField, SessionMeta};
 
-    // PREDECESSOR: tab A splits a recovery placeholder with shell 0 (role
-    // `operator`); tab B holds shell 1 alone (role `worker`). Built by the
-    // real restore, stamped by the real verb, captured by the real capture.
+    // Predecessor: tab A splits a recovery placeholder with shell 0 (role `operator`); tab B
+    // holds shell 1 alone (role `worker`). Built by the real restore, stamped by the real verb,
+    // captured by the real capture.
     let mut old = App::headless_for_test();
     let mut layout = single_leaf_window(bare_leaf());
     layout.restored_tabs = vec![
@@ -1959,8 +1921,8 @@ fn a_graft_carries_a_leaf_only_onto_the_shell_that_leaf_names() {
             .collect()
     };
 
-    // `main_entry` picks by `bootstrap_local_id`: session 0 IS shell 0, fills tab
-    // A's terminal pane, and takes shell 0's identity; tab B adopts shell 1.
+    // `main_entry` picks by `bootstrap_local_id`: session 0 is shell 0, fills tab A's terminal
+    // pane, and takes shell 0's identity; tab B adopts shell 1.
     let mut new = App::headless_for_test();
     new.handoff_successor = true;
     adopt_as(&mut new, 0, 0);
@@ -1976,13 +1938,10 @@ fn a_graft_carries_a_leaf_only_onto_the_shell_that_leaf_names() {
     );
     assert_eq!(registry_meta(&new, placed[1][0]), worker);
 
-    // The mirror's pick: session 0 is shell 1. The graft still fills tab
-    // A's pane with it, but tab A's leaf names shell 0, so none of that
-    // leaf's identity may land on this one. Tab B's leaf names shell 1,
-    // which this restore already adopted, so tab B shows that shell again
-    // (round six, finding 10: no stand-in shell is forked during the
-    // overlap for a shell that is here), and shell 1's identity goes to
-    // session 0, the shell it describes.
+    // The mirror's pick: session 0 is shell 1. The graft still fills tab A's pane with it, but
+    // tab A's leaf names shell 0, so none of that leaf's identity may land on it. Tab B's leaf
+    // names shell 1, already adopted, so tab B shows that shell again (no stand-in is forked
+    // during the overlap for a shell that is here), and shell 1's identity goes to session 0.
     let mut new = App::headless_for_test();
     new.handoff_successor = true;
     adopt_as(&mut new, 0, 1);
@@ -2001,8 +1960,8 @@ fn a_graft_carries_a_leaf_only_onto_the_shell_that_leaf_names() {
         "tab B's pane shows shell 1, the shell its leaf names"
     );
 
-    // A handoff child's bootstrap it did NOT adopt stands in for a shell
-    // running elsewhere; it is not the one the leaf names either.
+    // A handoff child's bootstrap it did not adopt stands in for a shell running elsewhere;
+    // it is not the one the leaf names either.
     let mut new = App::headless_for_test();
     new.handoff_successor = true;
     new.seamless_adopt = vec![handed_off_shell(1)];
@@ -2288,13 +2247,10 @@ fn a_durable_layout_names_the_conversation_the_agents_record_names_as_it_is_take
     crate::harness_host::publish_snapshot_for_test(&sid, None);
 }
 
-/// THE AGENT A CRASH TOOK GOES BACK TO ITS TAB (2026-09-27): a cold
-/// restore of the live layout whose leaf carries an agent hands the host
-/// that agent with the sid of the tab that now stands for the leaf and
-/// that tab's own shell — once: a second take finds nothing. NEGATIVE
-/// CONTROL: a leaf with no agent hands nothing. (A seamless successor
-/// hands nothing at its restore pass: a handoff leaf's agent is owed only
-/// at the Commit, to the adopted shell the leaf names —
+/// A cold restore of the live layout hands the host each leaf's agent once, with the sid and
+/// shell of the tab that now stands for the leaf; a leaf with no agent hands nothing. A session
+/// shown in two windows is relaunched once, and not at all where the PTY keeper gave its live
+/// shell back. (A seamless successor hands at its Commit instead:
 /// `a_handoff_leaf_with_a_pending_agent_is_relaunched_by_the_successor`.)
 #[test]
 fn a_restored_leafs_agent_is_handed_to_its_new_tab_once() {
@@ -2347,12 +2303,9 @@ fn a_restored_leafs_agent_is_handed_to_its_new_tab_once() {
     );
     assert!(cold.take_restored_agents().is_empty(), "handed once");
 
-    // ONE SESSION SHOWN IN TWO WINDOWS (`Open Session in New Window`) IS
-    // RELAUNCHED ONCE (restore audit, 2026-10-02). The image names its
-    // agent on both leaves (`fill_agents` fills by session), and a cold
-    // restore gives each leaf a shell of its own: relaunched once per
-    // leaf, one conversation was resumed in two tabs. The first leaf
-    // takes it, and the reopened row names that one place.
+    // One session shown in two windows: the image names its agent on both leaves and a cold
+    // restore gives each its own shell; only the first leaf takes the agent, the place the
+    // reopened row names.
     let co_viewed = vec![
         window_of(vec![leaf_hosting(8, Some(agent.clone()))]),
         window_of(vec![leaf_hosting(8, Some(agent.clone()))]),
@@ -2390,11 +2343,8 @@ fn a_restored_leafs_agent_is_handed_to_its_new_tab_once() {
         "in the first window's tab, whose leaf took its bootstrap shell"
     );
 
-    // …AND NOT AT ALL WHERE THE PTY KEEPER GAVE ITS SESSION'S LIVE SHELL
-    // BACK: the leaf rebuilt first takes the kept shell, whose agent
-    // still runs, and the other leaf's fresh shell must not resume the
-    // same conversation beside it. RED before: relaunched in the second
-    // window's tab.
+    // Where the PTY keeper gave the session's live shell back, its agent still runs: neither
+    // leaf relaunches it.
     let mut kept = App::headless_for_test();
     kept.seamless_adopt = vec![handed_off_shell(8)];
     kept.restore_into_window(
@@ -2667,18 +2617,10 @@ fn a_held_tabs_holds_ride_its_leaf_back_onto_its_tab_after_every_end() {
     );
 }
 
-/// ROUND FOUR, PLAN ITEM 7 (c): A HANDOFF LEAF THAT NAMES AN AGENT — one
-/// the outgoing instance's cold-restore queue still owed at its park — is
-/// relaunched by the successor, at its Commit, in the ADOPTED shell the
-/// leaf names (where the outgoing instance was relaunching it), under that
-/// tab's sid. NEGATIVE CONTROLS: nothing before the Commit; a handoff leaf
-/// with no agent (what every older producer writes) owes nothing; a leaf
-/// naming a shell this process did not adopt is dropped, never given to
-/// a stand-in.
-///
-/// RED before the change: `carry_restored_identity` skipped every agent
-/// on a seamless successor (`!self.handoff_successor`), so the leaf's
-/// agent was dropped and nothing was ever handed.
+/// A handoff leaf naming an agent the outgoing instance's queue still owed at its park is
+/// relaunched by the successor at its Commit, in the adopted shell the leaf names and under
+/// that tab's sid. Nothing before the Commit; a leaf with no agent owes nothing; a leaf naming
+/// a shell this process did not adopt is dropped, never given to a stand-in.
 #[test]
 fn a_handoff_leaf_with_a_pending_agent_is_relaunched_by_the_successor() {
     let agent = dead_agent();
@@ -2738,33 +2680,13 @@ fn a_handoff_leaf_with_a_pending_agent_is_relaunched_by_the_successor() {
     assert!(successor.take_restored_agents().is_empty(), "one-shot");
 }
 
-/// ROUND FOUR, PLAN ITEM 7 (b)+(c), THE OUTGOING SIDE: a park pauses the
-/// supervisor host's cold-restore queue (`App::park_all_readers`), the
-/// handoff layout names the agent a tab is still owed on that tab's leaf
-/// — the same as the Commit's re-capture, whatever the step in flight
-/// ends in — and a rollback resumes the queue. NEGATIVE CONTROLS: a tab
-/// owed nothing names nothing, and a person's quit layout never names an
-/// owed agent.
-///
-/// THE CRASH JOURNAL NAMES IT TOO (restore audit, 2026-10-02): until the
-/// relaunched agent runs, nothing is published for its tab, so the
-/// journal's images of a launch that reopened a crashed desk named no
-/// agent there: stopped again before the relaunch ran (its probation's
-/// second chance), the next launch reopened that tab bare.
-///
-/// AND SO DOES A RESTART'S QUIT LAYOUT (restore audit round two,
-/// 2026-10-02), filled after the host's shutdown as `main_entry` fills
-/// it ([`App::fill_desk_agents`]).
-///
-/// EACH WITH THE CLAUDE HOME AND THE LOGIN ITS AGENT RAN UNDER (2026-10-09):
-/// the owed snapshot's, which every one of the three used to drop, so the
-/// next launch, or the successor, relaunched it in the default home on the
-/// default account.
-///
-/// RED before the change: every handoff leaf said `agent: None`; before
-/// the journal's change, so did every leaf of its image; before round
-/// two, so did every leaf of the restart's quit layout; before
-/// 2026-10-09, each named the agent with no home and no login.
+/// The outgoing side: a park pauses the supervisor host's cold-restore queue
+/// (`App::park_all_readers`), the handoff layout names the agent a tab is still owed on that
+/// tab's leaf (as the Commit's re-capture does), and a rollback resumes the queue. The crash
+/// journal's image and a restart's quit layout (filled after the host's shutdown,
+/// [`App::fill_desk_agents`]) name it too, each with the Claude home and login its agent ran
+/// under. A tab owed nothing names nothing, and a person's quit layout never names an owed
+/// agent.
 #[cfg(unix)]
 #[test]
 fn the_handoff_layout_carries_the_agent_a_restored_tab_is_still_owed() {
@@ -2886,24 +2808,14 @@ fn the_handoff_layout_carries_the_agent_a_restored_tab_is_still_owed() {
     );
 }
 
-/// A RELAUNCH OWED BETWEEN THE PARK'S CAPTURE AND THE COMMIT'S RE-CAPTURE
-/// (round seven, finding 111). The agent a worker's back-off owes a tab is
-/// read live into the handoff layout, so an agent that crashes while the
-/// successor boots is named by the Commit's re-capture and not by the
-/// pending layout the successor restores. The Commit is refused — the
-/// successor would not relaunch it, and this process, once it exited,
-/// could not — for a reason of its own, as activity: the rollback resumes
-/// the worker, which relaunches the agent here, and the next attempt
-/// carries whatever is still owed. The reverse (an owed relaunch settled in
-/// between) is refused the same way. NEGATIVE CONTROL: the window/tab/pane
-/// topology is unchanged in both.
+/// A relaunch owed (or settled) between the park's capture and the Commit's re-capture changes
+/// what the leaves carry (`commit_agent_carry`) but not the window/tab/pane topology. The Commit
+/// is refused for that reason, as activity, not as a topology change: the successor would not
+/// relaunch the agent and this process, once exited, could not, so the rollback resumes the
+/// worker here and the next attempt carries what is still owed.
 ///
-/// RED before the fix: the leaf's agent was compared as topology, and the
-/// Commit was refused as "window/tab/pane topology changed".
-///
-/// The host knows the tab is open (`for_restored_test_with_open_tabs`), as
-/// a live App's harness does: an inert one forgot the owed relaunch at
-/// whatever pass another test's bell started between the captures.
+/// The host knows the tab is open (`for_restored_test_with_open_tabs`), as a live App's
+/// harness does; an inert one can forget the owed relaunch between the captures.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_owed_between_the_two_captures_refuses_the_commit_by_name() {
@@ -2942,7 +2854,7 @@ fn a_relaunch_owed_between_the_two_captures_refuses_the_commit_by_name() {
         commit_layout_topology(&pending)
     );
     assert_ne!(commit_agent_carry(&live), commit_agent_carry(&pending));
-    // NEGATIVE CONTROL: nothing moved, nothing differs.
+    // Negative control: nothing moved, nothing differs.
     assert_eq!(
         commit_agent_carry(&app.capture_handoff_layout()),
         commit_agent_carry(&live)
@@ -3020,23 +2932,10 @@ fn an_owed_relaunch_keeps_its_home_login_and_cause_across_the_commit() {
     }
 }
 
-/// A CRASH DURING A SUCCESSFUL COMMIT'S HOLD REACHES THE SUCCESSOR (round
-/// eighteen; `HostHandle::pending_restored_for`'s stated residual: a crash
-/// read after the Commit's re-capture was on neither layout). The parent's
-/// host supervises the tab's Claude Code, published as every supervised
-/// agent is; a seamless update parks, its layout is captured, and its
-/// Commit goes ahead — and the agent crashes during the Commit's hold, read
-/// by the parent's exit watch in a process about to exit, typed into by
-/// nobody there (parked, then stopped). The successor's Commit hands it the
-/// tab: the agent its parent supervised there is watched from that Commit,
-/// its exit read as the successor sees it — the agent gone, a crash's record
-/// left — and it is relaunched once, by the successor alone.
-///
-/// FAILS ON 745d63b36: a handoff leaf carried an agent only where a
-/// relaunch was owed at the park (`TerminalLeafRestore::agent`), and nothing
-/// told the successor which agent ran in the tab: its first pass found no
-/// agent named there and started nothing, and the crash was relaunched by
-/// nobody and said to nobody (the wait for its relaunch runs out).
+/// A crash during a successful Commit's hold reaches the successor: the parent's host
+/// supervises the tab's agent and the park's layout names it on the leaf; the agent crashes
+/// during the hold, where nobody can act on it. The successor watches it from its Commit, reads
+/// the exit (agent gone, a crash's record left) and relaunches it once.
 #[cfg(unix)]
 #[test]
 fn a_crash_during_a_successful_commits_hold_is_relaunched_by_the_successor() {
@@ -3112,9 +3011,8 @@ fn a_crash_during_a_successful_commits_hold_is_relaunched_by_the_successor() {
         "the crash during the hold relaunched by the successor",
         || (!relaunched.lock().unwrap().is_empty()).then_some(()),
     );
-    // Once, on the crash's record: two whole passes since with no worker
-    // left — the one handed the exit ended — so no second worker, and no
-    // second relaunch, can follow.
+    // Once: two whole passes since with no worker left (the one handed the exit ended), so no
+    // second relaunch can follow.
     let then = passes.load(std::sync::atomic::Ordering::SeqCst);
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
@@ -3134,15 +3032,10 @@ fn a_crash_during_a_successful_commits_hold_is_relaunched_by_the_successor() {
     successor_host.shutdown_and_join();
 }
 
-/// THE HANDOFF LEAF NAMES THE AGENT ITS HOST SUPERVISES, WHERE NOTHING IS
-/// OWED (round eighteen): the agent the host last published for a tab rides
-/// that tab's handoff leaf (`TerminalLeafRestore::supervised`) — never a
-/// durable layout's, whose `agent` names what runs, and never a tab owed a
-/// relaunch, whose `agent` names that. The Commit compares the process it
-/// names: re-read with its conversation followed it is no change, and
-/// another process in its place refuses the Commit as activity, its exit
-/// decided by the outgoing instance. The topology does not change either
-/// way.
+/// Where nothing is owed, the agent the host last published for a tab rides that tab's handoff
+/// leaf (`TerminalLeafRestore::supervised`), never a durable layout's or an owed tab's. The
+/// Commit compares the process it names: the same process with a new conversation is no change,
+/// another process in its place refuses the Commit; the topology does not change either way.
 #[cfg(unix)]
 #[test]
 fn the_handoff_leaf_names_the_supervised_agent_where_nothing_is_owed() {
@@ -4237,35 +4130,20 @@ fn a_shell_the_keeper_gave_back_keeps_its_own_hold() {
 /// re-exec ends ADOPTED — owned by a session — or CLOSED, never dropped while
 /// still open (a live, readerless channel whose shell never sees its hangup).
 ///
-/// Driven through the orphan net, `App::adopt_orphan_shells_as_tabs` — the
-/// placement every shell no restored leaf claimed goes through — once with a
-/// front window to adopt into and once with none. The headless harness has
-/// no event loop for `spawn_session`, so its stand-in builds the session, but
-/// the master reaches that session's sink through the shipping
-/// `HandedMaster::into_sink`, the one adoption both share. Each handed master
-/// is one end of a socketpair and its peer is the witness: EOF there means
-/// every copy of the master is closed; a pooled session carrying the shell's
-/// `local_id` whose sink owns a master means it was adopted. Per master that
-/// is the model's `Adopt`, its `CloseFallback`, or — neither — its
-/// `BuggyDrop`, and every step is validated against the committed model
-/// after the `Prepare`s that hand the masters across.
+/// Driven through the orphan net (`App::adopt_orphan_shells_as_tabs`), with a front window and
+/// without. The headless stand-in builds the session, but the master reaches its sink through
+/// the shipping `HandedMaster::into_sink`. Each master is one end of a socketpair whose peer
+/// is the witness: EOF there means every copy is closed; a pooled session carrying the shell's
+/// `local_id` whose sink owns a master means it was adopted. Per master that is the model's
+/// `Adopt`, `CloseFallback` or (neither) `BuggyDrop`, each step validated against the model.
 ///
-/// The other ways a handed master can end: a refused handoff —
-/// `seamless::tests::a_refused_handoff_closes_every_master_it_was_handed` —
-/// and a spawn that fails after taking the `Adopted`, which needs the event
-/// loop no headless test has and is closed by ownership instead: the error
-/// drops either the `HandedMaster` not yet adopted or the sink that adopted
-/// it, and both close the master.
+/// A refused handoff is `seamless::tests::a_refused_handoff_closes_every_master_it_was_handed`;
+/// a spawn that fails after taking the `Adopted` is closed by ownership (the error drops the
+/// `HandedMaster` or the sink, and both close the master).
 ///
-/// NEGATIVE CONTROLS: a master left open with no owner is the `BuggyDrop`
-/// step, which only `Buggy = 1` admits. Until `spawn::HandedMaster` owned the
-/// descriptor that is exactly what the windowless branch did ("their raw fds
-/// close with the process"); make `HandedMaster`'s `Drop` a no-op again and
-/// this test fails there. And a master the adoption closes as it hands it on
-/// is a pooled session over a closed master, which this test refuses: let
-/// `into_sink` drop its handle (`self.0` for the `ManuallyDrop`) and the
-/// front-window case fails — in a debug build as an abort ("IO Safety
-/// violation"), when that session's sink closes the descriptor a second time.
+/// Negative controls: a no-op `HandedMaster` `Drop` leaves a master open with no owner, the
+/// `BuggyDrop` step only `Buggy = 1` admits; an `into_sink` that closes its handle leaves a
+/// pooled session over a closed master, which the front-window case refuses.
 #[test]
 #[cfg(unix)]
 fn handed_off_masters_are_adopted_or_closed_never_leaked() {
@@ -4284,15 +4162,12 @@ fn handed_off_masters_are_adopted_or_closed_never_leaked() {
             other => panic!("unexpected witness read: {other:?}"),
         }
     };
-    // A master the net closed reads EOF at its peer only once EVERY copy is
-    // closed, and a child another test in this binary is forking holds one
-    // until it execs (a socketpair end is made close-on-exec non-atomically
-    // on macOS, so it can even ride through the exec). So a master that is
-    // not in the pool is given a hang detector's minute to read closed before
-    // it is classified; a leak — `HandedMaster`'s `Drop` a no-op, the negative
-    // control above — never closes and still reads as the `BuggyDrop` step, a
-    // minute later (the fd-copy sweep of 2026-09-27). An adopted master is
-    // read at once: a live master must never be waited into reading closed.
+    // A closed master reads EOF at its peer only once every copy is closed, and a child another
+    // test in this binary is forking holds one until it execs (on macOS a socketpair end is
+    // made close-on-exec non-atomically, so it can even ride through the exec). So a master not
+    // in the pool gets a hang detector's minute to read closed; a leak never closes and still
+    // reads as `BuggyDrop`. An adopted master is read at once: a live master must never be
+    // waited into reading closed.
     let eventually_closed = |peer: &UnixStream| {
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         loop {
@@ -4352,8 +4227,8 @@ fn handed_off_masters_are_adopted_or_closed_never_leaked() {
         assert!(buggy.action_enabled("BuggyDrop", &state));
         let (mut adopted, mut closed_count) = (0, 0);
         for (local_id, peer) in &peers {
-            // Adopted = a pooled session carries the shell AND its sink owns
-            // a master, as a real adoption's does.
+            // Adopted: a pooled session carries the shell and its sink owns a master, as a
+            // real adoption's does.
             let in_pool = app.pool.iter().any(|session| {
                 session.handoff_local_id == Some(*local_id) && session.ctx.sink.master() >= 3
             });
@@ -4421,10 +4296,9 @@ fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
     }
 }
 
-/// A shell the PTY KEEPER kept for window `owner`, which knew it as
-/// `local_id`: [`handed_off_shell`] with the keeper's release obligation,
-/// its device numbered `owner * 100 + local_id` so a test can say whose
-/// shell a pane took.
+/// A shell the PTY keeper kept for window `owner`, which knew it as `local_id`:
+/// [`handed_off_shell`] with the keeper's release obligation, its device numbered
+/// `owner * 100 + local_id` so a test can say whose shell a pane took.
 fn recovered_shell(owner: u32, local_id: u64) -> crate::spawn::Adopted {
     crate::spawn::Adopted {
         keeper: Some(crate::keeper_link::Claim::new(
@@ -4443,24 +4317,15 @@ fn whose(shell: &crate::spawn::Adopted) -> Option<(Option<u32>, u64)> {
         .map(|claim| (claim.owner(), claim.rdev()))
 }
 
-/// ROUND SEVEN, FINDING 5'S SECOND REVIEW — A TAKEN-OVER IMAGE'S PANES GET
-/// THE SHELLS THE SUCCESSOR RE-TAGGED. The parent's desk: pane 0 (`/a`) and
-/// pane 1 (`/b`, where an agent ran), the parent's pool ids 0 and 1. Its
-/// shell 0 ended during the update; the successor adopted shell 1 as ITS
-/// session 0 (its counter starts over), and after Commit started a fresh
-/// session 1. At Commit it took the parent's journal image over, and
-/// `keeper_link::activate` sent its registrations — through the real keeper
-/// core, which keeps only the latest tag: shell 1 is now (successor, 0).
-/// Then the successor died before its first image. The next launch's claim
-/// reopens the parent's image (leaves keyed by the parent), and the
-/// placement puts the parent's shell back in pane 1 — the agent's pane is
-/// filled by its live shell, so the agent is not relaunched beside itself —
-/// while the successor's fresh session goes to the orphan net, never into
-/// the parent's pane 1 (the collision the first review fixed). And with
-/// the crash BEFORE the link delivered the registrations (the keeper still
-/// holding the parent's tag), the same pane takes the same shell.
-/// NEGATIVE CONTROL: without the registration's `handed` pair, the re-tagged
-/// shell matches no pane and pane 1 starts fresh (the review's failure).
+/// A taken-over image's panes get the shells the successor re-tagged. The parent's desk: pane
+/// 0 (`/a`) and pane 1 (`/b`, an agent), pool ids 0 and 1. Shell 0 ended during the update;
+/// the successor adopted shell 1 as its session 0 and started a fresh session 1, took the
+/// parent's journal image over at Commit and re-registered with the keeper (which keeps only
+/// the latest tag), then died before its first image. The next launch reopens the parent's
+/// image and puts the parent's shell back in pane 1 (so the agent is not relaunched beside
+/// itself), the fresh session going to the orphan net; with the crash before the registrations
+/// were delivered, the same pane takes the same shell. Negative control: without the
+/// registration's `handed` pair the re-tagged shell matches no pane.
 #[cfg(unix)]
 #[test]
 fn a_taken_over_image_places_the_shells_its_successor_re_tagged() {
@@ -4602,20 +4467,14 @@ fn a_taken_over_image_places_the_shells_its_successor_re_tagged() {
     }
 }
 
-/// ROUND SEVEN'S LEFTOVER I2b — TWO GENERATIONS ON, A KEPT SHELL STILL
-/// FINDS ITS PANE. The chain G → P → S: G's image keys pane 1 (`/b`) by
-/// G's shell 1. P adopted that shell as its session 0 and took G's image
-/// over at its Commit, but never replaced it (its first image failed to
-/// write and its desk did not change). S adopted P's session 0 as its own
-/// session 0, took P's journal — still G's image — over, registered the
-/// shell with the keeper, and died before its own first image. S's
-/// registration names S's pair and P's (`handed`); neither is on any of
-/// G's leaves. So P's handoff record says the pair G's image keys the
-/// shell by (`App::journal_keys` → `SessionRecord::journal_key`), S's
-/// registration names it too (`Tag::keyed`), and the placement puts the
-/// shell back in pane 1 instead of a bare orphan tab beside a relaunched
-/// agent. NEGATIVE CONTROL: without the key, pane 1 takes no shell — the
-/// one-generation limit the round-seven fixer disclosed.
+/// Two generations on, a kept shell still finds its pane. Chain G → P → S: G's image keys
+/// pane 1 by G's shell 1. P adopted that shell and took G's image over at Commit without
+/// replacing it; S adopted it from P, took P's journal (still G's image) over, registered the
+/// shell with the keeper and died before its own first image. S's registration names S's pair
+/// and P's (`handed`), neither on G's leaves, so P's handoff record carries the pair G's image
+/// keys the shell by (`App::journal_keys` → `SessionRecord::journal_key`), S's registration
+/// names it (`Tag::keyed`), and the placement puts the shell back in pane 1. Negative control:
+/// without the key, pane 1 takes no shell.
 #[cfg(unix)]
 #[test]
 fn a_kept_shell_two_updates_on_finds_the_pane_its_grandparents_image_keys() {
@@ -4744,15 +4603,11 @@ fn a_kept_shell_two_updates_on_finds_the_pane_its_grandparents_image_keys() {
     }
 }
 
-/// An update's successor that took its parent's desk over at Commit
-/// (round eight of the update audit, findings 46 and 76). The parent's
-/// image: pane 0 (`/a`) and pane 1 (`/b`, Claude on its conversation),
-/// the parent's pool ids 0 and 1. The successor adopted the parent's
-/// shell 1 as ITS session 0 and shell 0 as its session 1 (so a carry keyed
-/// by the wrong id space shows), its Commit waiter took the image over,
-/// and its wake installed it. Its host has published no agent yet (no
-/// worker attached: 45 s after an update from a build that writes no
-/// claim) and its engines answer no folder (busy, or no OSC 7 yet).
+/// An update's successor that took its parent's desk over at Commit. The parent's image: pane
+/// 0 (`/a`) and pane 1 (`/b`, Claude on its conversation), pool ids 0 and 1. The successor
+/// adopted the parent's shell 1 as its session 0 and shell 0 as its session 1 (so a carry keyed
+/// by the wrong id space shows) and took the image over. Its host has published no agent yet
+/// and its engines answer no folder.
 #[cfg(unix)]
 struct Successor {
     app: App,
@@ -4873,25 +4728,12 @@ impl Successor {
     }
 }
 
-/// ROUND EIGHT OF THE UPDATE AUDIT, FINDING 76 — THE SUCCESSOR'S FIRST
-/// IMAGE KEEPS WHAT IT TOOK OVER UNTIL IT KNOWS BETTER. Its first capture
-/// after Commit replaced the taken-over image with one built only of its
-/// own state: no agent (its host had published none) and no folder or
-/// title (its engines answered none). Killed then, the next launch reopened
-/// the desk in `$HOME` and relaunched no conversation. The image now
-/// carries the parent's record and folders forward, keyed by the parent's
-/// ids the sessions were handed under. NEGATIVE CONTROLS: the same desk
-/// killed before the first image (the take-over alone) reopens the same;
-/// and once the successor's own status read says the shell holds the
-/// agent's tab, its image carries no agent there.
-///
-/// AND SO DOES A RESTART'S QUIT LAYOUT (the review of restore audit round
-/// two, 2026-10-03), filled as `main_entry` fills it
-/// ([`App::fill_desk_agents`]): that quit retires the journal that
-/// carried the agent, so its layout is the one record left.
-///
-/// RED before the fix: `resumed` was empty and every folder was `None`;
-/// before the review, the restart's quit layout named no agent.
+/// The successor's first image keeps what it took over until it knows better: the parent's
+/// agent record and folders are carried forward, keyed by the parent's ids the sessions were
+/// handed under, and a restart's quit layout ([`App::fill_desk_agents`]) names the agent too.
+/// Negative controls: killed before the first image (the take-over alone) the desk reopens the
+/// same; once this run's own status read says the shell holds the agent's tab, the image
+/// carries no agent there.
 #[cfg(unix)]
 #[test]
 fn a_successors_first_image_keeps_the_agent_and_folders_it_took_over() {
@@ -4956,8 +4798,8 @@ fn a_successors_first_image_keeps_the_agent_and_folders_it_took_over() {
         "each leaf names the parent's pair it was handed as"
     );
 
-    // NEGATIVE CONTROL: this run's own status read says the shell holds
-    // the agent's tab now — the agent is gone, and so is its record.
+    // Negative control: this run's own status read says the shell holds the agent's tab now,
+    // so the agent is gone, and so is its record.
     let mut successor = Successor::of_a_handed_off_desk();
     {
         let session = successor.app.pool.get(0).expect("session 0");
@@ -4975,17 +4817,10 @@ fn a_successors_first_image_keeps_the_agent_and_folders_it_took_over() {
     assert_eq!(cwds(&reopened.manifest), vec!["/b", "/a"]);
 }
 
-/// ROUND EIGHT OF THE UPDATE AUDIT, FINDING 46 — A KEPT SHELL FILLS ITS
-/// PANE IN THE SUCCESSOR'S OWN IMAGE WHILE THE KEEPER STILL HOLDS IT UNDER
-/// THE PARENT. The successor published its own image (its pool ids) and
-/// died before its re-registration reached the keeper (or its link never
-/// started), so the keeper offers each shell under the parent's pair,
-/// which no leaf of that image carries: every kept shell became an
-/// unnamed orphan tab, and the agent was relaunched beside its
-/// still-running original. The image names the pairs its leaves were
-/// handed as, and each shell takes its own pane. NEGATIVE CONTROL: placed
-/// without those pairs (the image before the fix), both shells are the
-/// orphan net's.
+/// A kept shell fills its pane in the successor's own image while the keeper still holds it
+/// under the parent's pair (the successor died before its re-registration reached the
+/// keeper): the image names the pairs its leaves were handed as, so each shell takes its own
+/// pane. Negative control: placed without those pairs, both shells are the orphan net's.
 #[cfg(unix)]
 #[test]
 fn a_successors_own_image_places_the_shells_the_keeper_holds_under_the_parent() {
@@ -5027,17 +4862,12 @@ fn a_successors_own_image_places_the_shells_the_keeper_holds_under_the_parent() 
     }
 }
 
-/// P3 REVIEW — WHOSE SHELL FILLS WHICH PANE. Two windows registered with
-/// one keeper both died; each minted its pool ids from 0, so the next
-/// launch is offered shells `{0, 1}` of window A and `{0, 1}` of window
-/// B, and the reopened layout is both crash journals' windows. Every pane
-/// takes ITS OWN window's shell — session 0 included — through the same
-/// picks `main_entry` and the restore make. A layout whose writer is
-/// unknown (a clean quit's `session.toml`, written by a window that left
-/// the keeper nothing) takes none, and neither does a journal of another
-/// window: those shells go to the orphan net, carrying no leaf's id.
-/// NEGATIVE CONTROL: without the placement, window A's first pane takes
-/// B's shell 0 when the keeper offers B's first.
+/// Whose shell fills which pane: two windows registered with one keeper both died, each
+/// minting pool ids from 0, so the next launch is offered shells `{0, 1}` of window A and of
+/// window B. Every pane takes its own window's shell (session 0 included) through the picks
+/// `main_entry` and the restore make. A layout whose writer is unknown (a clean quit's
+/// `session.toml`) takes none, nor does a journal of another window: those shells go to the
+/// orphan net, carrying no leaf's id.
 #[test]
 fn a_recovered_shell_fills_only_a_pane_its_own_window_wrote() {
     const A: u32 = 4101;
@@ -5048,8 +4878,8 @@ fn a_recovered_shell_fills_only_a_pane_its_own_window_wrote() {
             window_of(vec![leaf_naming(0), leaf_naming(1)]),
         ])
     };
-    // The keeper offers in its own order; each case lists the window
-    // whose shells a pane must NOT take first.
+    // The keeper offers in its own order; each case lists first the window whose shells a pane
+    // must not take.
     let offered = |first: u32, then: u32| {
         vec![
             recovered_shell(first, 0),
@@ -5124,13 +4954,10 @@ fn a_recovered_shell_fills_only_a_pane_its_own_window_wrote() {
     );
 }
 
-/// P3 REVIEW — AN OFFERED MASTER THAT BECOMES NO SESSION IS RELEASED. The
-/// keeper holds its own copy of every master it offered; when this window
-/// drops its copy without registering a session — the orphan net with no
-/// window to land in, here — the keeper must be told, or it keeps the
-/// master (the shell never hung up, running unseen) and offers it again
-/// to the next launch. A shell the net DOES place is registered, and is
-/// not released (its release is its session's close).
+/// The keeper holds its own copy of every master it offered: one this window drops without
+/// registering a session (here the orphan net with no window) is released to the keeper, or
+/// the shell never hangs up and is offered again. A shell the net places is registered, not
+/// released (its release is its session's close).
 #[test]
 fn an_offered_master_that_becomes_no_session_is_released() {
     let mut new = App::headless_for_test();
@@ -5154,10 +4981,9 @@ fn an_offered_master_that_becomes_no_session_is_released() {
     );
 }
 
-/// The six USER fields handed-off shell `shell` wore in the predecessor.
-/// Every free-text value names its shell, so a value on the wrong session
-/// says whose it was; `questions` is a closed set of words, so it cycles
-/// with the shell id and the other five carry the name.
+/// The six user fields handed-off shell `shell` wore in the predecessor. Every free-text value
+/// names its shell, so a value on the wrong session says whose it was; `questions` is a closed
+/// set of words, so it cycles with the shell id.
 fn identity_of(shell: u64) -> crate::session_timeline::SessionMeta {
     let words = crate::session_timeline::QUESTIONS_POLICY_WORDS;
     let word = words[usize::try_from(shell).expect("a small index") % words.len()];
@@ -5248,14 +5074,12 @@ fn window_of(roots: Vec<restore::RestoredSplitTree>) -> restore::WindowLayout {
     layout
 }
 
-/// A handoff SUCCESSOR rebuilt from `windows` the way the child runs. The
-/// layout crosses the wire (`to_toml`, then `from_toml` plus
-/// `covers_exact_seamless_ids`, as `take_incoming` accepts it) with shells
-/// `0..shells` handed off; session 0 adopts by `session0`'s pick; window 0
-/// is rebuilt around it, and every further window is created around the
-/// shell its bootstrap leaf names — `apply_restore_manifest`'s pick — or a
-/// fresh one when that shell is taken. The restore itself runs unchanged,
-/// and must place every shell: this harness leaves the orphan net nothing.
+/// A handoff successor rebuilt from `windows` the way the child runs: the layout crosses the
+/// wire (`to_toml`, then `from_toml` plus `covers_exact_seamless_ids`, as `take_incoming`
+/// accepts it) with shells `0..shells` handed off; session 0 adopts by `session0`'s pick;
+/// window 0 is rebuilt around it, and every further window around the shell its bootstrap
+/// leaf names (`apply_restore_manifest`'s pick), or a fresh one when that shell is taken. The
+/// restore must place every shell: this harness leaves the orphan net nothing.
 fn successor_of(
     windows: Vec<restore::WindowLayout>,
     shells: u64,
@@ -5448,18 +5272,9 @@ fn handoff_layout_placed(old: &App) -> (restore::RestoreManifest, restore::Resto
     (layout, placed)
 }
 
-/// ROUND EIGHT OF THE UPDATE AUDIT, D5 (#505, and the lead U33): A DESK
-/// PAST THE WINDOW CAP FOLDS INTO THE HANDOFF LAYOUT. Nothing at runtime
-/// limits how many windows a desk has, but a layout holds at most
-/// `MAX_WINDOWS` (64) of them, and the producer applied no cap: the
-/// capture of a 70-window desk wrote 70 windows, its own round trip read
-/// back 64, and the worker filed every attempt as a transient
-/// `ProducerFailed` that froze every tab again on each retry — the desk
-/// never updated. Now the windows past the cap are tabs of the last
-/// window that fits: the layout round-trips, names every handed shell,
-/// and the successor places each one.
-///
-/// RED before the fold: the round trip read 64 of the 70 windows back.
+/// A desk past the window cap folds into the handoff layout: a layout holds at most
+/// `MAX_WINDOWS` windows, so the windows past it become tabs of the last window that fits; the
+/// layout round-trips and names every handed shell, and the successor places each one.
 #[cfg(unix)]
 #[test]
 fn a_desk_past_the_window_cap_folds_into_the_handoff_layout_and_places_every_shell() {
@@ -5516,20 +5331,10 @@ fn a_desk_past_the_window_cap_folds_into_the_handoff_layout_and_places_every_she
     );
 }
 
-/// THE SUCCESSOR OF A FOLDED LAYOUT CAPTURES ONE EVERY BUILD READS WHOLE
-/// (the D5 review). The fold put a second Settings tab and a second view
-/// of the same document into the last window, and the successor reopens
-/// them all. Its next captures — the next update's and the quit's —
-/// wrote both copies into that window's legacy mirror, which every build's
-/// parse refuses: the next update refused its own layout at the park, and
-/// the quit layout and every crash journal left the window out, with every
-/// tab the fold had put into it. Now the mirror leaves the second copy out
-/// (`restore::NativeTabRestore::joins_mirror`), as it does a mixed split
-/// tab, and the canonical tabs keep every tab.
-///
-/// RED before the fix: the next update's capture did not read back whole
-/// ("window 64 of the handoff layout is in a shape this build does not
-/// read back"), and the parse leaves that window out.
+/// The successor of a folded layout captures one every build reads whole: the fold put a
+/// second Settings tab and a second view of the same document into the last window, and the
+/// legacy mirror leaves the second copy out (`restore::NativeTabRestore::joins_mirror`), as it
+/// does a mixed split tab, while the canonical tabs keep every tab.
 #[cfg(unix)]
 #[test]
 fn the_successor_of_a_folded_layout_captures_a_layout_every_build_reads_whole() {
@@ -5630,13 +5435,8 @@ fn the_successor_of_a_folded_layout_captures_a_layout_every_build_reads_whole() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// D5's tab half: A WINDOW PAST THE TAB CAP SPILLS INTO ANOTHER WINDOW.
-/// A window holds at most 256 tabs; a 300-tab window wrote a layout no
-/// build reads whole. Its tabs past the cap move to the next window with
-/// room — here a window made for them, since the desk has no other — and
-/// every shell is placed.
-///
-/// RED before the fold: the round trip dropped the 300-tab window.
+/// A window past the tab cap (256) spills its extra tabs into the next window with room, here
+/// a window made for them, and every shell is placed.
 #[cfg(unix)]
 #[test]
 fn a_window_past_the_tab_cap_spills_into_another_window_of_the_handoff_layout() {
@@ -5716,22 +5516,11 @@ fn owe_a_proof(app: &mut App, label: &str) -> std::os::fd::OwnedFd {
     read
 }
 
-/// ROUND EIGHT, FINDING 58: A CO-VIEW WINDOW THAT LOSES ITS GLASS DROPS
-/// ONLY ITS VIEWS — AND A SHELL IT ALONE SHOWED DEGRADES THE HANDOFF.
-/// Since round six's finding 10 a co-view window is rebuilt by the native
-/// arm, and its other tabs adopt handed shells there. When its glass will
-/// not attach the arm closes the window, which drops a shell shown only in
-/// it before the proof: the proof then named a subset, the parent filed
-/// `AdoptionMismatch` — a STRUCTURAL verdict that latches the new build —
-/// for what was this machine's GPU or surface trouble, which the terminal
-/// arm answers by degrading. Here the arm's own response
-/// (`close_window_logical`) runs on the co-view window of W0[shell 0],
-/// W1[shell 1], W2[shell 0 again | shell 2]: the handoff is degraded, so
-/// the proof is withheld and the parent's rollback resumes every shell.
-/// NEGATIVE CONTROL: a co-view window showing only shell 0 again drops no
-/// shell, and the handoff stands.
-///
-/// RED before the fix: `handoff_degraded` stayed false with shell 2 gone.
+/// A co-view window whose glass will not attach is closed (`close_window_logical`), dropping
+/// only its views; a handed shell shown in it alone is lost before the proof, so the handoff
+/// is degraded (the proof withheld, the parent's rollback resumes every shell) rather than
+/// proving a subset. Negative control: a co-view window showing only shell 0 again drops no
+/// shell.
 #[cfg(unix)]
 #[test]
 fn a_co_view_window_without_glass_degrades_the_handoff_when_it_drops_a_handed_shell() {
@@ -5771,17 +5560,10 @@ fn a_co_view_window_without_glass_degrades_the_handoff_when_it_drops_a_handed_sh
     }
 }
 
-/// ROUND EIGHT, FINDING 59: A HELD PANE OPEN IN TWO WINDOWS COMES BACK IN
-/// BOTH. A pane kept by `--hold` and opened in a new window is one session
-/// in two views; the capture names it at both leaves, the successor turns
-/// both into placeholders carrying it, and the held screen crosses once.
-/// The first placeholder took the screen and the second, finding it gone,
-/// said the pane was 'not carried' — and the next update carried that
-/// placeholder on, so the second view was lost for good. Now the second
-/// placeholder shows the session the first one restored, as a co-viewed
-/// live shell's later leaf shows the adopted shell again.
-///
-/// RED before the fix: window 2 held a recovery placeholder, no terminal.
+/// A held pane open in two windows comes back in both: the capture names it at both leaves,
+/// the successor turns both into placeholders carrying it, and the held screen crosses once;
+/// the second placeholder shows the session the first restored, as a co-viewed live shell's
+/// later leaf does.
 #[test]
 fn a_co_viewed_held_pane_comes_back_in_both_of_its_windows() {
     const HELD: u64 = 7;
@@ -6034,16 +5816,10 @@ fn a_handoff_carries_each_identity_onto_the_shell_its_leaf_names_and_never_a_sta
     assert_eq!(handed_off.len(), 2);
 }
 
-/// A SHELL THE REBUILD LEAVES OVER STILL COMES BACK WEARING ITS IDENTITY.
-/// The orphan net re-homes every handed-off shell no leaf took as a tab of
-/// the front window, so none is lost. Such a shell is left over because the
-/// leaf naming it never rebuilt — its tab failed to build, or, as here, its
-/// window could not be created and `apply_restore_manifest` stopped — or
-/// was filled by another shell. Its identity reached nobody during the
-/// rebuild, and the net used to place it bare: the manifest was consumed by
-/// then. The leaves naming handed-off shells now outlive it
-/// (`handed_off_leaves`), and the net puts each one's identity on its
-/// shell before registering it.
+/// A shell the rebuild leaves over still comes back wearing its identity: the orphan net
+/// re-homes it as a tab of the front window, and the leaves naming handed-off shells outlive
+/// the consumed manifest (`handed_off_leaves`), so the net puts each one's identity on its
+/// shell before registering it. Here window 1 is never created.
 #[test]
 fn an_orphaned_shell_comes_back_wearing_the_identity_of_the_leaf_that_names_it() {
     let wire = restore::RestoreManifest::new(vec![
@@ -6105,19 +5881,14 @@ fn an_orphaned_shell_comes_back_wearing_the_identity_of_the_leaf_that_names_it()
     assert!(new.structural_invariants_ok());
 }
 
-/// THE BOOTSTRAP STARTS IN THE DIRECTORY OF THE PANE IT FILLS. A cold
-/// restore spawns session 0 in `first_leaf_cwd` before the deferred pass
-/// grafts it onto the canonical tree's first terminal leaf — the leaf
-/// `bootstrap_local_id` names. `first_leaf_cwd` read the first TAB, and on a
-/// native-only first tab fell back to the legacy `tabs` mirror, which lists
-/// all-terminal tabs only: behind a tab splitting a native view with a
-/// terminal, it named another tab's pane. A pane that recorded no directory
-/// starts where another pane of its OWN tab was — what that first-tab read
-/// did for a first tab — but never where another tab's was.
+/// The bootstrap starts in the directory of the pane it fills: `first_leaf_cwd` follows the
+/// canonical tree's first terminal leaf (the leaf `bootstrap_local_id` names), never the
+/// legacy mirror, which lists all-terminal tabs only. A pane that recorded no directory starts
+/// where another pane of its own tab was, never where another tab's was.
 #[test]
 fn the_bootstrap_cwd_is_the_directory_of_the_leaf_the_bootstrap_fills() {
-    // PREDECESSOR: a Settings tab, a tab splitting a recovery placeholder
-    // with session 0, then session 1's all-terminal tab.
+    // The predecessor: a Settings tab, a tab splitting a recovery placeholder with session 0,
+    // then session 1's all-terminal tab.
     let mut old = App::headless_for_test();
     old.restore_into_window(
         WindowId(0),
@@ -6231,12 +6002,10 @@ fn the_bootstrap_cwd_is_the_directory_of_the_leaf_the_bootstrap_fills() {
     }
 }
 
-/// THE GRAFT IS A CHANGE A WATCHER CAN SEE. The grafted session is already
-/// registered and served under its sid when the deferred restore reaches
-/// it, so a `meta` reader or a `subscribe … events` watcher may already have
-/// seen it without its identity. Each field the graft moves lands on the
-/// session's timeline as the ordinary `meta-change` — what the digest pushes
-/// as `EVENT <sid> meta …` — and the watcher is woken for it.
+/// The graft is a change a watcher can see: the grafted session is already registered and
+/// served when the deferred restore reaches it, so each field the graft moves lands on its
+/// timeline as the ordinary `meta-change` (pushed as `EVENT <sid> meta …`) and the watcher is
+/// woken.
 #[test]
 fn a_graft_announces_every_field_it_moves_to_an_events_watcher() {
     let mut app = App::headless_for_test();

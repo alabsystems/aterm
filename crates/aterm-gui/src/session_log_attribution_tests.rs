@@ -665,12 +665,46 @@ fn a_persons_first_input_after_an_update_answers_mail_delivered_before_it() {
     );
 }
 
+/// THE VIEW AGAINST THE RING, IN ORDER (the review of 6F-8): the log's
+/// records of the exact pairs, projected, are the ring's rows of them, row
+/// for record, in order; a `human` row stands where its mark stands, before
+/// the row of the entry whose reconcile delivered the key.
+fn assert_the_view_is_the_ring(g: &crate::session_timeline::SessionTimeline) {
+    let (view, ring) = crate::session_log::observed::overlap_tests::exact_view_and_ring(g);
+    assert_eq!(view, ring, "the view's order is the ring's");
+}
+
+/// THE VIEW'S `human` ROWS AGAINST THE RING'S (phase 6, 6F-8, ruling U13):
+/// the ring's `human` rows and the burst marks (every `human` mark but the
+/// mail latch's own, `why=mail`), as counts.
+fn human_rows_and_burst_marks(g: &crate::session_timeline::SessionTimeline) -> (usize, usize) {
+    let rows = g.since(None).filter(|e| e.kind == "human").count();
+    let marks = g
+        .slog()
+        .log()
+        .window()
+        .filter(|r| r.op == Op::Mark && r.k == Kind::Human)
+        .filter(|r| r.f.get_word(aterm_slog::Key::Why) != Some("mail"))
+        .count();
+    (rows, marks)
+}
+
 /// T2, ONE COUNT DELIVERED ONCE: delivered mail; a person's key that opens
 /// a burst is counted (`note_reaching`, `note_person`'s first half); a
 /// reconciling entry (the status sweep's agent publication) wins the
 /// timeline and delivers it; then the key's own delivery
 /// (`deliver_noted`, its second half) runs. One thread, in that order: one
-/// `human` mark after the mail, not one per delivery.
+/// `human` mark after the mail, not one per delivery; and since 6F-8 it is
+/// the burst's (the reconcile read the burst the key opened, published
+/// before its class), so the ring's one `human` row is one record of the
+/// view; and since the review of 6F-8 that row stands where the mark does,
+/// before the verdict's `agent-change` row, as the `human` mark stands
+/// before the `agent` mark. NEGATIVE CONTROLS (by scratch revert): with the
+/// burst not published the reconcile's mark is the latch's alone, and the
+/// key's own delivery marks it again; with the verdict's row recorded
+/// before its mark (as built through 6F-8), or the owed rows paid only by
+/// the key's own delivery, the ring puts the `human` row after the
+/// `agent-change` row the view puts it before.
 #[test]
 fn a_persons_key_a_reconcile_delivered_first_is_marked_once() {
     let h = crate::session_store::test_handle(33);
@@ -701,6 +735,13 @@ fn a_persons_key_a_reconcile_delivered_first_is_marked_once() {
         .filter_map(|r| aterm_slog::encode(r, aterm_slog::Tier::Host).ok())
         .collect();
     assert_eq!(human.len(), 1, "one key, one human mark: {human:?}");
+    assert!(!human[0].contains("why="), "the burst's mark: {human:?}");
+    assert_eq!(
+        human_rows_and_burst_marks(&g),
+        (1, 1),
+        "the ring's row is the view's"
+    );
+    assert_the_view_is_the_ring(&g);
 }
 
 /// T2, A RECONCILE INSIDE A PERSON'S NOTE: delivered mail; a person's key
@@ -743,6 +784,70 @@ fn a_reconcile_inside_a_persons_note_marks_the_key_once() {
         .collect();
     assert_eq!(human.len(), 1, "one key, one human mark: {human:?}");
     assert!(!human[0].contains("reached="), "the key reached: {human:?}");
+    assert_eq!(
+        human_rows_and_burst_marks(&g),
+        (1, 1),
+        "the ring's row is the view's (6F-8)"
+    );
+    assert_the_view_is_the_ring(&g);
+}
+
+/// T2, A MAIL DELIVERY'S RECONCILE (the review of 6F-8): delivered mail; a
+/// person's key that opens a burst is counted; a second mail's delivery
+/// wins the timeline (the fabric's one hook, `record_fact`) and its
+/// reconcile delivers the key, writing the burst's `human` mark before the
+/// second mail's; then the key's own delivery (`deliver_noted`) runs. One
+/// `human` mark after the first mail, the burst's, and the ring's one
+/// `human` row stands before the second mail's `inbox` row, where the view
+/// puts it. NEGATIVE CONTROLS (by scratch revert): the fact's row recorded
+/// before its mark (as built through 6F-8), or the owed rows paid only by
+/// the key's own delivery, put the `human` row after the `inbox` row.
+#[test]
+fn a_persons_key_a_mail_delivery_reconciled_first_keeps_the_rings_order() {
+    let h = crate::session_store::test_handle(36);
+    let _hand = hand_clock(&h.ctx.timeline);
+    let store = crate::session_store::new_store();
+    store.write().unwrap().register(h.clone());
+    claude_busy(&h);
+    let deliver = |off: u64| {
+        let line = format!(
+            "{} off={off} from=h-a kind=task trust=agent text=x",
+            h.ctx.self_id.as_str()
+        );
+        assert!(crate::fabric::cmd_deliver(&store, &line).starts_with("OK"));
+    };
+    deliver(9);
+    let noted = h
+        .ctx
+        .human_input
+        .note_reaching(crate::metrics::now_us(), Gesture::Other, true);
+    assert!(noted.burst, "the first gesture opens a burst");
+    deliver(10);
+    let _ = crate::app_input::deliver_noted(&h.ctx, noted, true);
+    let g = h.ctx.timeline.lock().unwrap();
+    let marks: Vec<String> = g
+        .slog()
+        .log()
+        .window()
+        .filter(|r| r.op == Op::Mark)
+        .skip_while(|r| r.k != Kind::Mail)
+        .filter(|r| matches!(r.k, Kind::Human | Kind::Mail))
+        .map(|r| match r.f.get_word(aterm_slog::Key::Why) {
+            Some(why) => format!("{} why={why}", r.k.word()),
+            None => r.k.word().to_string(),
+        })
+        .collect();
+    assert_eq!(
+        marks,
+        ["mail", "human", "mail"],
+        "the key is the burst's mark, before the second mail"
+    );
+    assert_eq!(
+        human_rows_and_burst_marks(&g),
+        (1, 1),
+        "the ring's row is the view's"
+    );
+    assert_the_view_is_the_ring(&g);
 }
 
 /// T39, A BURST A GESTURE THAT REACHES NO PROGRAM OPENS ANSWERS NO MAIL:

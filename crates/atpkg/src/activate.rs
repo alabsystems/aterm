@@ -1077,11 +1077,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// [`prune_stale_shims`] is the one predicate in this module that removes files from the
-    /// user's `PATH`, so this enumerates the shapes a real `bin/` holds and pins exactly
-    /// which of them a prune of `ay@19` removes and which it leaves. A change that puts the
-    /// prune on the shared `bin/` listing ([`crate::ops::BinScan`]) cannot widen the blast
-    /// radius without failing here.
+    /// [`prune_stale_shims`] is the one predicate here that deletes from the user's `PATH`:
+    /// this pins exactly which shapes of a real `bin/` a prune of `ay@19` removes.
     #[cfg(unix)]
     #[test]
     fn the_prune_deletes_exactly_the_stale_and_leaves_everything_else() {
@@ -1402,16 +1399,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// The mode `bin/` comes out at is a property of the PREFIX SHAPE,
-    /// and activation is where it was easiest to get wrong: these three entry points
-    /// chmod'd their directory to `0700` unconditionally, so every install and update
-    /// re-hardened the ONE directory on the user's PATH (undoing a correct `atpkg link`
-    /// on the way).
-    ///
-    /// A `$HOME` prefix — this fixture, and every install that is not a system prefix —
-    /// must be UNCHANGED by the routing: still exactly `0700`. The probe comparison is the
-    /// shape-agnostic half: `bin/` carries the mode THIS layout gives its own directories,
-    /// whatever shape the layout turns out to be.
+    /// `bin/`'s mode follows the prefix shape: a `$HOME` prefix keeps it `0700`, and every
+    /// activation entry point leaves it at the mode this layout gives its own directories.
     #[cfg(unix)]
     #[test]
     fn a_home_shaped_prefix_keeps_bin_private() {

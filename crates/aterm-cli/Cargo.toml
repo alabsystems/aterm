@@ -67,8 +67,7 @@ aterm-json = { workspace = true }
 # First-party; the one binary links aterm-ctl and amacs already.
 amacs-term = { workspace = true }
 
-# The POSIX console driver (driver_unix.rs: termios raw mode + poll(2) loop);
-# the Windows driver is kernel32 console FFI with no libc.
+# driver_unix.rs: termios raw mode and a poll(2) loop. The Windows driver is kernel32 FFI.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 # `aterm_link::fabric::doctor_summary` probe for `aterm doctor`.
@@ -95,7 +94,3 @@ aterm-time = { workspace = true }
 # test threads fork (Linux's ETXTBSY).
 aterm-spec = { workspace = true }
 
-# The setup doctor's unit-test flush (`macos_doctor::durable_directory`): a plain
-# `fsync(2)` through the counting seam. Already in the graph via aterm-machines.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-aterm-durable = { workspace = true }

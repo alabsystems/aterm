@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BRIDGE LAUNCHER — the half of `Scope::Bridge` that makes the authority
-//! real. A2 built the scope, the seam and the fail-closed halt; this starts the
-//! process that holds them.
+//! The bridge launcher: starts and supervises the process that holds `Scope::Bridge`.
 //!
 //! ```text
 //! [fabric]
@@ -109,9 +107,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// A development build's override for `[fabric] command` (the e2e harness's): read
-/// only through [`aterm_types::dev_seam!`], so a shipped aterm has the config key
-/// alone.
+/// The dev-build override for `[fabric] command`, read only through [`aterm_types::dev_seam!`].
 const FABRIC_COMMAND_ENV: &str = "ATERM_FABRIC_COMMAND";
 
 /// The back-off between relaunches, and its ceiling. A bridge that fails at
@@ -120,17 +116,10 @@ const FABRIC_COMMAND_ENV: &str = "ATERM_FABRIC_COMMAND";
 const RELAUNCH_MIN: Duration = Duration::from_millis(200);
 const RELAUNCH_MAX: Duration = Duration::from_secs(30);
 
-/// How long a child must RUN before its exit counts as "it was working, then it
-/// stopped" rather than "it cannot start".
-///
-/// THE TEST IS DURATION, NOT SPAWN SUCCESS, and that distinction is the whole
-/// point of the ceiling above. `supervise` used to reset the back-off on every
-/// `Ok(child)` — i.e. whenever the spawn succeeded — and escalate only on
-/// `Err`, which is the binary being MISSING. The failure the doc actually names
-/// (a bad cap file, an unreachable broker) spawns fine and exits within
-/// milliseconds, so it reset the floor every time: five process spawns a second,
-/// two socketpairs and two aterm threads each, `bridge_lost` on every cycle, for
-/// the life of the instance, and `RELAUNCH_MAX` unreachable.
+/// How long a child must run before its exit counts as "it was working, then it stopped"
+/// rather than "it cannot start". The test is duration, not spawn success: a bad cap file or
+/// an unreachable broker spawns fine and exits in milliseconds, and resetting on every
+/// successful spawn would relaunch it five times a second for good.
 const RELAUNCH_HEALTHY: Duration = Duration::from_secs(5);
 
 /// How long a QUIT waits for its bridge to take `bye quit` ([`bye`]). The
@@ -170,10 +159,9 @@ pub(crate) fn configured_command(config: &crate::app_config::Config) -> Option<V
     (!argv.is_empty()).then_some(argv)
 }
 
-/// `[fabric] hold_on_bridge_lost`: `true` restores the fail-closed sweep (a
-/// lost bridge holds every session it governed); absent or `false` — the
-/// default since the owner's direction of 2026-09-29 — leaves them running
-/// with an advisory ([`crate::fabric::bridge_lost`]).
+/// `[fabric] hold_on_bridge_lost`: `true` is the fail-closed sweep (a lost bridge holds every
+/// session it governed); absent or `false`, the default, leaves them running with an advisory
+/// ([`crate::fabric::bridge_lost`]).
 #[must_use]
 pub(crate) fn hold_on_bridge_lost(config: &crate::app_config::Config) -> bool {
     config
@@ -183,16 +171,12 @@ pub(crate) fn hold_on_bridge_lost(config: &crate::app_config::Config) -> bool {
         .unwrap_or(false)
 }
 
-/// THE SUPERVISOR RECORD — one per process, and its `armed` half is ONE-WAY.
+/// The process-wide supervisor record; `armed` is a one-way latch.
 ///
-/// scope-waiver: the phrase describes the `static SUPERVISOR` below, and a
-/// `static` is one per process by the language rather than by a discipline an
-/// instance count could check — there is no field whose replication would
-/// falsify it. The half that IS falsifiable is behavioural (one supervisor
-/// THREAD, not one record) and it is enforced in code, not in this prose:
-/// [`arm`] checks `armed` and sets it under ONE hold of that static's lock,
-/// and `supervisor` is registered in the lock-order census's `GUARD_HELPERS`
-/// so its callers' invisible holds are placed in the graph.
+/// [`supervise`] loops forever with no stop handle, so a second supervisor would be a second
+/// relaunch loop: two bridges racing for one `BRIDGE_CONTEXT`. [`arm`] checks and sets `armed`
+/// under one hold of the lock, and `fabric attach` on an armed instance is refused. `supervisor`
+/// is registered in the lock-order census's `GUARD_HELPERS`.
 ///
 /// [`supervise`] loops forever with no stop handle, so a second supervisor would
 /// be a second relaunch loop over the same instance: two bridge children racing
@@ -212,9 +196,8 @@ struct Supervisor {
     armed: Option<Vec<String>>,
     /// The command the instance was launched with, if any.
     configured: Option<Vec<String>>,
-    /// The argv a SEAMLESS UPDATE's outgoing process was armed with by `fabric
-    /// attach` (round seven of the update audit, finding 7), put here by the
-    /// successor's intake ([`carry_attached`]) and taken by [`spawn_supervisor`]
+    /// The argv a seamless update's outgoing process was armed with by `fabric attach`, put
+    /// here by the successor's intake ([`carry_attached`]) and taken by [`spawn_supervisor`]
     /// when no `[fabric] command` is configured.
     carried: Option<Vec<String>>,
 }
@@ -247,17 +230,14 @@ fn supervisor() -> std::sync::MutexGuard<'static, Supervisor> {
 pub(crate) enum ArmError {
     /// The argv was empty. Nothing is armed.
     NoCommand,
-    /// `argv[0]` cannot be executed — see [`preflight`] for `reason`. Refused
-    /// BEFORE the latch closes: nothing is armed, and an `attach` with the
-    /// corrected command is allowed.
+    /// `argv[0]` cannot be executed ([`preflight`] gives `reason`). Refused before the latch
+    /// closes, so nothing is armed and a corrected `attach` is allowed.
     NotExecutable {
         program: String,
         reason: &'static str,
     },
-    /// One is already running, with THIS argv. The request's argv was NOT
-    /// applied — the latch is one-way, which is the whole reason this is an
-    /// error and not an `OK already`: a caller who passed a different command
-    /// must learn that it did not take.
+    /// One is already running, with this argv. The request's argv did not take, which is why
+    /// this is an error and not `OK already`.
     AlreadySupervised(Vec<String>),
     /// The thread could not be spawned. Nothing is armed; a retry is allowed.
     Thread(std::io::Error),
@@ -279,20 +259,15 @@ pub(crate) fn status() -> SupervisorStatus {
     }
 }
 
-/// Launch and SUPERVISE the bridge, if one is configured. Returns whether a
-/// supervisor thread started — `false` means the fabric is off or a thread could
-/// not be spawned, never a half-attached bridge.
+/// Launch and supervise the bridge, if one is configured or carried. Returns whether a
+/// supervisor thread started; `false` never means a half-attached bridge.
 ///
-/// Called once, from the control server, after the socket is bound and
-/// `BRIDGE_CONTEXT` is published: a bridge that attached earlier would find a
-/// half-built process. It is ALSO the one place the configured command is
-/// recorded for `fabric status` and a bare `fabric attach` — so an instance
-/// launched with no `[fabric] command` records `None`, which is what a later
-/// bare `attach` answers `ERR fabric no command` from.
+/// Called once, from the control server, after the socket is bound and `BRIDGE_CONTEXT` is
+/// published: a bridge that attached earlier would find a half-built process. It also records
+/// the configured command for `fabric status` and a bare `fabric attach` (`None` there is
+/// `ERR fabric no command`).
 pub(crate) fn spawn_supervisor(config: &crate::app_config::Config) -> bool {
-    // `[fabric] hold_on_bridge_lost`: read before any bridge can attach, so the
-    // first loss already answers to it (`fabric::bridge_lost`). Absent is the
-    // default since 2026-09-29: a lost bridge halts nothing.
+    // Read before any bridge can attach, so the first loss already answers to it.
     crate::fabric::set_hold_on_bridge_lost(hold_on_bridge_lost(config));
     let configured = configured_command(config);
     let carried = {
@@ -300,14 +275,9 @@ pub(crate) fn spawn_supervisor(config: &crate::app_config::Config) -> bool {
         g.configured = configured.clone();
         g.carried.take()
     };
-    // A BRIDGE ARMED AT RUNTIME COMES BACK AFTER AN UPDATE (round seven of the
-    // update audit, finding 7): with no command configured, the argv the
-    // outgoing process was attached to (`fabric attach`) is armed here, as that
-    // process would have been by its own attach. Before this carry the
-    // successor came up `fabric=absent`, mail stopped, and every carried
-    // `origin=fleet` hold — which only a reconnecting bridge lifts — stood for
-    // good, with nothing said. The configured command, when there is one, is
-    // still the instance's.
+    // With no command configured, the argv the outgoing process was `fabric attach`ed to is
+    // armed across a seamless update; without it the carried `origin=fleet` holds, which only
+    // a reconnecting bridge lifts, would stand for good. A configured command wins.
     let argv = match (configured, carried) {
         (Some(argv), _) => argv,
         (None, Some(argv)) => {
@@ -321,9 +291,9 @@ pub(crate) fn spawn_supervisor(config: &crate::app_config::Config) -> bool {
     };
     match arm(argv) {
         Ok(()) => true,
-        // Startup runs once and before the socket serves a request, so this arm
-        // cannot lose to a `fabric attach`; if it ever did, a supervisor IS
-        // running, which is what the `bool` answers.
+        // Startup runs once and before the socket serves a request, so this arm cannot lose to
+        // a `fabric attach`; if it ever did, a supervisor is running, which is what the `bool`
+        // answers.
         Err(ArmError::AlreadySupervised(_)) => true,
         // The configured command cannot run. It stays RECORDED (`fabric status`
         // names it), it is NOT armed — the supervisor used to retry a typo for
@@ -386,11 +356,9 @@ pub(crate) fn set_command_on_disk_for_tests(argv: Option<Vec<String>>) {
         .unwrap_or_else(|p| p.into_inner()) = argv;
 }
 
-/// Arm the supervisor with `argv` — the ONE seam that starts a `supervise`
-/// thread, shared by the startup path ([`spawn_supervisor`]) and the running
-/// instance's `fabric attach`. Exactly once per process: the check and the set
-/// happen under the record's lock, so two concurrent attaches cannot both
-/// spawn.
+/// Arm the supervisor with `argv`: the one seam that starts a `supervise` thread, for startup
+/// ([`spawn_supervisor`]) and `fabric attach`. Once per process; the check and the set happen
+/// under the record's lock, so two concurrent attaches cannot both spawn.
 ///
 /// `argv` is executed directly, never through a shell — the caller has already
 /// read it the way [`configured_command`] reads the config (a line split on
@@ -404,11 +372,9 @@ pub(crate) fn arm(argv: Vec<String>) -> Result<(), ArmError> {
     if let Some(running) = &guard.armed {
         return Err(ArmError::AlreadySupervised(running.clone()));
     }
-    // BEFORE THE LATCH CLOSES, and under its lock so the check-and-set stays
-    // one step: a program that cannot run arms nothing, and the slot stays
-    // open for the corrected command. (After the `armed` check on purpose: a
-    // caller on an armed instance is owed "already supervised", the answer to
-    // what it asked, whatever it typed.)
+    // Before the latch closes, under its lock: a program that cannot run arms nothing. After
+    // the `armed` check on purpose: on an armed instance the answer is "already supervised",
+    // whatever was typed.
     if let Err(reason) = preflight(&argv[0], std::env::var_os("PATH").as_deref()) {
         return Err(ArmError::NotExecutable {
             program: argv[0].clone(),
@@ -421,15 +387,8 @@ pub(crate) fn arm(argv: Vec<String>) -> Result<(), ArmError> {
         .spawn(move || supervise(&thread_argv))
         .map_err(ArmError::Thread)?;
     guard.armed = Some(argv);
-    // TELL THE ENDPOINT A BRIDGE IS COMING. `fabric=absent` means both "the
-    // first bridge has not attached yet" and "no bridge will ever attach",
-    // and a `post --wait` parked in those two states is owed opposite advice:
-    // wait, versus stop waiting — this instance has no fabric. Recorded here
-    // rather than inferred from the config at the far end, because THIS is
-    // the one place that knows a supervisor really started (a config with a
-    // `[fabric] command` whose thread failed to spawn is the `Err` case), and
-    // it is the same place for `fabric attach` as for startup, so the two
-    // cannot flip the latch at different moments.
+    // Tell the endpoint a bridge is coming, so a `post --wait` under `fabric=absent` waits
+    // rather than stopping. Here because this is the one place that knows a supervisor started.
     crate::fabric::note_bridge_supervised();
     Ok(())
 }
@@ -437,27 +396,12 @@ pub(crate) fn arm(argv: Vec<String>) -> Result<(), ArmError> {
 /// PRE-FLIGHT: whether `argv[0]` can be executed at all, checked BEFORE the
 /// one-way latch closes. `Err` is the `reason=` token the verb reports.
 ///
-/// Measured before this existed: `fabric attach /typo` answered `OK attached`,
-/// the supervisor retried the bad argv for ever (back-off to [`RELAUNCH_MAX`]),
-/// and the instance's only attach slot was wedged for its lifetime — the one
-/// remedy being the relaunch the verb exists to avoid. The same typo in
-/// `[fabric] command` did the same from startup.
-///
-/// The name is resolved the way the spawn will resolve it: a word with a
-/// `/` is a path (relative to this process's cwd, which the child inherits); a
-/// bare word is searched on `PATH` — THIS process's `PATH`, which is the child's
-/// too, since [`filter_child_env`] passes it through — the way `execvp` searches
-/// it, so a candidate that exists but is not executable is skipped, not
-/// reported, and an unset `PATH` falls back to `execvp`'s own default. What is
-/// checked is exactly what a spawn refuses synchronously: existence (`ENOENT`),
-/// and the execute bit on a regular file (`EACCES`). A program that passes and
-/// still fails to start — a script whose interpreter is missing, an ACL the mode
-/// bits do not show — is the supervisor's to retry, logged, which is what every
-/// attach did before this check; a program this refuses is one no retry would
-/// ever have started.
-///
-/// Pure over `(program, path)` so the resolution is tested without mutating the
-/// process environment.
+/// Resolved the way the spawn resolves it: a word with a `/` is a path (relative to the cwd the
+/// child inherits); a bare word is searched on this process's `PATH` (the child keeps it) as
+/// `execvp` does, skipping a non-executable candidate, with `execvp`'s default when `PATH` is
+/// unset. Only what a spawn refuses synchronously is checked: existence (`ENOENT`) and the
+/// execute bit on a regular file (`EACCES`). A program that passes and still fails to start (a
+/// missing interpreter, an ACL) is the supervisor's to retry.
 fn preflight(program: &str, path: Option<&std::ffi::OsStr>) -> Result<(), &'static str> {
     if program.contains('/') {
         return match std::fs::metadata(program) {
@@ -476,10 +420,9 @@ fn preflight(program: &str, path: Option<&std::ffi::OsStr>) -> Result<(), &'stat
     if found { Ok(()) } else { Err("not-on-path") }
 }
 
-/// Any execute bit. What `execve` requires of the mode; the uid-specific
-/// refinement (`access(2)`) is deliberately not attempted here — a wrong pass
-/// falls back to the supervisor's logged retry, a wrong refusal would block a
-/// program that runs.
+/// Any execute bit, as `execve` requires of the mode. The uid-specific check (`access(2)`) is
+/// not attempted: a wrong pass falls back to the supervisor's logged retry, a wrong refusal
+/// would block a program that runs.
 fn is_executable(md: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     md.permissions().mode() & 0o111 != 0
@@ -585,13 +528,10 @@ fn quit_bye(seam: Option<&std::ffi::OsStr>) -> Bye {
     }
 }
 
-/// Clear the record so a test section starts from "nothing armed, nothing
-/// configured". Called from `fabric::with_link_reset`, which serializes every
-/// test that touches the process-wide link — the `armed` half is a one-way
-/// latch in production and only a test may re-open it. A supervisor thread a
-/// previous section armed keeps running; it cannot reach the link (no
-/// `BRIDGE_CONTEXT` is published in a test process, so `attach_fabric_bridge`
-/// serves nothing), it only retries its argv with the back-off above.
+/// Clear the record for a test section; called from `fabric::with_link_reset`, which
+/// serializes the tests that touch the process-wide link. Only a test reopens the latch. A
+/// supervisor thread an earlier section armed keeps retrying its argv but serves nothing: a
+/// test process publishes no `BRIDGE_CONTEXT`.
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
     let mut g = supervisor();
@@ -604,10 +544,9 @@ pub(crate) fn reset_for_tests() {
 }
 
 /// What a seamless update's manifest carries of the supervisor
-/// ([`crate::session_store::SessionHandoff::fabric_attached`]): the armed argv
-/// when `fabric attach` armed it — it differs from the configured command, or
-/// none was configured — and nothing when the configuration armed it (the
-/// successor reads the same configuration) or nothing is armed.
+/// ([`crate::session_store::SessionHandoff::fabric_attached`]): the armed argv when `fabric
+/// attach` armed it (it differs from the configured command), else nothing; the successor
+/// reads the same configuration.
 pub(crate) fn handoff_attached() -> Vec<String> {
     let g = supervisor();
     match &g.armed {
@@ -671,16 +610,9 @@ fn supervise(argv: &[String]) {
     }
 }
 
-/// The next back-off, given the current one and how long the child RAN — `None`
-/// when the spawn itself failed and no child ever existed.
-///
-/// A bridge that ran for [`RELAUNCH_HEALTHY`] is not a configuration error, so
-/// its restart starts from the floor again. Everything else — a spawn failure, or
-/// a child that spawned and exited immediately — DOUBLES, which is the only way
-/// the ceiling is ever reached.
-///
-/// Extracted as a pure function so the escalation is unit-testable without a
-/// process, a clock or a sleep: `supervise` itself never returns.
+/// The next back-off, given the current one and how long the child ran (`None`: the spawn
+/// failed). A child that ran [`RELAUNCH_HEALTHY`] restarts from the floor; a spawn failure or
+/// an immediate exit doubles it, up to the ceiling.
 fn next_backoff(current: Duration, ran: Option<Duration>) -> Duration {
     match ran {
         Some(ran) if ran >= RELAUNCH_HEALTHY => RELAUNCH_MIN,
@@ -688,32 +620,22 @@ fn next_backoff(current: Duration, ran: Option<Duration>) -> Duration {
     }
 }
 
-/// One bridge generation: the child, and a second handle on each near end, so
-/// the lanes can be RETIRED when the child exits.
+/// One bridge generation: the child, and a second handle on each near end, so the lanes can be
+/// retired when the child exits.
 struct Launched {
     child: LaneChild,
     near: [std::os::unix::net::UnixStream; 2],
 }
 
 impl Launched {
-    /// Wait for the bridge to exit, then SHUT BOTH LANES DOWN.
+    /// Wait for the bridge to exit, then shut both lanes down.
     ///
-    /// The fail-closed halt fires when a near end reads its end-of-file, and
-    /// that used to come only when the LAST copy of the far end closed — which
-    /// is not the bridge's exit when another process holds a copy: a child this
-    /// process spawned elsewhere caught the far end between `socketpair` and
-    /// its `F_SETFD` (49 of 400 plain spawns racing a `pair()`, measured in the
-    /// 2026-09-30 review), or one the bridge itself left behind. That holder
-    /// kept the old generation's lanes — `Scope::Bridge` authority — served,
-    /// and the halt unfired, for as long as it lived. `shutdown` acts on the
-    /// socket, not on a descriptor, so the serving threads read end-of-file now
-    /// and every copy of the far end is dead with it: the authority ends with
-    /// the process it was handed to.
-    ///
-    /// Each half on its own ([`aterm_uds::hangup::hang_up`]): a bridge that
-    /// half-closed a lane before it exited has shut that near end's read half,
-    /// and Darwin refuses a both-ways `shutdown` of it, shutting NOTHING — the
-    /// holder of the far end went on reading what the lane wrote.
+    /// A near end reads end-of-file only once every copy of the far end closes, and another
+    /// process can hold one (a child spawned elsewhere between `socketpair` and its `F_SETFD`, or
+    /// one the bridge left behind). `shutdown` acts on the socket, so the serving threads read
+    /// end-of-file now and the `Scope::Bridge` authority ends with the bridge process. Each half
+    /// goes on its own ([`aterm_uds::hangup::hang_up`]): Darwin refuses a both-ways `shutdown` of
+    /// a near end whose read half the bridge already shut.
     fn wait_and_retire(mut self) -> std::io::Result<std::process::ExitStatus> {
         let status = self.child.wait();
         for lane in &self.near {
@@ -744,20 +666,10 @@ fn launch_serving(
     let near = [near_verb.try_clone()?, near_push.try_clone()?];
     let mut cmd = LaneCommand::new(&argv[0]);
     cmd.args(&argv[1..])
-        // THE ENVIRONMENT IS FILTERED, not inherited whole. A spawn inherits the
-        // parent block by default, which handed the one process holding
-        // `Scope::Bridge` aterm's own identity, its control-socket path, and — when
-        // this aterm is itself nested — the OUTER instance's `ATERM_EDGE_TOKENS`
-        // path, plus the `ATERM_EDGE_*` bearer secrets themselves when that outer
-        // aterm is an older one that still injected them (audit finding F1 moved
-        // them into a 0600 file). The whole block replaced by the deny-listed
-        // one is the same rule the PTY spawn seam applies to a child shell
-        // (`aterm-pty`'s `build_child_env`), applied at this seam because that
-        // one does not cover it.
+        // The whole environment is the filtered one, not the inherited block plus edits.
         .env_exactly(filter_child_env(std::env::vars_os()))
-        // The child's stdin is NOTHING. Its two real channels are fds 3 and 4,
-        // and leaving stdin attached to aterm's own would let a bridge read
-        // whatever aterm was launched with.
+        // Stdin is null: the real channels are fds 3 and 4, and an inherited stdin would let
+        // the bridge read whatever aterm was launched with.
         .stdin(ChildStdio::Null)
         .stdout(ChildStdio::Inherit)
         .stderr(ChildStdio::Inherit);
@@ -767,14 +679,10 @@ fn launch_serving(
         OwnedFd::from(far_push),
     )?;
 
-    // ATTACH BOTH, and only after the spawn succeeded: a near end served against
-    // a child that never started would report a bridge (`fabric=stalled`, the
-    // attach state) that does not exist. Either end closing fires the
-    // fail-closed halt, which is exactly §11.2's "when either fd closes".
-    // ONE GENERATION PER LAUNCH, shared by both lanes: either lane closing still
-    // reports the link lost, and neither lane's late-unwinding guard can report a
-    // LATER launch's live bridge disconnected. See
-    // [`crate::fabric::BridgeGeneration`].
+    // Attach only after the spawn succeeded: a near end served against a child that never
+    // started would report a bridge (`fabric=stalled`) that does not exist. One generation per
+    // launch, shared by both lanes, so a late-unwinding guard cannot report a later launch's
+    // bridge lost (`crate::fabric::BridgeGeneration`).
     let generation = crate::fabric::next_bridge_generation();
     if !attach(near_verb, generation) {
         aterm_log::warn!("fabric bridge verb lane could not be served");
@@ -785,7 +693,7 @@ fn launch_serving(
     Ok(Launched { child, near })
 }
 
-/// aterm's environment with the deny list applied — what the bridge child gets.
+/// aterm's environment minus [`aterm_types::domain::is_ai_env_key`]: what the bridge child gets.
 ///
 /// A DENY LIST AND NOT AN ALLOW LIST, on purpose: `aterm-link serve` legitimately
 /// needs `HOME`/`XDG_STATE_HOME` for its state directory, `PATH`, and the locale,
@@ -854,11 +762,9 @@ mod tests {
             .to_string()
     }
 
-    /// THE PRE-FLIGHT RESOLVES `argv[0]` THE WAY THE SPAWN WILL. A path is a
-    /// path; a bare name walks `PATH` like `execvp` — a directory that holds a
-    /// non-executable file of that name is skipped, not reported — and an unset
-    /// `PATH` is the libc default, not "nowhere". Pure over the `PATH` value,
-    /// so nothing here touches the process environment.
+    /// The pre-flight resolves `argv[0]` the way the spawn will: a path is a path; a bare name
+    /// walks `PATH` like `execvp`, skipping a non-executable match; an unset `PATH` is the
+    /// libc default.
     #[test]
     fn the_pre_flight_resolves_argv0_the_way_spawn_will() {
         use std::ffi::OsStr;
@@ -884,8 +790,8 @@ mod tests {
         );
         assert_eq!(preflight("true", None), Ok(()));
 
-        // execvp semantics: the first PATH entry holds a `true` that is NOT
-        // executable; the search moves on to the one that is.
+        // execvp semantics: the first PATH entry holds a `true` that is not executable; the
+        // search moves on to the one that is.
         let dir = std::env::temp_dir().join(format!("aterm-fabric-path-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("true"), b"not a program\n").unwrap();
@@ -915,14 +821,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **THE LANES ARE RETIRED WHEN THE BRIDGE EXITS, whoever else holds a far
-    /// end** (2026-09-30 review, F2). The bridge here leaves a process behind
-    /// holding both far ends — what a child spawned elsewhere in this process
-    /// holds when it caught a lane between `socketpair` and its `F_SETFD`. The
-    /// recorder holds the near ends as the serving threads do. Once the bridge
-    /// is reaped, the near verb end must read its end-of-file — the read the
-    /// fail-closed halt waits on — though the holder lives on (before: the read
-    /// blocked until the holder died, here past the hang detector).
+    /// The lanes are retired when the bridge exits though a leftover process holds both far
+    /// ends: once the bridge is reaped, the near verb end reads the end-of-file the
+    /// fail-closed halt waits on.
     #[test]
     fn the_lanes_are_retired_when_the_bridge_exits_whoever_else_holds_a_far_end() {
         use std::io::{BufRead as _, Read as _};
@@ -974,16 +875,11 @@ mod tests {
         );
     }
 
-    /// A LANE THE BRIDGE HALF-CLOSED IS RETIRED TOO. The stand-in bridge shuts
-    /// its verb lane's write half (with `perl`: a shell cannot `shutdown`) and
-    /// exits, leaving a holder of both far ends behind, as above. The near verb
-    /// end already reads end-of-file from the half-close, so what the retire
-    /// must still end is the other direction: once the bridge is reaped, a
-    /// write to the lane must fail, where it reached the holder before.
-    ///
-    /// NEGATIVE CONTROL (run by restoring the both-ways `shutdown`): Darwin
-    /// refused it for a near end whose read half the bridge's half-close had
-    /// shut (`ENOTCONN`) and shut nothing, so the write still succeeded.
+    /// A lane the bridge half-closed is retired too. The stand-in (`perl`: a shell cannot
+    /// `shutdown`) shuts its verb lane's write half and exits, leaving a holder of both far
+    /// ends; once it is reaped, a write to the lane must fail. Negative control (a both-ways
+    /// `shutdown`): Darwin refuses it on a near end whose read half is shut (`ENOTCONN`),
+    /// shutting nothing, and the write succeeds.
     #[test]
     fn a_lane_the_bridge_half_closed_is_retired_whoever_else_holds_a_far_end() {
         use std::io::{BufRead as _, Write as _};
@@ -1133,11 +1029,8 @@ mod tests {
         );
     }
 
-    /// THE COMMAND NEVER REACHES A SHELL. It is split on whitespace and executed
-    /// directly, so a metacharacter is one more ARGUMENT and not a second
-    /// command — otherwise every byte of this config key would be an injection
-    /// surface for whoever can write the file, and the config file is exactly
-    /// what a prompt-injected agent with Owner scope would reach for.
+    /// The command never reaches a shell: a metacharacter is one more argument, not a second
+    /// command.
     #[test]
     fn a_metacharacter_is_an_argument_and_not_a_second_command() {
         let cfg = Config::default();
@@ -1155,17 +1048,8 @@ mod tests {
             );
         });
     }
-    /// A CHILD THAT SPAWNS AND EXITS AT ONCE ESCALATES — the failure
-    /// `RELAUNCH_MIN`/`RELAUNCH_MAX`'s own doc names ("a bad cap file, an
-    /// unreachable broker").
-    ///
-    /// `supervise` used to reset the back-off on every `Ok(child)`, i.e. whenever
-    /// the spawn SUCCEEDED, and escalate only on `Err` — which is the
-    /// binary being missing. A bad `--cap-file` makes `Bridge::new` fail,
-    /// `aterm-link serve` print and exit 1 in milliseconds, and `launch_once`
-    /// still return `Ok`: five spawns a second, two socketpairs and two aterm
-    /// threads each, `bridge_lost` on every cycle, for the life of the instance,
-    /// with `RELAUNCH_MAX` unreachable.
+    /// A child that spawns and exits at once (a bad cap file, an unreachable broker) escalates
+    /// its back-off; only one that ran [`RELAUNCH_HEALTHY`] resets it.
     #[test]
     fn a_bridge_that_exits_immediately_escalates_its_backoff() {
         let instant = Duration::from_millis(5);
@@ -1183,11 +1067,11 @@ mod tests {
         }
         assert_eq!(backoff, RELAUNCH_MAX);
 
-        // A spawn failure escalates exactly as it always did.
+        // A spawn failure escalates.
         assert_eq!(next_backoff(RELAUNCH_MIN, None), RELAUNCH_MIN * 2);
 
-        // A bridge that RAN is not a configuration error: back to the floor, so a
-        // bridge somebody killed comes back promptly.
+        // A bridge that ran is not a configuration error: back to the floor, so a bridge
+        // somebody killed comes back promptly.
         assert_eq!(
             next_backoff(RELAUNCH_MAX, Some(RELAUNCH_HEALTHY)),
             RELAUNCH_MIN
@@ -1207,17 +1091,8 @@ mod tests {
         );
     }
 
-    /// THE BRIDGE CHILD DOES NOT INHERIT ATERM'S SECRETS.
-    ///
-    /// `Command` inherits the parent block by default and this seam applied no
-    /// filter, so the one process holding `Scope::Bridge` also held — in a
-    /// `/proc`-readable environment block — aterm's own identity, its
-    /// control-socket path, and, when this aterm is itself nested under an older
-    /// aterm, the OUTER instance's `ATERM_EDGE_READ`/`WRITE`/`SIGNAL` bearer
-    /// secrets: the values audit finding F1 moved out of env into a 0600 file,
-    /// which an aterm from before that move still injects. The module
-    /// header claimed the child got "none of aterm's own environment beyond what
-    /// it needs" while it got all of it.
+    /// The bridge child inherits none of aterm's identity, edge secrets, outer fabric
+    /// credentials or AI-tool variables.
     #[test]
     fn the_bridge_child_inherits_no_identity_no_socket_and_no_edge_secret() {
         let pair = |k: &str, v: &str| (std::ffi::OsString::from(k), std::ffi::OsString::from(v));
@@ -1284,12 +1159,8 @@ mod tests {
         );
     }
 
-    /// A NON-UTF-8 key that carries a deny-listed PREFIX is still denied
-    /// (2026-09-27). The filter let every non-UTF-8 key through on the grounds
-    /// that "every deny-listed name is ASCII" — true of the exact names, but the
-    /// prefixes match a key's leading bytes, so `ANTHROPIC_\xffX` kept its
-    /// `ANTHROPIC_` and reached the bridge child. The last key is the control: a
-    /// non-UTF-8 key with no deny-listed prefix still passes.
+    /// A non-UTF-8 key with a deny-listed prefix is still denied (a prefix matches leading
+    /// bytes); one with no such prefix passes.
     #[cfg(unix)]
     #[test]
     fn a_non_utf8_key_with_a_denied_prefix_does_not_reach_the_bridge_child() {
@@ -1307,17 +1178,9 @@ mod tests {
         assert_eq!(kept, vec![b"PLAIN_\xffKEY".to_vec()]);
     }
 
-    /// THE SUPERVISOR IS ARMED ONCE PER PROCESS, AND THE LATCH IS ONE-WAY.
-    ///
-    /// `supervise` loops forever with no stop handle, so a second `arm` would be
-    /// a second relaunch loop over the same instance. The check-and-set is under
-    /// one lock, the endpoint's `supervised` latch flips at the same moment, and
-    /// an empty argv arms nothing — `launch_once` indexes `argv[0]`, and a
-    /// thread panicking on it would have "armed" a supervisor that runs nothing.
-    ///
-    /// The argv names a program that does not exist, ON PURPOSE: the spawn
-    /// fails at once, so the thread this leaks into the test process spawns no
-    /// child and only sleeps out its back-off (to the 30 s ceiling).
+    /// The supervisor arms once per process and the latch is one-way; an empty argv arms
+    /// nothing. The armed program exits at once, so the thread this leaks only re-spawns it
+    /// under the back-off.
     #[test]
     fn the_supervisor_arms_once_and_records_what_it_runs() {
         crate::fabric::with_link_reset(|| {
@@ -1330,10 +1193,8 @@ mod tests {
                 "an empty argv must not flip the endpoint's latch"
             );
 
-            // THE PRE-FLIGHT: a program that cannot run is refused BEFORE the
-            // latch closes — nothing armed, nothing flipped — so the slot is
-            // not wedged by a typo. Measured before it existed: `/nonexistent`
-            // was `Ok`, and the only remedy was a relaunch.
+            // A program that cannot run is refused before the latch closes: nothing armed,
+            // nothing flipped.
             for (argv0, reason) in [
                 ("/nonexistent/aterm-link", "not-found"),
                 ("/", "not-a-file"),
@@ -1355,8 +1216,7 @@ mod tests {
                     "{argv0} must not flip the endpoint's latch"
                 );
             }
-            // A regular file with no execute bit — the shape a path to a config
-            // file, or a script never `chmod +x`ed, hits.
+            // A regular file with no execute bit (a config file, a script never `chmod +x`ed).
             let dir =
                 std::env::temp_dir().join(format!("aterm-fabric-preflight-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
@@ -1378,7 +1238,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             assert!(status().armed.is_none() && !crate::fabric::bridge_supervised());
 
-            // AND THE SLOT IS STILL OPEN: the corrected command arms.
+            // The slot is still open: the corrected command arms.
             let argv = vec![true_program(), "serve".to_string()];
             assert!(
                 arm(argv.clone()).is_ok(),
@@ -1387,10 +1247,8 @@ mod tests {
             assert!(crate::fabric::bridge_supervised(), "arming IS the latch");
             assert_eq!(status().armed.as_deref(), Some(argv.as_slice()));
 
-            // The second arm is refused and names what is running — the
-            // request's argv did NOT take, and a caller must be told so. The
-            // latch check comes BEFORE the pre-flight (this argv would fail
-            // it): "already supervised" is the answer to what was asked.
+            // A second arm is refused and names what runs. The latch check precedes the
+            // pre-flight (this argv would fail it).
             let second = vec!["/nonexistent/other".to_string()];
             match arm(second) {
                 Err(ArmError::AlreadySupervised(running)) => assert_eq!(running, argv),
@@ -1404,14 +1262,8 @@ mod tests {
         });
     }
 
-    /// THE STARTUP PATH RECORDS THE CONFIGURED COMMAND EVEN WHEN IT ARMS NOTHING.
-    ///
-    /// `fabric status` and a bare `fabric attach` read it, and an instance
-    /// launched with no `[fabric] command` must record `None` — that is the
-    /// `ERR fabric no command` a later bare attach answers from — while one
-    /// launched WITH a command records it and arms through the same seam the
-    /// verb uses, so the two cannot flip the endpoint's latch at different
-    /// moments.
+    /// The startup path records the configured command (`None` when there is none, which a
+    /// bare `fabric attach` answers `ERR fabric no command` from) and arms through [`arm`].
     #[test]
     fn the_startup_path_records_the_configured_command_and_arms_through_the_one_seam() {
         crate::test_env::scoped_unset(FABRIC_COMMAND_ENV, || {
@@ -1421,10 +1273,8 @@ mod tests {
                 assert!(s.armed.is_none() && s.configured.is_none());
                 assert!(!crate::fabric::bridge_supervised());
             });
-            // A configured command that cannot run: RECORDED — `fabric status`
-            // names it and a bare `attach` re-tries it — but NOT armed, where the
-            // supervisor used to retry the typo for ever, and the latch says so
-            // (`post` answers `no-bridge=1`, which is the truth).
+            // A configured command that cannot run is recorded but not armed, and the latch
+            // says so (`post` answers `no-bridge=1`).
             crate::fabric::with_link_reset(|| {
                 assert!(!spawn_supervisor(&with_command(Some(
                     "/nonexistent/aterm-link serve --fleet lab"
@@ -1461,16 +1311,9 @@ mod tests {
         });
     }
 
-    /// ROUND SEVEN OF THE UPDATE AUDIT, FINDING 7: a bridge armed at runtime
-    /// with `fabric attach` rides the handoff manifest and is armed again by the
-    /// successor, which has no command configured — before the carry it came up
-    /// `fabric=absent` with its carried fleet holds unliftable. NEGATIVE
-    /// CONTROLS: a bridge the CONFIGURATION armed is not carried (the successor
-    /// reads the same configuration), and a configured command wins over a
-    /// carried one.
-    ///
-    /// FAILS WITHOUT THE FIX: the manifest has no field and the successor's
-    /// `status().armed` is `None`.
+    /// A bridge armed at runtime with `fabric attach` rides the handoff manifest and is armed
+    /// again by a successor with no command configured. Controls: a bridge the configuration
+    /// armed is not carried, and a configured command wins over a carried one.
     #[test]
     fn a_runtime_attached_bridge_is_armed_again_after_an_update() {
         use crate::session_store::{SessionHandoff, SessionStore};

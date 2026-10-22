@@ -619,13 +619,11 @@ fn linear_mode_matches_cpu_and_keeps_procedural_exact() {
     );
 }
 
-/// A SUBSCRIPT cell (`Script::Sub`, chrome-only: the Claude footer's facts)
-/// draws its glyph smaller and lower — no glyph's ink, a parenthesis taller
-/// than the letters included, above `SUB_CEILING` — the rule glyph beside it
-/// full size; a nudged one draws the same glyph moved sideways by exactly its
-/// nudge, a fraction of a pixel included (its ink's centre, weighted by
-/// coverage); and the GPU, which takes the CPU's raster and placement,
-/// matches it.
+/// A subscript cell (`Script::Sub`, chrome-only) draws its glyph smaller and
+/// lower, with no ink above `SUB_CEILING` (a parenthesis taller than the letters
+/// included), while the rule glyph beside it stays full size. A nudged one moves
+/// sideways by exactly its nudge, to a fraction of a pixel (its coverage-weighted
+/// ink centre). The GPU takes the CPU's raster and placement, and matches it.
 #[test]
 fn sub_script_gpu_matches_cpu() {
     use aterm_core::terminal::Script;

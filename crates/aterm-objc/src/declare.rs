@@ -5,18 +5,10 @@
 //! `class_addIvar`, `class_addProtocol`, `objc_registerClassPair`, plus
 //! `objc_msgSendSuper` for `[super …]`.
 //!
-//! What the declared classes need, and so what this provides:
-//!
-//! * Any superclass (`NSObject`, `NSView`, `NSWindow`, `NSApplication`,
-//!   `NSResponder` in practice).
-//! * One Rust value per instance (`type Ivars = T`), dropped correctly, rather
-//!   than per-field ivars.
-//! * An automatic `dealloc` that drops the ivars and calls `[super dealloc]`;
-//!   no user-facing `dealloc` hook. [`IvarSlot`]'s flag keeps that drop sound
-//!   if `dealloc` runs before the ivars were written.
-//! * Protocol claims via `class_addProtocol`.
-//! * Superclass sends through [`crate::msg_super`] and
-//!   [`ObjcSuper`](crate::ObjcSuper).
+//! A declared class has any superclass, one Rust value per instance
+//! (`type Ivars = T`) rather than per-field ivars, an automatic `dealloc` that
+//! drops the ivars and calls `[super dealloc]` ([`IvarSlot`]'s flag keeps that
+//! sound if `dealloc` runs before the ivars were written), and protocol claims.
 //!
 //! Ivars drop on whatever thread performs the last release (`S3` in the crate
 //! docs). Instantiation is gated by [`MainThread`]; the release end is not.
@@ -33,8 +25,8 @@ use crate::runtime::{
 /// The name of the single ivar every declared class carries.
 pub(crate) const IVAR_NAME: &CStr = c"_atermIvars";
 
-/// A witness that the caller asked, on this thread, whether it is the process
-/// main thread, and got yes.
+/// A witness that the caller asked `+[NSThread isMainThread]` on this thread
+/// and got yes.
 ///
 /// `alloc_init` and `alloc_ivars` take one, so a declared class cannot be
 /// instantiated (and its Rust ivars born) off the main thread without an
@@ -89,9 +81,8 @@ impl MainThread {
     ///
     /// # Safety
     /// The caller must be on the process main thread, or know that the class
-    /// has no main-thread affinity and its `Ivars` may be dropped on whatever
-    /// thread performs the last release (`S3`). Nothing that reaches AppKit
-    /// satisfies anything but the first.
+    /// has no main-thread affinity and its `Ivars` may be dropped on any thread
+    /// (`S3`).
     #[must_use]
     pub const unsafe fn new_unchecked() -> Self {
         Self::mint()
@@ -121,8 +112,6 @@ impl ClassMeta {
     #[inline]
     #[must_use]
     pub fn class(&self) -> ClassPtr {
-        // The address came from FFI, so its provenance is already exposed; Rust
-        // never dereferences a class pointer, only hands it back to the runtime.
         // SAFETY: `class_addr` is private and written only by
         // `ClassBuilder::register`, from the pair `objc_registerClassPair` just
         // registered; classes are never disposed, so it is still a class.
@@ -155,9 +144,8 @@ impl<T> IvarSlot<T> {
     /// # Safety
     /// `slot` must point at a properly aligned, writable `IvarSlot<T>` whose
     /// `initialized` flag is `false` (freshly `+alloc`ed; refilling would leak
-    /// the old value). Alignment holds because
-    /// [`crate::ClassBuilder::add_rust_ivar`] refuses a `T` aligned above the
-    /// instance base's 16 bytes (`S4`).
+    /// the old value). Alignment holds because `add_rust_ivar` refuses a `T`
+    /// aligned above 16 (`S4`).
     pub unsafe fn init(slot: *mut Self, value: T) {
         // SAFETY: `slot` is aligned, writable and unfilled. Writing the whole
         // struct is one initialising store with no read of the old bytes.
@@ -172,10 +160,8 @@ impl<T> IvarSlot<T> {
     /// Borrow the value.
     ///
     /// The initialised flag is checked in release builds too: the class is
-    /// registered under a public name, so Objective-C code (a nib, a framework
-    /// `+alloc`/`-init`, `NSClassFromString`) can mint an instance whose slot
-    /// was never written. A panic in a trampoline aborts, so the failure is loud.
-    /// The cost is one load and a predictable branch.
+    /// registered under a public name, so Objective-C code (a nib,
+    /// `NSClassFromString`) can mint an instance whose slot was never written.
     ///
     /// The flag does not guard against a substituting initializer (one that
     /// releases `self` and returns a different object): a sibling class whose
@@ -186,9 +172,7 @@ impl<T> IvarSlot<T> {
     ///
     /// # Safety
     /// `slot` must point at an aligned, readable `IvarSlot<T>` (initialised or
-    /// zeroed) that outlives `'a`. The safe `ivars()` accessor can rely on
-    /// alignment because `add_rust_ivar` refuses any `T` needing more than the
-    /// 16 bytes `class_createInstance` guarantees.
+    /// zeroed) that outlives `'a`.
     #[must_use]
     pub unsafe fn get<'a>(slot: *const Self) -> &'a T {
         // SAFETY: `slot` is aligned, readable and live for `'a`; the flag is
@@ -277,20 +261,12 @@ impl ClassBuilder {
     /// encoding, so the runtime never treats the bytes as an object to retain,
     /// release or scan.
     ///
-    /// `T` may not be aligned above 16 (`S4`). `class_createInstance` allocates
+    /// `T` may not be aligned above 16 (`S4`): `class_createInstance` allocates
     /// with `malloc`, which guarantees only 16-byte alignment, and
-    /// `class_addIvar` aligns the ivar's offset but not the base. Over 4,096
-    /// raw `+alloc`s per class:
-    ///
-    /// ```text
-    /// Ivars align  ivar offset  slot misaligned    base not 32-aligned
-    ///        16         16          0 / 4096          2042 / 4096
-    ///        32         32         19 / 4096            19 / 4096
-    ///        64         64          9 / 4096             9 / 4096
-    /// ```
-    ///
-    /// A misaligned slot makes `IvarSlot::init`'s write and every `&T`
-    /// undefined behaviour, so an over-aligned `T` is refused at compile time:
+    /// `class_addIvar` aligns the ivar's offset but not the base (a 32-aligned
+    /// slot landed misaligned in 19 of 4,096 `+alloc`s). A misaligned slot
+    /// makes every `&T` undefined behaviour, so an over-aligned `T` is refused
+    /// at compile time:
     ///
     /// ```compile_fail
     /// #[repr(align(32))]
@@ -312,9 +288,7 @@ impl ClassBuilder {
     /// );
     /// ```
     pub fn add_rust_ivar<T>(&mut self) {
-        // The instance base is only 16-aligned (`malloc`) and the slot sits at
-        // a fixed offset from it, so a `T` wanting more would be misaligned in
-        // some instances.
+        // `S4`: see the doc above.
         const {
             assert!(
                 align_of::<IvarSlot<T>>() <= 16,
@@ -367,13 +341,9 @@ impl ClassBuilder {
 
     /// Declare conformance to a protocol, by name.
     ///
-    /// The protocol object comes from [`protocol_or_register`], which supplies a
-    /// name-only protocol when the host framework does not register one (e.g.
-    /// `NSApplicationDelegate` on some macOS releases), so launch never depends
-    /// on it.
-    ///
-    /// Panics only if the runtime refuses the claim (no protocol can be
-    /// supplied, or `class_addProtocol` answers NO).
+    /// [`protocol_or_register`] supplies a name-only protocol when the host
+    /// framework does not register one, so launch never depends on it. Panics only
+    /// if `class_addProtocol` answers NO.
     pub fn add_protocol(&mut self, name: &'static CStr) {
         let proto = protocol_or_register(name);
         // SAFETY: `self.cls` is a live class pair and `proto` a live, immortal
@@ -467,12 +437,9 @@ pub unsafe fn send_super_dealloc(this: Id, cls: ClassPtr) {
 
 /// Abort the process after a Rust panic reached an `extern "C"` boundary.
 ///
-/// Unwinding out of an ObjC frame is undefined behaviour, so every trampoline
-/// [`crate::declare_class!`] generates catches and lands here.
-///
-/// Writes straight to stderr and ignores the result, allocating nothing:
-/// `eprintln!` panics on a closed or full stderr (normal for a GUI app), and a
-/// panic here would unwind out of the frame this exists to protect.
+/// Writes straight to stderr and ignores the result: `eprintln!` panics on a
+/// closed or full stderr (normal for a GUI app), and a panic here would unwind
+/// out of the frame this exists to protect.
 #[cold]
 #[inline(never)]
 pub fn abort_on_unwind(method: &str) -> ! {

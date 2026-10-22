@@ -119,9 +119,8 @@ fn empty_inbox_get_reports_its_header_without_fabricating_a_body() {
     assert_eq!(output.stderr, b"aterm-ctl: OK 0\n");
 }
 
-/// `offscreen`'s header places its rows (`last=` is the next poll's `since=`,
-/// `screen_rows=` splits the archive from the screen): it goes to stderr with
-/// the rows on stdout, as `inbox`'s does — empty or not, once.
+/// `offscreen`'s header (`last=`, `screen_rows=`) goes to stderr once, empty or not, with
+/// the rows on stdout, as `inbox`'s does.
 #[test]
 fn offscreen_keeps_its_header_on_stderr_and_its_rows_on_stdout() {
     let header = "OK 3 first=41 last=42 lost=0 breaks=0 back=1 epoch=2 origin=5 alt=1 seq=9 \

@@ -437,11 +437,10 @@ mod tests {
             census.solo.admitted.len(),
             census.closure.admitted.len() + census.closure.refused
         );
-        assert_eq!(census.cask.admitted, ["zipped"]);
+        assert_eq!(census.cask.admitted, ["zipped", "imaged"]);
         assert_eq!(
             census.cask.ranked(),
             [
-                ("cask <name> needs its Homebrew extraction recipe", 1, 1),
                 (
                     "cask <name> ships a pkg installer (root work abrew never does itself)",
                     1,
@@ -463,7 +462,7 @@ mod tests {
             text.contains("  admitted solo, refused with closure: 2\n   openssl needs its Homebrew build/relocation recipe (its bottle relocates: cellar :any): 2 (1 alone)\n"),
             "{text}"
         );
-        assert!(text.contains("casks: 1/4 (25.0%)\n"), "{text}");
+        assert!(text.contains("casks: 2/4 (50.0%)\n"), "{text}");
         let json = census.json();
         assert_eq!(
             json.pointer("/formulae/closure").and_then(Value::as_u64),
@@ -471,7 +470,7 @@ mod tests {
         );
         assert_eq!(
             json.pointer("/casks/admitted").and_then(Value::as_u64),
-            Some(1)
+            Some(2)
         );
     }
 
@@ -512,7 +511,7 @@ mod tests {
                 .contains_key("<name> needs a newer macOS")
         );
         // Casks judge the same machine: neither changes what the fixture's do.
-        assert_eq!(big_sur.cask.admitted, ["zipped"]);
+        assert_eq!(big_sur.cask.admitted, ["zipped", "imaged"]);
     }
 
     #[test]

@@ -16,7 +16,9 @@
 //! after each operation) and lets the device move between threads (`Send`):
 //! nothing stays current behind the guard's back. A nested `enter` on the
 //! thread that already holds the device is a no-op guard, so a resource can be
-//! dropped inside an encode.
+//! dropped inside an encode, and a present binds once for all its steps (on
+//! NVIDIA's GLX a bind and a release each cost milliseconds). A latched loss
+//! refuses the nested guards too.
 //!
 //! # Displays
 //!
@@ -483,6 +485,16 @@ impl GlShared {
 
     /// Make the context current on this thread (see the module header).
     pub(crate) fn enter(&self) -> Result<Current<'_>, String> {
+        // First, so a nested guard refuses too: a present holds one guard
+        // throughout, and a loss latched in it ends the present at its next
+        // step's guard, as when every step bound the context itself.
+        if self.lost() {
+            #[cfg(not(target_arch = "wasm32"))]
+            let why = self.loss_reason().unwrap_or("EGL_CONTEXT_LOST");
+            #[cfg(target_arch = "wasm32")]
+            let why = "EGL_CONTEXT_LOST";
+            return Err(format!("gl: the context is lost ({why})"));
+        }
         if HELD.with(Cell::get) == std::ptr::from_ref(self) {
             return Ok(Current {
                 shared: self,
@@ -494,13 +506,6 @@ impl GlShared {
                 "gl: another GL device is current on this thread; the arm does not nest devices"
                     .to_owned(),
             );
-        }
-        if self.lost() {
-            #[cfg(not(target_arch = "wasm32"))]
-            let why = self.loss_reason().unwrap_or("EGL_CONTEXT_LOST");
-            #[cfg(target_arch = "wasm32")]
-            let why = "EGL_CONTEXT_LOST";
-            return Err(format!("gl: the context is lost ({why})"));
         }
         let guard = self
             .lock
@@ -1261,8 +1266,9 @@ mod tests {
     use super::super::test_device as device;
 
     /// The device makes its context current under the guard, releases it on
-    /// drop (another thread can then take it), nests on one thread, and
-    /// refuses a second device while the first is held on the thread.
+    /// drop (another thread can then take it), nests on one thread until a
+    /// loss latches, and refuses a second device while the first is held on
+    /// the thread.
     #[test]
     fn the_context_is_current_only_inside_a_guard_and_moves_between_threads() {
         let dev = device();
@@ -1302,6 +1308,18 @@ mod tests {
             assert!(err.contains("held on this thread"), "{err}");
         }
         assert!(current().is_null(), "the outer guard released the context");
+        // A loss latched while a guard is held refuses the nested guards
+        // after it, as it refuses a first one.
+        {
+            let _held = other.enter().expect("enter the other device");
+            other.0.latch_lost("gl: drilled");
+            let err = other
+                .enter()
+                .err()
+                .expect("a nested enter after a latched loss");
+            assert!(err.contains("lost (gl: drilled)"), "{err}");
+        }
+        assert!(current().is_null(), "the refused nested guard kept nothing");
         let moved = dev.clone();
         std::thread::spawn(move || {
             let cur = moved.enter().expect("enter on another thread");

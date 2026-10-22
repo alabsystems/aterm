@@ -284,22 +284,10 @@ fn an_extra_retain_defers_the_drop() {
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
-/// `MainThread::new()` is a REAL query, and it says no here.
-///
-/// W3's judge built the counterexample this witness exists for: a declared
-/// class registered, instantiated and deallocated on a `std::thread::spawn`ed
-/// thread, with no witness, NOT ONE `unsafe` token at the call site, and no
-/// diagnostic anywhere — the ivar type's Rust destructor running on a foreign
-/// thread through the front door. That program is now `error[E0061]` (see the
-/// `compile_fail` doctest on `declare_class!`), which is the arming; this test
-/// is the other half, the one that keeps the witness from being a rubber stamp.
-///
-/// A token that could always be minted would prove nothing, so what is asserted
-/// is that the checked constructor REFUSES: on a libtest worker (which is not
-/// the process main thread — `pthread_main_np()` is 0 there even under
-/// `--test-threads=1`, measured twice this campaign) and on a thread this test
-/// spawns itself. The affirmative half cannot live in libtest by construction
-/// and is proved by the AppKit driver instead.
+/// `MainThread::new()` is a real query: it refuses a libtest worker and a thread this test
+/// spawns, so the witness is no rubber stamp. Instantiating without a witness does not compile
+/// (the `compile_fail` doctest on `declare_class!`); the affirmative half needs the process main
+/// thread, which libtest never gives, and `crates/aterm-gui/examples/objc_event_drive.rs` runs it.
 #[test]
 fn the_main_thread_witness_refuses_a_worker_and_a_spawned_thread() {
     assert!(

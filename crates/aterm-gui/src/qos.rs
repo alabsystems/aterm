@@ -156,8 +156,7 @@ where
         })
 }
 
-// ---------------------------------------------------------------------------
-// A FORK FROM A DEMOTED THREAD RUNS AT THE DEFAULT CLASS.
+// A fork from a demoted thread runs at the default class.
 //
 // A fork-path spawn — any `Command` with a `pre_exec`, a raw `fork()`, a
 // `forkpty` — makes a child that holds a copy of every descriptor aterm has
@@ -899,12 +898,10 @@ mod tests {
         }
     }
 
-    /// The class a fork from the CALLING thread ran at, as the forked child
-    /// reads it in its last step before the exec: its copy of this thread's QoS
-    /// word, which `fork(2)` took when it copied the address space — the copy
-    /// the forking thread's class paces ([`fork_at_default`]). Not the child's
-    /// base priority: the kernel starts a forked thread with no class whichever
-    /// class forked it, so that reads the same with or without the guard.
+    /// The class a fork from the calling thread ran at, as the forked child reads it
+    /// before its exec: its copy of this thread's QoS word, taken when `fork(2)` copied
+    /// the address space ([`fork_at_default`]). Not the child's base priority, which
+    /// starts with no class whichever class forked it.
     #[cfg(target_os = "macos")]
     fn class_a_fork_ran_at() -> u32 {
         use std::io::Read as _;

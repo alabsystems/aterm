@@ -479,14 +479,10 @@ fn idle() -> Facts {
 
 // ---------------------------------------------------------------- the readers
 
-/// The login fact is the supervisor's reading and the transcript's: the
-/// recorded screen reads as the wall by the supervisor's wall recogniser; the
-/// transcript's last word on the login is Claude Code's
-/// `authentication_failed` row from 05:00:24 until the person's
-/// `Login successful` at 14:33:36, when the wall lifted; a turn the session's
-/// model answers lifts it too. Negative controls: the screen once the login is
-/// back; the transcript before the wall, after the lift and after a model's
-/// answer; a synthetic row that is not a login's (`No response requested.`,
+/// The login wall is read from the screen (the supervisor's wall recogniser) and the transcript
+/// (its last word on the login: the `authentication_failed` row, lifted by `Login successful` or
+/// a model's answer). Negative controls: the screen with the login back; the transcript before
+/// the wall, after the lift and after an answer; another synthetic row (`No response requested.`,
 /// an overload); the wall's words in a subagent's row.
 #[test]
 fn the_login_wall_is_read_from_the_screen_and_the_transcript() {
@@ -614,14 +610,9 @@ fn local_command_2_1_283(ts: &str, content: &str, run: bool) -> String {
     )
 }
 
-/// The login as Claude Code 2.1.283 writes it lifts the wall: the wall
-/// (`authentication_failed`, `Not logged in · Please run /login`), then the
-/// person's `/login` and `Login successful` as two `system`/`local_command`
-/// rows with a top-level `content`, then, nothing typed, the model answering
-/// the prompt the wall had answered. The login is back at `Login successful`,
-/// not at the model's answer (a session whose pending prompt is not asked
-/// again has none). Negative control: another local command's output lifts
-/// nothing.
+/// The login as Claude Code 2.1.283 writes it (two `system`/`local_command` rows with a top-level
+/// `content`: the `/login`, then `Login successful`) lifts the wall at `Login successful`.
+/// Negative control: another local command's output lifts nothing.
 #[test]
 fn the_login_as_2_1_283_writes_it_lifts_the_wall() {
     let asked = format!(
@@ -818,15 +809,11 @@ fn a_session_at_the_login_wall_is_never_asked_and_no_clock_runs() {
 
 // ---------------------------------------------------------------- the real visit
 
-/// The recorded session through the real visit (the driver's `visit`, a parked
-/// stand-in agent, a stand-in instance serving the screens, the recorded rows
-/// as transcript): at the wall nothing is typed. A pending upgrade and an
-/// announced one whose window ran out both wait `login`, as does one whose
-/// screen no longer shows the wall while the transcript's last word on the
-/// login is still the wall. Once the login is back, the upgrade that typed four
-/// notices into the wall types its last one again (ask 4, marker `12cbabd0`,
-/// the ledger saying why) instead of giving up. Negative control: had the
-/// model received that fourth notice, the same visit gives up.
+/// The recorded session through the real visit ([`visit_at`]): at the wall nothing is typed, and a
+/// pending upgrade, one whose window ran out, and one whose screen no longer shows the wall (the
+/// transcript still does) all wait `login`. Once the login is back the upgrade that typed four
+/// notices into the wall types its last again (ask 4, marker `12cbabd0`, the ledger saying why)
+/// instead of giving up. Negative control: had the model received that notice, it gives up.
 #[cfg(unix)]
 #[test]
 fn the_incident_is_waited_out_and_its_last_notice_asked_again() {
@@ -1062,13 +1049,11 @@ fn a_ready_to_the_current_marker_restarts_under_every_gate() {
     assert_eq!(waits.step, "wait:awaiting-ready", "{waits:?}");
 }
 
-/// A recorded state file of a given-up upgrade is read and recovered: it reads
-/// as `failed:unanswered` with its last marker, tab and fences, and writes
-/// back the same. A READY to its marker after the give-up is honoured. Where
-/// the owner spoke after that READY the give-up is still taken back (none of
-/// its notices reached the model), found further back than the ordinary tail
-/// when the conversation has gone on. A newer target asks afresh. Negative
-/// control: a give-up whose last notice the model received stays given up.
+/// The state file 0.93.0 left reads as `failed:unanswered` with its last marker, tab and fences,
+/// and writes back the same. A READY to its marker after the give-up is honoured; with the owner
+/// speaking after it the give-up is taken back (none of its notices reached the model), found
+/// past the ordinary tail too; a newer target asks afresh. Negative control: a give-up whose last
+/// notice the model received rests (`wait:failed`), and one with no stop stamp is re-armed.
 #[cfg(unix)]
 #[test]
 fn the_state_0_93_0_left_is_read_and_recovered() {

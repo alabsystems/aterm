@@ -45,7 +45,7 @@ pub const ORIGIN_ENV: &str = "ATERM_KEEPER_ORIGIN";
 /// The file a keeper running from its copy writes into the copy's directory
 /// first thing ([`mark_ran`]): the copy's exec is over, so it may go once its
 /// keeper is gone ([`sweep`]).
-pub const RAN: &str = "ran";
+pub const RAN: &str = aterm_uds::deadline::RAN;
 
 /// Say, in `copy` (the directory [`own_copy`] names), that this keeper runs
 /// from it. Best effort: a copy without it is kept for the first-exec hang
@@ -112,9 +112,8 @@ pub fn run_from_own_copy(exe: &Path, dir: &Path, identity: &Identity) -> String 
         Err(why) => return why,
     };
     // The copy's age, which a sweep reads when its keeper ends before it says it ran, counts
-    // from its exec, not from the copy and its check.
-    let _ = std::fs::File::open(&copy.home)
-        .and_then(|home| home.set_modified(std::time::SystemTime::now()));
+    // from its exec on the awake clock, not from the copy and its check.
+    aterm_uds::deadline::stamp_exec(&copy.home);
     let failed = reexec(&copy.exe, exe);
     // A failed exec loaded nothing from the copy, so nothing assesses it.
     let _ = std::fs::remove_dir_all(&copy.home);
@@ -272,17 +271,10 @@ fn sweep_at(dir: &Path, born: impl Fn(u32) -> Option<Birth>, now: std::time::Sys
 /// Whether a gone keeper's copy at `home` may go at `now`: it was never run
 /// (a half-made copy, `partial`, is renamed whole before its exec), its keeper
 /// said it ran from it ([`RAN`]), or the first-exec hang has passed since its
-/// exec (the directory's modification time, set just before it,
-/// [`run_from_own_copy`]).
+/// exec (stamped just before it, [`run_from_own_copy`];
+/// [`aterm_uds::deadline::copy_may_go`]).
 fn may_go(home: &Path, partial: bool, now: std::time::SystemTime) -> bool {
-    partial
-        || home.join(RAN).exists()
-        || std::fs::symlink_metadata(home)
-            .and_then(|meta| meta.modified())
-            .is_ok_and(|at| {
-                now.duration_since(at)
-                    .is_ok_and(|age| age >= aterm_uds::deadline::FIRST_EXEC_HANG)
-            })
+    partial || aterm_uds::deadline::copy_may_go(home, now)
 }
 
 #[cfg(test)]

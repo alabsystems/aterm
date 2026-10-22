@@ -10,22 +10,20 @@ repository.workspace = true
 description = "Portable update primitives shared by aterm-update and atpkg: source resolution, machine-roster verification, file locks, HTTP, private directories and SHA-256."
 
 [features]
-# Development seams in an optimized build (`aterm_types::dev_seam!`: ATERM_UPDATE_ROOT;
-# `source::REPOINT_IS_A_DEV_SEAM`: the `[update]` owner/repo repoint). Debug builds
-# compile them anyway; the release cutter never enables this — aterm-release's
-# buildplan pins that.
+# Development seams in an optimized build (`ATERM_UPDATE_ROOT`; the `[update]` owner/repo
+# repoint, `source::REPOINT_IS_A_DEV_SEAM`). Debug builds compile them anyway; the release
+# cutter never enables this.
 dev-seams = []
 
 [dependencies]
-# Reuse the single source-of-truth private-dir ownership predicate (no drift with
-# the control socket's Application Support hardening).
+# The private-dir ownership predicate shared with the control socket's hardening, plus
+# `dev_seam!` and the RFC 3339 helpers.
 aterm-types = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
 aterm-durable = { workspace = true }
 # The roster clock (`roster::now_unix`) reads the workspace's one epoch accessor.
 aterm-time = { workspace = true }
-# Route diagnostics through the global logger aterm-gui installs, so they land in
-# the app log file (visible for a Finder-launched .app, unlike stderr).
+# Diagnostics land in the app log file (visible for a Finder-launched .app, unlike stderr).
 aterm-log = { workspace = true }
 # The shared release-manifest wire type (src/manifest.rs): ONE serde struct the
 # publisher (crates/aterm-release) and the updater client both compile against.
@@ -49,15 +47,11 @@ ring = { workspace = true }
 # the entry point every trust path uses: canonical padding REQUIRED and no
 # trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
-# `aterm_uds::spawnfd::command`: the `Command` every child here is built with, so
-# none inherits a descriptor of this process above stdio (clippy.toml: one child
-# constructor), and on Windows a caller with no console (the window) gives its curl and
-# certutil children a WINDOWLESS console instead of a visible one.
+# `aterm_uds::spawnfd::command` builds every child: no descriptor above stdio leaks, and on
+# Windows a console-less caller gives its curl and certutil children a windowless console.
 aterm-uds = { workspace = true }
 
-# flock(2) for the apply/stage critical sections + getuid(2) for the private-dir
-# ownership check. The two narrow syscalls with no safe std wrapper (POSIX-only;
-# Windows uses std-only approximations).
+# getuid(2), fsync(2), and the open flags and errno values std does not name.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
@@ -74,13 +68,11 @@ aterm-tempfile = { workspace = true }
 # The Linux binary-identity round-trip test reads its JSON back through the
 # workspace's own parser; the library itself writes no JSON.
 aterm-json = { workspace = true }
-# The roster tests must SIGN deterministic fixtures with obviously-synthetic seeds
-# (`Ed25519KeyPair::from_seed_unchecked` + `.sign`), which needs ring's `alloc` feature.
-# Re-declaring ring here with DEFAULT features pulls alloc into the TEST build only, so
-# the normal build still proves the no-alloc verify path compiles on its own.
+# The roster tests sign synthetic fixtures, which needs ring's `alloc`; default features in
+# the test build only, so the normal build still proves the no-alloc verify path.
 ring = { workspace = true, features = ["default"] }
-# The Linux arm's hash loop (`hash::sha256_stream`) is compiled for tests on every
-# host, so its recorded answers run here too, not only on Linux.
+# `hash::sha256_stream` (the Linux arm) compiles for tests on every host, so its recorded
+# answers run everywhere.
 aterm-digest = { workspace = true }
 
 [lints]

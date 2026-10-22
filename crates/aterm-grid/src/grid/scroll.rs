@@ -1218,7 +1218,6 @@ impl Grid {
                         *c = fill;
                     }
                 }
-                // Wide char fixup at rectangle boundaries.
                 r.fixup_wide_boundary(left_usize, right_usize, cols, true);
                 // The fill bypasses len maintenance (an empty template can
                 // orphan the tail, a coloured one extends it): recompute.

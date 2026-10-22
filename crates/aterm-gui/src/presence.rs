@@ -104,12 +104,9 @@ pub(crate) fn pill_need_words(ask: &crate::needs::HarnessAsk) -> String {
     format!("{LEAD}{}{tail}", pill_text::<Native>(&ask.first, room))
 }
 
-/// This host's presence seam (`aterm_messages::presence::Host`): an
-/// uninhabited marker, because the orphan rule forbids implementing the
-/// engine's trait on `aterm_phase`'s types. A wall is `aterm_phase`'s
-/// [`aterm_phase::WallKind`], a stall the server's published
-/// [`crate::input_stall::InputStallFact`], this process's harness is
-/// [`crate::harness_host::holder`], and the percent codec is the wire's.
+/// This host's presence seam (`aterm_messages::presence::Host`): an uninhabited
+/// marker, because the orphan rule forbids implementing the engine's trait on
+/// `aterm_phase`'s types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Native {}
 
@@ -145,11 +142,9 @@ impl aterm_messages::presence::Host for Native {
         kind.wire()
     }
 
-    /// A wall that reads `limited` (a usage window, a model bucket, spend, an
-    /// API rate limit: [`aterm_phase::WallKind::reads_limited`]) keeps that word
-    /// (`limited → 19:30 · 1d 22h`); an API error the network caused says what
-    /// went wrong ([`api_cause_words`]); any other wall is the state it leaves
-    /// the session in (`status_item::wall_words`).
+    /// A wall that reads `limited` ([`aterm_phase::WallKind::reads_limited`]) keeps that word;
+    /// an API error the network caused says what went wrong ([`api_cause_words`]); any other
+    /// wall is the state it leaves the session in (`status_item::wall_words`).
     fn wall_band(kind: aterm_phase::WallKind) -> &'static str {
         if kind.reads_limited() {
             return "limited";
@@ -1364,10 +1359,8 @@ mod tests {
         assert!(guarded.subject().is_some());
     }
 
-    /// Each wall fixture reads `wall:<kind>` under `program=claude` through the
-    /// one adapter, a 529 and a real Fable screen included. Negative controls: a
-    /// tool's output quoting `API Error: 529` under a `⏺ Bash(…)` call stays
-    /// `idle`; every wall screen under a shell is not an agent.
+    /// Each wall fixture reads `wall:<kind>` under `claude`; a tool's output
+    /// quoting `API Error: 529` stays `idle`, and a shell is never an agent.
     #[test]
     fn a_wall_is_published_by_kind() {
         use aterm_phase::prompt::fixtures::{
@@ -1476,12 +1469,8 @@ mod tests {
         assert_eq!(left.word(), "-", "the screen it left: {left:?}");
     }
 
-    /// Claude Code is published idle only at its composer: the screens between
-    /// launch and REPL (the shell's rows with the dialog erased, then the
-    /// alternate screen half drawn) publish `unknown`, and the whole REPL
-    /// publishes `idle` (the control), in shell mode too (`!` typed into the
-    /// empty prompt box). The dialog itself is still a prompt, and the same rows
-    /// under a shell are no agent.
+    /// Claude Code is idle only at its composer: the launch's earlier frames are
+    /// `unknown`, and the trust dialog is a prompt.
     #[test]
     fn claude_code_is_published_idle_only_at_its_composer() {
         use aterm_phase::prompt::fixtures::{

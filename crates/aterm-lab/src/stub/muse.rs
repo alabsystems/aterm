@@ -503,7 +503,7 @@ impl Stub {
             J::Str(s) => s.clone(),
             other => other.py(),
         };
-        self.dump(body);
+        self.dump(body, "muse-side");
         let answer = side_answer(&role, &tools);
         let summary = format!(
             "kind=muse-side role={role} auth={} model={model} items={} tools={} last_user=\"{}\" side:{}",

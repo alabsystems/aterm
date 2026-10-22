@@ -91,6 +91,73 @@ pub use complete::{
 /// Shipped code reads it too (the updater, the keeper, the mug), not only tests.
 pub const FIRST_EXEC_HANG: Duration = Duration::from_secs(10 * 60);
 
+/// The file a program started from a fresh copy writes into the copy's directory first thing
+/// (the keeper's and the mug's copies): the copy's first exec is over, so it may go
+/// ([`copy_may_go`]).
+pub const RAN: &str = "ran";
+
+/// The file [`stamp_exec`] writes into a copy's directory just before its exec: the awake
+/// clock's reading then, in milliseconds.
+pub const EXEC_STAMP: &str = "exec";
+
+/// Say in `home`, the directory of a copy about to be exec'd, when that is on the awake clock
+/// ([`EXEC_STAMP`], [`crate::process::awake_ms`]): `syspolicyd` assesses only while the machine
+/// is awake, so a sleep or a step of the wall clock inside [`FIRST_EXEC_HANG`] must not age the
+/// copy ([`copy_may_go`]). Writing it also sets the directory's modification time, so the
+/// wall-clock reading a copy without a stamp falls back to counts from the exec too, not from
+/// the copy. Best effort.
+pub fn stamp_exec(home: &std::path::Path) {
+    let stamp = crate::process::awake_ms()
+        .map(|ms| ms.to_string())
+        .unwrap_or_default();
+    if let Err(e) = std::fs::write(home.join(EXEC_STAMP), stamp) {
+        eprintln!("cannot stamp {} before its exec: {e}", home.display());
+    }
+}
+
+/// Whether the directory `home`, holding a copy a program may have been started from, may be
+/// removed at `now` ([`copy_wait_left`] is `None`).
+#[must_use]
+pub fn copy_may_go(home: &std::path::Path, now: std::time::SystemTime) -> bool {
+    copy_wait_left(home, now).is_none()
+}
+
+/// How long the copy in `home` must still stay at `now`, `None` once it may go: a program
+/// running from it said so ([`RAN`] in it), or [`FIRST_EXEC_HANG`] has passed since its exec.
+/// That is time awake since its [`EXEC_STAMP`] (one clock read, which never goes backwards in a
+/// boot, so a clock behind the stamp is a later boot's, and no assessment outlives a boot), or
+/// for a copy with no stamp the wall-clock time since the directory last changed (a copy is
+/// made whole before its exec). A directory whose time cannot be read, or that changed after
+/// `now`, stays the whole hang. Waiting what this says with the machine awake is enough under
+/// either clock.
+#[must_use]
+pub fn copy_wait_left(home: &std::path::Path, now: std::time::SystemTime) -> Option<Duration> {
+    copy_wait_left_at(home, now, crate::process::awake_ms())
+}
+
+/// [`copy_wait_left`] with the awake clock reading `awake_now`.
+fn copy_wait_left_at(
+    home: &std::path::Path,
+    now: std::time::SystemTime,
+    awake_now: Option<u64>,
+) -> Option<Duration> {
+    if home.join(RAN).exists() {
+        return None;
+    }
+    let stamp = std::fs::read_to_string(home.join(EXEC_STAMP))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    let age = match (stamp, awake_now) {
+        (Some(at), Some(awake)) => Some(Duration::from_millis(awake.checked_sub(at)?)),
+        _ => std::fs::symlink_metadata(home)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|at| now.duration_since(at).ok()),
+    };
+    let left = FIRST_EXEC_HANG.saturating_sub(age.unwrap_or_default());
+    (!left.is_zero()).then_some(left)
+}
+
 #[cfg(any(test, debug_assertions))]
 mod silent;
 #[cfg(any(test, debug_assertions))]
@@ -789,6 +856,59 @@ mod tests {
         ExitWait, OUTPUT_KEEP, RunError, output_until, output_while_progressing, outputs_until,
     };
     use super::{Gate, Refused};
+
+    /// A copy's age is awake time since its exec when it is stamped, wall-clock time since its
+    /// directory changed when not, and a copy a program ran from goes at once. NEGATIVE CONTROL:
+    /// a stamped copy whose directory reads hours old (a sleep, a clock step) is kept while the
+    /// awake clock says the hang has not passed; a reading of the age off the wall clock fails it.
+    #[test]
+    fn a_copy_ages_on_the_awake_clock_from_its_exec() {
+        use super::{EXEC_STAMP, FIRST_EXEC_HANG, RAN, copy_wait_left_at, stamp_exec};
+        let copy_may_go_at =
+            |home: &std::path::Path, now, awake| copy_wait_left_at(home, now, awake).is_none();
+        let hang = u64::try_from(FIRST_EXEC_HANG.as_millis()).expect("ms");
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("1-2");
+        std::fs::create_dir(&home).expect("mkdir");
+        let now = std::time::SystemTime::now();
+        // Past the hang since every change below, which all come after `now`.
+        let later = now + FIRST_EXEC_HANG + Duration::from_secs(60);
+        // Unstamped: the wall clock since the directory changed.
+        assert!(!copy_may_go_at(&home, now, Some(5)));
+        assert!(copy_may_go_at(&home, later, Some(5)));
+        // Stamped at 1000 ms awake: the wall clock no longer counts.
+        std::fs::write(home.join(EXEC_STAMP), "1000\n").expect("stamp");
+        assert!(
+            !copy_may_go_at(&home, later, Some(1000 + hang - 1)),
+            "slept through"
+        );
+        assert!(copy_may_go_at(&home, now, Some(1000 + hang)));
+        assert!(copy_may_go_at(&home, now, Some(999)), "a later boot");
+        assert_eq!(
+            copy_wait_left_at(&home, later, Some(1000 + 60_000)),
+            Some(FIRST_EXEC_HANG - Duration::from_secs(60)),
+            "what is left is awake time too"
+        );
+        // No awake clock to read, or a stamp that is not one: the wall clock again.
+        assert!(!copy_may_go_at(&home, now, None));
+        assert!(copy_may_go_at(&home, later, None));
+        std::fs::write(home.join(EXEC_STAMP), "").expect("blank stamp");
+        assert!(!copy_may_go_at(&home, now, Some(1000 + hang)));
+        assert!(copy_may_go_at(&home, later, Some(1000 + hang)));
+        // A program ran from it.
+        std::fs::write(home.join(RAN), "").expect("ran");
+        assert!(copy_may_go_at(&home, now, Some(0)));
+        // The real stamp reads as a number where the clock is wired, and moves the directory.
+        let fresh = dir.path().join("3-4");
+        std::fs::create_dir(&fresh).expect("mkdir");
+        stamp_exec(&fresh);
+        let text = std::fs::read_to_string(fresh.join(EXEC_STAMP)).expect("stamped");
+        assert!(text.is_empty() || text.parse::<u64>().is_ok(), "{text:?}");
+        // One clock read: a later reading is never behind an earlier one in a boot.
+        let first = crate::process::awake_ms();
+        let second = crate::process::awake_ms();
+        assert!(first <= second, "{first:?} then {second:?}");
+    }
 
     /// Short: the work never answers on its own; the assertion is that the call comes back.
     const DEADLINE: Duration = Duration::from_millis(200);

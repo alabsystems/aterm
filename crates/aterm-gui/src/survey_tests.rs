@@ -791,6 +791,49 @@ fn a_remote_hold_names_the_node_that_holds_it() {
     assert_eq!(row(&store)["held_from"], "-", "handed back");
 }
 
+/// WHICH TAB RANG, read from the survey: the row of a session that rang
+/// counts its bells and names the program in front of each, as `status`
+/// does, at facts and at content alike. NEGATIVE CONTROL: the row of a
+/// session that rang nothing reads `bells=0 bells_sounded=0 last_bell=-`.
+#[test]
+fn a_session_that_rang_says_so_on_its_row_and_a_quiet_one_does_not() {
+    use crate::bell_ledger::{BellSound, Rang};
+    let store = crate::session_store::new_store();
+    let rang = crate::session_store::test_handle(1);
+    let quiet = crate::session_store::test_handle(2);
+    let at = aterm_time::unix_millis().unwrap_or(0);
+    for sound in [BellSound::Sounded, BellSound::Limited] {
+        rang.ctx.bells.ring(Rang {
+            at_unix_ms: at,
+            program: Some("zsh".into()),
+            sound,
+        });
+    }
+    store.write().unwrap().register(rang);
+    store.write().unwrap().register(quiet);
+    for level in [SurveyLevel::Facts, SurveyLevel::Content] {
+        let reply = survey_rows(&store, level, usize::MAX, &here());
+        let rows: Vec<_> = reply.lines().skip(2).map(fields).collect();
+        assert_eq!(rows.len(), 2, "{reply}");
+        assert_eq!(rows[0]["bells"], "2", "{reply}");
+        assert_eq!(rows[0]["bells_sounded"], "1", "{reply}");
+        let last: Vec<Vec<&str>> = rows[0]["last_bell"]
+            .split(',')
+            .map(|entry| entry.split('/').skip(1).collect())
+            .collect();
+        assert_eq!(last, [["limited", "zsh"], ["sounded", "zsh"]], "{reply}");
+        assert_eq!(
+            (
+                rows[1]["bells"].as_str(),
+                rows[1]["bells_sounded"].as_str(),
+                rows[1]["last_bell"].as_str()
+            ),
+            ("0", "0", "-"),
+            "{reply}"
+        );
+    }
+}
+
 /// WHAT EACH LEVEL CARRIES, field by field and in order: the facts are words,
 /// counts and ages — attention only as a flag — and content adds the
 /// excerpts and the attention line's words. A fleet peer allowed facts that
@@ -825,6 +868,9 @@ fn each_level_emits_exactly_its_fields() {
         "held_from",
         "typed_by",
         "typed_ms",
+        "bells",
+        "bells_sounded",
+        "last_bell",
     ];
     const CONTENT: &[&str] = &[
         "user_title",

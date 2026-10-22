@@ -22,7 +22,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use aterm_uds::spawnfd::{Child as OwnedChild, Stdio as OwnedStdio};
 
 use astream_broker::{Broker, BrokerHandle, Client, OpenOptions, Prepared};
 use aterm_link::ctl::{Ctl, Reply};
@@ -547,7 +549,8 @@ pub fn node_grants(node: &str) -> Vec<String> {
 /// variable whose name begins with `ATERM_` is removed, whatever it is called
 /// and whenever it was invented. The exceptions are NAMED rather than assumed —
 /// the caller re-sets `ATERM_FABRIC_COMMAND` after this runs (the grid is the
-/// `--lines`/`--columns` flags). Automatic update checks and the package lane are switched off by
+/// `--lines`/`--columns` flags), and this sets [`STALE_HORIZON`] after the
+/// removal. Automatic update checks and the package lane are switched off by
 /// the fixture CONFIG ([`FIXTURE_GUI_CONFIG`]), the way a person switches them off,
 /// and the reroute's stubs land under the scratch HOME. A variable
 /// the test wants is one the test states; a variable it inherits is one nobody
@@ -562,7 +565,25 @@ pub fn prepare_gui_environment(cmd: &mut Command) {
             cmd.env_remove(&name);
         }
     }
+    cmd.env(STALE_HORIZON.0, STALE_HORIZON.1.as_millis().to_string());
 }
+
+/// Every launch's owed-answer horizon (`aterm-gui-fabric`'s
+/// `ATERM_FABRIC_STALE_AFTER_MS` seam) at [`VERB_DEADLINE`], past every verb's
+/// own wait, set by [`prepare_gui_environment`].
+///
+/// THE PRODUCTION SIX SECONDS IS A LATENCY BUDGET HERE, and no world's proof is
+/// the stale verdict (`link_state` reads `stalled`; the endpoint's unit tests
+/// age the owed clock and keep the default). A live bridge on a loaded machine
+/// has owed an answer for six seconds while still moving it, and a `--wait`
+/// post then ended `ERR fabric stale id=<n> queued=1` for a post that landed
+/// moments later (`exactly_once`, 23 s under load against 2 s alone). A world
+/// whose proof is the horizon names its own value in its environment, which a
+/// launch applies after this. A build that reads no seams (an
+/// `ATERM_TEST_EXECUTABLE` built without `dev-seams`) runs the production six
+/// seconds, as it honours none of the suite's other seams (`ATERM_LINK_FAULT`,
+/// the fast timers) either.
+pub const STALE_HORIZON: (&str, Duration) = ("ATERM_FABRIC_STALE_AFTER_MS", VERB_DEADLINE);
 
 /// Arm a `--headless` launch with a LIFELINE held for the life of this test
 /// process (`aterm_uds::lifeline::arm_for_process`): the instance's `Drop`
@@ -620,13 +641,107 @@ pub fn prepare_fixture_config(tmp: &Path) {
 /// [`World::boot_with_grants`] takes in place of the whole node ring.
 pub type GrantsFor<'a> = &'a dyn Fn(&str) -> Vec<String>;
 
+/// Exclusive scratch. An incomplete setup or teardown keeps its evidence.
+struct Scratch {
+    dir: Option<aterm_tempfile::TempDir>,
+    keep: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            eprintln!("KEPT fabric world {}", dir.keep().display());
+        }
+    }
+}
+
+/// Observe only: the child belongs to the instance, never this harness's reaper.
+/// The parent and birth checks bind the exit descriptor to that instance's child.
+fn child_exit(pid: i32, parent: u32) -> Result<std::os::fd::OwnedFd, String> {
+    let birth = aterm_uds::process::read_process_birth(pid)
+        .ok_or_else(|| format!("cannot read child {pid}'s birth"))?;
+    if aterm_uds::process::read_process_parent(pid) != Some(parent) {
+        return Err(format!(
+            "{pid} is not an observed child of instance {parent}"
+        ));
+    }
+    let fd = u32::try_from(pid)
+        .ok()
+        .and_then(aterm_uds::exitwatch::exit_fd)
+        .ok_or_else(|| format!("cannot watch child {pid}'s exit"))?;
+    if aterm_uds::process::read_process_birth(pid) != Some(birth)
+        || aterm_uds::process::read_process_parent(pid) != Some(parent)
+    {
+        return Err(format!(
+            "child {pid} changed across exit-watch registration"
+        ));
+    }
+    Ok(fd)
+}
+
+fn exited(fd: &std::os::fd::OwnedFd) -> Result<bool, String> {
+    use std::os::fd::AsRawFd as _;
+    let mut p = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one live owned exit descriptor and one writable pollfd; no wait.
+    let n = unsafe { libc::poll(&mut p, 1, 0) };
+    if n < 0 {
+        let e = std::io::Error::last_os_error();
+        return if e.kind() == std::io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(format!("poll child exit: {e}"))
+        };
+    }
+    if p.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Err(format!("invalid child exit watch: {}", p.revents));
+    }
+    Ok(p.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+}
+
+/// A direct child is signalled only through its owned, cached-reap handle.
+fn end_owned_child(child: &mut OwnedChild) -> Result<(), String> {
+    let mut killed = false;
+    for phase in 0..2 {
+        let end = Instant::now() + DEADLINE;
+        let mut exit = aterm_uds::deadline::ExitWait::new(child);
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|e| format!("reap instance: {e}"))?
+            {
+                return if !killed && status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("instance did not finish a graceful quit: {status}"))
+                };
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            exit.wait(left);
+        }
+        if phase == 0 {
+            child
+                .kill()
+                .map_err(|e| format!("kill owned instance: {e}"))?;
+            killed = true;
+        }
+    }
+    Err("owned instance not reaped after SIGKILL".into())
+}
+
 pub struct World {
     pub tmp: PathBuf,
     pub broker: Option<Broker>,
     pub handle: Option<BrokerHandle>,
     pub broker_sock: String,
     pub broker_log: String,
-    pub gui: Option<Child>,
+    pub gui: Option<OwnedChild>,
     pub ctl_sock: String,
     pub token: String,
     pub node: String,
@@ -656,25 +771,22 @@ pub struct World {
     pub retained: bool,
     /// The read connection every polled broker read shares ([`World::read`]).
     watch: std::sync::Mutex<Option<Client>>,
+    lifeline: std::sync::Mutex<Option<aterm_uds::lifeline::Lifeline>>,
+    stopped: bool,
+    scratch: Scratch,
 }
 
 impl Drop for World {
     fn drop(&mut self) {
-        if let Some(mut gui) = self.gui.take() {
-            let _ = gui.kill();
-            let _ = gui.wait();
-        }
+        let ended = self.stop();
+        self.watch
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         if let Some(mut h) = self.handle.take() {
             h.shutdown();
         }
         self.broker.take();
-        // Kill the bridge too: aterm's supervisor relaunches it, so a leaked
-        // child would outlive the test and keep publishing.
-        if let Ok(pid) = std::fs::read_to_string(self.state.join("pid"))
-            && let Ok(pid) = pid.trim().parse::<i32>()
-        {
-            kill(pid, 9);
-        }
         // `$ATERM_LINK_KEEP=1` leaves the scratch world behind, for the same
         // reason [`Fleet::drop`] honours it and with the same default: a failing
         // end-to-end test whose gui log, cap file and bridge state dir delete
@@ -682,8 +794,25 @@ impl Drop for World {
         // since it was written; `World` deleted unconditionally — and most of
         // this crate's end-to-end suites are `World` suites, so for most of them
         // the evidence was unreachable.
-        if std::env::var_os("ATERM_LINK_KEEP").is_none() {
-            let _ = std::fs::remove_dir_all(&self.tmp);
+        if ended.is_ok()
+            && !std::thread::panicking()
+            && !self.scratch.keep.load(std::sync::atomic::Ordering::Relaxed)
+            && std::env::var_os("ATERM_LINK_KEEP").is_none()
+            && let Some(scratch) = self.scratch.dir.take()
+        {
+            let path = scratch.keep();
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                eprintln!(
+                    "KEPT {}: fabric scratch cleanup failed: {e}",
+                    path.display()
+                );
+            }
+        }
+        if let Err(why) = ended {
+            eprintln!(
+                "KEPT {}: fabric process cleanup unknown: {why}",
+                self.tmp.display()
+            );
         }
     }
 }
@@ -732,6 +861,100 @@ pub fn aterm_to_launch() -> &'static str {
 }
 
 impl World {
+    /// Cut this world's lifeline, reap its direct instance, and observe the
+    /// bridge and listed foreground roots exit. An exit descriptor proves
+    /// termination, not this harness's reap of the instance's children. A
+    /// failure preserves scratch; it never authorizes a signal by a pid file.
+    ///
+    /// # Errors
+    /// A child identity/exit could not be observed, the instance needed a
+    /// forced kill, or its owned handle could not confirm a successful reap.
+    pub fn stop(&mut self) -> Result<(), String> {
+        if self.stopped {
+            return Ok(());
+        }
+        let mut failures = Vec::new();
+        let mut watches = Vec::new();
+        if let Some(gui) = &self.gui {
+            let observed = (|| {
+                let mut pids = Vec::new();
+                let bridge = std::fs::read_to_string(self.state.join("pid"))
+                    .map_err(|e| format!("read bridge pid: {e}"))?
+                    .trim()
+                    .parse::<i32>()
+                    .map_err(|e| format!("parse bridge pid: {e}"))?;
+                pids.push(bridge);
+                let mut ctl = connect_within(&self.ctl_sock, &self.token, DEADLINE)
+                    .map_err(|e| format!("connect for owned foreground roots: {e}"))?;
+                let who = ctl
+                    .request("who")
+                    .map_err(|e| format!("read foreground roots: {e}"))?;
+                if !who.ok() {
+                    return Err(format!("foreground roots: {}", who.header()));
+                }
+                for row in who.rows() {
+                    let pid = kv(row, "fgpgid")
+                        .and_then(|p| p.parse::<i32>().ok())
+                        .filter(|p| *p > 1)
+                        .ok_or_else(|| format!("no foreground root in {row}"))?;
+                    if !pids.contains(&pid) {
+                        pids.push(pid);
+                    }
+                }
+                for pid in pids {
+                    watches.push((pid, child_exit(pid, gui.id())?));
+                }
+                Ok(())
+            })();
+            if let Err(why) = observed {
+                failures.push(why);
+            }
+        } else {
+            failures.push("no owned instance handle for child-exit observations".into());
+        }
+        self.lifeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gui) = &mut self.gui {
+            match end_owned_child(gui) {
+                Ok(()) => {
+                    self.gui = None;
+                }
+                Err(why) => failures.push(why),
+            }
+        }
+        let end = Instant::now() + DEADLINE;
+        while !watches.is_empty() {
+            let mut pending = Vec::new();
+            for (pid, fd) in watches {
+                match exited(&fd) {
+                    Ok(true) => {}
+                    Ok(false) => pending.push((pid, fd)),
+                    Err(why) => failures.push(format!("child {pid}: {why}")),
+                }
+            }
+            watches = pending;
+            if watches.is_empty() {
+                break;
+            }
+            if Instant::now() >= end {
+                failures.push(format!(
+                    "child exits unconfirmed: {:?}",
+                    watches.iter().map(|(pid, _)| pid).collect::<Vec<_>>()
+                ));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if failures.is_empty() {
+            self.stopped = true;
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
     /// Boot everything. `tag` keeps parallel tests off each other's paths, and
     /// `accept_from` is the bridge's `--accept-from` list.
     pub fn boot(tag: &str, accept_from: &[&str]) -> Self {
@@ -893,8 +1116,21 @@ impl World {
         // function returns, which is after the control socket answers — so the
         // window it bounds is exactly the expensive one.
         let _boot = boot_permit();
-        let tmp = PathBuf::from(format!("/tmp/atl-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let scratch = Scratch {
+            dir: Some(
+                aterm_tempfile::Builder::new()
+                    .prefix("atl-")
+                    .tempdir_in("/tmp")
+                    .expect("exclusive world scratch"),
+            ),
+            keep: Default::default(),
+        };
+        let tmp = scratch
+            .dir
+            .as_ref()
+            .expect("new scratch")
+            .path()
+            .to_path_buf();
         std::fs::create_dir_all(tmp.join("run/aterm")).expect("scratch runtime dir");
         prepare_fixture_config(&tmp);
         let state = tmp.join("link");
@@ -954,11 +1190,11 @@ impl World {
         let gui_log = tmp.join("gui.log");
         let out = std::fs::File::create(&gui_log).expect("gui log");
         let err = out.try_clone().expect("gui log clone");
-        let mut cmd = Command::new(aterm_to_launch());
+        let mut cmd = aterm_uds::spawnfd::command(aterm_to_launch());
         // BEFORE the explicit `.env` calls below, never after: `Command`
         // applies env operations in order, so a blanket removal that ran last
         // would delete the three variables this harness deliberately sets.
-        prepare_gui_environment(&mut cmd);
+        scratch_spawnfd(&mut cmd, &tmp);
         cmd.arg("--headless")
             .env("HOME", scratch_home(&tmp))
             // Every launch's TMPDIR is its scratch: a FIFO a SIGKILLed spawn left goes with it.
@@ -968,14 +1204,14 @@ impl World {
             .env("SHELL", "/bin/sh")
             .args(["--lines", "40", "--columns", "120"])
             .env("ATERM_FABRIC_COMMAND", &fabric_cmd)
-            .stdin(Stdio::null())
+            .stdin(OwnedStdio::null())
             .stdout(out)
             .stderr(err);
         for (k, v) in env {
             cmd.env(k, v);
         }
-        arm_lifeline(&mut cmd, &tmp);
-        let gui = cmd.spawn().expect("launch aterm --headless");
+        let lifeline =
+            aterm_uds::lifeline::Lifeline::arm(&mut cmd, &tmp).expect("the world's lifeline");
 
         let mut world = World {
             tmp,
@@ -983,7 +1219,7 @@ impl World {
             handle,
             broker_sock,
             broker_log,
-            gui: Some(gui),
+            gui: None,
             ctl_sock,
             token: String::new(),
             node,
@@ -992,9 +1228,13 @@ impl World {
             opts,
             retained,
             watch: std::sync::Mutex::new(None),
+            lifeline: std::sync::Mutex::new(Some(lifeline)),
+            stopped: false,
+            scratch,
         };
+        world.gui = Some(cmd.spawn().expect("launch aterm --headless"));
         let gui = world.gui.as_mut().expect("the gui just spawned");
-        world.token = World::wait_for_token_of(&world.ctl_sock, gui, &world.gui_log);
+        world.token = World::wait_for_owned_token_of(&world.ctl_sock, gui, &world.gui_log);
         world
     }
 
@@ -1220,6 +1460,10 @@ impl World {
     }
 
     fn sibling_with(&mut self, fabric: Option<&str>) -> Sibling {
+        // The independently owned sibling may outlive this World.
+        self.scratch
+            .keep
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let own = self.gui.as_ref().expect("this world's gui").id();
         self.ctl_sock = self
             .tmp
@@ -1265,6 +1509,11 @@ impl World {
     /// half of a seamless update's successor, which a headless instance
     /// cannot reach by updating. `env` reaches the instance and its bridge.
     pub fn successor_instance(&self, n: usize, env: &[(&str, &str)]) -> Successor {
+        // A successor can outlive this World. Its shared paths must survive
+        // independently of which owner drops first, even before readiness.
+        self.scratch
+            .keep
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let fabric = std::fs::read_to_string(self.tmp.join("fabric.cmd"))
             .expect("this world's fabric command");
         let run = self.tmp.join(format!("run-{n}"));
@@ -1274,8 +1523,8 @@ impl World {
         let log_path = self.tmp.join(format!("successor-{n}.log"));
         let log = std::fs::File::create(&log_path).expect("successor log");
         let err = log.try_clone().expect("successor log clone");
-        let mut cmd = Command::new(aterm_to_launch());
-        prepare_gui_environment(&mut cmd);
+        let mut cmd = aterm_uds::spawnfd::command(aterm_to_launch());
+        scratch_spawnfd(&mut cmd, &self.tmp);
         cmd.arg("--headless")
             .env("HOME", scratch_home(&self.tmp))
             .env("TMPDIR", &self.tmp)
@@ -1284,21 +1533,28 @@ impl World {
             .env("SHELL", "/bin/sh")
             .args(["--lines", "40", "--columns", "120"])
             .env("ATERM_FABRIC_COMMAND", fabric.trim())
-            .stdin(Stdio::null())
+            .stdin(OwnedStdio::null())
             .stdout(log)
             .stderr(err);
         for (k, v) in env {
             cmd.env(k, v);
         }
-        arm_lifeline(&mut cmd, &self.tmp);
-        let mut child = cmd.spawn().expect("launch a successor aterm --headless");
-        let token = World::wait_for_token_of(&sock, &mut child, &log_path);
-        Successor {
-            child: Some(child),
+        let lifeline =
+            aterm_uds::lifeline::Lifeline::arm(&mut cmd, &self.tmp).expect("successor lifeline");
+        let mut successor = Successor {
+            child: None,
+            lifeline: Some(lifeline),
             sock,
-            token,
+            token: String::new(),
             log: log_path,
-        }
+        };
+        successor.child = Some(cmd.spawn().expect("launch a successor aterm --headless"));
+        successor.token = World::wait_for_owned_token_of(
+            &successor.sock,
+            successor.child.as_mut().expect("spawned successor"),
+            &successor.log,
+        );
+        successor
     }
 
     /// This session's `inbox` rows (`--peek`, so the watermarks do not move).
@@ -1307,15 +1563,10 @@ impl World {
     }
 
     /// `@{from} post to=@{to} kind={kind} {flags} --wait=60000 {text}`, answered with its
-    /// header and the offset it LANDED at, however slowly a loaded machine's bridge
-    /// publishes it.
-    ///
-    /// A `--wait` post ends `ERR fabric stale id=<n> queued=1` once the bridge has owed an
-    /// answer for three link refreshes (6 s, the wedged-helper horizon `STALE_AFTER`), and
-    /// a live bridge at load 30 has taken that long. The post is still queued then, and the
-    /// bridge publishes it when it gets to it, so this waits (a hang detector, not a
-    /// budget) for the record on `to`'s lane and reads its offset there. Any other refusal
-    /// fails here with the header and the log.
+    /// header and the offset it LANDED at. The wait is a minute's hang detector, and no
+    /// loaded bridge cuts it short at the wedged-helper horizon: every world sets that
+    /// horizon past it ([`STALE_HORIZON`]). Any refusal fails here with the header and the
+    /// log.
     pub fn post_landed(
         &self,
         from: &str,
@@ -1328,23 +1579,12 @@ impl World {
             "@{from} post to=@{to} kind={kind} {flags} --wait=60000 {text}"
         ));
         let header = reply.header().to_string();
-        if reply.ok() {
-            let off = off_of(&header);
-            return (header, off);
-        }
         assert!(
-            header.starts_with("ERR fabric stale ") && header.contains(" queued=1"),
+            reply.ok(),
             "@{from}'s post to @{to}: {header} — log:\n{}",
             self.log_tail()
         );
-        let lane = format!("/f/{FLEET}/in/{}/{to}/{}/{kind}", self.node, self.node);
-        let needle = format!("text={}", aterm_link::pct::encode(text));
-        let off = until("a post its slow bridge left queued to land", || {
-            let (rows, _) = self.read(|c| c.fetch(0, &lane, 256)).ok()?;
-            rows.into_iter()
-                .find(|(_, _, body)| String::from_utf8_lossy(body).contains(&needle))
-                .map(|(off, _, _)| off)
-        });
+        let off = off_of(&header);
         (header, off)
     }
 
@@ -1713,7 +1953,7 @@ pub fn alive(pid: i32) -> bool {
 impl World {
     /// Relaunch `aterm` against the same scratch world — the same broker,
     /// the same bridge state dir, the same node id, the same fabric command.
-    pub fn relaunch_gui(w: &World) -> Child {
+    pub fn relaunch_gui(w: &World) -> OwnedChild {
         let fabric_cmd = std::fs::read_to_string(w.tmp.join("fabric.cmd"))
             .expect("the boot recorded its fabric command");
         let out = std::fs::OpenOptions::new()
@@ -1722,11 +1962,11 @@ impl World {
             .open(&w.gui_log)
             .expect("gui log");
         let err = out.try_clone().expect("gui log clone");
-        let mut cmd = Command::new(aterm_to_launch());
+        let mut cmd = aterm_uds::spawnfd::command(aterm_to_launch());
         // BEFORE the explicit `.env` calls below, never after: `Command`
         // applies env operations in order, so a blanket removal that ran last
         // would delete the three variables this harness deliberately sets.
-        prepare_gui_environment(&mut cmd);
+        scratch_spawnfd(&mut cmd, &w.tmp);
         cmd.arg("--headless")
             .env("HOME", scratch_home(&w.tmp))
             .env("TMPDIR", &w.tmp)
@@ -1735,10 +1975,14 @@ impl World {
             .env("SHELL", "/bin/sh")
             .args(["--lines", "40", "--columns", "120"])
             .env("ATERM_FABRIC_COMMAND", fabric_cmd.trim())
-            .stdin(Stdio::null())
+            .stdin(OwnedStdio::null())
             .stdout(out)
             .stderr(err);
-        arm_lifeline(&mut cmd, &w.tmp);
+        let lifeline =
+            aterm_uds::lifeline::Lifeline::arm(&mut cmd, &w.tmp).expect("relaunch lifeline");
+        *w.lifeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lifeline);
         cmd.spawn().expect("relaunch aterm --headless")
     }
 
@@ -1750,7 +1994,7 @@ impl World {
     /// the test actually depends on.
     ///
     pub fn wait_for_token_at(sock: &str) -> String {
-        Self::wait_for_token(sock, None)
+        Self::wait_for_token(sock, || {})
     }
 
     /// [`World::wait_for_token_at`] for the instance this test just spawned as
@@ -1761,7 +2005,14 @@ impl World {
     /// so an instance alive but never answering does not outlive its test.
     pub fn wait_for_token_of(sock: &str, child: &mut Child, log: &Path) -> String {
         let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Self::wait_for_token(sock, Some((&mut *child, log)))
+            Self::wait_for_token(sock, || {
+                if let Ok(Some(exit)) = child.try_wait() {
+                    panic!(
+                        "aterm exited ({exit}) before it answered on {sock}; its log:\n{}",
+                        log_tail_of(log)
+                    );
+                }
+            })
         }));
         waited.unwrap_or_else(|why| {
             let _ = child.kill();
@@ -1770,16 +2021,29 @@ impl World {
         })
     }
 
-    fn wait_for_token(sock: &str, mut spawned: Option<(&mut Child, &Path)>) -> String {
-        until("aterm to bind and answer on its control socket", || {
-            if let Some((child, log)) = spawned.as_mut()
-                && let Ok(Some(exit)) = child.try_wait()
-            {
-                panic!(
-                    "aterm exited ({exit}) before it answered on {sock}; its log:\n{}",
-                    log_tail_of(log)
-                );
+    pub fn wait_for_owned_token_of(sock: &str, child: &mut OwnedChild, log: &Path) -> String {
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::wait_for_token(sock, || {
+                if let Ok(Some(exit)) = child.try_wait() {
+                    panic!(
+                        "aterm exited ({exit}) before it answered on {sock}; its log:\n{}",
+                        log_tail_of(log)
+                    );
+                }
+            })
+        }));
+        waited.unwrap_or_else(|why| {
+            let _ = child.kill();
+            if let Err(cleanup) = end_owned_child(child) {
+                eprintln!("instance readiness cleanup: {cleanup}");
             }
+            std::panic::resume_unwind(why)
+        })
+    }
+
+    fn wait_for_token(sock: &str, mut check_child: impl FnMut()) -> String {
+        until("aterm to bind and answer on its control socket", || {
+            check_child();
             let path = aterm_uds::latest::token_path_for_sock(sock)?;
             let token = std::fs::read_to_string(path).ok()?;
             let token = token.trim().to_string();
@@ -1816,7 +2080,8 @@ impl Drop for Sibling {
 /// with the test unless [`Successor::take`] hands it to the [`World`] it
 /// succeeds, which then tears it down as its own.
 pub struct Successor {
-    child: Option<Child>,
+    child: Option<OwnedChild>,
+    lifeline: Option<aterm_uds::lifeline::Lifeline>,
     /// Its control socket, in its own runtime dir.
     pub sock: String,
     /// Its Owner token.
@@ -1852,6 +2117,10 @@ impl Successor {
     /// and its log replace the ones `w` held, whose process must be gone.
     pub fn take(mut self, w: &mut World) {
         w.gui = self.child.take();
+        *w.lifeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = self.lifeline.take();
+        w.stopped = false;
         w.ctl_sock = std::mem::take(&mut self.sock);
         w.token = std::mem::take(&mut self.token);
         w.gui_log = std::mem::take(&mut self.log);
@@ -1860,9 +2129,11 @@ impl Successor {
 
 impl Drop for Successor {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        self.lifeline.take();
+        if let Some(mut child) = self.child.take()
+            && let Err(why) = end_owned_child(&mut child)
+        {
+            eprintln!("successor cleanup unknown: {why}");
         }
     }
 }
@@ -1913,6 +2184,7 @@ pub fn scratch_spawnfd<'a>(
             cmd.env_remove(&name);
         }
     }
+    cmd.env(STALE_HORIZON.0, STALE_HORIZON.1.as_millis().to_string());
     cmd.envs(scratch_cli_env(tmp))
 }
 

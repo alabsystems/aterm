@@ -333,11 +333,8 @@ mod tests {
         unsafe { libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
     }
 
-    /// Round eight of the update audit, #28: the cold lane hands a lifelined
-    /// instance's successor the copy [`super::adopt_or_exit`] keeps. It is the
-    /// same FIFO as the adopted lifeline, it outlives the adoption's sweep of that
-    /// FIFO's other descriptors (made BEFORE the sweep, the sweep closed it), and
-    /// it is close-on-exec except inside [`super::inherit_across_exec`].
+    /// The copy kept for the cold lane is the lifeline's own FIFO, survives the adoption's sweep,
+    /// and is close-on-exec except inside [`super::inherit_across_exec`].
     #[test]
     fn the_relaunch_copy_is_the_lifeline_and_crosses_only_an_exec() {
         let dir = std::env::temp_dir().join(format!("aterm-lifeline-r8-28-{}", std::process::id()));

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CHANGE CONE: what a bare `targo --unverified verify` lints, tests and
-//! documents. The crates whose own files changed since the merge-base of HEAD
-//! and the base (local `origin/main` unless `--base` names another) —
-//! uncommitted and untracked changes included — CLOSED UNDER `depends on`, read
-//! from `targo tree --invert`, the graph the build itself uses, dev edges
-//! included. A path package outside the workspace that the graph carries (a
-//! `[patch]`ed fork under `vendor/`, an astream crate under the `vendor/astream`
-//! gitlink) is closed the same way when a change touches it. Offline: nothing is
-//! fetched.
+//! The change cone: what a bare `targo --unverified verify` lints, tests and
+//! documents. The crates whose own files changed since the merge-base of HEAD and
+//! the base (`origin/main` unless `--base` names another), uncommitted and
+//! untracked changes included, closed under "depends on" as `targo tree --invert`
+//! reads it, dev edges included. A path package the graph carries outside the
+//! workspace (a `[patch]`ed fork under `vendor/`, an astream crate under the
+//! `vendor/astream` gitlink) is closed the same way. Offline: nothing is fetched.
 //!
 //! It FAILS WIDE. Anything it cannot answer — no targo, no merge-base, an
 //! unreadable graph, a change to a file that re-plans every unit — widens the
@@ -19,10 +17,9 @@
 //! comment or a `default-members` edit selects nothing, a dependency row or a
 //! locked package its dependents, and anything else still widens.
 //!
-//! [`select`] is a PURE function of (changed paths, manifests, members, the
-//! inverted-graph query), so its rules are unit-tested without a repo;
-//! [`resolve`] fetches those inputs and adds consumers of shared input files
-//! that Cargo's package graph does not represent.
+//! [`select`] is a pure function of its inputs, unit-tested without a repo;
+//! [`resolve`] fetches them and adds consumers of shared input files that Cargo's
+//! package graph does not represent.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -42,9 +39,9 @@ pub struct Member {
     pub name: String,
     /// Repo-relative directory of its manifest (`crates/aterm-grid`).
     pub dir: String,
-    /// Does it have a library target? `cargo test --doc -p X` is a hard ERROR
-    /// when NO selected package has one, and an all-binary selection is an
-    /// ordinary outcome here (`aterm-lab` is bin-only), so the doctest stage asks.
+    /// Does it have a library target? `cargo test --doc` errors when no selected
+    /// package has one, and an all-binary selection is ordinary (`aterm-lab`), so
+    /// the doctest stage asks.
     pub has_lib: bool,
 }
 
@@ -91,11 +88,8 @@ impl Members {
         self.0.iter().map(|m| m.name.clone()).collect()
     }
 
-    /// Does any of `crates` have a library target?
-    ///
-    /// Fail-closed in the direction that RUNS the stage: if no member at all
-    /// claims a lib the table is not believable (the script's rule — an
-    /// unreadable member list answers YES), so the doctest stage runs and
+    /// Does any of `crates` have a library target? When no member claims one, the
+    /// table is not believable and the answer is yes, so the doctest stage runs and
     /// reports whatever cargo says.
     #[must_use]
     pub fn any_has_lib(&self, crates: &[String]) -> bool {
@@ -154,15 +148,15 @@ impl<S: Into<String>> FromIterator<(S, Option<S>)> for Manifests {
 /// What the selection decided.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Selection {
-    /// Could not narrow honestly. The run does MORE work, and says why.
+    /// Could not narrow honestly: the whole workspace runs, and this says why.
     Widened(String),
     /// The seeds, and the seeds closed under reverse dependency.
     Narrowed {
         /// Crates whose own files changed: members, and path packages outside
         /// the workspace (a vendored fork, an astream crate under its gitlink).
         seeds: Vec<String>,
-        /// `seeds` plus every workspace crate that depends on one of them.
-        /// Legitimately EMPTY when the diff touched no crate at all.
+        /// `seeds` plus every workspace crate that depends on one of them;
+        /// empty when the diff touched no crate.
         crates: Vec<String>,
         /// Does any selected crate have a library target? (see [`Members::any_has_lib`])
         any_lib: bool,
@@ -419,12 +413,11 @@ fn parent_dir(path: &str) -> &str {
 /// The workspace member owning a repo-relative path: nearest ancestor manifest,
 /// accepted only if its package is a member.
 ///
-/// A path no member owns (`docs/`, `tools/`, and non-member manifests) contributes
-/// no ownership seed. [`resolve`] separately seeds members that include shared
-/// inputs, and [`select`] the dependents of a path package outside the workspace
-/// the path touches; other such paths are covered by the whole-tree checks. The walk
-/// never consults the repo-root manifest: it is virtual, and a
-/// root-level change that matters is a [`REPLANNING_PATHS`] widening instead.
+/// A path no member owns (`docs/`, `tools/`, non-member manifests) seeds nothing
+/// here; [`resolve`] seeds members that include shared inputs, [`select`] the
+/// dependents of a touched path package, and [`TESTED_BY`] adds the member whose
+/// tests exercise the file. The virtual root manifest is never consulted: a
+/// root-level change that matters is a [`REPLANNING_PATHS`] widening.
 #[must_use]
 pub fn owning_member<'a>(
     path: &str,
@@ -559,8 +552,8 @@ fn owning_dir<'a>(path: &'a str, manifests: &Manifests) -> Option<&'a str> {
 }
 
 /// The forks among `forks` a change to `paths` touched: a path inside a fork's
-/// directory, or a path that CONTAINS it — a submodule bump lists only its
-/// gitlink (`vendor/astream`), never the files of the crates beneath it.
+/// directory, or one that contains it (a submodule bump lists only its gitlink,
+/// `vendor/astream`, never the files of the crates beneath it).
 #[must_use]
 pub fn forks_touched(paths: &[String], forks: &[(String, String)]) -> BTreeSet<String> {
     forks
@@ -973,8 +966,8 @@ fn flag_hidden_edits(root: &Path, path_env: &OsStr) -> Option<Vec<String>> {
     Some(gone)
 }
 
-/// A child's stdout on success, `None` on any failure — stdout ONLY, because a
-/// warning on stderr must never be parsed as part of the dependency graph.
+/// A child's stdout on success, `None` on any failure. Stdout only: a warning on
+/// stderr must never be parsed as part of the dependency graph.
 fn stdout_of(cmd: &mut Command, root: &Path, path_env: &OsStr) -> Option<String> {
     let out = cmd.current_dir(root).env("PATH", path_env).output().ok()?;
     out.status
@@ -1090,13 +1083,11 @@ pub fn lock_shared_names(lock: &str) -> BTreeSet<String> {
 }
 
 /// The in-repo path packages the resolved graph carries that are not workspace
-/// members — the `[patch]`ed forks under `vendor/` and the astream crates
-/// aterm-link path-depends on — each with its repo-relative directory, sorted.
-/// Read from the graph [`invert`] queries (`targo tree`, the same edges), so
-/// every package listed is one it can answer for: a package the graph does not
-/// carry (an astream crate aterm does not use, one behind an off-by-default
-/// feature) is no build input of any default-feature check. `None` when the
-/// graph could not be read.
+/// members (the `[patch]`ed forks under `vendor/`, the astream crates aterm-link
+/// path-depends on), each with its repo-relative directory, sorted. Read from the
+/// same graph [`invert`] queries, so every package listed is one it can answer for;
+/// one the graph does not carry is no build input of a default-feature check.
+/// `None` when the graph could not be read.
 fn read_path_packages(
     root: &Path,
     tools: &Toolchain,
@@ -1141,8 +1132,8 @@ fn invert(
         path_env,
         &[
             "tree",
-            // every member, not the default ones: a tool left out of
-            // `default-members` is as affected as any other dependant
+            // Every member, not only `default-members`: one left out of the
+            // default set is as affected as any other dependent.
             "--workspace",
             "--invert",
             crate_name,
@@ -1150,8 +1141,7 @@ fn invert(
             "none",
             "--format",
             "{p}",
-            // DEV edges included: a crate whose TESTS use the changed crate is
-            // as affected as one whose library does.
+            // Dev edges: a crate whose tests use the changed crate is affected too.
             "--edges",
             "normal,build,dev",
         ],
@@ -1184,8 +1174,8 @@ fn manifests_near(root: &Path, paths: &[String]) -> Manifests {
 }
 
 /// The name a `Cargo.toml` declares in its `[package]` table (`None` for a
-/// virtual manifest). Deliberately does not read `[[bin]]`/`[lib]` name keys:
-/// only the package name is a `-p` spec.
+/// virtual manifest). Not `[[bin]]`/`[lib]` names: only the package name is a
+/// `-p` spec.
 #[must_use]
 pub fn manifest_package_name(text: &str) -> Option<String> {
     let mut in_package = false;
@@ -1221,16 +1211,10 @@ pub fn declares_lib_target(manifest: &str) -> bool {
     manifest.lines().any(|l| l.starts_with("[lib]"))
 }
 
-/// Does the member at `crates/<name>` have a library target — for the ONE
-/// scope shape (`-p <crate>`) that never resolved the graph and so has no
-/// `Members` table to ask. Both halves of cargo's rule: the explicit `[lib]`
-/// table ([`declares_lib_target`]) and the autodiscovered `src/lib.rs` on
-/// disk. The `crates/<name>` convention is this workspace's layout; a member
-/// living elsewhere makes the manifest unreadable, and an unanswerable
-/// question answers YES — the same fail-closed direction as
-/// [`Members::any_has_lib`], here meaning the doc-driver diagnosis fires
-/// rather than a bare run that would die raw at rustdoc exec if the answer
-/// was really yes.
+/// Does the member at `crates/<name>` have a library target, for a `-p` scope,
+/// which has no [`Members`] table to ask: an explicit `[lib]` table
+/// ([`declares_lib_target`]) or a `src/lib.rs` on disk. A manifest it cannot read
+/// (a member outside `crates/`) answers yes, as [`Members::any_has_lib`] does.
 #[must_use]
 pub fn crate_dir_has_lib(root: &std::path::Path, name: &str) -> bool {
     let dir = root.join("crates").join(name);
@@ -1854,12 +1838,10 @@ checksum = "aaa"
         assert_eq!(narrowed(&sel), (vec![], vec![]), "a file no test claims");
     }
 
-    /// A VENDORED PACKAGE IS A BUILD INPUT OF ITS DEPENDENTS: a submodule bump
-    /// (only the gitlink `vendor/astream` is listed) touches every astream crate
-    /// the graph carries beneath it, and a file of a `[patch]`ed fork touches the
-    /// fork; either selects the members that depend on it, named after the
-    /// packages. Negative controls: vendor/ files no package owns, and a sibling
-    /// directory sharing a prefix, select nothing and do not widen.
+    /// A gitlink bump (only `vendor/astream` is listed) touches every astream crate the
+    /// graph carries beneath it, and a `[patch]`ed fork's file touches the fork; either
+    /// selects its dependents. Negative controls: vendor/ files no package owns, and a
+    /// sibling directory sharing a prefix, select nothing and do not widen.
     #[test]
     fn a_vendored_package_or_its_gitlink_selects_the_members_that_depend_on_it() {
         const VENDORED: &[(&str, &str)] = &[
@@ -2084,7 +2066,7 @@ checksum = "aaa"
     fn the_lib_question_is_answered_from_the_manifest_or_yes() {
         let tmp = std::env::temp_dir().join(format!("atv-scoped-lib-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        // Bin-only: a manifest with no [lib] and no src/lib.rs answers NO.
+        // Bin-only: a manifest with no [lib] and no src/lib.rs answers no.
         let bin_only = tmp.join("crates/binonly");
         std::fs::create_dir_all(bin_only.join("src")).unwrap();
         std::fs::write(
@@ -2105,7 +2087,7 @@ checksum = "aaa"
         )
         .unwrap();
         assert!(crate_dir_has_lib(&tmp, "declared"));
-        // Unanswerable answers YES — the Members::any_has_lib direction.
+        // Unanswerable answers yes, as `Members::any_has_lib` does.
         assert!(crate_dir_has_lib(&tmp, "no-such-member"));
         let _ = std::fs::remove_dir_all(&tmp);
         let m = Members::new(vec![

@@ -45,7 +45,7 @@ pub const DEFAULT_MAX_ROWS: usize = 8000;
 /// it reads the whole ledger ([`Session::ledger_turn`]).
 const HISTORY_DEPTH: usize = 8;
 /// How many characters of the turn's text (whitespace aside) its `❯` row must
-/// begin with. The ledger keeps up to 512 bytes of it.
+/// begin with.
 pub const MARKER_CHARS: usize = 60;
 /// The caret Claude Code's user rows open with, and any reader's without one.
 const CLAUDE_CARET: char = '❯';
@@ -319,9 +319,7 @@ fn newest_turn(turns: Vec<LedgerTurn>) -> Option<LedgerTurn> {
     Some(turns.swap_remove(at))
 }
 
-/// Decode the control protocol's `%XX` escape: the wire's one TOTAL decoder,
-/// under the name this crate's parsers (`ledger`, `claim`, `lifecycle`, the
-/// approval loop, `run`) import it by.
+/// Decode the control protocol's `%XX` escape, under the name this crate's parsers import.
 pub(crate) use aterm_codec::pct::decode as pct_decode;
 
 /// One `offscreen … screen=1` reply: the header's fields and the two halves.
@@ -356,10 +354,9 @@ pub struct Offscreen {
 /// Why an `offscreen` reply could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OffscreenError {
-    /// No `OK <n> first=… last=…` header anywhere (an `aterm ctl` that prints
-    /// only a line-framed verb's rows), or the header alone with rows it counts
-    /// dropped (an `aterm ctl` that predates `offscreen` frames it like
-    /// `lines`, a status line). Either way the rows cannot be placed.
+    /// No `OK <n> first=… last=…` header anywhere (an `aterm ctl` that prints only a
+    /// line-framed verb's rows), or the header alone with its rows dropped (an `aterm ctl`
+    /// that frames `offscreen` like a status line): the rows cannot be placed.
     NoHeader,
     /// A header that does not describe the rows that came.
     Bad(String),
@@ -710,8 +707,8 @@ fn assess(
             if off.breaks > 0 {
                 recheck = Some(joined.first + u64::try_from(s).unwrap_or(u64::MAX));
             }
-            // A tail read (no ledger turn) left out OLDER rows: nothing after
-            // the start. An oldest-first page left out newer ones.
+            // A tail read (no ledger turn) left out older rows, none after the start; an
+            // oldest-first page left out newer ones.
             if off.more && marker == Marker::Ledger {
                 reasons.push(Reason::MaxRows);
             }

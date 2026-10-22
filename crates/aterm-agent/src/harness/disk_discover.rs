@@ -522,14 +522,11 @@ impl Exec {
     }
 }
 
-/// The names Claude Code's own binary answers to as a TOOL, not a Claude
-/// Code (it dispatches on `argv[0]`): its shell's `grep` is `ARGV0=ugrep
-/// <claude>`, its `find` `ARGV0=bfs <claude>`, its `rg` and its Linux
-/// sandbox's `apply-seccomp` likewise (Claude Code 2.1.287's shell
-/// snapshot). Measured 2026-10-02: 7 such `ugrep`s ran orphaned for a day
-/// and more, in the working directories of the sessions that started them.
-/// A name not here reads as a Claude Code: one more kept project, never a
-/// session lost.
+/// The names Claude Code's binary answers to as a tool, not a Claude Code (it dispatches on
+/// `argv[0]`): its shell's `grep` is `ARGV0=ugrep <claude>`, its `find` `ARGV0=bfs <claude>`,
+/// likewise `rg` and the Linux sandbox's `apply-seccomp`; orphaned ones can run for days in a
+/// session's directory. A name not here reads as a Claude Code: one more kept project, never
+/// a session lost.
 const CLAUDE_TOOLS: &[&str] = &["ugrep", "bfs", "rg", "apply-seccomp"];
 
 /// The extensions a Windows program file carries, which [`claude_code`]
@@ -1101,11 +1098,9 @@ pub enum Origin {
         /// Claude Code directory holds it ([`Owners`]).
         session_dir: PathBuf,
     },
-    /// Reached from an owner's folder by a `target*` link that points OUT of
-    /// it, or from two owners' at once: it belongs to whatever else names it,
-    /// never to an owner that can end. (A scratch worktree's `target ->
-    /// ~/repo/target.noindex` must never make the checkout's build directory
-    /// an ended session's.)
+    /// Reached from an owner's folder by a `target*` link pointing out of it, or from two
+    /// owners' at once: it belongs to whatever else names it, never to an owner that can end
+    /// (a scratch worktree's `target -> ~/repo/target.noindex` is the checkout's).
     Linked {
         /// The link, or the second owner's folder, it was reached through.
         from: PathBuf,
@@ -2869,14 +2864,11 @@ fn own_use(
     Ok(None)
 }
 
-/// What a removal of a gone owner's build directory checks under cargo's
-/// locks, right before it deletes: the directory is inside the owner's
-/// folder ([`owns`]) and the owner is still gone ([`still_gone`], a session's
-/// by the running processes `census` reads now). That no running process
-/// uses it ([`unused`]) is asked just BEFORE the reclaim opens the
-/// directory: a child this process forks while the reclaim holds
-/// its handles carries copies of them until it execs, and would read as a
-/// user of the very directory being reclaimed.
+/// What a removal of a gone owner's build directory checks under cargo's locks, right before
+/// it deletes: the directory is inside the owner's folder ([`owns`]) and the owner is still
+/// gone ([`still_gone`]). [`unused`] is asked earlier, before the reclaim opens the directory:
+/// a child forked while the reclaim holds its handles carries copies until it execs, and
+/// would read as a user of the directory.
 ///
 /// # Errors
 ///

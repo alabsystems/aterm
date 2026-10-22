@@ -32,14 +32,14 @@
 //!    either. A sheet nobody answers for [`SHEET_FOR`] is Not Now, and a `sudo` password
 //!    sheet that needs the same window takes it (the ask comes back after).
 //! 3. **The join** ([`JoinReach::run`], on a background thread): `client::join` of the
-//!    default source with the typed password, the subscriber installed once the request is
-//!    queued (or after the join, for a Mac that was in already) when this aterm is a copy
-//!    that lasts ([`lasting_program`]), and the outcome told through the message surface: a
-//!    band answer to the press ([`joined_notice`], [`pending_notice`], [`failed_notice`])
-//!    and, where the person has something left to do, a digest line ([`pending_entry`],
-//!    [`failed_entry`], [`unsynced_entry`], [`unfinished_entry`]). Names, counts, the join
-//!    code and program paths only, never a value; the typed password is wiped when the
-//!    join returns.
+//!    sheet's URL (the ALab default unless the person edited it) with the typed password,
+//!    the subscriber installed once the request is queued (or after the join, for a Mac
+//!    that was in already) when this aterm is a copy that lasts ([`lasting_program`]), and
+//!    the outcome told through the message surface: a band answer to the press
+//!    ([`joined_notice`], [`pending_notice`], [`failed_notice`]) and, where the person has
+//!    something left to do, a digest line ([`pending_entry`], [`failed_entry`],
+//!    [`unsynced_entry`], [`unfinished_entry`]). Names, counts, the join code and program
+//!    paths only, never a value; the typed password is wiped when the join returns.
 //!
 //! Headless code reaches neither WindowServer nor the LAN: the probe lane starts on a
 //! windowed instance only, the join and the sheet run behind [`JoinReach`] (inert on the
@@ -138,6 +138,13 @@ pub(crate) fn vault_host() -> &'static str {
     &rest[..end]
 }
 
+/// Whether the sheet's `source` (empty: the default) is the ALab vault's URL, which a bare
+/// `aterm secrets join` joins.
+pub(crate) fn is_alab_source(source: &str) -> bool {
+    let source = source.trim();
+    source.is_empty() || source == aterm_secrets::ALAB_DEFAULT_URL
+}
+
 // ---------------------------------------------------------------------------
 // The events
 // ---------------------------------------------------------------------------
@@ -220,10 +227,12 @@ pub(crate) enum JoinEnd {
         names: usize,
         subscriber: Option<Unsynced>,
     },
-    /// Asked; an admin Mac must approve `code` (this Mac asked as `host`).
+    /// Asked; an admin Mac must approve `code` (this Mac asked as `host`); `with_password`
+    /// when a join password went with the request, so a mistyped one may be why it waits.
     Pending {
         code: String,
         host: String,
+        with_password: bool,
         subscriber: Option<Unsynced>,
     },
     /// The join failed: what failed, never a value.
@@ -417,6 +426,20 @@ pub(crate) fn lasting_program(program: PathBuf) -> Result<PathBuf, Unsynced> {
     } else {
         Err(Unsynced::Fleeting(program.display().to_string()))
     }
+}
+
+/// The program a subscriber installed now runs (`service::program_for_service`, which
+/// refuses a copy that does not last): where this aterm runs when that is why
+/// ([`lasting_program`]), else what failed.
+#[cfg(target_os = "macos")]
+fn subscriber_program() -> Result<PathBuf, Unsynced> {
+    aterm_secrets::service::program_for_service().map_err(|error| {
+        std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .ok()
+            .and_then(|exe| lasting_program(exe).err())
+            .unwrap_or_else(|| Unsynced::Failed(error.to_string()))
+    })
 }
 
 /// This Mac's vault setup under `paths`: `source.toml`, `state.toml` and the subscriber's
@@ -859,7 +882,7 @@ const fn never() -> bool {
     false
 }
 
-/// The live join, on a background thread: [`join_vault`] of the ALab default, then — when
+/// The live join, on a background thread: [`join_vault`] of the sheet's source, then — when
 /// it ends pending — a look at whether this Mac is in every [`MEMBER_RECHECK`], so the
 /// subscriber's finishing of it is told as a join. The password is wiped before the end
 /// is posted.
@@ -902,10 +925,12 @@ fn spawn_join(job: JoinJob) -> bool {
 #[cfg(target_os = "macos")]
 fn look_join(job: JoinJob) -> bool {
     let JoinJob { password, post, .. } = job;
+    let with_password = password.is_some();
     drop(password);
     post(VaultWake::Joined(JoinEnd::Pending {
         code: "SEAM-CODE".to_string(),
         host: "development-seam".to_string(),
+        with_password,
         subscriber: None,
     }));
     true
@@ -970,6 +995,7 @@ pub(crate) fn join_vault(plan: &JoinPlan<'_>) -> JoinEnd {
         JoinOutcome::Pending { code, host } => JoinEnd::Pending {
             code,
             host,
+            with_password: client::asked_with_password(plan.paths),
             subscriber,
         },
     }
@@ -982,18 +1008,15 @@ pub(crate) fn join_vault(plan: &JoinPlan<'_>) -> JoinEnd {
 #[cfg(target_os = "macos")]
 fn install_subscriber(home: &Path, config_path: Option<&Path>) -> Result<(), Unsynced> {
     use aterm_secrets::service::{self, Job};
-    let installed = service::program_for_service()
+    let installed = subscriber_program().and_then(|program| {
+        service::install(
+            home,
+            Job::Subscriber,
+            &program,
+            &["secrets".to_string(), "watch".to_string()],
+        )
         .map_err(|error| Unsynced::Failed(error.to_string()))
-        .and_then(lasting_program)
-        .and_then(|program| {
-            service::install(
-                home,
-                Job::Subscriber,
-                &program,
-                &["secrets".to_string(), "watch".to_string()],
-            )
-            .map_err(|error| Unsynced::Failed(error.to_string()))
-        });
+    });
     match &installed {
         Ok(line) => aterm_log::info!("secrets join: {line}"),
         Err(why) => aterm_log::warn!("secrets join: no subscriber: {}", why.why()),
@@ -1039,11 +1062,7 @@ fn watch_membership(config_path: Option<&Path>, post: &dyn Fn(VaultWake)) {
                 let names = Paths::live()
                     .and_then(|paths| aterm_secrets::client::status(&paths))
                     .map_or(0, |status| status.names.len());
-                let subscriber = subscriber_gap(&setup.plist, || {
-                    aterm_secrets::service::program_for_service()
-                        .map_err(|error| Unsynced::Failed(error.to_string()))
-                        .and_then(lasting_program)
-                });
+                let subscriber = subscriber_gap(&setup.plist, subscriber_program);
                 post(VaultWake::Joined(JoinEnd::Joined { names, subscriber }));
                 return;
             }
@@ -1349,48 +1368,60 @@ fn secrets_words(n: usize) -> String {
     }
 }
 
-/// The join in flight, from the press until its answer replaces it.
-pub(crate) fn joining_row() -> Message {
-    Message::new(
-        tags::PRIVACY,
-        Severity::Info,
-        "Joining the ALab secrets vault",
-    )
-    .line(format!("asking the vault at {}", vault_host()))
-    .meter(aterm_messages::Meter::busy(""))
-    .working(JOIN_WAIT + Duration::from_secs(60))
-    .key(KEY_JOIN)
+/// The join in flight, from the press until its answer replaces it: the vault at the
+/// sheet's `source` (empty: the default). A URL is named as the CLI names one, never with
+/// its userinfo, query or fragment, where a credential could ride; a path is a vault file.
+pub(crate) fn joining_row(source: &str) -> Message {
+    let source = source.trim();
+    let lower = source.to_ascii_lowercase();
+    let line = if is_alab_source(source) {
+        format!("asking the vault at {}", vault_host())
+    } else if lower.starts_with("http://") || lower.starts_with("https://") {
+        format!(
+            "asking the vault at {}",
+            clean(&aterm_secrets::transport::describe(source))
+        )
+    } else {
+        "reading the vault file".to_string()
+    };
+    Message::new(tags::PRIVACY, Severity::Info, "Joining the secrets vault")
+        .line(line)
+        .meter(aterm_messages::Meter::busy(""))
+        .working(JOIN_WAIT + Duration::from_secs(60))
+        .key(KEY_JOIN)
 }
 
 /// The answer to Join: in, and synced; `follows` when the subscriber keeps it so.
 pub(crate) fn joined_notice(names: usize, follows: bool) -> Message {
     let held = format!("{} in ~/.secrets", secrets_words(names));
-    Message::new(
-        tags::PRIVACY,
-        Severity::Info,
-        "Joined the ALab secrets vault",
-    )
-    .line(if follows {
-        format!("{held}; this Mac keeps them in sync")
-    } else {
-        held
-    })
-    .notice(NoticeKind::Answer)
-    .key(KEY_JOIN)
+    Message::new(tags::PRIVACY, Severity::Info, "Joined the secrets vault")
+        .line(if follows {
+            format!("{held}; this Mac keeps them in sync")
+        } else {
+            held
+        })
+        .notice(NoticeKind::Answer)
+        .key(KEY_JOIN)
 }
 
-/// What fixes a mistyped join password on a pending Mac (the band's words; the digest line
-/// says it as a sentence): its proof matched nothing, so it waits for an approval by code
-/// with no sign of why, and only a join again sends another. The join this window ran is
-/// always the ALab default's, which is the verb's own.
-const RETYPE: &str = "a mistyped join password is fixed by running aterm secrets join in a terminal (it asks for the password again)";
+/// What fixes a mistyped join password on a Mac that waits with one: its proof matched
+/// nothing, so it waits for an approval by code with no sign of why, and only a join again
+/// sends another. A bare join asks for the ALab vault, so another vault's URL is added (as
+/// [`JOIN_AGAIN`] says), never shown here, since it may carry a query or a pin.
+const RETYPE: &str = "a mistyped join password is fixed by running aterm secrets join in a terminal, adding the vault's URL if not the ALab one (it asks for the password again)";
 
-/// The answer to Join: asked, and an admin Mac approves `code`.
-pub(crate) fn pending_notice(code: &str) -> Message {
-    Message::new(
+/// What the digest line of a join that failed or never finished asks: a join again, which
+/// names the vault's URL for any vault but the ALab default, the bare verb's.
+const JOIN_AGAIN: &str =
+    "Run aterm secrets join in a terminal, adding the vault's URL if not the ALab one";
+
+/// The answer to Join: asked, and an admin Mac approves `code`; [`RETYPE`] when a join
+/// password went with the request.
+pub(crate) fn pending_notice(code: &str, with_password: bool) -> Message {
+    let message = Message::new(
         tags::PRIVACY,
         Severity::Info,
-        "Asked to join the ALab vault",
+        "Asked to join the secrets vault",
     )
     .line(format!(
         "an admin Mac approves code {}; this Mac joins by itself then",
@@ -1399,8 +1430,12 @@ pub(crate) fn pending_notice(code: &str) -> Message {
     .line(format!(
         "on an admin Mac: aterm secrets approve {}",
         clean(code)
-    ))
-    .line(RETYPE)
+    ));
+    if with_password {
+        message.line(RETYPE)
+    } else {
+        message
+    }
     .notice(NoticeKind::Answer)
     .key(KEY_JOIN)
 }
@@ -1410,31 +1445,39 @@ pub(crate) fn failed_notice(why: &str) -> Message {
     Message::new(
         tags::PRIVACY,
         Severity::Warn,
-        "Could not join the ALab vault",
+        "Could not join the secrets vault",
     )
     .line(clean(why))
     .notice(NoticeKind::Answer)
     .key(KEY_JOIN)
 }
 
-/// The digest line while an admin Mac has not approved this one.
-pub(crate) fn pending_entry(code: &str, host: &str) -> Entry {
+/// The digest line while an admin Mac has not approved this one; [`RETYPE`] when a join
+/// password went with the request.
+pub(crate) fn pending_entry(code: &str, host: &str, with_password: bool) -> Entry {
     let code = clean(code);
-    Entry::new(
+    let entry = Entry::new(
         Family::Privacy,
         SUBJECT,
         CAUSE_PENDING,
         "This Mac needs vault approval",
         Why::OnlyYou(Reason::new(
-            "only an admin Mac can let this Mac into the ALab secrets vault",
+            "only an admin Mac can let this Mac into the secrets vault",
         )),
         Then::step(format!("On an admin Mac run aterm secrets approve {code}")),
     )
     .more(format!(
         "This Mac asked as {}, code {code}; it joins by itself once approved.",
         clean(host)
-    ))
-    .more("A mistyped join password is fixed by running aterm secrets join in a terminal, which asks for the password again.")
+    ));
+    if with_password {
+        entry.more(format!(
+            "{}.",
+            crate::update_words::capitalize_first(RETYPE)
+        ))
+    } else {
+        entry
+    }
     .log_line(format!("secrets join-pending code={code}"))
 }
 
@@ -1445,10 +1488,8 @@ pub(crate) fn failed_entry(why: &str) -> Entry {
         SUBJECT,
         CAUSE_FAILED,
         "Joining the secrets vault failed",
-        Why::YourAction(Reason::new(
-            "the ALab secrets vault did not let this Mac in",
-        )),
-        Then::step("Run aterm secrets join in a terminal"),
+        Why::YourAction(Reason::new("the secrets vault did not let this Mac in")),
+        Then::step(JOIN_AGAIN),
     )
     .severity(Severity::Warn)
     .more(clean(why))
@@ -1466,7 +1507,7 @@ pub(crate) fn unfinished_entry() -> Entry {
         Why::YourAction(Reason::new(
             "this Mac was set up for a secrets vault but nothing will let it in",
         )),
-        Then::step("Run aterm secrets join in a terminal"),
+        Then::step(JOIN_AGAIN),
     )
     .severity(Severity::Warn)
     .more("A join was cut off before it asked the vault or installed its subscriber.")
@@ -1696,6 +1737,7 @@ impl App {
         let Some(post) = self.secrets_post() else {
             return;
         };
+        let row = joining_row(&source);
         let started = self.secrets_join.run(JoinJob {
             source,
             password,
@@ -1704,7 +1746,7 @@ impl App {
         });
         self.secrets_join.join_started(started);
         if started {
-            self.post_message(joining_row());
+            self.post_message(row);
         } else {
             self.secrets_join_ended(JoinEnd::Failed {
                 why: "the join could not start".to_string(),
@@ -1754,13 +1796,14 @@ impl App {
             JoinEnd::Pending {
                 code,
                 host,
+                with_password,
                 subscriber,
             } => {
                 aterm_log::info!("secrets vault: asked to join as {host}, code {code}");
-                self.post_message(pending_notice(code));
+                self.post_message(pending_notice(code, *with_password));
                 self.except_clear(&entry_key(CAUSE_FAILED));
                 self.except_clear(&entry_key(CAUSE_UNFINISHED));
-                self.except(&pending_entry(code, host));
+                self.except(&pending_entry(code, host, *with_password));
                 subscriber.as_ref()
             }
             JoinEnd::Failed { why } => {
@@ -2584,19 +2627,19 @@ mod tests {
         assert_eq!(attention(&joined_notice(12, true)), Ok(Attention::Answer));
         assert_eq!(attention(&joined_notice(12, false)), Ok(Attention::Answer));
         assert_eq!(
-            attention(&pending_notice("ABCD2345")),
+            attention(&pending_notice("ABCD2345", true)),
             Ok(Attention::Answer)
         );
         assert_eq!(
             attention(&failed_notice("no route")),
             Ok(Attention::Failure)
         );
-        assert_eq!(attention(&joining_row()), Ok(Attention::Progress));
+        assert_eq!(attention(&joining_row("")), Ok(Attention::Progress));
         for msg in [
             joined_notice(1, true),
-            pending_notice("ABCD2345"),
+            pending_notice("ABCD2345", true),
             failed_notice("x"),
-            joining_row(),
+            joining_row(""),
         ] {
             assert_eq!(
                 msg.key.as_deref(),
@@ -2609,7 +2652,7 @@ mod tests {
         assert!(joined.contains("keeps them in sync"), "{joined}");
         let unsynced = format!("{:?}", joined_notice(3, false).detail);
         assert!(unsynced.contains("3 secrets") && !unsynced.contains("in sync"));
-        let pending = format!("{:?}", pending_notice("ABCD2345").detail);
+        let pending = format!("{:?}", pending_notice("ABCD2345", true).detail);
         assert!(
             pending.contains("aterm secrets approve ABCD2345"),
             "{pending}"
@@ -2617,12 +2660,18 @@ mod tests {
         // A pending Mac whose proof matched nothing is told how to send another.
         let retype = "mistyped join password is fixed by running aterm secrets join";
         assert!(pending.contains(retype), "{pending}");
-        let digest = format!("{:?}", pending_entry("ABCD2345", "m99").message().unwrap());
-        assert!(digest.contains(retype), "{digest}");
+        let digest = format!(
+            "{:?}",
+            pending_entry("ABCD2345", "m99", true).message().unwrap()
+        );
+        assert!(
+            digest.contains(&format!("A {retype}")),
+            "a sentence: {digest}"
+        );
 
         let dmg = Unsynced::Fleeting("/Volumes/aterm/aterm.app/Contents/MacOS/aterm".into());
         for (entry, cause) in [
-            (pending_entry("ABCD2345", "m99"), CAUSE_PENDING),
+            (pending_entry("ABCD2345", "m99", true), CAUSE_PENDING),
             (failed_entry("the vault refused"), CAUSE_FAILED),
             (unfinished_entry(), CAUSE_UNFINISHED),
             (
@@ -2638,13 +2687,84 @@ mod tests {
                 .unwrap_or_else(|fault| panic!("{cause}: {fault:?}"));
             assert!(matches!(msg.need(), aterm_messages::need::Need::Later(_)));
         }
-        let shown = format!("{:?}", pending_entry("ABCD2345", "m99").message().unwrap());
+        let shown = format!(
+            "{:?}",
+            pending_entry("ABCD2345", "m99", true).message().unwrap()
+        );
         assert!(shown.contains("aterm secrets approve ABCD2345") && shown.contains("m99"));
         let shown = format!("{:?}", unsynced_entry(&dmg).message().unwrap());
         assert!(
             shown.contains("Move aterm to Applications") && shown.contains("/Volumes/aterm"),
             "{shown}"
         );
+    }
+
+    /// A JOIN OF ANOTHER VAULT (the sheet's URL edited) is told as one: the pending answer
+    /// and digest line say how a mistyped join password is fixed only when one was typed,
+    /// adding the vault's URL if not the ALab one (never the URL itself, which may carry a
+    /// query or a pin), the row in flight names the vault asked as the CLI does (scheme, host
+    /// and path, never userinfo) or a vault file, and no outcome calls it the ALab vault.
+    #[test]
+    fn a_join_of_another_vault_is_told_by_its_own_url() {
+        let url = "https://vault.example/v1/x?k=private-query#private-pin";
+        assert!(
+            is_alab_source("") && is_alab_source(&format!(" {} ", aterm_secrets::ALAB_DEFAULT_URL))
+        );
+        assert!(!is_alab_source(url));
+        let typed = [
+            format!("{:?}", pending_notice("ABCD2345", true).detail),
+            format!(
+                "{:?}",
+                pending_entry("ABCD2345", "m99", true).message().unwrap()
+            ),
+        ];
+        for told in &typed {
+            assert!(
+                told.contains("running aterm secrets join in a terminal, adding the vault's URL if not the ALab one"),
+                "{told}"
+            );
+        }
+        let by_code = [
+            format!("{:?}", pending_notice("ABCD2345", false).detail),
+            format!(
+                "{:?}",
+                pending_entry("ABCD2345", "m99", false).message().unwrap()
+            ),
+        ];
+        for told in &by_code {
+            assert!(!told.contains("mistyped"), "{told}");
+        }
+        let row = joining_row(url);
+        let shown = format!("{row:?}");
+        assert!(
+            shown.contains("asking the vault at https://vault.example/v1/x"),
+            "{shown}"
+        );
+        assert!(!shown.contains("private"), "{shown}");
+        // Userinfo (refused by the join, but typed) never shows; a vault at a path is a file.
+        for typed in [
+            "https://t0ken-private@vault.example/v1/x",
+            "https://u5er-private:pa55-private@vault.example/v1/x",
+        ] {
+            let shown = format!("{:?}", joining_row(typed));
+            assert!(!shown.contains("private"), "{shown}");
+        }
+        for path in ["/Volumes/v/team.vault", "~/team.vault"] {
+            let shown = format!("{:?}", joining_row(path));
+            assert!(shown.contains("reading the vault file"), "{shown}");
+        }
+        for title in [
+            row.title,
+            joined_notice(1, true).title,
+            pending_notice("ABCD2345", false).title,
+            failed_notice("x").title,
+        ] {
+            assert!(!title.contains("ALab"), "{title}");
+        }
+        for entry in [failed_entry("x"), unfinished_entry()] {
+            let shown = format!("{:?}", entry.message().unwrap());
+            assert!(shown.contains("adding the vault's URL"), "{shown}");
+        }
     }
 
     /// The App's side on the test App (no AppKit, no proxy): the outcomes post the answer
@@ -2676,7 +2796,7 @@ mod tests {
             .messages
             .live_by_key(KEY_JOIN)
             .expect("the answer is on the band");
-        assert_eq!(row.msg.title, "Could not join the ALab vault");
+        assert_eq!(row.msg.title, "Could not join the secrets vault");
 
         // The next launch: the join that failed after it wrote its source is unfinished,
         // and its subscriber is off.
@@ -2693,6 +2813,7 @@ mod tests {
         app.on_secrets_vault(VaultWake::Joined(JoinEnd::Pending {
             code: "ABCD2345".to_string(),
             host: "m99".to_string(),
+            with_password: false,
             subscriber: Some(Unsynced::Fleeting("/Volumes/aterm/aterm.app".into())),
         }));
         assert_eq!(
@@ -2727,7 +2848,7 @@ mod tests {
             .messages
             .live_by_key(KEY_JOIN)
             .expect("the answer is on the band");
-        assert_eq!(row.msg.title, "Joined the ALab secrets vault");
+        assert_eq!(row.msg.title, "Joined the secrets vault");
     }
 
     /// A loopback vault: an admin's home that created it, the server, and its pinned URL.
@@ -2842,6 +2963,7 @@ mod tests {
             matches!(
                 &end,
                 JoinEnd::Pending {
+                    with_password: true,
                     subscriber: None,
                     ..
                 }

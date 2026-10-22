@@ -586,7 +586,7 @@ mod tests {
         "  ⎿  Tip: Use /btw to ask a quick side question",
     ];
 
-    /// No card, recognised or not, hides the status row: a BUSY worker never reads idle.
+    /// No card, recognised or not, hides the status row: a busy worker never reads idle.
     #[test]
     fn no_card_turns_a_busy_worker_idle() {
         for card in [

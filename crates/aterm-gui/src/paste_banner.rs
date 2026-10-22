@@ -85,8 +85,8 @@ impl PendingPaste {
         self.serial
     }
 
-    /// Surrender the parked paste for CONFIRMED delivery: the window, the owning
-    /// session, the text, its source and the framing the question was asked under.
+    /// Surrender the parked paste for confirmed delivery: the window, the owning session, the
+    /// text, its source and the framing the question was asked under.
     pub(crate) fn take(
         self,
     ) -> (

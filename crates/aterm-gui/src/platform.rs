@@ -32,11 +32,9 @@ use crate::app_config::WindowTheme;
 use crate::notify::NotifyMsg;
 use crate::{Wake, WindowId, menu, toolbar};
 
-/// One complete toolbar tab-strip model, borrowed for a single
-/// [`AppRt::set_toolbar_tabs`] push: parallel per-tab slices paired by index
-/// (title, id, strip metadata, hover tooltip, chrome extension), plus the
-/// active index. Bundled so the seam stays one argument as chrome stages
-/// keep adding per-tab context.
+/// One complete toolbar tab-strip model, borrowed for a single [`AppRt::set_toolbar_tabs`]
+/// push: parallel per-tab slices paired by index (title, id, strip metadata, hover tooltip,
+/// chrome extension), plus the active index.
 #[derive(Clone, Copy)]
 pub(crate) struct ToolbarTabsModel<'a> {
     pub(crate) titles: &'a [String],
@@ -73,112 +71,50 @@ pub(crate) trait AppRt {
     /// covers it). No-op on Wayland.
     fn window_set_background_color(&self, window: &Window, bg: u32);
 
-    /// Apply the window-CHROME appearance: match the NSWindow colour space to
-    /// softbuffer's device-RGB content (dropping the per-frame CoreAnimation gamut
-    /// conversion) and set the titlebar light/dark appearance from `theme`. No-op
-    /// off macOS.
+    /// Apply the window-chrome appearance: match the NSWindow colour space to softbuffer's
+    /// device-RGB content (dropping a per-frame CoreAnimation gamut conversion) and set the
+    /// titlebar light/dark appearance from `theme`.
     fn window_set_appearance(&self, window: &Window, theme: WindowTheme);
 
-    /// L1 (early reveal): SYNCHRONOUSLY paint the window's themed backdrop onto
-    /// glass, without waiting for the event loop to pump a paint message.
-    ///
-    /// The warm-launch early reveal shows the first window and then BLOCKS the
-    /// event-loop thread joining the backend build — a wait that is only long on
-    /// Windows, the one platform that takes this path (the macOS join measures
-    /// 0.01 ms; see `app_window.rs`'s join note). On Windows the
-    /// themed erase that makes the revealed window look like the terminal (the
-    /// class brush `window_set_background_color` installs) only runs when a
-    /// paint/erase message is processed — which the blocked loop will not do,
-    /// so without this the "revealed" window would sit as an unpainted rectangle
-    /// for the whole join, which is worse than staying hidden. The Windows impl
-    /// forces the erase inline via `RedrawWindow(RDW_ERASENOW)`.
-    ///
-    /// Default no-op: macOS/Linux do not take the early-reveal path today, and
-    /// their compositors clear fresh windows to the layer/window background
-    /// without a client-side erase anyway.
+    /// Synchronously paint the window's themed backdrop, without waiting for the event loop to
+    /// pump a paint message. The Windows warm-launch early reveal shows the first window, then
+    /// blocks the event-loop thread on the backend join, and the themed erase (the class brush
+    /// `window_set_background_color` installs) runs only on a paint/erase message; without this
+    /// the revealed window is an unpainted rectangle for the whole join.
     #[cfg(windows)]
     fn window_flush_backdrop(&self, _window: &Window) {}
 
-    /// M3 (colour-managed present): tag the window's GPU swapchain layer (the
-    /// CAMetalLayer wgpu attached at surface creation) with an EXPLICIT colour
-    /// space, so ColorSync INTERPRETS the presented sRGB-encoded bytes instead of
-    /// stretching them to the panel's native (P3) primaries. Interpretation only:
-    /// the application-provided swapchain bytes and readback are untouched; the
-    /// resulting compositor colour transform is outside our observation boundary.
-    /// Called AFTER the wgpu surface exists (the layer is created there).
-    /// Returns the colour space actually in effect, or `None` when it cannot be
-    /// established; capture must retain prior known metadata or refuse rather
-    /// than assuming a best-effort tag succeeded.
+    /// Tag the window's GPU swapchain layer (the CAMetalLayer wgpu attaches at surface
+    /// creation) with an explicit colour space, so ColorSync interprets the sRGB-encoded bytes
+    /// instead of stretching them to the panel's P3 primaries; bytes and readback are untouched.
+    /// Call after the wgpu surface exists. Returns the space in effect, or `None` when it cannot
+    /// be established: capture then keeps prior metadata or refuses, never assuming the tag took.
     fn window_set_surface_colorspace(
         &self,
         window: &Window,
         cs: SurfaceColorspace,
     ) -> Option<SurfaceColorspace>;
 
-    /// LIVE-RESIZE ANCHOR: stop the compositor from RESCALING the last presented
-    /// frame while the window is being dragged.
+    /// Stop the compositor rescaling the last presented frame during a live drag.
     ///
-    /// wgpu (via `raw-window-metal`) does not render into the view's own backing
-    /// layer — it installs a `CAMetalLayer` as a SUBLAYER and keeps its frame in
-    /// sync with the super layer through a KVO observer on `bounds`. That layer
-    /// keeps CoreAnimation's default `contentsGravity` (`resize`), and
-    /// `raw-window-metal` deliberately leaves it there ("masks / alleviates issues
-    /// with resizing", `observer.rs`).
+    /// wgpu (via `raw-window-metal`) renders into a `CAMetalLayer` sublayer that tracks the super
+    /// layer by KVO with CoreAnimation's default `contentsGravity` (`resize`). In a drag the
+    /// bounds change in AppKit's transaction while our present lands in a later one, so the
+    /// compositor stretches the previous drawable and smears the text; anchoring at the top-left
+    /// keeps a not-yet-repainted frame at 1:1. Across a Retina/non-Retina move a stale frame
+    /// reads at the wrong size until the next one (gravity uses `physical / contentsScale`).
     ///
-    /// For a terminal that default is exactly wrong. Every step of a live drag
-    /// changes the layer's bounds inside AppKit's own CoreAnimation transaction,
-    /// while our next present lands in a LATER one — so for the frames in between,
-    /// the compositor stretches the previous drawable onto the new bounds. Text
-    /// rasterized for one pixel size and then non-uniformly rescaled is the
-    /// smeared, shredded look the drag shows, and it snaps back the moment a real
-    /// frame arrives. Anchoring at the top-left instead makes a not-yet-repainted
-    /// frame stay at 1:1 exactly where it was drawn — the content sits still and
-    /// the newly exposed strip is simply uncovered until the next present fills
-    /// it, which is the behaviour iTerm2 gets from owning its view's layer.
-    ///
-    /// The cost is confined to the frames we have not repainted yet, and it is a
-    /// scale-factor change (dragging a window between a Retina and a non-Retina
-    /// display) that pays it: `raw-window-metal` syncs `contentsScale` from the
-    /// root layer immediately, and gravity is computed on the LOGICAL size
-    /// (`physical / contentsScale`), so until the next frame lands a stale image
-    /// reads at the WRONG size rather than merely soft — 2x oversized and cropped
-    /// to the anchored corner going Retina→non-Retina, half-sized going the other
-    /// way. That is one artifact, for one frame, on a rare event, traded against a
-    /// continuous artifact on a very common one. Upstream keeps the stretching
-    /// default precisely to blur over that case; a terminal would rather the text
-    /// it is showing be the right size than smoothly the wrong one.
-    ///
-    /// This deliberately goes against `raw-window-metal`'s documented request that
-    /// consumers not set `contentsGravity` on the layer it owns (its `lib.rs`
-    /// "Semantics" note). The reasoning there is that layer presentation belongs to
-    /// the windowing library — but here aterm IS the windowing integration, it
-    /// already sets `colorspace` and `opaque` on this same layer through
-    /// [`layer_colorspace`], and the property is never written back by the crate's
-    /// KVO observer (which syncs only `bounds` and `contentsScale`), so the value
-    /// set at attach stands for the layer's life.
-    ///
-    /// Applied ONCE per window, right after the wgpu surface (and therefore the
-    /// layer) exists. Best-effort and a no-op off macOS.
+    /// `raw-window-metal` asks consumers not to set `contentsGravity`, but its KVO observer
+    /// writes only `bounds` and `contentsScale`, so the value set at attach stands. Applied once
+    /// per window after the wgpu surface exists; a no-op off macOS.
     fn window_anchor_surface_top_left(&self, window: &Window);
 
-    /// READ BACK the live presentation state of the window's GPU swapchain layer:
-    /// `(contents_gravity, contents_scale, contents_are_flipped)`.
-    ///
-    /// [`AppRt::window_anchor_surface_top_left`] is the one change in the resize
-    /// path that NO in-process instrument can score, because the artifact it
-    /// prevents happens in the compositor, after aterm has submitted its frame —
-    /// `image`/`video`/`metrics` all stop at the WSI boundary by construction. What
-    /// IS observable, and what this exposes, is whether the anchor is actually in
-    /// effect on the live layer.
-    ///
-    /// That turns an unverifiable claim into a checkable one and, more usefully,
-    /// into a regression guard: the layer belongs to `raw-window-metal`, whose docs
-    /// reserve the right to overwrite common `CALayer` properties, and wgpu
-    /// reconfigures the surface on every resize. If either ever reverts the gravity,
-    /// `dims` says so instead of the smear quietly coming back.
-    ///
-    /// `None` where there is no such layer (off macOS, CPU backend, no window).
-    /// Read-only: it must never be the thing that establishes the state it reports.
+    /// Read back the live presentation state of the window's GPU swapchain layer:
+    /// `(contents_gravity, contents_scale, contents_are_flipped)`. The anchor
+    /// ([`AppRt::window_anchor_surface_top_left`]) prevents a compositor artifact no in-process
+    /// capture can see, so `dims` reports whether it is in effect on the live layer, which
+    /// `raw-window-metal` or a wgpu reconfigure could revert. `None` where there is no such layer
+    /// (off macOS, CPU backend, no window). Read-only: it never establishes what it reports.
     fn window_surface_presentation(&self, window: &Window) -> Option<(String, f64, bool)>;
 
     /// A frame of `window` was just presented (its swap or its image put
@@ -188,24 +124,18 @@ pub(crate) trait AppRt {
     /// other platforms' compositors pace a resize themselves.
     fn window_frame_presented(&self, _window: &Window) {}
 
-    /// M5 TRUE VIBRANCY: install / update / remove the window-level
-    /// `NSVisualEffectView` blurred backdrop and flip the window + CAMetalLayer to
-    /// non-opaque so the GPU's translucent (PostMultiplied) present composites over
-    /// it. `material` is the resolved config `background_material`; `translucent`
-    /// is `background_opacity < 1.0` (`aterm_render::vibrancy::is_translucent`);
-    /// `bg` (`0x00RRGGBB`) is the theme background used to RESTORE the opaque
-    /// seamless-titlebar fill when translucency turns off.
+    /// Install / update / remove the window-level `NSVisualEffectView` blurred backdrop and
+    /// flip the window and CAMetalLayer to non-opaque so the GPU's translucent (PostMultiplied)
+    /// present composites over it. `material` is the resolved `background_material`;
+    /// `translucent` is `background_opacity < 1.0` (`aterm_render::vibrancy::is_translucent`);
+    /// `bg` (`0x00RRGGBB`) restores the opaque titlebar fill when translucency turns off.
     ///
-    /// * `translucent && material != None` → a `behindWindow` visual-effect view
-    ///   (the mapped `NSVisualEffectMaterial`) is installed behind the Metal layer,
-    ///   the window is made non-opaque with a clear background, and the Metal layer
-    ///   is set non-opaque — the desktop shows blurred through the terminal bg.
-    /// * `translucent && material == None` → the same non-opaque flip WITHOUT a
-    ///   blur view — the desktop shows through unblurred (plain translucency).
-    /// * `!translucent` → any installed view is removed and the window / Metal
-    ///   layer restored to opaque with the `bg` fill (the byte-identical default).
+    /// * `translucent && material != None`: a `behindWindow` effect view behind the Metal
+    ///   layer, and a non-opaque window and layer; the desktop shows blurred.
+    /// * `translucent && material == None`: the same flip with no blur view.
+    /// * `!translucent`: any installed view removed, window and layer opaque with the `bg` fill.
     ///
-    /// Best-effort like the other chrome methods; a no-op off macOS.
+    /// Best-effort; a no-op off macOS.
     fn window_set_vibrancy(
         &self,
         window: &Window,
@@ -214,58 +144,39 @@ pub(crate) trait AppRt {
         bg: u32,
     );
 
-    /// M3 phase B: the EDR maximum of the screen `window` currently occupies —
-    /// `NSScreen.maximumExtendedDynamicRangeColorComponentValue` (1.0 on an SDR
-    /// panel; ~1.6 on a MacBook HDR panel at typical brightness; up to 16 on a
-    /// Pro Display XDR). Queried at GPU attach and RE-queried on monitor
-    /// changes (`refresh_frame_interval`); fed per-window into the renderer,
-    /// which sanitizes it through the PROVEN `aterm_render::hdr` chain — so the
-    /// off-macOS `1.0` (no headroom) makes the EDR aurora pass provably inert.
+    /// The EDR maximum of the screen `window` occupies
+    /// (`NSScreen.maximumExtendedDynamicRangeColorComponentValue`: 1.0 on SDR, ~1.6 on a MacBook
+    /// HDR panel, up to 16 on a Pro Display XDR). Queried at GPU attach and on monitor changes
+    /// (`refresh_frame_interval`); the renderer sanitizes it through `aterm_render::hdr`, so
+    /// `1.0` off macOS keeps the EDR pass inert.
     fn screen_edr_max(&self, window: &Window) -> f32;
 
-    /// FIRE-INTO-CHROME: extend the window's content view under the titlebar
-    /// (`NSWindowStyleMaskFullSizeContentView`) so the GPU surface spans the full
-    /// frame — giving the window-space effects layer (fire, embers, meteors) a
-    /// drawable band above the terminal grid. Applied ONCE at attach, per chrome'd
-    /// terminal window (never from the config-reload appearance path, which hits
-    /// every window including Settings). Default ON; `$ATERM_NO_FULLSIZE_CONTENT`
-    /// is the escape hatch (checked inside the macOS impl). No-op off macOS.
+    /// Extend the window's content view under the titlebar
+    /// (`NSWindowStyleMaskFullSizeContentView`) so the GPU surface spans the full frame, giving
+    /// the effects layer a band above the grid. Applied once at attach per chrome'd terminal
+    /// window, never from the config-reload appearance path (which reaches every window,
+    /// Settings included). No-op off macOS.
     fn window_set_fullsize_content(&self, _window: &Window) {}
 
-    /// FIRE-INTO-CHROME: the height of the window's titlebar band in POINTS
-    /// (logical) — the chrome headroom the effects layer may draw into. Valid both
-    /// BEFORE the full-size-content mask is applied (frame minus content-rect
-    /// height) and after (content view height minus `contentLayoutRect` height,
-    /// which correctly collapses to 0 in fullscreen). `0.0` off macOS and for
-    /// chromeless windows.
+    /// The titlebar band height in logical points, the chrome headroom the effects layer may
+    /// draw into: content-view height minus `contentLayoutRect` height, so `0` before the
+    /// full-size-content mask, in fullscreen, off macOS and for chromeless windows.
     ///
-    /// THIS SEAM IS THE *MEASURED* OS BAND, and stays that way. C3 gives Windows a
-    /// real WinUI-height tab band through the same `head` MECHANISM, but it is
-    /// deliberately NOT plumbed through here: the synthetic band's height is
-    /// `target − pad_top − tab_strip_rows·cell_h`, i.e. a function of the live
-    /// config and the window's cell box, and an `AppRt` has neither — it would have
-    /// to be handed the answer through a side channel and then hand it back, which
-    /// is a mailbox pretending to be a measurement. `App` derives it instead
-    /// (`App::synthetic_strip_head_px`) and writes the SAME
-    /// `WindowState::head_pts` this measurement writes, so everything downstream —
-    /// the resize law, the pointer mapping, the chrome bleed, the pixel band — sees
-    /// one band and cannot tell the two apart.
+    /// This is the measured OS band only. Windows' synthetic tab band depends on live config and
+    /// the cell box, which an `AppRt` lacks, so `App` derives it (`synthetic_strip_head_px`) and
+    /// writes the same `WindowState::head_pts`; everything downstream sees one band.
     fn titlebar_band_pts(&self, _window: &Window) -> f64 {
         0.0
     }
 
-    /// The usable placement area of the screen `window` sits on — the display
-    /// rectangle MINUS the permanent system chrome (on macOS the menu bar and the
-    /// Dock: `NSScreen.visibleFrame`) — in LOGICAL POINTS with a TOP-LEFT origin and
-    /// y growing DOWN, i.e. the same space `Window::outer_position().to_logical()`
-    /// reports. This is what the new-window cascade wraps against, so a cascaded
-    /// window never lands under the menu bar or behind the Dock.
+    /// The usable placement area of `window`'s screen: the display minus permanent system
+    /// chrome (on macOS the menu bar and Dock, `NSScreen.visibleFrame`), in logical points with a
+    /// top-left origin and y growing down, the space `Window::outer_position().to_logical()`
+    /// reports. The new-window cascade wraps against it.
     ///
-    /// `None` when the platform cannot answer (no native window, an off-screen
-    /// window whose `screen` is nil, or a backend with no work-area concept — every
-    /// non-macOS apprt today). Callers then fall back to the winit monitor bounds,
-    /// which are the FULL display rectangle — a slightly later wrap, never a wrong
-    /// one. See [`crate::app_window::WorkAreaPts`].
+    /// `None` when the platform cannot answer (no native window, an off-screen window, or no
+    /// work-area concept); callers fall back to the winit monitor bounds, the full display, which
+    /// wraps slightly later but never wrongly. See [`crate::app_window::WorkAreaPts`].
     fn window_work_area_pts(&self, _window: &Window) -> Option<crate::app_window::WorkAreaPts> {
         None
     }
@@ -281,10 +192,9 @@ pub(crate) trait AppRt {
         1.0
     }
 
-    /// M3 (Windows scRGB): the display's reference-white scale (`SDR-white / 80`) for
-    /// the EDR present, so the grid isn't dim (scRGB `1.0` == 80 nits). Default `1.0`
-    /// (no scaling) — correct on macOS (the extended-linear layer auto-maps `1.0` → SDR
-    /// white) and on Linux; only the Windows impl queries a real value.
+    /// Windows scRGB: the display's reference-white scale (`SDR-white / 80`) for the EDR
+    /// present, so the grid is not dim (scRGB `1.0` is 80 nits). Default `1.0`, correct on
+    /// macOS (the extended-linear layer maps `1.0` to SDR white) and Linux.
     fn screen_sdr_white_scale(&self, _window: &Window) -> f32 {
         1.0
     }
@@ -309,9 +219,8 @@ pub(crate) trait AppRt {
     /// action target the caller keeps alive. `None` off macOS (no menu installed).
     fn install_menu(&self, proxy: &EventLoopProxy<Wake>) -> Option<menu::MenuHandle>;
 
-    /// Create the menu-bar OPERATOR status item (status_item.rs), rendered from
-    /// `glance`, returning the retained handle the caller keeps alive for the
-    /// process lifetime. Default `None`: no status bar exists off macOS.
+    /// Create the menu-bar operator status item (`status_item.rs`), rendered from `glance`,
+    /// returning the handle the caller keeps for the process lifetime. Default `None`.
     fn install_status_item(
         &self,
         _proxy: &EventLoopProxy<Wake>,
@@ -320,9 +229,8 @@ pub(crate) trait AppRt {
         None
     }
 
-    /// Bring another aterm instance's windows to the front by pid (the status
-    /// menu's sibling rows). Default `false`: no cross-instance activation
-    /// exists off macOS yet.
+    /// Bring another aterm instance's windows to the front by pid (the status menu's sibling
+    /// rows). macOS only.
     #[cfg(target_os = "macos")]
     fn activate_instance(&self, _pid: u32) -> bool {
         false
@@ -353,15 +261,11 @@ pub(crate) trait AppRt {
         crate::control::pbcopy(text)
     }
 
-    /// Un-minimize and raise OUR OWN `window` — the receiving half of a
-    /// `windowing_behavior = "attach"` forward, where `aterm new-tab` spawns a
-    /// tab in an instance the user may not be able to see.
-    ///
-    /// `false` by default (nothing raised). winit's own `focus_window()` is
-    /// deliberately NOT the seam: on Windows it early-returns for a MINIMIZED
-    /// window — the case that matters most here — and steals the foreground by
-    /// SendInput-ing a synthetic Alt keypress, which is not something a
-    /// background tab-spawn may inject into the user's input stream.
+    /// Un-minimize and raise our own `window`: the receiving half of a
+    /// `windowing_behavior = "attach"` forward, where `aterm new-tab` spawns a tab in an
+    /// instance the user may not see. Default `false`. Not winit's `focus_window()`: on Windows
+    /// it early-returns for a minimized window and steals the foreground with a synthetic Alt
+    /// keypress, which a background tab-spawn must not inject.
     fn window_bring_to_front(&self, _window: &Window) -> bool {
         false
     }
@@ -376,17 +280,11 @@ pub(crate) trait AppRt {
         wid: WindowId,
     ) -> Option<toolbar::ToolbarHandle>;
 
-    /// Re-sync a window's native toolbar tab strip to `titles` with the `active`
-    /// index selected. `ids` is the canonical STABLE `TabId` per tab, paired by
-    /// index — the strip stamps it on each chip so a right-click can capture the
-    /// clicked tab's identity at menu-pop time (a positional index would re-bind
-    /// to whatever tab later occupied the slot). `ext` is the per-tab chrome
-    /// EXTENSION paired by index (session-metadata stage 2): the composed hover
-    /// tooltip applied via the chip's `setToolTip:` and the right-click
-    /// context-menu MODEL the chip pops as a native `NSMenu` (see
-    /// `crate::session_chrome`). No-op off macOS / when no handle exists (the
-    /// Linux model still RECORDS `ext` so the `chrome` mirror reads one truth on
-    /// every platform).
+    /// Re-sync a window's native toolbar tab strip to `tabs`. Each chip carries its stable
+    /// `TabId`, so a right-click captures the clicked tab at menu-pop time (a positional index
+    /// would re-bind), and its chrome extension (`ext`: the hover tooltip and the context-menu
+    /// model; see `crate::session_chrome`). With no native strip the non-macOS model still
+    /// records `ext`, so the `chrome` mirror reads one truth on every platform.
     fn set_toolbar_tabs(&self, handle: &toolbar::ToolbarHandle, tabs: ToolbarTabsModel<'_>);
 
     /// Push a window's needs pill alone (its age moved and nothing else),
@@ -403,35 +301,27 @@ pub(crate) trait AppRt {
         true
     }
 
-    /// Re-flow a window's native toolbar tab strip to the window's CURRENT width from
-    /// the state its chips already hold — no titles, no terminal reads. Called on every
-    /// window resize so the strip follows the edge instead of waiting for the next
-    /// title or chrome refresh. Default: nothing (no native strip, or one whose widgets
-    /// the toolkit lays out itself).
+    /// Re-flow a window's native tab strip to its current width from the state its chips hold
+    /// (no titles, no terminal reads), on every window resize. Default: nothing (no native
+    /// strip, or one the toolkit lays out itself).
     fn reflow_toolbar_tabs(&self, _handle: &toolbar::ToolbarHandle) {}
 
-    /// Whether this platform could present the native rename editor, WITHOUT
-    /// presenting it. `begin_tab_rename` installs the field as a side effect, so
-    /// a surface asking "should this command be enabled?" cannot use it.
-    /// Default: `false` — no native editor here, so the tab strip is the only
-    /// surface, and a window with `tab_strip_rows = 0` has none.
+    /// Whether this platform could present the native rename editor, without presenting it
+    /// (`begin_tab_rename` installs the field as a side effect). Default `false`: the tab strip
+    /// is the only surface, and a window with `tab_strip_rows = 0` has none.
     fn can_present_tab_rename(&self, handle: &toolbar::ToolbarHandle) -> bool {
         let _ = handle;
         false
     }
 
-    /// Open the INLINE SESSION-RENAME editor over the strip's `tab` chip, seeded
-    /// with `seed` (the current pin — EMPTY when unpinned) and placeheld with
-    /// `placeholder` (the label the ladder falls back to, so an empty field
-    /// visibly means "use that"). Returns whether an editor is actually on
-    /// screen; `App` refuses to hold edit state that nothing is presenting.
+    /// Open the inline session-rename editor over the strip's `tab` chip, seeded with `seed`
+    /// (the current pin, empty when unpinned) and placeheld with `placeholder` (the label the
+    /// ladder falls back to). Returns whether an editor is on screen; `App` holds no edit state
+    /// that nothing presents.
     ///
-    /// The editor is owned by the strip HANDLE, not by a tab chip: chips are
-    /// destroyed and rebuilt whenever the tab count or the container width
-    /// changes, which ordinary background events (a background session exiting,
-    /// any window resize) cause mid-edit. `tab` is the STABLE id, used only to
-    /// re-find the chip and reposition the editor over it — or, when it is gone,
-    /// to cancel. Default: `false` (no inline editor on this platform yet).
+    /// The editor is owned by the strip handle, not a chip: chips are rebuilt whenever the tab
+    /// count or the width changes, which background events cause mid-edit. `tab` is the stable
+    /// id used to re-find the chip, or to cancel when it is gone. Default: `false`.
     fn begin_tab_rename(
         &self,
         handle: &toolbar::ToolbarHandle,
@@ -451,21 +341,18 @@ pub(crate) trait AppRt {
         let _ = handle;
     }
 
-    /// The live rename editor's current text, or `None` when none is open. The
-    /// native field owns the in-progress text, so a command that must run
-    /// OUTSIDE an open editor reads it here and commits before proceeding —
-    /// otherwise closing a tab with ⌘W mid-rename would silently discard it.
-    /// Default: `None`.
+    /// The live rename editor's current text, or `None` when none is open. The native field
+    /// owns the in-progress text, so a command that runs outside the editor (⌘W closing the tab)
+    /// reads it here and commits first. Default: `None`.
     fn rename_editor_text(&self, handle: &toolbar::ToolbarHandle) -> Option<String> {
         let _ = handle;
         None
     }
 
-    /// Forward one editing command to the live rename field's field editor
-    /// instead of to the terminal. macOS resolves a menu key equivalent BEFORE
-    /// the first responder sees the key, so without this ⌘V would paste into the
-    /// PTY behind an open editor. Returns whether the field editor took it.
-    /// Default: `false` (no editor to forward to).
+    /// Forward one editing command to the live rename field's field editor instead of to the
+    /// terminal: macOS resolves a menu key equivalent before the first responder sees the key,
+    /// so without this ⌘V would paste into the PTY behind an open editor. Returns whether the
+    /// field editor took it. Default: `false`.
     fn rename_editor_edit(
         &self,
         handle: &toolbar::ToolbarHandle,
@@ -475,25 +362,16 @@ pub(crate) trait AppRt {
         false
     }
 
-    /// Read native title chrome as one introspection line (titles, selection,
-    /// independent status, and full tooltips), or `None` only for an empty tab set.
-    /// On Linux this reflects the real in-memory tab-chrome model
-    /// `set_toolbar_tabs` maintains (see `toolbar.rs`), in the SAME line shape macOS
-    /// emits.
-    ///
-    /// The `chrome` verb calls this on every platform. Linux/other non-macOS hosts
-    /// return their live in-memory model; macOS reads the retained native tab views.
+    /// Read native title chrome as one introspection line (titles, selection, independent
+    /// status, full tooltips), or `None` only for an empty tab set. macOS reads the retained
+    /// native tab views; elsewhere it is the in-memory model `set_toolbar_tabs` maintains
+    /// (`toolbar.rs`), in the same line shape.
     fn read_toolbar_chrome(&self, handle: &toolbar::ToolbarHandle) -> Option<String>;
 
-    /// Read the native toolbar tab strip's per-tab CONTEXT-MENU models as
-    /// introspection lines (`tab-menu tab=<i> items=[...]` — one per tab chip,
-    /// none at ≤1 tab, mirroring the hide-when-≤1 strip rule) for the `chrome`
-    /// verb. Ground truth: read off the SAME stored models a right-click pops
-    /// (the live macOS `TabView`s' entries / the Linux in-memory chrome model),
-    /// serialised by the one pure `session_chrome::tab_menu_chrome_line`, so
-    /// the listing IS the on-screen menu. A provided default (both `toolbar`
-    /// modules expose `read_tab_menus`) keeps every impl — including the
-    /// Windows one, which shares the non-macOS toolbar model — in lockstep.
+    /// The strip's per-tab context-menu models as `chrome` introspection lines
+    /// (`tab-menu tab=<i> items=[...]`, one per chip, none at ≤1 tab), read off the same stored
+    /// models a right-click pops and serialised by `session_chrome::tab_menu_chrome_line`. Both
+    /// `toolbar` modules expose `read_tab_menus`, so this default serves every impl.
     fn read_toolbar_tab_menus(&self, handle: &toolbar::ToolbarHandle) -> Vec<String> {
         toolbar::read_tab_menus(handle)
     }
@@ -516,12 +394,11 @@ pub(crate) trait AppRt {
         None
     }
 
-    /// Register the whole-app quit confirmation for AppKit `terminate:` gestures that
-    /// BYPASS the application menu's Quit item — the Dock-icon "Quit", AppleScript
-    /// `quit`, and logout/restart/shutdown. macOS wires winit's synchronous
-    /// `applicationShouldTerminate:` to a typed event-loop deferral, where `App` runs
-    /// the same dialog and document-durability barrier as ⌘Q; a no-op off macOS.
-    /// Called once, when the menu is installed.
+    /// Register the whole-app quit confirmation for AppKit `terminate:` gestures that bypass
+    /// the application menu's Quit item: the Dock-icon "Quit", AppleScript `quit`, and
+    /// logout/restart/shutdown. macOS wires winit's synchronous `applicationShouldTerminate:` to
+    /// a typed event-loop deferral, where `App` runs the same dialog and document-durability
+    /// barrier as ⌘Q; a no-op off macOS. Called once, when the menu is installed.
     fn install_quit_confirm(&self);
 
     /// Query the OS motion preference. macOS reads
@@ -539,53 +416,43 @@ pub(crate) trait AppRt {
         crate::native_appearance::AppearancePreferences::default()
     }
 
-    /// Subscribe to the OS reduce-motion CHANGE notification (macOS:
-    /// `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification` on the
-    /// workspace notification center), posting [`Wake::ReduceMotionChanged`] so
-    /// the main thread re-queries [`Self::reduce_motion`] and repaints. Returns
-    /// the retained observer target the caller must keep alive for the process
-    /// life (AppKit references it weakly). Windows currently samples only at
-    /// window attach; other platforms have no query, so both return `None`.
+    /// Subscribe to the OS reduce-motion change notification (macOS:
+    /// `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification` on the workspace centre),
+    /// posting [`Wake::ReduceMotionChanged`] so the main thread re-queries
+    /// [`Self::reduce_motion`] and repaints. Returns the observer target the caller keeps for
+    /// the process life (AppKit references it weakly); `None` elsewhere.
     fn observe_reduce_motion(&self, proxy: &EventLoopProxy<Wake>) -> Option<ReduceMotionObserver>;
 
-    /// Hold App Nap off for the rest of the process's life, and return the
-    /// activity token the caller keeps for that life: the activity ends when
-    /// the token is released. Called once, and only on the WINDOWED lane —
-    /// `App::resumed`, after its headless return — so a headless or
-    /// test-constructed `App` never reaches the platform service (AGENTS.md
-    /// rule 5). macOS: `begin_app_nap_opt_out` below, which carries the
-    /// 2026-09-28 incident. Default `None`: App Nap is macOS's, so there is
-    /// nothing to hold elsewhere.
+    /// Hold App Nap off for the rest of the process's life; the activity ends when the returned
+    /// token is released. Called once, on the windowed lane only (`App::resumed`, after its
+    /// headless return), so a headless or test `App` never reaches the platform service.
+    /// Default `None`: App Nap is macOS's.
     fn hold_off_app_nap(&self) -> Option<AppNapActivity> {
         None
     }
 }
 
-/// The colour space a GPU window's CAMetalLayer is tagged with at surface attach
-/// (M3). `Srgb` / `DisplayP3` come straight from config `window_colorspace`
-/// ([`crate::app_config::WindowColorspace`], mapped via `From`). Pure data: the
-/// variant → CoreGraphics-name mapping is [`Self::cg_name`], unit-tested below.
+/// The colour space a GPU window's CAMetalLayer is tagged with at surface attach. `Srgb` /
+/// `DisplayP3` come from config `window_colorspace` ([`crate::app_config::WindowColorspace`]);
+/// [`Self::cg_name`] maps each to its CoreGraphics name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SurfaceColorspace {
     /// The honest tag for aterm's sRGB-encoded bytes (config default).
     Srgb,
     /// The legacy stretched interpretation (bytes read as P3 coordinates).
     DisplayP3,
-    /// M3 phase B: the EDR tag for an `Rgba16Float` swapchain — linear-light
-    /// sRGB primaries with >1.0 headroom. NOT a config value: chosen by
-    /// [`resolve_surface_colorspace`] whenever the attached surface is HDR
-    /// (the f16 pixels ARE linear; any other tag would mis-render them).
+    /// The EDR tag for an `Rgba16Float` swapchain: linear-light sRGB primaries with >1.0
+    /// headroom. Not a config value: [`resolve_surface_colorspace`] picks it for any HDR
+    /// surface.
     ExtendedLinearSrgb,
 }
 
 impl SurfaceColorspace {
-    /// The CoreGraphics NAMED-colour-space identifier for this tag, as accepted
-    /// by `CGColorSpaceCreateWithName`. These string VALUES equal the
-    /// `kCGColorSpace*` constant names (stable ABI — they are serialized into
-    /// ICC-tagged files), which lets the macOS impl build the CFString via a
-    /// toll-free-bridged NSString instead of linking the CG data symbols.
-    // Consumed only by the macOS layer-tagging impl; the mapping is still
-    // unit-tested (below) on every platform.
+    /// The CoreGraphics named-colour-space identifier for this tag, as accepted by
+    /// `CGColorSpaceCreateWithName`. The `kCGColorSpace*` constants' values equal their names
+    /// (stable ABI), so the macOS impl builds the CFString from a toll-free-bridged NSString
+    /// instead of linking the CG data symbols.
+    // Consumed only by the macOS layer-tagging impl; unit-tested on every platform.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn cg_name(self) -> &'static str {
         match self {
@@ -617,12 +484,10 @@ pub(crate) fn capture_space_after_surface_tag(
     effective.map_or(previous, SurfaceColorspace::gpu_capture_space)
 }
 
-/// The layer tag for a just-attached (or re-tagged) GPU window: an HDR
-/// (`Rgba16Float`) swapchain MUST be read as extended-linear-sRGB — its pixels
-/// are linear light with EDR headroom, so the config tag would mis-render them
-/// — while an SDR swapchain takes the user's `window_colorspace` verbatim.
-/// PURE (a total match, unit-tested below); both the attach seam and the
-/// hot-reload re-tag route through it so the precedence has one owner.
+/// The layer tag for a just-attached (or re-tagged) GPU window: an HDR (`Rgba16Float`)
+/// swapchain must be read as extended-linear-sRGB (its pixels are linear light with EDR
+/// headroom), while an SDR swapchain takes the user's `window_colorspace` verbatim. The attach
+/// seam and the hot-reload re-tag both route through it.
 #[must_use]
 pub(crate) fn resolve_surface_colorspace(
     cfg: crate::app_config::WindowColorspace,
@@ -688,17 +553,9 @@ impl AppRt for AppRtMacOS {
         toolbar::can_present_tab_rename(handle)
     }
 
-    /// Paint the NSWindow background the terminal's theme background colour (`bg`,
-    /// as `0x00RRGGBB`), so the transparent titlebar and the bare single-tab
-    /// compact bar read as a SEAMLESS extension of the terminal body rather than a
-    /// distinct, lighter chrome strip. This is the window-level half of the Ghostty
-    /// "transparent" titlebar look (the toolbar.rs strip toggling is the other
-    /// half). The terminal content view (softbuffer/Metal layer) paints its own
-    /// background over the content area, so this colour only ever shows in the
-    /// titlebar region the content view does not cover.
-    ///
-    /// Best-effort, mirroring [`Self::window_set_appearance`]: off the main thread
-    /// or with no AppKit `NSWindow`, it is simply a no-op.
+    /// Fill the NSWindow background with the theme background (`bg`, `0x00RRGGBB`) so the
+    /// transparent titlebar and the compact bar read as part of the terminal body; the content
+    /// view paints over the rest. No AppKit window is a no-op.
     fn window_set_background_color(&self, window: &Window, bg: u32) {
         let ns_window = ns_window_of(window);
         if ns_window.is_null() {
@@ -736,19 +593,11 @@ impl AppRt for AppRtMacOS {
         }
     }
 
-    /// Make the window's colour space match softbuffer's device-RGB content so
-    /// CoreAnimation does NOT run a per-frame colour-space conversion on the main
-    /// thread. softbuffer (`backends/cg.rs`) builds its CGImage with
-    /// `CGColorSpace::new_device_rgb()`; on a wide-gamut (P3) display CoreAnimation
-    /// otherwise converts device-RGB → display-P3 on *every* commit
-    /// (`CA::Render::prepare_image` → `vImageConvert_AnyToAny`) — profiled at ~half
-    /// of all present cost during heavy output. Tagging the NSWindow device-RGB
-    /// makes content and window the same space, so the conversion is skipped; the
-    /// final space→panel mapping is done once by the WindowServer, not per app
-    /// frame. aterm's framebuffer pixels are unchanged — only the redundant gamut
-    /// round-trip is removed. `$ATERM_NO_COLORSPACE_MATCH` opts out in a
-    /// development build only ([`aterm_types::dev_seam!`]) — the A/B lever for
-    /// profiling the conversion; a shipped binary always matches.
+    /// Match the NSWindow colour space to softbuffer's device-RGB content (its CGImage uses
+    /// `CGColorSpace::new_device_rgb()`), so CoreAnimation skips a per-commit device-RGB →
+    /// display-P3 conversion on wide-gamut displays (profiled at about half of present cost under
+    /// heavy output), then set the titlebar appearance from `theme`. The pixels are unchanged.
+    /// `$ATERM_NO_COLORSPACE_MATCH` opts out in a development build ([`aterm_types::dev_seam!`]).
     fn window_set_appearance(&self, window: &Window, theme: WindowTheme) {
         use aterm_objc::sel;
 
@@ -771,14 +620,9 @@ impl AppRt for AppRtMacOS {
                 }
             }
         }
-        // Ghostty-style unified chrome: a transparent titlebar so the window frame
-        // (titlebar + traffic lights) reads as a seamless extension of the terminal
-        // body. The titlebar's LIGHT/DARK appearance now follows config `window_theme`
-        // ([`WindowTheme`]): Dark -> NSAppearanceNameDarkAqua, Light ->
-        // NSAppearanceNameAqua, Auto -> leave the appearance UNSET so the window tracks
-        // the OS `effectiveAppearance` (including live day-night switches). This
-        // replaces the old unconditional dark force that left light-desktop users with
-        // permanently dark chrome. `window_theme = "auto"` is the old opt-out's spelling.
+        // A transparent titlebar, so the frame reads as an extension of the terminal body; its
+        // light/dark appearance follows `window_theme`: Dark → DarkAqua, Light → Aqua, Auto →
+        // unset, tracking the OS `effectiveAppearance` (live day-night switches included).
         // SAFETY: `appearanceNamed:`/`setAppearance:`/`setTitlebarAppearsTransparent:`
         // are standard NSWindow/NSAppearance calls on the main thread; the appearance
         // object is autoreleased and used immediately within this pool.
@@ -787,11 +631,10 @@ impl AppRt for AppRtMacOS {
             WindowTheme::Light => Some("NSAppearanceNameAqua"),
             WindowTheme::Dark => Some("NSAppearanceNameDarkAqua"),
         };
-        // SAFETY: `+appearanceNamed:` is `-(id)(NSString *)` and returns an
-        // AUTORELEASED, framework-owned appearance (nil for a name this OS does
-        // not know, which is checked); `-setAppearance:` is `-(void)(id)` and
-        // accepts nil, which is exactly the Auto path; `-setTitlebarAppears
-        // Transparent:` is `-(void)(BOOL)`.
+        // SAFETY: `+appearanceNamed:` is `-(id)(NSString *)` and returns an autoreleased,
+        // framework-owned appearance (nil for a name this OS does not know, checked);
+        // `-setAppearance:` is `-(void)(id)` and accepts nil (the Auto path);
+        // `-setTitlebarAppearsTransparent:` is `-(void)(BOOL)`.
         unsafe {
             if let Some(name) = appearance_name {
                 if let Some(name) = appkit::nsstring(name) {
@@ -805,27 +648,19 @@ impl AppRt for AppRtMacOS {
                     }
                 }
             } else {
-                // Auto: CLEAR any previously-forced appearance (`setAppearance: nil`)
-                // so the window resumes tracking the OS `effectiveAppearance`. Without
-                // this, a live Dark/Light -> Auto change would leave the last forced
-                // appearance stuck instead of reverting. nil is harmless at attach
-                // (a fresh NSWindow already tracks the OS).
+                // Auto: clear any forced appearance so the window tracks the OS
+                // `effectiveAppearance` again after a live Dark/Light → Auto change.
                 appkit::send_v_id(ns_window, sel!(setAppearance:), aterm_objc::Id::NIL);
             }
-            // Transparent titlebar is desired in every mode (it is the
-            // chrome-unification half, independent of light/dark).
             appkit::send_v_bool(ns_window, sel!(setTitlebarAppearsTransparent:), true);
         }
-        // NOTE: the fullSizeContentView style mask deliberately does NOT live here —
-        // config reload re-runs this method on EVERY window (including Settings),
-        // which would leak the mask onto windows that must keep normal chrome. The
-        // mask is applied once, per chrome'd terminal window, at attach — see
-        // [`AppRt::window_set_fullsize_content`].
+        // The fullSizeContentView mask does not live here: config reload re-runs this on every
+        // window, Settings included, which must keep normal chrome. It is applied once per
+        // chrome'd terminal window at attach ([`AppRt::window_set_fullsize_content`]).
     }
 
-    /// Tag the CAMetalLayer wgpu attached to this window's NSView with the named
-    /// colour space (see [`layer_colorspace`]). Best-effort like the other chrome
-    /// methods: no AppKit window / no metal layer → a silent no-op.
+    /// Tag the CAMetalLayer wgpu attached to this window's NSView with the named colour space
+    /// (see [`layer_colorspace`]); no window or metal layer answers `None`.
     fn window_set_surface_colorspace(
         &self,
         window: &Window,
@@ -834,10 +669,8 @@ impl AppRt for AppRtMacOS {
         layer_colorspace::set(window, cs.cg_name()).then_some(cs)
     }
 
-    /// Pin the CAMetalLayer's `contentsGravity` to `topLeft` so a live drag never
-    /// shows a rescaled stale frame (see [`AppRt::window_anchor_surface_top_left`]).
-    /// Best-effort like the other chrome methods: no AppKit window / no metal
-    /// layer → a silent no-op.
+    /// Pin the CAMetalLayer's `contentsGravity` to the visual top-left (see
+    /// [`AppRt::window_anchor_surface_top_left`]); no metal layer is a silent no-op.
     fn window_anchor_surface_top_left(&self, window: &Window) {
         layer_colorspace::anchor_contents_top_left(window);
     }
@@ -848,10 +681,7 @@ impl AppRt for AppRtMacOS {
         layer_colorspace::read_contents_presentation(window)
     }
 
-    /// Install / update / remove the window-level `NSVisualEffectView` and flip the
-    /// window + CAMetalLayer opacity for M5 true vibrancy. All the AppKit work lives
-    /// in the `vibrancy` module (hand-rolled `msg_send`, like `layer_colorspace`).
-    /// Best-effort: no AppKit window → a silent no-op.
+    /// See [`AppRt::window_set_vibrancy`]; the AppKit work lives in the `vibrancy` module.
     fn window_set_vibrancy(
         &self,
         window: &Window,
@@ -862,10 +692,8 @@ impl AppRt for AppRtMacOS {
         vibrancy::set(window, material, translucent, bg);
     }
 
-    /// `NSScreen.maximumExtendedDynamicRangeColorComponentValue` for this
-    /// window's screen. Best-effort: any missing link (no AppKit window, the
-    /// window is off-screen so `screen` is nil) returns `1.0` — no headroom,
-    /// which the proven sanitizer treats as SDR.
+    /// `NSScreen.maximumExtendedDynamicRangeColorComponentValue` for this window's screen;
+    /// `1.0` (no headroom, treated as SDR) with no AppKit window or an off-screen one.
     fn screen_edr_max(&self, window: &Window) -> f32 {
         let ns_window = ns_window_of(window);
         if ns_window.is_null() {
@@ -908,11 +736,10 @@ impl AppRt for AppRtMacOS {
         }
     }
 
-    /// Apply `NSWindowStyleMaskFullSizeContentView` (1<<15) so the content view —
-    /// and with it the GPU surface — spans under the titlebar. Best-effort like
-    /// the other chrome methods: no AppKit window → a silent no-op. Always ON in a
-    /// shipped binary; `$ATERM_NO_FULLSIZE_CONTENT` turns it off in a development
-    /// build ([`aterm_types::dev_seam!`]) to A/B a misbehaving titlebar band.
+    /// Apply `NSWindowStyleMaskFullSizeContentView` (1<<15) so the content view, and the GPU
+    /// surface with it, spans under the titlebar. No AppKit window is a no-op;
+    /// `$ATERM_NO_FULLSIZE_CONTENT` turns it off in a development build
+    /// ([`aterm_types::dev_seam!`]).
     fn window_set_fullsize_content(&self, window: &Window) {
         if aterm_types::dev_seam!("ATERM_NO_FULLSIZE_CONTENT").is_some() {
             return;
@@ -934,34 +761,21 @@ impl AppRt for AppRtMacOS {
         }
     }
 
-    /// The titlebar band height in POINTS: the max of the two AppKit derivations —
-    /// `frame.height - contentRectForFrameRect(frame).height` (valid BEFORE the
-    /// full-size-content mask, when the content rect excludes the titlebar) and
-    /// `contentView.bounds.height - contentLayoutRect.height` (valid AFTER the
-    /// mask, when the content view spans the full frame but `contentLayoutRect`
-    /// still excludes the chrome — and correctly `0` in fullscreen, where the
-    /// titlebar detaches). Best-effort: any missing link returns `0.0` (no band).
+    /// The titlebar band height in points: `contentView.bounds.height −
+    /// contentLayoutRect.height`, so `0` before the full-size-content mask and in fullscreen,
+    /// where the titlebar detaches. Any missing link returns `0.0`.
     fn titlebar_band_pts(&self, window: &Window) -> f64 {
         let ns_window = ns_window_of(window);
         if ns_window.is_null() {
             return 0.0;
         }
-        // SAFETY: every message below is a side-effect-free geometry read.
-        // `-bounds` and `-contentLayoutRect` are `-(NSRect)`, a 32-byte struct
-        // return — the shape D4 exists for, and `msg` picks
-        // `objc_msgSend_stret` for it on the x86_64 compat slice without this
-        // call site having to know.
+        // SAFETY: every message below is a side-effect-free geometry read. `-bounds` and
+        // `-contentLayoutRect` return `NSRect`, a 32-byte struct, which `msg` sends through
+        // `objc_msgSend_stret` on the x86_64 slice.
         unsafe {
-            // ONE formula, post-mask only: `contentView.bounds − contentLayoutRect`
-            // is the chrome band actually overlapping the drawable content. It is
-            // 0 until fullSizeContentView is applied (so the ATERM_NO_FULLSIZE_CONTENT
-            // escape hatch yields head 0 — the grid keeps the whole content view),
-            // 0 again in native fullscreen (the titlebar hides — the band collapses
-            // and on_resize re-derives), and the full titlebar+toolbar height once
-            // the mask + toolbar are in (callers measure AFTER installing both).
-            // The pre-mask `frame − contentRectForFrameRect` form was dropped: it
-            // under-counts the unified toolbar AND reports a phantom band when the
-            // mask was deliberately never applied (adversarial review).
+            // Callers measure after the mask and toolbar are in. The pre-mask
+            // `frame − contentRectForFrameRect` form under-counts the unified toolbar and reports
+            // a phantom band when the mask is never applied.
             let content_view = crate::appkit::send_id(ns_window, aterm_objc::sel!(contentView));
             if content_view.is_null() {
                 return 0.0;
@@ -972,17 +786,12 @@ impl AppRt for AppRtMacOS {
         }
     }
 
-    /// `NSScreen.visibleFrame` of the screen this window is on, flipped into
-    /// winit's top-left-origin point space (see [`AppRt::window_work_area_pts`]).
-    ///
-    /// AppKit's screen space is BOTTOM-left origin; winit reports window positions
-    /// relative to the TOP-left of the MAIN display (`CGMainDisplayID`), so the flip
-    /// must use the identical law as winit's own `flip_window_screen_coordinates`
-    /// (`y_top = main_height - rect.height - rect.origin.y`) — anything else would
-    /// silently offset the whole cascade on a multi-display desktop. The main
-    /// display's height therefore comes from the same CoreGraphics call winit uses,
-    /// NOT from `NSScreen.mainScreen` (which is the FOCUSED screen, not the origin
-    /// screen).
+    /// `NSScreen.visibleFrame` of this window's screen, flipped into winit's top-left-origin
+    /// point space (see [`AppRt::window_work_area_pts`]) with winit's own law
+    /// (`flip_window_screen_coordinates`: `y_top = main_height - rect.height - rect.origin.y`).
+    /// The main display's height comes from `CGMainDisplayID`, as winit's does, not
+    /// `NSScreen.mainScreen` (the focused screen); any other law offsets the cascade on a
+    /// multi-display desktop.
     fn window_work_area_pts(&self, window: &Window) -> Option<crate::app_window::WorkAreaPts> {
         #[link(name = "CoreGraphics", kind = "framework")]
         unsafe extern "C" {
@@ -1059,17 +868,10 @@ impl AppRt for AppRtMacOS {
     }
 
     fn activate_instance(&self, pid: u32) -> bool {
-        // NSRunningApplication is InteriorMutable (not MainThreadOnly), but
-        // this is only ever called on the event-loop turn, keeping the AppKit
-        // call ordered against our own window state. BOTH flags, always:
-        // `IgnoringOtherApps` is deprecated and inert on macOS 14+ (the
-        // cooperative activation model ignores it), but on macOS 13 and
-        // earlier `-activateWithOptions:` WITHOUT it is refused whenever
-        // another app is frontmost — which is the only time this menu row is
-        // ever used — so the status item's "raise instance" silently did
-        // nothing on a Ventura machine (measured 2026-09-06). Inert where it
-        // is deprecated, required where it is not: setting it unconditionally
-        // is the one spelling that is right on every macOS this app supports.
+        // Called only on the event-loop turn, which keeps the AppKit call ordered against our
+        // own window state. Both flags, always: `IgnoringOtherApps` is deprecated and inert on
+        // macOS 14+, but on macOS 13 and earlier `-activateWithOptions:` without it is refused
+        // whenever another app is frontmost, the only time this row is used.
         /// `NSRunningApplication.h:23` — `NSApplicationActivateAllWindows = 1 << 0`.
         const ACTIVATE_ALL_WINDOWS: usize = 1 << 0;
         /// `NSRunningApplication.h:39` in MacOSX13.3.sdk —
@@ -1081,12 +883,10 @@ impl AppRt for AppRtMacOS {
         let Ok(pid) = libc::pid_t::try_from(pid) else {
             return false;
         };
-        // SAFETY: `+runningApplicationWithProcessIdentifier:` is
-        // `-(id)(pid_t)` — `pid_t` is `int`, i.e. `i32`, NOT `NSInteger`, which
-        // is why the prototype is written out here rather than reaching for the
-        // `isize` helper — and returns nil for a dead pid, which reads as a
-        // failed activation. `-activateWithOptions:` is
-        // `-(BOOL)(NSApplicationActivationOptions)`, an `NSUInteger` bitmask.
+        // SAFETY: `+runningApplicationWithProcessIdentifier:` is `-(id)(pid_t)` (`pid_t` is
+        // `i32`, not `NSInteger`, hence the written-out prototype) and returns nil for a dead
+        // pid; `-activateWithOptions:` is `-(BOOL)(NSApplicationActivationOptions)`, an
+        // `NSUInteger` bitmask.
         unsafe {
             let find: unsafe extern "C-unwind" fn(
                 aterm_objc::Id,
@@ -1491,18 +1291,10 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     Some((age_s.max(0.0) * 1e9) as u64)
 }
 
-/// This window's AppKit `-[NSWindow windowNumber]`, or `0` when it has no AppKit
-/// window (headless / another backend).
-///
-/// The one thing the `hwkey` hardware-path injector needs from the main thread.
-/// `-[NSApplication sendEvent:]` routes a key event to the window whose number is
-/// baked into the event, so posting with `0` would dispatch to nothing and the
-/// instrument would silently measure an empty run. Reading it requires touching an
-/// `NSWindow`, which is main-thread-only; everything else the injector does is
-/// deliberately off-main (see [`crate::hwkey`]).
-///
-/// Read-only and allocation-free: it must not perturb the loop whose stalls are
-/// the subject of the measurement.
+/// This window's `-[NSWindow windowNumber]`, or `0` with no AppKit window. The `hwkey`
+/// injector needs it from the main thread: `sendEvent:` routes a key to the window number baked
+/// into the event, and `0` would dispatch to nothing. Read-only and allocation-free, so it does
+/// not perturb the loop being measured.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub(crate) fn appkit_window_number(window: &Window) -> i64 {
@@ -1510,9 +1302,7 @@ pub(crate) fn appkit_window_number(window: &Window) -> i64 {
     if ns_window.is_null() {
         return 0;
     }
-    // SAFETY: `-windowNumber` is `-(NSInteger)`, a plain scalar getter with no
-    // side effects — which is what keeps this read from perturbing the loop
-    // whose stalls are the subject of the measurement.
+    // SAFETY: `-windowNumber` is `-(NSInteger)`, a side-effect-free scalar getter.
     unsafe { crate::appkit::send_isize(ns_window, aterm_objc::sel!(windowNumber)) as i64 }
 }
 
@@ -1563,11 +1353,10 @@ pub(crate) fn appkit_window_is_key_in_active_app(_window: &Window) -> bool {
 
 /// Whether a hardware-input event occurred inside `within`.
 ///
-/// Reads the KERNEL's HID idle clock — the `HIDIdleTime` property of the
-/// `IOHIDSystem` registry entry, nanoseconds since the last event from any HID
-/// device, physical or virtual — through IOKit (see [`hid_idle`]). Machine-wide
-/// and therefore conservative (activity in another application postpones an
-/// automatic update), which is what the "install when quiet" policy wants.
+/// Reads the kernel's HID idle clock (`HIDIdleTime` on the `IOHIDSystem` registry entry,
+/// nanoseconds since the last event from any HID device) through IOKit ([`hid_idle`]).
+/// Machine-wide, so activity in another app postpones an automatic update, as "install when
+/// quiet" wants.
 ///
 /// LAW (the 2026-08-17 WindowServer watchdog incident): this probe MUST NOT go
 /// through WindowServer. It used to read CoreGraphics' event-source clocks —
@@ -1583,8 +1372,7 @@ pub(crate) fn appkit_window_is_key_in_active_app(_window: &Window) -> bool {
 /// AppKit's event queue: the crash-45791 concern this probe originally replaced
 /// `nextEventMatchingMask` for still holds.)
 ///
-/// Fails CLOSED: if the HID system cannot be read, input is reported as recent
-/// (the machine is treated as busy), the same posture as an invalid sample.
+/// Fails closed: an unreadable HID system reports input as recent.
 #[cfg(target_os = "macos")]
 fn recent_user_input_event(within: std::time::Duration) -> bool {
     match hid_idle::seconds_since_last_input() {
@@ -1593,11 +1381,9 @@ fn recent_user_input_event(within: std::time::Duration) -> bool {
     }
 }
 
-// FAILS OPEN, unlike the macOS arm (which reports input as recent when the
-// HID clock cannot be read). Harmless while the automatic apply lane is
-// macOS-only (Linux carries read-only update facts, `native_updater_service`).
-// If a non-macOS automatic apply lane ever lands, this must become
-// fail-closed (`true`) or read a real input clock.
+// Fails open, unlike the macOS arm: harmless while the automatic apply lane is macOS-only
+// (Linux carries read-only update facts, `native_updater_service`). A non-macOS automatic apply
+// lane must make this fail closed (`true`) or read a real input clock.
 #[cfg(not(target_os = "macos"))]
 fn recent_user_input_event(_within: std::time::Duration) -> bool {
     false
@@ -1615,27 +1401,21 @@ pub(crate) fn user_input_source(headless: bool) -> fn(std::time::Duration) -> bo
     }
 }
 
-/// The input-activity source for HEADLESS instances and unit tests: never
-/// recent. A headless `App` has no operator at a keyboard whose activity should
-/// postpone anything, and a unit test must not depend on whether the machine
-/// running it happens to be busy — so neither may consult the platform. This is
-/// also the guarantee that keeps a test binary from ever reaching WindowServer
-/// through the input-activity path (see [`recent_user_input_event`]).
+/// The input-activity source for headless instances and unit tests: never recent. Neither has
+/// an operator whose activity should postpone anything, and neither may consult the platform,
+/// which keeps a test binary from reaching WindowServer through this path.
 #[must_use]
 pub(crate) fn no_recent_user_input_event(_within: std::time::Duration) -> bool {
     false
 }
 
-/// The kernel's HID idle clock, read from the IORegistry — the one
-/// input-activity source on macOS that never involves WindowServer.
+/// The kernel's HID idle clock, read from the IORegistry: the one input-activity source on
+/// macOS that never involves WindowServer.
 ///
-/// Tiny-FFI posture (like `keymap::hid_lock_state`): IOKit + CoreFoundation
-/// are system frameworks (no crate on the dependency surface); the SDK
-/// signatures are declared inline. The `IOHIDSystem` service and the property
-/// key are looked up ONCE and cached; each read is one `IORegistryEntry
-/// CreateCFProperty` (a synchronous kernel RPC, thread-agnostic) plus a
-/// `CFNumber` unwrap. Measured on macOS 26.5.1: unentitled read succeeds and the
-/// value advances one second per second while the machine is idle.
+/// Tiny FFI (like `keymap::hid_lock_state`): IOKit and CoreFoundation are system frameworks,
+/// with the SDK signatures declared inline. The `IOHIDSystem` service and the property key are
+/// looked up once and cached; each read is one `IORegistryEntryCreateCFProperty` (a synchronous,
+/// thread-agnostic kernel RPC that needs no entitlement) plus a `CFNumber` unwrap.
 #[cfg(target_os = "macos")]
 mod hid_idle {
     use std::ffi::{c_char, c_void};
@@ -1665,7 +1445,7 @@ mod hid_idle {
 
     #[link(name = "IOKit", kind = "framework")]
     unsafe extern "C" {
-        /// Returns a CFMutableDictionaryRef, CONSUMED by `IOServiceGetMatchingService`.
+        /// Returns a CFMutableDictionaryRef, consumed by `IOServiceGetMatchingService`.
         fn IOServiceMatching(name: *const c_char) -> *mut c_void;
         fn IOServiceGetMatchingService(main_port: MachPort, matching: *mut c_void) -> IoService;
         fn IOObjectRelease(object: IoObject) -> i32;
@@ -1705,13 +1485,10 @@ mod hid_idle {
         static HANDLES: OnceLock<Option<Handles>> = OnceLock::new();
         HANDLES
             .get_or_init(|| {
-                // SAFETY: `IOServiceMatching` takes a NUL-terminated class name
-                // and returns an owned dictionary consumed by
-                // `IOServiceGetMatchingService`; the returned service is retained
-                // for the life of the process (deliberately never released — it
-                // is the cache) unless the key cannot be made, in which case it is
-                // released. `CFStringCreateWithCString` takes a NUL-terminated
-                // UTF-8 literal; the string is likewise kept for the process.
+                // SAFETY: `IOServiceMatching` takes a NUL-terminated class name and returns a
+                // dictionary `IOServiceGetMatchingService` consumes. The service and the
+                // `CFStringCreateWithCString` key (a NUL-terminated UTF-8 literal) are the cache,
+                // kept for the process; the service is released only if the key cannot be made.
                 unsafe {
                     let matching = IOServiceMatching(IOHID_SYSTEM_CLASS.as_ptr().cast::<c_char>());
                     if matching.is_null() {
@@ -1811,28 +1588,10 @@ mod user_input_probe_tests {
 /// The X11 twin of the macOS queue age: how long the key event being dispatched
 /// took from the X server stamping it to this code running, in nanoseconds.
 ///
-/// Until 2026-09-24 this was `None` everywhere off macOS ("winit exposes no event
-/// timestamp"), so on Linux `key_write`, `key_queue` and `input_present` all
-/// started their clocks AFTER the event loop had dequeued the key. Two real
-/// slices lived before that point and no instrument could see either:
-///
-///  * THE INPUT-METHOD ROUND TRIP. With `XMODIFIERS=@im=ibus` (Ubuntu's default)
-///    and IME allowed (every aterm window, `app_window.rs`), winit hands every
-///    KeyPress to `XFilterEvent`, which forwards it to `ibus-x11` → `ibus-daemon`
-///    → the engine and back before the key is delivered. Measured on the GB10
-///    host (2026-09-24, an unmapped probe window driving the same `XFilterEvent`
-///    path, 300-400 keys): p50 4.8 ms / p99 8.4 ms / max 15.4 ms at load 10, and
-///    p50 0.5 ms / max 10.1 ms with every core busy.
-///  * QUEUE RESIDENCE BEHIND A BUSY LOOP — the slice the macOS backdate exists for.
-///
-/// The server's `time` is `CLOCK_MONOTONIC` in milliseconds on a local Xorg
-/// (measured on the same host: a PropertyNotify stamp trails a client's
-/// `CLOCK_MONOTONIC` read by 1 ms, five of five), so the age is one subtraction.
-/// Fail-closed `None`, and the caller keeps its post-dequeue stamp, when no X11
-/// key is being dispatched (Wayland, a control-socket key, an IME commit) or the
-/// age is implausible — a replayed event, or a remote `DISPLAY` whose server
-/// clock is another machine's; [`x_event_max_age_ms`] says where "implausible"
-/// starts.
+/// A local Xorg's `time` is `CLOCK_MONOTONIC` in milliseconds, so the age is one subtraction.
+/// `None` (the caller keeps its post-dequeue stamp) when no X11 key is being dispatched
+/// (Wayland, a control-socket key, an IME commit) or the age is implausible (a replayed event,
+/// or a remote `DISPLAY` on another machine's clock); [`x_event_max_age_ms`] sets the bound.
 #[cfg(target_os = "linux")]
 pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     static MAX_AGE_MS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -1854,19 +1613,11 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     x_server_event_age_ns(server_ms, now_ns, max_age_ms)
 }
 
-/// The oldest X server stamp [`current_event_queue_age_ns`] believes, by the
-/// `DISPLAY` the process connects to (winit's `XOpenDisplay(NULL)` reads
-/// exactly that variable).
-///
-/// A LOCAL server (`:N`, `unix:N`, or a socket path) stamps from this machine's
-/// `CLOCK_MONOTONIC`, so a large age is a real wait: 60 s, well past the 5 s
-/// release stall watchdog. It used to be 2 s for every display, copied from the
-/// macOS window, and that hid exactly the episodes the backdate exists to
-/// price: a key that sat 2.7 s behind a parked loop was rejected and booked
-/// `key_queue = 0`, so `max_key_queue` could never pass 2 s. Anything else
-/// (`host:N`, an ssh-forwarded `localhost:10`) is a server on ANOTHER machine's
-/// clock whose stamp compares with nothing here; it keeps the 2 s window, so a
-/// coincidental near-match is the most that can leak in.
+/// The oldest X server stamp [`current_event_queue_age_ns`] believes, by `DISPLAY` (what
+/// winit's `XOpenDisplay(NULL)` reads). A local server (`:N`, `unix:N`, a socket path) stamps
+/// from this machine's `CLOCK_MONOTONIC`, so a large age is a real wait: 60 s, past the 5 s
+/// stall watchdog. Any other display (`host:N`, an ssh-forwarded `localhost:10`) runs on another
+/// machine's clock and keeps a 2 s window, so only a coincidental near-match can leak in.
 #[cfg(any(target_os = "linux", test))]
 fn x_event_max_age_ms(display: Option<&std::ffi::OsStr>) -> u32 {
     const LOCAL_MAX_AGE_MS: u32 = 60_000;
@@ -1882,26 +1633,17 @@ fn x_event_max_age_ms(display: Option<&std::ffi::OsStr>) -> u32 {
     }
 }
 
-/// The age of an event stamped `server_ms` (the X server's wrapping 32-bit
-/// millisecond clock) at `now_ns` on the same clock in nanoseconds: `now` minus
-/// the stamp, the wrap undone against `now`'s own low 32 bits.
+/// The age of an event stamped `server_ms` (the X server's wrapping 32-bit millisecond clock)
+/// at `now_ns` on the same clock in nanoseconds, the wrap undone against `now`'s low 32 bits.
 ///
-/// THE AGE READS HIGH, NEVER LOW, BY UP TO ABOUT 2 MS on a `CONFIG_HZ=1000`
-/// kernel such as this host's. Two biases stack. The stamp is a truncated
-/// millisecond (up to 1 ms). And Xorg's `GetTimeInMillis` reads
-/// `CLOCK_MONOTONIC_COARSE` whenever that clock's resolution is 1 ms or finer,
-/// which is one kernel tick at `CONFIG_HZ=1000`, so the stamp already trails
-/// `CLOCK_MONOTONIC` by up to one more tick before it is truncated; the
-/// five-of-five 1 ms trail measured above is that. At `CONFIG_HZ=250` the
-/// coarse clock is 4 ms, Xorg falls back to the fine clock, and only the
-/// truncation remains. The server stamps the key when IT processes the device
-/// event, so the kernel-to-Xorg leg is not in the age at all.
+/// The age reads high, never low, by up to about 2 ms on a `CONFIG_HZ=1000` kernel: the stamp
+/// is a truncated millisecond, and Xorg's `GetTimeInMillis` reads `CLOCK_MONOTONIC_COARSE` (up
+/// to one tick behind) when its resolution is 1 ms or finer. The kernel-to-Xorg leg is not in
+/// the age: the server stamps when it processes the device event.
 ///
-/// Up to 2 ms "in the future" reads as no queueing: nothing above makes a local
-/// stamp lead, so this is slack for a clock this function does not know about.
-/// Anything further in the future, or older than `max_age_ms`, is a clock that
-/// is not ours (fail closed). So is a stamp of `0`: that is X's `CurrentTime`,
-/// which a client's `XSendEvent` may carry, not a time the server read.
+/// Up to 2 ms in the future reads as no queueing (slack for an unknown clock). Further ahead,
+/// older than `max_age_ms`, or a stamp of `0` (X's `CurrentTime`, which `XSendEvent` may carry)
+/// is a clock that is not ours: `None`.
 #[cfg(any(target_os = "linux", test))]
 fn x_server_event_age_ns(server_ms: u32, now_ns: u64, max_age_ms: u32) -> Option<u64> {
     const FUTURE_SLACK_MS: u32 = 2;
@@ -1965,11 +1707,8 @@ mod x_server_event_age_tests {
         assert_eq!(x_server_event_age_ns(1_003, 1_000 * MS, LOCAL), None);
     }
 
-    /// THE REVIEW FINDING THIS PINS. With one 2 s cap for every display, a key
-    /// that waited 2.7 s (the live window's `max_input_present` was 2721 ms)
-    /// was rejected and booked `key_queue = 0`: the instrument built to see a
-    /// parked loop could not see a park longer than 2 s. On a local server it
-    /// now can.
+    /// A local server prices a multi-second park (here 2.7 s) instead of refusing it; a
+    /// foreign clock keeps the 2 s window.
     #[test]
     fn a_local_server_prices_a_multi_second_park() {
         let now_ns = 100_000 * MS;
@@ -2033,13 +1772,10 @@ mod x_server_event_age_tests {
     }
 }
 
-/// THE SEAM, DRIVEN (a review finding: only the arithmetic was tested, and the
-/// winit stamp that feeds it had never run). The stamp is published by the same
-/// winit function the X11 event processor wraps each non-synthetic key dispatch
-/// in, and read back here through the real [`current_event_queue_age_ns`], so a
-/// wiring break shows up as a red test instead of as `key_queue_p50 == 0` on a
-/// live window. What it cannot reach without an X server is the call site
-/// itself; that one line is `event_processor.rs`'s only use of the helper.
+/// Drives the seam: the stamp is published by the winit function the X11 event processor wraps
+/// each non-synthetic key dispatch in, and read back through the real
+/// [`current_event_queue_age_ns`]. Only the call site in winit's `event_processor.rs` needs an
+/// X server.
 #[cfg(all(test, target_os = "linux"))]
 mod x11_key_stamp_seam_tests {
     use aterm_window::platform::x11::{dispatch_with_key_event_server_time, key_event_server_time};
@@ -2090,8 +1826,8 @@ mod x11_key_stamp_seam_tests {
             None
         );
 
-        // A dispatch that unwinds withdraws the stamp too, so the NEXT key
-        // (or a control-socket key, which is never stamped) cannot inherit it.
+        // A dispatch that unwinds withdraws the stamp too, so the next key (or a never-stamped
+        // control-socket key) cannot inherit it.
         let unwound = std::panic::catch_unwind(|| {
             dispatch_with_key_event_server_time(stamp, || panic!("a key handler panicked"))
         });
@@ -2209,12 +1945,8 @@ impl AppRt for AppRtLinux {
         None
     }
 
-    /// INTENTIONAL no-op: the `NSVisualEffectView` behind-window blur is an AppKit
-    /// concept. The Linux analogue is winit `set_transparent` / `set_blur` plus a
-    /// Wayland `blur` protocol (KDE) / GTK4 backdrop, deferred with the rest of the
-    /// native chrome work — so `background_material` has no window-level consumer
-    /// here yet (the GPU translucent-present path is macOS-first). Documented rather
-    /// than silently empty.
+    /// No-op: the behind-window blur is an AppKit concept, so `background_material` has no
+    /// window-level consumer here.
     fn window_set_vibrancy(
         &self,
         _window: &Window,
@@ -2224,15 +1956,13 @@ impl AppRt for AppRtLinux {
     ) {
     }
 
-    /// Linux presents SDR by design (see `window_set_surface_colorspace`): `1.0`
-    /// — no headroom, so the aurora pass is provably inert. (The Windows EDR
-    /// query lives in the dedicated `platform_win::AppRtWindows`.)
+    /// SDR by design (see `window_set_surface_colorspace`): no headroom, so the aurora pass is
+    /// inert.
     fn screen_edr_max(&self, _window: &Window) -> f32 {
         1.0
     }
 
-    /// `1.0` (no scaling) on Linux — the scRGB reference-white scale is a
-    /// Windows-HDR concept, handled in `platform_win::AppRtWindows`.
+    /// No scaling: the scRGB reference-white scale is a Windows HDR concept.
     fn screen_sdr_white_scale(&self, _window: &Window) -> f32 {
         1.0
     }
@@ -2247,11 +1977,9 @@ impl AppRt for AppRtLinux {
         crate::notify::spawn_delivery(suppress, silent, own_alerts, center)
     }
 
-    // The branches below delegate to the `menu::`/`toolbar::` modules — the menu is
-    // `None` on Linux by design (the own-rendered command palette + keybindings are
-    // the cross-platform command surface, docs/INTROSPECTABLE_SURFACES_DESIGN.md;
-    // the native macOS bar is a mirror of it), while the toolbar backs a REAL
-    // in-memory tab-chrome model. One platform surface, no dead code on Linux.
+    // The menu is `None` here by design: the own-rendered command palette and keybindings
+    // are the cross-platform command surface (docs/INTROSPECTABLE_SURFACES_DESIGN.md), the
+    // native macOS bar a mirror of it. The toolbar backs the in-memory tab-chrome model.
     fn install_menu(&self, proxy: &EventLoopProxy<Wake>) -> Option<menu::MenuHandle> {
         menu::install(proxy)
     }
@@ -2311,11 +2039,11 @@ impl AppRt for AppRtLinux {
 #[cfg(target_os = "macos")]
 pub(crate) type PlatformAppRt = AppRtMacOS;
 
-/// The native Windows selection — real DWM chrome (see `crate::platform_win`).
+/// Windows: native DWM chrome (see `crate::platform_win`).
 #[cfg(windows)]
 pub(crate) type PlatformAppRt = crate::platform_win::AppRtWindows;
 
-/// The graceful no-op selection for every OTHER non-macOS target (Linux/BSD).
+/// Every other target (Linux, the BSDs).
 #[cfg(all(not(target_os = "macos"), not(windows)))]
 pub(crate) type PlatformAppRt = AppRtLinux;
 
@@ -2457,30 +2185,9 @@ pub(crate) type AppNapActivity = ();
 /// 2026-09-28 (0.98.0): holding no activity, the whole process went unscheduled for 3 h 22 m on a
 /// saturated Mac — agents alive, control socket dark — and thawed 5 ms after an App Nap assertion.
 ///
-/// What the evidence says, and what it does not. aterm held no power or
-/// activity assertion (`pmset -g assertions` listed none), so App Nap was free
-/// to nap it, and a napped app runs every thread at priority 4 (the reflow note
-/// in `app_render.rs` read all 38 of the live app's threads there), which the
-/// machine's load of 45-151 can starve outright. The thaw came 5 ms after
-/// runningboardd logged WindowServer acquiring a `com.apple.appnap` /
-/// `AppDrawing` assertion on the process. App Nap applies to aterm itself and
-/// not to its PTY children, which is why the agents kept running while every
-/// `aterm ctl` (`os error 35`) and every relay client ("timed out waiting for
-/// the server") hit its read deadline after a successful connect. That makes
-/// App Nap the fitting suspect, not a proven cause: an unnapped process can
-/// still be starved by such a load, only no longer from background priority.
-///
-/// THE FLAGS: `appkit::consts::NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP`,
-/// every user-initiated flag (the set that keeps App Nap off) minus the one that
-/// would stop the Mac idle-sleeping — a terminal left open overnight must not
-/// hold the machine awake. Its sudden- and automatic-termination bits change
-/// nothing: `apps/aterm-mac/Info.plist` opts into neither.
-///
-/// THE TOKEN: `-beginActivityWithOptions:reason:` returns it at +0
-/// (autoreleased), and the activity ENDS when it is deallocated
-/// (`NSProcessInfo.h`), so it is retained here and `App` keeps it for the
-/// process's life. No `-endActivity:` is ever sent: the exit seam forgets `App`,
-/// and the activity ends with the process.
+/// `-beginActivityWithOptions:reason:` returns the token at +0 and the activity ends when it is
+/// deallocated (`NSProcessInfo.h`), so it is retained here and `App` keeps it for the process's
+/// life; no `-endActivity:` is sent.
 #[cfg(target_os = "macos")]
 fn begin_app_nap_opt_out() -> Option<AppNapActivity> {
     use aterm_objc::{Obj, autoreleasepool, class, sel};
@@ -2494,16 +2201,12 @@ fn begin_app_nap_opt_out() -> Option<AppNapActivity> {
 
     let token = autoreleasepool(|_| {
         let reason = appkit::nsstring(REASON)?;
-        // SAFETY: `+processInfo` is `-(id)`, the immortal process singleton
-        // (the same send `current_event_queue_age_ns` makes), and
-        // `-beginActivityWithOptions:reason:` is
-        // `-(id<NSObject>)(NSActivityOptions, NSString *)`, `@@:Q@` — the
-        // `uint64_t` options word is `NSUInteger`-wide on every Apple target, so
-        // `send_id_usize_id` is its exact shape. `reason` is a live +1 NSString
-        // this frame owns; the receiver retains or copies whatever it keeps.
-        // The token comes back AUTORELEASED (+0, borrowed inside this pool), so
-        // it is retained before the pool pops. `NSProcessInfo` is thread-safe,
-        // and this runs on the main thread anyway (`App::resumed`).
+        // SAFETY: `+processInfo` is `-(id)`, the immortal process singleton, and
+        // `-beginActivityWithOptions:reason:` is `-(id<NSObject>)(NSActivityOptions, NSString *)`
+        // (`@@:Q@`; the `uint64_t` options word is `NSUInteger`-wide on every Apple target, so
+        // `send_id_usize_id` is its exact shape). `reason` is a live +1 NSString this frame owns.
+        // The token comes back autoreleased (+0), so it is retained before the pool pops. This
+        // runs on the main thread (`App::resumed`).
         unsafe {
             let info = appkit::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
             if info.is_null() {
@@ -2712,10 +2415,8 @@ mod reduce_motion {
     use crate::Wake;
     use crate::appkit::{self, MainThread};
 
-    /// The workspace notification this module observes. Its value equals
-    /// AppKit's exported `NSWorkspaceAccessibilityDisplayOptionsDidChange
-    /// Notification` constant; it is posted on the WORKSPACE centre, not the
-    /// default one.
+    /// The workspace notification this module observes, equal to AppKit's exported constant of
+    /// the same name. It is posted on the workspace centre, not the default one.
     pub(crate) const DISPLAY_OPTIONS_NOTIFICATION: &str =
         "NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification";
 
@@ -2751,22 +2452,14 @@ mod reduce_motion {
     }
 
     aterm_objc::declare_class! {
-        /// The notification-observer target. Owns the relay and exposes one
-        /// `reduceMotionDidChange:` selector that posts
-        /// [`Wake::ReduceMotionChanged`] — a pure relay from AppKit into the
-        /// event loop (the main thread re-queries the flag there, so a burst of
-        /// notifications coalesces to the latest value).
-        ///
-        /// Declared with [`aterm_objc::declare_class!`] rather than objc2's:
-        /// this is the FIRST site ported off the objc2 cluster. The class name,
-        /// the superclass, the selector and the behaviour are unchanged; a
-        /// registered-class + real-notification test below proves it.
+        /// The notification-observer target: one `reduceMotionDidChange:` selector that posts
+        /// [`Wake::ReduceMotionChanged`]. The main thread re-queries the flag, so a burst of
+        /// notifications coalesces to the latest value.
         pub(crate) struct ReduceMotionTarget: NSObject {
             const NAME: &str = "ATermReduceMotionTarget";
             type Ivars = ReduceMotionIvars;
 
-            /// The observer selector. Fire-and-forget: a closed loop (app
-            /// shutting down) just drops the event, like every other relay.
+            /// The observer selector: runs the relay.
             @sel(reduceMotionDidChange:)
             fn reduce_motion_did_change(&self, _note: aterm_objc::Id) {
                 (self.ivars().relay)();
@@ -2823,10 +2516,8 @@ mod reduce_motion {
 
     /// `[[NSWorkspace sharedWorkspace] notificationCenter]`, or null.
     fn workspace_center() -> aterm_objc::Id {
-        // SAFETY: `+sharedWorkspace` is a standard singleton accessor and
-        // `-notificationCenter` a plain accessor on it; both return autoreleased
-        // or immortal objects that are only borrowed here. Both prototypes are
-        // `-(id)`, exactly as cast.
+        // SAFETY: `+sharedWorkspace` and `-notificationCenter` are `-(id)` accessors returning
+        // autoreleased or immortal objects, only borrowed here.
         unsafe {
             let f: unsafe extern "C-unwind" fn(
                 aterm_objc::ClassPtr,
@@ -2853,9 +2544,8 @@ mod reduce_motion {
     /// exactly as before: `App` keeps the returned handle in a field for the
     /// process lifetime.
     fn register(target: &aterm_objc::Retained<ReduceMotionTarget>) -> bool {
-        // A SCOPE, not an RAII token: `AutoreleasePool::new` is `unsafe` since
-        // W2 closed D2, because a token can be dropped out of order and that is
-        // a use-after-free plus a fatal runtime error.
+        // A scope, not an RAII token: a pool token dropped out of order is a use-after-free,
+        // which is why `AutoreleasePool::new` is `unsafe`.
         aterm_objc::autoreleasepool(|_| {
             let center = workspace_center();
             if center.is_null() {
@@ -2938,11 +2628,8 @@ mod reduce_motion {
     /// `[[NSWorkspace sharedWorkspace] <flag>]`, or `false` if there is no
     /// workspace. The one shape all three accessibility getters have.
     fn workspace_flag(flag: aterm_objc::Sel) -> bool {
-        // SAFETY: `+sharedWorkspace` is `-(id)`, the standard singleton
-        // accessor, and each `flag` is a `-(BOOL)` side-effect-free property
-        // read on it. `Bool`, not `bool`: on the x86_64 compat slice `BOOL` is
-        // `signed char` and only two of its 256 values are valid `bool` bit
-        // patterns, so the conversion happens once, inside `send_bool`.
+        // SAFETY: `+sharedWorkspace` is `-(id)`, the standard singleton accessor, and each
+        // `flag` is a side-effect-free `-(BOOL)` property read, converted once in `send_bool`.
         unsafe {
             let ws = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
             if ws.is_null() {
@@ -2982,8 +2669,7 @@ mod reduce_motion {
         let target = new_target(
             main_thread,
             Box::new(move || {
-                // Fire-and-forget: a closed loop (app shutting down) just drops the
-                // event, exactly as the objc2 version did.
+                // Fire-and-forget: a closed loop (app shutting down) drops the event.
                 let _ = proxy.send_event(Wake::ReduceMotionChanged);
             }),
             Box::new(aterm_update::note_system_woke),
@@ -3008,9 +2694,8 @@ mod reduce_motion {
             register,
         };
 
-        /// Remove `target` from the workspace centre — production never does
-        /// this (the observer lives for the process), but a test must, or the
-        /// centre keeps a weak reference to freed memory.
+        /// Remove `target` from the workspace centre. Production never does (the observer lives
+        /// for the process); a test must, or the centre keeps a dangling weak reference.
         fn unregister(target: &aterm_objc::Retained<ReduceMotionTarget>) {
             for center in [super::workspace_center(), super::default_center()] {
                 if center.is_null() {
@@ -3086,10 +2771,9 @@ mod reduce_motion {
             });
         }
 
-        /// THE PROOF. Not "the macro expands": the class is looked up by name in
-        /// the Objective-C runtime's own table, an instance is registered with
-        /// the real `NSWorkspace` notification centre, the real notification is
-        /// posted, and AppKit's dispatch machinery is what calls the Rust body.
+        /// The class is looked up by name in the Objective-C runtime, registered with the real
+        /// `NSWorkspace` centre, and AppKit's dispatch of the real notification calls the Rust
+        /// body.
         #[test]
         fn a_real_workspace_notification_reaches_the_declared_class() {
             use aterm_objc::{ClassType, class, class_name, superclass_of};
@@ -3131,11 +2815,7 @@ mod reduce_motion {
             // SAFETY: `target` is a live instance; `-respondsToSelector:` is a
             // side-effect-free query.
             unsafe {
-                // `-respondsToSelector:` returns `BOOL`. This said `-> bool`
-                // until `msg` grew its `Encode` bound and refused it: `bool`
-                // has no `Encode` impl on purpose, because on the x86_64
-                // compat slice `BOOL` is `signed char` and only two of its 256
-                // values are valid `bool` bit patterns.
+                // `BOOL` is `signed char` on the x86_64 slice, so the return is `Bool`.
                 let responds: unsafe extern "C-unwind" fn(
                     aterm_objc::Id,
                     aterm_objc::Sel,
@@ -3160,7 +2840,7 @@ mod reduce_motion {
             // the default centre.
             post_default(super::SYSTEM_COLORS_NOTIFICATION);
             unregister(&target);
-            // Removed: a further post must NOT reach it.
+            // Removed: a further post must not reach it.
             post();
             post_named(DID_WAKE_NOTIFICATION);
             post_default(super::SYSTEM_COLORS_NOTIFICATION);
@@ -3185,9 +2865,8 @@ mod reduce_motion {
             );
         }
 
-        /// The ivars are dropped when the last reference goes — the generated
-        /// `dealloc`, on the real site's real ivar type (a boxed closure that
-        /// owns an `Arc`).
+        /// The generated `dealloc` drops the ivars (a boxed closure owning an `Arc`) with the
+        /// last reference.
         #[test]
         fn dropping_the_target_drops_its_relay() {
             struct Spy(Arc<AtomicUsize>);
@@ -3218,11 +2897,9 @@ mod reduce_motion {
     }
 }
 
-/// CAMetalLayer colour-space tagging (M3, colour-managed present): the one
-/// place that reaches the wgpu-created metal layer and sets its `colorspace`
-/// property. Hand-rolled CoreGraphics FFI in the `main.rs::cg_capture` style —
-/// CoreGraphics is already linked in-process (AppKit pulls it in), so the
-/// `#[link]` adds bindings, not a dependency.
+/// CAMetalLayer colour-space tagging: the one place that reaches the wgpu-created metal layer
+/// and sets its `colorspace`. Hand-rolled CoreGraphics FFI in the style of `lib.rs`'s
+/// `cg_capture`; AppKit already links CoreGraphics, so the `#[link]` adds no dependency.
 #[cfg(target_os = "macos")]
 mod layer_colorspace {
     use std::ffi::c_void;
@@ -3233,31 +2910,9 @@ mod layer_colorspace {
     use super::ns_view_of;
     use crate::appkit;
 
-    /// An OPAQUE `CGColorSpace`, as a bare pointer.
-    ///
-    /// # This type used to be a struct with an `Encode` impl, and the PORT DELETED IT
-    ///
-    /// The objc2 form declared a `#[repr(C)] struct CGColorSpace` with a
-    /// hand-written `RefEncode` whose only job was to make a
-    /// `*mut CGColorSpace` encode as `^{CGColorSpace=}` rather than `^v` —
-    /// because objc2 CHECKS the argument encodings of a send against the
-    /// runtime's own method signature and ABORTS THE PROCESS on a mismatch, so
-    /// a bare `void *` panicked on every windowed GPU launch.
-    ///
-    /// `aterm-objc` does not perform that check: a send is a typed cast to the
-    /// selector's exact C prototype, which is the contract, and there is no
-    /// second opinion to satisfy. So the struct, the `RefEncode` impl and the
-    /// `Encoding::Pointer(&Encoding::Struct(…))` literal all go away and the
-    /// argument is what CoreGraphics actually hands back: a pointer.
-    ///
-    /// That is a REAL trade, not a free win, and it is worth stating in both
-    /// directions: objc2 caught a wrong prototype at run time and turned it into
-    /// a loud abort; this layer catches nothing and a wrong cast is undefined
-    /// behaviour. The crate's answer is that the cast IS the contract — the same
-    /// posture `aterm-gpu/src/metal/ffi.rs` has always had — and that the
-    /// encodings it registers for its own DECLARED methods are checked against
-    /// the runtime by the tests in this tree. It is also one of the few places
-    /// in this whole port where removing the binding made the code SHORTER.
+    /// An opaque `CGColorSpace`, as a bare pointer. `aterm-objc` checks no argument encodings:
+    /// a send is a typed cast to the selector's exact C prototype, so a wrong cast is undefined
+    /// behaviour, not a runtime abort (the posture of `aterm-gpu/src/metal/ffi.rs`).
     type CGColorSpaceRef = *mut c_void;
 
     // SAFETY: standard, stable CoreGraphics C entry points with the published
@@ -3272,10 +2927,8 @@ mod layer_colorspace {
         fn CGColorSpaceRelease(space: CGColorSpaceRef);
     }
 
-    /// `-[CALayer isKindOfClass:CAMetalLayer]`, with the class looked up
-    /// dynamically so a hypothetical process without QuartzCore degrades to a
-    /// no-op instead of a panic — the property the objc2 form got from
-    /// `AnyClass::get`.
+    /// `-[CALayer isKindOfClass:CAMetalLayer]`, with the class looked up dynamically so a
+    /// process without QuartzCore degrades to a no-op instead of a panic.
     ///
     /// # Safety
     /// `obj` must be nil or a live object.
@@ -3284,10 +2937,9 @@ mod layer_colorspace {
         if obj.is_null() || metal.is_null() {
             return false;
         }
-        // SAFETY: `-isKindOfClass:` is `-(BOOL)(Class)` and side-effect free.
-        // The argument is a CLASS, not an object — `@encode(Class)` is `"#"`,
-        // not `"@"` — which is exactly the distinction `ClassPtr`'s own newtype
-        // exists to keep, and the reason this is not `send_bool_id`.
+        // SAFETY: `-isKindOfClass:` is `-(BOOL)(Class)` and side-effect free. The argument is a
+        // Class (`@encode` `"#"`, not `"@"`), which `ClassPtr` keeps distinct; hence not
+        // `send_bool_id`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::ClassPtr) -> aterm_objc::Bool =
                 aterm_objc::checked_msg();
@@ -3295,25 +2947,20 @@ mod layer_colorspace {
         }
     }
 
-    /// Find the CAMetalLayer wgpu attached to `view` and set its `colorspace`
-    /// to the named CG colour space. Best-effort: any missing link in the chain
-    /// (no AppKit handle, no layer, unknown name) is a silent no-op — the layer
-    /// then keeps its previous tag (untagged = the legacy panel-native read).
+    /// Find the CAMetalLayer wgpu attached to `view` and set its `colorspace` to the named CG
+    /// colour space; returns whether it did. On any missing link (no AppKit handle, no layer,
+    /// unknown name) the layer keeps its previous tag.
     #[must_use]
     pub(crate) fn set(window: &Window, cg_name: &str) -> bool {
         let view = ns_view_of(window);
         let Some(name) = appkit::nsstring(cg_name) else {
             return false;
         };
-        // SAFETY: `view` is this window's live NSView (winit owns it for the
-        // window's lifetime); borrowed on the main thread (this is only reached
-        // from the winit event loop), as AppKit requires. The layer walk reads
-        // retained CALayer objects owned by that view. `CGColorSpaceCreateWith
-        // Name` takes a `CFStringRef`, and an `NSString` is toll-free-bridged,
-        // so the +1 NSString is passed as one; the returned space is +1 by the
-        // CREATE rule. `-setColorspace:` is `-(void)(CGColorSpaceRef)` — a bare
-        // pointer argument, not an object — and RETAINS, so releasing our
-        // create-ref right after is balanced.
+        // SAFETY: `view` is this window's live NSView, borrowed on the main thread (only the
+        // winit event loop reaches this); the layer walk reads CALayers that view retains.
+        // `CGColorSpaceCreateWithName` takes a `CFStringRef`, which the toll-free-bridged
+        // NSString is, and returns +1; `-setColorspace:` is `-(void)(CGColorSpaceRef)` (a bare
+        // pointer) and retains, so releasing our reference right after is balanced.
         unsafe {
             let Some(layer) = find_metal_layer(view) else {
                 return false;
@@ -3330,50 +2977,33 @@ mod layer_colorspace {
         }
     }
 
-    /// LIVE-RESIZE ANCHOR: set the window's CAMetalLayer `contentsGravity` to
-    /// `topLeft`, so a bounds change the app has not yet repainted leaves the
-    /// previous drawable at 1:1 in place instead of stretching it to fit (see
-    /// [`super::AppRt::window_anchor_surface_top_left`] for the full rationale).
-    /// Best-effort: no metal layer → a silent no-op. Shares [`find_metal_layer`]
-    /// with the colour-space tagger.
+    /// Set the window's CAMetalLayer `contentsGravity` to the visual top-left, so a bounds
+    /// change not yet repainted leaves the previous drawable at 1:1 instead of stretching it
+    /// (see [`super::AppRt::window_anchor_surface_top_left`]). No metal layer is a no-op.
     pub(crate) fn anchor_contents_top_left(window: &Window) {
         // SAFETY: the `CALayerContentsGravity` constants are stable exported
         // QuartzCore symbols; these are reads of immutable `CFStringRef` globals,
         // never freed or mutated here.
         #[link(name = "QuartzCore", kind = "framework")]
         unsafe extern "C" {
-            /// Pins unrescaled contents to the layer's MAXIMUM-Y left corner.
+            /// Pins unrescaled contents to the layer's maximum-Y left corner.
             static kCAGravityTopLeft: *const c_void;
-            /// Pins unrescaled contents to the layer's MINIMUM-Y left corner.
+            /// Pins unrescaled contents to the layer's minimum-Y left corner.
             static kCAGravityBottomLeft: *const c_void;
         }
         let view = ns_view_of(window);
-        // SAFETY: `view` is this window's live NSView (winit owns it for the
-        // window's lifetime), borrowed on the main thread as AppKit requires;
-        // `-contentsAreFlipped` is a side-effect-free `-(BOOL)` read and
-        // `-setContentsGravity:` is `-(void)(NSString *)`, a plain property
-        // write that RETAINS the string, which is a framework constant that
-        // outlives us.
+        // SAFETY: `view` is this window's live NSView, borrowed on the main thread;
+        // `-contentsAreFlipped` is a side-effect-free `-(BOOL)` read and `-setContentsGravity:`
+        // a `-(void)(NSString *)` property write of a framework constant.
         unsafe {
             let Some(layer) = find_metal_layer(view) else {
                 return;
             };
-            // WHICH CORNER IS "VISUALLY TOP" IS NOT A CONSTANT — ASK THE LAYER.
-            //
-            // CoreAnimation defines these names on the layer's own Y axis, not on
-            // the screen: `CALayer.h` states "'bottom' always means Minimum Y and
-            // 'top' always means Maximum Y". winit's NSView reports
-            // `isFlipped == true` (it uses an upper-left origin), and the layer we
-            // are writing is a `raw-window-metal` SUBLAYER of that flipped view's
-            // backing layer — so assuming `kCAGravityTopLeft` is the visual top-left
-            // is exactly the kind of guess that anchors a stale frame to the WRONG
-            // edge and makes it slide during a drag instead of sitting still.
-            //
-            // `-[CALayer contentsAreFlipped]` is the API for precisely this: it
-            // reports whether contents are implicitly flipped when rendered, i.e.
-            // whether minimum-Y is the visual top. Read it and pick the constant
-            // that lands on the visual TOP-LEFT either way, which is the corner a
-            // terminal grows from.
+            // Which corner is visually top is not a constant: CoreAnimation names gravity on
+            // the layer's own Y axis ("'top' always means Maximum Y", `CALayer.h`), and this
+            // layer is a sublayer of winit's flipped NSView. `-contentsAreFlipped` says
+            // whether minimum-Y is the visual top; pick the constant that lands on the visual
+            // top-left, the corner a terminal grows from.
             let flipped = appkit::send_bool(layer, sel!(contentsAreFlipped));
             let gravity = if flipped {
                 kCAGravityBottomLeft
@@ -3392,11 +3022,8 @@ mod layer_colorspace {
     }
 
     /// Read back the CAMetalLayer's live `contentsGravity`, `contentsScale` and
-    /// `contentsAreFlipped` — the state
-    /// [`anchor_contents_top_left`](Self::anchor_contents_top_left) established, so
-    /// it can be asserted rather than assumed (see
-    /// [`super::AppRt::window_surface_presentation`]). Pure reads; `None` when there
-    /// is no metal layer.
+    /// `contentsAreFlipped`, the state [`anchor_contents_top_left`] establishes (see
+    /// [`super::AppRt::window_surface_presentation`]). Pure reads; `None` with no metal layer.
     pub(crate) fn read_contents_presentation(window: &Window) -> Option<(String, f64, bool)> {
         let view = ns_view_of(window);
         // SAFETY: `view` is this window's live NSView (winit owns it for the
@@ -3417,10 +3044,9 @@ mod layer_colorspace {
         }
     }
 
-    /// M5: set the window's CAMetalLayer `opaque` flag. `false` lets the GPU's
-    /// translucent (PostMultiplied) present composite over the `NSVisualEffectView`
-    /// behind it; `true` restores the opaque default. Best-effort: no metal layer →
-    /// a silent no-op. Shares [`find_metal_layer`] with the colour-space tagger.
+    /// Set the window's CAMetalLayer `opaque` flag. `false` lets the GPU's translucent
+    /// (PostMultiplied) present composite over the `NSVisualEffectView` behind it; `true`
+    /// restores the opaque default. No metal layer is a silent no-op.
     pub(crate) fn set_metal_opaque(window: &Window, opaque: bool) {
         let view = ns_view_of(window);
         // SAFETY: `view` is this window's live NSView (winit owns it for the
@@ -3434,12 +3060,9 @@ mod layer_colorspace {
         }
     }
 
-    /// The CAMetalLayer under `view`, if any. wgpu (via raw-window-metal) either
-    /// re-types the view's own backing layer as a CAMetalLayer or — the common
-    /// winit case — installs one as a SUBLAYER of the existing backing layer, so
-    /// check the layer itself, then one level of sublayers. Class lookup is
-    /// dynamic (`AnyClass::get`) so a hypothetical process without QuartzCore
-    /// degrades to a no-op instead of a panic.
+    /// The CAMetalLayer under `view`, if any. wgpu (via raw-window-metal) either re-types the
+    /// view's backing layer or, the common winit case, installs a sublayer, so check the layer
+    /// itself, then one level of sublayers.
     ///
     /// SAFETY: caller guarantees `view` is a live NSView borrowed on the main
     /// thread; every message below is a side-effect-free read.
@@ -3472,13 +3095,9 @@ mod layer_colorspace {
     }
 }
 
-/// M5 TRUE VIBRANCY (macOS): install / update / remove the window-level
-/// `NSVisualEffectView` behind the Metal layer and flip the window + Metal-layer
-/// opacity, so the GPU's translucent (PostMultiplied) present composites over a
-/// live blurred backdrop. Hand-rolled `msg_send` in the `layer_colorspace` /
-/// `reduce_motion` style — CoreAnimation + AppKit are already linked, so this
-/// adds no dependency (and needs no extra objc2-app-kit feature). All calls run
-/// on the main thread (the winit event loop guarantees it) as AppKit requires.
+/// macOS vibrancy: install / update / remove the window-level `NSVisualEffectView` behind the
+/// Metal layer and flip the window and layer opacity, so the GPU's translucent (PostMultiplied)
+/// present composites over a live blurred backdrop. Main thread only, as AppKit requires.
 #[cfg(target_os = "macos")]
 mod vibrancy {
     use aterm_objc::{Id, Sel, class, sel};
@@ -3488,17 +3107,13 @@ mod vibrancy {
     use crate::app_config::BackgroundMaterial;
     use crate::appkit;
 
-    // `NSVisualEffectMaterial` raw values, at the SDK's own numbers
-    // (`NSVisualEffectView.h:33/45/57`, `:74`, `:85`; `NSView.h` for the
-    // autoresize bits and `NSWindow.h` for the ordering mode). These were
-    // already hand-written constants before the port, for the same reason every
-    // AppKit constant in this tree is one: they are header ENUMERATORS with no
-    // exported symbol, so `objc2-app-kit` compiles its own copy too.
-    // Only the three semantic materials the config exposes.
+    // `NSVisualEffectMaterial` and friends at the SDK's own numbers (`NSVisualEffectView.h`;
+    // `NSView.h` for the autoresize bits, `NSWindow.h` for the ordering mode): header
+    // enumerators with no exported symbol. Only the three materials the config exposes.
     const MATERIAL_SIDEBAR: isize = 7; // NSVisualEffectMaterialSidebar
     const MATERIAL_HUD: isize = 13; // NSVisualEffectMaterialHUDWindow
     const MATERIAL_UNDER_WINDOW: isize = 21; // NSVisualEffectMaterialUnderWindowBackground
-    // `NSVisualEffectBlendingModeBehindWindow` (blur the desktop BEHIND the window).
+    // `NSVisualEffectBlendingModeBehindWindow` (blur the desktop behind the window).
     const BLENDING_BEHIND_WINDOW: isize = 0;
     // `NSVisualEffectStateActive` (always blur, don't track window key state — a
     // terminal reads its background the same whether or not it holds focus).
@@ -3537,15 +3152,13 @@ mod vibrancy {
             if content.is_null() {
                 return;
             }
-            // Idempotent: drop any effect view we installed on a prior call, so
-            // this recomputes from a clean slate (material change, or turning
-            // translucency off). Identify ours purely by class.
+            // Idempotent: drop any effect view a prior call installed (identified by class) and
+            // recompute from a clean slate.
             remove_effect_views(content);
 
             if translucent {
-                // A behind-window blur needs a NON-opaque window with a clear fill,
-                // so the desktop (blurred by the effect view) shows through the
-                // translucent bg pixels the Metal layer composites.
+                // A behind-window blur needs a non-opaque window with a clear fill, so the
+                // blurred desktop shows through the translucent pixels the Metal layer composites.
                 appkit::send_v_bool(ns_window, sel!(setOpaque:), false);
                 let clear = appkit::send_id(class(c"NSColor").as_id(), sel!(clearColor));
                 if !clear.is_null() {
@@ -3581,12 +3194,10 @@ mod vibrancy {
         }
     }
 
-    /// Remove every `NSVisualEffectView` currently among `content`'s direct
-    /// subviews (the ones this module installed). Pointers are gathered FIRST, then
-    /// removed, so the live `subviews` array is never mutated mid-walk.
+    /// Remove every `NSVisualEffectView` among `content`'s direct subviews (the ones this
+    /// module installed), gathered first so the live `subviews` array is not mutated mid-walk.
     ///
-    /// SAFETY: `content` is a live NSView on the main thread; the reads are
-    /// side-effect-free and `removeFromSuperview` is a standard call.
+    /// SAFETY: `content` is a live NSView on the main thread.
     unsafe fn remove_effect_views(content: Id) {
         let effect_cls = class(c"NSVisualEffectView");
         if effect_cls.is_null() {
@@ -3622,22 +3233,15 @@ mod vibrancy {
         }
     }
 
-    /// Create an `NSVisualEffectView` filling `content`'s bounds with the given
-    /// `material`, behind-window blending, active state, and add it BELOW the
-    /// existing subviews (so the Metal content draws over it).
+    /// Create an `NSVisualEffectView` filling `content`'s bounds with `material`, behind-window
+    /// blending and active state, and add it below the existing subviews. The class is looked
+    /// up dynamically, so a process without it gets a no-op.
     ///
-    /// SAFETY: `content` is a live NSView on the main thread; the class is looked
-    /// up dynamically so a process without AppKit's effect view degrades to a
-    /// no-op instead of a panic.
+    /// SAFETY: `content` is a live NSView on the main thread.
     ///
-    /// MEMORY: `alloc`+`initWithFrame:` hands back a +1 create-rule reference that
-    /// we own. `addSubview:` takes its OWN retain (the superview's ownership), so
-    /// our +1 is surplus and MUST be released or every vibrancy re-apply — GPU
-    /// rebuild, opacity slider, material change, per-window attach — leaks a
-    /// GPU-backed effect view (MEM-L1). We release right after `addSubview:`; the
-    /// view stays alive under the superview's retain. On the nil path we do NOT
-    /// release: a failing `init` already releases `self` per Cocoa convention, so
-    /// touching it would be an over-release.
+    /// Memory: `alloc`+`initWithFrame:` returns a +1 we own and `addSubview:` takes its own
+    /// retain, so ours is released after adding, or every vibrancy re-apply leaks a GPU-backed
+    /// view. On the nil path nothing is released: a failing `init` already released `self`.
     unsafe fn install_effect_view(content: Id, material: isize) {
         let effect_cls = class(c"NSVisualEffectView");
         if effect_cls.is_null() {
@@ -3663,10 +3267,8 @@ mod vibrancy {
                 ORDER_BELOW,
                 Id::NIL,
             );
-            // Balance the create-rule +1 from alloc/init; the superview now owns
-            // it. `-release` is sent explicitly rather than through `Obj`
-            // because the +1 is handed straight to `addSubview:` and never held
-            // in Rust — wrapping it would be a `Retained` created only to drop.
+            // Balance the create-rule +1; the superview now owns the view. Sent directly: the
+            // +1 goes straight to `addSubview:` and is never held in Rust.
             appkit::send_v(effect, sel!(release));
         }
     }
@@ -3716,7 +3318,7 @@ mod surface_colorspace_tests {
             SurfaceColorspace::from(WindowColorspace::DisplayP3),
             SurfaceColorspace::DisplayP3
         );
-        // The kCGColorSpace* constant VALUES equal their names (stable ABI).
+        // The kCGColorSpace* constants' values equal their names (stable ABI).
         assert_eq!(SurfaceColorspace::Srgb.cg_name(), "kCGColorSpaceSRGB");
         assert_eq!(
             SurfaceColorspace::DisplayP3.cg_name(),
@@ -3728,9 +3330,8 @@ mod surface_colorspace_tests {
         );
     }
 
-    /// M3 phase B precedence, totally: an HDR (f16) surface is ALWAYS tagged
-    /// extended-linear (its pixels ARE linear — any config tag would mis-render
-    /// them); an SDR surface takes the config verbatim.
+    /// An HDR (f16) surface is always tagged extended-linear (its pixels are linear light); an
+    /// SDR surface takes the config verbatim.
     #[test]
     fn hdr_surface_outranks_config_tag() {
         for cfg in [WindowColorspace::Srgb, WindowColorspace::DisplayP3] {
@@ -3771,49 +3372,28 @@ mod surface_colorspace_tests {
     }
 }
 
-/// Opt this application OUT of macOS diacritic press-and-hold, so a HELD key
-/// REPEATS instead of opening the accent palette.
+/// Opt this application out of macOS diacritic press-and-hold, so a held key repeats instead
+/// of opening the accent palette.
 ///
-/// aterm opts every window into IME (`set_ime_allowed(true)` in `app_window.rs`) so
-/// CJK/dead-key composition works. In winit that makes `keyDown:` route every key
-/// through `interpretKeyEvents` on a view that implements `NSTextInputClient` and
-/// `firstRectForCharacterRange:` — which is precisely the configuration macOS reads
-/// as "this responder wants press-and-hold". So holding any diacritic-capable
-/// letter (a e i o u n c s y z l …) suppresses the autorepeat keyDown stream after
-/// the ~500 ms hold threshold and shows the accent palette instead. The 2nd..Nth
-/// repeat never reaches `App::on_key` at all: for roughly half the alphabet, held
-/// key repeat is not slow, it is ABSENT — and no amount of render or lock tuning
-/// can touch it, because the events are never delivered.
+/// aterm opts every window into IME (`set_ime_allowed(true)`), so winit routes `keyDown:`
+/// through `interpretKeyEvents` on an `NSTextInputClient` view, which macOS reads as wanting
+/// press-and-hold: holding a diacritic-capable letter stops the autorepeat stream after ~500 ms,
+/// and those repeats never reach `App::on_key`.
 ///
-/// `registerDefaults:` rather than an `Info.plist` key: `NSUserDefaults` does not
-/// read the bundle Info.plist, so the plist route that circulates as folklore does
-/// nothing. Registration also covers the UN-BUNDLED `aterm` binary, which has no
-/// Info.plist to carry a key in the first place.
-///
-/// It registers a DEFAULT, not a value: a user who genuinely wants the accent
-/// palette can still override it with
-/// `defaults write com.aterm.aterm ApplePressAndHoldEnabled -bool true`, because an
-/// explicitly-written user default outranks a registered one. Must run before the
-/// first window is created, while AppKit is still reading the value.
+/// `registerDefaults:`, not an `Info.plist` key: `NSUserDefaults` does not read the bundle
+/// plist, and the un-bundled `aterm` binary has none. It registers a default, so
+/// `defaults write com.aterm.aterm ApplePressAndHoldEnabled -bool true` still wins. Must run
+/// before the first window is created.
 #[cfg(target_os = "macos")]
 pub(crate) fn disable_press_and_hold() {
     use aterm_objc::{Bool, Id, Sel, autoreleasepool, class, sel};
 
     use crate::appkit;
 
-    // SAFETY: standard NSUserDefaults registration. `+numberWithBool:` is
-    // `-(id)(BOOL)` and `+dictionaryWithObject:forKey:` is `-(id)(id, id)`;
-    // both return AUTORELEASED objects, borrowed inside this pool.
-    // `+standardUserDefaults` is `-(id)`, the process singleton, and
-    // `-registerDefaults:` is `-(void)(NSDictionary *)`, which COPIES the
-    // dictionary — so nothing here has to outlive the pool.
-    //
-    // The objc2 form's three chained `Retained::into_super` upcasts
-    // (NSNumber → NSValue → NSObject → AnyObject, to satisfy the erased
-    // element type of `registerDefaults:`) have no counterpart: `Id` IS the
-    // erased type, so the upcast is not expressible and not needed. That is
-    // the same shape as the `CGColorSpace` `RefEncode` deletion above — where
-    // the binding's type discipline cost lines, the port gets them back.
+    // SAFETY: standard NSUserDefaults registration. `+numberWithBool:` (`-(id)(BOOL)`) and
+    // `+dictionaryWithObject:forKey:` (`-(id)(id, id)`) return autoreleased objects borrowed
+    // inside this pool; `+standardUserDefaults` is the process singleton, and
+    // `-registerDefaults:` copies the dictionary, so nothing has to outlive the pool.
     autoreleasepool(|_| unsafe {
         let Some(key) = appkit::nsstring("ApplePressAndHoldEnabled") else {
             return;

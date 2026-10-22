@@ -1,21 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FONT ORACLE (TF.1 of docs/AUDIT-third-party-2026-10-15.md): what today's
-//! third-party font code answers, recorded before `aterm-font` replaces it.
+//! The font oracle (TF.1 of docs/AUDIT-third-party-2026-10-15.md): answers
+//! recorded from the third-party font crates, which the first-party code
+//! replacing them is held to.
 //!
 //! - `tests/fixtures/font-oracle/shaping.txt`: rustybuzz's glyph ids, clusters,
-//!   advances and offsets, shaped the way `RowShaper` and `shape_cluster` call
-//!   it, for every face the run shaper reaches: a primary (and its styled
-//!   siblings) under each feature list `should_run_shaping` lets through,
-//!   whether by the `liga`/`calt` gate or by a configured `font_features` tag
-//!   the face advertises, and the colour face. Inputs: programming ligatures,
-//!   per-tag feature probes, Arabic and Hebrew both logical and as the
-//!   visual-order runs a reordered row held (the runs rustybuzz was handed;
-//!   since TF.6 the planner reverses their letters first), Devanagari, CJK,
-//!   automatic fractions, the normalization fallbacks, default ignorables,
-//!   emoji ZWJ sequences, flags, keycaps and skin tones, and variable primaries
-//!   at the instance aterm draws them at and under `font_weight` requests.
+//!   advances and offsets for every face the run shaper reaches, under each
+//!   feature list `should_run_shaping` lets through, plus the colour face's
+//!   `shape_cluster` clusters.
 //! - `tests/fixtures/font-oracle/reader.txt`: ttf-parser's answers per face and
 //!   variation instance (cmap, metrics, MVAR-applied metrics, advances, bounds,
 //!   glyf/gvar and CFF outlines as point-stream digests, OS/2, name, kern,
@@ -26,9 +19,8 @@
 //! - `tests/fixtures/font-oracle/reader-gvar-alloc.txt`: the same `read`
 //!   answers for `GVAR_ALLOC_FACES` (`font_oracle/corpus.rs`), faces with
 //!   glyphs past 32 `gvar` tuples, recorded by the recorder below with
-//!   ttf-parser's `gvar-alloc`: the feature aterm's Linux build ships, which
-//!   ttf-parser as `-p aterm-render` resolves it (here) lacks. aterm-font's
-//!   replay holds it; no test here does.
+//!   ttf-parser's `gvar-alloc` feature, as aterm's Linux build ships it.
+//!   aterm-font's `tests/reader_oracle.rs` replays it; no test here does.
 //! - `tests/fixtures/font-oracle/hinting.txt`: skrifa's grid-fitted masks,
 //!   recorded by `tests/font_oracle/recorder`, a crate outside the workspace,
 //!   through `font_oracle/hint_raster.rs`. Since TF.4 aterm-font's
@@ -39,34 +31,29 @@
 //!   `hint-differential` mode compares skrifa and the carve over every face
 //!   the host has.
 //!
-//! Since TF.6 the `shape` lines are answered here by aterm-font's shaper
-//! (`font_oracle/shaper.rs`), held to rustybuzz's recorded answers with the
-//! accepted deltas `shaping_answers_hold` names, while the colour face's
-//! `morx` sequences are CoreText's (aterm-render's
-//! `coretext_answers_the_emoji_lines`). The shaping corpus stays rustybuzz's
-//! record: a bless rewrites the `read` lines, never the `shape` ones.
+//! Here aterm-font answers the `shape` lines (`font_oracle/shaper.rs`), held
+//! to rustybuzz's up to the deltas `shaping_answers_hold` accepts, and the
+//! `read` lines (`font_oracle/reader.rs`).
 //!
-//! System fonts are never committed: their answers are filed under the font
-//! file's FNV-1a digest, and a face that is absent, or that an OS update
-//! replaced, is skipped (its lines kept), never failed. Committed faces must
-//! answer every line. `ATERM_BLESS_GOLDEN=1` re-records the faces this host
-//! has and keeps every other face's lines; a re-record belongs in a commit
-//! that says which answer moved and why. Since TF.5 a bless writes `read`
-//! lines from aterm-font, the reader under test, so a re-recorded `read`
-//! line is checked against ttf-parser only by the recorder's `replay`: run
-//! it before committing one.
+//! System fonts are never committed: their answers are keyed by the font
+//! file's FNV-1a digest, and a face that is absent or changed is skipped (its
+//! lines kept), never failed. Committed faces must answer every line.
+//! `ATERM_BLESS_GOLDEN=1` re-records `reader.txt` for the faces this host has
+//! and keeps every other face's lines; `shaping.txt` stays rustybuzz's. A
+//! blessed `read` line is aterm-font's answer, so only the recorder's `replay`
+//! checks it against ttf-parser: run it before committing one, in a commit
+//! that says which answer moved and why.
 //!
 //! Replay: `targo --unverified test -p aterm-render --test render_suite --
 //! font_oracle::`.
 
 mod corpus;
-/// The shaper the `shape` lines are answered with here: aterm-font's, the
-/// renderer's since TF.6. `probe.rs`, rustybuzz's half that recorded them,
-/// is the recorder's alone.
+/// aterm-font's shaper, which answers the `shape` lines here. `probe.rs`, the
+/// rustybuzz half that recorded them, is the recorder's alone.
 mod shaper;
-/// The reader `reader.rs` answers the `read` lines with: aterm-font, the
-/// renderer's reader since TF.5, under ttf-parser's names (its outline sink
-/// trait is `OutlineSink`). The recorder answers them with ttf-parser.
+/// The reader `reader.rs` answers the `read` lines with: aterm-font, under
+/// ttf-parser's names (its outline sink trait is `OutlineSink`). The recorder
+/// answers them with ttf-parser.
 mod font {
     pub(crate) use aterm_font::OutlineSink as OutlineBuilder;
     pub(crate) use aterm_font::*;
@@ -197,9 +184,9 @@ fn no_calt_config() -> [FontFeature; 1] {
 
 /// Whether `tag` is one a user sets in `font_features` to pick a glyph
 /// variant: the stylistic sets and character variants, and the other
-/// discretionary OpenType features. The features rustybuzz applies on its own
-/// (`ccmp`, `locl`, the joining forms, ...) are left out: they are on in every
-/// shaped run already, so a config naming one shapes like the base list.
+/// discretionary OpenType features. The features the shaper applies on its
+/// own (`ccmp`, `locl`, the joining forms, ...) are left out: they are on in
+/// every shaped run already, so a config naming one shapes like the base list.
 fn user_configurable(tag: [u8; 4]) -> bool {
     let numbered = |prefix: &[u8]| {
         tag.starts_with(prefix) && tag[2].is_ascii_digit() && tag[3].is_ascii_digit()
@@ -343,7 +330,8 @@ const FEATURE_CASES: &[&str] = &[
 ];
 
 /// Automatic fractions, the normalization fallbacks rustybuzz applies before
-/// mapping, default ignorables, left-to-right mirroring pairs and symbols.
+/// mapping (the shaper does not: [`ShapingDelta::Normalization`]), default
+/// ignorables, left-to-right mirroring pairs and symbols.
 fn misc_cases() -> Vec<Case> {
     [
         ("frac.half", "1\u{2044}2"),
@@ -374,16 +362,16 @@ fn misc_cases() -> Vec<Case> {
     .collect()
 }
 
-/// Right-to-left strings, each recorded in LOGICAL order and as the runs the
-/// renderer actually shapes: the row reordered to VISUAL order the way
-/// aterm-core's `compute_visual_order_cells` does (LTR paragraph, the
-/// default), then cut at spaces, which break a shaping run.
+/// Right-to-left strings, each recorded in logical order and as the runs a
+/// reordered row holds: the row reordered to visual order as aterm-core's
+/// `compute_visual_order_cells` does (LTR paragraph), then cut at spaces.
+/// Those are the runs rustybuzz was handed; the planner reverses their
+/// right-to-left letters back to logical order before shaping
+/// (`plan_row_runs`).
 ///
-/// `he.niqqud` is an ENGINE PROBE, not a run aterm feeds: aterm keeps a
-/// combining mark on its base cell as a cluster, and a cell that carries a
-/// cluster never joins a run (`cell_is_shapeable`), so the run shaper never
-/// sees a point next to its letter. The probe pins what the engine does with
-/// marks for the replacement's sake.
+/// `he.niqqud` is an engine probe, not a run aterm feeds: a combining mark
+/// rides its base cell as a cluster, and a cell with a cluster never joins a
+/// run (`cell_is_shapeable`).
 fn rtl_cases() -> Vec<Case> {
     let mut out = Vec::new();
     for (id, logical) in [
@@ -435,10 +423,10 @@ fn visual_runs(logical: &str) -> Vec<String> {
         .collect()
 }
 
-/// Devanagari and CJK. Apart from `deva.bare` (narrow consonants, no marks)
-/// and `cjk.halfwidth-kana`, these are ENGINE PROBES, not runs aterm feeds:
-/// virama and vowel signs ride their base cell as a cluster and a wide cell
-/// is never shapeable (`cell_is_shapeable`), so the run shaper sees neither.
+/// Devanagari and CJK. Apart from `deva.bare` and `cjk.halfwidth-kana`, these
+/// are engine probes, not runs aterm feeds: virama and vowel signs ride their
+/// base cell as a cluster and a wide cell is never shapeable
+/// (`cell_is_shapeable`), so the run shaper sees neither.
 fn complex_cases() -> Vec<Case> {
     [
         ("deva.namaste", "\u{928}\u{92E}\u{938}\u{94D}\u{924}\u{947}"),
@@ -494,15 +482,14 @@ enum Tier {
     Reduced,
 }
 
-/// The instances the run shaper shapes a face at, each with its tier. This
-/// mirrors `Renderer::compute_variations_for`: a variable primary is shaped
-/// at `resolve_default_coords` with the config's `font_variation` /
-/// `font_weight` requests applied, and with NO coordinates set when that lands
-/// exactly on the `fvar` defaults (Cinzel's `Regular` is its default). The
-/// full set goes at the instance aterm draws by default; the reduced set at
-/// the `fvar` default and under `font_weight = 700` and `900`, so an answer
-/// that moves with the coordinates is told apart from one that ignores them.
-/// A styled sibling is a separate, non-instantiated file: no coordinates.
+/// The instances the run shaper shapes a face at, each with its tier,
+/// mirroring `Renderer::compute_variations_for`: a variable primary is shaped
+/// at `resolve_default_coords` with the `font_variation` / `font_weight`
+/// requests applied, and with no coordinates set when that lands exactly on
+/// the `fvar` defaults. The full set goes at the instance aterm draws by
+/// default; the reduced set at the `fvar` default and at `wght` 700 and 900,
+/// so an answer that moves with the coordinates is told apart from one that
+/// ignores them. A styled sibling is a separate, non-instantiated file.
 fn shaping_instances(bytes: &[u8], index: u32, roles: u8) -> Vec<(Tier, Coords)> {
     if roles & corpus::PRIMARY == 0 {
         return vec![(Tier::Reduced, Vec::new())];
@@ -537,14 +524,12 @@ fn shaping_instances(bytes: &[u8], index: u32, roles: u8) -> Vec<(Tier, Coords)>
 }
 
 /// Every shaping case a primary or styled face gets at one tier, each with its
-/// feature list. A list `build_feature_list(user, ligatures_on)` is shaped
-/// only when `should_run_shaping` lets a renderer with that config shape on
-/// the primary: by the `liga`/`calt` gate, or because the primary advertises
-/// a tag the config sets (`has_user_features`). On a primary that fails the
-/// gate (SF Mono), a configured feature is the only way the shaper runs, so
-/// each tag it advertises gets lists of its own, with ligatures on and off.
-/// A styled sibling is shaped under its PRIMARY's gate, whatever its own
-/// `GSUB` holds (Courier New Italic has no `liga`; Courier New does).
+/// feature list. A list is shaped only when `should_run_shaping` lets a
+/// renderer with that config shape on the primary: by the `liga`/`calt` gate,
+/// or because the primary advertises a tag the config sets. On a primary that
+/// fails the gate (SF Mono) a configured feature is the only way the shaper
+/// runs, so each tag it advertises gets lists of its own. A styled sibling is
+/// shaped under its primary's gate, whatever its own `GSUB` holds.
 fn shaping_plan(gate: &Gate, tier: Tier) -> Vec<(Features, Case)> {
     let mut out = Vec::new();
     let mut add = |user: &[FontFeature], ligatures_on: bool, cases: Vec<Case>| {
@@ -719,10 +704,9 @@ fn glyph_raster(h: &mut Fnv, gid: u16, r: &GlyphRaster) {
     }
 }
 
-/// aterm's own `font::Font` (the type that retired fontdue) over this face:
-/// the cmap it builds, line metrics, per-glyph metrics, legacy kerning and
-/// first-party coverage rasters, plus the run shaper's GSUB gate. TF.3 and
-/// TF.5 move its reads onto `aterm-font`; these answers must not move.
+/// aterm's own `font::Font` over this face: the cmap it builds, line metrics,
+/// per-glyph metrics, legacy kerning and coverage rasters, plus the run
+/// shaper's GSUB gate.
 fn font_answers(bytes: &Arc<Vec<u8>>, index: u32) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if index == 0 {
@@ -1087,11 +1071,11 @@ fn moved_by_coordinates(lines: &[Line], present: &Present) -> usize {
         .count()
 }
 
-/// What the face files a shaping line is filed under have, for telling the
-/// replay's deltas apart: a `GPOS` or a legacy `kern` table (upstream
-/// positioned with them), a `morx` table (upstream shaped the colour face's
-/// sequences with it; on macOS CoreText does now), and the nominal glyph of
-/// every character the corpus shapes and of its Bidi_Mirroring_Glyph.
+/// What a shaping line's face has, for telling the replay's deltas apart: a
+/// `GPOS` or legacy `kern` table (rustybuzz positions with them), a `morx`
+/// table (rustybuzz shapes the colour face's sequences with it; on macOS
+/// CoreText does), and the nominal glyph of every character the corpus shapes
+/// and of its Bidi_Mirroring_Glyph.
 #[derive(Clone, Default)]
 struct ShapingTraits {
     positions: bool,
@@ -1131,26 +1115,24 @@ fn corpus_chars(corpus_text: &str) -> BTreeSet<char> {
     out
 }
 
-/// The accepted ways aterm-font's shaper answers a recorded rustybuzz line
-/// differently (TF.6 of docs/AUDIT-third-party-2026-10-15.md). Each is told
-/// by what the answer holds, not by the case's name alone, and each has a
-/// test of its own.
+/// The accepted ways aterm-font's shaper differs from a recorded rustybuzz
+/// ("upstream") answer, each told by what the answer holds, not by the case's
+/// name alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ShapingDelta {
-    /// Upstream normalized before mapping: it decomposed a character the
-    /// face lacks, composed a base and mark the face has precomposed,
-    /// reordered marks by combining class, and gave spaces and U+2011 a
-    /// fallback glyph. On the `norm.*` and `*.niqqud.logical` cases each
-    /// character now maps to its own glyph ([`unnormalized`],
-    /// `normalization_is_not_replayed`).
+    /// Upstream normalizes before mapping: it decomposes a character the face
+    /// lacks, composes a base and mark the face has precomposed, reorders
+    /// marks by combining class, and gives spaces and U+2011 a fallback glyph.
+    /// The shaper maps each character of the `norm.*` and `*.niqqud.logical`
+    /// cases to its own glyph ([`unnormalized`], `normalization_is_not_replayed`).
     Normalization,
-    /// Upstream mirrored every mirrorable character of a right-to-left run,
-    /// whatever its bidi level; mirroring is the bidi step's now, by level
-    /// (`brackets_mirror_by_level_not_by_run`). The answer is the recorded
-    /// one with each mirrored glyph swapped back ([`unmirrored`]).
+    /// Upstream mirrors every mirrorable character of a right-to-left run,
+    /// whatever its bidi level; here the bidi step mirrors by level
+    /// (`brackets_mirror_by_level_not_by_run`). The answer is the recorded one
+    /// with each mirrored glyph swapped back ([`unmirrored`]).
     Mirroring,
-    /// Upstream positioned with `GPOS`, `kern` or fallback mark placement;
-    /// the shaper advances by `hmtx` alone. Ids and clusters still match.
+    /// Upstream positions with `GPOS`, `kern` or fallback mark placement; the
+    /// shaper advances by `hmtx` alone. Ids and clusters still match.
     Positions,
 }
 
@@ -1164,7 +1146,7 @@ fn ids_and_clusters(answer: &str) -> String {
     format!("{head}| {}", glyphs.join(" "))
 }
 
-/// An answer's `(glyph id, cluster)` pairs in LOGICAL order: a right-to-left
+/// An answer's `(glyph id, cluster)` pairs in logical order: a right-to-left
 /// answer lists its glyphs visually, so it is read backwards.
 fn logical_glyphs(answer: &str) -> Option<Vec<(u32, usize)>> {
     let (head, rest) = answer.split_once('|')?;
@@ -1181,13 +1163,13 @@ fn logical_glyphs(answer: &str) -> Option<Vec<(u32, usize)>> {
     Some(out)
 }
 
-/// The recorded answer as the shaper gives it without mirroring: in a
+/// The recorded answer as the shaper gives it, without mirroring: in a
 /// right-to-left answer, each glyph upstream drew for a mirrorable character
-/// as the nominal glyph of the character's Bidi_Mirroring_Glyph is swapped
-/// back for the character's own, with the advance the answer records for that
-/// glyph (a bracket pair's advances differ on a proportional face); every
-/// other token stays as recorded. `None` when nothing was mirrored, a swapped
-/// glyph's advance is not in the answer, or the answer does not parse.
+/// as its Bidi_Mirroring_Glyph's nominal glyph is swapped back for the
+/// character's own, with the advance the answer records for that glyph (a
+/// bracket pair's advances differ on a proportional face). `None` when
+/// nothing was mirrored, a swapped glyph's advance is not in the answer, or
+/// the answer does not parse.
 fn unmirrored(line: &Line, traits: &ShapingTraits) -> Option<String> {
     let text = corpus::unescape(&line.input)?;
     let (head, rest) = line.answer.split_once('|')?;
@@ -1222,13 +1204,13 @@ fn unmirrored(line: &Line, traits: &ShapingTraits) -> Option<String> {
 /// Whether `now` maps the line's text as written, with no normalization: read
 /// in logical order and cut at its clusters, each cluster holds one glyph per
 /// character, and every character but a mark is drawn with its own nominal
-/// glyph (a default ignorable with the space's, as upstream hides it), so
-/// nothing was decomposed, composed, reordered by combining class or given a
+/// glyph (a default ignorable with the space's, which hides it), so nothing
+/// was decomposed, composed, reordered by combining class or given a
 /// fallback. A mark may still take a contextual form in `ccmp` (a combining
-/// ring above a capital turns into its cap form), which is `GSUB`'s, not
-/// normalization's. A cluster with FEWER glyphs than characters is a `GSUB`
-/// ligature of a letter and its marks (Courier New's vav with holam): upstream
-/// drew it the same way, so that cluster must answer as recorded.
+/// ring above a capital turns into its cap form): that is `GSUB`'s, not
+/// normalization's. A cluster with fewer glyphs than characters is a `GSUB`
+/// ligature of a letter and its marks (Courier New's vav with holam), which
+/// upstream draws the same way, so that cluster must answer as recorded.
 fn unnormalized(line: &Line, now: &str, traits: &ShapingTraits) -> bool {
     let ignorable = |c: char| matches!(c, '\u{AD}' | '\u{200B}'..='\u{200F}' | '\u{2060}');
     let (Some(text), Some(glyphs), Some(recorded)) = (
@@ -1367,8 +1349,8 @@ fn compare_shaping(
         if seen.contains(&line.id()) {
             continue;
         }
-        // A system face this host has that no bless recorded: rustybuzz's
-        // answers for it would come from the recorder, so it is skipped.
+        // A system face this host has that the corpus does not hold: there is
+        // no rustybuzz answer to hold it to, so it is skipped.
         if !keys_recorded.contains(&line.key) && present.get(&line.key) == Some(&false) {
             report
                 .unrecorded
@@ -1382,14 +1364,13 @@ fn compare_shaping(
     report
 }
 
-/// THE SHAPING REPLAY (TF.6): every `shape` line of the TF.1 corpus, which
-/// rustybuzz 0.20.1 recorded, answered by aterm-font's shaper. A line must
-/// answer exactly, or differ only in one of the accepted [`ShapingDelta`]s;
-/// the colour face's `morx` sequences are CoreText's on macOS and are held
-/// to their lines by `coretext_answers_the_emoji_lines`.
+/// The shaping replay: every `shape` line, recorded by rustybuzz 0.20.1,
+/// answered by aterm-font's shaper. A line must answer exactly or differ only
+/// in an accepted [`ShapingDelta`]; a `morx` face's emoji lines are CoreText's,
+/// held by `coretext_answers_the_emoji_lines`.
 ///
 /// The corpus stays rustybuzz's: `ATERM_BLESS_GOLDEN` does not rewrite it
-/// here (the recorder outside the workspace replays it on rustybuzz).
+/// (the recorder's `replay` checks it on rustybuzz).
 #[test]
 fn shaping_answers_hold() {
     let path = format!(
@@ -1426,7 +1407,7 @@ fn shaping_answers_hold() {
             .starts_with("RTL Arab |"),
         "a visual-order Arabic run is guessed right-to-left"
     );
-    // NEGATIVE CONTROL for the instances: Cinzel's weight axis moves its
+    // Negative control for the instances: Cinzel's weight axis moves its
     // advances, so a shaper that dropped the coordinates would lose these.
     assert!(
         moved_by_coordinates(&got, &present) > 0,
@@ -1445,8 +1426,7 @@ fn shaping_answers_hold() {
         report.moved.len(),
         report.moved.join("\n")
     );
-    // Not vacuous: the committed faces alone answer hundreds of lines exactly,
-    // with ids and clusters checked on every other one.
+    // Not vacuous: the committed faces alone answer hundreds of lines exactly.
     assert!(
         report.exact >= 500,
         "font oracle `shaping`: only {} answers compared",
@@ -1454,12 +1434,11 @@ fn shaping_answers_hold() {
     );
 }
 
-/// NEGATIVE CONTROL for the delta classes: an id that moves on a face with no
-/// positioning tables is not a positions delta, a moved id is never one, a
-/// right-to-left answer is a mirroring delta only when every changed glyph is
-/// a bracket drawn as its own glyph instead of its mirror's, and a
-/// normalization case is let through only when each character maps to its
-/// own glyph.
+/// Negative control for the delta classes: an advance that moves on a face
+/// with no positioning tables is not a positions delta, nor is a moved id or
+/// direction; a right-to-left answer is a mirroring delta only when it is the
+/// recorded one with every mirrored bracket swapped back; and a normalization
+/// case passes only when each character maps to its own glyph.
 #[test]
 fn a_shaping_delta_is_classified_narrowly() {
     let line = |case: &str, input: &str, answer: &str| Line {
@@ -1553,8 +1532,8 @@ fn a_shaping_delta_is_classified_narrowly() {
         shaping_delta(&acute, "LTR Latn | 21:0:600 40:0:0", &plain),
         None
     );
-    // nor is a cluster split in three, nor a composition the face's `GSUB`
-    // did not record,
+    // nor is three glyphs for two characters, nor a composition the recorded
+    // answer does not hold,
     assert_eq!(
         shaping_delta(&acute, "LTR Latn | 20:0:600 40:0:0 40:0:0", &plain),
         None
@@ -1569,11 +1548,10 @@ fn a_shaping_delta_is_classified_narrowly() {
 }
 
 /// [`ShapingDelta::Normalization`]: on every `norm.*` and `*.niqqud.logical`
-/// line a face this host has answers, the shaper maps each character to its
-/// own glyph ([`unnormalized`]). NEGATIVE CONTROL: rustybuzz's recorded
-/// answers fail that check (it composed, decomposed, reordered marks and
-/// substituted fallbacks), and differ from the shaper's, on lines enough
-/// that the delta is real.
+/// line of a face this host has, the shaper maps each character to its own
+/// glyph ([`unnormalized`]). Negative control: enough of rustybuzz's recorded
+/// answers fail that check, and differ from the shaper's, that the delta is
+/// real.
 #[test]
 fn normalization_is_not_replayed() {
     let corpus_text = std::fs::read_to_string(format!(

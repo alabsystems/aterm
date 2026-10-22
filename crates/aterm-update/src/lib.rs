@@ -60,22 +60,20 @@
 //!    floor (blocks replay, rollback and yanked builds).
 //! 2. Integrity: the downloaded container's SHA-256 equals the manifest's.
 //!
-//! Authenticity comes from every configured tier (defense in depth):
+//! Authenticity comes from every configured tier:
 //!
-//! * Tier REPO (a fork with no master of its own): "it came from my channel
-//!   repository over TLS", plus a structural `codesign --verify` (an ad-hoc
-//!   signature suffices; arm64 requires one to run) to catch corruption. No Apple
-//!   anchor, Team ID or notarization.
+//! * Tier REPO (a fork with no master of its own): the release came from the channel
+//!   repository over TLS, plus a structural `codesign --verify` (an ad-hoc signature
+//!   suffices) to catch corruption.
 //! * Tier ROSTER (this tree): the paper master is compiled in
 //!   (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`), so every release must carry
 //!   the master-signed machine roster and an Ed25519 appcast signature by a machine
 //!   the roster names and has not revoked (`github::authorize_by_roster`). The
 //!   manifest pins the SHA-256 of every downloadable container (DMG and zip), so
-//!   this authenticates whichever one is staged, even against a repo-write
-//!   attacker. `atpkg` verifies its index under the same roster.
+//!   this holds even against a repo-write attacker.
 //! * Tier APPLE (optional, additive): if [`PINNED_TEAM_ID`] is set, `codesign
-//!   --verify` also runs with a designated requirement pinning the Apple anchor,
-//!   Developer-ID chain and Team ID, plus `spctl -a -t exec` notarization.
+//!   --verify` also pins the Apple anchor, Developer-ID chain and Team ID, plus
+//!   `spctl -a -t exec` notarization.
 //!
 //! Everything shells out to `codesign`/`spctl`/`hdiutil`/`ditto`/`curl`; the
 //! container's SHA-256 is `aterm_update_core::sha256_file`'s (in process, on the CPU's
@@ -90,8 +88,8 @@
 
 #[cfg(target_os = "macos")]
 mod bundle;
-// The schedule is portable; every target tests the real cadence against the
-// watchdog budget, even though the background loop currently ships on macOS.
+// Portable so every target's tests check the real cadence against the watchdog
+// budget; the background loop ships on macOS.
 #[cfg(any(target_os = "macos", test))]
 mod cadence;
 /// The schedule's constants and [`STALE_CHECK_AFTER`], compiled on every target.
@@ -253,21 +251,19 @@ pub use aterm_update_core::{DEFAULT_OWNER, DEFAULT_REPO, Source};
 
 pub use progress::{Progress, ProgressNotify, set_progress_observer};
 
-/// Re-exported for every OTHER lane that re-launches aterm forwarding its own
-/// argv (the GUI's cold-exec/seamless/Windows successor spawns): strip the
-/// leading `--window` mode pins so no relaunch path can re-grow the argv the
-/// boot swap pins exactly once. A RUNNING window's successor forwards its flags
-/// and nothing its launch asked for once (`running_window_successor_args`).
+/// For every lane that relaunches aterm forwarding its own argv: strip the leading
+/// `--window` pins the boot swap adds, so no relaunch re-grows them. A running
+/// window's successor forwards its flags but not what its launch asked for once
+/// (`running_window_successor_args`).
 pub use relaunch::{
     RELAUNCH_OF_RUNNING_ENV, reexec_forwarded_args, running_window_successor_args,
     window_successor_args,
 };
 
-/// The Apple Developer Team ID for the optional Tier APPLE anchor, from the
-/// committed constant `aterm_update_core::pins::APPLE_TEAM_ID` (never the build
-/// environment). Empty does not disable the updater; it skips the
-/// codesign/notarization anchor and leaves the repo and roster tiers. Non-empty
-/// additionally requires the swapped bundle be Developer-ID signed by this team.
+/// The Apple Developer Team ID for the optional Tier APPLE anchor, from the committed
+/// `aterm_update_core::pins::APPLE_TEAM_ID` (never the build environment). Empty
+/// skips the codesign/notarization anchor and leaves the repo and roster tiers;
+/// non-empty also requires the swapped bundle be Developer-ID signed by this team.
 pub const PINNED_TEAM_ID: &str = aterm_update_core::pins::APPLE_TEAM_ID;
 
 /// Runtime raise of the Tier APPLE anchor, from `[update] require_team_id` in the
@@ -277,18 +273,9 @@ static REQUIRED_TEAM_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new(
 /// Opts in to Developer-ID and notarization enforcement at runtime, without a
 /// rebuild.
 ///
-/// Shipped aterm pins a real Team ID, so [`PINNED_TEAM_ID`] is non-empty and this
-/// is a no-op there. For forks and self-hosted builds with an empty pin (structural
-/// `codesign --verify` only), it lets a deployment require a Developer ID from
-/// settings.
-///
-/// One-way, so a config file can never downgrade a compiled trust anchor:
-///
-/// * compiled pin non-empty ⇒ the compiled pin wins; this call is ignored;
-/// * compiled pin empty + `Some(team)` ⇒ that team is now required;
-/// * compiled pin empty + `None`/blank ⇒ unchanged (structural-only).
-///
-/// Backed by a `OnceLock`: only the first call takes effect, so a later config
+/// One-way, so config can never downgrade a compiled anchor: a non-empty compiled pin
+/// wins; with an empty pin, `Some(team)` requires that team and `None`/blank leaves
+/// it structural-only. Only the first call takes effect (`OnceLock`), so a config
 /// reload cannot loosen the anchor mid-session.
 pub fn set_required_team_id(team: Option<&str>) {
     if !PINNED_TEAM_ID.is_empty() {
@@ -440,42 +427,30 @@ pub enum ImageReplacement {
 /// never counted, and never escapes: waiting for the press is the design.
 pub const LEFT_STAGE_ESCAPE: usize = 2;
 
-/// What a launch of this build can PROVE about its boot trial — handed to the boot
-/// apply, which counts the launch, and to the health confirmation, which settles
-/// the trial.
+/// What a launch of this build can prove about its boot trial: handed to the boot
+/// apply, which counts the launch, and to the health confirmation, which settles it.
 ///
-/// macOS keeps ONE trial per swapped build, and the build it proves is the app a
-/// person opens: its windows. A `--headless` launch proves the engine and the
-/// control socket and nothing about the window path; were it to confirm the trial,
-/// it would delete the retained predecessor while the build's windows could still
-/// crash before their first frame, leaving a crash-looping release with nothing to
-/// revert to. Linux keeps the same shape per lane ([`linux_session_started`]).
+/// macOS keeps one trial per swapped build, and what it proves is the build's
+/// windows. A `--headless` launch proves only the engine and control socket; were it
+/// to confirm the trial, it would delete the retained predecessor while the windows
+/// could still crash before their first frame. Linux keeps the same shape per lane
+/// ([`linux_session_started`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrialWitness {
     /// A launch that opens windows.
     Window,
-    /// A `--headless` launch: counted toward only a trial no window has launched —
-    /// the headless self-update lane, whose successor is itself headless — and
-    /// settling only its headless path. Its confirmation of such a trial disarms it
-    /// (later updates are not held) but keeps the previous build for the build's
-    /// next window launch, which puts it back on trial; one a
-    /// window has launched it leaves for a window altogether.
+    /// A `--headless` launch. It counts only toward a trial no window has launched
+    /// (the headless self-update lane, whose successor is headless too). Confirming
+    /// such a trial disarms it (later updates are not held) but keeps the previous
+    /// build until the build's next window launch, which puts it back on trial; a
+    /// trial a window has launched it leaves to a window.
     Headless,
 }
 
-/// Whether the updater runs on this platform at all: macOS or Linux. Every lane a PERSON starts
-/// reads this and nothing more — `aterm update check` / Settings ▸ Software Update's
-/// Check for Updates ([`check_now`]), Update Now and `aterm ctl update apply` (the
-/// window's apply lane), and the launch-time swap of a build already staged. It
-/// requires no pinned anchor — the default Tier REPO works with none (see the
-/// crate-level trust model), so an internal build with no Apple Developer ID and no
-/// signing key still self-updates. Dev-build inertness comes from [`bundle::resolve`],
-/// not from a missing pin, and has two sources there: the LAYOUT (a `cargo run` /
-/// `target/` binary is not an installed `.app`) and the codesign-sealed
-/// [`bundle::DEV_BUILD_KEY`] mark (a local build installed in place, which layout alone
-/// cannot distinguish from a release). Linux instead requires explicit enrollment
-/// of its safe executable path and always authenticates signed native artifacts;
-/// merely running a checkout does not enroll it. Other platforms are unsupported.
+/// Whether the updater runs on this platform at all: macOS or Linux. Every lane a
+/// person starts reads only this: `aterm update check` and Settings ▸ Software
+/// Update's Check for Updates ([`check_now`]), Update Now and `aterm ctl update apply`
+/// (the window's apply lane), and the launch-time swap of a staged build.
 ///
 /// Not the setting: "Check for updates automatically" (`[update] enabled`) is
 /// [`automatic`]'s and switches off only the background checker, so checks and
@@ -519,13 +494,12 @@ pub fn running_is_dev_marked() -> bool {
     }
 }
 
-/// "Check for updates automatically" (`[update] enabled`, Settings ▸ Software
-/// Update, read once per process by [`aterm_update_core::settings::update_enabled`])
-/// on a platform the updater runs on ([`enabled`]). It gates the one lane nobody
-/// asked for: the background checker ([`spawn_background_check_with_settings`]) in
-/// the window and every terminal session, and, in a dev-marked copy, the window's
-/// daily look at the channel ([`dev_channel::spawn_watch`]). Applying a staged
-/// build is `[update] auto_apply`'s question.
+/// "Check for updates automatically" (`[update] enabled`, read once per process by
+/// [`aterm_update_core::settings::update_enabled`]) on a platform the updater runs on
+/// ([`enabled`]). It gates only the lane nobody asked for: the background checker
+/// ([`spawn_background_check_with_settings`]) and, in a dev-marked copy, the window's
+/// daily look at the channel ([`dev_channel::spawn_watch`]). Applying a staged build
+/// is `[update] auto_apply`'s question.
 #[must_use]
 pub fn automatic() -> bool {
     enabled() && aterm_update_core::settings::update_enabled()
@@ -533,7 +507,7 @@ pub fn automatic() -> bool {
 
 /// Applies a staged update if one is ready and strictly newer than `current_build`
 /// (the running build number). On success this does not return: it re-execs the
-/// swapped-in binary. See the crate-level trust model.
+/// swapped-in binary.
 ///
 /// Inherited PTY/proof descriptors (`handoff_fds`) stay CLOEXEC for every
 /// verification helper and are exposed only to the updater's final exec image.
@@ -612,21 +586,15 @@ pub fn swap_staged_for_launch(
 
 /// The clause an apply-path refusal carries when its cause can clear by itself: a
 /// verification helper past its deadline or the apply budget, a helper the kernel
-/// would not start just then (`EAGAIN`, `ENOMEM`, `EMFILE`, `ENFILE`), or the apply
-/// lock held by another process past its bounded wait.
+/// would not start just then (`EAGAIN`, `ENOMEM`, `EMFILE`, `ENFILE`), the apply lock
+/// held by another process past its bounded wait, or a full disk.
 ///
-/// A clause in the text rather than a type because these refusals reach every
-/// reader as a `String` (the apply lane's `Result<_, String>`,
-/// `ApplyOutcome::Deferred`, the GUI's cached pre-park verdict, the ledger's
-/// `last_failure`), and the readers that decide how long to wait (`aterm-gui`'s
-/// physical-failure shape, [`refusal_needs_person`]) hold only that string. It
-/// keeps a timeout on a loaded machine from reading as a structural verdict or a
-/// person's to clear.
-///
-/// Minted through one spelling, `verify::mark_passing`, where each cause is
-/// decided (`verify.rs`'s `timed_out`, helper spawns and `lock_wait_refusal`;
-/// a full disk in `install.rs` and the check's download), so the classification
-/// cannot drift from the wording. A reason without it keeps the verdict it had.
+/// A clause rather than a type because these refusals reach every reader as a
+/// `String` (the apply lane's `Result<_, String>`, `ApplyOutcome::Deferred`, the GUI's
+/// cached pre-park verdict, the ledger's `last_failure`), and the readers that decide
+/// how long to wait ([`refusal_needs_person`], `aterm-gui`) hold only that string.
+/// Minted only by `verify::mark_passing`, where each cause is decided, so the
+/// classification cannot drift from the wording.
 pub const PASSING_REFUSAL_KEY: &str = "a passing condition, not a verdict on the update";
 
 /// The key every "the install location cannot be written" refusal carries (the
@@ -675,23 +643,18 @@ pub fn is_passing_refusal(reason: &str) -> bool {
 }
 
 /// The words every "this stage waits for an update check to confirm its signer"
-/// refusal carries: the swap's gate 4d, and
-/// the pre-park checks that ask the same question
-/// (`install::roster_freshness_gate`, `Ready::roster_authorization_stale`). Kept
-/// here, beside [`PASSING_REFUSAL_KEY`], so a reader of the refusal on any platform
-/// can name it ([`is_roster_confirmation_wait`]).
+/// refusal carries: the swap's gate 4d and the pre-park checks that ask the same
+/// question (`install::roster_freshness_gate`, `Ready::roster_authorization_stale`).
 pub const ROSTER_UNCONFIRMED_KEY: &str = "confirmed against a current machine roster";
 
 /// Whether an apply-path refusal is the wait for an update check to confirm the
-/// stage's roster authorization ([`ROSTER_UNCONFIRMED_KEY`]), always a PASSING one.
+/// stage's roster authorization ([`ROSTER_UNCONFIRMED_KEY`]), always a passing one.
 ///
-/// Not a moment the next attempt may win, and never a failure: the refusal lasts
-/// until a check reads the machine roster, which no apply attempt does, so a lane
-/// that retried it on the transient schedule spent its budget (and, in the window,
-/// took the manual-only latch and the failing alarm's streak) on what was only a
-/// check that had not run yet — offline, or still starting after a launch. The
-/// window's automatic lane HOLDS on it instead and goes on when a check reports the
-/// stage.
+/// No apply attempt can end it, only a check that reads the machine roster, so a lane
+/// that retried it on the transient schedule would spend its budget (and, in the
+/// window, the manual-only latch and the failing alarm's streak) waiting for a check
+/// that had not run yet. The window's automatic lane holds on it and goes on when a
+/// check reports the stage.
 #[must_use]
 pub fn is_roster_confirmation_wait(reason: &str) -> bool {
     is_passing_refusal(reason) && reason.contains(ROSTER_UNCONFIRMED_KEY)
@@ -725,17 +688,13 @@ pub fn refusal_needs_person(_reason: &str) -> bool {
 
 /// Overlap-handoff pre-park verification: authenticates the staged candidate
 /// (codesign policy plus sealed build/commit rebinding, bound to the authorized
-/// artifact identity) and proves the bundle it would replace can become the
-/// swap's rollback source, while the caller's PTY readers are all still live. The
-/// handoff child re-runs the complete gate at swap time; this only moves the first
-/// verdict out of the parked window so a doomed candidate never parks a reader. See
-/// `install::preverify_staged_handoff_candidate` and
-/// `install::preverify_installed_rollback_source`.
+/// artifact identity) and proves the bundle it would replace can become the swap's
+/// rollback source, while the caller's PTY readers are still live. The handoff child
+/// re-runs the complete gate at swap time; this moves the first verdict out of the
+/// parked window so a doomed candidate never parks a reader.
 ///
-/// `Ok` carries the candidate's handoff policy file
-/// ([`aterm_update_core::handoff_policy`]) and whether its sealed `Info.plist`
-/// declares the chunked rendezvous grant ([`HandoffCandidateFacts`]), read from the
-/// verified stage after every check passed.
+/// `Ok` carries [`HandoffCandidateFacts`], read from the verified stage after every
+/// check passed.
 #[cfg(target_os = "macos")]
 pub fn preverify_staged_for_handoff(
     current_build: u64,
@@ -752,13 +711,11 @@ pub fn preverify_staged_for_handoff(
 }
 
 /// The code-signing identifier of a handoff candidate: the staged `.app`, or, for an
-/// activation, the installed bundle `activation` names. The launched lane's rendezvous
-/// admits only a dialer whose code carries an aterm release's identifier, a clause the
-/// candidate's own check (`codesign -R` with the Developer ID requirement) does not
-/// test; reading it before the launch lets a candidate signed otherwise take the fork
-/// lane, whose gate does not ask, instead of being launched only to be turned away at
-/// its dial. A display of the bundle the pre-verification (this worker's, or the cached
-/// pass) authenticated; it grants nothing.
+/// activation, the installed bundle `activation` names. The launched lane's
+/// rendezvous admits only a dialer carrying an aterm release's identifier, which the
+/// candidate's own check (`codesign -R`) does not test; reading it before the launch
+/// sends a candidate signed otherwise to the fork lane instead of being turned away
+/// at its dial. Display only; it grants nothing.
 ///
 /// # Errors
 /// No staging root, or `codesign` did not answer (a passing refusal when it
@@ -777,20 +734,15 @@ pub fn handoff_candidate_signing_identifier(
     }
 }
 
-/// WHAT A CACHED PASS CANNOT VOUCH FOR, for a handoff whose full
-/// pre-verification a fresh cached pass let the worker skip: `Some(refusal)`
-/// when `target_build` is below the operator apply floor this machine's staging
-/// root records — the floor ratchets on
-/// OBSERVATION, so it can rise inside the pass's freshness window — and, for a
-/// STAGED candidate (`staged_commit` is the commit the pass was cached for), when
-/// that stage is no longer the published one (a check that observes a revocation
-/// retires it). Either way the cached pass would otherwise
-/// park every reader for a successor whose own gate finds nothing to apply. An
-/// activation (`None`) has no stage, so it is asked the floor and whether the
-/// install path still holds it (another window may have retired it since the pass
-/// was cached). Small reads. Without a staging root an
-/// activation has nothing yanked (`None`), and a staged candidate has no stage,
-/// which refuses.
+/// What a cached pass cannot vouch for, for a handoff whose full pre-verification a
+/// fresh cached pass let the worker skip. `Some(refusal)` when `target_build` is below
+/// the operator apply floor the staging root records (the floor ratchets on
+/// observation, so it can rise inside the pass's freshness window), or, for a staged
+/// candidate (`staged_commit` is the commit the pass was cached for), when that stage
+/// is no longer the published one. Either way the pass would park every reader for a
+/// successor whose own gate finds nothing to apply. An activation (`None`) is asked
+/// the floor and whether the install path still holds it. Without a staging root an
+/// activation is `None` and a staged candidate refuses.
 #[cfg(target_os = "macos")]
 pub fn handoff_cached_pass_refusal(
     target_build: u64,
@@ -835,8 +787,8 @@ pub const HANDOFF_PREVERIFY_BOUND: std::time::Duration = std::time::Duration::fr
 #[cfg(not(target_os = "macos"))]
 pub const HANDOFF_PREVERIFY_BOUND: std::time::Duration = std::time::Duration::ZERO;
 
-/// What an outgoing build learns from a handoff candidate's bundle ONCE the
-/// pre-verify has authenticated it — never from a bundle that failed a check.
+/// What an outgoing build learns from a handoff candidate's bundle once the
+/// pre-verify has authenticated it, never from a bundle that failed a check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandoffCandidateFacts {
     /// The candidate's signed handoff policy.
@@ -849,8 +801,8 @@ pub struct HandoffCandidateFacts {
 }
 
 impl HandoffCandidateFacts {
-    /// Read both facts off a bundle that has just passed its checks — or refuse, as a
-    /// passing condition, when either file was not READ ([`Self::admitted`]).
+    /// Read both facts off a bundle that has just passed its checks, or refuse as a
+    /// passing condition when either file was not read ([`Self::admitted`]).
     #[cfg(target_os = "macos")]
     pub(crate) fn read(app_root: &std::path::Path) -> Result<Self, String> {
         Self::admitted(
@@ -859,14 +811,12 @@ impl HandoffCandidateFacts {
         )
     }
 
-    /// The facts as a pre-verification may pass them on: a file this process could
+    /// The facts as a pre-verification may pass them on. A file this process could
     /// not read just then (no descriptor left, an I/O error) is refused as a passing
-    /// condition, so it is never cached with the candidate's pass as a verdict — a
-    /// policy as "the successor asks nothing" (`PolicyRead::Unread`), and the
-    /// `Info.plist` as "the successor takes no chunked grant" (`grant_chunks` an
-    /// `Err`: both are read off the same verified bundle at the same instant, and
-    /// both are cached beside the pass).
-    /// The handoff worker files it transient and the next attempt reads them again.
+    /// condition, so it is never cached beside the candidate's pass as a verdict: a
+    /// policy as "the successor asks nothing" (`PolicyRead::Unread`), the `Info.plist`
+    /// as "no chunked grant" (`grant_chunks` an `Err`). The next attempt reads them
+    /// again.
     #[cfg(target_os = "macos")]
     fn admitted(
         policy: aterm_update_core::handoff_policy::PolicyRead,
@@ -914,19 +864,17 @@ pub fn preverify_staged_for_handoff(
 }
 
 /// Records that a staged build failed to become the running build, durably and
-/// visibly to `aterm-ctl update status`. The apply lane is the GUI's, but the
-/// ledger is this crate's, so the GUI reports outcomes here.
+/// visibly to `aterm ctl update status`. The apply lane is the GUI's, but the ledger
+/// is this crate's.
 ///
 /// `reason` should be the typed outcome (`ChildDied`, `AdoptionMismatch`,
 /// `ActivityRevoked`, `TimedOut`, `PreparationFailed`, `re-exec failed`): it decides
 /// between "the machine was too busy" and "these two builds cannot hand off".
-/// `target_build` names the artifact the attempt was trying to reach; see
-/// [`health::Health::apply_failures_for_target`].
+/// `target_build` names the artifact the attempt was trying to reach.
 ///
-/// Returns what it just wrote, so a surface can report the first failure without
-/// waiting for a later re-read. `None` means nothing was recorded (no staging
-/// root), never "zero failures". Best-effort: observability never blocks or fails
-/// an update.
+/// Returns what it wrote, so a surface can report the first failure without a
+/// re-read; `None` means nothing was recorded (no staging root), never "zero
+/// failures". Best-effort: observability never blocks or fails an update.
 #[cfg(target_os = "macos")]
 pub fn record_apply_failure(
     current_build: u64,
@@ -960,7 +908,7 @@ pub fn record_apply_failure(
 /// make it report a different streak.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecordedApplyFailure {
-    /// The ESCALATION streak after this write (`UpdateStatus::failing_applies`).
+    /// The escalation streak after this write (`UpdateStatus::failing_applies`).
     pub apply_failures: u32,
     /// Consecutive failures of [`Self::target_build`] after this write.
     pub failures_for_target: u32,
@@ -976,14 +924,11 @@ pub struct RecordedApplyFailure {
 /// Records that an apply was refused (blocked, deferred or held) rather than
 /// attempted and failed.
 ///
-/// Refusals stay out of the failure streaks (a busy terminal must not escalate),
-/// but they must be observable: this writes the reason to the health ledger
-/// ([`apply_lane_report`], the control socket's `apply_refusal=`) and stops the
-/// status outcome advertising the stage as though nothing had tried to apply it.
-///
-/// `reason` must name what refused and why. Best-effort and request-rate only (it
-/// takes the ledger lock and writes two small files): explicit apply requests and
-/// terminal verdicts, never a per-frame or per-poll path.
+/// Refusals stay out of the failure streaks (a busy terminal must not escalate) but
+/// stay observable: this writes the reason to the health ledger ([`apply_lane_report`],
+/// the control socket's `apply_refusal=`) and stops the status outcome advertising
+/// the stage as untried. `reason` names what refused and why. Request-rate only (it
+/// takes the ledger lock and writes two small files), never per-frame or per-poll.
 #[cfg(target_os = "macos")]
 pub fn record_apply_refusal(current_build: u64, reason: &str) {
     let Some(staging) = paths::Staging::resolve() else {
@@ -1020,8 +965,7 @@ pub fn record_apply_refusal(_current_build: u64, _reason: &str) {}
 /// What the ledger knows about the seamless handoff's freeze: the last timed dry
 /// run of the park's capture (taken while a successor booted, over how many
 /// sessions, the first freeze rung it seeded, the build that took it) and the last
-/// landed park's real cost. See [`health::Health::handoff_capture_us`] and
-/// `handoff_park_us`.
+/// landed park's real cost.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HandoffCaptureRecord {
     /// The dry run's capture, in microseconds (0 when only a park was kept).
@@ -1134,7 +1078,7 @@ pub struct ApplyLaneReport {
     pub last_failure_target_build: u64,
     /// See [`Self::last_failure_target_build`].
     pub failures_for_target: u32,
-    /// Reason of the most recent apply REFUSAL — a verdict that stopped an apply
+    /// Reason of the most recent apply refusal: a verdict that stopped an apply
     /// before it could fail. Empty once an apply succeeds or hard-fails.
     pub last_refusal: String,
     /// RFC3339 UTC of [`Self::last_refusal`]; empty when there is none.
@@ -1244,18 +1188,16 @@ pub fn confirm_boot_health_exact(
     install::confirm_boot_health(current_build, Some(current_commit), witness)
 }
 
-/// A terminal session of this executable is starting (an interactive launch): on
-/// Linux it counts against a replaced executable's trial, as a window's launch does
-/// ([`apply_staged_if_ready_preserving_fds_exact`]), and returns whether this launch
-/// is a start of that trial; the caller then confirms it with
-/// [`confirm_linux_session`] once the session proves healthy (its shell's first
-/// output; staying up silent proves nothing), so a terminal-only copy can
-/// confirm an update. `false` elsewhere, and on Linux when there is nothing to
-/// prove: no trial, a confirmed one, or a process running some other file.
+/// A terminal session of this executable is starting (an interactive launch). On
+/// Linux it counts against a replaced executable's trial, as a window's launch does,
+/// and returns whether this launch is a start of that trial; the caller then confirms
+/// it with [`confirm_linux_session`] once the session proves healthy (its shell's
+/// first output; staying up silent proves nothing), so a terminal-only copy can
+/// confirm an update. `false` elsewhere, and when there is nothing to prove.
 ///
 /// A `--headless` GUI instance starts through here instead of the boot apply: it
-/// opens no window, so it proves what a session proves, and its
-/// [`confirm_boot_health_exact`] confirms the session lane, never the window's.
+/// opens no window, so its [`confirm_boot_health_exact`] confirms the session lane,
+/// never the window's.
 #[must_use]
 pub fn linux_session_started(_current_build: u64, _current_commit: &str) -> bool {
     #[cfg(target_os = "linux")]
@@ -1269,28 +1211,24 @@ pub fn linux_session_started(_current_build: u64, _current_commit: &str) -> bool
 }
 
 /// How long a terminal session that counted a start of a replaced Linux executable's
-/// trial waits for its shell's first output before it defers the trial's verdict
-/// ([`defer_linux_session_verdict`]): half the window in which a start may still
-/// confirm itself (`linux_trial::START_SETTLES_SECS`, 20 s; a test pins the half), so
-/// the move has the other half to land in: a try that finds the update lock held (a
-/// sibling's start hashing the executable) is tried again every second until it lands,
-/// the stamp it moves settles, or the shell speaks.
+/// trial waits for its shell's first output before deferring the trial's verdict
+/// ([`defer_linux_session_verdict`]): half of `linux_trial::START_SETTLES_SECS` (20 s;
+/// a test pins the half), leaving the other half for the move to land, retried every
+/// second while a sibling's start holds the update lock.
 pub const LINUX_SESSION_SILENT_DEFER: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// A terminal session [`linux_session_started`] counted as one of a pending trial's
-/// starts has been up for [`LINUX_SESSION_SILENT_DEFER`] and its shell has printed
-/// nothing yet: on Linux, move the trial's stamp forward ONCE, if this start's is still
-/// the one the trial holds, so the next start over the budget (a tab opened before the
-/// first prompt) is judged against the move rather than rolling a slow-starting healthy
-/// build back for good. It confirms NOTHING: a build that hangs before its shell speaks
-/// is rolled back one window later, and only the shell's first output confirms
-/// ([`confirm_linux_session`]). `true` when it moved; `false` everywhere else.
+/// A session [`linux_session_started`] counted as a pending trial's start has been up
+/// for [`LINUX_SESSION_SILENT_DEFER`] with a silent shell: on Linux, move the trial's
+/// stamp forward once, if this start's is still the one the trial holds, so the next
+/// start over the budget (a tab opened before the first prompt) is judged against the
+/// move instead of rolling a slow-starting healthy build back. It confirms nothing: a
+/// build that hangs before its shell speaks is rolled back one window later, and only
+/// the shell's first output confirms ([`confirm_linux_session`]). `true` when it
+/// moved; `false` everywhere else.
 ///
-/// A try that did not land (the update lock busy past its half second, a read that
-/// failed) is tried again after `pause(span)`, which waits `span` and answers `false`
-/// to stop — once the shell has spoken — until the stamp the move would move is no
-/// longer young (a single try, lost to a sibling's hash of the executable, would
-/// leave the burst to be rolled back after all).
+/// A try that did not land (the update lock busy past its half second, a failed read)
+/// is retried after `pause(span)`, which waits `span` and answers `false` to stop
+/// (once the shell has spoken), until the stamp is no longer young.
 #[must_use]
 pub fn defer_linux_session_verdict(
     _current_build: u64,
@@ -1307,25 +1245,22 @@ pub fn defer_linux_session_verdict(
     }
 }
 
-/// Read, now, the path of the executable this process runs, which the Linux update
-/// lane keeps for the life of the process. The GUI entry calls it where the boot apply
-/// ([`apply_staged_if_ready_preserving_fds_exact`]) would have read it, for a launch
-/// whose start is counted only later ([`linux_window_opened`]): read first after a
-/// sibling aterm replaced the executable, the path names the unlinked file
-/// (`<path> (deleted)`), and the process then runs no background check and reports
-/// only that refusal until it exits. A no-op off Linux, and after the first read.
+/// Reads now the path of the executable this process runs, which the Linux update
+/// lane keeps for the life of the process. The GUI entry calls it where the boot
+/// apply would have, for a launch whose start is counted later
+/// ([`linux_window_opened`]): first read after a sibling replaced the executable,
+/// the path would name the unlinked file (`<path> (deleted)`) and the process would
+/// run no background check. A no-op off Linux, and after the first read.
 pub fn linux_capture_executable() {
     #[cfg(target_os = "linux")]
     linux::capture_context();
 }
 
-/// A WINDOWED Linux launch has opened its display (its event loop is built): count
-/// it against a replaced executable's trial, as the boot apply
-/// ([`apply_staged_if_ready_preserving_fds_exact`]) counts a launch whose display
-/// answered before it opened. The GUI entry calls it for a launch whose display it
-/// could not vouch for beforehand (an `ssh -X` forward, or nothing answering where
-/// the window will connect), so a launch that cannot open a display is no start of
-/// the trial and a forwarded display that opens still is. `NotApplicable` off Linux.
+/// A windowed Linux launch has opened its display (its event loop is built): count
+/// it against a replaced executable's trial, as the boot apply counts a launch whose
+/// display answered beforehand. The GUI entry calls it for a launch whose display it
+/// could not vouch for (an `ssh -X` forward, nothing answering yet), so a launch that
+/// cannot open a display is no start of the trial. `NotApplicable` off Linux.
 #[must_use]
 pub fn linux_window_opened(_current_build: u64, _current_commit: &str) -> ApplyOutcome {
     #[cfg(target_os = "linux")]
@@ -1417,8 +1352,8 @@ pub struct InstalledUpdateFacts {
 /// absence of proof is not proof the installed bundle changed.
 #[cfg(target_os = "macos")]
 pub fn installed_update_facts_checked() -> Result<Option<InstalledUpdateFacts>, String> {
-    // Pure observation — a dev-marked build's provenance is no less true, so report
-    // it rather than blanking the panel. See `bundle::resolve_layout`.
+    // Pure observation: a dev-marked build's provenance is no less true, so report
+    // it rather than blanking the panel.
     let Some(installed) = bundle::resolve_layout() else {
         return Ok(None);
     };
@@ -1489,18 +1424,15 @@ fn installed_announcement_due(
 }
 
 /// The activation pre-verify: before the GUI parks a reader to hand off to a newer
-/// build already at its own bundle path (installed by another producer: the release
-/// cutter, a user dragging a new `.app` over the old one, a sibling aterm's swap),
-/// proves that bundle is exactly what the reducer authorized: a non-symlink
-/// directory that passes the complete codesign policy, whose sealed build and commit
-/// equal `expected_build` / `expected_commit`, and whose build is strictly newer
-/// than the running one. Anything else refuses, so a bundle swapped again before
-/// the handoff is caught before the terminal is touched. Runs on the handoff
-/// worker, never the event loop.
+/// build already at its own bundle path (installed by the release cutter, a person
+/// dragging a new `.app` over the old one, or a sibling aterm's swap), proves that
+/// bundle is exactly what the reducer authorized: a non-symlink directory that passes
+/// the complete codesign policy, whose sealed build and commit equal `expected_build`
+/// / `expected_commit`, and whose build is strictly newer than the running one.
+/// Anything else refuses, so a bundle swapped again before the handoff is caught
+/// before the terminal is touched. Runs on the handoff worker, never the event loop.
 ///
-/// `Ok` carries that bundle's handoff policy file
-/// ([`aterm_update_core::handoff_policy`]) and chunked-grant declaration
-/// ([`HandoffCandidateFacts`]), read only once every check has passed.
+/// `Ok` carries [`HandoffCandidateFacts`], read only once every check has passed.
 #[cfg(target_os = "macos")]
 pub fn preverify_installed_for_handoff(
     current_build: u64,
@@ -1523,12 +1455,11 @@ pub fn preverify_installed_for_handoff(
 /// [`preverify_installed_at`] under `staging`'s apply lock (bounded, like the staged
 /// lane's check), with the operator floor read under it.
 ///
-/// A sibling aterm's staged swap renames a new bundle onto this path while holding
-/// that lock; unlocked, it could land between the codesign check and the policy
-/// read, caching the replacement's policy under the verified bundle's identity.
-/// Under the lock a swap happens wholly before the check or wholly after the read.
-/// (A bundle dragged over by hand takes no lock; the swap-time gate catches that.)
-/// No staging root means no sibling can be swapping, so no lock.
+/// A sibling aterm's staged swap renames a new bundle onto this path under that lock;
+/// unlocked, it could land between the codesign check and the policy read, caching
+/// the replacement's policy under the verified bundle's identity. (A bundle dragged
+/// over by hand takes no lock; the swap-time gate catches that.) No staging root
+/// means no sibling can be swapping, so no lock.
 #[cfg(target_os = "macos")]
 fn preverify_installed_locked<R>(
     staging: Option<&paths::Staging>,
@@ -1569,8 +1500,7 @@ fn preverify_installed_at<R>(
     read_policy: &dyn Fn(&std::path::Path) -> R,
 ) -> Result<R, String> {
     let (build, commit) = install::verified_bundle_identity_at(app_root)?;
-    // The operator apply floor (a yank) gates an activation exactly as it gates a
-    // staged swap (`install.rs`).
+    // The operator apply floor (a yank) gates an activation as it gates a staged swap.
     if build < floor_min_build {
         return Err(format!(
             "installed bundle build {build} is below the operator apply floor \
@@ -1593,7 +1523,7 @@ fn preverify_installed_at<R>(
         ));
     }
     // Every refusal returned above: the policy is read from a bundle that passed
-    // its codesign policy and IS the authorized successor, or not at all.
+    // its codesign policy and is the authorized successor, or not at all.
     Ok(read_policy(app_root))
 }
 
@@ -1602,11 +1532,9 @@ fn preverify_installed_at<R>(
 /// process commits it (never, if the candidate is rejected and exits).
 ///
 /// It gates only [`health::Health::expire_stale_apply_streak`]: a candidate's own
-/// background check must not expire the apply streak its own attempt is about to
-/// add to, or `failing_applies` could never pass 1 and reach the persistent
-/// verdict. Scoped to the candidate so an ordinary launch (headless, `--version`,
-/// a session that never presents a frame) still heals a stale streak on its first
-/// check.
+/// background check must not expire the apply streak its own attempt is about to add
+/// to, or `failing_applies` could never pass 1. An ordinary launch still heals a
+/// stale streak on its first check.
 static UNCOMMITTED_CANDIDATE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1625,9 +1553,8 @@ pub fn is_uncommitted_handoff_candidate() -> bool {
 /// Blocks the calling background thread while this process is an uncommitted
 /// handoff candidate, up to `bound`; `true` when it waited at all. The outgoing
 /// process may still reject it, so nothing it does before Commit may reach the
-/// network, the store or the ledger. Polled every 50 ms: the flag is cleared on the
-/// main thread at `Wake::ActivateCommittedHandoff`. The bound outlasts the late
-/// park's grant budget so a candidate its parent never answered cannot spin.
+/// network, the store or the ledger. Polls every 50 ms; the main thread clears the
+/// flag at `Wake::ActivateCommittedHandoff`.
 pub fn wait_while_uncommitted_handoff_candidate(bound: std::time::Duration) -> bool {
     let started = std::time::Instant::now();
     let mut waited = false;
@@ -1668,15 +1595,14 @@ pub fn trial_launch_count(_build: u64) -> u32 {
 }
 
 /// A successor of `build` leaving by rule (its parent closed the rendezvous, or it
-/// refused the handoff before the transfer) gives back the boot-trial launch this
-/// process counted at boot, if any and not yet given back: it did not fail the
-/// build, and three such exits must not revert a healthy build. Named by this
-/// process's pid and kernel birth stamp ([`aterm_update_core::LaunchName`]), so
-/// neither an earlier kept launch nor a sibling window's launch of the same trial
-/// is taken for it, and the parent settling the same death
-/// ([`forgive_trial_launch_of`]) gives back nothing more. `true` when a launch was
-/// given back, or owed back to the next holder of the apply lock when another aterm
-/// held it past the wait.
+/// refused the handoff before the transfer) gives back the boot-trial launch it
+/// counted at boot, if not given back yet: it did not fail the build, and three such
+/// exits must not revert a healthy build. Named by pid and kernel birth stamp
+/// ([`aterm_update_core::LaunchName`]), so neither an earlier kept launch nor a
+/// sibling window's launch of the same trial is taken for it, and the parent settling
+/// the same death ([`forgive_trial_launch_of`]) gives back nothing more. `true` when a
+/// launch was given back, or owed to the next holder of the apply lock when another
+/// aterm held it past the wait.
 #[cfg(target_os = "macos")]
 pub fn forgive_own_trial_launch(build: u64) -> bool {
     install::forgive_own_trial_launch(build)
@@ -1692,19 +1618,18 @@ pub fn forgive_own_trial_launch(_build: u64) -> bool {
 /// candidate counted (process `pid`, born at `started`, the kernel's
 /// `pbi_start_tvsec`/`pbi_start_tvusec`, else named by pid alone), because the
 /// candidate did not fail the build: the parent ended it for its own reason
-/// (readiness deadline, user activity, proof mismatch, a session closing), or it
-/// died in a way that is no evidence against the bytes. Left counted, bounded
-/// automatic re-attempts would walk a healthy build to `MAX_BOOT_ATTEMPTS`. Runs on
-/// the handoff worker after the reap, under the apply lock like
-/// `check_boot_health`; a lock another aterm holds past the wait leaves the
-/// give-back OWED, and the next holder of the lock pays it before it reads the
-/// count. Best-effort: nothing here can fail an apply.
+/// (readiness deadline, user activity, proof mismatch, a session closing), or it died
+/// in a way that is no evidence against the bytes. Left counted, automatic
+/// re-attempts would walk a healthy build to `MAX_BOOT_ATTEMPTS`. Runs on the handoff
+/// worker after the reap, under the apply lock; a lock another aterm holds past the
+/// wait leaves the give-back owed, and the next holder pays it before reading the
+/// count. Best-effort.
 ///
 /// By name, never by the count's movement: several windows' launches of one trial
-/// overlap, so a count delta could erase an earlier kept launch (the crash signal)
-/// or skip the candidate's own. A candidate never counted, or one that gave its
-/// launch back itself ([`forgive_own_trial_launch`]), gives nothing back here.
-/// `true` when a launch was given back, or owed back.
+/// overlap, so a count delta could erase an earlier kept launch (the crash signal) or
+/// skip the candidate's own. A candidate never counted, or one that gave its launch
+/// back itself ([`forgive_own_trial_launch`]), gives nothing back here. `true` when a
+/// launch was given back, or owed back.
 #[cfg(target_os = "macos")]
 pub fn forgive_trial_launch_of(target_build: u64, pid: u32, started: Option<(u64, u64)>) -> bool {
     // A stamp that does not fit is no stamp: the pid alone names the launch.
@@ -1750,17 +1675,15 @@ pub fn read_launch_stamp(stamp: &std::path::Path) -> Option<aterm_update_core::L
     install::read_trial_launch_stamp(stamp)
 }
 
-/// Gives back the counted launch of `target_build` that the launched successor
-/// named in its stamp at `stamp` ([`stamp_trial_launch`]): the successor
-/// LaunchServices reported terminated before it checked in, with no pid. The
-/// by-pid counterpart is [`forgive_trial_launch_of`]. `true` when a launch was
+/// Gives back the counted launch of `target_build` that the launched successor named
+/// in its stamp at `stamp` ([`stamp_trial_launch`]): the successor LaunchServices
+/// reported terminated before it checked in, with no pid. `true` when a launch was
 /// given back, or owed back.
 ///
 /// By the stamped name, never a guess: the newest launch without a live process may
-/// be a sibling's crash the trial must keep. A candidate that counted nothing or
-/// gave its launch back ([`forgive_own_trial_launch`]) stamped a name that is not
-/// on the line, so nothing is given back; nor for no stamp, a torn one, or a launch
-/// the kernel would not name.
+/// be a sibling's crash the trial must keep. Nothing is given back for a candidate
+/// that counted nothing or already gave its launch back, for no stamp, a torn one, or
+/// a launch the kernel would not name.
 #[cfg(target_os = "macos")]
 pub fn forgive_stamped_trial_launch(target_build: u64, stamp: &std::path::Path) -> bool {
     install::forgive_stamped_trial_launch(target_build, stamp)
@@ -1794,10 +1717,8 @@ pub struct SupersededActivation {
     pub trial_launches: u32,
     /// `Some(why)` when the exchange happened (the running build is back at the
     /// install path) but the activation's boot trial could not be disarmed. Still a
-    /// retire, not a refusal: `recover_abandoned_preswap_trial_if_exact` finishes
-    /// that crash cut on the next boot apply, which the newer build's candidate
-    /// runs before it swaps anything, and the lane stages the newer build as after
-    /// a clean retire.
+    /// retire: `recover_abandoned_preswap_trial_if_exact` finishes it on the next boot
+    /// apply, which the newer build's candidate runs before it swaps anything.
     pub trial_disarm_deferred: Option<String>,
 }
 

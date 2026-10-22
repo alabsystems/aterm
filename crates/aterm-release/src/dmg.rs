@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// `ditto`'s switches for a PKZip archive of bytes alone: no resource forks or HFS
-/// metadata, no extended attributes, no ACLs, no quarantine (the set `DITTONORSRC`
-/// stands for, spelled out so nothing in the environment can turn one back on).
+/// metadata, extended attributes, ACLs or quarantine (`DITTONORSRC` spelled out, so the
+/// environment cannot turn one back on).
 pub const ARCHIVE_NO_METADATA: [&str; 4] = ["--norsrc", "--noextattr", "--noacl", "--noqtn"];
 
 /// A packaged artifact (DMG or zip): the release asset path, its byte digest (manifest
@@ -60,8 +60,8 @@ pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Package
 
     // Stage the app and an /Applications symlink (the drag-to-install gesture) under
     // dist/, on the same filesystem, removed on every exit path. The dot-name keeps the
-    // stage out of Spotlight (MEASURED: a `.metadata_never_index` marker is inert, by
-    // atpkg's since-deleted noindex probe).
+    // stage out of Spotlight (a `.metadata_never_index` marker is inert;
+    // crates/atpkg/src/noindex.rs).
     let stage = out_dir.join(format!(".dmg-stage-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage).map_err(|e| format!("create {}: {e}", stage.display()))?;
@@ -241,8 +241,8 @@ fn build_in_stage(_app: &Path, _stage: &Path, _volname: &str, _dmg: &Path) -> Re
     Err("DMG creation requires macOS (hdiutil); build releases on a Mac".into())
 }
 
-/// Streaming in-process SHA-256 → lowercase hex. Public: the publish
-/// self-check re-hashes assets through the same code path.
+/// Streaming in-process SHA-256 as lowercase hex; the publish self-check re-hashes
+/// assets through it too.
 pub fn sha256_file(path: &Path) -> Result<String, String> {
     use aterm_digest::Sha256;
     use std::io::Read;

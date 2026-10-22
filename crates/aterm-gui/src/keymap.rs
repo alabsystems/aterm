@@ -741,9 +741,7 @@ fn windows_composed_text(
     }
 }
 
-/// The layout-BASE key of a press, for the Ctrl+Alt rescue in
-/// [`windows_key_input`]. Windows implements `KeyEventExtModifierSupplement`
-/// (macOS and the Linux backends use it as their whole encode path).
+/// The layout base key of a press, for the Ctrl+Alt rescue in [`windows_key_input`].
 #[cfg(windows)]
 fn key_without_modifiers(ev: &KeyEvent) -> WinitKey {
     use aterm_window::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -1036,9 +1034,8 @@ mod tests {
         assert_eq!(bytes, b"@", "Shift+2 must emit '@', not '2'");
     }
 
-    /// The Windows lock-state query returns ONLY the two lock bits (whatever
-    /// the host's live toggle state is — a real GetKeyState round-trip, callable
-    /// without a window or event loop).
+    /// The Windows lock-state query (a real `GetKeyState` round-trip) returns only
+    /// the two lock bits.
     #[cfg(windows)]
     #[test]
     fn lock_modifiers_reports_only_lock_bits() {
@@ -1492,10 +1489,9 @@ mod tests {
         assert!(build_key_input(&kp, Modifiers::empty(), false).is_some());
     }
 
-    /// The macOS lock-state query is a real IOKit HID round-trip (kernel, never
-    /// WindowServer — see `hid_lock_state`), callable without a window or event
-    /// loop, and reports ONLY Caps Lock (macOS has no Num Lock). It is allowed
-    /// to find the HID system unreachable (a sandbox) — then it reports nothing.
+    /// The macOS lock-state query is a real IOKit HID round-trip (kernel only, see
+    /// `hid_lock_state`) and reports only Caps Lock, or nothing when the HID system
+    /// is unreachable (a sandbox).
     #[cfg(target_os = "macos")]
     #[test]
     fn lock_modifiers_reports_only_caps_lock_from_the_hid_system() {
@@ -1518,9 +1514,8 @@ mod tests {
         assert!(m.contains(Modifiers::SUPER));
     }
 
-    /// IME-1: a committed composition is encoded as ordinary text through the
-    /// engine (each char a `Character` key), NOT a raw `& 0x1f` byte. ASCII
-    /// commits round-trip to their bytes; multi-byte CJK to their UTF-8.
+    /// A committed composition is encoded as ordinary text: ASCII to its bytes, CJK
+    /// to its UTF-8.
     #[test]
     fn commit_sends_committed_text() {
         // ASCII commit (e.g. an accented dead-key result reduced to ASCII).
@@ -2111,10 +2106,8 @@ mod tests {
         );
     }
 
-    /// Bug hunt 8: Ctrl on a Cyrillic layout. AppKit's base key for the C key
-    /// is 'с' (U+0441), which has no control byte, so Ctrl+С wrote 'с' and
-    /// could not interrupt; the physical key's US letter names the byte.
-    /// Kitty keeps reporting the layout's key.
+    /// Ctrl on a Cyrillic layout: the base key 'с' has no control byte, so the
+    /// physical key's US letter names it; kitty keeps reporting the layout's key.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn ctrl_on_a_cyrillic_layout_sends_the_control_byte() {

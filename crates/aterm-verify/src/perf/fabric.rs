@@ -25,10 +25,14 @@
 //!
 //! `--pingpong-rounds N` sizes the ping-pong arm (A posts, B replies on
 //! receipt, back to back): its round trip, each reply's wait for the commit of
-//! the delivery it answers, and the share of the window the bridge's loop spent
-//! blocked on broker replies, which the bridge counts itself (its wait-tally
-//! development seam, `aterm_link::wait_tally`, set in that arm's world alone).
-//! Every tier arm runs it beside the latency, burst and attach phases.
+//! the delivery it answers, and where the bridge's loop spent the window — the broker,
+//! the verb lane, the state dir, its park and its wakes — which the bridge
+//! counts itself (its wait-tally development seam, `aterm_link::wait_tally`
+//! v=2, set in that arm's world alone), and a paced sub-phase on an idle loop.
+//! `--bystanders N` spawns N idle sessions beside the messaging and ping-pong
+//! worlds' two, so the walks over every session carry them.
+//! Every tier arm runs all scenarios unless `--scenario` selects only
+//! messaging, pingpong, attach or handoff. Unselected scenarios never start.
 //!
 //! `--durability strict,ordered,relaxed` names the ARMS, each one bench run
 //! and one ledger entry on the one build: the bench opens its broker with
@@ -166,6 +170,8 @@ impl Arm {
 /// leaves the bench's default (`crates/aterm/tests/fabric_bench/spec.rs`).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Args {
+    /// The scenarios measured (`--scenario`), all unless named.
+    pub scenario: bench_spec::Scenario,
     pub samples: Option<u32>,
     pub burst: Option<u32>,
     /// The ping-pong arm's measured round trips (`--pingpong-rounds`).
@@ -193,6 +199,9 @@ pub(crate) struct Args {
     /// `--retention-interval-ms N`: the retaining broker's tick interval;
     /// `None` leaves astream's minute (what ships).
     pub retention_interval_ms: Option<u64>,
+    /// `--bystanders N`: idle sessions spawned beside the messaging and
+    /// ping-pong worlds' two; `None` leaves the bench's default, none.
+    pub bystanders: Option<u32>,
 }
 
 fn positive(flag: &str, raw: &str) -> Result<u32, String> {
@@ -222,6 +231,11 @@ impl Args {
         let mut horizons: Vec<u64> = Vec::new();
         for (flag, raw) in options {
             match *flag {
+                "--scenario" => {
+                    a.scenario = bench_spec::Scenario::parse(raw).map_err(|_| {
+                        format!("`--scenario` takes all, messaging, pingpong, attach or handoff, not `{raw}`")
+                    })?;
+                }
                 "--latency-samples" => a.samples = Some(positive(flag, raw)?),
                 "--burst" => a.burst = Some(positive(flag, raw)?),
                 "--pingpong-rounds" => a.pingpong = Some(positive(flag, raw)?),
@@ -279,6 +293,11 @@ impl Args {
                 }
                 "--retention-interval-ms" => {
                     a.retention_interval_ms = Some(u64::from(positive(flag, raw)?));
+                }
+                "--bystanders" => {
+                    a.bystanders = Some(raw.parse::<u32>().map_err(|_| {
+                        format!("`{flag}` needs a non-negative integer, got `{raw}`")
+                    })?);
                 }
                 // The run's switch, which `super::main` reads; it names every
                 // lane, so every lane's parser is handed it.
@@ -351,6 +370,9 @@ impl Args {
     /// Pure (unit-tested).
     pub(crate) fn bench_words(&self, out: &Path, arm: Arm) -> String {
         let mut words = vec![format!("out={}", out.display())];
+        if self.scenario != bench_spec::Scenario::All {
+            words.push(format!("scenario={}", self.scenario.word()));
+        }
         if let Some(n) = self.samples {
             words.push(format!("samples={n}"));
         }
@@ -376,6 +398,9 @@ impl Args {
         if let Some(ms) = self.retention_interval_ms {
             words.push(format!("retention_interval_ms={ms}"));
         }
+        if let Some(n) = self.bystanders {
+            words.push(format!("bystanders={n}"));
+        }
         words.extend(arm.words());
         words.join(" ")
     }
@@ -384,6 +409,9 @@ impl Args {
     /// its ledger entry.
     pub(crate) fn command_line(&self, arm: Arm) -> String {
         let mut line = String::from("targo --unverified verify perf fabric");
+        if self.scenario != bench_spec::Scenario::All {
+            line.push_str(&format!(" --scenario {}", self.scenario.word()));
+        }
         // The default arm is left unsaid, so a dev entry reads exactly as every
         // entry before the opt arm did.
         if self.profile != Profile::Dev {
@@ -413,6 +441,9 @@ impl Args {
         }
         if let Some(ms) = self.retention_interval_ms {
             line.push_str(&format!(" --retention-interval-ms {ms}"));
+        }
+        if let Some(n) = self.bystanders {
+            line.push_str(&format!(" --bystanders {n}"));
         }
         line.push_str(&arm.flags());
         line
@@ -632,6 +663,12 @@ fn run_arm(
             profile.name()
         )));
     }
+    if report.get("scenario").and_then(aterm_json::Value::as_str) != Some(args.scenario.word()) {
+        return Err(Halt::Fail(format!(
+            "the fabric bench did not report the requested scenario `{}`; no ledger entry was written",
+            args.scenario.word()
+        )));
+    }
     // The entry's JSON carries what the lane read about the build, beside the
     // bench's own words for the arm.
     if let Some(fields) = report.as_object_mut() {
@@ -644,6 +681,7 @@ fn run_arm(
 
     let date = super::trend::utc_date();
     let header = Provenance {
+        scenario: args.scenario,
         date: &date,
         machine: &arena::chip(),
         macos: &arena::macos_version(),
@@ -1011,6 +1049,7 @@ fn cpus() -> String {
 
 /// What a ledger entry records about the run beside its numbers.
 struct Provenance<'a> {
+    scenario: bench_spec::Scenario,
     date: &'a str,
     machine: &'a str,
     macos: &'a str,
@@ -1029,11 +1068,15 @@ struct Provenance<'a> {
 impl Provenance<'_> {
     /// The entry's head. Pure (unit-tested).
     fn render(&self) -> String {
+        let scenarios = match self.scenario {
+            bench_spec::Scenario::All => "post -> deliver, burst, ping-pong, attach",
+            selected => selected.word(),
+        };
         format!(
             "<!-- SPDX-License-Identifier: Apache-2.0 -->\n\
              <!-- Copyright 2026 Andrew Yates -->\n\
              \n\
-             # Fabric: post -> deliver, burst, ping-pong, attach — {date}\n\
+             # Fabric: {scenarios} — {date}\n\
              \n\
              Protocol: `docs/measured/fabric/README.md`. MEASURED, not judged. Append-only: a \
              superseding run gets a new file.\n\
@@ -1075,6 +1118,7 @@ mod tests {
         o.insert("--attach-sessions", "1,4,16".to_string());
         o.insert("--no-windows", String::new());
         let a = Args::from_options(&o).expect("parses");
+        assert_eq!(a.scenario, bench_spec::Scenario::All);
         assert_eq!(a.samples, Some(50));
         assert_eq!(a.attach, Some(vec![1, 4, 16]));
         // No tier named: the one arm aterm ships, NAMED in the bench's words
@@ -1137,6 +1181,26 @@ mod tests {
                 .bench_words(Path::new("/s"), shipped),
             "out=/s durability=ordered horizon_ms=100"
         );
+        for word in ["all", "messaging", "pingpong", "attach", "handoff"] {
+            let mut selected = BTreeMap::new();
+            selected.insert("--scenario", word.to_string());
+            let a = Args::from_options(&selected).expect(word);
+            let spec =
+                bench_spec::parse(&a.bench_words(Path::new("/s"), shipped)).expect("bench words");
+            assert_eq!(spec.scenario.word(), word);
+            if word == "all" {
+                assert_eq!(
+                    a.bench_words(Path::new("/s"), shipped),
+                    "out=/s durability=ordered horizon_ms=100"
+                );
+                assert!(!a.command_line(shipped).contains("--scenario"));
+            } else {
+                assert!(
+                    a.command_line(shipped)
+                        .contains(&format!(" --scenario {word} "))
+                );
+            }
+        }
         // Refused here, before any build: what does not parse, and what the
         // bench's own grammar refuses (past one instance's capacity, a list
         // that does not rise, a tier it does not know).
@@ -1155,6 +1219,10 @@ mod tests {
             ("--durability", "strict,,relaxed"),
             ("--horizon-ms", "100"),
             ("--passes", "0"),
+            ("--scenario", ""),
+            ("--scenario", "Pingpong"),
+            ("--scenario", "pingpong,attach"),
+            ("--scenario", "unknown"),
         ] {
             let mut o = BTreeMap::new();
             o.insert(flag, bad.to_string());
@@ -1220,6 +1288,39 @@ mod tests {
             let o: BTreeMap<&'static str, String> =
                 pairs.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
             assert!(Args::from_options(&o).is_err(), "{pairs:?}");
+        }
+    }
+
+    /// `--bystanders N` (B10) reaches the bench's words and the entry's
+    /// reproducing line only when given, 0 included; the bench's own grammar
+    /// refuses a count past what one instance carries.
+    #[test]
+    fn the_bystanders_reach_the_bench_and_the_ledger() {
+        let shipped = Arm::shipped();
+        for n in ["0", "64"] {
+            let mut o = BTreeMap::new();
+            o.insert("--bystanders", n.to_string());
+            let a = Args::from_options(&o).expect("parses");
+            assert_eq!(
+                a.bench_words(Path::new("/s"), shipped),
+                format!("out=/s bystanders={n} durability=ordered horizon_ms=100")
+            );
+            assert!(
+                a.command_line(shipped)
+                    .contains(&format!(" --bystanders {n} ")),
+                "{}",
+                a.command_line(shipped)
+            );
+        }
+        let a = Args::from_options(&BTreeMap::new()).expect("bare");
+        assert!(
+            !a.bench_words(Path::new("/s"), shipped)
+                .contains("bystanders")
+        );
+        for bad in ["-1", "many", "999"] {
+            let mut o = BTreeMap::new();
+            o.insert("--bystanders", bad.to_string());
+            assert!(Args::from_options(&o).is_err(), "{bad}");
         }
     }
 
@@ -1451,6 +1552,7 @@ mod tests {
     #[test]
     fn the_entry_head_carries_every_provenance_field() {
         let p = Provenance {
+            scenario: bench_spec::Scenario::All,
             date: "2026-10-16",
             machine: "Apple M5 Max",
             macos: "27.0",

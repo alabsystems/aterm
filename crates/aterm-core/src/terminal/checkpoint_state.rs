@@ -11,14 +11,13 @@
 //!   The XTPUSHCOLORS stack travels as [`ColorOverridesRepr`] diffs too, so a
 //!   pop after the handoff also lands on the new theme.
 //! * [`ShellRepr`] carries the OSC 133/633 phase, the in-progress mark and
-//!   block, the still-readable completed marks and blocks, and the monotonic
-//!   counters observers key on. Rows are absolute and each grid's absolute row
-//!   counter is carried, so a mark names the same line after the handoff and a
-//!   command running across the update still completes on its D.
+//!   block, the completed ones still readable, and the monotonic counters
+//!   observers key on. Rows are absolute and each grid's absolute row counter
+//!   is carried, so a mark names the same line after the handoff and a command
+//!   running across the update still completes on its D.
 //! * [`TitleRepr`] carries the window title (OSC 0/2), the icon name (OSC 0/1)
-//!   and the XTWINOPS title stack (CSI 22/23 t). The successor treats a carried
-//!   title as OSC input ([`Terminal::restore_title`]): capped, stripped of
-//!   controls, the stack bounded.
+//!   and the XTWINOPS title stack (CSI 22/23 t), restored as OSC input
+//!   ([`Terminal::restore_title`]).
 
 use std::collections::VecDeque;
 

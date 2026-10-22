@@ -197,9 +197,8 @@ fn all_rule_rows_make_no_false_shift() {
     assert_eq!(a.gaps().count(), 0);
 }
 
-// An independent expression of the retained-row accounting policy. Layout's
-// padding calculation does not call the production charge/rounding helper, and
-// the header/slot sizes do not use ALT_ARCHIVE_ROW_OVERHEAD.
+// The retained-row charge computed independently of the production helper and
+// of ALT_ARCHIVE_ROW_OVERHEAD.
 fn expected_retained_row_charge(len: usize) -> usize {
     let padded_text = std::alloc::Layout::from_size_align(len, 16)
         .unwrap()

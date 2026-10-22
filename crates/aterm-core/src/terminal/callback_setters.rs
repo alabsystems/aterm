@@ -1,8 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Callback registration for `Terminal`: the `set_*_callback` methods,
-//! `resize()` and the resize offload.
+//! Callback registration for `Terminal` (the `set_*_callback` methods),
+//! `resize()`, the resize offload and the compression-worker hooks.
 
 use super::{ClipboardOperation, Terminal, types};
 #[cfg(any(test, target_os = "linux"))]
@@ -92,12 +92,11 @@ impl Terminal {
         }
     }
 
-    /// Lend each grid the DECSC slot that belongs to it (xterm `sc[0]` to the
-    /// primary-content grid, `sc[1]` to the alternate one) for a resize or an
-    /// offloaded re-attach, so the slot follows its text as the grid's own
-    /// cursor does ([`Grid::lend_saved_cursor`](crate::grid::Grid::lend_saved_cursor)).
-    /// The 1049 exit and DECRC then land on the cell after the saved output, not
-    /// on whatever the resize moved under the old coordinates.
+    /// Lend each grid its DECSC slot (xterm `sc[0]` to the primary-content
+    /// grid, `sc[1]` to the alternate) for a resize or an offloaded re-attach,
+    /// so the slot follows its text as the grid's own cursor does
+    /// ([`Grid::lend_saved_cursor`](crate::grid::Grid::lend_saved_cursor)): the
+    /// 1049 exit and DECRC then land on the cell after the saved output.
     fn lend_saved_cursors(&mut self) {
         let (active, inactive) = if self.modes.alternate_screen {
             (self.cursor_save.alt, self.cursor_save.main)
@@ -111,9 +110,8 @@ impl Terminal {
         }
     }
 
-    /// Take the lent slots back where the grids carried them
-    /// ([`Self::lend_saved_cursors`]). The rest of each slot (style, modes,
-    /// charset, pending wrap) is the host's and stays as saved.
+    /// Take the lent slots back where the grids carried them. The rest of each
+    /// slot (style, modes, charset, pending wrap) stays as saved.
     fn take_back_saved_cursors(&mut self) {
         let active = self.grid.take_lent_saved_cursor();
         let inactive = self
@@ -152,10 +150,9 @@ impl Terminal {
     }
 
     /// [`resize_offloading_scrollback`](Self::resize_offloading_scrollback) with
-    /// a seam policy, the offloaded twin of
-    /// [`resize_with_policy`](Self::resize_with_policy). Under
-    /// [`ResizePolicy::ConPty`] the re-attach does no deficit fill, so a conhost
-    /// repaint that arrives before the re-attach is never shifted.
+    /// a seam policy. Under [`ResizePolicy::ConPty`] the re-attach does no
+    /// deficit fill, so a conhost repaint that arrives before it is never
+    /// shifted.
     pub fn resize_offloading_scrollback_with_policy(
         &mut self,
         rows: u16,
@@ -333,9 +330,8 @@ impl Terminal {
     }
 
     /// Shared post-resize side effects: the resize journal entry, selection
-    /// handling, the DEC 2048 in-band size report and the debug invariant check.
-    /// `cols_changed`, `rows_before` and `origin` are captured by the caller
-    /// before the resize.
+    /// handling, the DEC 2048 size report and the debug invariant check. The
+    /// arguments are captured before the resize.
     fn finalize_resize(
         &mut self,
         cols_changed: bool,
@@ -358,10 +354,10 @@ impl Terminal {
             // A width change never keeps a grid resize undo, so none is open.
             self.resize_undo_selection = None;
             self.text_selection.clear();
-            // The parked selection's grid was rewrapped too. Cleared
-            // unconditionally because `finish_resize_offload` /
-            // `abort_resize_offload` later mutate that grid's scrollback with no
-            // selection call; sound only while the offload path is width-only.
+            // The parked selection's grid was rewrapped too. Cleared outright:
+            // `finish_resize_offload`/`abort_resize_offload` later change that
+            // grid's scrollback with no selection call (sound only while the
+            // offload path is width-only).
             self.parked_text_selection.clear();
         } else {
             // A rows grow that revealed retained history moves every pre-resize row
@@ -398,8 +394,7 @@ impl Terminal {
                 let parked_floor =
                     i32::try_from(parked_grid.scrollback_lines()).unwrap_or(i32::MAX);
                 if demoted > 0 {
-                    // The parked grid ran the same shapes and recorded its own
-                    // demote count — read it, never the active grid's.
+                    // The parked grid's own demote count, never the active grid's.
                     self.parked_text_selection.adjust_for_rows_shrink(
                         max_rows,
                         parked_revealed,

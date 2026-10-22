@@ -37,20 +37,204 @@
 //! the processes the lane started are signalled. Run by hand, never by a
 //! default test run.
 
-use std::io::{BufRead as _, Write as _};
+use std::io::{Read as _, Write as _};
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aterm_sysprobe::slots::{Machine, Record, RecordRead, SlotReader, SlotsRead, Unread};
-use aterm_uds::spawnfd::{Child, Stdio};
+use aterm_uds::spawnfd::{Child, Command, Stdio};
 
-use crate::instance::{BOOT, CONFIG_OFF, Instance, Launch, World, resolve_aterm, take_value};
+use crate::instance::{
+    BOOT, CONFIG_OFF, Instance, Launch, Reply, World, resolve_aterm, take_value,
+};
 use crate::paths::paths;
 use crate::pyjson::J;
 use crate::{Fail, LAB, Res, stop};
 
 /// A one-minute hang detector for what must happen.
 const MUST: Duration = Duration::from_secs(60);
+
+/// An early return or unwind keeps the scratch while a child's outcome may
+/// still be unknown. Only the ordinary, fully collected path releases it.
+struct LaneWorld {
+    world: World,
+    settled: bool,
+}
+
+impl LaneWorld {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            world: World::new(CONFIG_OFF)?,
+            settled: false,
+        })
+    }
+}
+
+impl std::ops::Deref for LaneWorld {
+    type Target = World;
+
+    fn deref(&self) -> &World {
+        &self.world
+    }
+}
+
+impl Drop for LaneWorld {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.world.keep();
+        }
+    }
+}
+
+/// A pipe drained on the calling thread, so there is no detached reader to
+/// outlive the world. Each turn reads at most one chunk and keeps a bounded
+/// tail; a busy writer cannot keep the deadline from being checked.
+struct Pipe {
+    file: std::fs::File,
+    bytes: Vec<u8>,
+    eof: bool,
+}
+
+impl Pipe {
+    fn new(fd: OwnedFd) -> Result<Self, String> {
+        let file = std::fs::File::from(fd);
+        crate::sys::set_nonblocking(file.as_raw_fd())
+            .map_err(|e| format!("make child pipe nonblocking: {e}"))?;
+        Ok(Self {
+            file,
+            bytes: Vec::new(),
+            eof: false,
+        })
+    }
+
+    fn read(&mut self) -> Result<(), String> {
+        if self.eof {
+            return Ok(());
+        }
+        let mut chunk = [0; 8192];
+        match self.file.read(&mut chunk) {
+            Ok(0) => self.eof = true,
+            Ok(n) => {
+                self.bytes.extend_from_slice(&chunk[..n]);
+                let cut = self
+                    .bytes
+                    .len()
+                    .saturating_sub(aterm_uds::deadline::OUTPUT_KEEP);
+                self.bytes.drain(..cut);
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(format!("read child pipe: {e}")),
+        }
+        Ok(())
+    }
+}
+
+/// Ownership is armed immediately after spawn, before pipe setup or any
+/// other fallible operation. Drop signals only the direct, unreaped child
+/// and uses the existing exit watcher for a bounded reap reserve. This is
+/// no claim that arbitrary descendants have ended.
+struct Running {
+    child: Child,
+    out: Option<Pipe>,
+    err: Option<Pipe>,
+    status: Option<ExitStatus>,
+}
+
+impl Running {
+    fn start(cmd: &mut Command) -> Result<Self, String> {
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("start child: {e}"))?;
+        let mut run = Self {
+            child,
+            out: None,
+            err: None,
+            status: None,
+        };
+        let out = run.child.stdout.take().ok_or("child has no stdout")?;
+        run.out = Some(Pipe::new(out.into())?);
+        let err = run.child.stderr.take().ok_or("child has no stderr")?;
+        run.err = Some(Pipe::new(err.into())?);
+        Ok(run)
+    }
+
+    fn step(&mut self) -> Result<(), String> {
+        for pipe in [&mut self.out, &mut self.err].into_iter().flatten() {
+            pipe.read()?;
+        }
+        if self.status.is_none() {
+            self.status = self.child.try_wait().map_err(|e| format!("wait: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn collected(&self) -> bool {
+        self.status.is_some()
+            && [&self.out, &self.err]
+                .iter()
+                .all(|p| p.as_ref().is_some_and(|p| p.eof))
+    }
+
+    fn finish(&mut self, hang: Duration) -> Result<Output, String> {
+        let end = Instant::now() + hang;
+        loop {
+            self.step()?;
+            if self.collected() {
+                return Ok(Output {
+                    status: self.status.expect("collected child"),
+                    stdout: std::mem::take(&mut self.out.as_mut().expect("stdout").bytes),
+                    stderr: std::mem::take(&mut self.err.as_mut().expect("stderr").bytes),
+                });
+            }
+            if Instant::now() >= end {
+                return Err(format!(
+                    "hang detector: child or pipes not done within {hang:?}"
+                ));
+            }
+            stop::sleep(Duration::from_millis(20)).map_err(|_| "interrupted".to_owned())?;
+        }
+    }
+
+    fn end(&mut self) -> Result<(), String> {
+        if self.status.is_some() {
+            return Ok(());
+        }
+        let killed = self.child.kill();
+        let mut exit = aterm_uds::deadline::ExitWait::new(&self.child);
+        let end = Instant::now() + MUST;
+        loop {
+            self.status = self
+                .child
+                .try_wait()
+                .map_err(|e| format!("reap child: {e}"))?;
+            if self.status.is_some() {
+                return Ok(());
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(format!("child not reaped after SIGKILL ({killed:?})"));
+            }
+            exit.wait(left);
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Err(why) = self.end() {
+            eprintln!("slot lane: cleanup unknown: {why}");
+        }
+    }
+}
 
 /// The stand-in's line once it holds its slot.
 const HELD: &str = "held";
@@ -119,7 +303,7 @@ fn find_build_slot() -> Option<PathBuf> {
 
 /// `<dur>` as `<n>s`, `<n>m` or `<n>h`.
 fn duration_of(v: &str) -> Option<Duration> {
-    let (n, unit) = v.split_at(v.len().checked_sub(1)?);
+    let (n, unit) = v.split_at_checked(v.len().checked_sub(1)?)?;
     let n: u64 = n.parse().ok()?;
     let secs = match unit {
         "s" => n,
@@ -169,7 +353,7 @@ pub fn cmd_slot_capture(args: &[String]) -> Res {
         println!("slot-capture: NOT RUN (skip: no build-slot in ~/.local/bin or $HOME/trust/scripts)");
         return Ok(3);
     };
-    let world = World::new(CONFIG_OFF)?;
+    let mut world = LaneWorld::new()?;
     let slots = world.dir.join("slots");
     let cwd = world.dir.join("work");
     std::fs::create_dir_all(&cwd).map_err(|e| format!("cannot make {}: {e}", cwd.display()))?;
@@ -180,20 +364,16 @@ pub fn cmd_slot_capture(args: &[String]) -> Res {
         slots.display()
     );
     let spawned_us = now_us();
-    let mut child = aterm_uds::spawnfd::command(&build_slot)
-        .env_clear()
+    let mut cmd = aterm_uds::spawnfd::command(&build_slot);
+    cmd.env_clear()
         .env("HOME", &world.home)
         .env("PATH", CAPTURE_PATH)
         .env("BUILD_SLOT_DIR", &slots)
         .args(["--no-worktree-lock", "--mem-gb", "0", "--", "true"])
-        .current_dir(&cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run {}: {e}", build_slot.display()))?;
-    let wrapper = child.id();
-    let status = reaped(&mut child, MUST)?;
+        .current_dir(&cwd);
+    let mut child = Running::start(&mut cmd)?;
+    let wrapper = child.child.id();
+    let status = child.finish(MUST)?.status.code();
     let exited_us = now_us();
     let mut v = Verdict::default();
     v.check(
@@ -243,24 +423,8 @@ pub fn cmd_slot_capture(args: &[String]) -> Res {
         text.starts_with("{\"pid\": ") && text.contains(", \"started\": "),
         || format!("{text:?}"),
     );
+    world.settled = true;
     Ok(v.end("slot-capture"))
-}
-
-/// Reap `child` within `hang` (a hang detector): its exit code (`None`: a
-/// signal ended it). Past it, the child is `SIGKILL`ed and reaped.
-fn reaped(child: &mut Child, hang: Duration) -> Result<Option<i32>, String> {
-    let end = Instant::now() + hang;
-    loop {
-        if let Some(status) = child.try_wait().map_err(|e| format!("wait: {e}"))? {
-            return Ok(status.code());
-        }
-        if Instant::now() >= end {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("hang detector: not done within {hang:?}"));
-        }
-        stop::sleep(Duration::from_millis(20)).map_err(|_| "interrupted".to_owned())?;
-    }
 }
 
 /// One slot file's identity and record, read without a lock.
@@ -315,13 +479,17 @@ fn lsof_holders(files: &[SlotFile]) -> Result<Vec<(PathBuf, u32)>, String> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    let out = aterm_uds::spawnfd::command("/usr/sbin/lsof")
-        .args(["-n", "-F", "pn", "--"])
-        .args(files.iter().map(|f| f.path.as_os_str()))
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot run lsof: {e}"))?;
+    let mut cmd = aterm_uds::spawnfd::command("/usr/sbin/lsof");
+    cmd.args(["-n", "-F", "pn", "--"])
+        .args(files.iter().map(|f| f.path.as_os_str()));
+    let out = Running::start(&mut cmd)?.finish(MUST)?;
     // lsof exits 1 when none of the files is open.
+    if !matches!(out.status.code(), Some(0 | 1)) {
+        return Err(format!(
+            "lsof failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
     let mut held = Vec::new();
     let mut pid = None;
     for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -476,39 +644,30 @@ pub fn hold_main(args: &[String]) -> i32 {
 
 /// The stand-in on `slot`, working in `dir`; back once it holds the slot
 /// (its first exec waited under [`aterm_uds::deadline::FIRST_EXEC_HANG`]).
-fn start_holder(slot: &Path, dir: &Path) -> Result<Child, String> {
-    let mut child = aterm_uds::spawnfd::command(&paths().exe)
+fn start_holder(world: &World, slot: &Path, dir: &Path) -> Result<Running, String> {
+    let env = world.env();
+    let mut cmd = aterm_uds::spawnfd::command(&paths().exe);
+    cmd.env_clear()
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .arg(HOLD_VERB)
         .arg(slot)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot start the stand-in: {e}"))?;
-    let Some(out) = child.stdout.take() else {
-        return Err("the stand-in has no stdout".into());
-    };
-    let (tx, said) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut tx = Some(tx);
-        for line in std::io::BufReader::new(out).lines() {
-            let Ok(line) = line else { break };
-            if line == HELD
-                && let Some(tx) = tx.take()
-            {
-                let _ = tx.send(());
-            }
+        .current_dir(dir);
+    let mut child = Running::start(&mut cmd)?;
+    let end = Instant::now() + aterm_uds::deadline::FIRST_EXEC_HANG;
+    loop {
+        child.step()?;
+        let out = child.out.as_ref().expect("stdout");
+        if out
+            .bytes
+            .split_inclusive(|b| *b == b'\n')
+            .any(|line| line == b"held\n")
+        {
+            return Ok(child);
         }
-    });
-    if said
-        .recv_timeout(aterm_uds::deadline::FIRST_EXEC_HANG)
-        .is_ok()
-    {
-        Ok(child)
-    } else {
-        let _ = child.kill();
-        let _ = child.wait();
-        Err("the stand-in never said it held its slot".into())
+        if out.eof || Instant::now() >= end {
+            return Err("the stand-in never said it held its slot".into());
+        }
+        stop::sleep(Duration::from_millis(20)).map_err(|_| "interrupted".to_owned())?;
     }
 }
 
@@ -527,9 +686,9 @@ pub fn cmd_slot_lane(args: &[String]) -> Res {
         )));
     }
     let aterm = resolve_aterm(aterm).map_err(|e| Fail::exit(3, e))?;
-    let mut world = World::new(CONFIG_OFF)?;
+    let mut world = LaneWorld::new()?;
     if keep {
-        world.keep();
+        world.world.keep();
     }
     // The instance's reader looks in `<HOME>/.cache/build-slot`.
     let slots = aterm_sysprobe::slots::default_dir(&world.home);
@@ -538,10 +697,10 @@ pub fn cmd_slot_lane(args: &[String]) -> Res {
         std::fs::create_dir_all(d).map_err(|e| format!("cannot make {}: {e}", d.display()))?;
     }
     let slot = slots.join("slot-0");
-    let mut holder = start_holder(&slot, &holder_dir)?;
+    let mut holder = start_holder(&world, &slot, &holder_dir)?;
     println!(
         "slot-lane: stand-in pid {} holds {}",
-        holder.id(),
+        holder.child.id(),
         slot.display()
     );
     let mut inst = Instance::start(
@@ -560,13 +719,17 @@ pub fn cmd_slot_lane(args: &[String]) -> Res {
             sandbox: None,
         },
     )?;
-    let ran = inst
-        .await_socket(BOOT)
-        .map_err(|f| f.msg.unwrap_or_default())
-        .and_then(|()| lane(&inst, &world, &mut holder));
+    let ran = await_socket(&mut inst, &world).and_then(|()| lane(&inst, &world, &mut holder));
     inst.stop();
-    let _ = holder.kill();
-    let _ = holder.wait();
+    let ended = holder.end().and_then(|()| holder.finish(MUST).map(|_| ()));
+    let instance_ended = !inst.running();
+    if ran.is_ok() && ended.is_ok() && instance_ended {
+        world.settled = true;
+    }
+    ended?;
+    if !instance_ended {
+        return Err("the instance's exit could not be confirmed; its world was kept".into());
+    }
     match ran {
         Ok(Some(v)) => Ok(v.end("slot-lane")),
         Ok(None) => Ok(3),
@@ -579,8 +742,8 @@ pub fn cmd_slot_lane(args: &[String]) -> Res {
 
 /// The waits against the running `inst` (the module docs); `None`: a named
 /// skip.
-fn lane(inst: &Instance, world: &World, holder: &mut Child) -> Result<Option<Verdict>, String> {
-    let ls = inst.ctl(&["ls"]);
+fn lane(inst: &Instance, world: &World, holder: &mut Running) -> Result<Option<Verdict>, String> {
+    let ls = ctl(inst, world, &["ls"])?;
     let sid = ls
         .stdout
         .split_whitespace()
@@ -588,7 +751,7 @@ fn lane(inst: &Instance, world: &World, holder: &mut Child) -> Result<Option<Ver
         .map(str::to_owned)
         .ok_or_else(|| format!("no session in `ls`: {}", ls.stdout))?;
     let at = format!("@{sid}");
-    let sys = inst.ctl(&[&at, "sys"]);
+    let sys = ctl(inst, world, &[&at, "sys"])?;
     if sys.code != 0 {
         println!(
             "slot-lane: NOT RUN (skip: `sys` does not answer on a headless instance: {})",
@@ -600,7 +763,11 @@ fn lane(inst: &Instance, world: &World, holder: &mut Child) -> Result<Option<Ver
     // (a) Held: the wait times out. Fifteen seconds outlast the reader's
     // first reads (one sighting is pending, the second, a period later,
     // proves the holder).
-    let held = inst.ctl(&[&at, "await", "sys", "slots>=1", "timeout=15000"]);
+    let held = ctl(
+        inst,
+        world,
+        &[&at, "await", "sys", "slots>=1", "timeout=15000"],
+    )?;
     println!(
         "  while held: await sys slots>=1 timeout=15000 -> {}",
         held.first()
@@ -622,36 +789,11 @@ fn lane(inst: &Instance, world: &World, holder: &mut Child) -> Result<Option<Ver
     let armed_before = crate::util::scratch_text(&world.state().join("logs/aterm.log"))
         .matches(aterm_sysprobe::slots::ARMED_LINE)
         .count();
-    let (tx, answered) = std::sync::mpsc::channel();
-    let client = inst.client.clone();
-    let sock = inst.sock.to_string_lossy().into_owned();
-    let env = world.env();
-    let target = at.clone();
-    std::thread::spawn(move || {
-        let out = aterm_uds::spawnfd::command(&client)
-            .env_clear()
-            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .args([
-                "ctl",
-                "--sock",
-                sock.as_str(),
-                "--timeout",
-                "90",
-                target.as_str(),
-                "await",
-                "sys",
-                "slots>=1",
-                "timeout=60000",
-            ])
-            .stdin(Stdio::null())
-            .output();
-        let _ = tx.send(out.map(|o| {
-            (
-                o.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&o.stdout).into_owned(),
-            )
-        }));
-    });
+    let mut control = ctl_start(
+        inst,
+        world,
+        &[&at, "await", "sys", "slots>=1", "timeout=60000"],
+    )?;
     // The wait is armed before the slot frees: the instance logs the slots'
     // armed cadence when this wait, the only one, arms it. Once the stand-in
     // dies the reader needs two reads a period apart to call the slot free,
@@ -660,6 +802,10 @@ fn lane(inst: &Instance, world: &World, holder: &mut Child) -> Result<Option<Ver
     let armed_lines = |text: &str| text.matches(aterm_sysprobe::slots::ARMED_LINE).count();
     let deadline = Instant::now() + MUST;
     while armed_lines(&crate::util::scratch_text(&log)) < armed_before + 1 {
+        control.step()?;
+        if control.collected() {
+            return Err("the ctl client ended before the slots wait armed".into());
+        }
         if Instant::now() >= deadline {
             return Err(format!(
                 "hang detector: the wait never armed the slots (no `{}` in {})",
@@ -669,24 +815,115 @@ fn lane(inst: &Instance, world: &World, holder: &mut Child) -> Result<Option<Ver
         }
         stop::sleep(Duration::from_millis(50)).map_err(|_| "interrupted".to_owned())?;
     }
-    holder
-        .kill()
-        .map_err(|e| format!("SIGKILL the stand-in: {e}"))?;
-    holder
-        .wait()
-        .map_err(|e| format!("reap the stand-in: {e}"))?;
-    let reply = answered
-        .recv_timeout(MUST + Duration::from_secs(30))
-        .map_err(|_| "hang detector: the wait never answered".to_owned())?
-        .map_err(|e| format!("cannot run the ctl client: {e}"))?;
+    holder.end()?;
+    let reply = control.finish(MUST + Duration::from_secs(30))?;
+    let code = reply.status.code().unwrap_or(-1);
+    let answer = String::from_utf8_lossy(&reply.stdout);
     println!(
         "  freed: await sys slots>=1 timeout=60000 -> {}",
-        reply.1.trim()
+        answer.trim()
     );
     v.check(
         "once the stand-in is SIGKILLed, the wait answers OK sys slots=1/1",
-        reply.0 == 0 && reply.1.starts_with("OK sys slots=1/1 "),
-        || format!("exit {}: {}", reply.0, reply.1.trim()),
+        code == 0 && answer.starts_with("OK sys slots=1/1 "),
+        || format!("exit {code}: {}", answer.trim()),
     );
     Ok(Some(v))
+}
+
+/// A private instance client, owned before any wait for its answer or the
+/// instance's armed witness. All pipe reads stay on this thread.
+fn ctl_start(inst: &Instance, world: &World, args: &[&str]) -> Result<Running, String> {
+    let env = world.env();
+    let mut cmd = aterm_uds::spawnfd::command(&inst.client);
+    cmd.env_clear()
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .current_dir(&world.home)
+        .args([
+            "ctl",
+            "--sock",
+            &inst.sock.to_string_lossy(),
+            "--timeout",
+            "90",
+        ])
+        .args(args);
+    Running::start(&mut cmd)
+}
+
+/// Readiness uses the same owned client as the lane, including when the
+/// socket exists but its version reply never arrives. The child is held to
+/// the remaining boot deadline, followed only by its cleanup reserve.
+fn await_socket(inst: &mut Instance, world: &World) -> Result<(), String> {
+    let end = Instant::now() + BOOT;
+    loop {
+        if !inst.running() {
+            return Err(format!(
+                "the instance exited before its socket answered; its log:\n{}",
+                inst.log_tail(20)
+            ));
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!(
+                "the instance never answered on {} within {BOOT:?}; its log:\n{}",
+                inst.sock.display(),
+                inst.log_tail(20)
+            ));
+        }
+        if inst.sock.exists()
+            && ctl_start(inst, world, &["version"])?
+                .finish(left)?
+                .status
+                .success()
+        {
+            return Ok(());
+        }
+        stop::sleep(Duration::from_millis(100)).map_err(|_| "interrupted".to_owned())?;
+    }
+}
+
+fn ctl(inst: &Instance, world: &World, args: &[&str]) -> Result<Reply, String> {
+    let out = ctl_start(inst, world, args)?.finish(MUST + Duration::from_secs(30))?;
+    Ok(Reply {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::duration_of;
+    use std::time::Duration;
+
+    #[test]
+    fn watch_duration_requires_a_positive_bounded_number_and_an_ascii_unit() {
+        for (text, seconds) in [("1s", 1), ("30s", 30), ("20m", 1200), ("24h", 86400)] {
+            assert_eq!(
+                duration_of(text),
+                Some(Duration::from_secs(seconds)),
+                "{text}"
+            );
+        }
+        for text in [
+            "",
+            "s",
+            "0s",
+            "1",
+            "-1s",
+            "1é",
+            "é",
+            "1😀",
+            "1秒",
+            "18446744073709551616s",
+            "18446744073709551615m",
+            "18446744073709551615h",
+        ] {
+            assert_eq!(duration_of(text), None, "{text}");
+        }
+        assert_eq!(
+            duration_of("18446744073709551615s"),
+            Some(Duration::from_secs(u64::MAX))
+        );
+    }
 }

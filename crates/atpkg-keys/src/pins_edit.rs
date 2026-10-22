@@ -818,9 +818,8 @@ mod tests {
             assert!(read_anchor(&odd, FIXTURE).is_err(), "{line}");
         }
 
-        // A stray ITEM inside the block — the terminator went missing and the next
-        // top-level declaration was swallowed. Caught as an unrecognised line, which is
-        // the right refusal: the writer has no idea where this list ends.
+        // A missing terminator swallows the next top-level item: refused as an unrecognised
+        // line.
         let swallowed = fixture().replace("];\n", "");
         let err = read_anchor(&swallowed, FIXTURE).unwrap_err();
         assert!(err.contains("does not recognise"), "{err}");

@@ -674,9 +674,7 @@ pub(crate) fn pid_cpu_ns(pid: libc::pid_t) -> Option<u64> {
     u64::try_from(ticks.saturating_mul(1_000_000_000) / hz).ok()
 }
 
-// ---------------------------------------------------------------------------
-// THE WATCH (G1, and the server half of G2): publishing a stall.
-// ---------------------------------------------------------------------------
+// The watch: publishing a stall.
 
 /// The attention owner the server writes a stall under (`meta attention_owner=
 /// aterm`). A keyed entry, so it outranks an older supervisor badge while the
@@ -2928,8 +2926,8 @@ pub(crate) mod tests {
             assert_eq!(t, Transition::None, "held");
         };
 
-        // Its spin STOPPED (no CPU since t1), nothing unread: let go. This is
-        // the reviewer's program, asleep in `read` with nothing sent to it.
+        // Its spin stopped (no CPU since t1), nothing unread: let go, as for a
+        // program asleep in `read` with nothing sent to it.
         let mut w = InputWatches::default();
         held(&mut w);
         let (t, next) = w.step(

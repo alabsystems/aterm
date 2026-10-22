@@ -106,11 +106,8 @@ fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
     );
 }
 
-/// Whether `pid` is still this process's child, looked at without reaping it:
-/// `WNOWAIT` leaves an exited child waitable, so this never takes the reap from
-/// the helper under test. Polls until the child is no longer ours (the helper,
-/// or the reaper it handed the child to, collected it) or `within` runs out — a
-/// hang detector, not a latency budget — and says whether it still is.
+/// Whether `pid` is still this process's child, polled with `WNOWAIT` so the helper under test
+/// keeps the reap, until it is not or `within` (a hang detector) runs out.
 #[cfg(unix)]
 fn child_still_ours(pid: libc::pid_t, within: std::time::Duration) -> bool {
     use std::time::{Duration, Instant};
@@ -1293,11 +1290,9 @@ fn three_rapid_serious_mode_intents_rebase_through_each_completion() {
         state.insert("issued", issued);
         state.insert("completed", completed);
         state.insert("conflict", 0);
-        // The newest intent issued, read from the real lane (newest pending
-        // request, else the one in flight), not from
-        // `serious_mode_queued_projection`, which `projection` reads; one
-        // field for both would make `ProjectionTracksLatestIntent` trivially
-        // true.
+        // Read from the lane (newest pending, else in flight), not from
+        // `serious_mode_queued_projection` (`projection`'s source), so
+        // `ProjectionTracksLatestIntent` is not trivially true.
         state.insert(
             "last_desired",
             i64::from(queued.last().copied().or(current).unwrap_or(live)),
@@ -1742,10 +1737,9 @@ fn idle_reconcile_park_never_materializes_a_destination_or_warning_path() {
     );
 }
 
-/// Tier-1 binding for `NativeUpdateWorkerQueue`: drives the real capacity
-/// constant through the `try_send` Full/drain/retry decisions, the purpose
-/// coalescer and the disconnected restart path. The model specifies that
-/// visible boundary, not worker scheduling.
+/// Tier-1 binding for `NativeUpdateWorkerQueue`: the real capacity through `try_send`
+/// Full/drain/retry, the purpose coalescer and the disconnected restart path. The model covers
+/// that visible boundary, not worker scheduling.
 #[test]
 fn native_update_worker_queue_conforms_to_saturation_coalescing_and_disconnect() {
     // Records an apply refusal in the shared update ledger.
@@ -1885,9 +1879,8 @@ fn native_update_worker_queue_conforms_to_saturation_coalescing_and_disconnect()
     let lost = buggy.successors("DropApplyLatchWhenFull", &occupied)[0].clone();
     assert!(!buggy.check_invariant("NoSilentlyLostAcceptedIntent", &lost));
 
-    // Negative control for the restart budget: the real app made one restart
-    // attempt across 33 turns; a restart retried every turn is the hot loop,
-    // and the budget law sees it on the second retry.
+    // Negative control: a restart retried every turn (the hot loop) breaks `RestartAtMostOnce`
+    // on the second retry.
     let mut disconnected = model.init_state();
     for action in ["OccupyWorker", "RequestStageFull", "DisconnectWithPending"] {
         assert!(model.fire(action, &mut disconnected), "{action}");
@@ -2854,9 +2847,8 @@ fn installed_environment_repair_conforms_and_preserves_unrelated_budgets() {
             );
             drop(held);
         }
-        // A dirty test binary has no verifiable committed identity, so supply a
-        // clean one to the same reduction; shipping callers pass GIT_COMMIT and
-        // keep their dirty-identity refusal.
+        // A dirty test binary has no verifiable committed identity, so it supplies a clean one;
+        // shipping passes `build_info::git_commit()` and keeps its dirty-identity refusal.
         app.release_repaired_auto_apply_environment_for_commit(&facts, PREFLIGHT_TEST_COMMIT);
         let mut after = before.clone();
         after.insert("decided", 1);
@@ -3343,8 +3335,7 @@ fn a_press_the_folder_answered_is_not_sent_back_to_the_folder() {
         let mut app = App::headless_for_test();
         app.native_updater_service = NativeUpdaterService::new(10, "test", true);
         stage_one_build_for_test(&mut app, 11);
-        // The folder's block, as the automatic attempt took it, and its
-        // booking.
+        // The folder's block, as the automatic attempt took it, and its booking.
         app.auto_apply_intent = None;
         app.block_native_auto_apply_environment(
             11,
@@ -3626,9 +3617,8 @@ fn retiring_a_withdrawn_stage_releases_only_its_exact_latch_and_rearms_a_replace
         );
         assert!(app.automatic_apply_retry_scheduled(replacement));
 
-        // Restore only the leftover latch, then drive the real arming reducer:
-        // it shows why such a latch would strand a valid replacement newer
-        // than the running process.
+        // The leftover latch alone would strand a valid replacement newer than the running
+        // process.
         app.auto_apply_manual_only = Some(latch);
         app.auto_apply_intent = None;
         assert!(!app.arm_native_auto_apply(replacement, &"ab".repeat(32)));
@@ -4163,11 +4153,8 @@ fn a_capture_refusal_answers_by_who_asked_on_both_lanes() {
     }
 }
 
-/// Converge automatic apply structurally on the installed activation of
-/// `installed` through the shipping completion lane (every launched-lane
-/// failure's arc, since the candidate installs its bundle before it dials)
-/// and return the activation's digest. `observation` is the reconcile
-/// sequence to import the activation at.
+/// Converge automatic apply structurally on the activation of `installed` (imported at reconcile
+/// sequence `observation`) through the shipping completion lane, and return its digest.
 fn converge_structurally_on_the_activation(
     app: &mut App,
     installed: &InstalledUpdate,
@@ -4350,10 +4337,8 @@ fn a_newer_release_starts_the_retire_of_a_converged_activation_latch() {
     );
 }
 
-/// Only an observation of the new disk releases the latch: a retire landed
-/// with no observation leaves it standing, so an older in-flight observation
-/// cannot arm build 11 against the running build's install path. The new
-/// disk's observation retires the activation and latch, and arms build 12.
+/// A landed retire with no observation leaves the latch standing, so an older in-flight
+/// observation cannot arm build 11; the observation of the new disk releases it and arms 12.
 #[test]
 fn only_an_observation_of_the_new_disk_releases_a_superseded_activation_latch() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -5066,11 +5051,9 @@ fn passing_pre_park_reason() -> String {
     )
 }
 
-/// Project the automatic lane after a physical failure booked for `build`
-/// onto `NativeUpdateApplyLadder`'s latch variables, over `before` (the
-/// model state the failure was taken from). `converged` is the structural
-/// verdict the ladder calls it: a verdict minted for these bytes, or a latch
-/// with no deadline at all.
+/// Project the lane after a physical failure booked for `build` onto `NativeUpdateApplyLadder`'s
+/// latch variables over `before`; `converged` is a verdict for these bytes or a deadline-less
+/// latch.
 fn project_passing_failure(
     before: &aterm_spec::interp::State,
     app: &App,
@@ -5285,11 +5268,9 @@ fn a_refused_cold_relaunch_converges_across_its_own_relaunches() {
     }
 }
 
-/// A physical-failure latch lapsing keeps the ladder's anchor: the landing
-/// bound is per artifact and counts from the first arming, so the lapse
-/// re-arms the intent and resumes the ladder where the clock is. Driven
-/// through the real completion lane and the real re-arm (the Refresh
-/// reconcile's `arm_native_auto_apply`, which lapses the latch first).
+/// A physical-failure latch lapsing keeps the ladder's anchor: the landing bound counts from the
+/// first arming, so the lapse re-arms the intent where the clock is. Driven through the real
+/// completion lane and the Refresh reconcile's `arm_native_auto_apply`, which lapses the latch.
 #[test]
 fn a_physical_latch_lapse_resumes_the_ladder_where_the_clock_left_it() {
     use crate::native_update_auto_intent::{ApplyPhase, LANDS_WITHIN};
@@ -5610,10 +5591,8 @@ fn preverify_read_running(
     done
 }
 
-/// What a person's press left when it reached the fork lane while the
-/// candidate's read ran ([`crate::UpdateHandoffStartError::HeldForRead`],
-/// which `apply_staged_update_now` neither retires nor records, and
-/// `apply_native_update` holds): its installing row, its switch on record,
+/// What a person's press leaves when the fork lane holds it for the candidate's read
+/// ([`crate::UpdateHandoffStartError::HeldForRead`]): its installing row, its switch on record,
 /// and the hold.
 #[cfg(unix)]
 fn press_held_for_the_read(app: &mut App, build: u64) {
@@ -5862,15 +5841,9 @@ fn durable_download_status(app: &App, build: u64) -> DurableUpdateStatus {
     }
 }
 
-/// A retired download takes its older latches with it, carries its own to
-/// the activation, and leaves a newer one alone. Against one retirement
-/// (the installed bundle is now the staged build):
-///   * older than the retired build: cleared;
-///   * on the retired build (the same logical update, whose failed candidate
-///     installed the bundle): re-keyed to the activation with its deadline
-///     unchanged;
-///   * newer: survives, since a completion can land out of order (as in the
-///     `Retired` arm of `reconcile_returned_native_apply_with_facts`).
+/// A retired download takes its older latches with it, carries its own to the activation with its
+/// deadline, and leaves a newer one alone (a completion can land out of order, as in the
+/// `Retired` arm of `reconcile_returned_native_apply_with_facts`).
 #[test]
 fn retiring_a_download_for_its_activation_carries_only_its_own_latch() {
     for offset in [-1_i64, 0, 1] {
@@ -6272,10 +6245,8 @@ fn a_wait_on_a_person_ends_when_the_lane_stops_trying() {
     }
 }
 
-/// An editor holding the install is said once through the budget: the
-/// announced first attempt raises the `Update waits for you` outcome row,
-/// and the budget's exhaustion saying the same words again is the center's
-/// Duplicate (one row, one record), never a Fault echo plus a repost.
+/// An editor blocking the install is one row through the whole budget: the exhaustion's repeat is
+/// the center's Duplicate, never a second row or record.
 #[test]
 fn an_announced_editor_block_stays_one_row_through_the_budget() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -7095,10 +7066,8 @@ fn an_exhausted_preflight_block_budget_neither_latches_forever_nor_nags_on_a_sch
     assert_no_probe_disturbance(&app, wid, working_tab);
 }
 
-/// With the same Settings draft in place, a background probe and a person's
-/// click get the same verdict and different screens: the recovery surface is
-/// intact on the lane a person asked for (the Version menu's "Install aterm
-/// vX now").
+/// With the same Settings draft, a background probe and a person's press get the same verdict,
+/// but only the press surfaces Close Recovery.
 #[test]
 fn an_automatic_probe_is_silent_while_a_person_s_apply_still_surfaces_recovery() {
     let mut app = App::headless_for_test();

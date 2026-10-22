@@ -183,10 +183,9 @@ fn run_conformance() {
         validated += 1;
     }
 
-    // RaiseSession: raise session 0 while the newest window is frontmost, through the
-    // real `raise_session_by_id`. Headless there is no OS focus, so the step may be the
-    // admitted `frontmost' = frontmost` stutter; what is validated is that a raise never
-    // mints, destroys or exits. Negative control (c) keeps it non-vacuous.
+    // RaiseSession through the real `raise_session_by_id`. Headless there is no OS focus, so
+    // the step may be the admitted `frontmost' = frontmost` stutter; what is validated is that
+    // a raise never mints, destroys or exits. Negative control (c) keeps it non-vacuous.
     let prev = next;
     app.raise_session_by_id(0)
         .expect("session 0 is hosted by the first window");

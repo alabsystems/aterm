@@ -425,6 +425,11 @@ struct Mock {
     /// count of submissions written to the session (aterm-gui's
     /// `submit_count`); a screen with none sends none, as an older host.
     submits_on: BTreeMap<usize, u64>,
+    /// `text --json`'s `"inputs"` on each screen (by index): the host's
+    /// count of input writes before the rows (`None`: one in flight) and
+    /// after them (aterm-gui's `input_settled`, `input_sent`); a screen with
+    /// none sends none, as an older host.
+    inputs_on: BTreeMap<usize, (Option<u64>, u64)>,
     /// The server's launch witness (aterm-gui's `launch_witness`), as its
     /// last signed command start left it; `None`: a host that sends none.
     /// Published as the server publishes it, `text --json`'s `"launch"`
@@ -1265,6 +1270,7 @@ impl Mock {
             human_seq: None,
             human_seq_on: BTreeMap::new(),
             submits_on: BTreeMap::new(),
+            inputs_on: BTreeMap::new(),
             launch: None,
             person_at_key: 0,
             person_at_send: 0,
@@ -1755,6 +1761,10 @@ impl Mock {
         }
         if let Some(launch) = self.launch {
             human.push_str(&format!(",\"launch\":{}", launch.json(self.human_seq)));
+        }
+        if let Some((before, after)) = self.inputs_on.get(&i) {
+            let before = before.map_or_else(|| "null".to_string(), |n| n.to_string());
+            human.push_str(&format!(",\"inputs\":[{before},{after}]"));
         }
         if let Some(n) = self.submits_on.get(&i) {
             human.push_str(&format!(",\"submits\":{n}"));

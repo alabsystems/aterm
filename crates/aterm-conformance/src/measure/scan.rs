@@ -25,7 +25,7 @@ pub use super::frame::{Frame, FrameError, Rgb};
 // ------------------------------------------------------------ colour floor --
 
 /// The brightest channel an ink pixel needs: keeps a band's tapered fringe from
-/// voting. 60 keeps the luminance-capped v2 bed's dimmest stops (yellow, green
+/// voting. 60 keeps the luminance-capped rainbow's dimmest stops (yellow, green
 /// and cyan sit at 70-94) inside the domain.
 pub const SAT_MIN: u8 = 60;
 /// The channel spread (max - min) an ink pixel needs: the colour discriminator.
@@ -1540,7 +1540,7 @@ pub fn ribbon_present(metrics: &DynamicMetrics) -> bool {
 /// Whether one frame carries trail light for the continuity charge: ribbon
 /// geometry, or the band's own population at [`RIBBON_LIT_MIN_PX`]. The young
 /// tall band is taller than the thin arm's cap, so geometry alone reads it as
-/// a blackout; the OR can only move a frame from dark to lit.
+/// a blackout; the band term can only move a frame from dark to lit.
 #[must_use]
 pub fn driven_lit(metrics: &DynamicMetrics) -> bool {
     ribbon_present(metrics) || metrics.band_ink >= RIBBON_LIT_MIN_PX

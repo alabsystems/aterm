@@ -1,22 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Argv handed to a RELAUNCH of this binary — pure list surgery, no platform
-//! surface at all.
-//!
-//! It lives outside the macOS-only installer module because every platform
-//! relaunches aterm: the GUI's cold-exec and seamless handoffs, and the
-//! Windows successor spawn, all forward their own argv. Compiled here, one
-//! definition serves them all.
+//! Argv for a relaunch of this binary: pure list surgery, compiled on every platform because
+//! every platform relaunches aterm (the GUI's cold-exec and seamless handoffs, the Windows
+//! successor spawn).
 
-/// Forward this process's argv to a successor MINUS the leading `--window`
-/// pins an earlier boot swap prepended.
-///
-/// A relaunch that forwards argv verbatim re-grows the pins every time (each
-/// swap adds one), so the list a long-lived session hands its successor keeps
-/// getting longer. Stripping only the LEADING run keeps a user-authored
-/// `--window` later in the command line intact, and makes the operation a
-/// fixed point: applying it twice equals applying it once.
+/// Forward this process's argv to a successor minus the leading `--window` pins earlier boot
+/// swaps prepended (verbatim forwarding would grow one per swap). Only the leading run goes,
+/// so a user's later `--window` survives and the operation is a fixed point.
 pub fn reexec_forwarded_args(
     args: impl Iterator<Item = std::ffi::OsString>,
 ) -> Vec<std::ffi::OsString> {
@@ -32,21 +23,18 @@ pub fn reexec_forwarded_args(
     forwarded
 }
 
-/// Whether a forwarded argv (pins already stripped) was a front-door windowing
-/// VERB's: `aterm new-window|new-tab|split-pane …`. The router hands a verb's
-/// window to the window library IN THE SAME PROCESS (`window_verb` → `run_window`),
-/// so the process keeps the verb as its own argv — and the verb is the only bare
-/// word a running window's argv can start with: a flag-led launch that reached the
-/// window parser with a bare word first was refused there ("unknown command") and
-/// never ran.
+/// Whether a forwarded argv (pins stripped) is a windowing verb's
+/// (`aterm new-window|new-tab|split-pane …`). The router runs a verb's window in the same
+/// process (`window_verb` → `run_window`), keeping the verb as argv, and a verb is the only
+/// bare word a running window's argv can start with: the window parser refuses any other.
 fn starts_with_a_verb(forwarded: &[std::ffi::OsString]) -> bool {
     forwarded
         .first()
         .is_some_and(|first| !first.to_string_lossy().starts_with('-'))
 }
 
-/// The argv of the BOOT SWAP's re-exec — the same launch, not yet served, on the
-/// new build: exactly one leading `--window` pin, then [`reexec_forwarded_args`].
+/// The argv of the boot swap's re-exec (the same launch, not yet served, on the new build):
+/// one leading `--window` pin, then [`reexec_forwarded_args`].
 ///
 /// The one-binary router picks window or session from argv and whether stdin is a
 /// terminal, before anything else runs. A window started as `aterm --window` from a
@@ -93,11 +81,9 @@ const READY_FLAG: &str = "--ready-fd";
 /// before any session spawns, so no shell and no window opened from one inherits
 /// it.
 ///
-/// What it changes: the relaunched window's FIRST session (its bootstrap) does not
-/// run the launch's `-e` command, which that window already ran; every later tab
-/// and split does, as the window's did. The consumer is always this build or a
-/// newer one (the successor of an update, or the build a revert restores, which
-/// is the one that set it), so no build that could misread it ever sees it.
+/// The relaunched window's first session (its bootstrap) then skips the launch's `-e` command,
+/// which the window already ran; every later tab and split runs it. Its consumer is always
+/// this build or a newer one, so no build that could misread it sees it.
 pub const RELAUNCH_OF_RUNNING_ENV: &str = "ATERM_RELAUNCH_OF_RUNNING";
 
 /// The argv of a running window's update successor — the GUI's cold `exec` and its

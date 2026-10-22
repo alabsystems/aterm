@@ -568,22 +568,11 @@ mod tests {
         assert_eq!(find_any_of(b"\x9Chello", DCS_TERMINATORS), Some(0));
     }
 
-    // Differential: every scan arm in this file must classify every byte
-    // exactly like the scalar reference, at every position across the 16- and
-    // 32-byte chunk boundaries.
-    //
-    // Three layers, and the arch gating of each is deliberate:
-    //   * the DISPATCHER asserts are arch-neutral, so this checks whichever
-    //     arm the host running `cargo test` actually takes — SSE2/AVX2 on
-    //     x86_64, NEON on an aarch64 box, the scalar fallback on a target with
-    //     neither;
-    //   * the NEON asserts are arch-neutral too, because `arm_simd` is
-    //     portable safe Rust that compiles into every test build (see its
-    //     module doc). This is what gives the aarch64 arm a guard on x86-only
-    //     CI, in place of the nothing it had while these tests were
-    //     `target_arch = "x86_64"`-gated;
-    //   * only the SSE2/AVX2 tier calls stay x86-gated, x86_64 being the one
-    //     target with more than one tier to name.
+    // Differential: every scan arm classifies every byte like the scalar
+    // reference, at every position across the 16- and 32-byte chunk
+    // boundaries. The dispatcher asserts check whichever arm this host takes;
+    // the NEON asserts run on every host (`arm_simd` compiles into every test
+    // build); only the SSE2/AVX2 calls are x86-gated.
     #[test]
     fn test_tiers_exhaustive_bytes_and_positions() {
         #[cfg(target_arch = "x86_64")]

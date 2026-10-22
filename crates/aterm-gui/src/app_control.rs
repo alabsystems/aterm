@@ -1295,9 +1295,8 @@ mod tests {
         assert!(state.showcase.pack_open);
     }
 
-    /// A native view's inspected viewport is where the view is drawn: in a split,
-    /// below its pane's subtab title row. Checked for both leaves of a two-view split
-    /// against the canonical plan, with the header row's presence asserted.
+    /// A native view's inspected viewport is where the view is drawn: in a split, below its
+    /// pane's subtab title row.
     #[test]
     fn a_split_native_views_viewport_is_below_its_subtab_title_row() {
         use crate::native_app::AppViewState;
@@ -1437,11 +1436,8 @@ mod tests {
         }));
     }
 
-    /// The Manual's diagnostic footer is fitted to the width it owns, in the face it
-    /// paints: a `bidi` value error's full remedy fits a default 80x24 footer and is
-    /// not elided. The status paints in the proportional Ui face, so a character
-    /// budget calibrated for the monospace minibuffer under-counts the strip and a
-    /// tail elide drops the remedy.
+    /// The status paints in the proportional Ui face, so a character budget calibrated for
+    /// the monospace minibuffer under-counts the strip and a tail elide drops the remedy.
     #[test]
     fn manual_diagnostic_footer_keeps_a_remedy_that_fits_the_default_window() {
         let dir = std::env::temp_dir().join(format!(

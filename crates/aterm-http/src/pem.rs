@@ -17,7 +17,7 @@ const SUFFIX: &str = "-----";
 /// The one label this client will decode.
 const CERTIFICATE: &str = "CERTIFICATE";
 
-/// Decode every `CERTIFICATE` block in `text`, SKIPPING anything else.
+/// Decode every `CERTIFICATE` block in `text`, skipping anything else.
 ///
 /// For the system trust store on Linux and the BSDs (`crate::verifier`). It
 /// never errors:

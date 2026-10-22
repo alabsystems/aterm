@@ -36,6 +36,8 @@ pub struct Instance {
     file: std::fs::File,
     /// The job's label written beside the pid, once [`Instance::set_label`] named it.
     label: Option<String>,
+    /// Let go with the pid and the label left in the file ([`Instance::release_named`]).
+    leave_named: bool,
 }
 
 impl Drop for Instance {
@@ -43,7 +45,7 @@ impl Drop for Instance {
         // Emptied first while this description still holds it, so a lock nobody holds names
         // no pid: a probe holding it for an instant must not make this exited mug's pid read
         // as a running one. (A mug killed outright leaves its pid; `running_mug` checks it.)
-        if matches!(take(&self.file), Ok(true)) {
+        if !self.leave_named && matches!(take(&self.file), Ok(true)) {
             let _ = self.file.set_len(0);
         }
         // The release the flock rule asks for: `LOCK_UN` on the description before the close,
@@ -105,7 +107,11 @@ impl Instance {
             return Ok(None);
         }
         // From here the guard owns the lock, so an error below lets it go.
-        let held = Self { file, label: None };
+        let held = Self {
+            file,
+            label: None,
+            leave_named: false,
+        };
         held.write_holder()?;
         Ok(Some(held))
     }
@@ -133,6 +139,15 @@ impl Instance {
         file.set_len(0)?;
         file.rewind()?;
         file.write_all(text.as_bytes())
+    }
+
+    /// Let go of the lock with this mug's pid and label left in the file, as a mug that ends
+    /// for an update restart does: launchd is about to start its job again, and until the new
+    /// mug holds the lock, a `quit` from any build still finds that job in it
+    /// ([`last_holder`]) and boots it out. The pid left is checked as a killed mug's is
+    /// ([`running_mug`]).
+    pub fn release_named(mut self) {
+        self.leave_named = true;
     }
 
     /// A second descriptor on this hold's open file description, for a re-exec to place at
@@ -227,7 +242,11 @@ fn adopt_fd(fd: i32, path: &Path) -> Option<Instance> {
     if !take(&file).ok()? {
         return None;
     }
-    let held = Instance { file, label: None };
+    let held = Instance {
+        file,
+        label: None,
+        leave_named: false,
+    };
     held.write_holder().ok()?;
     Some(held)
 }
@@ -494,6 +513,18 @@ mod tests {
         );
         drop(held);
         assert_eq!(running_holder(&path), None);
+        assert_eq!(last_holder(&path), None, "a mug that lets go names nothing");
+
+        // NEGATIVE CONTROL of the drop above: one let go for an update restart leaves its job
+        // named, for a `quit` meanwhile to boot out.
+        let mut held = Instance::try_hold(&path).expect("hold").expect("free");
+        held.set_label(label).expect("label");
+        held.release_named();
+        assert_eq!(running_holder(&path), None, "let go");
+        assert_eq!(
+            last_holder(&path).and_then(|holder| holder.label),
+            Some(label.to_string())
+        );
     }
 
     #[test]

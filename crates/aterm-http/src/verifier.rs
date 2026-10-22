@@ -6,37 +6,14 @@
 //!
 //! | platform | who decides | revocation |
 //! | --- | --- | --- |
-//! | macOS / iOS | `SecTrustEvaluateWithError` ([`apple`]) | end-entity, from a stapled OCSP response only (network fetch is off) |
-//! | Windows | `CertGetCertificateChain` + `CertVerifyCertificateChainPolicy` ([`windows`]), the name then held to the subjectAltName by webpki | end-entity, may retrieve over the network |
+//! | macOS / iOS | `SecTrustEvaluateWithError` (`apple`) | end-entity, from a stapled OCSP response only (network fetch is off) |
+//! | Windows | `CertGetCertificateChain` + `CertVerifyCertificateChainPolicy` (`windows`) | end-entity, may retrieve over the network |
 //! | Linux, BSD | the distro's on-disk CA store, verified by `rustls`'s own webpki (`unix`) | **none** |
-//! | wasm32, Android, anything else | nothing — construction fails ([`unsupported`]) | n/a |
+//! | wasm32, Android, anything else | nothing — construction fails (`unsupported`) | n/a |
 //!
-//! These match `rustls-platform-verifier` except that macOS forbids network
-//! fetching during verification (see [`apple`]), Windows refuses a leaf crypt32
-//! would match on its subject CN alone (see [`windows`]), and the remaining targets
-//! fail closed instead of falling back to a BUNDLED root set.
-//!
-//! # Fail closed, and the shapes that enforce it
-//!
-//! The failure that matters here is not "a good connection was refused", it is
-//! "a forged certificate was ACCEPTED". Every naive test exercises the accept
-//! path only, so the code is written so that acceptance is hard to reach by
-//! accident:
-//!
-//! * [`PlatformVerifier::verify_server_cert`] can only produce
-//!   `ServerCertVerified::assertion()` after an arm returned `Ok(())`. There is
-//!   no `match` here whose catch-all accepts, and no arm returns `Ok` except on
-//!   an explicit positive result from the OS — `true` from
-//!   `SecTrustEvaluateWithError`, `dwError == 0` from the Windows SSL policy (and
-//!   then a subjectAltName that names the server), an `Ok` from
-//!   `WebPkiServerVerifier`.
-//! * An FFI call that fails, a certificate the OS will not parse, a hostname
-//!   that will not encode, an empty root store: all `Err`. So is a platform
-//!   that never answers: macOS's evaluation runs under a deadline
-//!   ([`apple`], `aterm_uds::deadline`) and a `trustd` that does not reply is a refusal
-//!   [`is_service_unanswered`] names, never a hang and never an acceptance.
-//! * Nothing derived from the peer's chain is ever `unwrap`ped, `expect`ed, or
-//!   indexed. It is attacker-controlled input.
+//! This matches `rustls-platform-verifier` except that macOS forbids network
+//! fetching during verification and the remaining targets fail closed instead
+//! of falling back to a bundled root set.
 //!
 //! The failure that matters is a forged certificate accepted, so acceptance is
 //! hard to reach by accident:
@@ -77,13 +54,7 @@ mod windows;
 #[cfg(windows)]
 use windows as imp;
 
-// ALSO COMPILED IN APPLE TEST BUILDS — where it is not the selected arm, and
-// where `unix::tests` drives its store discovery, its tolerant PEM path and its
-// chain math natively against `/etc/ssl/cert.pem`, the same shape of bundle a
-// Linux box has. A shipped Apple build does not carry it (it is not the arm
-// that runs there); the Linux box's own build and the linux-arm cell of
-// `verify cells` type-check it for the triples that do. What that still leaves unproven is named in `unix`'s
-// own header.
+// Also compiled in Apple test builds, so `unix::tests` runs there (see its header).
 #[cfg(any(
     all(unix, not(target_vendor = "apple"), not(target_os = "android")),
     all(test, target_vendor = "apple")
@@ -229,9 +200,8 @@ fn invalid_certificate(reason: impl Into<String>) -> rustls::Error {
 
 /// Verifies server certificates against the operating system's trust store.
 ///
-/// Handshake-signature verification is not platform work — it is the crypto
-/// provider's — so those three methods delegate to `rustls`. Only
-/// [`Self::verify_server_cert`] differs per platform.
+/// Handshake signatures are the crypto provider's work, so those methods
+/// delegate to `rustls`; only [`Self::verify_server_cert`] differs per platform.
 #[derive(Debug)]
 pub struct PlatformVerifier {
     inner: imp::Verifier,
@@ -249,11 +219,8 @@ impl PlatformVerifier {
         Self::build(Vec::new(), provider)
     }
 
-    /// TEST ONLY: the platform's trust anchors PLUS `extra_roots`.
-    ///
-    /// `#[cfg(test)]` on purpose — see this module's header. Extra anchors ADD
-    /// to the system set rather than replacing it, so chains a real system root
-    /// validates still validate.
+    /// Test only (see the module docs): the platform's trust anchors plus
+    /// `extra_roots`, which add to the system set rather than replace it.
     #[cfg(test)]
     fn new_with_extra_roots(
         extra_roots: Vec<CertificateDer<'static>>,

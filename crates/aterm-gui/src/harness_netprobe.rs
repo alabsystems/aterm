@@ -969,17 +969,11 @@ mod tests {
         vars
     }
 
-    /// THE AGENT'S SETTINGS SIDE OF ITS LOGIN ([`stored_login_of`]): over the
-    /// route's own gather, a quiet tree leaves it its stored login; and it
-    /// is NO stored login where a settings source — the user's, the
-    /// project's, a `--settings` — gives it an API key or names an
-    /// `apiKeyHelper`, where a source could not be parsed, where the
-    /// vendor's profile store holds a config (under `$HOME/.config/anthropic`,
-    /// or where `ANTHROPIC_CONFIG_DIR` names it), where that store is inside
-    /// a file-provider domain (never listed), and where the environment was
-    /// not read at all or reads empty. NEGATIVE CONTROLS: settings that set
-    /// only a model and an `env` block with no such name leave it; and so
-    /// does a profile store with no `.json` in it.
+    /// A quiet tree leaves the stored login. It is gone where a settings source (user, project,
+    /// `--settings`) gives an API key, a profile or an `apiKeyHelper` or does not parse, where the
+    /// vendor's profile store holds a config (`$HOME/.config/anthropic`, or `ANTHROPIC_CONFIG_DIR`)
+    /// or sits in a file-provider domain, and where the environment is unread or empty. Negative
+    /// controls: a model and an unrelated `env` block, or a store with no `.json`.
     #[test]
     fn an_agents_settings_and_profile_store_can_take_its_stored_login_away() {
         let dir = scratch("stored");

@@ -283,6 +283,11 @@ fn quiet(_app: &App, _now: Instant) -> bool {
     true
 }
 
+/// A moment that is never quiet: the owner is typing.
+fn never_quiet(_app: &App, _now: Instant) -> bool {
+    false
+}
+
 #[test]
 fn setup_permission_hold_defers_queued_launch_decisions_and_automatic_page_effects() {
     use crate::devtools_helper::{HandOver, Origin, test_arms};
@@ -1730,6 +1735,453 @@ fn the_launch_asks_record_is_read_off_the_event_loop() {
         "asked on this Mac already: dropped"
     );
     assert_eq!(debugger_alerts().len(), before, "no alert");
+}
+
+/// THE OFFER WRITES THIS MAC OFF THE EVENT LOOP, AND ITS ALERT FOLLOWS AT THE NEXT LOOK.
+/// On a launch, the look that would ask starts the offer's disk half (the change lock,
+/// the record's read and this Mac's durable line) on a thread of its own and waits,
+/// queued and with no alert, however fast that ends, and the window's thread syncs
+/// nothing. The disk half's end makes the ask due, and the next look raises the alert
+/// before it judges anything again, so a moment that is no longer quiet does not hold
+/// back the alert for a Mac already recorded. A settle writes its record on a thread
+/// too. NEGATIVE CONTROL: with the disk work run in the look (the other tests' queue),
+/// that look raises the alert, and the window's thread made the durable flushes.
+#[test]
+fn the_launch_asks_record_is_written_off_the_event_loop() {
+    use aterm_durable::{Flush, seam::Recording};
+    let flushes = Recording::start();
+    let mut t = Instant::now();
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let config = root.path().join("aterm.toml");
+    let mut app = ready_to_ask(root.path(), owner_says_no);
+    app.debugger_launch =
+        crate::debugger_access::LaunchAskQueue::reading_record_for_test(|| Some("READY-MAC"));
+    let before = debugger_alerts().len();
+    let _ = flushes.take();
+    app.look_for_debugger_moment(later(&mut t), quiet);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the record's read ends",
+        || app.debugger_launch.asked("READY-MAC").map(|_| ()),
+    );
+    // A fresh reading at the moment, however long that read took.
+    debugger_reads_off(&mut app);
+    let asking = later(&mut t);
+    app.look_for_debugger_moment(asking, quiet);
+    assert!(app.debugger_launch.queued(), "the look waits for the write");
+    assert_eq!(
+        debugger_alerts().len(),
+        before,
+        "no alert before the record"
+    );
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the disk half ends", || {
+        app.debugger_launch.due(asking).then_some(())
+    });
+    assert!(crate::debugger_access::read_asked(&config, "READY-MAC"));
+    app.look_for_debugger_moment(asking, never_quiet);
+    assert_eq!(
+        debugger_alerts().len(),
+        before + 1,
+        "asked, once, quiet or not"
+    );
+    assert_eq!(debugger_alerts().last(), Some(&launch_alert(&mut app)));
+    assert!(
+        !app.debugger_launch.queued(),
+        "asked: over for this process"
+    );
+    assert!(
+        !flushes.take().contains(&Flush::Durable),
+        "nothing synced on the window's thread"
+    );
+
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut inline = ready_to_ask(root.path(), owner_says_no);
+    let _ = flushes.take();
+    inline.look_for_debugger_moment(later(&mut t), quiet);
+    assert_eq!(
+        debugger_alerts().len(),
+        before + 2,
+        "in the look: asked at once"
+    );
+    assert!(
+        flushes.take().contains(&Flush::Durable),
+        "in the look: synced on this thread"
+    );
+
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let config = root.path().join("aterm.toml");
+    let mut app = ready_to_ask(root.path(), owner_says_yes);
+    app.debugger_launch =
+        crate::debugger_access::LaunchAskQueue::reading_record_for_test(|| Some("READY-MAC"));
+    app.owner_quiet.lock().unwrap().note_debugger_answered();
+    let _ = flushes.take();
+    app.look_for_debugger_moment(later(&mut t), quiet);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the record's read ends",
+        || app.debugger_launch.asked("READY-MAC").map(|_| ()),
+    );
+    app.look_for_debugger_moment(later(&mut t), quiet);
+    assert!(!app.debugger_launch.queued(), "answered: settled");
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the settle's record lands",
+        || crate::debugger_access::read_asked(&config, "READY-MAC").then_some(()),
+    );
+    assert_eq!(debugger_alerts().len(), before + 2, "no alert");
+    assert!(
+        !flushes.take().contains(&Flush::Durable),
+        "the settle synced nothing on the window's thread"
+    );
+
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut inline = ready_to_ask(root.path(), owner_says_yes);
+    inline.owner_quiet.lock().unwrap().note_debugger_answered();
+    let _ = flushes.take();
+    inline.look_for_debugger_moment(later(&mut t), quiet);
+    assert!(!inline.debugger_launch.queued(), "in the look: settled");
+    assert!(
+        flushes.take().contains(&Flush::Durable),
+        "in the look: the settle synced on this thread"
+    );
+}
+
+/// WHILE THE OFFER'S DISK HALF IS OUT, THE ASK ONLY WAITS: a look then ends nothing,
+/// even one that would drop the ask (here, no config folder), so no write lands after
+/// the ask is over; and once the answer is in, it is spent before anything is judged
+/// again, so the Mac it recorded is asked. NEGATIVE CONTROL: with no disk half out, the
+/// same look drops the ask.
+#[test]
+fn the_launch_ask_waits_out_its_disk_half_and_spends_it_first() {
+    use crate::debugger_access::OfferPrep;
+    let mut t = Instant::now();
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut dropped = ready_to_ask(root.path(), owner_says_no);
+    dropped.consent_card_config = None;
+    dropped.look_for_debugger_moment(later(&mut t), quiet);
+    assert!(
+        !dropped.debugger_launch.queued(),
+        "no config folder: dropped"
+    );
+
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let read = app.debugger_access_facts();
+    let slot = app.debugger_launch.start_prepare(read).expect("none out");
+    app.consent_card_config = None;
+    let before = debugger_alerts().len();
+    let waiting = later(&mut t);
+    app.look_for_debugger_moment(waiting, quiet);
+    assert!(
+        app.debugger_launch.queued(),
+        "a write may still land: nothing ends"
+    );
+    assert!(app.debugger_launch.preparing());
+    assert_eq!(debugger_alerts().len(), before);
+    let _ = slot.set(OfferPrep::Recorded);
+    app.look_for_debugger_moment(waiting, quiet);
+    assert_eq!(
+        debugger_alerts().len(),
+        before + 1,
+        "the recorded Mac is asked"
+    );
+    assert!(
+        !app.debugger_launch.queued(),
+        "asked: over for this process"
+    );
+}
+
+/// FIRST-LAUNCH SETUP COMES FIRST: while it holds the macOS permissions back (its offer
+/// not yet answered, cancelled, or applied with its permissions choice unchecked) the
+/// ask does not look: no record, no alert, still queued. An Apply that keeps the choice
+/// releases it, and the Mac is asked.
+#[test]
+fn a_held_first_launch_setup_holds_the_debugger_ask() {
+    use crate::InitialSetupPermissionPolicy as Policy;
+    let mut t = Instant::now();
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let config = root.path().join("aterm.toml");
+    let mut app = ready_to_ask(root.path(), owner_says_no);
+    app.hold_initial_setup_permissions();
+    let before = debugger_alerts().len();
+    app.look_for_debugger_moment(later(&mut t), quiet);
+    assert!(app.debugger_launch.queued(), "held: still to come");
+    assert_eq!(debugger_alerts().len(), before, "held: no alert");
+    assert!(
+        !crate::debugger_access::read_asked(&config, "READY-MAC"),
+        "held: no record"
+    );
+    app.accepted_initial_setup_apply();
+    app.observe_initial_setup_permissions(Some(Policy {
+        revision: 1,
+        allowed: false,
+    }));
+    app.look_for_debugger_moment(later(&mut t), quiet);
+    assert_eq!(
+        debugger_alerts().len(),
+        before,
+        "the choice unchecked: held"
+    );
+    assert!(app.debugger_launch.queued());
+    app.accepted_initial_setup_apply();
+    app.observe_initial_setup_permissions(Some(Policy {
+        revision: 2,
+        allowed: true,
+    }));
+    app.look_for_debugger_moment(later(&mut t), quiet);
+    assert_eq!(debugger_alerts().len(), before + 1, "applied: asked");
+    assert!(crate::debugger_access::read_asked(&config, "READY-MAC"));
+}
+
+/// An app whose offer's disk half has just recorded this Mac: the look that
+/// started it waited, and its answer is in. `at` is that look's time.
+fn recorded_mid_offer(app: &mut App, t: &mut Instant) -> Instant {
+    let read = app.debugger_access_facts();
+    let slot = app.debugger_launch.start_prepare(read).expect("none out");
+    let at = later(t);
+    app.look_for_debugger_moment(at, quiet);
+    assert!(
+        app.debugger_launch.preparing(),
+        "PRECONDITION: the look waits"
+    );
+    let _ = slot.set(crate::debugger_access::OfferPrep::Recorded);
+    at
+}
+
+/// AN ANSWER GIVEN WHILE THE OFFER RECORDS SETTLES THE ASK: the owner answered a
+/// debugger-access alert after the offer was admitted (a Settings press, its change not
+/// started yet), so the Mac just recorded gets no second alert and the ask is over, as
+/// admission's settle for an answer says. NEGATIVE CONTROL: unanswered, the same answer
+/// raises the alert.
+#[test]
+fn an_answer_given_while_the_offer_records_settles_the_ask() {
+    let mut t = Instant::now();
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let at = recorded_mid_offer(&mut app, &mut t);
+    app.owner_quiet.lock().unwrap().note_debugger_answered();
+    let before = debugger_alerts().len();
+    app.look_for_debugger_moment(at, quiet);
+    assert_eq!(debugger_alerts().len(), before, "answered: no second alert");
+    assert!(!app.debugger_launch.queued(), "answered: settled");
+
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut unanswered = ready_to_ask(root.path(), owner_says_no);
+    let at = recorded_mid_offer(&mut unanswered, &mut t);
+    unanswered.look_for_debugger_moment(at, quiet);
+    assert_eq!(debugger_alerts().len(), before + 1, "unanswered: asked");
+}
+
+/// A DECLINE QUIET THAT BEGAN WHILE THE OFFER RECORDS DEFERS THE ALERT, NEVER DROPS IT:
+/// a recent decline of any Security alert quiets this one too, so the recorded answer is
+/// kept and the ask waits, still queued, for its time (not at the next wake); a look
+/// once the quiet has passed raises the alert, whatever the moment.
+#[test]
+fn a_decline_quiet_while_the_offer_records_defers_its_alert() {
+    use crate::debugger_access::AskWait;
+    let mut t = Instant::now();
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let at = recorded_mid_offer(&mut app, &mut t);
+    app.owner_quiet.lock().unwrap().note_decline();
+    let before = debugger_alerts().len();
+    app.look_for_debugger_moment(at, quiet);
+    assert_eq!(debugger_alerts().len(), before, "quieted: no alert yet");
+    assert!(app.debugger_launch.queued(), "quieted: still to come");
+    assert!(app.debugger_launch.offering(), "the answer is kept");
+    assert!(
+        !app.debugger_launch.due(at),
+        "a kept answer waits for its time"
+    );
+    let next = app.debugger_launch.next_deadline().expect("a later look");
+    assert_eq!(next, at + AskWait::OwnerQuiet.look_again());
+    *app.owner_quiet.lock().unwrap() = crate::native_settings::OwnerQuiet::default();
+    app.look_for_debugger_moment(next, never_quiet);
+    assert_eq!(
+        debugger_alerts().len(),
+        before + 1,
+        "the quiet passed: asked"
+    );
+    assert_eq!(debugger_alerts().last(), Some(&launch_alert(&mut app)));
+    assert!(
+        !app.debugger_launch.queued(),
+        "asked: over for this process"
+    );
+}
+
+/// A KEPT ANSWER'S ALERT STATES A FRESH READING OF THE RULE: once the decline quiet has
+/// passed, a reading older than [`crate::debugger_access::ASK_PROBE_FRESH`] is retired
+/// and the rule read again before any alert, as admission does, so a rule switched on
+/// meanwhile (by the owner's own `sudo`, which retires no cached answer) is a press the
+/// lane refuses: the ask ends with no alert, the record standing. NEGATIVE CONTROL: a
+/// rule read again as off is asked about.
+#[test]
+fn a_kept_answer_is_spent_on_a_fresh_reading_of_the_rule() {
+    use crate::debugger_access::ASK_PROBE_FRESH;
+    use aterm_containment::consent::{
+        DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel, ProbeGate, SelfHardening,
+    };
+    fn rule(mode: DebuggerMode) -> DebuggerProbe {
+        DebuggerProbe {
+            mode,
+            member: DebuggerMember::Admin,
+            label: DebuggerProbeLabel::StatusOk,
+        }
+    }
+    fn reads_on(_: ProbeGate) -> DebuggerProbe {
+        rule(DebuggerMode::Enabled)
+    }
+    fn reads_off(_: ProbeGate) -> DebuggerProbe {
+        rule(DebuggerMode::Disabled)
+    }
+    type ReadAgain = fn(ProbeGate) -> DebuggerProbe;
+    for (read_again, asked) in [(reads_on as ReadAgain, 0), (reads_off, 1)] {
+        let mut t = Instant::now();
+        let root = crate::test_scratch::outlived_dir("aterm-access-");
+        let mut app = ready_to_ask(root.path(), owner_says_no);
+        let at = recorded_mid_offer(&mut app, &mut t);
+        app.owner_quiet.lock().unwrap().note_decline();
+        app.look_for_debugger_moment(at, quiet);
+        assert!(app.debugger_launch.offering(), "PRECONDITION: kept");
+        *app.owner_quiet.lock().unwrap() = crate::native_settings::OwnerQuiet::default();
+        // The quiet outlasted the reading, and the rule may have changed meanwhile.
+        app.consent.publish_debugger_aged_for_test(
+            rule(DebuggerMode::Disabled),
+            SelfHardening::Hardened,
+            Duration::from_secs(120),
+        );
+        app.consent.probes_for_test().debugger = read_again;
+        let before = debugger_alerts().len();
+        let next = app.debugger_launch.next_deadline().expect("a later look");
+        app.look_for_debugger_moment(next, quiet);
+        assert_eq!(
+            debugger_alerts().len(),
+            before,
+            "no alert on an old reading"
+        );
+        assert!(app.debugger_launch.offering(), "kept for the fresh reading");
+        let gate = app.config.privacy_probe_gate();
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the rule read again",
+            || {
+                app.consent
+                    .debugger_cached(gate)
+                    .filter(|row| {
+                        !row.pending() && row.probe_age().is_some_and(|age| age < ASK_PROBE_FRESH)
+                    })
+                    .map(|_| ())
+            },
+        );
+        let next = app.debugger_launch.next_deadline().expect("a later look");
+        app.look_for_debugger_moment(next, quiet);
+        assert_eq!(
+            debugger_alerts().len(),
+            before + asked,
+            "asked only over a rule still off"
+        );
+        assert!(
+            !app.debugger_launch.queued(),
+            "over for this process either way"
+        );
+    }
+}
+
+/// FIRST-LAUNCH SETUP'S HOLD DOES NOT STRAND AN OFFER ADMITTED BEFORE IT ARMED: the
+/// hold holds back asks not yet admitted, but this Mac is recorded already, and an alert
+/// held behind a setup the owner cancels would never come. Under the hold the ask's
+/// looks keep waking while its answer is out or kept, and that answer is spent.
+/// NEGATIVE CONTROL: with nothing offered, a held look asks nothing and the hold folds
+/// no look for the ask.
+#[test]
+fn a_setup_hold_armed_while_the_offer_records_does_not_strand_it() {
+    use crate::metrics::DeadlineOwner;
+    let fold = |app: &App, now: Instant| {
+        let (mut deadline, mut owner) = (None, DeadlineOwner::None);
+        app.fold_consent_lane_deadlines(now, &mut deadline, &mut owner);
+        deadline
+    };
+    let focus = |app: &mut App| {
+        for ws in app.windows.values_mut() {
+            ws.os_window_for_test = true;
+            ws.focused = true;
+        }
+        assert!(
+            app.any_os_window_focused(),
+            "PRECONDITION: a focused window"
+        );
+    };
+    let mut t = Instant::now();
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut held = ready_to_ask(root.path(), owner_says_no);
+    focus(&mut held);
+    held.hold_initial_setup_permissions();
+    let before = debugger_alerts().len();
+    let at = later(&mut t);
+    held.look_for_debugger_moment(at, quiet);
+    assert_eq!(debugger_alerts().len(), before, "held: no alert");
+    assert!(held.debugger_launch.queued(), "held: still to come");
+    let look = at + Duration::from_secs(1);
+    held.debugger_launch.look_later(look);
+    assert_ne!(
+        fold(&held, at),
+        Some(look),
+        "held, nothing offered: no look folded for the ask"
+    );
+
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut app = ready_to_ask(root.path(), owner_says_no);
+    focus(&mut app);
+    let read = app.debugger_access_facts();
+    let slot = app.debugger_launch.start_prepare(read).expect("none out");
+    let at = later(&mut t);
+    app.look_for_debugger_moment(at, quiet);
+    app.hold_initial_setup_permissions();
+    let backstop = app.debugger_launch.next_deadline().expect("a later look");
+    assert_eq!(fold(&app, at), Some(backstop), "held: the look still wakes");
+    let _ = slot.set(crate::debugger_access::OfferPrep::Recorded);
+    app.look_for_debugger_moment(at, quiet);
+    assert_eq!(
+        debugger_alerts().len(),
+        before + 1,
+        "held, but recorded already: asked"
+    );
+    assert!(
+        !app.debugger_launch.queued(),
+        "asked: over for this process"
+    );
+
+    // An answer kept for a decline's quiet, not out, still wakes its look under the hold.
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut kept = ready_to_ask(root.path(), owner_says_no);
+    focus(&mut kept);
+    let at = recorded_mid_offer(&mut kept, &mut t);
+    kept.owner_quiet.lock().unwrap().note_decline();
+    kept.look_for_debugger_moment(at, quiet);
+    assert!(
+        kept.debugger_launch.offering() && !kept.debugger_launch.preparing(),
+        "PRECONDITION: kept, not out"
+    );
+    kept.hold_initial_setup_permissions();
+    assert!(
+        kept.debugger_launch.next_deadline().is_some(),
+        "a later look"
+    );
+    // Before every other lane's turn, so the fold can only be the ask's.
+    let next = at + Duration::from_secs(1);
+    kept.debugger_launch.look_later(next);
+    assert_eq!(
+        fold(&kept, at),
+        Some(next),
+        "held: the kept look still wakes"
+    );
+    *kept.owner_quiet.lock().unwrap() = crate::native_settings::OwnerQuiet::default();
+    kept.look_for_debugger_moment(next, quiet);
+    assert_eq!(
+        debugger_alerts().len(),
+        before + 2,
+        "held, kept, the quiet passed: asked"
+    );
 }
 
 /// A headless instance never queues the ask, and one queued on it by hand drops at its

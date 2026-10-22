@@ -168,9 +168,8 @@ fn stall_facts(stall: &WorkerStall) -> String {
     }
 }
 
-/// The warning the remedy's bound takes by default, for the person where they
-/// look ([`super::IdleHost::inform`]): the state on its first line (the
-/// record's title), what to do on the second:
+/// The warning the remedy's bound gives by default, for the person ([`super::IdleHost::inform`]):
+/// the state on its first line (the record's title), what to do on the second:
 ///
 /// ```text
 /// claude frozen: not reading input for 11m00s (1 B queued, rss 38.8 GB)

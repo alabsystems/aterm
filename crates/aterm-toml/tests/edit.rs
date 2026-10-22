@@ -317,12 +317,8 @@ fn the_comment_lines_under_a_tables_last_line_are_that_tables() {
     }
 }
 
-/// A leading byte-order mark is the file's, so it stays first whatever an edit
-/// removes or adds. The edits are Settings' Reset then Undo, which reads the
-/// reset file back before writing the key again, and the retired
-/// `packages.auto_update` spelling giving way to `packages.enabled`. Carried
-/// on the first line's text, the mark followed that text below the key the
-/// edit added, where it does not parse, or went with the first line itself.
+/// A leading byte-order mark stays first whatever an edit removes or adds: Settings' Reset
+/// then Undo, and `packages.auto_update` giving way to `packages.enabled`.
 #[test]
 fn a_byte_order_mark_stays_first() {
     fn print(doc: &DocumentMut) -> String {

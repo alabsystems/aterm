@@ -19,7 +19,7 @@
 //! and a `--fleet` that differs is refused until `off`, exit 2, before
 //! anything is written; so is a root whose metadata cannot be read.
 //!
-//! ## The steps, in order
+//! ## `on`, in order
 //!
 //! 1. The binary: `aterm` on `$PATH`, else this executable (a development
 //!    build's `ATERM_BIN` seam first). It has to carry `link serve` and
@@ -41,7 +41,9 @@
 //!    every aterm on the machine.
 //! 2. The root, `~/.local/share/aterm-fabric`, 0700 (the `$ATERM_FABRIC_HOME`
 //!    development seam redirects it) — an existing one another user can reach
-//!    is made 0700, and the line names the mode it had — and, for an aterm
+//!    by its mode is made 0700, and the line names the mode it had; one that is
+//!    a symlink, another user's, or open to others by an access list is
+//!    refused (`aterm_uds::private_file`'s one rule) — and, for an aterm
 //!    path that is not plain, the `program` link in it (step 1), made or
 //!    re-pointed, never over a file that is not a link (`program_step`). The
 //!    broker's socket lives in it, and the directory bounds who can connect
@@ -1971,9 +1973,8 @@ pub(crate) use aterm_uds::atomic_file::{
     create_temp_beside, write as write_atomic, ConfigFile, LOCK_OPEN_FLAGS,
 };
 
-/// `n` random bytes through the ONE audited entropy helper
-/// (`aterm_uds::rand`): a hand-rolled device read is the incident the B4 guard
-/// exists for.
+/// `n` random bytes through the one audited entropy helper (`aterm_uds::rand`); the `dev-read`
+/// guard refuses a hand-rolled device read.
 pub(crate) fn random_bytes(n: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     aterm_uds::rand::fill(&mut buf)?;
@@ -2230,63 +2231,65 @@ fn config_step(config: Option<&Path>, command: &[String], out: &mut Out) -> bool
     }
 }
 
-/// Step 2 of `on`: the fabric root and its state directory, both 0700 — `already`
-/// when both exist at that mode, else created (a dry run writes nothing). An existing one
-/// another user can reach (a restore, a `cp -r`) is made 0700 and the line names the mode it
-/// had: the root holds the socket, the mint secret and the cap, so it is never reported 0700
-/// without its mode having been read. `false` stops the run.
+/// Step 2 of `on`: the fabric root and its state directory, each a private directory by
+/// aterm-uds's one rule ([`aterm_uds::private_file::ensure_private_dir`]) — `already` when
+/// both are, else the missing ones created 0700 (a dry run writes nothing). An existing one
+/// another user can reach by its mode (a restore, a `cp -r`) is made 0700 and the line names
+/// the mode it had: the root holds the socket, the mint secret and the cap, so it is never
+/// reported 0700 without its mode having been read. One that is a symlink, no directory,
+/// another user's, or open to others by an access list (an inherited `everyone allow read`
+/// entry, which mode bits do not show) is refused, and nothing is changed: `false` stops the
+/// run.
 fn root_step(p: &Paths, state: &Path, out: &mut Out) -> bool {
-    if p.root.is_dir() && state.is_dir() {
-        use std::os::unix::fs::PermissionsExt;
-        let mut wide = Vec::new();
-        for d in [p.root.as_path(), state] {
-            match std::fs::metadata(d) {
-                Ok(m) if m.permissions().mode() & 0o077 == 0 => {}
-                Ok(m) => wide.push((d, m.permissions().mode() & 0o777)),
-                Err(e) => {
-                    out.fail("root", &format!("{}: {e}", d.display()));
-                    return false;
-                }
+    use aterm_uds::private_file::{ensure_private_dir, judge_private_dir, PrivateDir};
+    // A refusal names the directory; an OS error (it carries a code) does not.
+    let failed = |out: &mut Out, d: &Path, e: &io::Error| {
+        if e.raw_os_error().is_some() {
+            out.fail("root", &format!("{}: {e}", d.display()));
+        } else {
+            out.fail("root", &e.to_string());
+        }
+    };
+    // Both judged before either is changed, so a refusal of the second leaves the
+    // first as it was.
+    let mut missing = Vec::new();
+    let mut wide = Vec::new();
+    for d in [p.root.as_path(), state] {
+        match judge_private_dir(d) {
+            Ok(PrivateDir::Private) => {}
+            Ok(PrivateDir::Missing) => missing.push(d),
+            Ok(PrivateDir::Open(mode)) => wide.push((d, mode)),
+            Err(e) => {
+                failed(out, d, &e);
+                return false;
             }
         }
-        if wide.is_empty() {
-            out.already("root", &format!("{} (0700)", p.root.display()));
-            return true;
-        }
-        let was: Vec<String> = wide
-            .iter()
-            .map(|(d, mode)| format!("{} was {mode:04o}", d.display()))
-            .collect();
-        out.done(
-            "root",
-            &format!("chmod 700 — {}", was.join(", ")),
-            &format!("made 0700 ({})", was.join(", ")),
-        );
-        if !out.dry_run {
-            for (d, _) in &wide {
-                if let Err(e) = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))
-                {
-                    out.fail("root", &format!("{}: {e}", d.display()));
-                    return false;
-                }
-            }
-        }
+    }
+    if missing.is_empty() && wide.is_empty() {
+        out.already("root", &format!("{} (0700)", p.root.display()));
         return true;
     }
-    out.done(
-        "root",
-        &format!("create {} and {} (0700)", p.root.display(), state.display()),
-        &format!("created {} (0700)", p.root.display()),
-    );
+    let made: Vec<String> = missing.iter().map(|d| d.display().to_string()).collect();
+    let was: Vec<String> = wide
+        .iter()
+        .map(|(d, mode)| format!("{} was {mode:04o}", d.display()))
+        .collect();
+    let (mut would, mut did) = (Vec::new(), Vec::new());
+    if !made.is_empty() {
+        would.push(format!("create {} (0700)", made.join(" and ")));
+        did.push(format!("created {} (0700)", made.join(" and ")));
+    }
+    if !was.is_empty() {
+        would.push(format!("chmod 700 — {}", was.join(", ")));
+        did.push(format!("made 0700 ({})", was.join(", ")));
+    }
+    out.done("root", &would.join("; "), &did.join("; "));
     if !out.dry_run {
-        if let Err(e) = std::fs::create_dir_all(state).and_then(|()| {
-            for d in [p.root.as_path(), state] {
-                std::fs::set_permissions(d, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        for d in [p.root.as_path(), state] {
+            if let Err(e) = ensure_private_dir(d) {
+                failed(out, d, &e);
+                return false;
             }
-            Ok(())
-        }) {
-            out.fail("root", &format!("{}: {e}", state.display()));
-            return false;
         }
     }
     true
@@ -3606,9 +3609,11 @@ pub fn on(opts: &OnOpts) -> ExitCode {
                 ),
                 &format!("minted {}", secret.display()),
             );
+            // Written by aterm-uds's private-file writer: the root is judged private
+            // (step 2's rule) again, as it stands, before a byte of the secret lands in it.
             if !opts.dry_run {
-                if let Err(e) =
-                    random_bytes(SECRET_LEN).and_then(|b| write_atomic(&secret, &b, 0o600))
+                if let Err(e) = random_bytes(SECRET_LEN)
+                    .and_then(|b| aterm_uds::private_file::write_private(&p.root, MINT_SECRET, &b))
                 {
                     out.fail("secret", &format!("{}: {e}", secret.display()));
                     return ExitCode::from(2);
@@ -5149,6 +5154,116 @@ mod tests {
             .file_type()
             .is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `on`'s paths with `root` as the fabric root.
+    fn paths_at(root: &Path) -> Paths {
+        Paths {
+            home: root.parent().expect("a parent").to_path_buf(),
+            login_home: None,
+            root: root.to_path_buf(),
+            aterm: "/usr/local/bin/aterm".to_string(),
+            fleet: "local".to_string(),
+            config: None,
+            rendezvous: None,
+            durability: None,
+        }
+    }
+
+    fn dir_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::symlink_metadata(path)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// Step 2 judges the root and its state directory by aterm-uds's private-directory
+    /// rule. A dry run changes nothing; a missing state directory is made 0700; a root open
+    /// by its mode is narrowed; a second run reads `already`. A symlinked root is refused, and
+    /// nothing is made through it.
+    #[test]
+    fn the_root_step_makes_narrows_or_refuses_by_the_private_directory_rule() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let p = paths_at(&root);
+        let state = p.state();
+
+        let mut dry = Out::new(true);
+        assert!(root_step(&p, &state, &mut dry));
+        assert_eq!((dry.changed, dry.failed), (1, false));
+        assert_eq!(dir_mode(&root), 0o755, "a dry run narrows nothing");
+        assert!(!state.exists(), "a dry run makes nothing");
+
+        let mut run = Out::new(false);
+        assert!(root_step(&p, &state, &mut run));
+        assert_eq!((run.changed, run.failed), (1, false));
+        assert_eq!(dir_mode(&root), 0o700);
+        assert_eq!(dir_mode(&state), 0o700);
+
+        let mut again = Out::new(false);
+        assert!(root_step(&p, &state, &mut again));
+        assert_eq!((again.changed, again.failed), (0, false));
+
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&root, &linked).expect("link");
+        let p = paths_at(&linked);
+        let mut out = Out::new(false);
+        assert!(!root_step(&p, &p.state(), &mut out));
+        assert!(out.failed);
+    }
+
+    /// On macOS a 0700 root carrying an `everyone allow read` entry is open to every user
+    /// though its mode says otherwise: step 2 refuses it, dry or not, and makes no state
+    /// directory in it; the mint secret's writer refuses that root as well. Once `chmod -N`
+    /// removes the entry, the same step passes and the secret is written 0600: the negative
+    /// control.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_root_step_refuses_a_root_an_access_list_opens_to_others() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let root = dir.path().join("root");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        let chmod = |args: &[&str]| {
+            let ran = aterm_uds::spawnfd::command("/bin/chmod")
+                .args(args)
+                .arg(&root)
+                .status()
+                .expect("run chmod");
+            assert!(ran.success(), "chmod {args:?}");
+        };
+        chmod(&["+a", "everyone allow read"]);
+        let p = paths_at(&root);
+        let state = p.state();
+        for dry_run in [true, false] {
+            let mut out = Out::new(dry_run);
+            assert!(!root_step(&p, &state, &mut out), "dry_run={dry_run}");
+            assert!(out.failed);
+            assert!(!state.exists(), "dry_run={dry_run}");
+        }
+        assert_eq!(
+            aterm_uds::private_file::write_private(&root, MINT_SECRET, b"secret")
+                .expect_err("a root an access list opens")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(!p.secret().exists());
+
+        chmod(&["-N"]);
+        let mut out = Out::new(false);
+        assert!(root_step(&p, &state, &mut out));
+        assert_eq!(dir_mode(&state), 0o700);
+        aterm_uds::private_file::write_private(&root, MINT_SECRET, b"secret").expect("write");
+        let meta = std::fs::symlink_metadata(p.secret()).expect("secret");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     }
 
     /// Any root but the default derives its label from POSIX `cksum` of its path (the expected

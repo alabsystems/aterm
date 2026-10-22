@@ -2369,12 +2369,11 @@ mod macos {
                     self.show_context_menu(event);
                     return;
                 }
-                // A double-click renames the tab's focused session in place; AppKit has
-                // already applied the system interval and slop. After the ctrl guard,
-                // before the drag seed: latching `dragged` stops a wobble from posting
-                // a reorder under the opening editor. The first press already selected.
-                // `== 2` because later clicks land on the field, and
-                // `begin_session_rename` is idempotent anyway.
+                // A double-click (AppKit applied the system interval and slop)
+                // renames the tab's focused session in place; the first press
+                // already selected. Latching `dragged` stops a wobble from posting
+                // a reorder under the opening editor. `== 2` because later clicks
+                // land on the field.
                 // SAFETY: `clickCount` is a side-effect-free getter on the live
                 // event, on the main thread.
                 if unsafe { appkit::send_isize(event, sel!(clickCount)) } == 2 {

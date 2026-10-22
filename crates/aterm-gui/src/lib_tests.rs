@@ -1208,6 +1208,100 @@ fn a_headless_bell_never_reaches_the_alert_sound() {
     );
 }
 
+/// One `key=` field of a `status` record, `None` when the record has none.
+fn status_field<'a>(record: &'a str, key: &str) -> Option<&'a str> {
+    record
+        .split(' ')
+        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// WHICH TAB RANG (2026-10-22): a BEL is kept on the session whose program
+/// rang it — the program in front, as `status program=` names it, and what
+/// the gates made of its sound, the newest first — and `status` says so.
+/// NEGATIVE CONTROL: the other tab, which rang nothing, reads
+/// `bells=0 bells_sounded=0 last_bell=-`. Keeping it moves nothing the bell
+/// does: the alert sound is still the gates' (one sounded, the second inside
+/// its lane `limited`, the third `off` by `bell_sound = false`).
+#[test]
+fn a_bell_is_kept_on_the_tab_that_rang_it_and_on_no_other() {
+    let mut app = App::headless_for_test();
+    app.headless = false;
+    let quiet = app.next_session_id;
+    app.push_stub_tab(WindowId(0), crate::stub_session(quiet));
+    {
+        let ctx = app.pool.get(0).expect("the ringing tab").ctx.clone();
+        let mut timeline = ctx.timeline.lock().unwrap();
+        timeline.note_foreground_group(4242);
+        timeline.set_program(4242, Some("vim".into()));
+    }
+    let now = std::time::Instant::now();
+    let before = crate::alert_sounds_on_this_thread();
+
+    app.on_bell(WindowId(0), 0, now);
+    app.on_bell(WindowId(0), 0, now);
+    app.config.bell_sound = Some(false);
+    app.on_bell(WindowId(0), 0, now);
+
+    assert_eq!(
+        crate::alert_sounds_on_this_thread() - before,
+        1,
+        "the record moves no gate: one sound for the three bells",
+    );
+    let rang = app.session_status_record(0).expect("the ringing tab");
+    assert_eq!(status_field(&rang, "bells"), Some("3"), "{rang}");
+    assert_eq!(status_field(&rang, "bells_sounded"), Some("1"), "{rang}");
+    let last: Vec<(&str, &str)> = status_field(&rang, "last_bell")
+        .expect("last_bell=")
+        .split(',')
+        .map(|entry| {
+            let mut parts = entry.split('/');
+            let age = parts.next().expect("an age");
+            assert!(age.parse::<u64>().is_ok(), "{entry}");
+            (
+                parts.next().expect("a sound"),
+                parts.next().expect("a program"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        last,
+        [("off", "vim"), ("limited", "vim"), ("sounded", "vim")],
+        "the newest first: {rang}"
+    );
+
+    let silent = app.session_status_record(quiet).expect("the quiet tab");
+    assert!(
+        silent.contains(" bells=0 bells_sounded=0 last_bell=- "),
+        "a tab that rang nothing says so: {silent}"
+    );
+}
+
+/// A headless instance's bell is kept as `headless` (it never sounds), and
+/// a serious-mode one as `serious`: the word names the gate that kept it
+/// quiet. NEGATIVE CONTROL: `bells_sounded=0` beside `bells=2`.
+#[test]
+fn a_quiet_bell_is_kept_with_the_gate_that_quieted_it() {
+    let mut app = App::headless_for_test();
+    let now = std::time::Instant::now();
+    app.on_bell(WindowId(0), 0, now);
+    app.headless = false;
+    assert!(app.set_serious_mode(true));
+    app.on_bell(WindowId(0), 0, now);
+    let record = app.session_status_record(0).expect("live session");
+    assert_eq!(status_field(&record, "bells"), Some("2"), "{record}");
+    assert_eq!(
+        status_field(&record, "bells_sounded"),
+        Some("0"),
+        "{record}"
+    );
+    let sounds: Vec<&str> = status_field(&record, "last_bell")
+        .expect("last_bell=")
+        .split(',')
+        .map(|entry| entry.split('/').nth(1).expect("a sound"))
+        .collect();
+    assert_eq!(sounds, ["serious", "headless"], "{record}");
+}
+
 #[test]
 fn capture_present_barrier_is_bounded_and_fail_closed() {
     let drive = |sequence: &[bool]| {
@@ -1704,11 +1798,9 @@ fn reload_retheme_then_revert_live_terminal() {
     assert_ne!(t.render_row(0)[0].bg, [0x20, 0x30, 0x40]);
 }
 
-/// Cmd-F find core, end to end over the real shared path: `search_full_history`
-/// finds every case-insensitive occurrence over a live terminal, `map_matches`
-/// maps the engine's absolute rows to selection rows, and highlighting a match
-/// via the selection (what `search_apply_current` does) round-trips to the
-/// matched text — so the find genuinely works.
+/// Cmd-F find over the real shared path: `search_full_history` finds every case-insensitive
+/// occurrence, `map_matches` maps the engine's absolute rows to selection rows, and a match
+/// applied as the selection (as `search_apply_current` does) round-trips to the matched text.
 #[test]
 fn find_matches_and_highlight() {
     use crate::app_search::map_matches;

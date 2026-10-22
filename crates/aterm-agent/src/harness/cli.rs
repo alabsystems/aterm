@@ -2653,9 +2653,9 @@ pub struct LimitsView {
 /// [`LimitsView`] of `rows`, read by `reader` (the tab's: [`aterm_phase::identify`]
 /// of its `status` `program=`), as of `now`: a reset that names no zone (or one
 /// `zone_offset_at` does not know) is at `local_offset_s`. A zone's offset is
-/// read AT the instant placed for ([`limit::zone_offset_at`] in production), as
-/// the loop that waits for the reset reads it, so a reset across a
-/// daylight-saving change shows the time the supervisor will continue at.
+/// read at the instant placed ([`limit::zone_offset_at`] in production), as the
+/// waiting loop reads it, so a reset across a daylight-saving change shows the
+/// time the supervisor will continue at.
 #[must_use]
 pub fn limits_view(
     reader: &dyn aterm_phase::ScreenReader,

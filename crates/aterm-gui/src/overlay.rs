@@ -156,9 +156,7 @@ fn seal(tag: u64, inner: u64) -> u64 {
     (tag.rotate_left(56) ^ inner) | 1
 }
 
-/// The single modal-overlay slot on a window. Exactly one variant is live at a time;
-/// mutual exclusion is structural (a slot holds one value), replacing the old
-/// hand-maintained "clear the other two" dance.
+/// The single modal-overlay slot on a window: one variant is live at a time.
 pub(crate) enum Overlay {
     Palette(PaletteState),
     /// The Overview (design §6) — every session grouped by window with its

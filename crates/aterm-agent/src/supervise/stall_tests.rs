@@ -136,9 +136,8 @@ fn a_thawed_worker_has_its_point_decided_again() {
     ended_with_the_session(&lines, code);
 }
 
-/// The loop tells its host the stall it holds and that it lifted
-/// ([`IdleHost::stalled`]), a notice of what it saw. Negative control: a
-/// worker that never stalls tells the host nothing.
+/// The host is told when a stall is held and when it lifts ([`IdleHost::stalled`]); a worker
+/// that never stalls tells it nothing.
 #[test]
 fn the_host_is_told_the_stall_it_holds_and_that_it_lifted() {
     #[derive(Debug, Default)]

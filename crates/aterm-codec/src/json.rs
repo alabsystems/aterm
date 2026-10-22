@@ -6,16 +6,14 @@
 //! (`aterm_control::wire::json_escape*` re-export it), and the supervisor's
 //! journal.
 //!
-//! RFC 8259 requires only `"`, `\` and U+0000-U+001F escaped, and a writer
-//! that stops there is valid JSON — but a reply is often read raw on a
-//! terminal, and a value in it is text a program chose (an OSC 7 cwd, an OSC
-//! 633 command line, a cell's glyph). So every character a terminal acts on or
-//! reorders text around ([`crate::tty::is_active`]: DEL, C1, the bidi marks,
-//! embeddings, overrides and isolates, U+2028/U+2029) is escaped as `\uXXXX`
-//! too. That is still valid JSON and decodes to the same string, so no parser
-//! sees a difference; only the raw bytes stop carrying instructions. Every
-//! other character, non-ASCII included, is verbatim UTF-8, so a styled frame
-//! of CJK text stays its size.
+//! RFC 8259 requires only `"`, `\` and U+0000-U+001F escaped, but a reply is
+//! often read raw on a terminal and its values are text a program chose (an
+//! OSC 7 cwd, an OSC 633 command line, a cell's glyph). So every character a
+//! terminal acts on or reorders text around ([`crate::tty::is_active`]: DEL, C1,
+//! the bidi marks, embeddings, overrides and isolates, U+2028/U+2029) is escaped
+//! as `\uXXXX` too: still valid JSON decoding to the same string, but the raw
+//! bytes carry no instructions. Every other character, non-ASCII included, is
+//! verbatim UTF-8, so a styled frame of CJK text stays its size.
 //!
 //! `aterm_link::glance`'s `json_string` stays separate because it escapes every
 //! character outside printable ASCII for an ASCII-only file contract.
@@ -122,8 +120,7 @@ mod tests {
         out
     }
 
-    /// The wire's spelling is unchanged for what it escaped before, and the
-    /// active class past C0 is now `\uXXXX` too.
+    /// RFC 8259's escapes, plus the active class past C0 as `\uXXXX`.
     #[test]
     fn escape_spells_rfc_8259_and_the_active_class() {
         for (raw, json) in [

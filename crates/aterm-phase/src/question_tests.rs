@@ -1047,9 +1047,8 @@ fn a_multi_select_cut_under_its_head_is_head_off_screen_at_every_swept_width() {
     );
 }
 
-/// The hand-built column-one dialogs (a shape 2.1.282 does not draw)
-/// are still questions — prompt phase — but not read whole, so nothing
-/// answers them.
+/// The hand-built column-one dialogs (a shape 2.1.282 does not draw) are questions but
+/// not read whole, so nothing answers them.
 #[test]
 fn a_column_one_question_is_still_a_question_not_read_whole() {
     for text in [QUESTION_YES_NO, QUESTION_DO_YOU_WANT] {
@@ -1859,16 +1858,11 @@ fn the_2_1_283_preview_is_unknown_on_its_chat_row_and_with_its_notes_open() {
     assert_eq!(focused[1], "❯ Chat about this");
 }
 
-/// The contract's texts (§4), typed into each 2.1.283 select tab — single
-/// and multi-select, alone and one of two, focused and left for the button
-/// — and wrapped as 2.1.283 wraps them, read back whole and exactly at 80
-/// and 200 columns, and at every width between the narrowest the tab's
-/// other rows fit in and 220: never cut, never joined with a doubled or
-/// missing space, never read as the placeholder. The two-question tabs
-/// with text in the field draw an 84-cell footer (`Enter to select ·
-/// Tab/Arrow keys to navigate · ctrl+g to edit in Vim · Esc to cancel`), so
-/// their narrowest is 84: how 2.1.283 draws that footer in 80 columns is
-/// not measured (the live check at 80x24 is the contract's L7).
+/// The policy texts, typed into each 2.1.283 select tab (single and multi-select, alone
+/// and one of two, focused and left for the button) and wrapped as 2.1.283 wraps them,
+/// read back whole and exactly at every width from the narrowest the tab's other rows
+/// fit in to 220. The two-question tabs with text in the field draw an 84-cell footer,
+/// so their narrowest is 84.
 #[test]
 fn the_reworded_policy_texts_read_whole_at_80_and_200_columns() {
     let check = |capture: &str, text: &str, width: usize| {
@@ -2308,14 +2302,9 @@ fn a_free_text_drawn_against_its_checkbox_reads_whole() {
     assert_eq!(worker_phase(&r), Phase::Prompt);
 }
 
-/// ATERM-KI-1015-1 F2, the reader's half (the harness sweep of 2026-10-15,
-/// Claude Code 2.1.300 at 50 columns): the long-term policy text typed into a
-/// multi-select question's free-text row, which ticks itself, is drawn `4.
-/// [✔]Decide yourself: …` — no space after the box — with its rows at column
-/// 8, not 9. Read only as `[✔] `, the row was no option, the dialog unknown,
-/// and the question the harness had answered was escalated as one aterm
-/// "could not read whole". Read with the vendor's spacing, it is the text the
-/// harness typed, ticked, with the focus on `Submit`.
+/// 2.1.300 at 50 columns draws a ticked multi-select free-text row as `4. [✔]Decide
+/// yourself: …`, no space after the box, its rows at column 8: it reads whole as the
+/// text typed, ticked, the focus on `Submit`.
 #[test]
 fn a_ticked_free_text_row_drawn_without_a_space_is_read_whole() {
     let (_, p, d) = read(QUESTION_MULTI_TYPED_50_2_1_300);

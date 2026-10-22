@@ -842,6 +842,17 @@ pub const NEED_WORDS: &[&str] = &[
     "decision",
     "help",
     "unknown",
+    // Phase 6 (6F-9, ruling U26), appended: the printed need words
+    // (`aterm_types::needs::NeedWord`, `status needs=`) a `shown` mark names
+    // (`question` is above). No need shown is no `need=`, never a word.
+    "frozen",
+    "stopped",
+    "stalled",
+    "login",
+    "memory",
+    "wall",
+    "ask",
+    "approval",
 ];
 
 /// The `word=` vocabulary: the agent verdict words, `act` words, `verdict`
@@ -1040,6 +1051,15 @@ pub const NET_WORDS: &[&str] = &["zero", "changed"];
 /// The class of program a render epoch judged (`render class=`, Phase 6
 /// step 6F-7): `aterm-gui`'s `resize_epoch::ProgramClass` words.
 pub const CLASS_WORDS: &[&str] = &["agent", "learned", "unknown"];
+
+/// How a shown need is shown (`shown sev=`, Phase 6 step 6F-9, ruling U26):
+/// `aterm_types::needs::Severity`'s words. No need shown is no `sev=`.
+pub const SEV_WORDS: &[&str] = &["stuck", "decide"];
+
+/// Whose hold the person is shown (`shown held=`, Phase 6 step 6F-9, ruling
+/// U26): `aterm_types::needs::HoldWord`'s words (`hold_by=`). No hold is no
+/// `held=`. Not `origin=`: that is a hold's slot, `fleet` among them.
+pub const HELD_WORDS: &[&str] = &["person", "remote", "local", "bridge"];
 
 /// What healed a render epoch (`render healed_by=`, Phase 6 step 6F-7):
 /// `aterm-gui`'s `resize_epoch::EpochBy` words, an open epoch's `-` aside.

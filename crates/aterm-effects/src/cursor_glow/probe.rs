@@ -17,9 +17,8 @@ pub(super) enum NbrProbe {
     /// No neighbour capture with this probe (a host wiring only `observe_row`):
     /// the row is unknown and no content witness judges it.
     Unprobed,
-    /// No row handed: the grid edge, or (from the GUI) a frame v2 did not own,
-    /// whose capture skipped the flanking rows. No witness judges it. (The
-    /// stars' gate reads v2's occupancy, which answers off-grid rows itself.)
+    /// No row handed: the grid edge, or a GUI frame v2 did not own, whose
+    /// capture skipped the flanking rows. No witness judges it.
     OffGrid,
     /// Captured: the chars ride the matching `row_above_*`/`row_below_*` double
     /// buffer, rotated with `row_cur`/`row_prev`.
@@ -36,21 +35,17 @@ pub(super) enum NbrProbe {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProbeTrust {
     /// Primary screen, or an alt-screen app inside the repaint-blink window (a
-    /// DECTCEM hide inside a DEC-2026 update: Claude Code's per-keystroke
-    /// bracket): every consumer may read it, kill/poof included.
+    /// DECTCEM hide inside a DEC-2026 update): every consumer, kill/poof included.
     Full,
-    /// Alt screen without repaint-blink evidence (less, vi, the ESC 7/ESC 8
-    /// streamer): exact content proofs only (the typed/delete confirm and the
-    /// unowned-steady anchor attestation, which fail closed on any difference).
-    /// Every kill/poof branch refuses it, so a Ctrl-U page scroll with a fresh
-    /// kill hint puffs no smoke.
+    /// Alt screen without repaint-blink evidence: exact content proofs only
+    /// (the typed/delete confirm and the unowned-steady anchor attestation, which
+    /// fail closed on any difference). Every kill/poof branch refuses it.
     ContentOnly,
 }
 
-/// Metadata for one cursor-row content probe ([`CursorGlow::observe_row`]): the
-/// sampled row, the caret, the row's fill (one past the last non-blank column),
-/// when, and its [`ProbeTrust`] class. The chars ride the double buffer
-/// (`row_cur`/`row_prev`).
+/// Metadata for one cursor-row content probe ([`CursorGlow::observe_row`]);
+/// `fill` is one past the last non-blank column. The chars ride the
+/// `row_cur`/`row_prev` double buffer.
 #[derive(Clone, Copy)]
 pub(super) struct RowProbe {
     pub(super) row: u16,
@@ -65,16 +60,13 @@ pub(super) struct RowProbe {
     pub(super) above: NbrProbe,
     /// What the host said about the row below `row`.
     pub(super) below: NbrProbe,
-    /// Which detector families may read this probe (see [`ProbeTrust`]). Rotates
-    /// with the metadata, so a kill branch cannot pair a full-trust `cur` with a
-    /// content-only `prev` unnoticed.
+    /// Which detector families may read this probe; rotates with the metadata,
+    /// so a kill branch cannot pair a full-trust `cur` with a content-only `prev`.
     pub(super) trust: ProbeTrust,
 }
 
-/// One sampled grid row for Rainbow Kitty's content witness
-/// ([`CursorGlow::observe_ribbon_row`], [`CursorGlow::capture_ribbon_row`]): the
-/// row and its per-column chars in the row probe's convention. Slots are
-/// resident and reused, so a steady frame allocates nothing.
+/// One sampled grid row for Rainbow Kitty's content witness, per-column chars
+/// in the row probe's convention. Slots are resident and reused.
 #[derive(Default)]
 pub(super) struct WitnessRowBuf {
     pub(super) row: u16,

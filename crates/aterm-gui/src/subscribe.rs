@@ -1570,11 +1570,9 @@ fn drain_log_events(watch: &mut Watch, sid: &str, out: &mut String) {
     }
 }
 
-/// A `GAP <sid> events-resync=<floor>` frame: a `since-turn=` resume anchor sat below
-/// the ledger's retained low-water, so turn records in `(anchor, floor)` were
-/// drop-oldest evicted, or left behind by a self-update handoff that could not carry
-/// the ledger whole, and are gone — the resumed subscriber missed them (re-read
-/// `history` if it needs the content). The events-stream twin of `frame_gap`.
+/// The `mail` stream: one `MAIL` line per newly delivered row the filter wants, oldest
+/// first, preceded by a `GAP` when the ring evicted rows this subscriber was never
+/// shown. Appended to the wake's buffer, so a wake is still one frame.
 ///
 /// Returns a [`Frame`], not a `String`, because unlike its sibling formatters this
 /// one is emitted STANDALONE rather than appended to a target's wake body — and a
@@ -4482,9 +4480,8 @@ mod tests {
         );
     }
 
-    /// ALT-SCREEN swap (1049) does not move the MAIN grid's `content_seq`, so a swap
-    /// landing on a seq the client already saw would be invisible to a pure seq
-    /// compare. A flag flip must force a resync (GAP + full frame) even at equal seq.
+    /// An alt-screen swap (1049) leaves the main grid's `content_seq` alone, so a flag
+    /// flip forces a resync (GAP + full frame) even at an equal seq.
     #[test]
     fn alt_screen_flip_forces_resync_even_at_equal_seq() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -4498,8 +4495,8 @@ mod tests {
             screen: true,
             ..Default::default()
         };
-        // The watch believes it is caught up at this seq but on the MAIN buffer
-        // (last_alt=false): the alt flip is the ONLY thing that changed.
+        // Caught up at this seq but on the main buffer (`last_alt == false`): the alt
+        // flip is the only change.
         let mut w = Watch {
             last_sent_seq: seq,
             ..watch_on(1, &term)
@@ -5162,8 +5159,7 @@ mod tests {
         );
     }
 
-    /// A `cells` DELTA carries the LOSSLESS styled-screen JSON payload (Item 1),
-    /// length-prefixed, on content advance.
+    /// A `cells` DELTA carries the lossless styled-screen JSON, length-prefixed.
     #[test]
     fn cells_delta_carries_styled_payload() {
         let term = Arc::new(Mutex::new(Terminal::new(2, 4)));
@@ -5356,19 +5352,12 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// THE EXIT LEDGER ON THE WIRE. A `subscribe … events` watch whose session a
-    /// control-socket `close` deregisters gets, BYTE-EXACTLY, the `closing` row the
-    /// store wrote — `reason=ctl-close by=<caller>` — followed by `exited`, and nothing
-    /// else: no history replayed, and the `state-change state=closed` written beside
-    /// it is not a wire kind (`exited` is that fact). Through the shipping
-    /// [`push_loop_with_peer_probe`], end to end, with the close
-    /// landing AFTER the loop has seeded and caught up. The peer probe is the one
-    /// hook the loop calls on its own thread strictly after the catch-up wake, so
-    /// deregistering from inside it is race-free where a feeder thread would have
-    /// to guess at the seeding instant. A `closing` row written after subscription
-    /// is a push; one written earlier would be history and this test would
-    /// (rightly) see nothing — so it also pins that the row is written AT
-    /// deregistration, not before.
+    /// The exit ledger on the wire, end to end through [`push_loop_with_peer_probe`]: an
+    /// `events` watch whose session a control-socket `close` deregisters gets exactly the
+    /// store's `closing reason=ctl-close by=<caller>` row, then `exited`, and nothing else
+    /// (the `state-change state=closed` beside it is no wire kind). The close runs inside
+    /// the peer probe, which the loop calls only after seeding and the catch-up wake, so
+    /// the row is a push, and it pins that the row is written at deregistration.
     #[test]
     fn push_loop_delivers_closing_before_exited_for_a_ctl_close() {
         let store = crate::session_store::new_store();
@@ -6147,17 +6136,9 @@ mod tests {
         assert_eq!(readers_of(&store), 0, "the ended loop left the readers");
     }
 
-    /// THE SCP-4 CORRECTNESS FIX, with its own negative control.
-    ///
-    /// A sibling that BOTH spawns and exits between two wakes used to appear in
-    /// neither snapshot and emit neither event — the `sessions` stream's own doc
-    /// said so outright. The journal records each transition as it happens, so both
-    /// events now surface, in order, on the next wake.
-    ///
-    /// The negative control is the OLD mechanism run over the SAME two instants:
-    /// it must emit nothing. Without it this test could pass for the wrong
-    /// reason (e.g. if the fixture accidentally left the session registered),
-    /// and the whole claim is that the two mechanisms DISAGREE here.
+    /// A sibling that both spawns and exits between two wakes surfaces as both events, in
+    /// order, on the next wake: the journal records each transition. The negative control
+    /// is a snapshot diff over the same two instants, which must see nothing.
     #[test]
     fn a_sub_tick_spawn_and_exit_both_surface() {
         let store = crate::session_store::new_store();
@@ -8005,14 +7986,11 @@ mod tests {
         );
     }
 
-    /// THE HANDSHAKE'S ACK FOLLOWS ITS WATCH'S SEED, as an adoption's does. A
-    /// reader acting on `sub <local> <sid>` — the fabric bridge reads the
-    /// session's opt-ins there — must find the watch already seeded, or a
-    /// `topic add` made between its read and the seed is below the watch's
-    /// watermark and in no read: pushed by nobody. The subscription here is
-    /// the bridge's own, `subscribe @* events,sessions` through the control
-    /// handler, and S's agent opts in at the instant its handshake ack is
-    /// written, on the thread that writes it.
+    /// The handshake's ack follows its watch's seed, as an adoption's does: a reader
+    /// acting on `sub <local> <sid>` must find the watch seeded, or a `topic add` made
+    /// between its read and the seed is pushed by nobody. The subscription is the
+    /// bridge's own, `subscribe @* events,sessions` through the control handler, and S
+    /// opts in at the instant its ack is written, on the writing thread.
     #[test]
     fn a_handshake_ack_is_written_after_its_watch_is_seeded() {
         let store = crate::session_store::new_store();
@@ -8210,12 +8188,9 @@ mod tests {
         assert!(master_closes(&peer), "the pin was the master's last holder");
     }
 
-    /// `@*` AT THE CAP ON ARRIVAL. An instance already holding more live
-    /// sessions than [`crate::control::MAX_SUBSCRIBE_TARGETS`] is exactly the
-    /// case adoption defers rather than drops, and a live target set is
-    /// bounded by the cap from its first wake, not only once it has grown. So
-    /// the handshake watches the cap and acks each, and the session left over
-    /// is adopted — acked — when a slot frees.
+    /// A `@*` subscription arriving over [`crate::control::MAX_SUBSCRIBE_TARGETS`] is
+    /// bounded from its first wake: the handshake watches and acks the cap, and the
+    /// session left over is adopted (acked) when a slot frees.
     #[test]
     fn an_at_star_subscription_over_the_cap_watches_the_cap_and_defers_the_rest() {
         use crate::control::MAX_SUBSCRIBE_TARGETS as CAP;

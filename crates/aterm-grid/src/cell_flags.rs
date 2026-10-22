@@ -233,11 +233,9 @@ impl CellFlags {
 
     /// The flags for the continuation spacer of a wide character written with `self`.
     ///
-    /// A rendition belongs to the character, not the column: a double-width
-    /// character is one character over two columns, so the spacer inherits the
-    /// lead's visual attributes and keeps only its own role bit. Without this,
-    /// SGR 7 (swapped for the lead only) paints the glyph's right half invisibly,
-    /// and underline/strikethrough/overline gap under every right half.
+    /// A rendition belongs to the character, not the column, so the spacer inherits
+    /// the lead's visual attributes and keeps only its own role bit. Otherwise SGR 7
+    /// paints the glyph's right half invisibly and underlines gap under it.
     #[must_use]
     #[inline]
     pub const fn wide_continuation_of(self) -> Self {
@@ -359,8 +357,6 @@ mod tests {
             assert_eq!(bits, want, "{name}");
         }
     }
-
-    // ---- Methods ----
 
     #[test]
     fn methods_agree_with_raw_bit_arithmetic() {

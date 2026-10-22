@@ -140,10 +140,8 @@ impl Drop for Flock {
 /// core takes the same lock for its "who" line. One source, beside that core.
 pub(crate) use aterm_toolchain::record_lock::RecordLock;
 
-/// The store-wide writer lock, held for the lifetime of the value. Dropping it (or
-/// the process exiting) releases it — `flock` is associated with the open file
-/// description, so the kernel always cleans up after a crashed holder — and a drop
-/// releases it at once, whatever another thread is spawning ([`Flock`]).
+/// The store-wide writer lock, held while the value lives. A drop releases it at once
+/// ([`Flock`]); the kernel releases it with a crashed holder.
 pub struct StoreLock {
     _file: Flock,
     /// The holder record this lock announced ([`StoreLock::announce_holder`]), removed on
@@ -670,9 +668,8 @@ mod tests {
         }
     }
 
-    /// The contention wake's poll never writes or claims the writer lock. A
-    /// missing file stays missing; a held writer remains held; after release the
-    /// shared check answers promptly and leaves an exclusive try available.
+    /// The release probe never creates, writes or claims the writer lock, and answers once
+    /// the writer drops.
     #[test]
     fn release_probe_is_read_only_and_never_claims_the_writer_lock() {
         let layout = temp_layout("release-probe");
@@ -895,12 +892,8 @@ mod tests {
         drop((again, copy));
     }
 
-    /// A DROPPED STORE LOCK IS FREE AT ONCE, whatever else holds its descriptor. A child
-    /// another thread is spawning holds a copy of every open descriptor until it execs, and
-    /// a lock released only by the close stayed held for that long: under a loaded suite the
-    /// holder test above read a released store as a person's, and the index probe and the
-    /// head watch deferred to a sibling that was gone. A second descriptor on the same open
-    /// file description (`try_clone`, which is `dup`) is exactly what that child holds.
+    /// A dropped lock is free at once while a copy of its descriptor lives: a child mid-spawn
+    /// holds one until it execs, and `try_clone` (`dup`) is that copy.
     #[test]
     fn a_dropped_store_lock_is_free_while_a_copy_of_its_descriptor_lives() {
         let a = temp_layout("dup");

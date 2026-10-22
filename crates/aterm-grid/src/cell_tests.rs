@@ -45,16 +45,8 @@ fn color_accessors_report_inline_colours_only() {
     assert_eq!((rgb.fg_color(), rgb.bg_color()), (None, None));
 }
 
-/// THE CELL PACKING IS LOSSLESS OVER EVERY INPUT. Each domain is small enough
-/// to enumerate whole:
-/// - every `char`: `Cell::new` stores a BMP char directly and anything past
-///   the BMP as U+FFFD, and is never complex; `set_char` on a complex cell
-///   clears COMPLEX and stores the BMP char exactly as `Cell::new` does, and
-///   on `Cell::EMPTY` it agrees with `Cell::new` (constructor parity);
-/// - every visual flag set (`u16 & VISUAL_FLAGS_MASK`) round-trips;
-/// - every (fg, bg) index pair round-trips through `PackedColors::with_indexed`;
-/// - every overflow index: `with_overflow_index` is complex, carries the index
-///   and reads U+FFFD as its codepoint.
+/// The packing is lossless over every `char` (past the BMP as U+FFFD, never
+/// complex), visual flag set, (fg, bg) index pair and overflow index.
 #[test]
 fn cell_packing_is_lossless_over_every_input() {
     for c in (0..=0x10_FFFF).filter_map(char::from_u32) {

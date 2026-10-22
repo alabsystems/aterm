@@ -4,21 +4,20 @@
 //! Streaming RFC 1951 (raw DEFLATE), RFC 1950 (zlib) and RFC 1952 (gzip)
 //! decompression over `std::io::Read`.
 //!
-//! atpkg's `tar-gz` and `zip` lanes feed a decompressed stream to an extractor
-//! one entry at a time under caps up to 2 GiB, and `aterm-png` unfilters an
-//! image a scanline at a time, so buffering the whole output for the one-shot
-//! [`inflate`](super::inflate) is not an option for either.
+//! atpkg's `tar-gz` and `zip` lanes extract an archive one entry at a time and
+//! `aterm-png` unfilters an image a scanline at a time, so neither can buffer the
+//! whole output for the one-shot [`inflate`](super::inflate).
 //!
 //! This drives the parent's `Huffman` construction, root tables, dynamic-table
 //! reader and bit reader incrementally:
 //!
-//! * input accumulates in a small refilled buffer; output keeps a 32 KiB history
+//! * input accumulates in a refilled buffer; output keeps a 32 KiB history
 //!   window plus undelivered bytes, so memory is bounded;
 //! * each unit of work (block header, table read, symbol, stored byte) runs
-//!   against a checkpoint of the bit reader. On
-//!   [`InflateError::Truncated`] with more source to read, the checkpoint is
-//!   restored, input is refilled and the unit retried; once the source is
-//!   exhausted `Truncated` is a real error. Work stays linear.
+//!   against a checkpoint of the bit reader. On [`InflateError::Truncated`] with
+//!   more source to read, the checkpoint is restored, input is refilled and the
+//!   unit retried; once the source is exhausted `Truncated` is a real error.
+//!   Work stays linear.
 
 use std::io::{self, Read};
 

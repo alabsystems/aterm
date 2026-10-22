@@ -1019,19 +1019,11 @@ pub(crate) fn seam_egress(
     )
 }
 
-/// THE source-blind byte-producing core of the seam (design A.2 / A.7). It is the
-/// SOLE reader of `keyboard_mode()`/`mouse_tracking_enabled()` and the SOLE caller
-/// of `encode_key_with_text` / the `encode_mouse_*` family / `encode_committed_
-/// text` / `format_paste_framed` / the focus-report egress, reading the relevant mode
-/// ONCE per event — the keyboard mode LOCK-FREE from the terminal's published
-/// [`ModeMirror`] (Key/Text arms: no mutex on the press path at all), the mouse and
-/// paste modes under a single `term_lock` — ending at the `mode`-selected
-/// [`emit`] (`Interactive` = non-parking on the UI thread; `Backpressured` =
-/// blocking + `SPILL_CAP` on an expendable thread). Sole BYTE-PRODUCING reader:
-/// the predictive-echo gate reads the narrow
-/// `Terminal::kitty_suppresses_predictive_echo()` projection too, but only to
-/// decide whether a local guess may PAINT — a display-only read that can never
-/// diverge the wire bytes.
+/// The source-blind byte-producing core of the seam (design A.2 / A.7): the sole caller of
+/// `encode_key_with_text`, the `encode_mouse_*` family, `encode_committed_text`,
+/// `format_paste_framed` and the focus-report egress. Each mode is read once per event: the
+/// keyboard and focus modes lock-free from the published [`ModeMirror`], the mouse and paste
+/// modes under one `term_lock`.
 ///
 /// CRITICAL (the indistinguishability invariant): this function takes NO
 /// [`Source`] — it is STRUCTURALLY impossible for it to branch on who produced
@@ -2361,14 +2353,8 @@ mod tests {
         ));
     }
 
-    /// Audit I7, THE WHOLE POINT, and cross-platform (no `cfg(unix)` — it asserts
-    /// the ROUTE, which needs no pipe): a horizontal wheel is REPORTED while an app
-    /// tracks the mouse, and produces ZERO local motion when nothing does.
-    ///
-    /// The tracking-OFF half is the regression fence for the guard this widening
-    /// replaced: `wheel_lines: 0` is the seam telling `input_wheel` "there is
-    /// nothing to scroll", so a tilt notch cannot become the phantom scroll-DOWN
-    /// the original early-return was added to kill.
+    /// A horizontal wheel is reported while an app tracks the mouse and moves nothing locally
+    /// otherwise (`wheel_lines: 0`), with DEC 1007 armed or under the Shift bypass too.
     #[test]
     fn horizontal_wheel_reports_only_while_tracking() {
         let sink = SinkWriter::new(-1);
@@ -2471,15 +2457,8 @@ mod tests {
         ));
     }
 
-    /// The report burst is bounded at BOTH ends, for every source. A tracking app
-    /// gets exactly one report per line up to [`MAX_WHEEL_BURST`], and a
-    /// non-positive count (a future grammar bug) is floored at one rather than
-    /// silently emitting nothing for one source and N for another.
-    ///
-    /// The ceiling used to live only in the `mouse` verb's `lines=N` parse, so a
-    /// CONTROLLER was bounded and a human gesture was not — a divergence the seam
-    /// exists to make impossible, and live exposure once the horizontal axis
-    /// started dividing trackpad pixel deltas by the (small) cell WIDTH.
+    /// One report per line up to [`MAX_WHEEL_BURST`] for every source; a non-positive count is
+    /// floored at one.
     #[test]
     fn the_report_burst_is_clamped_at_both_ends_for_every_source() {
         let term = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
@@ -2747,18 +2726,12 @@ mod tests {
         ));
     }
 
-    /// THE Tier-1 indistinguishability invariant (A.7), part 2 — BUILDER EQUALITY.
-    ///
-    /// The byte test (part 1) feeds one event to two terminals; this proves the
-    /// event a Human builds equals the event a Controller builds for the same
-    /// intent — closing the "but the builders could diverge" gap. We can't
-    /// construct a winit `KeyEvent` (its `platform_specific` field is `pub(crate)`),
-    /// so we drive the SAME primitives `keymap::build_key_input` uses
-    /// (`aterm_winit_keymap::{map_logical_key, base_layout_key_for}`) as the
-    /// human side, and the real control-verb parsers (`control::parse_key`,
-    /// `parse_ctrl`, `parse_mouse`) as the controller side. For the named-key /
-    /// ctrl-chord intents both sides land on the identical `InputEvent` — and then
-    /// `seam_egress` gives identical bytes.
+    /// The Tier-1 indistinguishability invariant (A.7), part 2: the event a Human builds equals
+    /// the one a Controller builds for the same intent. A winit `KeyEvent` cannot be constructed
+    /// (`platform_specific` is `pub(crate)`), so the human side drives the primitives
+    /// `keymap::build_key_input` uses (`aterm_winit_keymap::{map_logical_key,
+    /// base_layout_key_for}`) and the controller side the real verb parsers (`parse_key`,
+    /// `parse_ctrl`, `parse_mouse`).
     #[test]
     fn builders_converge() {
         use aterm_types::keyboard::{Key, Modifiers, NamedKey};
@@ -2862,12 +2835,9 @@ mod tests {
         assert_eq!(human_wheel, ctrl_wheel, "wheel builder mismatch");
     }
 
-    /// DEC 1016 (SGR-PIXEL) mouse mode reports a GENUINE PIXEL coordinate, not the
-    /// cell origin. With a 10×20 cell and a press in cell (col=3,row=2) at the
-    /// sub-cell pixel offset (x=4,y=7), the reported pixel is `col*cw+x = 34`,
-    /// `row*ch+y = 47`; `encode_sgr` adds the spec's +1, so the bytes are
-    /// `ESC [ < 0 ; 35 ; 48 M`. This is the whole point of the lane: the report
-    /// carries the real winit sub-cell pixel, not a cell-derived one.
+    /// DEC 1016 (SGR-pixel) reports the pixel: with a 10×20 cell, a press in cell (col=3,row=2)
+    /// at sub-cell offset (x=4,y=7) is pixel (34, 47), `ESC [ < 0 ; 35 ; 48 M` after
+    /// `encode_sgr`'s +1.
     #[test]
     fn sgr_pixel_1016_reports_true_pixel_coordinate() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -2897,14 +2867,9 @@ mod tests {
         assert_eq!(egress_bytes(&term_cell, &press), b"\x1b[<0;4;3M");
     }
 
-    /// Jump-to-prompt must navigate by PROMPTS, not by finished commands.
-    ///
-    /// `command_marks()` is filled only by OSC 133;D, so a shell that marks
-    /// where its prompt is but has no hook for "the command started executing"
-    /// — cmd.exe, whose `%PROMPT%` can emit A and B and nothing else — recorded
-    /// prompts that Ctrl+Shift+Up/Down could not reach. Measured before the fix
-    /// on a real cmd tab: four prompt marks at rows 3/50/97/100 and
-    /// `scroll prev-prompt` reporting `OK 0 71` at every step (never moved).
+    /// Jump-to-prompt navigates by prompts, not finished commands: an A/B-only shell (cmd.exe's
+    /// `%PROMPT%`) leaves `command_marks()` empty (only OSC 133;D fills it), and its prompts are
+    /// still reachable.
     #[test]
     fn jump_prompt_target_finds_prompts_from_an_a_b_only_shell() {
         let mut t = Terminal::new(4, 20);
@@ -3208,9 +3173,8 @@ mod tests {
         assert_eq!(shell_escape_path_windows("C:\\x y$"), "\"C:\\x y$\"");
     }
 
-    /// The CF_HDROP paste insertion (S9) is the drop_file contract verbatim:
-    /// per-path `shell_escape_path` + ONE trailing space, space-joined for a
-    /// multi-file copy, ending in a space — never a newline, so nothing runs.
+    /// The CF_HDROP paste insertion is the drop contract: per-path `shell_escape_path` plus one
+    /// trailing space, never a newline, so nothing runs.
     #[test]
     fn paths_paste_insertion_matches_the_drop_contract() {
         let one = vec!["C:\\Users\\me\\a.txt".to_string()];

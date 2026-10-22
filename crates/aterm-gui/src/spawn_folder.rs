@@ -886,7 +886,7 @@ impl PaneFolder {
     }
 }
 
-/// [`inherited`], PURE over `fault`. `held` is asked first: it is one
+/// [`inherited`], pure over `fault`. `held` is asked first: it is one
 /// `tcgetpgrp`, where the folder check starts a thread.
 pub(crate) fn inherited_in(
     reported: String,
@@ -1199,10 +1199,8 @@ mod tests {
         assert_eq!(canonical_now(&canonical).as_deref(), Some(&*canonical));
     }
 
-    /// A folder that is there stands; one that is gone, a FILE where the
-    /// folder was, a path through a file and a symlink loop are Missing; a
-    /// folder this user may not enter is Shut. The negative control is the
-    /// scratch folder itself.
+    /// Each way a folder is Missing or Shut; the scratch folder itself is the
+    /// negative control.
     #[cfg(unix)]
     #[test]
     fn each_folder_a_shell_cannot_start_in_is_judged_and_a_folder_is_not() {
@@ -1881,10 +1879,9 @@ mod tests {
         }
     }
 
-    /// A SPAWN WHOSE FOLDER IS GONE STARTS IN THE HOME FOLDER and names the
-    /// folder and why; a folder that is there is untouched (the negative
-    /// control); nothing asked is nothing changed; and with no home folder to
-    /// go to the request stands and nothing claims one.
+    /// The home folder stands in for a folder a shell cannot start in, naming it
+    /// and why; a present folder and an empty ask change nothing, and with no
+    /// home folder the request stands.
     #[test]
     fn a_folder_a_shell_cannot_start_in_starts_it_in_home_and_a_present_one_is_unchanged() {
         let fault = |dir: &str| match dir {

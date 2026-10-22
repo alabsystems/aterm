@@ -2646,6 +2646,20 @@ impl App {
         let plan = self
             .visible_leaf_plan_for_tab(wid, tab.id)
             .ok_or_else(|| "native view tab has no layout".to_string())?;
+        self.native_ui_viewport_in_plan(wid, view, &plan)
+    }
+
+    /// [`Self::native_ui_viewport_for`] from a visible `plan` of the view's
+    /// tab the caller already built (a capture lays its frame out from one).
+    pub(crate) fn native_ui_viewport_in_plan(
+        &self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> Result<crate::native_ui::LogicalRect, String> {
+        let Some(window) = self.windows.get(&wid) else {
+            return Err("unknown window".to_string());
+        };
         let leaf = plan
             .leaf(view)
             .ok_or_else(|| "native view is hidden by pane zoom".to_string())?;

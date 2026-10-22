@@ -179,12 +179,9 @@ fn the_tap_names_the_console_image_beside_a_windowed_one() {
     assert_eq!(tap_image(&console, |_| false), Some(console.clone()));
 }
 
-/// THE VERB, ON EVERY STDIN: a v1 file of mode 0600 in a 0700 directory,
-/// and one non-empty line, for a payload with figures; the dash line for
-/// one with none, for text that is not JSON, for an empty stdin and for one
-/// over the bound (drained); nothing written but the line where no tab or
-/// process is named or the directory cannot be made — and exit 0 every
-/// time. NEGATIVE CONTROL: the figures the line shows are the payload's.
+/// A payload with figures writes a v1 file (0600 in a 0700 directory) and prints the figures; no
+/// figures, non-JSON, empty or oversized stdin prints the dash line; no tab, no process or no
+/// directory writes nothing; every run prints one line and exits 0.
 #[test]
 fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
     let root = scratch("verb");

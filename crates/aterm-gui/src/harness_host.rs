@@ -23562,24 +23562,12 @@ fn agent_landing_told(host: HostHandle, agent: Program) -> Box<dyn FnMut() + Sen
     })
 }
 
-/// Park on the pushes that say a newer Claude Code is installed — atpkg's
-/// activation notice, and the native install's link repointed by Claude's
-/// own updater ([`aterm_agent::harness::upgrade_wake`]) — and hand each one
-/// to the host ([`HostHandle::note_activation`]), until the host shuts down
-/// (its trigger ends the wait at once). One kqueue, no timer of its own but
-/// the fallback. The thread's loop is [`activation_loop`], which also makes
-/// the host's own look at the accounts.
-///
-/// ARMED ON ITS OWN THREAD ([`activation_wake`]): reading where each marker
-/// is (atpkg's config parsed per agent, the notice folder made, every path
-/// resolved) cost the main thread about 5 M instructions inside every
-/// launch's `config_join`, and each agent with a marker of its own added its
-/// share (2026-10-20). The marks are taken as they stand when the thread
-/// starts, a few ms later than the main thread would have, and before the
-/// accounts' upkeep ([`maintain_accounts_live`]) runs; a pull of the
-/// trigger before the thread sets it is covered by the loop's first look
-/// ([`activation_loop`] looks at the accounts before its first wait, and a
-/// shutdown already asked ends the loop before it).
+/// THE ACCOUNTS' UPKEEP: the roster synced where it is missing
+/// (`accounts_sync::sync_if_missing_live`: a fetch over the network, each
+/// source bounded at 20 s, a machine id read, then the store's lock, which
+/// nothing bounds) and a renewal started where a login is walled
+/// (`accounts_sync::auto_renew_next_account`). Made on a thread of its own
+/// ([`Upkeep`]), never on the activation thread.
 fn maintain_accounts_live() {
     let Some(home) = aterm_primer::home_dir() else {
         return;
@@ -23597,21 +23585,132 @@ fn maintain_accounts_live() {
     aterm_agent::harness::accounts_sync::auto_renew_next_account(&home, &state, &roster, now);
 }
 
+/// One upkeep of the accounts ([`maintain_accounts_live`] in production).
+type UpkeepFn = Arc<dyn Fn() + Send + Sync>;
+
+/// THE ACCOUNTS' UPKEEP ON A THREAD OF ITS OWN, kicked by the activation
+/// thread at its arming and after every wait ([`upkept`]). It ran on the
+/// activation thread itself, before the first wait and after every one, so a
+/// newer build's wake waited out the whole upkeep: an upkeep held past the
+/// live test's 150 s handed on no activation at all
+/// (`an_activation_notice_upgrades_the_session_at_its_idle_point`, red under
+/// load in spawn-residuals-2's gate, 2026-10-21). Kicks while one runs fold
+/// into one more upkeep after it (a channel of one), so a stuck upkeep queues
+/// no work and two never run at once. After each upkeep the host looks at the
+/// accounts ([`accounts_look`]), as the loop's look after a wait followed the
+/// upkeep before, so a roster the upkeep synced is told at once. The thread
+/// ends once the activation thread drops its kick (the host shut down) and
+/// the upkeep in hand is over.
+struct Upkeep {
+    kick: std::sync::mpsc::SyncSender<()>,
+}
+
+impl Upkeep {
+    /// The upkeep's thread for `host`, making `upkeep` at each kick; `None`
+    /// where the thread could not start.
+    fn spawn(host: HostHandle, upkeep: UpkeepFn) -> Option<Self> {
+        let (kick, kicked) = std::sync::mpsc::sync_channel::<()>(1);
+        let spawned = std::thread::Builder::new()
+            .name(format!("{THREAD_PREFIX}upkeep"))
+            .spawn(move || {
+                while kicked.recv().is_ok() {
+                    upkeep();
+                    accounts_look(
+                        &host.shared.switches,
+                        &host.hooks,
+                        &host.shared.login_latches,
+                        false,
+                    );
+                }
+            });
+        match spawned {
+            Ok(_) => Some(Self { kick }),
+            Err(e) => {
+                aterm_log::warn!(
+                    "harness: the accounts' upkeep thread could not start: {e}; the activation \
+                     thread makes the upkeep itself"
+                );
+                None
+            }
+        }
+    }
+
+    /// One more upkeep once the one in hand is over; none more where one is
+    /// owed already.
+    fn kick(&self) {
+        let _ = self.kick.try_send(());
+    }
+}
+
+/// The activation thread's `wait` with the accounts' upkeep beside it
+/// ([`Upkeep`]): kicked now, at the arming, and after every wait, so no
+/// upkeep holds a wake back. Where its thread could not start, the upkeep is
+/// made in line, as it was before ([`upkept_on`]).
+fn upkept(
+    host: &HostHandle,
+    wait: impl FnMut() -> bool + Send + 'static,
+    upkeep: UpkeepFn,
+) -> Box<dyn FnMut() -> bool + Send> {
+    upkept_on(
+        Upkeep::spawn(host.clone(), Arc::clone(&upkeep)),
+        wait,
+        upkeep,
+    )
+}
+
+/// [`upkept`] over the upkeep's `thread` as it started: `None` (it could not)
+/// makes the upkeep in line, now and after every wait, so a held upkeep
+/// holds the arming and every wake behind it, as before the thread.
+fn upkept_on(
+    thread: Option<Upkeep>,
+    mut wait: impl FnMut() -> bool + Send + 'static,
+    upkeep: UpkeepFn,
+) -> Box<dyn FnMut() -> bool + Send> {
+    let Some(thread) = thread else {
+        upkeep();
+        return Box::new(move || {
+            let newer = wait();
+            upkeep();
+            newer
+        });
+    };
+    thread.kick();
+    Box::new(move || {
+        let newer = wait();
+        thread.kick();
+        newer
+    })
+}
+
+/// Park on the pushes that say a newer Claude Code is installed — atpkg's
+/// activation notice, and the native install's link repointed by Claude's
+/// own updater ([`aterm_agent::harness::upgrade_wake`]) — and hand each one
+/// to the host ([`HostHandle::note_activation`]), until the host shuts down
+/// (its trigger ends the wait at once). One kqueue, no timer of its own but
+/// the fallback. The thread's loop is [`activation_loop`], which also makes
+/// the host's own look at the accounts; the accounts' upkeep runs beside it
+/// ([`upkept`]).
+///
+/// ARMED ON ITS OWN THREAD ([`activation_wake`]): reading where each marker
+/// is (atpkg's config parsed per agent, the notice folder made, every path
+/// resolved) cost the main thread about 5 M instructions inside every
+/// launch's `config_join`, and each agent with a marker of its own added its
+/// share (2026-10-20). The marks are taken as they stand when the thread
+/// arms them, after the host has started and may have attached workers; the
+/// arming is an activation of its own for those ([`spawn_activation_wake_with`]).
+/// A pull of the trigger before the thread sets it is covered by the loop's
+/// first look ([`activation_loop`] looks at the accounts before its first
+/// wait, and a shutdown already asked ends the loop before it).
 fn spawn_activation_wake(host: HostHandle) {
     spawn_activation_wake_with(host, |host| {
-        // The marks before the accounts' upkeep: what stands when they are taken is the
-        // baseline, never news, and the upkeep can take seconds (`claude auth status`, a
-        // login staged), so a notice that landed while it ran went unseen for good.
         let mut wake = activation_wake(host);
-        maintain_accounts_live();
-        (
-            Some(wake.trigger()),
-            Box::new(move || {
-                let newer = wake.wait(WAKE_FALLBACK);
-                maintain_accounts_live();
-                newer
-            }),
-        )
+        let trigger = wake.trigger();
+        let wait = upkept(
+            host,
+            move || wake.wait(WAKE_FALLBACK),
+            Arc::new(maintain_accounts_live),
+        );
+        (Some(trigger), wait)
     });
 }
 
@@ -23621,6 +23720,14 @@ type ArmedWake = (Option<WakeTrigger>, Box<dyn FnMut() -> bool + Send>);
 
 /// [`spawn_activation_wake`] with the wake's arming injected, so a test sees
 /// which thread arms it.
+///
+/// THE ARMING IS AN ACTIVATION ([`HostHandle::note_activation`]): what stands
+/// when the marks are taken is their baseline, never news, and the host may
+/// have attached a worker and made its look at the agent's build before
+/// then. A build that landed between that look and the marks was seen by
+/// nobody, for good. Noted once armed, every worker attached before the
+/// arming looks again at its next idle point; one attached after it takes
+/// the count as it stands and is owed nothing.
 fn spawn_activation_wake_with(
     host: HostHandle,
     arm: impl FnOnce(&HostHandle) -> ArmedWake + Send + 'static,
@@ -23632,6 +23739,11 @@ fn spawn_activation_wake_with(
             if let Some(trigger) = trigger {
                 let _ = host.shared.wake.set(trigger);
             }
+            aterm_log::info!(
+                "harness: the activation wake is armed; every session supervised before it \
+                 looks at its next idle point"
+            );
+            host.note_activation();
             activation_loop(&host, wait);
         });
     if let Err(e) = spawned {

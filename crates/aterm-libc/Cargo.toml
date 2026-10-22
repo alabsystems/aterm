@@ -5,11 +5,9 @@
 # Named `libc` because `[patch.crates-io]` matches on package name: this
 # redirects every consumer's `libc = "0.2"` here.
 name = "libc"
-# NOT `version.workspace = true`: a semver contract with consumers. The
-# strictest requirement was `^0.2.182` (rustix 1.1.4, which left the lock at
-# linux-windowing LW.7); 0.2.186 meets all and matches the lock's pre-swap
-# version. A version below any requirement makes the
-# patch silently inert (`targo --unverified forge check` catches it).
+# Not `version.workspace = true`: it must meet every consumer's requirement, the
+# strictest being `^0.2.182` (rustix 1.1.4). One it misses leaves the patch
+# silently unused (`targo --unverified forge check` catches it).
 version = "0.2.186"
 edition.workspace = true
 license.workspace = true
@@ -24,12 +22,9 @@ path = "src/lib.rs"
 test = false
 
 [features]
-# Upstream's feature table, so no parent's feature request fails to resolve.
-# Resolved (`cargo tree --target <cell> -e features -i libc`):
-# `default,extra_traits,std` on the unix cells, `default,std` on Windows and
-# wasm32. `extra_traits` is real (reached via rustix's `libc-extra-traits`
-# until rustix left at LW.7) and gates the PartialEq/Eq/Hash derives upstream
-# gates.
+# Upstream's feature table, so every consumer's feature request resolves. Only
+# `extra_traits` does anything (the unix cells get it through rustix 0.38's
+# `libc-extra-traits`): it gates the PartialEq/Eq/Hash derives upstream gates.
 default = ["std"]
 extra_traits = []
 # Inert: the crate is always `no_std`, the generated cells apply `align` and

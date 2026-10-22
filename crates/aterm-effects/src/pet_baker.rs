@@ -742,8 +742,7 @@ mod tests {
         }
     }
 
-    /// Determinism: one key ⇒ byte-identical texels, across repeated lookups,
-    /// across independent bakers, and against a direct [`bake_pose`].
+    /// One key bakes byte-identical texels across hits, independent bakers and [`bake_pose`].
     #[test]
     fn same_key_bakes_byte_identical_tiles() {
         let k = key(5);
@@ -1043,11 +1042,8 @@ mod tests {
         );
     }
 
-    /// The LOD deletes the authored charm stack and rebuilds only what the
-    /// pixels can carry: at 36 px the walk keeps catch-light white from the
-    /// device-sized reflections but has no fully covered blush pink or tabby
-    /// brown. A bake above [`FACE_DETAIL_MIN_H`] keeps the authored versions of
-    /// all three.
+    /// At 36 px the walk keeps catch-light white (from the LOD reflections) but no blush pink or
+    /// tabby brown; above [`FACE_DETAIL_MIN_H`] all three authored inks are back.
     #[test]
     fn face_lod_rebuilds_reflections_but_culls_other_charm_ink() {
         let p = pose("walk_0");
@@ -1103,11 +1099,8 @@ mod tests {
         }
     }
 
-    /// The Retina identity path: a 2× default (cell_h ≈ 42 ⇒ a ~71 px tile)
-    /// bakes at or above [`FACE_DETAIL_MIN_H`], where the LOD never runs and the
-    /// full authored face is painted verbatim. At the boundary the first
-    /// full-face height keeps the catch-light and one pixel below it the LOD
-    /// culls it.
+    /// A 2× Retina default (cell_h 42, a 71 px tile) bakes the full authored face; at the
+    /// boundary, [`FACE_DETAIL_MIN_H`] keeps the catch-light and one pixel below culls it.
     #[test]
     fn retina_scale_bakes_hit_the_identity_path() {
         let mac_2x_h = (crate::kitty_pet::ART_ROWS * 42.0).round() as u32;

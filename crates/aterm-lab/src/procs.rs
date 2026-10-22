@@ -102,9 +102,24 @@ pub fn wait_gone(pid: i32, limit: Duration) -> bool {
     let mut fds = [crate::sys::pollfd(w.as_raw_fd())];
     let ms = i32::try_from(limit.as_millis()).unwrap_or(i32::MAX);
     let _ = crate::sys::poll(&mut fds, ms);
-    let exited = w.exit_status().is_some();
-    // `alive` reaps an ended child of ours, so none is left a zombie
-    !alive(pid) || exited
+    settled(pid, w.exit_status().is_some(), limit)
+}
+
+/// [`wait_gone`]'s answer once its watch fired or ran out (`exited`: the
+/// kernel's exit event came): whether `pid` ended. The exit event can come
+/// before a child of ours is a zombie its parent can reap, so where it came
+/// a child of ours is looked at again until it is reaped, within `limit`
+/// ([`ended_within`]): with one read of [`alive`] there, the wait said the
+/// child had ended while it still read alive, and it was left unreaped
+/// (`a_wait_that_runs_out_leaves_the_child_to_a_later_one` failed so once
+/// in a full run, 2026-10-22, the review of `b9/resid4-lab`). Without the
+/// event, `alive` reaps an ended child of ours, so none is left a zombie.
+fn settled(pid: i32, exited: bool, limit: Duration) -> bool {
+    if exited {
+        let _ = ended_within(pid, limit);
+        return true;
+    }
+    !alive(pid)
 }
 
 /// The rest of [`wait_gone`] for a `pid` the kernel would not watch: it has
@@ -457,6 +472,31 @@ mod tests {
         let me = i32::try_from(std::process::id()).unwrap();
         assert!(
             !ended_within(me, Duration::from_secs(60)),
+            "not ours: read once"
+        );
+    }
+
+    /// AN EXIT THE WATCH SAW IS WAITED ON UNTIL THE CHILD IS REAPED
+    /// ([`settled`]): told its exit came while the child still runs (as the
+    /// kernel's event can come before the child is a zombie its parent can
+    /// reap), the wait reaps it once it ends, so it never reads alive after
+    /// the wait said it ended. NEGATIVE CONTROLS: with no exit event, a live
+    /// child is no ended one; a process that is no child of ours is read
+    /// once, and the event's word stands.
+    #[test]
+    fn an_exit_the_watch_saw_is_waited_on_until_the_child_is_reaped() {
+        let long = spawn_kept(aterm_uds::spawnfd::command("/bin/sleep").arg("600")).unwrap();
+        assert!(!settled(long, false, Duration::from_secs(60)), "it runs");
+        crate::sys::kill(long, libc::SIGKILL).unwrap();
+        let pid = spawn_kept(aterm_uds::spawnfd::command("/bin/sleep").arg("0.3")).unwrap();
+        assert!(settled(pid, true, Duration::from_secs(60)), "its exit seen");
+        assert!(!crate::sys::alive(pid), "reaped: no zombie keeps the pid");
+        assert!(!alive(pid));
+        assert!(settled(long, true, Duration::from_secs(60)), "killed");
+        assert!(!crate::sys::alive(long), "reaped");
+        let me = i32::try_from(std::process::id()).unwrap();
+        assert!(
+            settled(me, true, Duration::from_secs(60)),
             "not ours: read once"
         );
     }

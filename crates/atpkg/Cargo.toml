@@ -171,7 +171,7 @@ path = "tests/atpkg_suite.rs"
 name = "packages_log_lanes"
 path = "tests/packages_log_lanes.rs"
 
-# Alone: opens a pty (`ptsname(3)` answers from a static buffer) and times a child waiting on a held lock.
+# Alone: opens a pty (`ptsname(3)` uses a static buffer) and times a child on a held lock.
 [[test]]
 name = "typed_lock_wait_tty"
 path = "tests/typed_lock_wait_tty.rs"

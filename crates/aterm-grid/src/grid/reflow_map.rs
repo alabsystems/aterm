@@ -227,8 +227,8 @@ pub(super) fn copy_cells_to_row(
     new_row.update_len(content_end);
 }
 
-/// Chunk non-empty cells into new-width rows with cursor tracking. Rows after
-/// the first are marked wrapped; the caller sets the first row's flag.
+/// Chunk `cells` into new-width rows with cursor tracking. Rows after the first
+/// are marked wrapped; the caller sets the first row's flag.
 ///
 /// `content_len` is where the content of `cells` ends ([`copy_cells_to_row`]).
 /// `points` are the cursors carried through the rewrap (the live one and the

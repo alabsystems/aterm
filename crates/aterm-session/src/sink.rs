@@ -1875,13 +1875,12 @@ impl SinkWriter {
         (ImmediateWrite::BusyZero, None)
     }
 
-    /// Write a WHOLE frame atomically with respect to other writers, returning the
-    /// number of bytes accepted (`== bytes.len()` on success). Holds the
-    /// serialization lock until the frame is either on the wire or handed to the
-    /// spill, so no other writer's bytes can appear inside this frame (a spilled
-    /// tail PREPENDS, and every writer queues behind a non-empty spill). Propagates
-    /// the first hard error rather than silently dropping the tail (the bug the
-    /// legacy `write_all` had before `write_some`).
+    /// Write a whole frame atomically with respect to other writers, returning the
+    /// bytes accepted (`== bytes.len()` on success). Holds the serialization lock until
+    /// the frame is in the kernel or handed to the spill, so no other writer's bytes
+    /// appear inside it (a spilled tail prepends, and every writer queues behind a
+    /// non-empty spill). Returns early only on a hard error, which it propagates, or a
+    /// `0` write (peer closed).
     ///
     /// On unix the body parks in blocking writes holding the lock: fine for bounded
     /// frames, but it carries the paste/query-reply deadlock described on
@@ -3184,14 +3183,13 @@ impl Shared {
         Some(poke)
     }
 
-    /// PREPEND a split frame's tail (or what a stopped paste still owes,
-    /// [`Self::prepend_owed`]) to the spill front — callable ONLY while
-    /// holding the fd lock (see `spill_tail_locked`): the holder's frame head is
-    /// already on the wire, so its tail must drain before anything a concurrent
-    /// writer appended meanwhile, and holding the fd lock is what guarantees the
-    /// drainer has no stale peek to reorder around (it peeks under that lock).
-    /// Same discard rule as [`Self::spill_append`]: a tail whose frame entered
-    /// before a discard (`since`) is dropped, and reported handled.
+    /// Prepend a split frame's tail (or a stopped paste's owed bytes,
+    /// [`Self::prepend_owed`]) to the spill. Only while holding the fd lock (see
+    /// `spill_tail_locked`): the holder's head is already in the kernel, so its tail
+    /// must drain before anything appended meanwhile, and the lock guarantees the
+    /// drainer has no stale peek (it peeks under that lock). A tail whose frame entered
+    /// before a discard (`since`) is dropped and reported handled, as in
+    /// [`Self::spill_append`].
     ///
     /// The drainer is arranged as [`Self::spill_append`] does for the same `room`: for
     /// [`Room::NoWait`] with an arranger installed the spawn is deferred to it;
@@ -3593,13 +3591,10 @@ mod tests {
         drop(writer);
     }
 
-    // Whole-frame atomicity: N threads each write a distinct frame LARGER than the
-    // socket send buffer (so a single `write` short-writes and the loop iterates,
-    // giving the kernel real opportunities to interleave two writers). Through one
-    // SinkWriter the bytes must arrive as exactly N CONTIGUOUS single-byte runs;
-    // without the serialization lock the runs would fragment. Driven on a stream
-    // socketpair (no shell, no unsafe — fds are borrowed from owned `UnixStream`s),
-    // with a concurrent reader so the oversized writes never deadlock on a full buffer.
+    // N threads each write a distinct frame larger than the socket send buffer, so one
+    // `write` short-writes and the loop iterates; through one SinkWriter the bytes must
+    // arrive as exactly N contiguous runs. A concurrent reader keeps the writers from
+    // blocking on a full buffer.
     #[test]
     fn write_frame_is_whole_frame_atomic_across_threads() {
         let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
@@ -4931,12 +4926,9 @@ mod metered_body_tests {
         );
     }
 
-    /// UNIX: A GIVE-UP HANDS BACK WHAT THE CUT OWES. The unix twin answers
-    /// `Ok(0)` when a stop finds the tty not draining; [`write_metered`] then
-    /// returns the bytes the program is still owed, for the body to deliver
-    /// ahead of the next frame. Stopped in the middle of the opening marker,
-    /// of a character, and of the text; and a give-up with no stop (a peer
-    /// that closed) owes nothing.
+    /// When the unix twin gives up (`Ok(0)` with the stop asked, on a tty not
+    /// draining), [`write_metered`] returns what the program is still owed; a give-up
+    /// with no stop (a closed peer) owes nothing.
     #[test]
     fn a_give_up_hands_back_what_the_cut_owes() {
         let gave_up_at = |frame: &[u8], stop: bool, at: usize| {

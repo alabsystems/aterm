@@ -2,12 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! The engine: every item through probe, plan, apply and read-back, in the order its
-//! `after` edges give (design §3.3).
+//! `after` edges give, the items that share an activation read back only after it ran
+//! once (design §3.3).
 
-use crate::Item;
 use crate::model::{Explain, ItemReport, Mode, Outcome, Probe, Remedy, Requires, StoodAside};
 use crate::scope::Scope;
+use crate::{Activation, Item};
 use std::fmt;
+use std::sync::Arc;
 
 /// Where the engine records a value before it changes it.
 pub trait Journal {
@@ -108,13 +110,19 @@ pub fn named_by<'a>(
 }
 
 /// The order `items` run in: each after every item its `after` names, and otherwise in
-/// the order given, so a composition that is already ordered keeps its order.
+/// the order given, so a composition that is already ordered keeps its order. An item that
+/// waits on an item with an [`Item::activation`] it does not share runs after every item of
+/// that activation: that item is read back only once the last of them is done.
 ///
 /// # Errors
 /// An edge that names no other item ([`Refusal::Dangling`]; an item that names itself
 /// exactly waits on itself, a [`Refusal::Cycle`]), or items that wait on each other.
 pub fn order(items: &[Box<dyn Item + '_>]) -> Result<Vec<usize>, Refusal> {
     let ids: Vec<String> = items.iter().map(|item| item.id()).collect();
+    let activations: Vec<Option<String>> = items
+        .iter()
+        .map(|item| item.activation().map(|activation| activation.id()))
+        .collect();
     let mut needs: Vec<Vec<usize>> = Vec::with_capacity(items.len());
     for (me, item) in items.iter().enumerate() {
         let mut mine = Vec::new();
@@ -127,6 +135,18 @@ pub fn order(items: &[Box<dyn Item + '_>]) -> Result<Vec<usize>, Refusal> {
                     want,
                 });
             }
+        }
+        let shared: Vec<&String> = mine
+            .iter()
+            .filter_map(|&other| activations[other].as_ref())
+            .filter(|&activation| activations[me].as_ref() != Some(activation))
+            .collect();
+        for activation in shared {
+            mine.extend(
+                (0..items.len()).filter(|&other| {
+                    other != me && activations[other].as_ref() == Some(activation)
+                }),
+            );
         }
         needs.push(mine);
     }
@@ -153,6 +173,12 @@ pub fn order(items: &[Box<dyn Item + '_>]) -> Result<Vec<usize>, Refusal> {
 /// In [`Mode::Apply`] a planned change is journaled, applied, and probed again. Only a
 /// read-back that probes `Ok` counts as [`Outcome::Changed`]. Anything else is
 /// [`Outcome::Failed`], with the read-back in `why`. A failure does not stop the run.
+/// An applied item with an [`Item::activation`] is read back only after that activation
+/// ran: once, after the last item of the run that names it, journaled first (its id, and
+/// the `from` and `to` its [`Activation::pending`] gives). When nothing is pending it is
+/// not run. One that fails, or whose line the journal refuses, fails each item it was to
+/// activate, and nothing of it is undone; one whose part for an item failed fails that
+/// item alone, and the others are read back.
 /// An item whose [`Item::after`] names an earlier item that did not end `Ok` or `Changed`
 /// is not probed in an apply run: it is [`Outcome::Blocked`] on that item. In a plan
 /// run it is probed as usual, since its prerequisite may only be planned; when that
@@ -201,62 +227,194 @@ pub fn run_scoped(
     // Outside a shell of the account's own (root, another `$HOME`, a private state root),
     // an account item is read and its change named, never made (design §3.2).
     let hold = scope.not_own_account.map(crate::scope::not_own_account);
-    let mut rows: Vec<ItemReport> = Vec::with_capacity(items.len());
-    for index in order {
-        let item = items[index].as_ref();
-        // Where a console item may not run, nothing of it is read (a workstation item over
-        // SSH reads another login's session otherwise).
-        if item.requires() == Requires::Console && !scope.admits(Requires::Console) {
-            let why = scope.not_own_account.map_or_else(
-                || crate::scope::NOT_AT_CONSOLE.to_owned(),
-                crate::scope::not_own_account,
-            );
-            let mut row = blank(item);
-            row.outcome = Outcome::Blocked;
-            row.explain = Some(item.explain(&Probe::Blocked { why: why.clone() }));
-            row.why = Some(why);
-            on_row(&row);
-            rows.push(row);
-            continue;
+    let activations: Vec<Option<Arc<dyn Activation + '_>>> =
+        items.iter().map(|item| item.activation()).collect();
+    // Each activation runs once the last item (in run order) that names it is done.
+    let mut last: Vec<(String, usize)> = Vec::new();
+    for (position, &index) in order.iter().enumerate() {
+        if let Some(activation) = &activations[index] {
+            let id = activation.id();
+            match last.iter_mut().find(|(seen, _)| *seen == id) {
+                Some(entry) => entry.1 = position,
+                None => last.push((id, position)),
+            }
         }
-        // A class this surface does not apply is planned in an apply run: probed, never
-        // applied, and anything after it waits.
-        let mode = if mode == Mode::Apply && !scope.applies(item.class()) {
-            Mode::Plan
-        } else {
-            mode
-        };
-        let blocker = (mode == Mode::Apply)
-            .then(|| unmet_prerequisite(item, &rows))
-            .flatten();
-        let row = match blocker {
-            // The prerequisite stood aside (a lock, the network): so does what waits for
-            // it, with the same line, so a surface's 75/69 counts it.
-            Some((on, Some(aside))) => {
+    }
+    // The rows applied and not yet read back: their activation's id, the row, the item.
+    let mut awaiting: Vec<(String, usize, usize)> = Vec::new();
+    let mut rows: Vec<ItemReport> = Vec::with_capacity(items.len());
+    for (position, &index) in order.iter().enumerate() {
+        let item = items[index].as_ref();
+        let activation = activations[index].as_deref();
+        let (row, awaits) =
+            if item.requires() == Requires::Console && !scope.admits(Requires::Console) {
+                // Where a console item may not run, nothing of it is read (a workstation item
+                // over SSH reads another login's session otherwise).
+                let why = scope.not_own_account.map_or_else(
+                    || crate::scope::NOT_AT_CONSOLE.to_owned(),
+                    crate::scope::not_own_account,
+                );
                 let mut row = blank(item);
                 row.outcome = Outcome::Blocked;
-                row.why = Some(format!("waits for {on}: {}", aside.why()));
-                row.explain = Some(explain_aside(item, &aside));
-                row.stood_aside = Some(aside);
-                row
-            }
-            Some((on, None)) => {
-                let why = format!("waits for {on}");
-                let mut row = blank(item);
-                row.outcome = Outcome::Blocked;
-                row.explain = Some(item.explain(&Probe::Waits {
-                    on,
-                    why: why.clone(),
-                }));
+                row.explain = Some(item.explain(&Probe::Blocked { why: why.clone() }));
                 row.why = Some(why);
-                row
-            }
-            None => run_one(item, mode, journal, &rows, hold.as_deref()),
-        };
-        on_row(&row);
+                (row, false)
+            } else {
+                // A class this surface does not apply is planned in an apply run: probed,
+                // never applied, and anything after it waits.
+                let mode = if mode == Mode::Apply && !scope.applies(item.class()) {
+                    Mode::Plan
+                } else {
+                    mode
+                };
+                let blocker = (mode == Mode::Apply)
+                    .then(|| unmet_prerequisite(item, &rows))
+                    .flatten();
+                match blocker {
+                    // The prerequisite stood aside (a lock, the network): so does what waits
+                    // for it, with the same line, so a surface's 75/69 counts it.
+                    Some((on, Some(aside))) => {
+                        let mut row = blank(item);
+                        row.outcome = Outcome::Blocked;
+                        row.why = Some(format!("waits for {on}: {}", aside.why()));
+                        row.explain = Some(explain_aside(item, &aside));
+                        row.stood_aside = Some(aside);
+                        (row, false)
+                    }
+                    Some((on, None)) => {
+                        let why = format!("waits for {on}");
+                        let mut row = blank(item);
+                        row.outcome = Outcome::Blocked;
+                        row.explain = Some(item.explain(&Probe::Waits {
+                            on,
+                            why: why.clone(),
+                        }));
+                        row.why = Some(why);
+                        (row, false)
+                    }
+                    None => run_one(
+                        item,
+                        mode,
+                        journal,
+                        &rows,
+                        hold.as_deref(),
+                        activation.is_some(),
+                    ),
+                }
+            };
+        if awaits && let Some(activation) = activation {
+            awaiting.push((activation.id(), rows.len(), index));
+        } else {
+            on_row(&row);
+        }
         rows.push(row);
+        if let Some(activation) = activation {
+            let id = activation.id();
+            if last.iter().any(|(seen, at)| *seen == id && *at == position) {
+                let mine: Vec<(usize, usize)> = awaiting
+                    .iter()
+                    .filter(|(of, _, _)| *of == id)
+                    .map(|&(_, at, item)| (at, item))
+                    .collect();
+                awaiting.retain(|(of, _, _)| *of != id);
+                settle(activation, &mine, items, &mut rows, journal, on_row);
+            }
+        }
     }
     Ok(rows)
+}
+
+/// Run `activation` once for the rows `awaiting` it (each a row and its item), its line
+/// journaled first, then read each of those items back, but for one whose part of it
+/// failed. Nothing awaits it: it is not run.
+fn settle(
+    activation: &dyn Activation,
+    awaiting: &[(usize, usize)],
+    items: &[Box<dyn Item + '_>],
+    rows: &mut [ItemReport],
+    journal: &mut dyn Journal,
+    on_row: &mut dyn FnMut(&ItemReport),
+) {
+    if awaiting.is_empty() {
+        return;
+    }
+    // Whether the journal refused its line, and why it did not run; else the items whose
+    // part of it failed. A refused line is explained as a refused item line is
+    // (`Blocked`): nothing the items' own remedy runs lifts it, the journal must take the
+    // record first.
+    let activated: Result<Vec<(String, String)>, (bool, String)> = match activation.pending() {
+        Err(why) => Err((false, why)),
+        Ok(None) => Ok(Vec::new()),
+        Ok(Some((from, to))) => journal
+            .before_change(&activation.id(), &from, &to, None)
+            .map_err(|why| (true, format!("the journal refused the record ({why})")))
+            .and_then(|()| activation.activate().map_err(|why| (false, why))),
+    };
+    for &(at, index) in awaiting {
+        let item = items[index].as_ref();
+        let row = &mut rows[at];
+        let failed = match &activated {
+            Err((refused, why)) => Some((*refused, why.as_str())),
+            Ok(failed) => failed
+                .iter()
+                .find(|(id, _)| *id == row.id)
+                .map(|(_, why)| (false, why.as_str())),
+        };
+        let last = match failed {
+            None => read_back(item, row),
+            Some((refused, why)) => {
+                let why = format!("applied, but not activated: {why}");
+                row.outcome = Outcome::Failed;
+                row.why = Some(why.clone());
+                if refused {
+                    Probe::Blocked { why }
+                } else {
+                    Probe::Unusable { why }
+                }
+            }
+        };
+        finish(item, row, &last);
+        on_row(row);
+    }
+}
+
+/// Probe `item` again after its change: only an `Ok` read-back makes `row` `Changed`; any
+/// other fails it, saying what the read-back found. The read-back, for the row's
+/// explanation.
+fn read_back(item: &dyn Item, row: &mut ItemReport) -> Probe {
+    let back = item.probe();
+    match &back {
+        Probe::Ok { .. } => row.outcome = Outcome::Changed,
+        Probe::Change { from: now, .. } => {
+            row.outcome = Outcome::Failed;
+            row.why = Some(format!("applied, but it still reads {now}"));
+        }
+        Probe::Unusable { why } => {
+            row.outcome = Outcome::Failed;
+            row.why = Some(format!("applied, but the read-back did not answer: {why}"));
+        }
+        Probe::Blocked { why }
+        | Probe::Waits { why, .. }
+        | Probe::NotApplicable { why }
+        | Probe::Deferred { why }
+        | Probe::Person { how: why, .. } => {
+            row.outcome = Outcome::Failed;
+            row.why = Some(format!("applied, but the read-back says: {why}"));
+        }
+    }
+    back
+}
+
+/// Complete `row` once its outcome is known: the item's detail, and for a row that is not
+/// `Ok` or `Changed` its explanation, by the probe `last` that judged it.
+fn finish(item: &dyn Item, row: &mut ItemReport, last: &Probe) {
+    row.detail = item.detail();
+    if !matches!(row.outcome, Outcome::Ok | Outcome::Changed) {
+        row.explain = Some(match &row.stood_aside {
+            Some(aside) => explain_aside(item, aside),
+            None => item.explain(last),
+        });
+    }
 }
 
 /// The first earlier row `item` must wait for that did not end `Ok` or `Changed`, and
@@ -298,14 +456,18 @@ fn blank(item: &dyn Item) -> ItemReport {
 
 /// One item through probe, plan, apply and read-back; `earlier` are the rows before it.
 /// With `hold`, the change the item would make is named and `Blocked` with that line, and
-/// nothing of it is applied, refreshed or journaled.
+/// nothing of it is applied, refreshed or journaled. With `activated`, an apply that did
+/// its work is not read back here: the row is returned with `true`, applied (`Changed`, as
+/// an item of the same activation that waits on it reads it), for [`settle`] to read back
+/// and complete after the activation.
 fn run_one(
     item: &dyn Item,
     mode: Mode,
     journal: &mut dyn Journal,
     earlier: &[ItemReport],
     hold: Option<&str>,
-) -> ItemReport {
+    activated: bool,
+) -> (ItemReport, bool) {
     let mut row = blank(item);
     // The probe the row's explanation reads: the first, or the read-back that judged it.
     let mut last = item.probe();
@@ -434,45 +596,19 @@ fn run_one(
                             row.outcome = Outcome::Blocked;
                             row.why = Some(aside.why().to_owned());
                             row.stood_aside = Some(aside);
+                        } else if activated {
+                            row.outcome = Outcome::Changed;
+                            return (row, true);
                         } else {
-                            let back = item.probe();
-                            match &back {
-                                Probe::Ok { .. } => row.outcome = Outcome::Changed,
-                                Probe::Change { from: now, .. } => {
-                                    row.outcome = Outcome::Failed;
-                                    row.why = Some(format!("applied, but it still reads {now}"));
-                                }
-                                Probe::Unusable { why } => {
-                                    row.outcome = Outcome::Failed;
-                                    row.why = Some(format!(
-                                        "applied, but the read-back did not answer: {why}"
-                                    ));
-                                }
-                                Probe::Blocked { why }
-                                | Probe::Waits { why, .. }
-                                | Probe::NotApplicable { why }
-                                | Probe::Deferred { why }
-                                | Probe::Person { how: why, .. } => {
-                                    row.outcome = Outcome::Failed;
-                                    row.why =
-                                        Some(format!("applied, but the read-back says: {why}"));
-                                }
-                            }
-                            last = back;
+                            last = read_back(item, &mut row);
                         }
                     }
                 }
             }
         }
     }
-    row.detail = item.detail();
-    if !matches!(row.outcome, Outcome::Ok | Outcome::Changed) {
-        row.explain = Some(match &row.stood_aside {
-            Some(aside) => explain_aside(item, aside),
-            None => item.explain(&last),
-        });
-    }
-    row
+    finish(item, &mut row, &last);
+    (row, false)
 }
 
 /// A stood-aside row's explanation: the line the apply stood aside with, and the remedy
@@ -1331,6 +1467,503 @@ pub(crate) mod tests {
                     how: "turn it on".into()
                 }
             )
+        );
+    }
+
+    /// What the activation fixtures did, in order: `probe <id>`, `apply <id>`,
+    /// `pending <activation>`, `activate <activation>`, `journal <id>`, `row <id>`.
+    type Events = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// An [`Activation`] that records what the engine asks of it.
+    struct Relaunch {
+        id: &'static str,
+        events: Events,
+        pending: Result<Option<(String, String)>, String>,
+        result: Result<Vec<(String, String)>, String>,
+    }
+
+    impl Activation for Relaunch {
+        fn id(&self) -> String {
+            self.id.into()
+        }
+        fn pending(&self) -> Result<Option<(String, String)>, String> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("pending {}", self.id));
+            self.pending.clone()
+        }
+        fn activate(&self) -> Result<Vec<(String, String)>, String> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("activate {}", self.id));
+            self.result.clone()
+        }
+    }
+
+    /// An item whose probes answer from a list (the last repeats), which records its
+    /// probes and applies, and which may share an activation.
+    struct Writer {
+        id: &'static str,
+        probes: std::sync::Mutex<Vec<Probe>>,
+        apply: Result<(), String>,
+        after: Vec<String>,
+        activation: Option<Arc<Relaunch>>,
+        events: Events,
+    }
+
+    impl Writer {
+        fn new(id: &'static str, events: &Events, activation: Option<&Arc<Relaunch>>) -> Self {
+            Self {
+                id,
+                probes: std::sync::Mutex::new(vec![change(), ok()]),
+                apply: Ok(()),
+                after: Vec::new(),
+                activation: activation.cloned(),
+                events: Arc::clone(events),
+            }
+        }
+    }
+
+    impl Item for Writer {
+        fn id(&self) -> String {
+            self.id.into()
+        }
+        fn family(&self) -> &'static str {
+            "test"
+        }
+        fn layer(&self) -> Layer {
+            Layer::Workstation
+        }
+        fn class(&self) -> Class {
+            Class::Preference
+        }
+        fn title(&self) -> String {
+            self.id.into()
+        }
+        fn probe(&self) -> Probe {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("probe {}", self.id));
+            let mut probes = self.probes.lock().unwrap();
+            if probes.len() > 1 {
+                probes.remove(0)
+            } else {
+                probes[0].clone()
+            }
+        }
+        fn apply(&self) -> Result<(), String> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("apply {}", self.id));
+            self.apply.clone()
+        }
+        fn explain(&self, probe: &Probe) -> Explain {
+            explained(probe)
+        }
+        fn after(&self) -> Vec<String> {
+            self.after.clone()
+        }
+        fn activation(&self) -> Option<Arc<dyn Activation + '_>> {
+            self.activation
+                .clone()
+                .map(|activation| activation as Arc<dyn Activation>)
+        }
+    }
+
+    /// A journal that records each line's id among the events, refusing those it names.
+    struct Recorded {
+        events: Events,
+        refuses: &'static [&'static str],
+    }
+
+    impl Journal for Recorded {
+        fn before_change(
+            &mut self,
+            id: &str,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<(), String> {
+            if self.refuses.contains(&id) {
+                return Err("the journal is full".into());
+            }
+            self.events.lock().unwrap().push(format!("journal {id}"));
+            Ok(())
+        }
+    }
+
+    fn relaunch(id: &'static str, events: &Events) -> Arc<Relaunch> {
+        Arc::new(Relaunch {
+            id,
+            events: Arc::clone(events),
+            pending: Ok(Some(("old".into(), "relaunched".into()))),
+            result: Ok(Vec::new()),
+        })
+    }
+
+    /// Run `items` with a [`Recorded`] journal, recording each row as it is handed out.
+    fn recorded(
+        items: &[Box<dyn Item + '_>],
+        mode: Mode,
+        events: &Events,
+        refuses: &'static [&'static str],
+    ) -> Vec<ItemReport> {
+        let mut journal = Recorded {
+            events: Arc::clone(events),
+            refuses,
+        };
+        let streamed = Arc::clone(events);
+        run_with(items, mode, &mut journal, &mut |row| {
+            streamed.lock().unwrap().push(format!("row {}", row.id));
+        })
+        .unwrap()
+    }
+
+    /// The Dock read what `init.desktop` and `init.dock` wrote, and was relaunched after
+    /// each; the one relaunched after the first could write what it read at its start
+    /// back over the second. Items that share an activation are therefore all applied,
+    /// the activation journaled and run once after the last of them, and each read back
+    /// only after it, while an item of no activation between them is read back at once.
+    /// The rows keep run order; each is handed out when it is complete. Negative control:
+    /// reading an activated item back right after its apply (as before) puts `probe a`
+    /// before `apply b`.
+    #[test]
+    fn items_sharing_an_activation_are_applied_before_it_runs_once_and_read_back_after_it() {
+        let events = Events::default();
+        let dock = relaunch("relaunch.dock", &events);
+        let items: Vec<Box<dyn Item>> = vec![
+            Box::new(Writer::new("a", &events, Some(&dock))),
+            Box::new(Writer::new("c", &events, None)),
+            Box::new(Writer::new("b", &events, Some(&dock))),
+        ];
+        let rows = recorded(&items, Mode::Apply, &events, &[]);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.id.as_str(), row.outcome))
+                .collect::<Vec<_>>(),
+            [
+                ("a", Outcome::Changed),
+                ("c", Outcome::Changed),
+                ("b", Outcome::Changed)
+            ]
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "probe a",
+                "journal a",
+                "apply a",
+                "probe c",
+                "journal c",
+                "apply c",
+                "probe c",
+                "row c",
+                "probe b",
+                "journal b",
+                "apply b",
+                "pending relaunch.dock",
+                "journal relaunch.dock",
+                "activate relaunch.dock",
+                "probe a",
+                "row a",
+                "probe b",
+                "row b",
+            ]
+        );
+        // A plan reads, and never asks the activation anything.
+        let events = Events::default();
+        let dock = relaunch("relaunch.dock", &events);
+        let items: Vec<Box<dyn Item>> = vec![
+            Box::new(Writer::new("a", &events, Some(&dock))),
+            Box::new(Writer::new("b", &events, Some(&dock))),
+        ];
+        let rows = recorded(&items, Mode::Plan, &events, &[]);
+        assert!(rows.iter().all(|row| row.outcome == Outcome::Planned));
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["probe a", "row a", "probe b", "row b"]
+        );
+    }
+
+    /// The activation is what makes the change felt, so an activation that fails, cannot
+    /// say what awaits it, or whose line the journal refuses (it is then not run) fails
+    /// every item it was to activate, with why; their read-back is not taken for success.
+    /// A refused line is explained as a refused item line is (`Blocked`, which no remedy
+    /// of the item lifts); a failed one as a read that did not answer (`Unusable`, which
+    /// the surface's next run may). Negative control: explaining the refusal as
+    /// `Unusable` fails the third case.
+    #[test]
+    fn an_activation_that_does_not_run_fails_every_item_it_was_to_activate() {
+        for (pending, result, refuses, ran, refused) in [
+            (
+                Ok(Some(("old".into(), "new".into()))),
+                Err("Dock did not start again".to_owned()),
+                &[][..],
+                true,
+                false,
+            ),
+            (
+                Err("cannot read the marker".to_owned()),
+                Ok(Vec::new()),
+                &[][..],
+                false,
+                false,
+            ),
+            (
+                Ok(Some(("old".into(), "new".into()))),
+                Ok(Vec::new()),
+                &["relaunch.dock"][..],
+                false,
+                true,
+            ),
+        ] {
+            let events = Events::default();
+            let dock = Arc::new(Relaunch {
+                id: "relaunch.dock",
+                events: Arc::clone(&events),
+                pending,
+                result,
+            });
+            let items: Vec<Box<dyn Item>> = vec![
+                Box::new(Writer::new("a", &events, Some(&dock))),
+                Box::new(Writer::new("b", &events, Some(&dock))),
+            ];
+            let rows = recorded(&items, Mode::Apply, &events, refuses);
+            for row in &rows {
+                assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
+                let why = row.why.clone().unwrap();
+                assert!(why.starts_with("applied, but not activated: "), "{why}");
+                let probe = if refused {
+                    Probe::Blocked { why }
+                } else {
+                    Probe::Unusable { why }
+                };
+                assert_eq!(row.explain, Some(explained(&probe)), "{row:?}");
+            }
+            let events = events.lock().unwrap();
+            assert_eq!(
+                events.iter().any(|event| event == "activate relaunch.dock"),
+                ran,
+                "{events:?}"
+            );
+            // No read-back after the apply: the row is judged by the activation.
+            assert_eq!(events.iter().filter(|event| *event == "probe a").count(), 1);
+        }
+    }
+
+    /// Each item settles alone: an activation whose part for one item failed (a consumer
+    /// of only that item's keys did not start again) fails that item, with why, and reads
+    /// the others back, so one consumer's trouble does not unverify, and so roll back, a
+    /// change another consumer took. Negative control: failing every awaiting item on any
+    /// named failure fails `b`.
+    #[test]
+    fn an_activation_that_fails_for_one_item_fails_only_that_item() {
+        let events = Events::default();
+        let dock = Arc::new(Relaunch {
+            id: "relaunch.dock",
+            events: Arc::clone(&events),
+            pending: Ok(Some(("old".into(), "new".into()))),
+            result: Ok(vec![(
+                "a".into(),
+                "NotificationCenter has not started again".into(),
+            )]),
+        });
+        let items: Vec<Box<dyn Item>> = vec![
+            Box::new(Writer::new("a", &events, Some(&dock))),
+            Box::new(Writer::new("b", &events, Some(&dock))),
+        ];
+        let rows = recorded(&items, Mode::Apply, &events, &[]);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.id.as_str(), row.outcome, row.why.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "a",
+                    Outcome::Failed,
+                    Some("applied, but not activated: NotificationCenter has not started again")
+                ),
+                ("b", Outcome::Changed, None),
+            ]
+        );
+        let events = events.lock().unwrap();
+        // `a` is judged by the activation, `b` by its read-back after it.
+        assert_eq!(events.iter().filter(|event| *event == "probe a").count(), 1);
+        assert_eq!(events.iter().filter(|event| *event == "probe b").count(), 2);
+    }
+
+    /// An activation runs only for a change that was applied: nothing pending, every item
+    /// already as wanted, or the one apply failing leaves it unrun and unjournaled; an
+    /// item whose apply fails is failed at once, and the others are still activated.
+    #[test]
+    fn an_activation_runs_only_when_an_applied_item_awaits_it_and_something_is_pending() {
+        // Nothing pending: read back at once, no line.
+        let events = Events::default();
+        let dock = Arc::new(Relaunch {
+            id: "relaunch.dock",
+            events: Arc::clone(&events),
+            pending: Ok(None),
+            result: Ok(Vec::new()),
+        });
+        let items: Vec<Box<dyn Item>> = vec![Box::new(Writer::new("a", &events, Some(&dock)))];
+        let rows = recorded(&items, Mode::Apply, &events, &[]);
+        assert_eq!(rows[0].outcome, Outcome::Changed);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "probe a",
+                "journal a",
+                "apply a",
+                "pending relaunch.dock",
+                "probe a",
+                "row a"
+            ]
+        );
+        // Already as wanted, or an apply that failed: nothing awaits it.
+        let events = Events::default();
+        let dock = relaunch("relaunch.dock", &events);
+        let mut wanted = Writer::new("a", &events, Some(&dock));
+        wanted.probes = std::sync::Mutex::new(vec![ok()]);
+        let mut fails = Writer::new("b", &events, Some(&dock));
+        fails.apply = Err("defaults write failed".into());
+        let items: Vec<Box<dyn Item>> = vec![Box::new(wanted), Box::new(fails)];
+        let rows = recorded(&items, Mode::Apply, &events, &[]);
+        assert_eq!(rows[0].outcome, Outcome::Ok);
+        assert_eq!(rows[1].outcome, Outcome::Failed);
+        assert_eq!(rows[1].why.as_deref(), Some("defaults write failed"));
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.contains("relaunch.dock")),
+            "{:?}",
+            events.lock()
+        );
+        // A failed apply beside an applied one: that one is still activated.
+        let events = Events::default();
+        let dock = relaunch("relaunch.dock", &events);
+        let mut fails = Writer::new("a", &events, Some(&dock));
+        fails.apply = Err("defaults write failed".into());
+        let items: Vec<Box<dyn Item>> = vec![
+            Box::new(fails),
+            Box::new(Writer::new("b", &events, Some(&dock))),
+        ];
+        let rows = recorded(&items, Mode::Apply, &events, &[]);
+        assert_eq!(
+            rows.iter().map(|row| row.outcome).collect::<Vec<_>>(),
+            [Outcome::Failed, Outcome::Changed]
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| *event == "activate relaunch.dock")
+                .count(),
+            1
+        );
+    }
+
+    /// An item a run selects (`--only`, [`crate::select`]) keeps its activation: the two
+    /// selected items of one activation still apply first and run it once, after both.
+    /// Negative control: `Narrowed` not forwarding [`Item::activation`] reads each back at
+    /// once after its own apply, and never runs the activation.
+    #[test]
+    fn a_selected_item_keeps_its_activation() {
+        let events = Events::default();
+        let dock = relaunch("relaunch.dock", &events);
+        let items: Vec<Box<dyn Item>> = vec![
+            Box::new(Writer::new("a", &events, Some(&dock))),
+            Box::new(Writer::new("c", &events, None)),
+            Box::new(Writer::new("b", &events, Some(&dock))),
+        ];
+        let (items, unmatched) = crate::select(items, &["a".into(), "b".into()]);
+        assert!(unmatched.is_empty(), "{unmatched:?}");
+        let rows = recorded(&items, Mode::Apply, &events, &[]);
+        assert!(
+            rows.iter().all(|row| row.outcome == Outcome::Changed),
+            "{rows:?}"
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "probe a",
+                "journal a",
+                "apply a",
+                "probe b",
+                "journal b",
+                "apply b",
+                "pending relaunch.dock",
+                "journal relaunch.dock",
+                "activate relaunch.dock",
+                "probe a",
+                "row a",
+                "probe b",
+                "row b",
+            ]
+        );
+    }
+
+    /// An item that waits on an activated item runs once that item is read back: after
+    /// every item of its activation, whatever the composition order. An item of the same
+    /// activation that waits on another applies after it, reading it as applied, and both
+    /// are read back after the activation.
+    #[test]
+    fn an_item_waiting_on_an_activated_item_runs_after_its_whole_activation() {
+        let events = Events::default();
+        let dock = relaunch("relaunch.dock", &events);
+        let mut d = Writer::new("d", &events, None);
+        d.after = vec!["a".into()];
+        let mut b = Writer::new("b", &events, Some(&dock));
+        b.after = vec!["a".into()];
+        let items: Vec<Box<dyn Item>> = vec![
+            Box::new(Writer::new("a", &events, Some(&dock))),
+            Box::new(d),
+            Box::new(b),
+        ];
+        assert_eq!(order(&items).unwrap(), [0, 2, 1]);
+        let rows = recorded(&items, Mode::Apply, &events, &[]);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.id.as_str(), row.outcome))
+                .collect::<Vec<_>>(),
+            [
+                ("a", Outcome::Changed),
+                ("b", Outcome::Changed),
+                ("d", Outcome::Changed)
+            ]
+        );
+        let events = events.lock().unwrap();
+        let at = |event: &str| events.iter().position(|e| e == event).unwrap();
+        assert!(at("apply b") < at("activate relaunch.dock"));
+        assert!(at("activate relaunch.dock") < at("probe d"));
+        // A dependant of an activation that fails waits, and is not applied.
+        let events = Events::default();
+        let dock = Arc::new(Relaunch {
+            id: "relaunch.dock",
+            events: Arc::clone(&events),
+            pending: Ok(Some(("old".into(), "new".into()))),
+            result: Err("Dock did not start again".into()),
+        });
+        let mut d = Writer::new("d", &events, None);
+        d.after = vec!["a".into()];
+        let items: Vec<Box<dyn Item>> = vec![
+            Box::new(Writer::new("a", &events, Some(&dock))),
+            Box::new(d),
+        ];
+        let rows = recorded(&items, Mode::Apply, &events, &[]);
+        assert_eq!(rows[1].outcome, Outcome::Blocked);
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "apply d")
         );
     }
 }

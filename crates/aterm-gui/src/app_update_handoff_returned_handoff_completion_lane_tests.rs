@@ -296,7 +296,7 @@ fn a_switch_the_automatic_lane_retries_by_itself_is_recorded_as_waiting() {
             crate::UpdateHandoffOutcome::TimedOut,
             true,
         ),
-        // NEGATIVE CONTROL: a person's press that failed is not retried.
+        // Negative control: a person's press that failed is not retried.
         (
             ApplyMode::Immediate,
             crate::UpdateHandoffOutcome::TimedOut,
@@ -529,7 +529,7 @@ fn a_capture_refusal_is_recorded_waits_for_the_desk_and_never_latches() {
     let now = std::time::Instant::now();
     assert!(app.capture_refusal_holds(build, dmg, false, now));
     assert!(app.capture_refusal_holds(build, dmg, false, now));
-    // …a DIFFERENT artifact is not held by it…
+    // …a different artifact is not held by it…
     assert!(!app.capture_refusal_holds(build + 1, dmg, false, now));
     // …and the desk moving releases it (a resize is one of the facts every
     // refusal the capture can make is about), once the spacing of a second
@@ -939,7 +939,7 @@ fn a_refusal_that_came_back_is_recorded_with_its_spacing() {
             .skip(before + started)
             .cloned()
             .collect();
-        // ONE RECORD PER REFUSAL: no separate "kept running" stop beside it.
+        // One record per refusal: no separate "kept running" stop beside it.
         assert_eq!(added.len(), 1, "refusal {refusal}: {added:?}");
         assert_eq!(
             added[0].title,
@@ -1053,13 +1053,9 @@ fn a_fork_lane_park_miss_is_recorded_as_the_routine_wait_it_is() {
     }
 }
 
-/// The classification as a table, so a new outcome variant must be placed
-/// deliberately. Three axes: who asked (the mode), what happened (the typed
-/// outcome), and for `ChildDied`, what the worker saw.
-///
-/// Driven with `Unobserved` evidence, the default for every outcome but
-/// `ChildDied`, which therefore lands in `Unexplained` here; its evidence-bearing
-/// arms are the table below.
+/// The classification as a table, so a new outcome variant is placed deliberately: by mode
+/// and typed outcome, with `Unobserved` evidence (so `ChildDied` lands in `Unexplained`; its
+/// evidence arms are `a_dead_candidate_is_classified_by_what_the_worker_saw`).
 #[test]
 fn every_handoff_outcome_lands_in_the_lane_its_evidence_earns() {
     use crate::ChildDeathEvidence as Death;
@@ -1105,10 +1101,9 @@ fn every_handoff_outcome_lands_in_the_lane_its_evidence_earns() {
             Lane::Manual,
             "{outcome:?} from a person"
         );
-        // The main thread's own activity-shaped rejection dominates the physical
-        // shape (a rollback the terminal caused says nothing about the artifact),
-        // but not a capture refusal, the park's own typed verdict about the desk
-        // (`RefusalNeverRetriesAsActivity`).
+        // The main thread's own activity-shaped rejection dominates the physical shape (a
+        // rollback the terminal caused says nothing about the artifact), but not a capture
+        // refusal (`RefusalNeverRetriesAsActivity`).
         assert_eq!(
             Lane::classify(
                 ApplyMode::AutomaticPastGrace,
@@ -1171,9 +1166,8 @@ fn a_starved_child_died_keeps_retrying_past_the_budget_a_refusal_would_spend() {
          got {still_coming:?}"
     );
 
-    // Still bounded: spend the rest of the transient lifetime and the schedule
-    // ends, said once. What follows is a quiet re-sample one epoch cooldown out,
-    // never a latch that never lapses: at most one attempt per six hours.
+    // Still bounded: the rest of the transient lifetime ends the schedule; after that, one
+    // quiet re-sample per epoch cooldown (six hours).
     for _ in STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS..PHYSICAL_FAILURE_LIFETIME_ATTEMPTS {
         reduce_one_returned_failure(
             &mut app,
@@ -1195,11 +1189,9 @@ fn a_starved_child_died_keeps_retrying_past_the_budget_a_refusal_would_spend() {
     );
 }
 
-/// A successor that refuses converges on the structural budget, but not on the
-/// first failure. `Exited { code: 0 }` is the refusal this tree produces: a
-/// candidate whose boot apply could not swap stays the old build, refuses the
-/// target identity, closes every adopted master and returns from `main_entry`.
-/// Reaching an `exit` separates it from a starved child.
+/// A refusing successor converges on the structural budget, but not on its first failure.
+/// `Exited { code: 0 }` is how a candidate whose boot apply could not swap refuses (it
+/// returns from `main_entry`); reaching an exit separates it from a starved child.
 #[test]
 fn a_refusing_child_died_converges_to_manual_only_within_its_budget() {
     use crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS;
@@ -1255,11 +1247,11 @@ fn a_refusing_child_died_converges_to_manual_only_within_its_budget() {
     );
 }
 
-/// A successor whose swap was deferred for a moment is retried, not converged: its
-/// boot apply waited out a sibling's apply lock (or `codesign` ran out of budget),
-/// stayed the old build and exited [`crate::seamless::EXIT_SUCCESSOR_PASSING`].
-/// The two failures that converge an exit `0` ride the transient schedule here:
-/// second rung, no structural verdict, trial launch forgiven.
+/// A successor whose swap was deferred for a moment (its boot apply waited out a sibling's
+/// apply lock, or `codesign` ran out of budget) exits
+/// [`crate::seamless::EXIT_SUCCESSOR_PASSING`] and is retried, not converged: the failures
+/// that converge an exit `0` leave it on the transient schedule's second rung, with no
+/// structural verdict and its trial launch forgiven.
 #[test]
 fn a_successor_that_exits_75_is_retried_on_the_transient_schedule() {
     use crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS;
@@ -1404,10 +1396,9 @@ fn an_unexplained_child_died_gets_a_second_epoch_and_then_only_resamples() {
     );
 }
 
-/// The evidence axis as a total table: every `ChildDeathEvidence` a worker can
-/// produce and the shape it earns. A child starved of CPU also exits before its
-/// readiness proof, so `ChildDied` cannot be structural unconditionally. Every
-/// arm is a fact the worker observed, never a duration threshold or a message.
+/// The evidence axis as a total table: each `ChildDeathEvidence` and the shape it earns. A
+/// CPU-starved child also dies before its proof, so `ChildDied` is not structural
+/// unconditionally; every arm is an observed fact, never a duration or a message.
 #[test]
 fn a_dead_candidate_is_classified_by_what_the_worker_saw() {
     use crate::ChildDeathEvidence as Death;

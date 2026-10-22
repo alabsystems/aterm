@@ -3421,18 +3421,11 @@ mod tests {
         );
     }
 
-    /// The caret cools with its trail, not with the ignition heat.
-    ///
-    /// After a 43-key burst, the ribbon's momentum spine is still high while
-    /// `TypingCadence::intensity` is already zero; a caret riding the cadence
-    /// drops to its idle mix (the theme's cursor colour) beside a fully painted
-    /// ribbon. The burst drives the real
-    /// [`crate::cursor_trail::TypingCadence`] and
-    /// [`crate::typing_momentum::TypingMomentum`], so "cadence dead, spine
-    /// alive" is measured on the real clocks and re-derives on retune.
-    ///
-    /// Negative control: `paint: None` on the same frames still collapses to
-    /// the base.
+    /// The caret cools with its trail, not with the ignition heat: after a 43-key burst the
+    /// ribbon's momentum spine is still high while `TypingCadence::intensity` is zero, and a
+    /// caret riding the cadence would drop to its idle mix beside a painted ribbon. Driven by
+    /// the real [`crate::cursor_trail::TypingCadence`] and
+    /// [`crate::typing_momentum::TypingMomentum`] clocks; `paint: None` is the negative control.
     #[test]
     fn the_caret_cools_with_its_trail_and_not_with_the_ignition_heat() {
         use crate::cursor_trail::TypingCadence;

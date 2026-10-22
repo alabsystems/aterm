@@ -170,6 +170,37 @@ pub struct Answered {
     pub delay: Duration,
     /// What the request was, for the log (`-` when the answer names nothing).
     pub tag: String,
+    /// A controller may hold the response until its input fixture is ready.
+    pub gate: Option<Arc<ResponseGate>>,
+}
+
+/// A response fixture released explicitly, instead of racing a timed delay.
+#[derive(Debug, Default)]
+pub struct ResponseGate {
+    open: Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl ResponseGate {
+    pub fn release(&self) {
+        *self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.changed.notify_all();
+    }
+
+    fn wait(&self) -> bool {
+        let open = self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (open, _) = self
+            .changed
+            .wait_timeout_while(open, Duration::from_secs(60), |open| !*open)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *open
+    }
 }
 
 impl Answered {
@@ -183,6 +214,7 @@ impl Answered {
             headers: Vec::new(),
             delay: Duration::ZERO,
             tag: "-".to_string(),
+            gate: None,
         }
     }
 
@@ -415,6 +447,12 @@ fn serve_one(conn: TcpStream, log: &Mutex<ApiLog>, answer: &Answer) {
                 ("t", J::Int(i64::try_from(at).unwrap_or(0))),
                 ("tag", J::s(a.tag.clone())),
                 ("u", J::s(tail)),
+                ("u_full", J::s(user)),
+                ("model", parsed.get("model").cloned().unwrap_or(J::Null)),
+                (
+                    "access_programs",
+                    parsed.get("access_programs").cloned().unwrap_or(J::Null),
+                ),
                 ("tool_output", tool_output),
                 ("status", J::Int(i64::from(a.status))),
                 ("n", J::Int(i64::try_from(n).unwrap_or(i64::MAX))),
@@ -440,6 +478,11 @@ fn serve_one(conn: TcpStream, log: &Mutex<ApiLog>, answer: &Answer) {
         };
         if !a.delay.is_zero() {
             std::thread::sleep(a.delay);
+        }
+        if let Some(gate) = &a.gate
+            && !gate.wait()
+        {
+            return;
         }
         if write_response(&mut w, &a, || {
             if let Some(id) = request_id {

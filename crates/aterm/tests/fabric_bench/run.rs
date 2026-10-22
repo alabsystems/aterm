@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The measured phases, over four worlds booted exactly as the fabric suite
-//! boots them (`harness::World`: a guarded broker in this process, opened with
+//! The measured phases, each selected scenario over its own world, booted as
+//! the fabric suite boots it (`harness::World`: a guarded broker in this process, opened with
 //! aterm's own options for the arm's tier — ordered at aterm's horizon by
 //! default — and retained by aterm's default rules as `aterm link broker`
 //! retains it, a headless `aterm`, and the real `aterm link serve` child it
@@ -78,7 +78,7 @@ use crate::census::{self, Rec};
 use crate::clock::{self, Clock, Heads, StopOnDrop, ms};
 use crate::harness::{self, DEADLINE, FLEET, World, kv, until};
 use crate::profile::{self, Profile};
-use crate::spec::{Log, ORDERED_HORIZON_MS, Spec, Tier};
+use crate::spec::{Log, ORDERED_HORIZON_MS, Scenario, Spec, Tier};
 use crate::stats;
 
 #[path = "run/pingpong.rs"]
@@ -203,6 +203,15 @@ fn spawn(w: &World) -> String {
         .nth(1)
         .expect("spawn answers OK <sid>")
         .to_string()
+}
+
+/// SPAWN `n` IDLE BYSTANDER SESSIONS ([`Spec::bystanders`]): sessions that never
+/// post or read, beside the two that talk. Their sids, for the presence wait.
+fn bystanders(w: &World, n: usize) -> Vec<String> {
+    if n > 0 {
+        eprintln!("fabric bench: spawning {n} idle bystander session(s)");
+    }
+    (0..n).map(|_| spawn(w)).collect()
 }
 
 /// Every presence row under this world's node, by subject: `(offset, body)`.
@@ -488,6 +497,12 @@ fn stop_and_read(w: &mut World) -> Vec<Rec> {
     }
     let recs = census::read_log(std::path::Path::new(&w.broker_log));
     w.broker.take();
+    w.stop().unwrap_or_else(|why| {
+        panic!(
+            "fabric world cleanup incomplete: {why}; kept {}",
+            w.tmp.display()
+        )
+    });
     recs
 }
 
@@ -1201,11 +1216,13 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     w.wait_ready();
     let served = served_line(&w, spec);
     let (a, b) = w.two_sessions();
+    let mut live = vec![a.clone(), b.clone()];
+    live.extend(bystanders(&w, spec.bystanders));
     wait_live(
         &w,
-        &[a.clone(), b.clone()],
+        &live,
         0,
-        "both sessions' presence rows to say live",
+        "both sessions' presence rows, and every bystander's, to say live",
     );
     let ruler = Ruler::for_world(&w);
     let mut cal_seq = 0;
@@ -2057,7 +2074,20 @@ fn retention_note(spec: &Spec) -> String {
     format!("**Retention:** the log {rules}{tick}; the bridge runs {mirror}.")
 }
 
-/// Measure everything `spec` names.
+/// Run only the selected scenario. The closure must contain world setup too.
+fn measure_scenario(
+    selected: Scenario,
+    scenario: Scenario,
+    measure: impl FnOnce() -> (Value, Vec<String>),
+) -> (Value, Vec<String>) {
+    if selected == Scenario::All || selected == scenario {
+        measure()
+    } else {
+        (Value::Null, Vec::new())
+    }
+}
+
+/// Measure everything `spec` names. Unselected JSON sections are null.
 #[must_use]
 pub fn measure(spec: &Spec) -> Report {
     // ONE BINARY THROUGHOUT. Read before the first launch and after the last
@@ -2066,16 +2096,30 @@ pub fn measure(spec: &Spec) -> Report {
     let binary_at_start = binary_identity();
     let clock = Clock::start();
     let started = Instant::now();
-    let (messaging, messaging_md) = messaging(spec, clock);
-    let (pingpong, pingpong_md) = pingpong::measure(spec, clock);
-    let (attach, attach_md) = attach(spec, clock);
-    let (handoff, handoff_md) = handoff::measure(spec, clock);
+    let (messaging, messaging_md) = measure_scenario(spec.scenario, Scenario::Messaging, || {
+        messaging(spec, clock)
+    });
+    let (pingpong, pingpong_md) = measure_scenario(spec.scenario, Scenario::Pingpong, || {
+        pingpong::measure(spec, clock)
+    });
+    let (attach, attach_md) =
+        measure_scenario(spec.scenario, Scenario::Attach, || attach(spec, clock));
+    let (handoff, handoff_md) = measure_scenario(spec.scenario, Scenario::Handoff, || {
+        handoff::measure(spec, clock)
+    });
     let mut md = vec![
         format!("**Broker:** {}", broker_note(spec)),
         String::new(),
         retention_note(spec),
         String::new(),
     ];
+    if spec.scenario != Scenario::All {
+        md.push(format!(
+            "**Scenario:** {} only; the other scenarios were not run.",
+            spec.scenario.word()
+        ));
+        md.push(String::new());
+    }
     md.extend(messaging_md);
     md.extend(pingpong_md);
     md.extend(attach_md);
@@ -2088,6 +2132,7 @@ pub fn measure(spec: &Spec) -> Report {
     let json = json!({
         "schema": "aterm-fabric-bench-v1",
         "spec": spec.words(),
+        "scenario": spec.scenario.word(),
         "profile": arm.map_or("unknown", Profile::name),
         "build": arm.map_or("a binary in neither arm's build directory", Profile::describe),
         "aterm_binary": harness::aterm(),
@@ -2116,6 +2161,51 @@ fn binary_identity() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_selected_scenarios_are_measured() {
+        use super::*;
+        use std::cell::Cell;
+
+        for phase in [Scenario::Messaging, Scenario::Attach, Scenario::Handoff] {
+            let (json, markdown) = measure_scenario(Scenario::Pingpong, phase, || {
+                panic!("pingpong-only started {}", phase.word());
+            });
+            assert!(json.is_null());
+            assert!(markdown.is_empty());
+        }
+        let calls = Cell::new(0);
+        let (json, markdown) = measure_scenario(Scenario::Pingpong, Scenario::Pingpong, || {
+            calls.set(calls.get() + 1);
+            (
+                json!({"measured": "pingpong"}),
+                vec!["pingpong".to_string()],
+            )
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(json["measured"].as_str(), Some("pingpong"));
+        assert_eq!(markdown, ["pingpong"]);
+
+        // The omitted/default selection still starts every phase exactly once.
+        calls.set(0);
+        for phase in [
+            Scenario::Messaging,
+            Scenario::Pingpong,
+            Scenario::Attach,
+            Scenario::Handoff,
+        ] {
+            let (json, markdown) = measure_scenario(Scenario::All, phase, || {
+                calls.set(calls.get() + 1);
+                (
+                    json!({"measured": phase.word()}),
+                    vec![phase.word().to_string()],
+                )
+            });
+            assert_eq!(json["measured"].as_str(), Some(phase.word()));
+            assert_eq!(markdown, [phase.word()]);
+        }
+        assert_eq!(calls.get(), 4);
+    }
+
     /// EACH ARM OPENS ITS BROKER AS ATERM OPENS IT: aterm's options for the
     /// tier — the escalation table on the weak tiers, none on strict — and
     /// the arm's horizon on ordered, aterm's own unless named. The std-only

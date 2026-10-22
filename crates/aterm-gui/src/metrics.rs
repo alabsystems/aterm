@@ -1411,29 +1411,20 @@ const fn tainted_at(
     capture_forced || capture_depth != 0 || now_ns < taint_until_ns
 }
 
-/// WHICH present drops make the following output→present samples meaningless.
-///
-/// PURE and deliberately NARROW. Occluded glass, or a drop the retry scheduler
-/// parked awaiting an external surface stimulus, means frames stopped reaching
-/// the screen for an interval nobody was watching — output kept stamping and
-/// the resuming present books the whole unwatched gap. A transient
-/// `CpuAcquire`/`GpuTimeout`/`GpuReconfigured` that retries a millisecond later
-/// is a stall the user genuinely FELT: tainting those would delete exactly the
-/// samples this histogram exists to catch.
+/// Which present drops make the following output→present samples meaningless. Narrow on
+/// purpose: occluded glass, or a drop parked awaiting an external surface stimulus, means
+/// nobody was watching while output kept stamping. A transient
+/// `CpuAcquire`/`GpuTimeout`/`GpuReconfigured` retried a millisecond later is a stall the
+/// user felt, which this histogram exists to catch.
 const fn drop_taints_present_latency(reason: PresentDropReason, parked: bool) -> bool {
     parked || matches!(reason, PresentDropReason::GpuOccluded)
 }
 
-/// A capture episode (`video` recording, paced or offscreen) opened or closed.
-///
-/// THE OBSERVER RULE IN CODE: a recording paces presents on its own schedule
-/// and pins gates the unrecorded path does not have, so every output→present
-/// sample taken while it runs describes the INSTRUMENT, not the terminal. Marking
-/// the episode is what lets `present_p95` stay a statement about aterm while the
-/// recorded numbers remain readable in their own ledger. Nesting-safe (depth,
-/// not a bool) so overlapping captures cannot leave the flag stuck either way,
-/// and the close arms the tail because presents already queued by the pacer land
-/// after it.
+/// A capture episode (`video` recording, paced or offscreen) opened or closed. A recording
+/// paces presents on its own schedule and adds gates, so output→present samples taken
+/// while it runs describe the instrument and go to the tainted ledger. Nesting-safe (a
+/// depth, not a bool); the close arms the tail because presents the pacer already queued
+/// land after it.
 pub(crate) fn note_capture_episode(active: bool) {
     METRICS.note_capture_episode(active);
 }
@@ -1459,9 +1450,8 @@ label_enum! {
     }
 }
 
-/// Record one UI-thread terminal-mutex wait at `site` (cheap: one bucket
-/// increment + a `fetch_max`). Uncontended acquisitions book `0` so `n_*`
-/// counts every acquisition and the percentiles are over the true population.
+/// Record one UI-thread terminal-mutex wait at `site`. Uncontended acquisitions book 0, so
+/// `n_*` counts every acquisition and the percentiles cover the whole population.
 pub(crate) fn note_term_wait(site: TermWaitSite, ns: u64) {
     METRICS.window.redraw.note_term_wait(site, ns);
 }
@@ -1474,43 +1464,30 @@ impl RedrawLedger {
     }
 }
 
-/// Record one swapchain-acquire attempt's wait, including refused acquisitions.
-/// Cheap (one histogram bucket increment); the shared GPU present seam consumes
-/// each sample once, before either success or failure routing.
+/// Record one swapchain-acquire attempt's wait, including refused acquisitions. The GPU
+/// present seam books each sample once, before success or failure routing.
 pub(crate) fn note_acquire_wait(ns: u64) {
     let _ = METRICS.window.redraw.acquire_wait.record(ns);
 }
 
-/// Record one completed acquisition's queue span. Booked from the same
-/// completion as [`note_acquire_wait`], so the two legs of one acquisition are
-/// always readable together and `n_acquire_queue` tracks `n_acquire`.
+/// Record one completed acquisition's queue span, from the same completion as
+/// [`note_acquire_wait`], so `n_acquire_queue` tracks `n_acquire`.
 pub(crate) fn note_acquire_queue(ns: u64) {
     let _ = METRICS.window.redraw.acquire_queue.record(ns);
 }
 
-/// Record one armed present's GPU PARK: the wall time its UI thread spent
-/// blocked in `waitUntilCompleted` waiting for the GPU to finish EARLIER work —
-/// the Submit-A pipelining wait before the frame's shared buffers may be
-/// rewritten, plus the pending-ring drain past depth 3. Neither wait has a
-/// timeout.
-///
-/// This exists because the frame-slot half used to be charged to
-/// `frame_render`: it runs inside the renderer's present work timer, so a GPU
-/// or WindowServer contention stall arrived at `record_present` as CPU render
-/// cost, counted against `slow_frames`, and fed the load-shed latch — while the
-/// ring drain, which runs before that timer starts, was invisible except as
-/// `redraw_total` slack. Same rule as the acquire park: a wait on the GPU is
-/// not compose work, so it is excluded from the causal cost and gets its own
-/// published last/max. The max is the point — one long park among thousands of
-/// zero ones is the stall, and only a max can see it.
+/// Record one armed present's GPU park: the UI thread's wall time in `waitUntilCompleted`
+/// (no timeout) for earlier GPU work, i.e. the Submit-A pipelining wait before the frame's
+/// shared buffers may be rewritten plus the pending-ring drain past depth 3. A wait on the
+/// GPU is not compose work, so it stays out of `frame_render`, `slow_frames` and the
+/// load-shed latch. The max is the point: one long park among thousands of zero ones is
+/// the stall.
 pub(crate) fn note_gpu_park(ns: u64) {
     let _ = METRICS.window.redraw.gpu_park.record(ns);
 }
 
-/// A frame whose causal compose+raster/encode-submit CPU work exceeds a ~30 fps
-/// (33.3 ms)
-/// budget — the floor below which interaction visibly stutters. `slow_frames` counts
-/// these so a driver can DETECT sustained lag rather than read a momentary value.
+/// A frame whose causal CPU work exceeds the ~30 fps (33.3 ms) budget below which
+/// interaction visibly stutters; `slow_frames` counts them.
 pub(crate) const SLOW_FRAME_THRESHOLD_NS: u64 = 33_333_333; // 1/30 s
 
 /// One window's present-side state, kept in its `WindowState` (UI thread only,
@@ -1626,14 +1603,10 @@ struct PresentBooking {
     input_predicted: u32,
 }
 
-/// Record one successful application present. `latency_ns` is the
-/// `output→application-present-return` delay for this frame, or `0` when no
-/// output burst was pending (a blink/selection/resize repaint) — a `0` leaves
-/// the last real measurement in place and is NOT a slow-frame input.
-/// `render_ns` is this frame's causal CPU wall time: compose plus CPU raster/copy,
-/// or time spent encoding GPU commands and calling `queue.submit`. It is not
-/// completed GPU execution and excludes surface acquisition and final-present
-/// pacing.
+/// Record one successful application present. `latency_ns` is this frame's
+/// output→application-present-return delay, or 0 when no output burst was pending (a
+/// blink/selection/resize repaint); 0 leaves the last measurement in place. `render_ns`
+/// is the frame's causal CPU wall time (see the module doc's `frame_render`).
 ///
 /// `window` is the PRESENTING window's state (`None` when it is gone). Only its
 /// pending keys — plus the session-routed global stamp — can be closed by this
@@ -1818,18 +1791,14 @@ impl Metrics {
     }
 }
 
-/// An `output→application-present-return` reading big enough to be what a user
-/// calls lag: THREE slow-frame budgets (100 ms). Well above the ~33 ms budget a
-/// single heavy frame can legitimately spend, so an ordinary slow frame never
-/// writes a line.
+/// An output→application-present-return reading big enough to be what a user calls lag:
+/// three slow-frame budgets (100 ms), well above what one heavy frame may spend.
 const SLOW_PRESENT_LOG_THRESHOLD_NS: u64 = SLOW_FRAME_THRESHOLD_NS * 3;
 
-/// Quiet time that separates two slow-present EPISODES. A stall is a RUN of
-/// slow presents: a line per frame would bury `aterm.log` and spend main-thread
-/// time inside the very stall it describes, and a line every few seconds still
-/// wrote 9,908 of the file's 11,587 lines during one 27-hour run (2026-09-18).
-/// So a slow present after at least this long without one opens an episode
-/// (one line), and one that has had none for this long is closed (one line).
+/// Quiet time that separates two slow-present episodes. A stall is a run of slow
+/// presents, and a line per frame (or even every few seconds) would bury `aterm.log` and
+/// spend main-thread time inside the stall. A slow present after this long without one
+/// opens an episode (one line); one with none for this long is closed (one line).
 const SLOW_PRESENT_EPISODE_QUIET_NS: u64 = 60_000_000_000;
 
 /// One run of slow presents, as `aterm.log` reports it. `samples == 0` means
@@ -1849,24 +1818,21 @@ enum SlowEpisodeStep {
     /// Not a slow present, or one whose delay belongs to the session-status
     /// observer: no line.
     Ignored,
-    /// It opened an episode — first closing `closed`, when one was still open
-    /// but had gone quiet: its lines are written.
+    /// It opened an episode, first closing `closed` when one was still open but had gone
+    /// quiet: its lines are written.
     Opened { closed: Option<SlowEpisode> },
     /// It joined the open episode: no line.
     Joined,
 }
 
-/// Fold one sample into `episode`. Pure, so the threshold, the quiet gap and
-/// the session-status rule are testable without the process globals or a real
-/// stall — the same rule [`wake_owner`] is kept pure for.
+/// Fold one sample into `episode`. Pure, so the threshold, quiet gap and session-status
+/// rule are testable without the process globals or a real stall.
 ///
-/// A sample whose last deadline owner is the session-status observer is
-/// skipped: it owned 9,842 of the 9,908 breadcrumbs of the 2026-09-18 run, and
-/// those readings timed that observer's wait on output nobody was watching, not
-/// lag in front of a user. Output that was not on screen never gets here at
-/// all: a sample taken while the window was occluded or parked goes to the
-/// tainted ledger in [`record_present`], and `present_latency_ns_with_plan`
-/// only times panes on this window's glass.
+/// A sample whose last deadline owner is the session-status observer is skipped: it times
+/// that observer's wait on output nobody was watching, not lag in front of a user.
+/// Off-screen output never gets here: occluded or parked samples go to the tainted ledger
+/// in [`record_present`], and `present_latency_ns_with_plan` times only panes on this
+/// window's glass.
 fn slow_episode_step(
     episode: &mut SlowEpisode,
     latency_ns: u64,
@@ -2018,23 +1984,13 @@ impl PresentObserver {
     }
 }
 
-/// An OFFSCREEN rasterization (`image` / `window` / `snapshot` introspection) —
-/// pixels built into a buffer that never reach glass.
+/// An offscreen rasterization (`image` / `window` / `snapshot` introspection): pixels
+/// built into a buffer that never reach glass.
 ///
-/// These used to call [`record_present`] with a zero latency, which bumped
-/// `frames`, `last_/max_frame_render_ns`, `slow_frames` and the present-gap clock
-/// with work no real present ever did. A full-frame `image` rasterization is far
-/// more expensive than a scissored dirty-row on-glass frame and happens at an
-/// arbitrary time relative to real presents, so the natural measurement protocol
-/// (`metrics reset` → drive → `image` → `metrics`) silently corrupted the exact
-/// counters it was reading: `max_frame_render_ms` took a value nothing on the
-/// present path produced, `slow_frames` could go 0 → 1 on a healthy run, and
-/// `max_frame_gap_ms` was skewed in BOTH directions (an `image` between two
-/// presents shrinks a real hitch out of existence; one taken long after the last
-/// present books a multi-second phantom gap).
-///
-/// Its own counters keep headless/introspection runs observable — the reason the
-/// original calls existed — without contaminating the on-glass ledger.
+/// Counted apart from presents: a full-frame `image` raster costs far more than a
+/// scissored on-glass frame and lands at an arbitrary time, so booking it as a present
+/// would corrupt `frames`, `max_frame_render_ms`, `slow_frames` and `max_frame_gap_ms`
+/// under the very `metrics reset` → drive → `image` → `metrics` protocol that reads them.
 pub(crate) fn record_offscreen_raster(render_ns: u64) {
     METRICS.window.present.note_offscreen_raster(render_ns);
 }
@@ -2477,9 +2433,9 @@ impl InputLedger {
     }
 }
 
-/// How many unpresented keystrokes one window's [`PendingInputStamp`] holds.
-/// A fast typist's burst through a multi-second stall fits; past it the OLDEST
-/// edges are kept and the rest counted in `input_edges_dropped`.
+/// How many unpresented keystrokes one window's [`PendingInputStamp`] holds: enough for a
+/// fast typist through a multi-second stall. Past it the oldest edges are kept and the
+/// rest counted in `input_edges_dropped`.
 pub(crate) const INPUT_EDGE_RING: usize = 32;
 
 /// One unpresented keystroke routed to a window.
@@ -2488,8 +2444,8 @@ struct InputEdge {
     /// The key's arrival (`now_ns` clock, possibly backdated by NSEvent queue
     /// age); never 0 for a held edge.
     arrival_ns: u64,
-    /// When the edge was armed — compared against the last [`reset`], because a
-    /// backdated arrival can precede a reset the key itself followed.
+    /// When the edge was armed, compared against the last [`reset`]: a backdated arrival
+    /// can precede a reset the key itself followed.
     armed_ns: u64,
     /// The predictor's op the key armed (`Predictor::newest_op`), when it armed
     /// one: a present that shows the prediction through it closes the slice
@@ -2984,9 +2940,12 @@ pub(crate) fn note_pty_write_at(key: u64) {
     let d = now_ns().saturating_sub(key);
     let _ = input.key_write.record(d);
     if latency_trace_on() {
+        // "PTY write", not "blocking WriteFile", which is one platform's syscall: on Unix
+        // the UI thread's key write is the non-parking `EgressMode::Interactive` one, and a
+        // key behind a paste (every key, on Windows) is written by the egress-order thread.
         crate::logging::stderr_line!(
             "KEYWRITE key->write={:.2}ms (last OS queue {:.2}ms + UI encode + term_locks \
-             + blocking WriteFile)",
+             + PTY write)",
             d as f64 / 1_000_000.0,
             input.key_queue.last() as f64 / 1_000_000.0
         );
@@ -3007,8 +2966,7 @@ impl Metrics {
     }
 }
 
-/// A DEC-2026 hold episode armed (the FALSE→TRUE rising edge saw its first held
-/// frame).
+/// A DEC 2026 hold episode armed (the rising edge saw its first held frame).
 pub(crate) fn note_sync_armed() {
     METRICS.window.sync.holds_armed.inc();
 }

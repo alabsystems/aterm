@@ -473,7 +473,7 @@ mod tests {
                             save_plan(root.path(), &plan).unwrap();
                         }
                         _ => {
-                            crate::macos_doctor::write_atomic(
+                            aterm_machines::port::write_atomic(
                                 &root.path().join("first-run.json"),
                                 b"invalid decision",
                                 0o600,

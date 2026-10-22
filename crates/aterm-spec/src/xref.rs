@@ -37,8 +37,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::derive::Model;
 
-/// What one conformance STEP entered: the action the step claims to drive, and the
-/// anchor ids whose annotated fn ran inside that step's window and no wider.
+/// What one conformance step entered: the action it claims to drive, and the anchor ids whose
+/// annotated fn ran inside that step's window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepRecord {
     /// The machine action this step drives, spelled as the anchors spell it.

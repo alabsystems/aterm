@@ -3,17 +3,14 @@
 
 //! Durable private crash journals for native documents.
 //!
-//! A journal filename is derived from the canonical URI but never contains it:
-//! it is the document's [`JournalDocumentKey`], a MAC of the URI under the
-//! per-install secret kept beside the journals ([`load_or_mint_journal_secret`]).
-//! Journals named by the older unkeyed identity are read once, to migrate them
-//! ([`LegacyJournal`]).
-//! Every publication uses a same-directory temporary file, `sync_all`, atomic
-//! rename, and directory sync. Thus an interrupted append leaves the previous
-//! complete image recoverable instead of exposing a valid-prefix ambiguity.
-//! Existing images and lock files are admitted through non-blocking, no-follow,
-//! regular-file handles so a planted FIFO, device, or link cannot park Manual or
-//! redirect persistence outside the private journal directory.
+//! A journal's filename is the document's [`JournalDocumentKey`], a MAC of the canonical URI
+//! under the per-install secret kept beside the journals ([`load_or_mint_journal_secret`]), so it
+//! never contains the URI. Journals under the older unkeyed name are read once, to migrate them
+//! ([`LegacyJournal`]). Every publication is a same-directory temporary file, `sync_all`, atomic
+//! rename and directory sync, so an interrupted append leaves the previous complete image. Images
+//! and lock files are opened non-blocking and no-follow and proved regular files, so a planted
+//! FIFO, device or link cannot park the event loop or redirect writes outside the journal
+//! directory.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -224,11 +221,10 @@ struct JournalEntry {
     next_rewrite_generation: u64,
     rewrite_inflight: Option<InflightRewrite>,
     pending_checkpoint: Option<SavedBaseline>,
-    /// The first snapshot this store published — the file contents the draft
-    /// was made against (the file at open, or the last verified save), or the
-    /// draft itself after a re-seat found no baseline to copy — as a
-    /// fingerprint and a sequence. A re-seat keeps it: the text itself is read
-    /// back from the image on disk, never held twice in memory.
+    /// The image's first snapshot, as a fingerprint and a sequence: the file contents the draft
+    /// was made against (at open or the last verified save), or the draft itself after a re-seat
+    /// found no baseline to copy. A re-seat reads its text back from the image on disk, so it is
+    /// never held twice in memory.
     baseline: ContentFingerprint,
     baseline_seq: Seq,
     /// Whether `baseline` is the file's contents: set by `initialize` and a
@@ -237,22 +233,19 @@ struct JournalEntry {
     /// lone snapshot, which every later open reads as clean
     /// ([`holds_no_draft`]).
     baseline_is_file: bool,
-    /// The image on disk may no longer be this store's own. An update's
-    /// successor republishes the journal of every document it restores, under
-    /// ITS sequence numbers; when that update rolls back, this process owns the
-    /// document again and must re-establish the image before it appends.
+    /// The image on disk may no longer be this store's own: an update's successor republishes
+    /// the journal of every document it restores under its own sequence numbers, so when the
+    /// update rolls back this process must re-establish the image before it appends.
     reseat_owed: bool,
     reseat_inflight: Option<JournalReseatPlan>,
-    /// The last re-seat failed. It is retried at every drive, but a draft
-    /// whose journal keeps refusing is said out loud, not waited on in silence
-    /// ([`DraftCarryRefusal::ReseatFailed`]).
+    /// The last re-seat failed. It is retried at every drive, and meanwhile the draft is
+    /// refused by name ([`DraftCarryRefusal::ReseatFailed`]).
     reseat_failed: bool,
-    /// The last append failed, and nothing has made the head durable since.
-    /// The update retries it itself before it asks
-    /// (`App::drive_owed_document_journals`), so the retry is on the worker
-    /// whenever the update reads this draft: without this fact a journal that
-    /// keeps refusing reads as one that is merely busy, and the update waits
-    /// on it in silence for good ([`DraftCarryRefusal::AppendFailed`]).
+    /// The last append failed and nothing has made the head durable since. The update retries
+    /// it before it asks (`App::drive_owed_document_journals`), so the retry is usually on the
+    /// worker when the update reads this draft: without this flag a journal that keeps refusing
+    /// reads as merely busy and the update waits on it forever
+    /// ([`DraftCarryRefusal::AppendFailed`]).
     append_failed: bool,
     /// A legacy journal this document was migrated from and that is not yet
     /// retired: bound into every write plan, which retires it before it
@@ -309,14 +302,11 @@ pub(crate) struct JournalReseatPlan {
 pub(crate) enum JournalReseatResult {
     /// The image on disk is still the one this store published.
     Unchanged,
-    /// A fresh image recovering to the plan's target was published. `baseline`
-    /// is its first snapshot: the plan's own when the image found on disk still
-    /// carried it or the target is that baseline, else the target itself (the
-    /// file's baseline was not there to copy, so a later open reports a disk
-    /// conflict rather than replaying the draft over contents it was not made
-    /// against, and keeps it aside rather than replacing it).
-    /// `baseline_is_file` says whether that snapshot is still the file's
-    /// contents, `preserved` whether the image found there was set aside first.
+    /// A fresh image recovering to the plan's target was published. `baseline` is its first
+    /// snapshot: the plan's when the image on disk still carried it or the target is that
+    /// baseline, else the target itself (so a later open over other contents reports a conflict
+    /// and keeps the draft aside rather than replaying it). `baseline_is_file` says whether that
+    /// snapshot is still the file's contents, `preserved` whether the found image was set aside.
     Republished {
         image: ContentFingerprint,
         baseline: ContentFingerprint,
@@ -327,10 +317,9 @@ pub(crate) enum JournalReseatResult {
     Failed(String),
 }
 
-/// Why a document's unsaved draft cannot be carried through an update right
-/// now, read from this store's memory alone (the disk half is
-/// [`verify_carried_draft`]). `Writing` and `Reseating` clear by themselves;
-/// the other two need something to change.
+/// Why a document's unsaved draft cannot be carried through an update right now, read from
+/// this store's memory alone (the disk half is [`verify_carried_draft`]). `Writing` and
+/// `Reseating` clear by themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DraftCarryRefusal {
     /// The document has no journal in this process.
@@ -517,9 +506,7 @@ impl DocumentJournalStore {
             return Err(DraftCarryRefusal::ReseatFailed);
         }
         if entry.append_failed && entry.desired.seq > entry.reducer.durable_seq() {
-            // Before "writing" for the same reason: the update drives the retry
-            // of a failed append the moment before it asks, so a journal that
-            // keeps refusing is always on the worker when asked.
+            // Before "writing" for the same reason (`JournalEntry::append_failed`).
             return Err(DraftCarryRefusal::AppendFailed);
         }
         if entry_busy(entry) {
@@ -600,10 +587,9 @@ impl DocumentJournalStore {
         if entry_busy(entry) {
             return Ok(None);
         }
-        // FIRST, because every other effect is bound to an image this store
-        // published: an append or checkpoint planned over a successor's image
-        // can only fail its preflight. While the fence stands, nothing is
-        // planned at all — the owed re-seat runs first once it falls.
+        // First, because every other effect is bound to an image this store published: an
+        // append or checkpoint planned over a successor's image can only fail its preflight.
+        // While the fence stands nothing is planned; the owed re-seat runs once it falls.
         if entry.reseat_owed && reseat_fenced {
             return Ok(None);
         }
@@ -751,12 +737,9 @@ impl DocumentJournalStore {
         }
     }
 
-    /// Roll back an append that never crossed the worker queue boundary.
-    ///
-    /// Queue saturation is not an I/O failure: the latest desired snapshot is
-    /// still owned by this store and will be planned again after a worker slot
-    /// becomes available. Only the small retry registry in `app_documents`
-    /// survives this call; the encoded append image is released here.
+    /// Roll back an append that never crossed the worker queue boundary. Queue saturation is
+    /// not an I/O failure: this store still owns the latest desired snapshot and plans it again
+    /// once a worker slot frees; the encoded append image is released here.
     pub(crate) fn defer_append(
         &mut self,
         document: DocumentId,
@@ -1019,13 +1002,9 @@ impl DocumentJournalStore {
     }
 }
 
-/// Take the journal's advisory lock for as long as the returned handle lives —
-/// how a test makes a peer's (a successor's) journal publication refuse busy.
-/// Released by `LOCK_UN` when the handle drops, as the product's own holder is
-/// ([`with_journal_lock`]): a lock released by the close alone lives on in the
-/// copy of its description any shell another test thread forked meanwhile holds
-/// until it execs, and the next take — 25 ms of it on the event loop — is
-/// refused for a lock nobody holds.
+/// Hold the journal's advisory lock while the returned handle lives, so a peer's journal
+/// publication refuses busy. Released by `LOCK_UN` on drop, as [`with_journal_lock`] releases:
+/// a close alone would leave it taken in any shell another test thread forked meanwhile.
 #[cfg(test)]
 pub(crate) fn hold_journal_lock_for_test(
     path: &Path,
@@ -1113,18 +1092,16 @@ fn entry_busy(entry: &JournalEntry) -> bool {
         || entry.reseat_inflight.is_some()
 }
 
-/// The disk half of carrying a draft through an update: read the journal image
-/// as the successor will (bounded, no-follow, regular file only), replay it
-/// (every record's checksum is checked on the way), and require that it
-/// recovers to EXACTLY `head` — byte for byte, which no digest improves on —
-/// against the file contents `disk` names, the same test the successor's open
-/// makes before it replays a draft ([`DraftJournalHost::inspect_open`]).
+/// The disk half of carrying a draft through an update: read the journal image as the
+/// successor will (bounded, no-follow, regular file only), replay it (checking every record's
+/// checksum), and require that it recovers to exactly `head`, byte for byte, against the file
+/// contents `disk` names — the test the successor's open makes before it replays a draft
+/// ([`DraftJournalHost::inspect_open`]).
 ///
-/// At an update's Commit this reads the successor's own work: a successor
-/// republishes the journal of every document it restores with the text it
-/// restored, so an image that still recovers to `head` is the proof the
-/// successor holds this buffer (or, when its restore failed, that the journal
-/// its Recovery tab reopens does).
+/// At an update's Commit this reads the successor's own work: a successor republishes the
+/// journal of every document it restores, so an image that still recovers to `head` proves the
+/// successor holds this buffer (or, when its restore failed, that the journal its Recovery tab
+/// reopens does).
 pub(crate) fn verify_carried_draft(
     candidate: &DraftCarryCandidate,
     head: &str,
@@ -1145,15 +1122,12 @@ pub(crate) fn verify_carried_draft(
     Ok(())
 }
 
-/// Whether a journal image holds no draft: it is its first snapshot alone, the
-/// file as it was opened or last saved, with nothing journaled past it. No
-/// writer leaves a draft as one record: `initialize` and a checkpoint write the
-/// file's snapshot, then the draft's when there is one; an append adds records,
-/// and compaction collapses an image to one only when its latest text is that
-/// snapshot at that sequence; a re-seat writes its target alone only when it is
-/// the file's contents ([`JournalEntry::baseline_is_file`]), and otherwise after
-/// the baseline it copied, or twice when it stands as its own. Such an image is
-/// never kept aside: it holds nothing the file did not once hold.
+/// Whether a journal image holds no draft: its first snapshot alone, the file as opened or last
+/// saved. No writer leaves a draft as one record: `initialize` and a checkpoint write the file's
+/// snapshot, then the draft's if any; an append only adds records; compaction collapses to one
+/// only when the latest text is that snapshot at that sequence; a re-seat writes its target alone
+/// only when it is the file's contents ([`JournalEntry::baseline_is_file`]). Such an image is
+/// never kept aside.
 fn holds_no_draft(recovered: &StoredJournalRecovery) -> bool {
     recovered.record_count == 1
 }
@@ -1174,9 +1148,8 @@ struct OpenReading {
 }
 
 fn read_for_open(recovered: &StoredJournalRecovery, disk_bytes: &[u8]) -> OpenReading {
-    // Opened or saved and never edited since: whatever the disk holds now,
-    // there is nothing to recover and nothing to keep aside, and `initialize`
-    // replaces this image with the file as it is.
+    // Opened or saved and never edited since: nothing to recover or keep aside, whatever the
+    // disk holds now; `initialize` replaces the image with the file as it is.
     if holds_no_draft(recovered) {
         return OpenReading {
             recover: false,
@@ -1326,11 +1299,8 @@ pub(crate) fn execute_journal_reseat(
                     true,
                 )
             }
-            // A draft whose baseline is not there to copy, or is itself a
-            // draft, stands as its own, so a later open over any other file
-            // contents reports a conflict and keeps it. Recorded twice: alone it
-            // would read as a clean image ([`holds_no_draft`]), which that open
-            // replaces.
+            // `[target, target]`: the draft stands as its own baseline, and the second record
+            // keeps it from reading as clean ([`holds_no_draft`]).
             _ => {
                 let draft = JournalRecord::snapshot_for(plan.key, &target);
                 (
@@ -1370,19 +1340,12 @@ fn synthetic_snapshot(document: DocumentId, seq: Seq, text: Arc<str>) -> Documen
 /// Narrow two document snapshots to the one replaced range between their common prefix and
 /// common suffix.
 ///
-/// PERF: this runs on the UI thread for EVERY committed edit (`next_effect` ← the editor's
-/// per-keystroke commit), and both scans cover the whole UNCHANGED region — for the common
-/// append-at-end that is the entire document, twice. Comparing `char`s meant two decoding
-/// iterators zipped together: several times the cost of a byte compare, and unvectorisable.
-/// So compare bytes and then snap the divergence point back onto a `char` boundary.
-///
-/// That is exactly equivalent, by UTF-8 self-synchronisation. Two strings agreeing on bytes
-/// `[0, k)` have the SAME char boundaries inside that window, so the largest boundary `b <= k`
-/// bounds a run of identical chars; and the char straddling `b` differs in the two strings
-/// (they differ at byte `k`, which lies inside it in both). The mirror argument holds for the
-/// suffix: a byte that is a boundary from one end is not a continuation byte, so it is a
-/// boundary in both tails. The returned [`JournalEdit`] is therefore bit-identical — which it
-/// must be, since `insert.len()` picks delta-vs-snapshot encoding against `MAX_INSERT_BYTES`.
+/// Runs on the UI thread for every committed edit and scans the whole unchanged region, so it
+/// compares bytes and snaps the divergence back onto a `char` boundary. That equals the
+/// char-wise answer by UTF-8 self-synchronisation: strings agreeing on bytes `[0, k)` share
+/// their char boundaries there, and the char straddling the largest boundary `b <= k` differs
+/// (byte `k` lies inside it in both); the suffix argument mirrors it. The result must be
+/// identical, since `insert.len()` picks delta or snapshot encoding against `MAX_INSERT_BYTES`.
 fn single_edit(before: &str, after: &str) -> JournalEdit {
     let mut prefix = before
         .as_bytes()
@@ -1403,7 +1366,7 @@ fn single_edit(before: &str, after: &str) -> JournalEdit {
         .zip(after_tail.as_bytes().iter().rev())
         .position(|(left, right)| left != right)
         .unwrap_or_else(|| before_tail.len().min(after_tail.len()));
-    // Snap DOWN (shrinking the matched tail) so the split lands on a boundary of both tails.
+    // Snap down (shrinking the matched tail) so the split lands on a boundary of both tails.
     while suffix > 0 && !before_tail.is_char_boundary(before_tail.len() - suffix) {
         suffix -= 1;
     }
@@ -1419,22 +1382,9 @@ impl DraftJournalHost {
         {
             use std::sync::atomic::{AtomicU64, Ordering};
             static NEXT: AtomicU64 = AtomicU64::new(1);
-            // A RECYCLED PID MUST NEVER RESOLVE TO A DEAD RUN'S ROOT. These
-            // roots are draft-recovery journals, so a pid+ordinal name alone let
-            // macOS pid recycling hand a fresh test process a prior run's
-            // unsaved draft — which crash recovery then dutifully replayed into
-            // the new test's document (the proven six-tests-at-once
-            // app_documents flake: one Enter on "abc" landed on a resurrected
-            // "abc\n" and read back "abc\n\n"). The process root is stamped per
-            // process INSTANCE, and a same-named corpse is removed.
-            //
-            // AND THEN TAKE THEM BACK. Every call used to leave one directory in
-            // the system temp dir forever; on m17-tower that reached 224,002 of
-            // them — enough that `/tmp`, a RAM-backed tmpfs there, held them in
-            // memory and the box ran itself out of swap. So every root for this
-            // process nests under ONE process root, which goes when the process
-            // exits and is swept by the next run when it was killed first
-            // ([`crate::test_scratch::process_root`]).
+            // Draft-recovery roots nest under one root per process instance
+            // (`crate::test_scratch::process_root`): a recycled pid must never resolve to a dead
+            // run's root, whose draft crash recovery would replay into this test's document.
             let root = crate::test_scratch::process_root(TEST_DRAFT_ROOT_PREFIX)
                 .join(NEXT.fetch_add(1, Ordering::Relaxed).to_string());
             let _ = std::fs::remove_dir_all(&root);
@@ -1520,14 +1470,13 @@ impl DraftJournalHost {
         if let Some(legacy_bytes) = legacy {
             let image = JournalImageGeneration::of(&legacy_bytes);
             match recover_journal_for(legacy_key, &legacy_bytes) {
-                // A LEGACY IMAGE THAT CARRIES NOTHING NEVER DECIDES
-                // ([`LegacyJournal`]): no draft, or one made against other
-                // contents that the file now equals. It is retired at the open,
-                // and the keyed journal (if any) decides below.
+                // A legacy image that carries nothing never decides ([`LegacyJournal`]): no
+                // draft, or one made against other contents that the file now equals. It is
+                // retired at the open, and the keyed journal (if any) decides below.
                 Ok(recovered) => {
                     let reading = read_for_open(&recovered, disk_bytes);
                     if reading.made_against_disk || reading.keep_aside {
-                        // A LEGACY DRAFT WINS while it exists.
+                        // A legacy draft wins while it exists.
                         decision.legacy = Some(LegacyJournal {
                             path: legacy_path,
                             image,
@@ -1593,20 +1542,14 @@ impl DraftJournalHost {
         Ok(decision)
     }
 
-    /// Publish a fresh, sequence-aligned image before any document view becomes
-    /// visible. A conflicting/corrupt prior image is renamed, never deleted.
+    /// Publish a fresh, sequence-aligned image before any document view becomes visible. A
+    /// conflicting or corrupt prior image is set aside, never deleted.
     ///
-    /// ALWAYS ON THE EVENT LOOP, hence no patience parameter: the one production
-    /// caller is `App::install_admitted_document` (`app_documents.rs`),
-    /// which runs it SYNCHRONOUSLY inside a `&mut self` handler because the
-    /// `InitializedJournal` it returns is what the open flow needs to build the
-    /// view. There is nowhere to hand it: the document worker's queue carries
-    /// appends and rewrites, whose results arrive later through `Wake`, and an
-    /// open cannot proceed on a promise. So this path takes the frame-sized
-    /// budget and, past it, REPORTS BUSY rather than blocking longer — the
-    /// refusal `manual_open_reports_busy_held_journal_lock_and_retries_cleanly`
-    /// pins, carrying the "retry opening Manual"
-    /// guidance that makes the user's retry the recovery path.
+    /// Always on the event loop, hence no patience parameter: `App::install_admitted_document`
+    /// calls it synchronously because the open needs the returned `InitializedJournal` to build
+    /// the view, and the document worker answers only later through `Wake`. Past the frame-sized
+    /// budget it reports busy with "retry opening Manual" rather than block
+    /// (`manual_open_reports_busy_held_journal_lock_and_retries_cleanly`).
     pub(crate) fn initialize(
         &self,
         decision: JournalOpenDecision,
@@ -1729,12 +1672,11 @@ fn preserve_journal_locked(path: &Path, expected: JournalImageGeneration) -> Res
     Err("too many preserved recovery journals for this document".to_string())
 }
 
-/// Retire a [`LegacyJournal`], under its own lock: gone already is retired;
-/// still the image the open read, it is set aside first when its draft was not
-/// carried, then unlinked; any other image an older aterm wrote after the read,
-/// newer than anything migrated from it, so it is LEFT for the next open to
-/// read and this refuses — the write that owed the retirement fails closed
-/// rather than publish a keyed image the next open would set aside.
+/// Retire a [`LegacyJournal`] under its own lock: gone already is retired; still the image the
+/// open read, it is set aside first when its draft was not carried, then unlinked. Any other
+/// image is one an older aterm wrote after the read, newer than anything migrated from it, so
+/// it is left for the next open and this refuses: the write that owed the retirement fails
+/// closed rather than publish a keyed image the next open would set aside.
 fn retire_legacy_journal(
     legacy: &LegacyJournal,
     patience: JournalLockPatience,
@@ -1784,23 +1726,17 @@ const JOURNAL_SECRET_FILE: &str = ".journal-key";
 const JOURNAL_SECRET_MAGIC: [u8; 8] = *b"ATDJKEY1";
 const JOURNAL_SECRET_FILE_LEN: usize = JOURNAL_SECRET_MAGIC.len() + JOURNAL_SECRET_LEN;
 
-/// The journal secret of the draft directory `root`, minted when it has none.
-///
-/// RULINGS (hashclock-2, 2026-10-10), all fail-closed and reversible:
-/// - MISSING: minted — 32 CSPRNG bytes ([`aterm_uds::rand::fill`]; no entropy,
-///   no secret, no store) written to a temporary created 0600 with
-///   `O_EXCL|O_NOFOLLOW`, synced, then published by `link(2)`, which never
-///   replaces: two aterms minting at once both end up reading the one that
-///   landed, never a half-written file. Keyed journals left by a secret that
-///   was deleted stay on disk untouched; no key reaches them again.
-/// - UNREADABLE OR MALFORMED (a link, FIFO or other non-regular file, another
-///   owner, group or other permission bits, a wrong length or magic, all zeros,
-///   an I/O error): REFUSED, and never replaced. Drafts keyed under it are read
-///   only through it, so minting over it would orphan every one; the store is
-///   unavailable instead (document opens say why, naming the file) and every
-///   journal — keyed or legacy — stays exactly where it is until the file is
-///   repaired, restored, or removed by the person who decides those drafts go.
-/// - NEVER A FALLBACK TO THE UNKEYED NAME for a new journal.
+/// The journal secret of the draft directory `root`, minted when it has none. Fail-closed:
+/// - Missing: minted from 32 CSPRNG bytes ([`aterm_uds::rand::fill`]; no entropy, no store)
+///   into a temporary created 0600 with `O_EXCL|O_NOFOLLOW`, synced, then published by
+///   `link(2)`, which never replaces, so two aterms minting at once both read the one that
+///   landed. Journals keyed under a deleted secret stay on disk, reached by no key again.
+/// - Unusable (a link, FIFO or other non-regular file, another owner, group or other permission
+///   bits, a wrong length or magic, all zeros, an I/O error): refused and never replaced, since
+///   the drafts keyed under it are read only through it. The store is unavailable (opens say
+///   why, naming the file) and every journal stays put until a person repairs, restores or
+///   removes the file.
+/// - A new journal never falls back to the unkeyed name.
 fn load_or_mint_journal_secret(root: &Path) -> Result<JournalSecret, String> {
     let path = root.join(JOURNAL_SECRET_FILE);
     let unusable = |error: String| {
@@ -1985,10 +1921,9 @@ fn open_journal_secret(path: &Path) -> std::io::Result<File> {
     File::open(path)
 }
 
-/// `patience` is the CALLER's declaration of which thread it is on, because that
-/// is the only place the answer is known: `native_document_queue` runs this on the
-/// `aterm-native-document` worker, `App::drive_document_journal_once` runs it
-/// inline on the thread that owns `App`. See [`JournalLockPatience`].
+/// `patience` is the caller's declaration of its thread, the only place that is known: the
+/// `aterm-native-document` worker (`native_document_queue`), or the thread that owns `App`
+/// (`App::drive_document_journal_once`). See [`JournalLockPatience`].
 pub(crate) fn execute_journal_append(
     path: &Path,
     key: JournalDocumentKey,
@@ -2332,91 +2267,23 @@ fn take_linked_journal_lock(
     ))
 }
 
-/// THE DEFECT THESE BUDGETS CLOSE, and the two independent mechanisms that size
-/// them.
+/// Which thread takes a journal lock, and so how long a refused take is retried before it is
+/// believed.
 ///
-/// A `flock` belongs to the OPEN FILE DESCRIPTION, not to the process or the
-/// descriptor, and `fork` hands the child a second descriptor onto the SAME
-/// description. So between any child's fork and its `execve`, that child owns a
-/// copy of every lock this process held at fork time — the lock stays taken
-/// after WE close our descriptor, until the child's `O_CLOEXEC` fires. aterm
-/// forks for every shell (`aterm_pty::spawn_shell_with_pid`, a hand-rolled
-/// `forkpty` whose child
-/// closes only the pty pair and the status pipe before `execve` — every other
-/// inherited descriptor, this lock included, rides to the exec), from a process
-/// whose document worker takes this lock for every draft append. A single
-/// `try_lock` therefore reports `WouldBlock` for a lock nobody wants, which is
-/// both a false diagnosis and a LOST APPEND: the reducer takes its failure
-/// branch and that document stops journaling.
+/// A `flock` belongs to the open file description, and `fork` hands each child a copy that lives
+/// until its `execve` closes it, so a lock released by the close alone stays taken in every child
+/// forked meanwhile; a single `try_lock` would refuse a lock nobody wants and drop the append. Two
+/// holders legitimately last a while:
 ///
 /// A refusal is believed only once it outlasts the budget below. Two DIFFERENT
 /// mechanisms hold this lock for a stretch, and both are real — a constant sized
 /// for only one of them is a constant nobody can maintain:
 ///
-///  1. FORK RESIDUE — a child of ours that has not reached `execve`. This is the
-///     mechanism above and it is self-inflicted: no other process is involved.
-///     Its duration is a scheduling latency, measured directly in this repo
-///     (`aterm_pty`'s `EXEC_STATUS_BUDGET` doc times fork to the `O_CLOEXEC` status
-///     pipe's EOF, which IS this window): p50 2.99 ms, p99 6.0 ms, max 12.7 ms
-///     over n=5000 at ordinary load; p50 4.5 ms, p99 206 ms, MAX 523 ms over
-///     n=20000 under deliberately pathological load (loadavg 118 on 18 cores).
-///     This lock and the sibling save lock are now released through `LOCK_UN`
-///     (`native_document_host::HeldAdvisoryLock`), which frees the description
-///     the child copied at the holder's release rather than at the child's exec
-///     (the product fd-hygiene sweep of 2026-09-27). The budgets are kept for the
-///     genuine peers: mechanism 2, and an older aterm sharing the journal that
-///     still releases by the close.
-///  2. A PEER'S DEVICE-BARRIER HOLD — a legitimate holder inside the locked
-///     section, which spans `sync_all` on the temporary (`atomic_replace_locked`)
-///     and `sync_directory` on the parent. Both are `F_FULLFSYNC`
-///     device-cache barriers on Apple targets, whose latency is bounded by the
-///     whole machine's I/O and not by the bytes written. Measured for THIS
-///     locked section: 9.13 ms mean / 13.9 ms p99 / 25.5 ms max over n=200 idle,
-///     and 20.5 ms mean / 42.9 ms p99 / 69.7 ms max over n=300 at loadavg 17 on
-///     18 cores with eight concurrent `fsync` writers. The sibling save path,
-///     whose locked section has the same two-barrier shape, was caught at
-///     82.5-279.7 ms in six leaked fixtures (`native_document_host`'s
-///     `PREFLIGHT_RETRY_BUDGET`).
-///
-/// So the lock is held until the LATER of those clears, and the worst legitimate
-/// hold this repo has ever measured on either mechanism is 523 ms.
-///
-/// WHAT THIS DOES NOT FIX, stated plainly:
-///
-///  * A THRESHOLD, NOT A PROOF. Neither budget can distinguish "our own child has
-///    not `execve`d yet" from "a peer is mid-barrier" from "another aterm has the
-///    journal open"; it only decides how long a refusal must persist before it is
-///    believed. The deterministic cure is OWNER IDENTITY — have the holder write
-///    its `std::process::id()` into the lock file before publishing and read it on
-///    `WouldBlock` (an advisory lock never blocks reads), so self-inflicted residue
-///    is ridden out and a live peer is reported busy at once. That is a bigger
-///    change than this one and is not taken here.
-///  * NOT `fcntl(F_SETLK)`. POSIX record locks are per-PROCESS, so a second request
-///    from this process SUCCEEDS instead of contending — that would silently delete
-///    the exclusion between the event loop's `initialize` and the worker's
-///    `execute_journal_append`, which are genuinely concurrent — and they drop all
-///    of a process's locks on ANY `close()` of the file, which `with_journal_lock`
-///    performs on every call. `F_OFD_SETLK` keeps the per-description semantics but
-///    is inherited by `fork` exactly as `flock` is, so it fixes nothing here.
-///  * A GENUINELY CONTENDED OPEN COSTS THE EVENT LOOP ITS WHOLE BUDGET — 25 ms,
-///    one and a half frames, once per document open, and only when the lock is
-///    actually refused. Past it the open FAILS with the retry guidance rather than
-///    waiting longer.
-///  * NO `cfg` GATE, deliberately. Windows has no `fork`, so mechanism 1 cannot
-///    happen there and only mechanism 2 can hold the lock — but mechanism 1 is the
-///    only term that raises the budget, and it raises it solely on `Worker`, the
-///    thread that exists to absorb waits. The event loop's budget is the same 25 ms
-///    on every platform. A Windows-specific constant would buy nothing and add a
-///    second number to keep true.
-///  * SCOPED OUT, having been checked: the crate's other single-shot file
-///    `try_lock`s. `control_auth.rs`'s instance lease has the same `flock`
-///    inheritance but a different contract — it is taken once and held for the whole
-///    process lifetime, so a residue window cannot change who owns it, and the only
-///    consequence is that `sweep_dead_instance_namespaces_with` may see an abandoned
-///    namespace as live for one fork window and sweep it on a later launch.
-///    `kitty_log.rs`'s rotation lock is documented best-effort and skips the merge
-///    on any refusal, which loses a log line, not a draft. Neither is a lost user
-///    edit, which is the harm that justified spending a budget here.
+/// A budget cannot tell residue from a live peer. `fcntl` record locks are no fix: they are per
+/// process, so the event loop's `initialize` and the worker's append would stop excluding each
+/// other, and any `close()` drops them; `F_OFD_SETLK` is inherited by `fork` as `flock` is. The
+/// budgets are the same on Windows, which has no fork: residue sizes only the worker's budget,
+/// whose thread exists to absorb waits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JournalLockPatience {
     /// The caller is the thread that owns `App` — the event loop. Every
@@ -2425,9 +2292,8 @@ pub(crate) enum JournalLockPatience {
     /// spelled out on `native_document_host::WRITE_LOCK_RETRY_BUDGET`, which
     /// [`Self::budget`] returns for it.
     EventLoop,
-    /// The caller is the `aterm-native-document` worker (`native_document_queue`),
-    /// whose whole job is to keep exactly this work off the event loop. Parking
-    /// it costs no frame and drops no input; refusing costs an append.
+    /// The caller is the `aterm-native-document` worker (`native_document_queue`), which exists
+    /// to keep this work off the event loop: waiting costs no frame, refusing costs an append.
     Worker,
     /// The launch sweep and a released journal's settle (`owner`): one try. A
     /// refusal means a writer is at this journal now, so it is no candidate
@@ -2440,29 +2306,15 @@ pub(crate) enum JournalLockPatience {
 }
 
 impl JournalLockPatience {
-    /// The ceiling this caller can afford. A CEILING, not a floor: an
-    /// uncontended take never sleeps at all under either value.
+    /// The longest this caller retries a refused lock; an uncontended take never sleeps.
     ///
-    /// EVENT LOOP — 25 ms. That is ~1.5 frames at 60 Hz and covers mechanism 1's
-    /// ordinary-load distribution (4x its p99, 2x its max) and mechanism 2's
-    /// idle distribution (~2x p99). It does NOT cover either tail, and is not
-    /// asked to: past it the honest answer is the refusal this module already
-    /// contracts for. Matching the sibling constant is deliberate — the same
-    /// number for the same thread means the next reader has ONE frame argument to
-    /// understand, not two, and the guard test named on `EventLoop` below fails if
-    /// the two ever drift apart.
+    /// Event loop: 25 ms (~1.5 frames at 60 Hz), the sibling write lock's budget. It covers fork
+    /// residue at ordinary load and an idle peer's barriers, not either tail; past it the open
+    /// reports busy.
     ///
-    /// WORKER — 2 s. Sized from the measurements above, not from headroom under
-    /// some test's assertion: ~4x the worst legitimate hold ever measured on
-    /// either mechanism (523 ms), ~7x the worst peer barrier hold (279.7 ms),
-    /// and enough for the two to overlap and still clear. Validated
-    /// empirically as well as arithmetically: at 250 ms four journal tests still
-    /// lost appends with the machine at 8x core oversubscription, while 2 s held
-    /// across 40 consecutive full-suite runs. The sibling save path spends a
-    /// comparable total on this same hazard (25 ms inner x a 500 ms outer
-    /// `PREFLIGHT_RETRY_BUDGET` that re-runs the whole side-effect-free preflight,
-    /// lock acquisition included); the journal has no outer retry, so its budget
-    /// is the whole allowance rather than the inner slice of one.
+    /// Worker: 2 s, ~4x the worst hold measured (523 ms); 250 ms still lost appends at 8x core
+    /// oversubscription. The journal has no outer retry (the save path has
+    /// `PREFLIGHT_RETRY_BUDGET`), so this is its whole allowance.
     const fn budget(self) -> std::time::Duration {
         match self {
             Self::EventLoop => crate::native_document_host::WRITE_LOCK_RETRY_BUDGET,
@@ -2501,10 +2353,9 @@ fn take_journal_lock(
     })
 }
 
-/// The sole production journal-image reader. The shared file-feed admission
-/// helper opens once with non-blocking/no-follow platform flags, proves that
-/// handle regular, rejects metadata oversize early, and reads at most
-/// `MAX_JOURNAL_BYTES + 1` so growth during the read cannot allocate unboundedly.
+/// The sole production journal-image reader: one non-blocking, no-follow open whose handle is
+/// proved regular, reading at most `MAX_JOURNAL_BYTES + 1` so growth during the read cannot
+/// allocate unboundedly.
 fn read_journal_image(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     match aterm_effects::file_feed::read_bounded_regular_file(path, MAX_JOURNAL_BYTES) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -2746,9 +2597,8 @@ mod tests {
         let error = read_journal_image(&oversized).expect_err("oversized journal is rejected");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains(&MAX_JOURNAL_BYTES.to_string()));
-        // A hang detector, never a latency budget: the cap is judged by the error
-        // above, and only a reader that never returns is judged by this clock. 1 s
-        // crossed under full-suite load (cb8c0cff).
+        // A hang detector, never a latency budget: the error above judges the cap; this clock
+        // only catches a reader that never returns.
         assert!(
             started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
             "the over-cap read never returned"
@@ -2766,9 +2616,8 @@ mod tests {
         make_fifo(&path);
         let started = std::time::Instant::now();
         let fifo_error = host.inspect_open(canonical, b"disk").unwrap_err();
-        // Refuses-without-BLOCKING: opening the FIFO parks FOREVER (no writer
-        // comes), so this is a hang detector, never a latency budget. 1 s crossed
-        // under full-suite load (cb8c0cff).
+        // Opening the FIFO would park forever (no writer comes): a hang detector, never a
+        // latency budget.
         assert!(
             started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
             "inspecting the FIFO journal parked"
@@ -2804,9 +2653,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let error = host.initialize(decision, &disk, &disk).unwrap_err();
-        // Refuses-without-BLOCKING: opening the FIFO lock parks FOREVER, so this is
-        // a hang detector, never a latency budget. 1 s crossed under full-suite
-        // load (cb8c0cff).
+        // Opening the FIFO lock would park forever: a hang detector, never a latency budget.
         assert!(
             started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
             "the FIFO journal lock parked initialization"
@@ -2883,13 +2730,8 @@ mod tests {
         panic!("no open descriptor refers to {}", path.display());
     }
 
-    /// The journal lock is FREE the instant the locked operation returns, even
-    /// while a copy of its description lives. The copy stands in for a shell
-    /// another thread forked mid-append: a forked child holds every descriptor
-    /// until it execs, and a lock released by the close alone lives on in that
-    /// copy — so the event loop's 25 ms take after a worker append refused an
-    /// open, and the worker waited out a lock nobody held (the product
-    /// fd-hygiene sweep of 2026-09-27).
+    /// The journal lock is free the instant the locked operation returns, even while a copy of
+    /// its description lives, as in a shell another thread forked mid-append.
     #[cfg(unix)]
     #[test]
     fn a_released_journal_lock_is_free_while_a_forked_copy_of_it_lives() {
@@ -3016,9 +2858,7 @@ mod tests {
             JournalAppendResult::Failed { message, .. }
                 if message.contains("regular non-link")
         ));
-        // Refuses-without-BLOCKING: opening the FIFO journal parks FOREVER, so
-        // this is a hang detector, never a latency budget. 1 s crossed under
-        // full-suite load (cb8c0cff).
+        // Opening the FIFO journal would park forever: a hang detector, never a latency budget.
         assert!(
             started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
             "appending to the FIFO journal parked"
@@ -3124,13 +2964,10 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Opened and never edited, then changed on disk by someone else (a `git
-    /// pull`): the reopen is plain. No draft ever existed, so there is no
-    /// conflict to report and no copy to keep, and the one image is replaced
-    /// by the file as it is now. A re-seat keeps it so: the first process,
-    /// taking the journal back from the second (an update rolled back),
-    /// publishes its clean document as one snapshot again, which the next open
-    /// over the changed file reads as plain too.
+    /// Opened and never edited, then changed on disk (a `git pull`): the reopen is plain, with
+    /// no conflict and no copy kept, and the one image is replaced by the file as it is now. A
+    /// re-seat by the first process (an update rolled back) republishes its clean document as one
+    /// snapshot, which the next open over the changed file reads as plain too.
     #[test]
     fn a_clean_journal_reopened_over_a_changed_file_holds_no_draft() {
         let root = test_root("clean-reopen");
@@ -3770,14 +3607,12 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// `single_edit` swapped its two `char`-decoding scans for byte scans plus a boundary
-    /// snap. The delta it emits feeds the `MAX_INSERT_BYTES` delta-vs-snapshot decision and is
-    /// proof-checked against the durable image, so it has to stay bit-identical. Differential
-    /// test against the original definition over strings built from 1-, 2-, 3- and 4-byte
-    /// scalars, with the divergence deliberately landing mid-sequence at both ends.
+    /// `single_edit` must equal the char-scan definition: its delta feeds the `MAX_INSERT_BYTES`
+    /// delta-vs-snapshot decision and is proof-checked against the durable image. Differential
+    /// over 1- to 4-byte scalars, with the divergence landing mid-sequence at both ends.
     #[test]
     fn single_edit_matches_the_char_scan_definition_on_multi_byte_boundaries() {
-        /// The pre-optimisation implementation, verbatim.
+        /// The char-scan definition.
         fn reference(before: &str, after: &str) -> JournalEdit {
             let mut prefix = 0;
             for (left, right) in before.chars().zip(after.chars()) {
@@ -3801,8 +3636,8 @@ mod tests {
             }
         }
 
-        // Same byte length, differing only in a trailing continuation byte, so a byte scan
-        // stops INSIDE a scalar and the snap is what recovers the char answer.
+        // Pairs of one byte length differing only in a trailing continuation byte, so a byte
+        // scan stops inside a scalar and the snap must recover the char answer.
         const ALPHABET: [&str; 8] = ["a", "b", "é", "è", "→", "←", "🙂", "🙁"];
         let mut cases: Vec<(String, String)> = vec![
             (String::new(), String::new()),
@@ -4083,11 +3918,10 @@ mod tests {
         assert_eq!(recovered.text, *head.text);
         assert_eq!(recovered.base_content, ContentFingerprint::of(b"disk"));
 
-        // A baseline that is not this store's (another process opened the file
-        // as it now is): the target is the baseline now, and the image (which
-        // holds no draft of its own) is not preserved. That draft is still a
-        // draft to the next open — a conflict kept aside, never a clean image
-        // replaced — and stays one through a second round with no edit between.
+        // A baseline that is not this store's (another process opened the file as it now is):
+        // the target becomes the baseline and the image (no draft of its own) is not preserved.
+        // The draft is still a conflict kept aside at the next open, and through a second round
+        // with no edit between.
         let other_base = encode_journal(&[JournalRecord::snapshot_for(
             key,
             &synthetic_snapshot(id, Seq(1), Arc::from("changed on disk")),
@@ -4232,9 +4066,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// A re-seat that fails (here: the journal lock held by a peer past the
-    /// event loop's budget) is owed again and SAID — the draft is refused by
-    /// name, not waited on — until a retry lands.
+    /// A re-seat that fails (the journal lock held past the event loop's budget) is owed again
+    /// and refuses the draft by name, not by waiting, until a retry lands.
     #[test]
     fn a_failed_reseat_is_refused_by_name_until_a_retry_lands() {
         let (root, mut journals, store, id, _disk, path, _key) = journaled_edit("reseat-failed");
@@ -4309,17 +4142,14 @@ mod tests {
         path
     }
 
-    /// hashclock-2 (2026-10-10): two names in one known directory whose
-    /// unkeyed FNV-1a/64 identities are equal — the pair a refuter's rho
-    /// search found in 45 s — name two journals, and neither document
-    /// recovers the other's draft. Both files are empty, so a shared journal's
-    /// baseline would match either one's disk and replay silently.
+    /// Two names in one directory whose unkeyed FNV-1a/64 identities are equal name two
+    /// journals, and neither document recovers the other's draft. Both files are empty, so a
+    /// shared journal's baseline would match either one's disk and replay silently.
     #[test]
     fn colliding_legacy_names_never_share_a_journal() {
         const A: &str = "file:///Users//alice/Downloads/7ykhvtpwaxxug.txt";
         const B: &str = "file:///Users//alice/Downloads/vwelffjwxnsmb.txt";
-        // The pair collides under the unkeyed identity origin/main named
-        // journals by (the refuter's key).
+        // The pair collides under the legacy unkeyed identity.
         assert_eq!(
             JournalDocumentKey::legacy_unkeyed(A),
             JournalDocumentKey(0x0307_5386_33bd_1a46)
@@ -4362,9 +4192,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Write `uri`'s journal as an aterm from before 2026-10-10 did: under the
-    /// unkeyed name, every record carrying the unkeyed key — the file's
-    /// snapshot, then the draft as an appended delta.
+    /// Write `uri`'s journal as an older aterm did: under the unkeyed name, every record
+    /// carrying the unkeyed key — the file's snapshot, then the draft as an appended delta.
     fn write_legacy_journal(root: &Path, uri: &str, disk: &str, draft: &str) -> PathBuf {
         let typed: &[&str] = if draft == disk { &[] } else { &[draft] };
         write_legacy_journal_typing(root, uri, disk, typed)
@@ -4445,11 +4274,9 @@ mod tests {
         (plan, completion)
     }
 
-    /// MIGRATION (hashclock-2, 2026-10-10): a draft an older aterm journaled
-    /// under the unkeyed name is recovered after the upgrade and moved to the
-    /// keyed journal. Its legacy file stays — still replaying under its own key,
-    /// which is what an outgoing older aterm's update Commit check reads — until
-    /// the keyed journal's first write, which retires it first.
+    /// A draft an older aterm journaled under the unkeyed name is recovered and moved to the
+    /// keyed journal. Its legacy file stays (an outgoing older aterm's update Commit check reads
+    /// it) until the keyed journal's first write, which retires it first.
     #[test]
     fn a_legacy_journal_is_recovered_and_retired_by_the_first_write() {
         const URI: &str = "file:///tmp/legacy-migration.md";
@@ -4613,13 +4440,10 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Review, 2026-10-10: an older aterm that runs after this one (another
-    /// build's instance, a downgrade, a rollback release) cannot see a keyed
-    /// journal, so opening the file it writes a CLEAN legacy image, the file
-    /// alone. That image carries nothing and never hides the keyed draft: the
-    /// next open here recovers the draft and retires the legacy image. Beside
-    /// a keyed image that does not decode, a clean legacy one lets the open say
-    /// so, as it does when no legacy image is there.
+    /// An older aterm that runs after this one cannot see a keyed journal, so opening the file
+    /// it writes a clean legacy image. That image never hides the keyed draft: the next open
+    /// here recovers the draft and retires the legacy image. Beside a keyed image that does not
+    /// decode, a clean legacy one lets the open report `Corrupt`, as with no legacy image.
     #[test]
     fn a_clean_legacy_journal_never_hides_a_keyed_draft() {
         const URI: &str = "file:///tmp/legacy-clean-after-keyed.md";
@@ -4660,11 +4484,10 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Review, 2026-10-10: a legacy draft that is the file itself (an older
-    /// aterm typed, then undid) still wins. Its document is dirty there, so an
-    /// outgoing older aterm's update Commit check reads it back, and it stays
-    /// until the first write. The keyed draft it sets aside is kept, and the
-    /// open SAYS so: a set-aside is never silent.
+    /// A legacy draft that is the file itself (an older aterm typed, then undid) still wins:
+    /// its document is dirty there, so an outgoing older aterm's update Commit check reads it
+    /// back, and it stays until the first write. The keyed draft it sets aside is kept, and the
+    /// open says so.
     #[test]
     fn a_legacy_draft_that_is_the_file_never_sets_a_keyed_draft_aside_silently() {
         const URI: &str = "file:///tmp/legacy-undone-after-keyed.md";

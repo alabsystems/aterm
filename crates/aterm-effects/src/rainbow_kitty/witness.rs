@@ -457,8 +457,8 @@ const CARRY_K: usize = RETURN_K + 1;
 /// witness ([`Witness::carry_caret`]).
 const CARRY_BIT: u8 = 1 << CARRY_K;
 
-/// A cell whose recorded glyph went BLANK this walk — provisional until its
-/// run has decided the clock ([`Witness::walk`]).
+/// A cell whose recorded glyph went blank this walk, provisional until its run
+/// has decided the clock ([`Witness::walk`]).
 #[derive(Clone, Copy, Debug)]
 struct Blanked {
     row: u16,
@@ -784,10 +784,9 @@ impl Witness {
         self.caret_carry = 0;
     }
 
-    /// The follow pass's search (see the module doc). For every run
-    /// `(row, cohort)` with a resident cell on a sampled row, read its armed
-    /// records (live, not released, on non-leaving cells) in column order and
-    /// name the run on `out` when its text moved vertically as a block:
+    /// The follow pass: name on `out` every run whose text moved vertically as
+    /// a block. For every run with a resident cell on a sampled row, of its armed
+    /// records (live, not released, on non-leaving cells):
     ///
     /// * At least two armed records, and at least two (no fewer than half) are
     ///   gone from their own row. A run whose glyphs still stand is never
@@ -1246,6 +1245,7 @@ impl Witness {
         cells: &[Cell],
         rows: &[RowSample<'_>],
         caret: Option<(u16, u16)>,
+        now: Instant,
         out: &mut Vec<ShiftRun>,
     ) {
         out.clear();
@@ -1287,7 +1287,14 @@ impl Witness {
                     continue;
                 }
                 if cell.leaving() {
-                    leaving_max = Some(leaving_max.map_or(cell.col, |m| m.max(cell.col)));
+                    let dark_release = cell.released_at.is_some()
+                        && cell.retract_at.is_some_and(|at| {
+                            now.saturating_duration_since(at).as_secs_f32()
+                                >= super::ribbon::RETRACT_FADE_S
+                        });
+                    if !dark_release {
+                        leaving_max = Some(leaving_max.map_or(cell.col, |m| m.max(cell.col)));
+                    }
                     continue;
                 }
                 let rec = match self.find(cell.row, cell.col, cell.born) {
@@ -1763,7 +1770,18 @@ impl Witness {
                     && let Some(i) = self.find(cell.row, cell.col, cell.born)
                     && self.seen[i].released
                 {
-                    self.seen[i].live = true;
+                    let replaced = row_sample.is_some_and(|sample| {
+                        let unit = unit_at(sample.cols, cell.col);
+                        !unit.is_blank() && unit != self.seen[i].unit
+                    });
+                    if replaced {
+                        // A dark partial release is still an identity claim:
+                        // different content revokes it rather than letting a
+                        // later coincidentally identical repaint restore it.
+                        Self::push_unit(retire, cell.row, cell.col, cell.born, self.seen[i].unit);
+                    } else {
+                        self.seen[i].live = true;
+                    }
                 }
                 continue;
             }
@@ -2859,13 +2877,10 @@ mod tests {
         }]
     }
 
-    /// A copy that appears beside a standing line is a twin once it has stood
-    /// there [`TWIN_MIN`] (fzf's list, a completion popup, a copy drawn above).
-    /// The run is armed with row 4 blank, then `abcdef` is drawn on row 4. Seen
-    /// on every sampled frame for 40 ms, every record is a twin and erasing row
-    /// 5 names nothing; less is a torn repaint and the move is named. The unit
-    /// is time: two frames 16 ms apart are a tear, two frames 120 ms apart a
-    /// copy.
+    /// A copy drawn beside a standing line (fzf's list, a completion popup) is a
+    /// twin once it has stood [`TWIN_MIN`] on every sampled frame, and the erase
+    /// names nothing; less is a torn repaint and the move is named. Time, not
+    /// frames: two frames 16 ms apart are a tear, 120 ms apart a copy.
     #[test]
     fn a_copy_that_appears_beside_a_standing_line_is_a_twin_once_it_has_stood_forty_ms() {
         let own = row("abcdef");
@@ -3043,13 +3058,10 @@ mod tests {
         assert_eq!(dests(&out), vec![], "erased beside a twin it learned");
     }
 
-    /// A band move that opens a row beside a line leaves that row unseen until
-    /// a frame shows it ([`Witness::translate_band`]). vim's `yyp` on a line on
-    /// row 10: band 11..=20 moves down one and the copy is written into the
-    /// opened row 11 in the same batch. The record's `+1` and `+2` are not
-    /// clear, so the copy is no arrival when `S` clears the original. A frame
-    /// showing row 11 without the glyph clears it again, and a later move there
-    /// follows.
+    /// A band move that opens a row beside a line leaves it unseen until a frame
+    /// shows it: vim's `yyp` copy, written into the opened row in the same
+    /// batch, is no arrival when `S` clears the original; a frame showing the
+    /// row without the glyph clears it, and a later move there follows.
     #[test]
     fn a_band_move_that_opens_a_row_beside_a_line_leaves_it_unseen_until_a_frame_shows_it() {
         let own = row("abcdef");
@@ -3444,6 +3456,7 @@ mod tests {
                 cols: &row(now),
             }],
             caret.map(|c| (5, c)),
+            Instant::now(),
             &mut out,
         );
         out

@@ -504,8 +504,8 @@ impl PackagesProgramRow {
                 .installed_build
                 .map(atpkg::vendor_direct::build_words),
         };
-        // What the row itself vouches for: a row pinned by its index IS at the pin, and a
-        // vendor's latest IS the head the lane last took. The store refines both.
+        // What the row itself vouches for: a row pinned by its index is at the pin, and a
+        // vendor's latest is the head the lane last took. The store refines both.
         let latest_known = match &kind {
             ProgramStateKind::Managed { build, .. } => {
                 Some(atpkg::vendor_direct::build_words(*build))

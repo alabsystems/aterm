@@ -154,10 +154,7 @@ mod tests {
         assert!(current_build_ok(&floored, "ay", None));
     }
 
-    // REGRESSION (audit 2026-09-15): a floor is per PROGRAM, because a build number is only
-    // comparable to another build number of the same program. Comparing every program's pin
-    // against ONE channel-wide number made the documented yank floor unusable: the only value
-    // that did not tombstone unrelated programs was 0.
+    // A floor is per program: a build number compares only with builds of the same program.
     #[test]
     fn a_program_floor_never_tombstones_a_program_it_does_not_name() {
         // The toolchain channel's shape: independent counters per member, with `trust`

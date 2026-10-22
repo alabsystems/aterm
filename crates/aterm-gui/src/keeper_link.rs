@@ -721,10 +721,10 @@ pub(crate) fn journal_refusal() -> Option<&'static str> {
     }
 }
 
-/// This window's crash marker, as the keeper is told it at HELLO (§5.4 row 3's
-/// cross-check): the keeper keeps it only if it finds the marker there with its
-/// lock held, and after this window's death reads its absence — the exit path
-/// unlinked it — together with `exit(0)` as a quit whose BYE was lost.
+/// This window's crash marker, as the keeper is told it at HELLO (§5.4): the
+/// keeper keeps it only if it finds the marker there with its lock held, and
+/// after this window's death reads its absence (the exit path unlinked it)
+/// together with `exit(0)` as a quit whose BYE was lost.
 #[cfg(unix)]
 fn marker() -> Option<MarkerRef> {
     use std::os::unix::ffi::OsStrExt as _;

@@ -39,6 +39,8 @@ pub const ATTACH_MAX: usize = 128;
 pub struct Spec {
     /// Where `fabric.json` and `fabric.md` are written.
     pub out: PathBuf,
+    /// Which scenario boots a world; all four unless explicitly selected.
+    pub scenario: Scenario,
     /// Measured post -> deliver round trips.
     pub samples: usize,
     /// Round trips run first and not measured: the first post on a fresh lane
@@ -71,6 +73,16 @@ pub struct Spec {
     pub retention: bool,
     /// The bridge's `--log` ([`Log`]): `auto`, what ships, or `off`.
     pub log: Log,
+    /// IDLE BYSTANDER SESSIONS spawned beside the messaging and ping-pong worlds'
+    /// two (`bystanders=`, default 0, at most [`ATTACH_MAX`]): a node hosting
+    /// more than the two that talk, so the bridge's and aterm's walks over every
+    /// session (the outbox peek's, the drain's roster read) carry them.
+    pub bystanders: usize,
+    /// THE PACED SUB-PHASE of the ping-pong arm (`paced=`, default
+    /// [`DEFAULT_PACED`], 0 for none): that many more round trips after the
+    /// back-to-back ones, each a fixed gap after the last one's reply, so each
+    /// finds the bridge's loop idle (`run/pingpong.rs`).
+    pub paced: usize,
     /// How often the retaining broker's retention tick runs when no batch asks
     /// for one sooner, in milliseconds (`retention_interval_ms=`, which the
     /// bench hands `Broker::set_retention_interval` after the rules). `None`
@@ -78,6 +90,49 @@ pub struct Spec {
     /// and the bench's bytes are far below every rule's bound, so without it
     /// no tick lands in a measured window. Only on a retaining broker.
     pub retention_interval_ms: Option<u64>,
+}
+
+/// The scenarios measured in one run. Selecting one does not start the others.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Scenario {
+    #[default]
+    All,
+    Messaging,
+    Pingpong,
+    Attach,
+    Handoff,
+}
+
+impl Scenario {
+    /// The word the specification and report use.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Messaging => "messaging",
+            Self::Pingpong => "pingpong",
+            Self::Attach => "attach",
+            Self::Handoff => "handoff",
+        }
+    }
+
+    /// Read exactly one scenario name.
+    ///
+    /// # Errors
+    ///
+    /// A name outside the five supported words.
+    pub fn parse(word: &str) -> Result<Self, String> {
+        match word {
+            "all" => Ok(Self::All),
+            "messaging" => Ok(Self::Messaging),
+            "pingpong" => Ok(Self::Pingpong),
+            "attach" => Ok(Self::Attach),
+            "handoff" => Ok(Self::Handoff),
+            _ => Err(format!(
+                "{ENV}: `scenario=` is all, messaging, pingpong, attach or handoff, not `{word}`"
+            )),
+        }
+    }
 }
 
 /// The bridge's `--log` mode, as a run names it (`log=auto|off`): `auto`,
@@ -203,6 +258,7 @@ pub const DEFAULT_BURST: usize = 500;
 pub const DEFAULT_PINGPONG: usize = 200;
 pub const DEFAULT_ATTACH: [usize; 3] = [1, 8, 32];
 pub const DEFAULT_ROUNDS: usize = 3;
+pub const DEFAULT_PACED: usize = 50;
 
 impl Spec {
     /// The sender sessions the burst is split across.
@@ -218,18 +274,24 @@ impl Spec {
     pub fn words(&self) -> String {
         let attach: Vec<String> = self.attach.iter().map(usize::to_string).collect();
         let mut words = format!(
-            "samples={} warmup={} burst={} pingpong={} attach={} rounds={} retention={} log={}",
+            "samples={} warmup={} burst={} pingpong={} attach={} rounds={} bystanders={} paced={} \
+             retention={} log={}",
             self.samples,
             self.warmup,
             self.burst,
             self.pingpong,
             attach.join(","),
             self.rounds,
+            self.bystanders,
+            self.paced,
             if self.retention { "on" } else { "off" },
             self.log.word()
         );
         if let Some(ms) = self.retention_interval_ms {
             words.push_str(&format!(" retention_interval_ms={ms}"));
+        }
+        if self.scenario != Scenario::All {
+            words.push_str(&format!(" scenario={}", self.scenario.word()));
         }
         words.push_str(&format!(" durability={}", self.durability.word()));
         if let Some(ms) = self.horizon_ms {
@@ -240,9 +302,9 @@ impl Spec {
 }
 
 /// Parse `out=<dir> [samples=<n>] [warmup=<n>] [burst=<n>] [pingpong=<n>]
-/// [attach=<n>,<n>,…] [rounds=<n>] [retention=on|off] [log=auto|off]
+/// [attach=<n>,<n>,…] [rounds=<n>] [bystanders=<n>] [paced=<n>] [retention=on|off] [log=auto|off]
 /// [retention_interval_ms=<n>] [durability=strict|ordered|relaxed]
-/// [horizon_ms=<n>]`. Pure (unit-tested).
+/// [horizon_ms=<n>] [scenario=all|messaging|pingpong|attach|handoff]`. Pure (unit-tested).
 ///
 /// # Errors
 ///
@@ -255,6 +317,7 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
     let mut out = None;
     let mut spec = Spec {
         out: PathBuf::new(),
+        scenario: Scenario::default(),
         samples: DEFAULT_SAMPLES,
         warmup: DEFAULT_WARMUP,
         burst: DEFAULT_BURST,
@@ -266,6 +329,8 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
         retention: true,
         log: Log::default(),
         retention_interval_ms: None,
+        bystanders: 0,
+        paced: DEFAULT_PACED,
     };
     let count = |key: &str, v: &str, zero_ok: bool| -> Result<usize, String> {
         match v.parse::<usize>() {
@@ -282,11 +347,14 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
             .ok_or_else(|| format!("{ENV}: `{word}` is not a key=value word"))?;
         match key {
             "out" if !v.is_empty() => out = Some(PathBuf::from(v)),
+            "scenario" => spec.scenario = Scenario::parse(v)?,
             "samples" => spec.samples = count(key, v, false)?,
             "warmup" => spec.warmup = count(key, v, true)?,
             "burst" => spec.burst = count(key, v, false)?,
             "pingpong" => spec.pingpong = count(key, v, false)?,
             "rounds" => spec.rounds = count(key, v, false)?,
+            "bystanders" => spec.bystanders = count(key, v, true)?,
+            "paced" => spec.paced = count(key, v, true)?,
             "durability" => spec.durability = Tier::parse(v)?,
             "retention" => spec.retention = on_off(v)?,
             "log" => spec.log = Log::parse(v)?,
@@ -338,6 +406,11 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
     if spec.attach.last().is_some_and(|&n| n > ATTACH_MAX) {
         return Err(format!("{ENV}: attach= tops out at {ATTACH_MAX} sessions"));
     }
+    if spec.bystanders > ATTACH_MAX {
+        return Err(format!(
+            "{ENV}: bystanders= tops out at {ATTACH_MAX} sessions on one instance"
+        ));
+    }
     Ok(spec)
 }
 
@@ -360,6 +433,15 @@ mod tests {
 
         let spec = parse("out=/tmp/x").expect("parses");
         assert_eq!(spec.out, PathBuf::from("/tmp/x"));
+        assert_eq!(spec.scenario, Scenario::All);
+        assert!(
+            !spec.words().contains("scenario="),
+            "default words stay compatible"
+        );
+        assert_eq!(
+            parse("out=/tmp/x scenario=all").expect("explicit all"),
+            spec
+        );
         assert_eq!(spec.samples, DEFAULT_SAMPLES);
         assert_eq!(spec.burst, DEFAULT_BURST);
         assert_eq!(spec.pingpong, DEFAULT_PINGPONG);
@@ -398,6 +480,21 @@ mod tests {
         );
         assert_eq!(spec.attach, vec![2, 4]);
         assert_eq!(spec.burst_senders(), 2, "101 posts need a second sender");
+        for scenario in [
+            Scenario::Messaging,
+            Scenario::Pingpong,
+            Scenario::Attach,
+            Scenario::Handoff,
+        ] {
+            let word = scenario.word();
+            let spec = parse(&format!("out=/o scenario={word}")).expect(word);
+            assert_eq!(spec.scenario, scenario);
+            assert!(spec.words().contains(&format!(" scenario={word} ")));
+            assert_eq!(
+                parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+                spec
+            );
+        }
         for bad in [
             "samples=5",           // no out=
             "out=/o samples=0",    // not positive
@@ -411,6 +508,10 @@ mod tests {
             "out=/o speed=11",     // unknown
             "out=/o samples",      // not key=value
             "out=",                // empty out
+            "out=/o scenario=",
+            "out=/o scenario=Pingpong",
+            "out=/o scenario=pingpong,attach",
+            "out=/o scenario=unknown",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
@@ -526,6 +627,48 @@ mod tests {
         ] {
             let err = parse(&format!("out=/o durability={bad}")).expect_err(bad);
             assert!(err.contains("durability="), "{bad}: {err}");
+        }
+    }
+    /// B10's two knobs: idle bystander sessions beside the talking two, and
+    /// the ping-pong arm's paced rounds. Both reach the words and reproduce;
+    /// a bystander count past what one instance carries is refused.
+    #[test]
+    fn the_bystanders_and_the_paced_rounds_are_named_and_reproduce() {
+        use super::*;
+
+        let bare = parse("out=/o").expect("bare");
+        assert_eq!((bare.bystanders, bare.paced), (0, DEFAULT_PACED));
+        assert!(
+            bare.words()
+                .contains(&format!(" bystanders=0 paced={DEFAULT_PACED} ")),
+            "{}",
+            bare.words()
+        );
+        for (words, bystanders, paced) in [
+            ("bystanders=64", 64, DEFAULT_PACED),
+            ("bystanders=16 paced=0", 16, 0),
+            ("paced=10", 0, 10),
+        ] {
+            let spec = parse(&format!("out=/o {words}")).expect(words);
+            assert_eq!(
+                (spec.bystanders, spec.paced),
+                (bystanders, paced),
+                "{words}"
+            );
+            assert_eq!(
+                parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+                spec,
+                "{words}"
+            );
+        }
+        // NEGATIVE CONTROLS.
+        for bad in [
+            "bystanders=-1",
+            "bystanders=x",
+            "paced=many",
+            "bystanders=999",
+        ] {
+            assert!(parse(&format!("out=/o {bad}")).is_err(), "{bad}");
         }
     }
 }

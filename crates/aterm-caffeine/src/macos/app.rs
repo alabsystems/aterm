@@ -11,12 +11,12 @@
 //! runs its own tracking loop, during which a choice, a tick, a state-file write or a wake
 //! can arrive, so it is shown after the borrow ends.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use aterm_objc::send::{
-    send_bool_isize, send_id, send_id_idptr_usize,
+    send_bool_isize, send_f64, send_id, send_id_idptr_usize,
     send_id_usize_point_usize_f64_isize_id_i16_isize_isize, send_isize, send_usize, send_v,
     send_v_id, send_v_id_bool, send_v_id_sel_id_id, send_v_sel_id_f64,
 };
@@ -44,6 +44,8 @@ const EVENT_TYPE_RIGHT_MOUSE_UP: usize = 4;
 const EVENT_TYPE_APPLICATION_DEFINED: usize = 15;
 /// `NSEventModifierFlagControl`.
 const MODIFIER_FLAG_CONTROL: usize = 1 << 18;
+/// `NSControlStateValueOn`, a checked menu item's `-state`.
+const CONTROL_STATE_ON: isize = 1;
 /// How often the mug looks again (the time left it shows, a deadline, the update watch).
 const TICK_SECS: u64 = 60;
 /// What `pmset -g assertions` names the activity.
@@ -100,6 +102,28 @@ fn click_of(event: Option<(usize, usize)>) -> Click {
     )
 }
 
+/// An event as [`click_from`] tells one from another: its type, modifier flags and time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EventKey {
+    kind: usize,
+    flags: usize,
+    at: f64,
+}
+
+/// What a press of the button means when the app's current event is `event`, and `stale` is
+/// the one that was current when the last press was read or the menu last closed. The app's
+/// current event stays the last one it took off the queue, so an event that is still `stale`
+/// came with no press of its own: an accessibility press (`-performClick:`, which brings no
+/// event) after a right-button pick in the menu, say. That toggles, as a press with no event
+/// does, whatever button made the old event. Where a fresh release landed is not asked: on
+/// macOS 15 a right-press dragged off the button still sends the action with its release
+/// outside the button, and that opens the menu, where a check of the release's place would
+/// toggle instead (checked in macOS 15.7 and 27.0 VMs, 2026-10-22).
+fn click_from(event: Option<EventKey>, stale: Option<EventKey>) -> Click {
+    let fresh = event.filter(|event| Some(*event) != stale);
+    click_of(fresh.map(|event| (event.kind, event.flags)))
+}
+
 /// The wall clock in whole seconds.
 fn now() -> u64 {
     aterm_time::unix_secs().unwrap_or(0)
@@ -140,6 +164,21 @@ impl Mug {
             self.exit = Some(exit);
         }
         Some(next)
+    }
+
+    /// [`Mug::handled`] for what the person does (a click, a menu choice). While an update
+    /// restart is decided but not yet made (its stop waits for the open menu to close), a
+    /// choice still counts: the mode it saves is the one the restarted mug reads, and a Quit
+    /// ends the job instead (exit 0, the mode off), so the mug the person quit does not come
+    /// back. Nothing is armed then: the restart's stop is already scheduled.
+    fn chosen(&mut self, f: impl FnOnce(&mut Self) -> Next) -> Option<Next> {
+        if self.exit != Some(Exit::Restart) {
+            return self.handled(f);
+        }
+        if f(self) == Next::Stop(Exit::Quit) {
+            self.exit = Some(Exit::Quit);
+        }
+        None
     }
 
     /// Publish this mug's mode. A failed write is logged; the caller stops the
@@ -204,18 +243,23 @@ impl Mug {
             MenuAction::Activate(choice) => self.set(Mode::chosen(choice, now), now),
             MenuAction::ToggleStartup => {
                 let on = launchd::startup_enabled(&self.paths, &self.label);
-                if let Err(err) = launchd::set_startup(&self.paths, &self.label, &self.origin, !on)
-                {
-                    let verb = if on { "turn off" } else { "turn on" };
-                    aterm_log::warn!("caffeine: could not {verb} Enable at Startup: {err}");
-                }
-                Next::Tick(next_tick_secs(self.mode, now))
+                self.set_startup(!on, now)
             }
             MenuAction::Quit => {
                 let _ = self.set(Mode::Off, now);
                 Next::Stop(Exit::Quit)
             }
         }
+    }
+
+    /// Turn Enable at Startup on or off: what the person asked for, the opposite of what the
+    /// menu showed them, however the login plist changed while the menu was open.
+    fn set_startup(&mut self, on: bool, now: u64) -> Next {
+        if let Err(err) = launchd::set_startup(&self.paths, &self.label, &self.origin, on) {
+            let verb = if on { "turn on" } else { "turn off" };
+            aterm_log::warn!("caffeine: could not {verb} Enable at Startup: {err}");
+        }
+        Next::Tick(next_tick_secs(self.mode, now))
     }
 
     /// The tick, and a wake from sleep: a passed deadline turns the mug off (saved), the
@@ -284,6 +328,11 @@ struct TargetIvars {
     /// `try_borrow_mut`s, so a nested delivery is dropped rather than a panic (which would
     /// abort inside a declared method).
     mug: RefCell<Mug>,
+    /// The app's current event when the last press was read or the menu last closed: one
+    /// still current at a press came with no press of its own ([`click_from`]).
+    stale: Cell<Option<EventKey>>,
+    /// Whether the menu is open: its tracking loop is running in [`ui::pop_up`].
+    tracking: Cell<bool>,
 }
 
 aterm_objc::declare_class! {
@@ -303,8 +352,10 @@ aterm_objc::declare_class! {
                 return;
             }
             let now = now();
-            match autoreleasepool(|_| current_click()) {
-                Click::Toggle => self.handle(|mug| mug.toggle(now)),
+            let event = autoreleasepool(|_| current_event());
+            let click = click_from(event, self.ivars().stale.replace(event));
+            match click {
+                Click::Toggle => self.handle_choice(|mug| mug.toggle(now)),
                 Click::Menu => self.show_menu(now),
             }
         }
@@ -317,6 +368,13 @@ aterm_objc::declare_class! {
             if MainThread::new().is_none() {
                 return Bool::NO;
             }
+            // Open already (AX is served while the menu tracks): nothing to queue, or the
+            // open would come once the person closed it. Two before the run loop turns open
+            // it once.
+            if self.ivars().tracking.get() {
+                return Bool::YES;
+            }
+            cancel_performs_of(self.as_id(), sel!(openMenu:));
             // SAFETY: as `schedule_stop`; `openMenu:` is a method the target declares.
             unsafe {
                 send_v_sel_id_f64(
@@ -346,9 +404,17 @@ aterm_objc::declare_class! {
             }
             // SAFETY: `sender` is the live NSMenuItem AppKit passed; `-tag` is `q16@0:8`.
             let tag = unsafe { send_isize(sender, sel!(tag)) };
-            if let Some(action) = MenuAction::from_tag(tag) {
-                let now = now();
-                self.handle(|mug| mug.choose(action, now));
+            let Some(action) = MenuAction::from_tag(tag) else {
+                return;
+            };
+            let now = now();
+            if action == MenuAction::ToggleStartup {
+                // The checkmark the person acted on, not the plist as it reads now.
+                // SAFETY: as `-tag`; `-state` is `q16@0:8`.
+                let shown = unsafe { send_isize(sender, sel!(state)) } == CONTROL_STATE_ON;
+                self.handle_choice(|mug| mug.set_startup(!shown, now));
+            } else {
+                self.handle_choice(|mug| mug.choose(action, now));
             }
         }
 
@@ -396,6 +462,17 @@ impl CaffeineTarget {
     /// this one is nested in), then arm the next tick or schedule the stop it asks for.
     fn handle(&self, f: impl FnOnce(&mut Mug) -> Next) {
         let next = autoreleasepool(|_| self.ivars().mug.try_borrow_mut().ok()?.handled(f));
+        self.follow(next);
+    }
+
+    /// [`Self::handle`] for what the person does ([`Mug::chosen`]).
+    fn handle_choice(&self, f: impl FnOnce(&mut Mug) -> Next) {
+        let next = autoreleasepool(|_| self.ivars().mug.try_borrow_mut().ok()?.chosen(f));
+        self.follow(next);
+    }
+
+    /// Arm the next tick or schedule the stop `next` asks for.
+    fn follow(&self, next: Option<Next>) {
         match next {
             Some(Next::Tick(secs)) => arm_tick(self.as_id(), secs),
             Some(Next::Stop(_)) => schedule_stop(self.as_id()),
@@ -416,7 +493,14 @@ impl CaffeineTarget {
             Some(ui.popup())
         });
         if let Some(popup) = popup {
+            // An open the accessibility action queued is this one.
+            cancel_performs_of(self.as_id(), sel!(openMenu:));
+            self.ivars().tracking.set(true);
             ui::pop_up(&popup);
+            self.ivars().tracking.set(false);
+            // The event that ended the menu (a right-button pick, say) is current until the
+            // next: a press that finds it there brought none of its own.
+            self.ivars().stale.set(autoreleasepool(|_| current_event()));
             autoreleasepool(|_| drop(popup));
         }
     }
@@ -429,25 +513,23 @@ fn shared_app() -> Id {
     unsafe { send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) }
 }
 
-/// The click the event being handled is, read off the app's current event.
-fn current_click() -> Click {
+/// The app's current event: the one being dispatched, or else the last it took off the queue.
+fn current_event() -> Option<EventKey> {
     let app = shared_app();
     if app.is_null() {
-        return click_of(None);
+        return None;
     }
-    // SAFETY: `-currentEvent` is `@16@0:8` on the live app and answers the event being
-    // dispatched (+0) or nil; on that event `-type` and `-modifierFlags` are both
-    // `Q16@0:8`, read only.
-    let event = unsafe {
+    // SAFETY: `-currentEvent` is `@16@0:8` on the live app and answers the event (+0) or
+    // nil; on that event `-type` and `-modifierFlags` are both `Q16@0:8` and `-timestamp`
+    // `d16@0:8`, read only.
+    unsafe {
         let event = send_id(app, sel!(currentEvent));
-        (!event.is_null()).then(|| {
-            (
-                send_usize(event, sel!(type)),
-                send_usize(event, sel!(modifierFlags)),
-            )
+        (!event.is_null()).then(|| EventKey {
+            kind: send_usize(event, sel!(type)),
+            flags: send_usize(event, sel!(modifierFlags)),
+            at: send_f64(event, sel!(timestamp)),
         })
-    };
-    click_of(event)
+    }
 }
 
 /// `+[NSObject cancelPreviousPerformRequestsWithTarget:selector:object:]`,
@@ -484,20 +566,12 @@ fn common_modes() -> Option<Obj> {
 fn arm_tick(target: Id, secs: u64) {
     autoreleasepool(|_| {
         let modes = common_modes();
-        // SAFETY: main-thread sends on the live target. The cancel is `CancelFn`'s prototype
-        // and drops only `tick:` performs in any mode (not a scheduled `stopRun:`); the
-        // perform is `PerformInModesFn`'s prototype, its modes array live across the send
-        // (the perform keeps its own copy), or `-performSelector:withObject:afterDelay:`,
-        // `v40@0:8:16@24d32`; `tick:` is a method the target declares.
+        cancel_performs_of(target, sel!(tick:));
+        // SAFETY: main-thread sends on the live target. The perform is `PerformInModesFn`'s
+        // prototype, its modes array live across the send (the perform keeps its own copy), or
+        // `-performSelector:withObject:afterDelay:`, `v40@0:8:16@24d32`; `tick:` is a method
+        // the target declares.
         unsafe {
-            let cancel: CancelFn = aterm_objc::checked_msg();
-            cancel(
-                class(c"NSObject").as_id(),
-                sel!(cancelPreviousPerformRequestsWithTarget:selector:object:),
-                target,
-                sel!(tick:),
-                Id::NIL,
-            );
             if let Some(modes) = &modes {
                 let perform: PerformInModesFn = aterm_objc::checked_msg();
                 perform(
@@ -519,6 +593,22 @@ fn arm_tick(target: Id, secs: u64) {
             }
         }
     });
+}
+
+/// Drop the delayed performs of `selector` (with a nil object) `target` has queued, in any
+/// mode; the others stay (a scheduled `stopRun:` too).
+fn cancel_performs_of(target: Id, selector: Sel) {
+    // SAFETY: a main-thread class send; `CancelFn`'s prototype, its target live.
+    unsafe {
+        let cancel: CancelFn = aterm_objc::checked_msg();
+        cancel(
+            class(c"NSObject").as_id(),
+            sel!(cancelPreviousPerformRequestsWithTarget:selector:object:),
+            target,
+            selector,
+            Id::NIL,
+        );
+    }
 }
 
 /// Send `target` `stopRun:` from the main run loop as soon as it next runs its default mode.
@@ -648,7 +738,11 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
         restart_on_update,
         instance,
     } = ctx;
-    let watch = restart_on_update.then(|| Watch::start(origin.clone()));
+    // The baseline is the code this process runs (its copy's Info.plist is the origin's as it
+    // was cloned), not the origin read now: an update landing during the copy's first exec
+    // would be taken for the code running, and never restarted onto.
+    let running = std::env::current_exe().unwrap_or_else(|_| origin.clone());
+    let watch = restart_on_update.then(|| Watch::start(origin.clone(), &running));
     let code_dir = paths.code_dir();
     let mug = Mug {
         // Read in `run_app`, once a writer's change can no longer be missed.
@@ -674,8 +768,13 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
         eprintln!("aterm caffeine: {}: {e}", code_dir.display());
     }
     // The one-mug lock is let go only now, with the item off the bar and the activity
-    // ended: a second mug never shares the bar with this one.
-    drop(instance);
+    // ended: a second mug never shares the bar with this one. An update restart leaves its
+    // job named in it, for a `quit` before launchd's new mug takes it.
+    if code == Exit::Restart.code() {
+        instance.release_named();
+    } else {
+        drop(instance);
+    }
     code
 }
 
@@ -694,6 +793,8 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
         main,
         TargetIvars {
             mug: RefCell::new(mug),
+            stale: Cell::new(None),
+            tracking: Cell::new(false),
         },
     ) else {
         return refuse("the runtime refused the mug's target");
@@ -810,6 +911,34 @@ mod tests {
         let others = (1 << 17) | (1 << 19) | (1 << 20);
         assert_eq!(click_of(Some((LEFT_UP, others))), Click::Toggle);
         assert_eq!(click_of(None), Click::Toggle);
+    }
+
+    /// A press that finds the app's current event still the one last read, or the one the
+    /// menu closed on, brought no event of its own (an accessibility press): it toggles,
+    /// whatever button made that event. NEGATIVE CONTROL: the same event read fresh (as
+    /// `click_of` alone reads it) opens the menu.
+    #[test]
+    fn a_press_finding_a_stale_event_toggles() {
+        let right = |at: f64| EventKey {
+            kind: EVENT_TYPE_RIGHT_MOUSE_UP,
+            flags: 0,
+            at,
+        };
+        let control = EventKey {
+            kind: 2,
+            flags: MODIFIER_FLAG_CONTROL,
+            at: 9.0,
+        };
+        assert_eq!(click_from(Some(right(1.0)), None), Click::Menu);
+        assert_eq!(click_from(Some(right(2.0)), Some(right(1.0))), Click::Menu);
+        assert_eq!(click_from(Some(control), Some(right(1.0))), Click::Menu);
+        // The right-button pick the menu closed on, still current at an AX press.
+        assert_eq!(
+            click_from(Some(right(1.0)), Some(right(1.0))),
+            Click::Toggle
+        );
+        assert_eq!(click_from(Some(control), Some(control)), Click::Toggle);
+        assert_eq!(click_from(None, Some(right(1.0))), Click::Toggle);
     }
 
     #[test]
@@ -965,7 +1094,7 @@ mod tests {
         // A restart decided by a tick is recorded the same way.
         let mut mug = scratch_mug(dir.path());
         std::fs::write(&mug.origin, b"build 1").expect("exe");
-        mug.watch = Some(Watch::start(mug.origin.clone()));
+        mug.watch = Some(Watch::start(mug.origin.clone(), &mug.origin));
         std::fs::write(&mug.origin, b"build two").expect("exe");
         assert_eq!(
             mug.handled(|m| m.tick(NOW)),
@@ -973,7 +1102,27 @@ mod tests {
         );
         assert_eq!(mug.exit, Some(Exit::Restart));
         assert_eq!(mug.handled(|m| m.choose(MenuAction::Quit, NOW)), None);
+        assert_eq!(mug.handled(|m| m.tick(NOW + 1)), None);
         assert_eq!(mug.exit, Some(Exit::Restart));
+        // But what the person does while that restart waits for the menu to close counts: a
+        // choice is saved for the restarted mug to read, and a Quit ends the job instead.
+        // NEGATIVE CONTROL: through `handled`, both were dropped above.
+        assert_eq!(
+            mug.chosen(|m| m.choose(MenuAction::Activate(Choice::Hours8), NOW)),
+            None,
+            "nothing armed: the restart's stop is scheduled"
+        );
+        assert_eq!(mug.exit, Some(Exit::Restart));
+        assert!(saved(&mug).is_some_and(|mode| mode.is_on(NOW)));
+        assert_eq!(mug.chosen(|m| m.choose(MenuAction::Quit, NOW)), None);
+        assert_eq!(mug.exit, Some(Exit::Quit));
+        assert_eq!(saved(&mug), Some(Mode::Off));
+        assert_eq!(
+            mug.chosen(|m| m.toggle(NOW)),
+            None,
+            "quitting: nothing more"
+        );
+        assert_eq!(saved(&mug), Some(Mode::Off));
     }
 
     #[test]
@@ -1025,6 +1174,14 @@ mod tests {
         let _ = mug.choose(MenuAction::ToggleStartup, NOW);
         assert!(!plist.exists());
         assert!(!checked(&mug));
+        // The menu's click asks for the opposite of the checkmark it showed, not of the file:
+        // turned on underneath while the menu showed it off, a click on it leaves it on.
+        // NEGATIVE CONTROL: the file's toggle turns it off.
+        let _ = mug.set_startup(true, NOW);
+        assert_eq!(mug.set_startup(true, NOW), Next::Tick(TICK_SECS));
+        assert!(checked(&mug), "asked on, stays on");
+        let _ = mug.choose(MenuAction::ToggleStartup, NOW);
+        assert!(!checked(&mug), "the control");
     }
 
     #[test]
@@ -1032,7 +1189,7 @@ mod tests {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let mut mug = scratch_mug(dir.path());
         std::fs::write(&mug.origin, b"build 1").expect("exe");
-        mug.watch = Some(Watch::start(mug.origin.clone()));
+        mug.watch = Some(Watch::start(mug.origin.clone(), &mug.origin));
         assert_eq!(mug.tick(NOW), Next::Tick(TICK_SECS));
         std::fs::write(&mug.origin, b"build two").expect("exe");
         assert_eq!(mug.tick(NOW + 60), Next::Stop(Exit::Restart));
@@ -1050,7 +1207,7 @@ mod tests {
         std::fs::write(&mug.origin, b"build 1").expect("exe");
         launchd::set_startup(&mug.paths, &mug.label, &mug.origin, true).expect("startup on");
         assert!(launchd::startup_enabled(&mug.paths, &mug.label));
-        mug.watch = Some(Watch::start(mug.origin.clone()));
+        mug.watch = Some(Watch::start(mug.origin.clone(), &mug.origin));
         mug.origin_serves = |_| Some(false);
         assert_eq!(mug.tick(NOW), Next::Tick(TICK_SECS));
         std::fs::write(&mug.origin, b"an older build").expect("exe");
@@ -1158,7 +1315,9 @@ mod tests {
             ),
             (c"NSEvent", sel!(type), false, types(uq, &[])),
             (c"NSEvent", sel!(modifierFlags), false, types(uq, &[])),
+            (c"NSEvent", sel!(timestamp), false, types(d, &[])),
             (c"NSMenuItem", sel!(tag), false, types(q, &[])),
+            (c"NSMenuItem", sel!(state), false, types(q, &[])),
             (c"NSWorkspace", sel!(sharedWorkspace), true, types(id, &[])),
             (
                 c"NSWorkspace",

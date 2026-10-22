@@ -1143,9 +1143,8 @@ mod tests {
         (cues, peak)
     }
 
-    /// An unchanged token is no arrival (a byte-identical repaint produced no
-    /// output), and [`OutputStreak::rebase`] makes the next observation baseline
-    /// instead of answering the swap.
+    /// An unchanged token is a repaint, not an arrival, and [`OutputStreak::rebase`] makes the
+    /// next observation baseline.
     #[test]
     fn an_unchanged_token_is_no_arrival_and_rebase_baselines() {
         let t0 = Instant::now();

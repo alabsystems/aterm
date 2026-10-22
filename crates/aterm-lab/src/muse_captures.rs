@@ -16,7 +16,10 @@
 //! shell call that asks) approved and denied; the file-write box (a protected
 //! path, `.agents/`) approved; the edit box on the same file denied; the
 //! question (`request_user_input`), then Down and Enter, and Down twice onto
-//! `None of the above` and Enter; the 429 with its retry row and its final
+//! `None of the above` and Enter; a turn ended on each tool's own rows with
+//! no words after them ([`TOOL_ROWS`]: a read, a search, a write, an edit,
+//! a shell call, the memory, the todos, the goal and the work list); the
+//! 429 with its retry row and its final
 //! error (`provider_retry.max_attempts=3`, the stub's `retry-after: 5`); the
 //! 401; the 500 with its retry row and its final error; the usage wall (a
 //! 429 `usage_limit_reached` with `resets_at`, the stub's `limit:` mode: Muse
@@ -65,6 +68,58 @@ const EDIT: &str = r#"{"name":"edit_file","input":{"path":".agents/probe-write.m
 
 /// One single-select question with two options (Muse Code adds `None of the above`).
 const QUESTION: &str = r#"{"name":"request_user_input","input":{"questions":[{"id":"color","header":"Color","question":"Which color should the probe use?","options":[{"label":"Red (Recommended)","description":"Warm and loud."},{"label":"Blue","description":"Cool and calm."}]}]}}"#;
+
+/// THE TOOL ROWS (`tool-row-<name>`): each call Muse Code's tool script can
+/// make in the lab without a box or the network, answered once, its result
+/// answered with a reply holding NO WORDS, so the turn ends on the call's own
+/// rows above the composer (as `forever --mode resid`'s `tool-end` chain ends
+/// on `  Read README.md`). `(capture name, tool, its input)`; `@` in the
+/// input is the project's `README.md` text the lab put there first.
+pub const TOOL_ROWS: [(&str, &str, &str); 12] = [
+    ("read", "read_file", r#"{"path":"README.md"}"#),
+    (
+        "search",
+        "search",
+        r#"{"pattern":"parser","paths":["README.md"]}"#,
+    ),
+    (
+        "search-none",
+        "search",
+        r#"{"pattern":"no-such-word-here"}"#,
+    ),
+    (
+        "write",
+        "write_file",
+        r#"{"path":"notes.txt","content":"written by the lab stub\n"}"#,
+    ),
+    (
+        "edit",
+        "edit_file",
+        r#"{"path":"README.md","find":"parser","replace":"lexer"}"#,
+    ),
+    ("bash", "bash", r#"{"command":"ls"}"#),
+    (
+        "bash-described",
+        "bash",
+        r#"{"command":"wc -l README.md","description":"Count the README's lines"}"#,
+    ),
+    ("read-memory", "read_memory", r#"{"path":"notes.md"}"#),
+    (
+        "add-memory",
+        "add_memory",
+        r#"{"path":"notes.md","content":"the lab's note"}"#,
+    ),
+    (
+        "todos",
+        "write_todos",
+        r#"{"todos":[{"text":"write the parser","status":"in_progress"},{"text":"land it","status":"pending"}]}"#,
+    ),
+    ("goal", "get_goal", "{}"),
+    ("work-list", "work_list", "{}"),
+];
+
+/// The README the tool rows' project holds (one line naming the parser).
+const README: &str = "the lab's project: a parser module";
 
 /// The captures' own lab.
 struct Cap {
@@ -527,6 +582,14 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         )?;
         c.stub_log(&run, "question-none-enter");
     }
+    // ---- a turn ended on each tool's own rows, no words after them
+    for (name, tool, input) in TOOL_ROWS {
+        let cap = format!("tool-row-{name}");
+        if !any(&["tool-row", &cap]) {
+            continue;
+        }
+        tool_row(c, &cap, tool, input)?;
+    }
     // ---- the walls
     if any(&["rate-limit-retry", "rate-limit-final"]) {
         let run = c.fresh_muse(&["-c", "provider_retry.max_attempts=3"])?;
@@ -613,9 +676,105 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
     Ok(())
 }
 
+/// One of [`TOOL_ROWS`] captured as `name`: a fresh session in a project
+/// holding [`README`], the stub's custom mode answering the turn with the one
+/// call (`tool` with `input`) and its result with no words, the turn over
+/// (the stub's log shows the call made, then the empty reply to its result),
+/// the screen settled.
+fn tool_row(c: &Cap, name: &str, tool: &str, input: &str) -> Result<(), Fail> {
+    let run = c.fresh()?;
+    c.project_file(&run, "README.md", README)?;
+    let run = c.muse(&run, &["--trust-workspace"], "^❯")?;
+    let input = crate::pyjson::J::parse(input)
+        .map_err(|e| Fail::die(format!("muse-captures: {name}'s input: {e}")))?;
+    let spec = crate::pyjson::J::obj([
+        ("stream", crate::pyjson::J::Bool(true)),
+        ("text", crate::pyjson::J::s("")),
+        (
+            "tool",
+            crate::pyjson::J::obj([
+                ("name", crate::pyjson::J::s(tool)),
+                ("input", input.clone()),
+            ]),
+        ),
+    ]);
+    crate::verbs::set_custom_mode(&run, name, &spec)?;
+    c.turn(&run, PROMPT)?;
+    let log = run.w.join("stub.log");
+    let called = format!(" custom tool:{tool}");
+    let answered = |text: &str| tool_answered(text, &called);
+    let mut over = false;
+    for _ in 0..60 {
+        if answered(&scratch_text(&log)) {
+            over = true;
+            break;
+        }
+        stop::sleep(Duration::from_millis(500))?;
+    }
+    c.must(
+        over,
+        &format!("the {tool} call and the empty reply to its result"),
+    )?;
+    c.settle(&run)?;
+    c.cap(
+        &run,
+        name,
+        &format!(
+            "launched with --trust-workspace in a project whose README.md holds `{README}`; `{PROMPT}` and Enter, the stub's custom mode answering the turn with the one call `muse.{tool} {}` and its result with a reply holding no words: the turn over on the call's own rows, its run settled (5 s and a quiet screen)",
+            input.dump(crate::pyjson::COMPACT)
+        ),
+    )?;
+    c.stub_log(&run, name);
+    Ok(())
+}
+
+/// Whether the stub's log `text` shows a turn's call (`called`, the log's `
+/// custom tool:<name>`) made, and then a reply to a later request of the turn
+/// with the custom mode's own text (` custom`, no call): its result answered.
+#[must_use]
+pub fn tool_answered(text: &str, called: &str) -> bool {
+    let turns = || {
+        text.lines()
+            .filter(|l| l.contains("POST /responses") && l.contains(" kind=muse "))
+    };
+    let Some(at) = turns().position(|l| l.contains(called)) else {
+        return false;
+    };
+    turns()
+        .skip(at + 1)
+        .any(|l| l.ends_with(" custom") || l.contains(" custom "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool row's capture waits for the call and the empty reply to its
+    /// result, in that order, on the turn's own lines. NEGATIVE CONTROLS: the
+    /// call alone, a side call's line, and the reply before the call.
+    #[test]
+    fn a_tool_rows_turn_is_over_once_its_result_was_answered() {
+        let call = "1 POST /responses -> 200 body=9B mode=toolrow kind=muse auth=key model=lab-stub stream=true items=2 tools=1 instructions=0c last_user=\"x\" custom tool:search";
+        let reply = "2 POST /responses -> 200 body=9B mode=toolrow kind=muse auth=key model=lab-stub stream=true items=4 tools=1 instructions=0c last_user=\"x\" custom";
+        let side = "3 POST /responses -> 200 body=9B mode=toolrow kind=muse-side role=prompt-hint auth=key custom";
+        assert!(tool_answered(
+            &format!("{call}\n{reply}\n"),
+            " custom tool:search"
+        ));
+        assert!(!tool_answered(&format!("{call}\n"), " custom tool:search"));
+        assert!(!tool_answered(
+            &format!("{call}\n{side}\n"),
+            " custom tool:search"
+        ));
+        assert!(!tool_answered(
+            &format!("{reply}\n{call}\n"),
+            " custom tool:search"
+        ));
+        assert!(!tool_answered(
+            &format!("{call}\n{reply}\n"),
+            " custom tool:bash"
+        ));
+    }
 
     /// Enter after `/usage` only when the menu's first row IS `/usage` and the
     /// composer reads exactly that. NEGATIVE CONTROLS: a first row of another

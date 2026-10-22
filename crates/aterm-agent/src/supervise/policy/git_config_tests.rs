@@ -819,6 +819,11 @@ fn the_git_on_the_workers_path_is_the_one_read() {
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The wrapper is a file this test just wrote: the system's assessment of
+    // its first exec, which waits out every scan queued ahead of it on a
+    // loaded host, is paid here, unclocked, under its own hang detector, not
+    // inside the read below.
+    aterm_spec::wait::first_exec(&wrapper, &["--version"]);
     let path = format!(
         "PATH={}:{}",
         bin.0.path().display(),

@@ -48,7 +48,9 @@
 //! liveness. A queue is at its bound only while it is over a cap AND non-empty,
 //! so one record larger than [`QUEUE_BYTES_MAX`] still makes progress.
 //!
-//! ## Every broker input carries its incarnation
+//! `Closed` is never bounded: a bound on it would bound the bridge's liveness. A push blocks only
+//! while its queue is over a cap and non-empty, so one record larger than [`QUEUE_BYTES_MAX`]
+//! still makes progress.
 //!
 //! A reader thread outlives its subscription: after `close_subscriptions` its
 //! parked `recv` returns microseconds later, unordered against the reconnect.
@@ -68,6 +70,8 @@ use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
+use crate::wait_tally::{Hist, Row, Stamp, Tally, Unit};
+
 /// One record off the bus: `(offset, subject, body)`, the shape
 /// `astream_broker::Record` already is.
 pub type Record = (u64, String, Vec<u8>);
@@ -75,14 +79,14 @@ pub type Record = (u64, String, Vec<u8>);
 /// What the loop took, in the order the loop must take them.
 #[derive(Debug)]
 pub enum Item {
-    /// A `/f/<F>/fleet/>` record — a halt or a barrier. FIRST, always.
+    /// A `/f/<F>/fleet/>` record: a halt or a barrier, ahead of every other record.
     Fleet(Record),
     /// One `EVENT …` line off aterm's push lane.
     Event(String),
     /// A `/f/<F>/in/<node>/>` record from the durable group.
     Inbox(Record),
-    /// A `/f/<F>/pub/*/*/say/>` BROADCAST record, fanned in to whichever local
-    /// sessions opted into its topic. LAST — see [`Queues::take`].
+    /// A `/f/<F>/pub/*/*/say/>` broadcast record, fanned in to the local sessions that opted
+    /// into its topic. Last ([`Queues::take`]).
     Say(Record),
     /// A source ended: its reader thread saw EOF or a transport error. Named so
     /// the loop can tell a broker subscription ending (ask the broker, then
@@ -192,7 +196,8 @@ fn record_bytes(r: &Record) -> usize {
 /// One broker source's share of the mailbox.
 #[derive(Default)]
 struct Face {
-    records: VecDeque<Record>,
+    /// Each with its stamp while the wait tally is on ([`Queues::stamping`]).
+    records: VecDeque<(Record, Option<Stamp>)>,
     /// Resident subject+body bytes, as the bound counts them.
     bytes: usize,
     /// The incarnation whose inputs are currently accepted. See the module
@@ -205,15 +210,15 @@ struct Face {
 impl Face {
     /// Its head; a paused face this take brings down to its low water answers
     /// where it resumes, once.
-    fn take(&mut self) -> Option<(Record, Option<u64>)> {
-        let r = self.records.pop_front()?;
+    fn take(&mut self) -> Option<(Record, Option<Stamp>, Option<u64>)> {
+        let (r, stamp) = self.records.pop_front()?;
         self.bytes = self.bytes.saturating_sub(record_bytes(&r));
         let resume = if at_low_water(self.records.len(), self.bytes) {
             self.paused.take()
         } else {
             None
         };
-        Some((r, resume))
+        Some((r, stamp, resume))
     }
 
     /// Forget everything queued, and move the generation.
@@ -229,8 +234,8 @@ impl Face {
 struct Queues {
     fleet: Face,
     /// aterm's events, each with the number of its push
-    /// ([`Queues::events_pushed`]).
-    events: VecDeque<(u64, String)>,
+    /// ([`Queues::events_pushed`]) and its stamp while the wait tally is on.
+    events: VecDeque<(u64, String, Option<Stamp>)>,
     /// How many events have ever been pushed: the number the next one takes,
     /// and so the [`EventMark`] of this moment.
     events_pushed: u64,
@@ -251,11 +256,49 @@ struct Queues {
     /// record waited: at [`EVENT_RUN_MAX`] the inbox record is taken next, and
     /// its take starts the count again ([`Queues::take`]).
     events_run: u32,
+    /// Whether each push is stamped for the wait tally ([`Mailbox::stamp`]).
+    stamping: bool,
+    /// Whether the loop is parked on [`Mailbox::take`] now: a push then is a
+    /// wake, and otherwise waits behind the loop's work.
+    parked: bool,
+    /// The stamped items' waits, by kind ([`Mailbox::copy_wakes`]).
+    wakes: Wakes,
     /// The bound's NEGATIVE CONTROL: every event ahead of every inbox record,
     /// however many, the order before the bound. Only this module's own tests
     /// set it.
     #[cfg(test)]
     events_first: bool,
+}
+
+/// THE WAIT TALLY'S VIEW OF THE QUEUES ([`crate::wait_tally`]): each stamped
+/// item's time from its push to its take, apart for an item pushed while the
+/// loop was parked on [`Mailbox::take`] (its wake) and one pushed while the loop
+/// worked (its wait behind that work), and apart for aterm's events and broker
+/// records. An item forgotten before it was taken
+/// ([`Mailbox::forget_queued_drains`], a reset) is not counted.
+#[derive(Debug, Default)]
+struct Wakes {
+    event: Hist,
+    record: Hist,
+    queued_event: Hist,
+    queued_record: Hist,
+}
+
+impl Wakes {
+    /// An item stamped `stamp` (none while the tally is off) is taken now.
+    fn taken(&mut self, stamp: Option<Stamp>, record: bool) {
+        let Some(stamp) = stamp else {
+            return;
+        };
+        let (ns, parked) = stamp.taken();
+        let row = match (parked, record) {
+            (true, false) => &mut self.event,
+            (true, true) => &mut self.record,
+            (false, false) => &mut self.queued_event,
+            (false, true) => &mut self.queued_record,
+        };
+        row.add(ns, Unit::Ns);
+    }
 }
 
 /// Where aterm's event queue stood at one moment ([`Mailbox::event_mark`]):
@@ -272,8 +315,8 @@ fn is_drain_event(line: &str) -> bool {
     toks.next() == Some("EVENT") && matches!(toks.nth(1), Some("post" | "fetch"))
 }
 
-/// Whether one source is over a bound AND non-empty: an empty queue must accept
-/// one record however large, or the lane wedges forever.
+/// Whether one source is over a bound and non-empty: an empty queue must accept one record
+/// however large, or the lane wedges forever.
 fn over_bound(rows: usize, bytes: usize) -> bool {
     rows > 0 && (rows >= QUEUE_ROWS_MAX || bytes >= QUEUE_BYTES_MAX)
 }
@@ -286,6 +329,12 @@ fn at_low_water(rows: usize, bytes: usize) -> bool {
 }
 
 impl Queues {
+    /// A push's stamp: now, and whether the loop is parked; `None` while the
+    /// wait tally is off, so an untallied bridge reads no clock for it.
+    fn stamp(&self) -> Option<Stamp> {
+        self.stamping.then(|| Stamp::now(self.parked))
+    }
+
     fn is_empty(&self) -> bool {
         self.fleet.records.is_empty()
             && self.events.is_empty()
@@ -345,7 +394,8 @@ impl Queues {
         #[cfg(not(test))]
         let inbox_due = waiting && self.events_run >= EVENT_RUN_MAX;
         if !inbox_due {
-            if let Some((_, e)) = self.events.pop_front() {
+            if let Some((_, e, stamp)) = self.events.pop_front() {
+                self.wakes.taken(stamp, false);
                 if waiting {
                     self.events_run += 1;
                 }
@@ -362,7 +412,8 @@ impl Queues {
     /// One broker source's head; a paused source this take brings down to its
     /// low water is owed its [`Item::Resume`].
     fn take_record(&mut self, s: Source) -> Option<Record> {
-        let (r, resume) = self.face(s)?.take()?;
+        let (r, stamp, resume) = self.face(s)?.take()?;
+        self.wakes.taken(stamp, true);
         if let Some(from) = resume {
             self.resume.push_back((s, from));
         }
@@ -431,10 +482,8 @@ impl Mailbox {
         self.queues.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Whether the loop has an input that outranks broadcast replay waiting.
-    /// A page already in flight cannot be preempted, but the bridge checks this
-    /// before each next page so an arriving halt or addressed message never
-    /// waits behind an entire replay slice.
+    /// Whether an input that outranks broadcast replay is waiting. The bridge checks before
+    /// each replay page, so a halt or addressed message waits one page, not a replay slice.
     pub(crate) fn replay_pressure(&self) -> ReplayPressure {
         let q = self.lock();
         if !q.closed.is_empty()
@@ -446,6 +495,32 @@ impl Mailbox {
             ReplayPressure::Pending
         } else {
             ReplayPressure::Clear
+        }
+    }
+
+    /// Stamp every push from now on for the wait tally (`true`), or no more:
+    /// the bridge turns it on with its recorder ([`crate::wait_tally`]).
+    pub(crate) fn stamp(&self, on: bool) {
+        self.lock().stamping = on;
+    }
+
+    /// Whether a taker is parked on [`Mailbox::take`] now: a test's cue that a
+    /// push from another thread is a wake.
+    #[cfg(test)]
+    pub(crate) fn parked(&self) -> bool {
+        self.lock().parked
+    }
+
+    /// Copy the stamped items' waits into the tally's wake rows.
+    pub(crate) fn copy_wakes(&self, t: &mut Tally) {
+        let q = self.lock();
+        for (row, h) in [
+            (Row::WakeEvent, &q.wakes.event),
+            (Row::WakeRecord, &q.wakes.record),
+            (Row::QueuedEvent, &q.wakes.queued_event),
+            (Row::QueuedRecord, &q.wakes.queued_record),
+        ] {
+            t.rows[row.index()] = *h;
         }
     }
 
@@ -480,12 +555,13 @@ impl Mailbox {
     /// nothing queued). See the module header.
     pub fn push(&self, s: Source, r: Record, generation: u64) -> Pushed {
         let mut q = self.lock();
+        let stamp = q.stamp();
         let Some(face) = q.face(s).filter(|face| face.generation == generation) else {
             return Pushed::Stale;
         };
         let resume_from = r.0.saturating_add(1);
         face.bytes = face.bytes.saturating_add(record_bytes(&r));
-        face.records.push_back(r);
+        face.records.push_back((r, stamp));
         let pushed = if over_bound(face.records.len(), face.bytes) {
             face.paused = Some(resume_from);
             Pushed::Paused
@@ -544,7 +620,7 @@ impl Mailbox {
         let mut q = self.lock();
         let before = q.events.len();
         q.events
-            .retain(|(pushed, line)| *pushed >= mark.0 || !is_drain_event(line));
+            .retain(|(pushed, line, _)| *pushed >= mark.0 || !is_drain_event(line));
         let forgot = before - q.events.len();
         drop(q);
         if forgot > 0 {
@@ -553,8 +629,8 @@ impl Mailbox {
         forgot
     }
 
-    /// Push one aterm `EVENT` line, WAITING while the event queue is over its
-    /// row bound (lines are small and coalesced, so only rows count).
+    /// Push one aterm `EVENT` line, waiting while the event queue is over its row bound (lines
+    /// are small and coalesced, so only rows count).
     pub fn push_event(&self, line: String) {
         let mut q = self.lock();
         while over_bound(q.events.len(), 0) {
@@ -562,7 +638,8 @@ impl Mailbox {
         }
         let pushed = q.events_pushed;
         q.events_pushed = pushed.saturating_add(1);
-        q.events.push_back((pushed, line));
+        let stamp = q.stamp();
+        q.events.push_back((pushed, line, stamp));
         drop(q);
         self.ready.notify_all();
     }
@@ -621,11 +698,8 @@ impl Mailbox {
         self.lock().bye
     }
 
-    /// Report that ATERM went away — never generation-scoped.
-    ///
-    /// The verb and push descriptors are inherited once at exec and no reconnect
-    /// touches them; this closure is the only thing that makes the run loop
-    /// return.
+    /// Report that aterm went away, never generation-scoped: the inherited verb and push
+    /// descriptors survive every reconnect, and this closure alone makes the run loop return.
     pub fn push_aterm_closed(&self) {
         self.lock().closed.push_back(Item::Closed(Source::Aterm));
         self.ready.notify_all();
@@ -678,12 +752,10 @@ impl Mailbox {
     /// during the duty, or later halts cannot arrive until the duty ends.
     /// Inbox and say resumes stay with the outer loop.
     ///
-    /// THE FLEET RECORDS COME FIRST HERE, unlike [`Mailbox::take`]'s closure
-    /// first: between two items a closure means a reconnect whose `Last` read
-    /// re-reads every halt, so the records behind it are redundant; inside a
-    /// duty a record already delivered is applied at once, and the closure
-    /// then ends the duty. `Closed(Aterm)` is never taken here: exiting is the
-    /// loop's.
+    /// Fleet records come first here, unlike [`Mailbox::take`]: between items a closure means
+    /// a reconnect whose `Last` read re-reads every halt, but inside a duty a delivered record
+    /// is applied at once and the closure then ends the duty. `Closed(Aterm)` is never taken
+    /// here: exiting is the loop's.
     pub(crate) fn take_urgent(&self) -> Option<Item> {
         self.lock().take_urgent()
     }
@@ -701,10 +773,12 @@ impl Mailbox {
             }
             return Some(item);
         }
+        q.parked = true;
         let (mut q, _) = self
             .ready
             .wait_timeout_while(q, timeout, |q: &mut Queues| q.is_empty())
             .unwrap_or_else(|p| p.into_inner());
+        q.parked = false;
         let item = q.take();
         drop(q);
         if item.as_ref().is_some_and(|(_, released)| *released) {
@@ -720,6 +794,74 @@ mod tests {
 
     fn rec(off: u64) -> Record {
         (off, format!("/s/{off}"), Vec::new())
+    }
+
+    /// **THE WAIT TALLY'S WAKE ROWS COUNT A PUSH THAT FOUND THE LOOP PARKED,
+    /// AND ITS QUEUED ROWS ONE THAT FOUND IT WORKING** ([`Wakes`]), each by
+    /// kind. An event and an inbox record pushed before the take are queued;
+    /// an event and a record each pushed once another thread is parked on
+    /// [`Mailbox::take`] are wakes; every item lands in one row, once.
+    /// NEGATIVE CONTROL: the same pushes unstamped count nothing.
+    #[test]
+    fn a_push_to_a_parked_taker_is_a_wake_and_one_to_a_working_loop_is_queued() {
+        use std::sync::Arc;
+        let counted = |stamping: bool| -> Tally {
+            let mb = Arc::new(Mailbox::default());
+            mb.stamp(stamping);
+            mb.push_event("EVENT 1 post 1".into());
+            assert_eq!(mb.push(Source::Inbox, rec(4), 0), Pushed::Queued);
+            assert!(matches!(mb.take(Duration::ZERO), Some(Item::Event(_))));
+            assert!(matches!(
+                mb.take(Duration::ZERO),
+                Some(Item::Inbox((4, _, _)))
+            ));
+            for record in [false, true] {
+                let taker = {
+                    let mb = Arc::clone(&mb);
+                    std::thread::spawn(move || mb.take(aterm_spec::wait::MUST_HAPPEN))
+                };
+                aterm_spec::wait::until_within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    "the taker parked on the mailbox",
+                    || mb.parked().then_some(()),
+                );
+                if record {
+                    assert_eq!(mb.push(Source::Inbox, rec(5), 0), Pushed::Queued);
+                } else {
+                    mb.push_event("EVENT 1 post 2".into());
+                }
+                let took = taker.join().expect("the taker");
+                assert!(
+                    match took {
+                        Some(Item::Event(_)) => !record,
+                        Some(Item::Inbox((5, _, _))) => record,
+                        _ => false,
+                    },
+                    "the parked take answered the push: {took:?}"
+                );
+                assert!(!mb.parked(), "a take that answered is parked no more");
+            }
+            let mut t = Tally::default();
+            mb.copy_wakes(&mut t);
+            t
+        };
+        let on = counted(true);
+        assert_eq!(
+            [
+                Row::WakeEvent,
+                Row::WakeRecord,
+                Row::QueuedEvent,
+                Row::QueuedRecord
+            ]
+            .map(|row| on.row(row).count),
+            [1, 1, 1, 1],
+            "each item in its own row, once"
+        );
+        assert_eq!(
+            counted(false),
+            Tally::default(),
+            "NEGATIVE CONTROL: unstamped pushes count nothing"
+        );
     }
 
     /// The full order, once: closed, fleet, resume, event, inbox, say.
@@ -1061,8 +1203,7 @@ mod tests {
         let fresh = mb.broker_generation(Source::Fleet);
         assert_ne!(stale, fresh, "a reconnect moves the generation");
 
-        // The reader the reconnect killed, waking up after it: a closure notice
-        // and a record, both from the subscription that no longer exists.
+        // The killed reader waking up after the reconnect.
         mb.push_closed(Source::Fleet, stale);
         mb.push_refused(Source::Inbox, stale, "subscribe");
         assert_eq!(mb.push(Source::Inbox, rec(2), stale), Pushed::Stale);

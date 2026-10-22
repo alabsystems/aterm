@@ -2,20 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-// Trust verification tool attribute (`#[trust::skip]`) registration, mirroring
-// aterm-log / aterm-types. Active only under the `trust_verify` cfg.
+// Registers the `trust` tool attribute (`#[trust::skip]`) under the `trust_verify` cfg.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
 //! Shell integration injection for aterm.
 //!
-//! Embeds shell integration scripts (zsh, bash, fish, PowerShell) in the
-//! Rust binary and provides a cross-platform injection mechanism that
-//! auto-loads them at shell startup without requiring user configuration.
-//!
-//! # Injection Strategies
-//!
-//! Each shell has its own auto-loading mechanism:
+//! Embeds the zsh, bash, fish and PowerShell integration scripts and injects them at
+//! shell startup with no user configuration:
 //!
 //! | Shell | Mechanism | How |
 //! |-------|-----------|-----|
@@ -51,10 +45,8 @@ use std::sync::{Mutex, PoisonError};
 mod shell_args;
 pub use shell_args::{ArgsMerge, merge_shell_args, shell_args_bypass};
 
-/// Embedded shell integration scripts (compiled into the binary).
-///
-/// This crate is the canonical owner of the shell script bodies (`aterm-core`
-/// re-exports it as `shell_integration`).
+/// The shell integration scripts, compiled in. `aterm-core` re-exports this crate as
+/// `shell_integration`.
 pub mod scripts {
     /// zsh shell integration (OSC 7/133 + prompt override).
     pub const ZSH: &str = include_str!("scripts/aterm_shell_integration.zsh");
@@ -288,10 +280,7 @@ pub const fn decode_integration_rev_le(bytes: [u8; 16]) -> (u64, u32, u32) {
     (rev_hash, shell_kind, nonce_prefix)
 }
 
-/// Result of preparing shell integration injection.
-///
-/// Contains environment variable modifications to apply to the child
-/// process before exec.
+/// Result of preparing shell integration: what to apply to the child before exec.
 #[derive(Debug)]
 pub struct InjectionEnv {
     /// Environment variables to set in the child process.

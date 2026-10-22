@@ -2024,9 +2024,6 @@ mod tests {
         assert!(cert_common_name("subject= /O=A Person/C=US").is_none());
     }
 
-    /// `provision` reads `~/.aterm/apple` and the ONE folder the operator named — never
-    /// `~/Downloads` on its own initiative: from an aterm shell, aterm is the app
-    /// responsible for that folder's consent dialog. Naming the folder is the consent.
     #[test]
     fn nothing_outside_aterms_own_folder_is_read_unless_the_operator_named_it() {
         let own = Watch::new(None);
@@ -2084,10 +2081,7 @@ mod tests {
         assert!(lookalike.consent_note().is_none());
     }
 
-    /// Two overlapping Developer ID certificates is what a RENEWAL looks like, so the
-    /// pairing proof selects by digest, not by keychain order. The
-    /// stream shape is MEASURED: `security find-certificate -a -p -Z` prints a SHA-256
-    /// line, a SHA-1 line, then the block.
+    /// A renewal leaves two overlapping certificates, so selection is by digest, not order.
     #[test]
     fn the_certificate_is_selected_by_digest_not_by_position() {
         let stream = "SHA-256 hash: AAAA\nSHA-1 hash: 1111111111111111111111111111111111111111\n\

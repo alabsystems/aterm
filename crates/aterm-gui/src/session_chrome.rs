@@ -261,19 +261,15 @@ pub(crate) enum ConnFlow {
 /// exists; the rendering already supports the flag.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConnectionFact {
-    /// The peer's registry sid — what the [`TabMenuEntry::ConnectionAction`]
-    /// rows target.
+    /// The peer's registry sid, which its [`TabMenuEntry::ConnectionAction`] rows target.
     pub peer_sid: SessionId,
-    /// The peer's display title (user meta title ▸ registry title), or
-    /// `unknown` for a foreign src no local session owns.
+    /// The peer's display title, or `unknown` for a foreign src no local session owns.
     pub peer_title: String,
     pub direction: ConnDirection,
-    /// The [`ConnFlow`] of the S-relative half: the S→peer half for
-    /// `Outbound`/`Peer`, the peer→S half for `Inbound`. (`Peer` renders the
-    /// bare `⇆` line, direction-symmetric, so its flow is not shown.)
+    /// The [`ConnFlow`] of the half seen from this session: this→peer for `Outbound`/`Peer`,
+    /// peer→this for `Inbound` (a `Peer` line does not show it).
     pub kind: ConnFlow,
-    /// Whether the connection is actively driving right now. Best-effort —
-    /// see the struct doc; `false` means "not known live", never "idle".
+    /// Whether the connection is driving right now; `false` means not known live, never idle.
     pub live: bool,
 }
 
@@ -291,13 +287,9 @@ pub(crate) struct TimelineNote {
     pub at_ms: u64,
 }
 
-/// One entry of the composed context menu — the platform-neutral MODEL the
-/// macOS strip renders as `NSMenuItem`s and the `chrome` verb serialises via
-/// [`tab_menu_chrome_line`]. Mirrors [`crate::menu::MENU_MODEL`]'s
-/// philosophy: the description IS the menu; native code only renders it.
-/// Deliberately FLAT — no submenu variant (design R15): per-peer sub-actions
-/// are flat rows under a per-peer [`TabMenuEntry::Header`], which keeps the
-/// serialization's flat `items=[…]` contract and the NSMenu render loop.
+/// One entry of the composed context menu: the platform-neutral model the macOS strip renders
+/// as `NSMenuItem`s and the `chrome` verb serialises ([`tab_menu_chrome_line`]). Flat, with no
+/// submenu: per-peer rows follow a per-peer [`TabMenuEntry::Header`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TabMenuEntry {
     /// A disabled, informational row (identity / connection lines).
@@ -313,40 +305,27 @@ pub(crate) enum TabMenuEntry {
     Event { words: String, at_ms: u64 },
     /// A native separator.
     Separator,
-    /// A live command row: `action`'s tag is what the `NSMenuItem` carries, so
-    /// the click dispatches through the SAME tag→[`MenuAction`] decode the menu
-    /// bar uses (never a parallel path). `enabled: false` renders greyed
-    /// (e.g. `Copy CWD` with no reported cwd). `label` is owned so live rows
-    /// can name peers (design §2.2 [v5]); the fixed rows pay one small clone
-    /// per compose, which is already epoch-gated.
+    /// A command row: the `NSMenuItem` carries `action`'s tag, so the click dispatches through
+    /// the menu bar's tag→[`MenuAction`] decode. `enabled: false` renders greyed.
     Action {
         label: String,
         action: MenuAction,
         enabled: bool,
     },
-    /// A per-peer connection row (design §2.2 [v5]): Show / Configure… /
-    /// Disconnect against `peer_sid`. NOT tag→[`MenuAction`] dispatched — the
-    /// action needs a peer ARGUMENT, so the native item's tag is an index into
-    /// the pop-time snapshot (the `menu_tab` precedent) and the click posts
-    /// `Wake::TabMenuConnection { window, tab, peer_sid, verb }`.
+    /// A per-peer row (Show / Configure… / Disconnect) against `peer_sid`. The action needs a
+    /// peer argument, so the native item's tag indexes the pop-time snapshot and the click posts
+    /// `Wake::TabMenuConnection`, not a [`MenuAction`].
     ConnectionAction {
         label: String,
         peer_sid: SessionId,
         verb: ConnVerb,
         enabled: bool,
     },
-    /// The owner's word on this tab's live agent upgrade (gap #21): Upgrade
-    /// Now / Not Today / Skip This Version, for the build `to` the menu
-    /// names. Carries its arguments like a connection row, for the same
-    /// reason: the native item's tag indexes the strip's pop-time snapshot
-    /// and the click posts `Wake::TabMenuUpgrade`, so a click after the
-    /// upgrade moved on names the build the owner SAW — which the harness
-    /// then refuses (`upgrade_drive::ask_for`) rather than applying the word
-    /// to a newer one. And the SESSION it saw: a split tab runs one per
-    /// pane and the menu is composed for the focused one, which can change
-    /// before the choice lands — the word is for `sid`, never for whichever
-    /// pane holds the focus then. Offered only when it does something:
-    /// always enabled.
+    /// The owner's word on this tab's live agent upgrade, for build `to` of session `sid`. Like
+    /// a connection row, the native item's tag indexes the pop-time snapshot and the click posts
+    /// `Wake::TabMenuUpgrade`, so the word names the build and pane the owner saw: the harness
+    /// refuses it once the upgrade moved on, and focus moving to another pane changes nothing.
+    /// Offered only when it does something, so always enabled.
     Upgrade {
         label: String,
         sid: String,
@@ -369,10 +348,8 @@ pub(crate) enum ConnVerb {
     StopWorker,
 }
 
-/// The per-tab chrome EXTENSION the app pushes to the native strip alongside
-/// titles/metadata: the composed tooltip + context-menu model. `Default` (no
-/// tooltip, empty menu) is the non-terminal-tab / unknown-session shape —
-/// exactly today's behavior, so native tabs and stubs degrade cleanly.
+/// The per-tab tooltip and context-menu model the app pushes to the native strip. `Default`
+/// (no tooltip, no menu) is the shape for non-terminal tabs and unknown sessions.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TabChromeExt {
     /// Tooltip text for the tab chip (`None` = no tooltip installed).
@@ -381,33 +358,24 @@ pub(crate) struct TabChromeExt {
     pub menu: Vec<TabMenuEntry>,
 }
 
-/// One session's cached composed chrome + the input EPOCHS it was composed
-/// from — the `App::session_chrome` map's value. Plain data here (next to the
-/// [`TabChromeExt`] it caches); the reuse policy lives at the one write site,
-/// [`crate::App::composed_session_chrome`].
+/// One session's cached chrome and the input epochs it was composed from (the
+/// `App::session_chrome` map's value); the reuse policy is in `App::composed_session_chrome`.
 pub(crate) struct CachedChrome {
-    /// The session timeline's high-water event id at compose time. Every
-    /// composed fact (meta / cwd / state) records a timeline event, so an
-    /// unchanged id means unchanged facts.
+    /// The timeline's high-water event id: every composed fact (meta, cwd, state) records an
+    /// event, so an unchanged id means unchanged facts.
     pub high_id: u64,
-    /// The resolved tab label at compose time — covers OSC-title drift, which
-    /// (for a BACKGROUND tab) may move without a timeline record.
+    /// The resolved tab label: an OSC title can move without a timeline record.
     pub label: String,
     /// The session-status revision at compose time. The activity line can
     /// change without a session-timeline event and is never part of the label,
     /// so it must be an independent cache epoch rather than relying on
     /// `high_id` or `label`.
     pub activity_revision: u64,
-    /// The connection store's revision at compose time (design §2.4 [v5]): a
-    /// connection mint/revoke/sweep moves NONE of the other epochs, so without
-    /// this the menu would list a revoked connection (and the tooltip its
-    /// line) for up to [`CACHE_MAX_AGE_MS`] while the §4 marks already
-    /// cleared. Bumped by every authority act — see
-    /// `crate::connections::ConnectionTable::bump_revision`.
+    /// The connection table's revision (`ConnectionTable::bump_revision`): a mint, revoke or
+    /// sweep moves no other epoch.
     pub connections_revision: u64,
-    /// The window's upgrade view's revision at compose time
-    /// (`upgrade_host::UpgradeView::revision`): the harness host's rows move
-    /// none of the other epochs, and the menu's upgrade words are theirs.
+    /// The window's `upgrade_host::UpgradeView` revision: the harness host's rows move no other
+    /// epoch.
     pub upgrade_revision: u64,
     /// When the clock may move this composition with no input epoch moving
     /// ([`clock_expiry_ms`], from [`crate::turn_ledger::now_ms`] at compose
@@ -433,13 +401,12 @@ pub(crate) struct CachedChrome {
 /// cannot move arms nothing.
 pub(crate) const CACHE_MAX_AGE_MS: u64 = 30_000;
 
-/// Maximum real window inspections/toolbar refreshes performed by the expiry
-/// fan-out in one event-loop turn. The cursor retains the unvisited remainder.
+/// Window inspections/toolbar refreshes the expiry fan-out performs per event-loop turn; the
+/// cursor keeps the remainder.
 pub(crate) const EXPIRY_WINDOW_SCAN_BUDGET: usize = 1;
 
-/// Observable projection of one real expiry scheduler turn. Tier-1 binds these
-/// counts to the derived model's `work` variable; unlike a due-session count,
-/// they measure the actual window traversal/rebuild boundary.
+/// Observable projection of one expiry scheduler turn; the conformance test binds these counts
+/// to the derived model's `work` variable.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExpiryProgress {
     pub(crate) admitted_session: Option<u64>,
@@ -486,9 +453,8 @@ pub(crate) fn next_cache_expiry_ms(
     cache.values().filter_map(|c| c.expires_ms).min()
 }
 
-/// Deterministic bounded set of entries due at `now_ms`, ordered by deadline
-/// then session id. Selection does not mutate: the App removes each selected
-/// entry immediately before recomposing every window that consumes it.
+/// At most `budget` entries due at `now_ms`, ordered by deadline then session id. Selection
+/// does not mutate: the App removes each entry before recomposing the windows that use it.
 #[must_use]
 pub(crate) fn due_cache_batch(
     cache: &std::collections::HashMap<u64, CachedChrome>,
@@ -498,14 +464,8 @@ pub(crate) fn due_cache_batch(
     if budget == 0 {
         return Vec::new();
     }
-    // Keep only the earliest `budget` candidates while scanning: a synchronized
-    // thousand-tab expiry still allocates O(Budget), never O(due entries). The
-    // buffer starts empty rather than pre-reserved because the push guard below
-    // is what enforces that bound — reserving up front only moved the same
-    // O(Budget) allocation earlier, and this runs on every event-loop park where
-    // the overwhelmingly common answer (30 s TTL) is "nothing due", so the
-    // lazy shape leaves the park allocation-free. Selection order and the
-    // returned value are unchanged.
+    // Keep only the earliest `budget` candidates while scanning, so a mass expiry allocates
+    // O(budget). Not pre-reserved: most calls find nothing due and stay allocation-free.
     let mut due: Vec<(u64, u64)> = Vec::new();
     for (session, entry) in cache {
         let Some(expiry) = entry.expires_ms.filter(|at| *at <= now_ms) else {
@@ -524,10 +484,8 @@ pub(crate) fn due_cache_batch(
     due.into_iter().map(|(_, session)| session).collect()
 }
 
-/// Render an age delta as the coarse human token the chrome shows. Coarse on
-/// purpose: the tooltip is rebuilt on input-epoch changes (not per frame), so a
-/// second-precise age would read as authoritative while being stale — a coarse
-/// bucket stays honest for the whole gap between rebuilds.
+/// An age delta as the coarse token the chrome shows: the chrome is recomposed on input
+/// changes, not per frame, so a coarse bucket stays true between rebuilds.
 #[must_use]
 pub(crate) fn relative_age(age_ms: u64) -> String {
     const SEC: u64 = 1000;
@@ -547,20 +505,15 @@ pub(crate) fn relative_age(age_ms: u64) -> String {
     }
 }
 
-/// The `~`-abbreviated display cwd, reusing the PROVEN component-boundary
-/// matcher [`crate::app_tabs::home_relative_suffix`] (a sibling like
-/// `/Users//foobar` under `home=/Users//foo` stays verbatim). `None` home or a
-/// foreign path shows the raw path.
+/// The `~`-abbreviated display cwd ([`crate::app_tabs::home_relative_suffix`] matches whole
+/// components, so `/Users//foobar` under `home=/Users//foo` stays verbatim).
 fn display_cwd(cwd: &str, home: Option<&str>) -> String {
     let display = match home.and_then(|h| crate::app_tabs::home_relative_suffix(cwd, h)) {
         Some(rest) => format!("~{rest}"),
         None => cwd.to_string(),
     };
-    // OSC 7 / OSC 633 cwd is program-supplied and can legally name files with
-    // controls on Unix. Keep that exact value for Copy CWD, but never let it
-    // forge tooltip/menu rows or apply bidi controls in native chrome. The
-    // display-only cap also keeps a valid PATH_MAX-sized directory from turning
-    // a hover card into thousands of glyphs.
+    // The cwd is program-supplied (OSC 7 / 633) and may hold controls; `Copy CWD` keeps the
+    // exact value, but the display strips controls and bidi, and caps a PATH_MAX-sized path.
     let display = crate::session_timeline::sanitize_presentation_line(
         &display,
         crate::session_timeline::META_DESCRIPTION_MAX,
@@ -568,9 +521,8 @@ fn display_cwd(cwd: &str, home: Option<&str>) -> String {
     display_description(&display)
 }
 
-/// The identity title line: `<icon> <label>` when an icon token is set, else
-/// the bare label. Shared verbatim by the tooltip's first line and the menu's
-/// first header, so the two surfaces always open with the same identity.
+/// The identity title line, `<icon> <label>` or the bare label: the first line of both the
+/// tooltip and the menu.
 fn title_line(input: &SessionChromeInput) -> String {
     let label = crate::session_timeline::sanitize_presentation_line(&input.label, usize::MAX);
     match input
@@ -583,14 +535,9 @@ fn title_line(input: &SessionChromeInput) -> String {
     }
 }
 
-/// One descriptive prose line, DISPLAY-truncated to
-/// [`DESCRIPTION_DISPLAY_MAX`] user-perceived characters with a trailing
-/// ellipsis. The unit is GRAPHEME CLUSTERS (via the workspace's own segmenter —
-/// the same one the core grid cells use), not `char`s: a `char` cut is
-/// UTF-8-safe but can land INSIDE a ZWJ emoji sequence or between a base letter
-/// and its combining accent, rendering a mangled partial glyph in the tooltip /
-/// menu header / `chrome` mirror. A cluster is indivisible on screen, so the
-/// cut must be too.
+/// One descriptive prose line, truncated for display to [`DESCRIPTION_DISPLAY_MAX`] grapheme
+/// clusters with a trailing ellipsis, so the cut never lands inside a ZWJ sequence or between
+/// a base and its combining mark.
 fn display_description(prose: &str) -> String {
     use aterm_grapheme::GraphemeClusters;
     let mut it = prose.graphemes();
@@ -602,14 +549,10 @@ fn display_description(prose: &str) -> String {
     }
 }
 
-/// ONE connection's display line, shared VERBATIM by the tooltip and the
-/// menu's per-peer header (design §2.3/§4 — one composer, two surfaces):
-/// `⇥ pushes into "build" · live` / `⇤ pulled by "operator"` /
-/// `⇆ peer "claude (b)"`. The glyph encodes the AUTHORITY direction (⇥ this
-/// session holds ops over the peer, ⇤ the peer holds ops over it, ⇆ both);
-/// the verb encodes the [`ConnFlow`] rung (write-input ⇒ push). Titles are
-/// program-influenced text, so they take the same sanitize+cap path as every
-/// other prose line.
+/// One connection's display line, shared by the tooltip and the menu's per-peer header:
+/// `⇥ pushes into "build" · live`, `⇤ pulled by "operator"`, `⇆ peer "claude (b)"`. The glyph
+/// is the authority direction (⇥ this session holds ops over the peer, ⇤ the reverse, ⇆
+/// both), the verb the [`ConnFlow`]. Titles are program-influenced, so they are sanitized.
 fn connection_line(fact: &ConnectionFact) -> String {
     let title = display_description(&crate::session_timeline::sanitize_presentation_line(
         &fact.peer_title,
@@ -626,8 +569,7 @@ fn connection_line(fact: &ConnectionFact) -> String {
     format!("{head} \"{title}\"{live}")
 }
 
-/// The per-connection lines in the input's (caller-sorted) order — appended to
-/// the tooltip's identity block and rendered as the menu's per-peer headers.
+/// The per-connection lines, in the caller's order.
 fn connection_lines(input: &SessionChromeInput) -> Vec<String> {
     input.connections.iter().map(connection_line).collect()
 }
@@ -667,8 +609,8 @@ fn header_lines(input: &SessionChromeInput) -> (Vec<String>, usize) {
             identity.push(format!("cwd: {cwd}"));
         }
     }
-    // The state is news unless it is the live default or the activity line
-    // already says it (`activity: exited (exit 1)`).
+    // The state is news unless it is the live default or the activity line already says it
+    // (`activity: exited (exit 1)`).
     if let Some(state) = input.state.as_deref().filter(|s| {
         !s.is_empty()
             && !matches!(*s, "-" | "alive" | "spawning")
@@ -784,8 +726,7 @@ pub(crate) fn timeline_tail(
         .collect()
 }
 
-/// A timeline event kind in a person's words (`cwd-change` → `changed
-/// directory`). A kind with no entry here is printed as recorded.
+/// A timeline event kind in a person's words; a kind with no entry is printed as recorded.
 fn event_words(kind: &str) -> &str {
     match kind {
         "spawned" => "started",
@@ -828,7 +769,7 @@ pub(crate) fn compose_tooltip(input: &SessionChromeInput) -> Option<String> {
         .is_some();
     let attention = attention_line(input);
     if identity.len() <= 1 && !icon && connections.is_empty() && attention.is_none() {
-        // Only the bare title line — nothing the chip doesn't already say.
+        // Only the bare title line: nothing the chip does not already say.
         return None;
     }
     let mut lines = identity;
@@ -837,8 +778,7 @@ pub(crate) fn compose_tooltip(input: &SessionChromeInput) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-/// The tooltip line that names why a tab's attention mark stands starts with
-/// this; the native hover ([`crate::toolbar`]) reads it to say the reason once.
+/// Prefix of the tooltip's attention line; the native hover ([`crate::toolbar`]) reads it.
 pub(crate) const NEEDS_ATTENTION_PREFIX: &str = "Needs attention: ";
 
 /// The hover's line for a harness's need in the worker's own words
@@ -846,10 +786,8 @@ pub(crate) const NEEDS_ATTENTION_PREFIX: &str = "Needs attention: ";
 /// [`NEEDS_ATTENTION_PREFIX`]: the reason told, as that line is.
 pub(crate) const NEEDS_YOU_PREFIX: &str = "Needs you: ";
 
-/// The tooltip's `Needs attention: <reason>` line: the reason the tab's mark
-/// stands, sanitized and capped at the `attention` field's own rules and then
-/// display-truncated like the description. `None` when no reason is recorded
-/// (the mark's own hover clause, `Needs attention`, still says THAT).
+/// The tooltip's `Needs attention: <reason>` line, sanitized and capped by the `attention`
+/// field's rules, then display-truncated; `None` when no reason is recorded.
 fn attention_line(input: &SessionChromeInput) -> Option<String> {
     let reason = input
         .attention
@@ -893,8 +831,7 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
         entries.push(TabMenuEntry::Separator);
         entries.extend(timeline);
     }
-    // The live agent upgrade's words (gap #21), right under the identity the
-    // headers above describe: the owner steers THIS tab's upgrade here.
+    // The live agent upgrade's words, right under the identity they steer.
     if let Some(upgrade) = input.upgrade.as_ref().filter(|u| !u.words.is_empty()) {
         entries.push(TabMenuEntry::Separator);
         entries.push(TabMenuEntry::Header("AGENT UPGRADE".to_string()));
@@ -977,10 +914,8 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
         }
     }
     entries.push(TabMenuEntry::Separator);
-    // FIRST because it is the identity action the headers above are about; the
-    // clipboard pair and the close follow. Gated on `has_session` like the id
-    // copy: the pin is SESSION metadata, so a tab with no session has nothing
-    // to rename (and the write path would no-op silently).
+    // Rename first: it acts on the identity the headers describe. It needs a session, since
+    // the pin is session metadata.
     entries.push(action(
         "Rename Session…",
         MenuAction::RenameSession,
@@ -1020,11 +955,8 @@ pub(crate) fn tab_menu_chrome_line(index: usize, entries: &[TabMenuEntry], now_m
     format!("tab-menu tab={index} items={items:?}")
 }
 
-/// ONE entry's mirror token — the per-item serialization [`tab_menu_chrome_line`]
-/// lists and the in-grid overlay's `controls tab-menu` rows reuse VERBATIM, so
-/// the two introspection readings of one composed model can never spell an item
-/// differently. Headers verbatim, separators `---`, disabled rows suffixed
-/// ` (disabled)`, connection rows flat with their `@<sid>` peer argument.
+/// One entry's mirror token: the item [`tab_menu_chrome_line`] lists and the in-grid overlay's
+/// `controls tab-menu` rows reuse, so both readings spell an item the same way.
 #[must_use]
 pub(crate) fn menu_entry_mirror(entry: &TabMenuEntry) -> String {
     let disabled_suffix = |enabled: bool| if enabled { "" } else { " (disabled)" };
@@ -1047,8 +979,7 @@ pub(crate) fn menu_entry_mirror(entry: &TabMenuEntry) -> String {
             peer_sid.as_str(),
             disabled_suffix(*enabled)
         ),
-        // The build it is for rides the mirror, as a connection row's peer
-        // does: a driving AI reads which target the word would name.
+        // The build rides the mirror, as a connection row's peer does.
         TabMenuEntry::Upgrade { label, to, .. } => format!("{label} ({to})"),
     }
 }
@@ -1291,9 +1222,8 @@ mod tests {
         }));
     }
 
-    /// The tab's hover names why its mark stands: a recorded reason is one
-    /// `Needs attention: <reason>` line under the identity lines (before the
-    /// connections), and is enough on its own to earn a tooltip.
+    /// A recorded attention reason is one `Needs attention: <reason>` line after the identity
+    /// lines, and earns a tooltip on its own.
     #[test]
     fn the_tooltip_names_why_a_tab_needs_a_look() {
         let stalled = SessionChromeInput {
@@ -1319,9 +1249,7 @@ mod tests {
         );
     }
 
-    /// The reason is capped and stripped of controls like every other line:
-    /// the stored `attention` is at most 256 bytes and the hover shows at most
-    /// the description cap of grapheme clusters, ellipsised.
+    /// The reason is sanitized and display-capped like every other line.
     #[test]
     fn the_reason_is_capped_and_sanitized() {
         let input = SessionChromeInput {
@@ -1345,8 +1273,7 @@ mod tests {
         );
     }
 
-    /// A session with NOTHING beyond its label composes NO tooltip — exactly
-    /// today's terminal-tab behavior (no tooltip that just repeats the chip).
+    /// A session with nothing beyond its label composes no tooltip.
     #[test]
     fn empty_metadata_degrades_to_no_tooltip() {
         let input = SessionChromeInput {
@@ -1354,8 +1281,7 @@ mod tests {
             ..SessionChromeInput::default()
         };
         assert_eq!(compose_tooltip(&input), None);
-        // `-` (the registry's unregistered marker) and empty strings count as
-        // absent, not as content worth a tooltip.
+        // `-` (the registry's unregistered marker) and empty strings count as absent.
         let dashed = SessionChromeInput {
             label: "zsh".to_string(),
             state: Some("-".to_string()),
@@ -1366,16 +1292,11 @@ mod tests {
         assert_eq!(compose_tooltip(&dashed), None);
     }
 
-    /// REGRESSION (grapheme-cluster truncation): a multi-codepoint cluster
-    /// straddling the cap must survive WHOLE or be dropped WHOLE — never split
-    /// mid-sequence. The old `chars().take(cap)` cut a ZWJ family emoji at
-    /// char 160, leaving a lone partial glyph (`👨…`) in the tooltip and menu
-    /// header; same for a combining accent, which lost its diacritic.
+    /// A multi-codepoint cluster straddling the cap is kept or dropped whole, never split.
     #[test]
     fn description_truncation_never_splits_a_grapheme_cluster() {
-        // 159 ASCII chars, then a ZWJ family emoji (5 chars, ONE cluster):
-        // 164 chars total but exactly 160 user-perceived characters — at the
-        // cap, so it must render WHOLE with no ellipsis.
+        // 159 ASCII chars, then a ZWJ family emoji (5 chars, one cluster): exactly 160
+        // clusters, so it renders whole with no ellipsis.
         let family = "👨\u{200D}👩\u{200D}👧";
         let mut input = full_input();
         input.description = Some(format!("{}{family}", "x".repeat(159)));
@@ -1392,8 +1313,7 @@ mod tests {
         );
         assert!(!line.ends_with('…'), "exactly at the cap ⇒ no ellipsis");
 
-        // One cluster PAST the cap: the whole trailing emoji is dropped (never
-        // a partial `👨` fragment) and the ellipsis follows a clean boundary.
+        // One cluster past the cap: the whole emoji is dropped before the ellipsis.
         input.description = Some(format!("{}{family}", "x".repeat(160)));
         let tip = compose_tooltip(&input).unwrap();
         let line = tip
@@ -1408,9 +1328,7 @@ mod tests {
             "over-cap cluster is dropped whole, cut lands on a cluster boundary"
         );
 
-        // A combining sequence (e + U+0301) straddling the cap: base and
-        // accent travel together — the old cut kept the bare `e` and dropped
-        // only the accent.
+        // A combining sequence (e + U+0301) straddling the cap stays together.
         input.description = Some(format!("{}e\u{301}zz", "x".repeat(159)));
         let tip = compose_tooltip(&input).unwrap();
         let line = tip
@@ -1426,8 +1344,7 @@ mod tests {
         assert!(line.ends_with('…'), "the trailing `zz` is truncated away");
     }
 
-    /// The timeline tail is capped to [`TIMELINE_TAIL`] defensively even when
-    /// the caller hands more — and it is the menu's: the tooltip carries none.
+    /// The menu's timeline tail is capped to [`TIMELINE_TAIL`]; the tooltip carries none.
     #[test]
     fn timeline_tail_is_capped() {
         let mut input = full_input();
@@ -1451,11 +1368,8 @@ mod tests {
         assert_eq!(headers, TIMELINE_TAIL);
     }
 
-    /// An agent's verdict moves, a person's own typing, the bus's own traffic
-    /// and a render verdict are no rows: without their payload they say
-    /// nothing. The cut
-    /// runs BEFORE the cap ([`timeline_tail`]), so a burst of them never
-    /// hides the older rows that say something.
+    /// Kinds that say nothing without their payload are no rows, and the cut runs before the
+    /// cap, so a burst of them never hides older rows.
     #[test]
     fn timeline_tail_leaves_out_agent_moves_and_typing() {
         let newest_first = [
@@ -1759,11 +1673,8 @@ mod tests {
         );
     }
 
-    /// A TAB WHOSE AGENT HAS AN UPGRADE PENDING OFFERS THE OWNER'S WORDS ON IT
-    /// (gap #21): an `AGENT UPGRADE` section under the identity — what it
-    /// moves, then every word that does something, each carrying the build it
-    /// is for, which the `chrome` mirror prints. NEGATIVE CONTROLS: no
-    /// upgrade, or one no word would move, composes no section at all.
+    /// A pending agent upgrade composes an `AGENT UPGRADE` section under the identity: what it
+    /// moves, then every word that does something, each carrying its build. No word, no section.
     #[test]
     fn a_pending_upgrade_offers_the_owners_words_for_its_build() {
         use aterm_messages::UpgradeWord::{NotToday, Now, Skip};

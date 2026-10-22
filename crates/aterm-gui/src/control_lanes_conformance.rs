@@ -369,10 +369,10 @@ fn count(n: usize) -> i64 {
     i64::try_from(n).expect("small counts fit i64")
 }
 
-/// Project the genuine lanes onto the model at a QUIESCENT point (no resume in
-/// the queue, no request between lanes). `held` is request-lane work no
-/// request in flight explains: an idle connection kept on its lane. A request
-/// lane serving a wait (the lanes' `inline` count) is `inline`, not `working`.
+/// Project the shipping lanes onto the model at a quiescent point (no resume in the
+/// queue, no request between lanes). `held` is request-lane work no request in flight
+/// explains: an idle connection kept on its lane. A request lane serving a wait (the
+/// lanes' `inline` count) is `inline`, not `working`.
 fn project(census: Census, flight: (usize, usize), facts: Facts) -> State {
     assert_eq!(
         census.waits, flight.1,
@@ -446,10 +446,9 @@ fn shipping_lanes_conform_to_the_lane_tenure_model() {
     let model = control_lane_tenure_model();
     let rig = Rig::new(model_limits());
     let mut facts = Facts::default();
-    // A QUIESCENT point: besides the shape named, every lane's work is a
-    // request in flight — no lane is still between its last reply and placing
-    // its connection. (An idle connection kept on a lane never gets there, and
-    // the settle names it.)
+    // A quiescent point: besides the shape named, every lane's work is a request in
+    // flight, no lane between its last reply and placing its connection. (An idle
+    // connection kept on a lane never gets there, and the settle names it.)
     let observe =
         |rig: &Rig, facts: Facts, what: &str, want: &dyn Fn(Census, (usize, usize)) -> bool| {
             let census = rig.settle(what, |c, f| want(c, f) && c.rpc == f.0 && c.waits == f.1);
@@ -692,9 +691,9 @@ fn the_old_lane_held_design_is_rejected_by_the_model() {
     assert!(!model.check_invariant("NoRefusalByIdleDriver", &refused));
 }
 
-/// Twelve idle persistent drivers against two request lanes: a fresh client
-/// is still admitted and served at once. The same drivers against the lanes
-/// without a parker (the old design) refuse the third.
+/// Twelve idle persistent drivers against two request lanes: a fresh client is still
+/// admitted and served at once. The same drivers against lanes without a parker refuse
+/// the third.
 #[test]
 fn idle_drivers_do_not_starve_a_fresh_client() {
     let rig = Rig::new(LaneLimits {
@@ -704,8 +703,8 @@ fn idle_drivers_do_not_starve_a_fresh_client() {
         open: 64,
         subscriptions: 1,
     });
-    // Each is served, and parked before the next dials: a lane is busy until
-    // its request is answered AND its connection is placed.
+    // Each is served and parked before the next dials: a lane is busy until its request
+    // is answered and its connection placed.
     let drivers: Vec<Client> = (0..12)
         .map(|index| {
             let driver = rig
@@ -748,9 +747,9 @@ fn idle_drivers_do_not_starve_a_fresh_client() {
     );
 }
 
-/// Drivers parked in waits move off the request lanes; with no wait lanes and
-/// no bound on the waits a request lane serves (the old design) the same waits
-/// take the request lanes and refuse a fresh client.
+/// Drivers parked in waits move off the request lanes; with no wait lanes and no bound on
+/// the waits a request lane serves, the same waits take the request lanes and refuse a
+/// fresh client.
 #[test]
 fn waiting_drivers_do_not_starve_a_fresh_client() {
     let rig = Rig::new(LaneLimits {

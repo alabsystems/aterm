@@ -317,9 +317,8 @@ impl CursorGlow {
         }
     }
 
-    /// The per-move light: exactly one of the style arms (fire meteor, rainbow
-    /// kitty jump, the navigation no-wake arm, the rainbow kitty backspace
-    /// poof, or the swept comet/ribbon path). Returns how many hue steps this
+    /// The per-move light: exactly one arm (the fire meteor, the navigation
+    /// no-wake arm, or the swept comet path). Returns how many hue steps this
     /// move advances (a coalesced typing run counts its laid cells; other moves
     /// one).
     #[allow(

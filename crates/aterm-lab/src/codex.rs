@@ -22,9 +22,11 @@
 //! outside the lab's process tree and the Desktop app are refused
 //! ([`safe_args`]); the sign-in screens offer a browser sign-in, so the harness
 //! is off for those two logins, and the jail denies the desktop's open doors
-//! (a bare-name `open` or `BROWSER` lands on the recorder). `--no-daemon` keeps
-//! Codex's app server inside the process the tab (or `codex-run`) started, in
-//! the tree the witness watches and `down` ends.
+//! (a bare-name `open` or `BROWSER` lands on the recorder). For codex-alab,
+//! `--no-daemon` keeps Codex's app server inside the process the tab (or
+//! `codex-run`) started, in the tree the witness watches and `down` ends; a
+//! vendor `codex` has no such flag and is launched without it
+//! ([`takes_no_daemon`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -281,12 +283,25 @@ pub fn safe_args(tab: bool, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the Codex at `bin` takes `--no-daemon`, by what it is: codex-alab
+/// does — its package root, the one whose manifest names `bin`, carries
+/// ALab's build mark (`aterm_agent::harness::codex_alab::alab_bytes`, the
+/// host's own reader: files only, never a run) — and its default starts the
+/// app server as a background daemon that leaves the tree and outlives it,
+/// from a copy of the package it installs into `CODEX_HOME`. A vendor
+/// `codex` has no such flag: 0.151.0 refuses it (`unexpected argument
+/// '--no-daemon'`).
+#[must_use]
+pub fn takes_no_daemon(bin: &str) -> bool {
+    aterm_agent::harness::codex_alab::alab_bytes(Path::new(bin))
+}
+
 /// The launcher: the line the tab types (`clear`, then `exec`), or
 /// `codex-run`'s (`exec`). Both exec, so the process the lab or the tab
-/// started IS Codex, and both put `--no-daemon` first: the app server runs
-/// inside that process, in the tree the witness watches and `down` ends by
-/// pid (Codex's default starts a background daemon that leaves the tree and
-/// outlives it, from a copy of the package it installs into `CODEX_HOME`).
+/// started IS Codex, and both put `--no-daemon` first where the binary takes
+/// it ([`takes_no_daemon`], read at each launch from the binary `up` took):
+/// codex-alab's app server then runs inside that process, in the tree the
+/// witness watches and `down` ends by pid.
 #[must_use]
 pub fn launcher(run: &Run, tab: bool, mode: &str, envs: &[String], args: &[String]) -> String {
     let w = run.w.to_string_lossy();
@@ -323,7 +338,10 @@ pub fn launcher(run: &Run, tab: bool, mode: &str, envs: &[String], args: &[Strin
     for kv in envs {
         s.push_str(&format!("  {} \\\n", shell_quote(kv)));
     }
-    s.push_str(&format!("  {} --no-daemon", shell_quote(&run.codex_bin)));
+    s.push_str(&format!("  {}", shell_quote(&run.codex_bin)));
+    if takes_no_daemon(&run.codex_bin) {
+        s.push_str(" --no-daemon");
+    }
     for a in args {
         s.push(' ');
         s.push_str(&shell_quote(a));
@@ -799,31 +817,79 @@ mod tests {
         assert!(ratelimit_headers(&["1".into(), "2".into(), "bogus=1".into()]).is_err());
     }
 
+    /// A Codex package at `root` (layout 1, `bin/codex` its entrypoint),
+    /// ALab's when `alab` (its `alab-build.json` beside the manifest): the
+    /// binary's path.
+    fn package_at(root: &Path, alab: bool) -> String {
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/codex"), "").unwrap();
+        fs::write(
+            root.join(aterm_agent::harness::codex_alab::PACKAGE_JSON),
+            r#"{"layoutVersion":1,"version":"0.164.0-dev.1+gabc","entrypoint":"bin/codex"}"#,
+        )
+        .unwrap();
+        let mark = root.join(aterm_agent::harness::codex_alab::ALAB_BUILD_JSON);
+        if alab {
+            fs::write(&mark, "{}").unwrap();
+        } else {
+            let _ = fs::remove_file(&mark);
+        }
+        root.join("bin/codex").to_string_lossy().into_owned()
+    }
+
+    /// THE LAUNCHER EXECS CODEX BY PATH, `--no-daemon` ONLY WHERE IT IS
+    /// TAKEN: codex-alab's package (its ALab build mark beside the manifest)
+    /// is launched with `--no-daemon` before the caller's arguments, in the
+    /// tab and in `codex-run`; vendor `codex`'s — the same package without
+    /// the mark, as 0.151.0's cask lays it — and a path in no package are
+    /// launched without it, the arguments straight after the binary.
+    /// NEGATIVE CONTROL: the mark written back into the vendor's package
+    /// brings `--no-daemon` back, so the mark alone decides.
     #[test]
-    fn the_launcher_execs_codex_by_path_with_no_daemon() {
-        let run = Run {
+    fn the_launcher_execs_codex_by_path_with_no_daemon_only_for_codex_alab() {
+        let scratch = aterm_tempfile::tempdir().expect("exclusive package fixture");
+        let alab = package_at(&scratch.path().join("alab b"), true);
+        let vendor = package_at(&scratch.path().join("vendor"), false);
+        let run = |codex_bin: &str| Run {
             tag: "t".into(),
             run: "/s/runs/t".into(),
             w: "/s/runs/t/scratch".into(),
             port: "5".into(),
             proxy: "http://127.0.0.1:6".into(),
-            codex_bin: "/a b/codex".into(),
+            codex_bin: codex_bin.into(),
             ..Run::default()
         };
-        let s = launcher(
-            &run,
-            true,
-            "lab",
-            &["K=v 1".into()],
-            &["-C".into(), "/x y".into()],
-        );
+        let args = ["-C".to_string(), "/x y".to_string()];
+        let s = launcher(&run(&alab), true, "lab", &["K=v 1".into()], &args);
         assert!(s.starts_with("#!/bin/sh\nclear\nexec env -u OPENAI_API_KEY -u CODEX_API_KEY -u OPENAI_BASE_URL PATH=\"/s/runs/t/shim:$PATH\""), "{s}");
         assert!(
             s.contains("  LAB_CODEX_KEY=lab-not-a-key \\\n  'K=v 1' \\\n"),
             "{s}"
         );
-        assert!(s.ends_with("  '/a b/codex' --no-daemon -C '/x y'\n"), "{s}");
-        let r = launcher(&run, false, "chatgpt", &[], &[]);
+        let quoted = shell_quote(&alab);
+        assert!(
+            s.ends_with(&format!("  {quoted} --no-daemon -C '/x y'\n")),
+            "codex-alab takes --no-daemon: {s}"
+        );
+        let r = launcher(&run(&alab), false, "chatgpt", &[], &[]);
         assert!(!r.contains("clear") && !r.contains("LAB_CODEX_KEY="), "{r}");
+        assert!(r.ends_with(" --no-daemon\n"), "codex-run's too: {r}");
+        for bin in [vendor.as_str(), "/a b/codex"] {
+            for (tab, mode) in [(true, "lab"), (false, "chatgpt")] {
+                let v = launcher(&run(bin), tab, mode, &[], &args);
+                assert!(
+                    v.ends_with(&format!("  {} -C '/x y'\n", shell_quote(bin)))
+                        && !v.contains("--no-daemon"),
+                    "{bin} has no --no-daemon: {v}"
+                );
+            }
+        }
+        // CONTROL: the mark alone decides.
+        let marked = package_at(&scratch.path().join("vendor"), true);
+        assert_eq!(marked, vendor);
+        assert!(
+            launcher(&run(&marked), true, "lab", &[], &args).ends_with(" --no-daemon -C '/x y'\n"),
+            "CONTROL: the mark brings --no-daemon back"
+        );
     }
 }

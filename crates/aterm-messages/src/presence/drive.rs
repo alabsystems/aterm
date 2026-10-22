@@ -40,7 +40,7 @@ const PILL_LABEL_CELLS: usize = 32;
 #[derive(Debug)]
 pub struct Table<V: Host> {
     slots: HashMap<u64, Slot<V>>,
-    /// When each session's `ttl=` supervisor claim lapses — the timer wakes
+    /// When each session's `ttl=` supervisor claim lapses: the timer wakes
     /// there, because a supervisor that dies writes nothing and its box must
     /// still reach the human.
     supervisor_until: HashMap<u64, Instant>,
@@ -157,9 +157,9 @@ pub struct Pressing {
     pub more: usize,
 }
 
-/// What the presence driver asks of its host. Implemented on the host's own
-/// state (the macOS App): every method is a read of it or one effect on it,
-/// and none decides anything the driver decides.
+/// What the presence driver asks of its host (the macOS App): every method is
+/// a read of its state or one effect on it, and none decides anything the
+/// driver decides.
 pub trait Desk {
     /// The host's presence seam.
     type V: Host;

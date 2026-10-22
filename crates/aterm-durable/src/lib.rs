@@ -62,12 +62,27 @@
 //! debug, `opt-test` and release alike, so a debug instance (`lab instance`) or the
 //! `opt-test` perf lane measures the flush that ships. That costs a test run little:
 //! measured on the crash journal's conformance test, the heaviest user, 3.8-7.5 s
-//! against 2.2-4.2 s with a plain `fsync(2)` in its place (load 27-47). What a crate's
-//! own unit tests may swap is the DURABLE flush (`seam::durable_fsync`, Unix only),
-//! whose `F_FULLFSYNC` costs a step of about 4.2 ms and, while it runs, holds up
-//! most flushes, growing writes, creates and renames made beside it: a probe saw
-//! every barrier it caught and 72-99% of the rest wait, from threads of one process
-//! on files in one directory tree (`docs/measured/flush-wait-2026-10-21.md`).
+//! against 2.2-4.2 s with a plain `fsync(2)` in its place (load 27-47).
+//!
+//! THE DURABLE FLUSH IS A PLAIN `fsync(2)` IN A TEST OR DEBUG BUILD ON APPLE TARGETS
+//! ([`durable`] and [`durable_data`], still recorded as [`Flush::Durable`]). It is a real
+//! flush, made at the same point and in the same order, so a test sees the same files,
+//! renames and errors; what it drops is the drive-cache barrier, which no test can
+//! observe (it orders the disk only against a power loss) and whose `F_FULLFSYNC` costs
+//! a step of about 4.2 ms and, while it runs, holds up most flushes, growing writes,
+//! creates and renames made beside it: a probe saw every barrier it caught and 72-99% of
+//! the rest wait, from threads of one process on files in one directory tree
+//! (`docs/measured/flush-wait-2026-10-21.md`). Every test binary of the workspace, the
+//! instances and children it starts, and every crate it reaches take this arm, so no
+//! crate keeps one of its own. Before it was here, six crates' own unit tests did:
+//! `aterm-gui --lib` made 4,763 full flushes (its crash journal's conformance test
+//! 13.6-17.0 s, 3.7 s with `fsync(2)`, and a no-op flush gained nothing more),
+//! `atpkg --lib` 7,381 (28.5-29.8 s instead of 44.5-63.6 s alone), `aterm-update --lib`
+//! 4,492 (7.0-7.3 s instead of 18.0-20.0 s), `aterm-agent --lib` 2,561. What those arms
+//! did not reach, measured on 2026-10-22 alternating two pairs each with this arm in
+//! the primitives: `fabric_world` 18.4-18.8 -> 14.8-15.5 s, `atpkg --lib` 8.1-8.3 ->
+//! 6.2-6.3 s, `aterm-agent --lib` 21.1-21.3 -> 19.2-19.8 s. Every release build (every
+//! shipped one) and every other target issues the full flush.
 
 use std::fs::File;
 use std::io;
@@ -236,7 +251,7 @@ impl Flush {
 pub fn durable(file: &File) -> io::Result<()> {
     #[cfg(any(test, debug_assertions, feature = "test-support"))]
     seam::note(Flush::Durable);
-    primitive::full(file)
+    full_or_fsync(file, primitive::full)
 }
 
 /// [`durable`] for `file`'s data and the metadata a read of it needs (its size), not
@@ -249,7 +264,23 @@ pub fn durable(file: &File) -> io::Result<()> {
 pub fn durable_data(file: &File) -> io::Result<()> {
     #[cfg(any(test, debug_assertions, feature = "test-support"))]
     seam::note(Flush::Durable);
-    primitive::full_data(file)
+    full_or_fsync(file, primitive::full_data)
+}
+
+/// The durable flush `full` ([`primitive::full`] or [`primitive::full_data`]): in every
+/// release build, and off Apple targets in every build.
+#[cfg(not(all(any(test, debug_assertions), target_vendor = "apple")))]
+#[inline]
+fn full_or_fsync(file: &File, full: fn(&File) -> io::Result<()>) -> io::Result<()> {
+    full(file)
+}
+
+/// [`full_or_fsync`] in a test or debug build on Apple targets: a plain `fsync(2)`
+/// ([`primitive::fsync`]) in place of `F_FULLFSYNC` (the [crate docs](crate) say why).
+#[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
+#[inline]
+fn full_or_fsync(file: &File, _full: fn(&File) -> io::Result<()>) -> io::Result<()> {
+    primitive::fsync(file)
 }
 
 /// ORDER everything written to `file`, and everything else this process or another
@@ -411,9 +442,9 @@ pub mod primitive {
 
     /// A plain `fsync(2)`, retried on `EINTR` as std retries its `F_FULLFSYNC`: the
     /// data handed to the drive, which by its own man page promises neither
-    /// durability nor order against a power loss. A crate's own unit tests take it in
-    /// place of the full flush ([`seam::durable_fsync`](crate::seam::durable_fsync));
-    /// nothing takes it in place of the barrier (see the [crate docs](crate)).
+    /// durability nor order against a power loss. A test or debug build on Apple targets
+    /// takes it in place of the full flush ([`durable`](crate::durable)); nothing takes it
+    /// in place of the barrier (see the [crate docs](crate)).
     ///
     /// # Errors
     /// The flush's own error.
@@ -446,10 +477,6 @@ pub mod primitive {
 pub mod seam {
     use super::Flush;
     use std::cell::RefCell;
-    #[cfg(unix)]
-    use std::fs::File;
-    #[cfg(unix)]
-    use std::io;
 
     thread_local! {
         static LOG: RefCell<Option<Vec<Flush>>> = const { RefCell::new(None) };
@@ -501,20 +528,6 @@ pub mod seam {
                 flushes.push(flush);
             }
         });
-    }
-
-    /// [`durable`](super::durable) as a crate's own unit tests take it on Apple
-    /// targets: recorded as [`Flush::Durable`], then a plain `fsync(2)` instead of
-    /// `F_FULLFSYNC`. The crates whose `durable` modules keep that test arm (each
-    /// measured what the drive-cache flush cost its suite and its neighbours) call
-    /// this, so the seam sees their durable sites too.
-    ///
-    /// # Errors
-    /// The flush's own error.
-    #[cfg(unix)]
-    pub fn durable_fsync(file: &File) -> io::Result<()> {
-        note(Flush::Durable);
-        super::primitive::fsync(file)
     }
 }
 

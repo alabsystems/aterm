@@ -497,6 +497,12 @@ const OPTIONS: &[OptSpec] = &[
         help: "vtebench's per-benchmark sampling time (default 10)",
     },
     OptSpec {
+        flag: "--scenario",
+        value: Some("all|messaging|pingpong|attach|handoff"),
+        lanes: &[Lane::Fabric],
+        help: "measure only this fabric scenario (default all)",
+    },
+    OptSpec {
         flag: "--latency-samples",
         value: Some("N"),
         lanes: &[Lane::Fabric],
@@ -553,6 +559,12 @@ const OPTIONS: &[OptSpec] = &[
         lanes: &[Lane::Fabric],
         help: "the retaining broker's retention tick interval (default astream's minute, what \
                ships)",
+    },
+    OptSpec {
+        flag: "--bystanders",
+        value: Some("N"),
+        lanes: &[Lane::Fabric],
+        help: "idle sessions spawned beside the messaging and ping-pong worlds' two (default 0)",
     },
     OptSpec {
         flag: "--horizon-ms",
@@ -1096,11 +1108,12 @@ mod tests {
     #[test]
     fn every_lane_family_parses_only_its_own_options_before_anything_runs() {
         let cli = parse(&args(
-            "fabric --latency-samples 7 --burst 200 --pingpong-rounds 30 --attach-sessions 1,4 \
+            "fabric --scenario pingpong --latency-samples 7 --burst 200 --pingpong-rounds 30 --attach-sessions 1,4 \
              --attach-rounds 2 --durability relaxed --json-out /tmp/f.json --no-windows",
         ))
         .expect("parses");
         let (_, fabric_args) = lane_args(&cli).expect("both parsers take it");
+        assert_eq!(fabric_args.scenario.word(), "pingpong");
         assert_eq!(fabric_args.burst, Some(200));
         assert_eq!(fabric_args.pingpong, Some(30));
         assert_eq!(fabric_args.json_out, Some(PathBuf::from("/tmp/f.json")));
@@ -1124,6 +1137,7 @@ mod tests {
             "fabric --pingpong-rounds 0",
             "fabric --attach-sessions 1,200",
             "fabric --profile release",
+            "fabric --scenario unknown",
         ] {
             let cli = parse(&args(line)).expect(line);
             assert!(lane_args(&cli).is_err(), "{line}");

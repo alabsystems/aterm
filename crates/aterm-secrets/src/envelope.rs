@@ -617,7 +617,8 @@ pub(crate) fn sign_unchecked(unsigned: &Unsigned, seed: &[u8; 32]) -> crate::Res
     }
     if text.len() + SIGNATURE_LINE > MAX_ENVELOPE {
         return Err(Error::new(format!(
-            "envelope: larger than {MAX_ENVELOPE} bytes"
+            "the vault is too large to publish: sealed, it comes to {} bytes, past the {MAX_ENVELOPE} a version holds; every entry is sealed twice (for the admins and for its audience), so about 5.9 MiB of entries fit",
+            text.len() + SIGNATURE_LINE
         )));
     }
     let signature = pair.sign(text.as_bytes());
@@ -676,27 +677,27 @@ fn verify_endorsement(
         .verify(handoff_message(name, signer).as_bytes(), endorsement)
 }
 
-/// The first link of `handoff`, from index `from` on, whose endorsement does not verify:
-/// link `k`'s key must have signed link `k + 1`'s key, and the last link's key `signer`.
-fn broken_link(
-    handoff: &[([u8; 32], [u8; 64])],
-    from: usize,
-    name: &str,
-    signer: &[u8; 32],
-) -> Option<usize> {
-    (from..handoff.len()).find(|&index| {
-        let (previous, endorsement) = &handoff[index];
-        let next = handoff.get(index + 1).map_or(signer, |(key, _)| key);
-        verify_endorsement(previous, endorsement, name, next).is_err()
-    })
+/// Whether link `index` of `handoff` verifies: link `k`'s key must have signed link
+/// `k + 1`'s key, and the last link's key `signer`.
+fn link_holds(handoff: &[Link], index: usize, name: &str, signer: &[u8; 32]) -> bool {
+    let (previous, endorsement) = &handoff[index];
+    let next = handoff.get(index + 1).map_or(signer, |(key, _)| key);
+    verify_endorsement(previous, endorsement, name, next).is_ok()
 }
 
-/// A short fingerprint of a signing key for people to compare: the first 8 bytes of its
-/// SHA-256 as `xxxx-xxxx-xxxx-xxxx` lowercase hex.
+/// The first link of `handoff`, from index `from` on, whose endorsement does not verify.
+fn broken_link(handoff: &[Link], from: usize, name: &str, signer: &[u8; 32]) -> Option<usize> {
+    (from..handoff.len()).find(|&index| !link_holds(handoff, index, name, signer))
+}
+
+/// A short fingerprint of a signing key for people to compare: the first 10 bytes of its
+/// SHA-256 as `xxxx-xxxx-xxxx-xxxx-xxxx` lowercase hex. A key confirmed by it is pinned, so
+/// it carries the 80 bits a machine's join code does against a key minted to match. An
+/// older build shows the first four groups.
 pub fn fingerprint(public: &[u8; 32]) -> String {
     let digest = aterm_digest::Sha256::digest(public);
-    let mut out = String::with_capacity(19);
-    for (index, pair) in digest[..8].chunks(2).enumerate() {
+    let mut out = String::with_capacity(24);
+    for (index, pair) in digest[..10].chunks(2).enumerate() {
         if index > 0 {
             out.push('-');
         }
@@ -822,6 +823,18 @@ impl Envelope {
             .is_some_and(|start| {
                 broken_link(&self.handoff, start, &self.name, &self.signer).is_some()
             })
+    }
+
+    /// The keys of this version's chain its signer was reached from, oldest first: each one
+    /// from whose link on every endorsement verifies. A key before a link that does not is
+    /// not among them, though the chain names it (before a reader's pin, nothing judged it).
+    #[cfg(unix)]
+    pub(crate) fn reached_from(&self) -> Vec<[u8; 32]> {
+        let start = (0..self.handoff.len())
+            .rev()
+            .find(|&index| !link_holds(&self.handoff, index, &self.name, &self.signer))
+            .map_or(0, |broken| broken + 1);
+        self.handoff[start..].iter().map(|(key, _)| *key).collect()
     }
 
     /// Where `key` hands off in this version's chain: the index of its link, or the chain's
@@ -1759,11 +1772,11 @@ mod tests {
     }
 
     #[test]
-    fn a_fingerprint_is_four_groups_of_hex() {
+    fn a_fingerprint_is_five_groups_of_hex() {
         let print = fingerprint(&public(&OLD));
-        assert_eq!(print.len(), 19);
+        assert_eq!(print.len(), 24);
         let groups: Vec<&str> = print.split('-').collect();
-        assert_eq!(groups.len(), 4);
+        assert_eq!(groups.len(), 5);
         assert!(groups.iter().all(|g| {
             g.len() == 4
                 && g.bytes()
@@ -1771,6 +1784,7 @@ mod tests {
         }));
         let digest = aterm_digest::Sha256::digest(public(&OLD));
         assert_eq!(&print[..4], format!("{:02x}{:02x}", digest[0], digest[1]));
+        assert_eq!(&print[20..], format!("{:02x}{:02x}", digest[8], digest[9]));
         assert_ne!(print, fingerprint(&public(&NEW)));
     }
 

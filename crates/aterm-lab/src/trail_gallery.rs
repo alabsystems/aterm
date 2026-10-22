@@ -42,6 +42,7 @@
 //! | `steam` | the burst under two text rows, then 12 Backspaces about 50 ms apart | `t0` `bs03` `bs06` `bs09` `bs12` `t120` `t470` |
 //! | `enter-bottom` | the burst on the last row of a full screen, then Enter (the screen scrolls) | `typed` `enter` `e120` `e470` |
 //! | `idle10` | the burst, then 10 s with no input | `mid` `t0` `idle1` `idle2` `idle5` `idle10` |
+//! | `redraw-stall` | a native Rust echo fixture types the burst, clears a suffix inside DEC-2026 for 500 ms, then restores exactly the same text without another key | `typed` `stalled` `restored` |
 //! | `cjk` | `echo 你好世界` (double-width input) | `mid` `t0` `t120` `t470` |
 //! | `bidi` | `echo שלום עולם` (right-to-left input) | `mid` `t0` `t120` `t470` |
 //! | `settings` | Settings ▸ Cursor & Motion, then ▸ Cursor Kitty, each with its live preview, at 110×40 cells of 16 px | `motion-0300` … `motion-2100`, `kitty-0300` `kitty-1200`, plus each page's `controls prefs` |
@@ -131,7 +132,7 @@ dirs, a private control socket, a lifeline; ended by its process group, never by
   --aterm PATH  the aterm to run (default: the lab's pick, `targo --unverified lab paths`); a release build keeps the
                 60 ms cadence (`targo --unverified build --release -p aterm`, then --aterm target/release/aterm)
   --theme       dark (the default theme), light (\"GitHub Light\") or both (the default)
-  --scenario    typing (default), context, steam, enter-bottom, idle10, cjk, bidi, settings, or all; repeatable
+  --scenario    typing (default), context, steam, enter-bottom, idle10, redraw-stall, cjk, bidi, settings, or all; repeatable
   --extra       a top-level aterm.toml line for every instance, replacing the base line of its key (the base lines:
                 the style, motion = \"full\", trail_sounds = false, and on light the theme)
   --columns --lines --font-px   the grid (default 72x14 cells of 22 px; settings 110x40 of 16 px)
@@ -185,6 +186,7 @@ pub enum Scenario {
     Steam,
     EnterBottom,
     Idle10,
+    RedrawStall,
     Cjk,
     Bidi,
     Settings,
@@ -192,12 +194,13 @@ pub enum Scenario {
 
 impl Scenario {
     /// Every scenario, in the order `all` runs them.
-    pub const ALL: [Scenario; 8] = [
+    pub const ALL: [Scenario; 9] = [
         Scenario::Typing,
         Scenario::Context,
         Scenario::Steam,
         Scenario::EnterBottom,
         Scenario::Idle10,
+        Scenario::RedrawStall,
         Scenario::Cjk,
         Scenario::Bidi,
         Scenario::Settings,
@@ -211,6 +214,7 @@ impl Scenario {
             Scenario::Steam => "steam",
             Scenario::EnterBottom => "enter-bottom",
             Scenario::Idle10 => "idle10",
+            Scenario::RedrawStall => "redraw-stall",
             Scenario::Cjk => "cjk",
             Scenario::Bidi => "bidi",
             Scenario::Settings => "settings",
@@ -482,6 +486,64 @@ fn keys_of(word: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// The gallery's PTY child: a deliberately stalled synchronized redraw. It
+/// runs as this same Rust tool, and touches only its inherited terminal.
+pub fn cmd_redraw_fixture(args: &[String]) -> Res {
+    use std::io::Read as _;
+
+    if !args.is_empty() {
+        return Err(Fail::usage("the redraw fixture takes no arguments"));
+    }
+    let _raw = crate::sys::RawMode::enter(0)
+        .ok_or_else(|| Fail::usage("the redraw fixture needs its private PTY"))?;
+    let mut input = std::io::stdin().lock();
+    let mut output = std::io::stdout().lock();
+    let io_error = |e| Fail::usage(format!("redraw fixture: {e}"));
+    output
+        .write_all(b"\x1b[2J\x1b[8;1Hredraw ready\x1b[5;1H> ")
+        .map_err(io_error)?;
+    output.flush().map_err(io_error)?;
+    let mut text = String::new();
+    let mut redraw_open = false;
+    let mut restored = false;
+    let mut key = [0u8; 1];
+    while input.read_exact(&mut key).is_ok() {
+        let redraw = key[0] == 7 && !restored && text == "echo the quick brown fox";
+        match key[0] {
+            3 | 4 => break,
+            7 if redraw => {}
+            0x20..=0x7e if text.len() < 80 => text.push(char::from(key[0])),
+            _ => continue,
+        }
+        if !redraw {
+            write!(
+                output,
+                "\x1b[?2026h\x1b[?25l\x1b[5;1H\x1b[2K> {text}\x1b[5;{}H\x1b[?25h\x1b[?2026l",
+                text.len() + 3
+            )
+            .map_err(io_error)?;
+            output.flush().map_err(io_error)?;
+        }
+        if redraw && !redraw_open {
+            output
+                .write_all(b"\x1b[?2026h\x1b[?25l\x1b[5;9H\x1b[K")
+                .map_err(io_error)?;
+            output.flush().map_err(io_error)?;
+            redraw_open = true;
+        } else if redraw {
+            write!(
+                output,
+                "\x1b[5;1H> {text}\x1b[8;1Hredraw restored\x1b[5;{}H\x1b[?25h\x1b[?2026l",
+                text.len() + 3
+            )
+            .map_err(io_error)?;
+            output.flush().map_err(io_error)?;
+            restored = true;
+        }
+    }
+    Ok(0)
 }
 
 /// `p` relative to `base` when it is not absolute (git's own files).
@@ -901,6 +963,23 @@ impl Shot<'_> {
                     self.snap(&format!("idle{s}"));
                 }
             }
+            Scenario::RedrawStall => {
+                self.burst(None, &word)?;
+                self.snap("typed");
+                self.press("ctrl+g");
+                self.mark("redraw-start");
+                self.tick_until(500, Duration::from_millis(16))?;
+                self.snap("stalled");
+                self.press("ctrl+g");
+                let ready = self
+                    .inst
+                    .ctl(&["await", "match", "redraw restored", "timeout=60000"]);
+                if ready.code != 0 {
+                    self.note("the redraw fixture did not restore its text");
+                    self.fails += 1;
+                }
+                self.snap("restored");
+            }
             Scenario::Settings => {
                 self.settings_page("/cursor-motion", "motion", &[300, 900, 1500, 2100])?;
                 self.settings_page("/cursor-kitty", "kitty", &[300, 1200])?;
@@ -945,17 +1024,22 @@ impl Gallery {
             .into_iter()
             .filter(|(k, _)| k != "ENV")
             .collect();
-        let args = vec![
+        let mut args = vec![
             "--columns".to_string(),
             columns.to_string(),
             "--lines".to_string(),
             lines.to_string(),
             "--font-px".to_string(),
             font_px.to_string(),
-            "-e".to_string(),
-            "/bin/sh".to_string(),
-            script.to_string_lossy().into_owned(),
         ];
+        args.push("-e".to_string());
+        if scenario == Scenario::RedrawStall {
+            args.push(paths().exe.to_string_lossy().into_owned());
+            args.push("__trail-redraw-fixture".to_string());
+        } else {
+            args.push("/bin/sh".to_string());
+            args.push(script.to_string_lossy().into_owned());
+        }
         let inst = Instance::start(
             &world,
             Launch {

@@ -4,15 +4,12 @@
 //! The self-feed floor: a process-wide token bucket on control-injected input, keyed by the
 //! target session's process-local id.
 //!
-//! A raw control-socket client can `feed @.` in a loop, and nothing on the
-//! client's side stops it. So every self-targeted injection verb passes [`allow`]
-//! first — `send`/`key`/`ctrl`/`feed`/`mouse`/`paste` at the dispatch path
-//! (control.rs) and `feed-bin` in `run_feed_bin` — and a feedback storm gets
-//! `ERR rate` instead of saturating the engine. The cap is far above legitimate
-//! driving, so only a runaway loop is throttled.
-//!
-//! Its `NoOverdraft` bound: a write is admitted only with a spare token, and
-//! tokens never exceed the cap.
+//! `aterm-agent`'s `SelfGovernor` binds only drivers that link it; a raw control-socket client
+//! can `feed @.` in a loop without it. So every self-targeted injection passes [`allow`] first
+//! (`send`/`key`/`ctrl`/`feed`/`mouse`/`paste`/`turn` in control.rs's `handle`, `feed-bin` in
+//! `run_feed_bin_routed`), and a storm gets `ERR rate`. The cap is far above legitimate
+//! driving. Its `NoOverdraft` bound (a write is admitted only with a spare token; tokens never
+//! exceed the cap) is model-checked by `inject_floor_model` (`aterm-spec`).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};

@@ -25,9 +25,9 @@ use crate::{
 };
 
 /// A screen's usable placement rectangle in logical points, top-left origin, y
-/// down (the space of [`Window::outer_position`] in logical units). On macOS it
-/// excludes the menu bar and Dock ([`AppRt::window_work_area_pts`]); elsewhere it
-/// is the full monitor rectangle.
+/// down (the space of [`Window::outer_position`] in logical units). On macOS and
+/// Windows it excludes the menu bar, Dock or taskbar
+/// ([`AppRt::window_work_area_pts`]); on Linux it is the full monitor rectangle.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct WorkAreaPts {
     pub(crate) x: f64,
@@ -966,7 +966,7 @@ impl App {
     }
 
     /// The usable placement rectangle of the screen `window` occupies, in points:
-    /// the real work area where measurable (macOS), else the winit monitor
+    /// the real work area where measurable (macOS, Windows), else the winit monitor
     /// rectangle, which only makes the cascade wrap slightly later.
     fn work_area_pts(&self, window: &Window) -> Option<WorkAreaPts> {
         if let Some(area) = self.apprt.window_work_area_pts(window) {
@@ -2294,8 +2294,8 @@ impl App {
         // only per session; drop this window's entries, since `WindowId`s are
         // never reused.
         self.find_origins.retain(|(_, entry), _| *entry != wid);
-        // Release this window's retained native toolbar backing objects (no-op off
-        // macOS / when none was installed) so they don't outlive the window.
+        // Release this window's toolbar handle (the native backing objects on macOS, the
+        // in-memory tab-strip model elsewhere) so it does not outlive the window.
         self._toolbars.remove(&wid);
         // A paste-confirmation sheet on this window dies with it and AppKit posts
         // no answer, so retire the entry and its key interceptor here.
@@ -2606,10 +2606,9 @@ impl App {
         self.pool.iter().any(Self::session_busy)
     }
 
-    /// Confirm a destructive close/quit gesture for window `wid`, returning `true` to
-    /// proceed. `exits_app`: the gesture quits the whole program (Cmd-Q, app-menu
-    /// Quit, or closing the last window); `busy`: closing now would SIGHUP a
-    /// foreground job.
+    /// Confirm a destructive close/quit gesture for window `wid`; `true` proceeds.
+    /// `exits_app`: the gesture quits the program (Cmd-Q, app-menu Quit, closing the last
+    /// window); `busy`: closing now would SIGHUP a foreground job.
     ///
     /// macOS shows the native `NSAlert`: always for a whole-app quit, and for a
     /// window/tab close only while a job runs. Linux asks in the window, through
@@ -3095,7 +3094,7 @@ impl App {
         self.confirm_destructive_gesture(wid, false, true, replay)
     }
 
-    /// Whether closing window `wid` quits the app: no other mixed-tab host survives.
+    /// Whether closing window `wid` quits the app: no other window survives.
     fn exits_app_when_closing(&self, wid: WindowId) -> bool {
         !self.windows.keys().any(|w| *w != wid)
     }

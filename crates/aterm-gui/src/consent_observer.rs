@@ -1101,12 +1101,9 @@ fn live_run_stream(sink: &StreamSink, mode: ObserverMode) {
             sink.post(ObserverEvent::Unavailable(reason));
             return;
         }
-        // How long the generation lived. The monotonic clock does not advance
-        // while the Mac sleeps, but the child's `--timeout` may: a generation
-        // that spanned a sleep would then end "early" by the monotonic count
-        // and burn the hourly restart budget on what was a rotation. The
-        // larger of the two is the honest length (a wall clock stepped back
-        // only ever makes the monotonic one win).
+        // The larger of the monotonic and wall clocks: the monotonic one stops while the Mac
+        // sleeps but `--timeout` may not, so a generation that spanned a sleep would read as an
+        // early end and spend the restart budget.
         let ran_for = generation
             .elapsed()
             .max(generation_wall.elapsed().unwrap_or_default());
@@ -2222,9 +2219,6 @@ mod tests {
         }
     }
 
-    /// A line that is not a `tccd` `AUTHREQ_*` message is not evidence of
-    /// anything — it is the ordinary traffic of a busy log — so it yields `None`
-    /// and never counts against the format-drift limit.
     #[test]
     fn a_non_authreq_line_is_not_a_format_change() {
         for line in [
@@ -2936,8 +2930,6 @@ mod tests {
         assert_eq!(observer.drain(Instant::now()), 1);
     }
 
-    /// An UNAVAILABLE observer pages nobody. `unavailable` is not `false` and it
-    /// is certainly not "a dialog is up".
     #[test]
     fn an_unavailable_observer_pages_nobody() {
         let t0 = Instant::now();
@@ -2979,10 +2971,8 @@ mod tests {
         assert!(observer.verdicts(now, &[(1, 4711)], |_| None).is_empty());
     }
 
-    /// `log stream` prints two header lines on STDOUT at the start of every
-    /// generation; the first echoes the predicate and so contains
-    /// `AUTHREQ_PROMPTING`. Neither is a message: a machine that never sees a
-    /// dialog must not drift to `format-unrecognized` after a day of rotations.
+    /// The two header lines `log stream` prints per generation (the first echoes the predicate)
+    /// are not messages, so a day of quiet rotations never drifts to `format-unrecognized`.
     #[test]
     fn the_stream_header_lines_are_not_messages_and_never_count_as_drift() {
         let filtering = "Filtering the log data using \"process == \"tccd\" AND \

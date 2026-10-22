@@ -3043,11 +3043,10 @@ fn keep_unproven_candidate(prepared: &PreparedSwapCandidate, staging: &Staging, 
     ));
 }
 
-/// The swap's second precondition, checked before the park: can the running bundle
-/// become the rollback source the swap installs at the fixed path? The boot apply
-/// asks the same at step 7 and still does; asking here, while every reader is live,
-/// keeps a doomed successor (which would stay the old build and refuse its target)
-/// from ever parking the terminal. Strictly additive.
+/// The swap's second precondition, checked before the park: can the running bundle become
+/// the rollback source the swap installs at the fixed path? The boot apply asks the same at
+/// step 7; asking here, while every reader is live, keeps a doomed successor (which would
+/// stay the old build and refuse its target) from ever parking the terminal.
 fn preverify_installed_rollback_source(
     installed: Option<&Path>,
     current_build: u64,
@@ -4700,12 +4699,9 @@ fn apply_staged_if_ready_inner(
         Err(outcome) => return outcome,
     };
     // Suppress the build whose exec failed so the next check does not re-download
-    // and re-apply it every interval. We still hold `ready` here.
-    //
-    // Budgeted, not permanent: this is one failed `execve` after a successful
-    // rollback, and an exec can fail for reasons unrelated to the artifact (ENOMEM,
-    // text-file-busy, a Gatekeeper scan). The crash-loop revert below stays
-    // permanent, because there the build proved itself bad.
+    // and re-apply it every interval. Budgeted, not permanent: an exec can fail for
+    // reasons unrelated to the artifact (ENOMEM, text-file-busy, a Gatekeeper scan),
+    // where a crash-loop revert quarantines a build that proved itself bad.
     crate::manifest::FailedMark::record_stage_failure(
         &staging.failed(),
         ready.build_number,
@@ -4827,9 +4823,9 @@ fn admit_stage_under_apply_lock(
     expected: Option<&ExpectedArtifact>,
 ) -> Result<AdmittedStage, ApplyOutcome> {
     // 3–4. The pre-lock peek, the lock, the work that must hold it, and the decision
-    //    made under it: one function ([`apply_lock_then_ready`]) that the Tier-1
-    //    test `two_processes_arming_one_build_swap_it_once` drives with a sibling's
-    //    whole apply injected while this launch waits for the lock.
+    //    made under it: one function ([`apply_lock_then_ready`]), which the test
+    //    `two_processes_arming_one_build_swap_it_once` drives with a sibling's whole
+    //    apply injected while this launch waits for the lock.
     //
     // Bounded, unlike every other taker of this lock: we are before the window, so
     // waiting here is a terminal that has not appeared. Every legitimate holder
@@ -5556,10 +5552,9 @@ fn settle_trial_without_revert(
     None
 }
 
-/// The crash-loop revert's re-exec of the restored build: the launch's own
-/// argv `args`, pinned to its mode exactly as the boot swap's re-exec is
-/// ([`window_successor_args`]), and the handoff authority variables the GUI's
-/// prearm consumed.
+/// The crash-loop revert's re-exec of the restored build: the launch's own argv `args`,
+/// pinned to its mode as the boot swap's re-exec is ([`window_successor_args`]), and the
+/// handoff authority variables the GUI's prearm consumed.
 ///
 /// The revert runs before the launch is served, so a window started as
 /// `aterm --window` from a shell still has that terminal on stdin: handed the
@@ -6318,13 +6313,12 @@ fn path_scan_uses(scan: aterm_uds::holders::PathScan, dir: &Path) -> Option<bool
     }
 }
 
-/// A HEADLESS confirmation of a trial no window is waiting on (see
-/// [`window_unproven_path`]): the trial is settled for the headless path — the
-/// sentinel disarms and the success is booked, exactly as a window's confirmation
-/// does, so later updates are not held — but the retained predecessor stays, and
-/// the record says which window launch puts the build back on trial. A record that
-/// cannot be written (or a trial with no identity to key it by) settles the whole
-/// trial, as before the record existed. Runs under the apply lock.
+/// A headless confirmation of a trial no window is waiting on (see
+/// [`window_unproven_path`]): the sentinel disarms and the success is booked, as a
+/// window's confirmation does, so later updates are not held, but the retained
+/// predecessor stays and the record says which window launch puts the build back on
+/// trial. A record that cannot be written (or a trial with no identity to key it by)
+/// settles the whole trial. Runs under the apply lock.
 fn confirm_headless_keeping_predecessor(
     staging: &Staging,
     current_build: u64,

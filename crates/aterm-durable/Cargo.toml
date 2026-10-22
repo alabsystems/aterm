@@ -32,7 +32,6 @@ workspace = true
 # crate has it anyway, so no manifest turns this on: a dev-dependency row that did
 # would fork this crate and every dependent between `targo --unverified test
 # --workspace` and `build -p aterm --profile test` (41 units recompiled). A
-# `--release` test run of a dependent whose tests reach the seam (the recording,
-# or the test arm's `durable_fsync`) names it: `--features
-# aterm-durable/test-support`. `--profile opt-test` needs nothing.
+# `--release` test run of a dependent whose tests reach the recording names it:
+# `--features aterm-durable/test-support`. `--profile opt-test` needs nothing.
 test-support = []

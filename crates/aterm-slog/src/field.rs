@@ -7,9 +7,9 @@
 
 use crate::vocab::{
     ACT_WORDS, ASK_WORDS, BOX_WORDS, CAUSE_WORDS, CHANGE_WORDS, CLASS_WORDS, CLS_WORDS, DIR_WORDS,
-    DUR_WORDS, END_WORDS, HEALED_BY_WORDS, MAIL_KIND_WORDS, NEED_WORDS, NET_WORDS, ORIGIN_WORDS,
-    OUT_WORDS, PHASE_WORDS, POOL_WORDS, SOURCE_WORDS, STATE_WORDS, ShortId, VERB_WORDS, WALL_WORDS,
-    WHY_WORDS, WORD_WORDS, lookup,
+    DUR_WORDS, END_WORDS, HEALED_BY_WORDS, HELD_WORDS, MAIL_KIND_WORDS, NEED_WORDS, NET_WORDS,
+    ORIGIN_WORDS, OUT_WORDS, PHASE_WORDS, POOL_WORDS, SEV_WORDS, SOURCE_WORDS, STATE_WORDS,
+    ShortId, VERB_WORDS, WALL_WORDS, WHY_WORDS, WORD_WORDS, lookup,
 };
 
 /// Where a value may be stored (§3.6). Ordered: a reply, journal or body at
@@ -187,7 +187,11 @@ keys! {
     Cwd "cwd" Host Cap::Text(256),
     Text "text" Host Cap::Text(160),
     As "as" Host Cap::Text(40),
-    Value "value" Host Cap::Text(160),
+    // A meta field's value (`meta field= value=`). 256 since phase 6 (6F-8,
+    // ruling U13): every byte of it a `meta-change` row's 256-byte payload
+    // shows, a description's longest included, and a character's whole
+    // escape past that, so the row is its record's (it was 160).
+    Value "value" Host Cap::Text(256),
     Vid "vid" Host Cap::Text(64),
     Tool "tool" Host Cap::Text(64),
     // A mail's sender and a post's address (`mail from= to=`): a principal
@@ -343,6 +347,20 @@ keys! {
     // the act itself, and an act with no word (`word=unknown`), is read from
     // here, the `harness-act` row's whole.
     HarnessAct "harness_act" Host Cap::Text(64),
+    // Phase 6 (6F-8, plan item U4c; ruling U13), appended so no
+    // discriminant moves: the Autopilot pair's timer on its `meta` mark
+    // (`meta field=autopilot value=cruise land_at=<unix s>`), as its
+    // `meta-change` row says it (`land_at=`, whole seconds, signed as the
+    // timer is). HOST: a timer is this machine's.
+    LandAt "land_at" Host Cap::I,
+    // Phase 6 (6F-9, ruling U26), appended so no discriminant moves: what
+    // the person is shown of a session's need, its `shown` mark's printed
+    // tuple beside `need=` (a `NeedWord`): how it is shown (`sev=`, a
+    // `Severity`) and whose hold stands (`held=`, a `HoldWord`); each absent
+    // for none. WIRE, closed words; the mark is local all the same (no bus
+    // class).
+    Sev "sev" Wire Cap::Word(SEV_WORDS),
+    Held "held" Wire Cap::Word(HELD_WORDS),
 }
 
 impl Key {

@@ -805,9 +805,7 @@ fn lineage_record_refusals(c: &CompilerContent) -> Result<(String, String), Vec<
     }
 }
 
-// ---------------------------------------------------------------------------------------
-// THE PAYLOAD SCAN
-// ---------------------------------------------------------------------------------------
+// The payload scan.
 
 /// One kind of compiler evidence found in a payload.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

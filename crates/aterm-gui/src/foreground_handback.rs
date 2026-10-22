@@ -177,10 +177,9 @@ impl FgCutter {
         self.edge.is_some()
     }
 
-    /// A sample `fg` taken after `filled` bytes of this batch were read.
-    /// Returns `true` when the batch must be delivered NOW (it carries an
-    /// edge): bytes read after this point belong to the new holder and must not
-    /// join the batch the edge cuts — the next batch starts at the new holder.
+    /// A sample `fg` taken after `filled` bytes of this batch were read. `true` when the batch
+    /// must be delivered now (it carries an edge): later bytes belong to the new holder and
+    /// start the next batch.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -791,8 +790,7 @@ fn darwin_group_has_stopped_member(pgid: i32) -> bool {
         .any(|pid| darwin_member_status(pid) == Some((SSTOP, pgid)))
 }
 
-/// macOS: one process's `(p_stat, pgid)`, `None` when it cannot be read (it
-/// exited mid-walk).
+/// macOS: one process's `(p_stat, pgid)`, `None` when it cannot be read (it exited).
 ///
 /// `PROC_PIDT_SHORTBSDINFO`, not `PROC_PIDTBSDINFO`: the long record is refused (`EPERM`) for
 /// another user's pid, so a stopped member of `producer | sudo tui` would read as running.
@@ -1285,10 +1283,8 @@ mod tests {
         assert!(v.probed().is_empty());
     }
 
-    /// The Linux member walk is bounded by the session's own process tree:
-    /// breadth first from the session leader, at most `TREE_CAP` processes,
-    /// and `None` (fall back) only when the leader's own children cannot be
-    /// listed.
+    /// The Linux member walk: breadth first from the session leader, at most `TREE_CAP`
+    /// processes, `None` (fall back) only when the leader's own children cannot be listed.
     #[test]
     fn foreground_handback_session_tree_walk_is_bounded() {
         assert_eq!(

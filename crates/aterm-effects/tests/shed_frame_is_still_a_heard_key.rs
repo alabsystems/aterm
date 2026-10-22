@@ -254,7 +254,7 @@ fn a_shed_tick_keeps_the_keyed_click_ledger() {
             t += Duration::from_millis(2);
         }
         // Program-driven moves only — no `note_typed`, so nothing licenses a
-        // fresh key. Count how many arrive silent: that is the ledger's depth.
+        // fresh key. Count how many arrive silent.
         let mut silent = 0;
         for col in 1..=16u16 {
             r.tick_at(t, &base, col);
@@ -275,9 +275,8 @@ fn a_shed_tick_keeps_the_keyed_click_ledger() {
     );
 }
 
-/// The master-off tick and `reset` still wipe the sound ledger
-/// (`clear_sound_ledger` is called conditionally by the zero-amplitude
-/// return).
+/// The master-off tick and `reset` still wipe the sound ledger; only the
+/// zero-amplitude return clears it conditionally (`clear_sound_ledger`).
 #[test]
 fn a_master_off_tick_still_wipes_the_sound_ledger() {
     let base = cfg(GlowStyle::Water);

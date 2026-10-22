@@ -8,16 +8,14 @@
 
 use super::Terminal;
 
-/// Maximum paste size in bytes (16 MiB). Pastes exceeding this are truncated
-/// at a char boundary to prevent unbounded memory allocation.
+/// Maximum paste size in bytes: longer pastes are truncated at a char boundary.
 const MAX_PASTE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum UTF-8 prefix the GUI's cursor-gesture admission probe inspects
 /// synchronously; past it admission is conservative. Formatting still takes the
 /// whole bounded paste, off the event thread.
 const PASTE_GESTURE_PROBE_BYTES: usize = 4 * 1024;
-/// Maximum UTF-8 body the delivered-insert pricer ([`Terminal::paste_insert_cells`])
-/// walks. A single-line body longer than this is wider than any row and wraps,
-/// so it is reported as an unknown width.
+/// Most UTF-8 body [`Terminal::paste_insert_cells`] walks: a longer single-line
+/// body is wider than any row and wraps, so its width is unknown.
 const PASTE_INSERT_PRICE_BYTES: usize = PASTE_GESTURE_PROBE_BYTES;
 
 /// The prefix the paste formatter may inspect, ending on a UTF-8 boundary. The
@@ -95,11 +93,10 @@ impl Terminal {
     /// [`aterm_grapheme::str_grid_columns_with`], under the terminal's
     /// ambiguous-width mode).
     ///
-    /// `Some(cells)` for a single-line body; `None` when the width is unknowable
-    /// from the text: a TAB, a line break, or a body longer than
-    /// [`PASTE_INSERT_PRICE_BYTES`]. The host then licenses an unknown-width
-    /// insert bounded by the cursor engine's gesture cap. The length is checked
-    /// before any character is scanned.
+    /// `None` when the width is unknowable from the text: a TAB, a line break,
+    /// or a body longer than [`PASTE_INSERT_PRICE_BYTES`] (checked before any
+    /// character is scanned). The host then licenses an unknown-width insert
+    /// bounded by the cursor engine's gesture cap.
     #[must_use]
     pub fn paste_insert_cells(text: &str, ambiguous_width_double: bool) -> Option<u16> {
         use aterm_types::text_shaping::AmbiguousWidth;
@@ -260,14 +257,11 @@ impl Terminal {
             grid.set_scrollback_line_limit(limit);
             grid.clamp_display_offset();
         }
-        // Keep the active grid's offset valid too (it is the primary when the
-        // alt screen is down; a no-op re-clamp otherwise).
+        // Keep the active grid's offset valid too.
         self.grid.clamp_display_offset();
-        // Shrinking evicts the oldest lines with no scroll or damage band, so
-        // re-floor the selection here. Only off the alt screen: there the
-        // eviction hit the saved primary in `alt_grid`, while `text_selection`
-        // addresses the alt buffer; the primary's selection is re-floored when
-        // it is restored.
+        // Re-floor the selection (see the doc), only off the alt screen: there
+        // the eviction hit the saved primary while `text_selection` addresses
+        // the alt buffer.
         if !self.modes.alternate_screen {
             let live_top_abs = self
                 .grid
@@ -340,10 +334,9 @@ impl Terminal {
     /// every tier of the tiered store. Visible rows are kept; the text selection
     /// is cleared, since its anchors would dangle.
     ///
-    /// This destroys like `SelectionCustody`'s `WholesaleInvalidate` but is not
-    /// its anchor: it is host-facing, and the VT producers (ED 3, RIS, Kitty
-    /// unscroll) reach the selection through `post_process`'s
-    /// `SelectionDamage::All` arm, where the anchor lives
+    /// Destroys like `SelectionCustody`'s `WholesaleInvalidate` but is not its
+    /// anchor: the VT producers (ED 3, RIS, Kitty unscroll) reach the selection
+    /// through `post_process`'s `SelectionDamage::All` arm
     /// ([`Terminal::post_process`]).
     pub fn clear_scrollback(&mut self) {
         self.grid.erase_scrollback();
@@ -351,8 +344,7 @@ impl Terminal {
             alt.erase_scrollback();
         }
         self.text_selection.clear();
-        // `erase_scrollback` ran on both grids, so the parked selection dangles
-        // too; clear it now rather than waiting for the exit batch's damage.
+        // The parked selection dangles too: clear it now, not at the exit batch.
         self.parked_text_selection.clear();
         // The anchors wholly in the erased history go with it; the visible
         // rows keep their absolute numbers, so the rest stay where they are,
@@ -541,13 +533,9 @@ impl Terminal {
 
     /// [`Self::format_paste`] with the bracketed-paste decision supplied by the
     /// caller rather than read from the live mode; the body is identical either
-    /// way.
-    ///
-    /// A queued paste is framed later than the moment a person was asked about
-    /// it, and the program may flip DEC 2004 in between; a host that asked (the
-    /// multi-line paste confirmation) frames by the mode the question was asked
-    /// under. Passing `self.modes().bracketed_paste` reproduces
-    /// [`Self::format_paste`].
+    /// way. A host that asked a person about a queued paste (the multi-line
+    /// paste confirmation) frames by the mode the question was asked under,
+    /// since the program may flip DEC 2004 in between.
     ///
     /// # Example
     ///
@@ -723,8 +711,7 @@ mod tests {
             term.format_paste_framed("a\x1b[31mb\nc", false),
             b"a[31mb\rc"
         );
-        // Passing the live mode is `format_paste`, which is how a caller with no
-        // captured answer keeps the write-time contract.
+        // Passing the live mode is `format_paste`.
         assert_eq!(
             term.format_paste_framed("a\x1b[31mb\nc", term.modes().bracketed_paste),
             term.format_paste("a\x1b[31mb\nc")
@@ -873,7 +860,6 @@ mod tests {
     #[test]
     fn osc_133_marks_queue_real_payloads() {
         let mut term = Terminal::new(24, 80);
-        // A → B → C → D is the accepted state machine.
         term.process(b"\x1b]133;A\x07");
         term.process(b"\x1b]133;B\x07");
         term.process(b"\x1b]133;C\x07");

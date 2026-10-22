@@ -48,8 +48,8 @@ pub const ALAB_DEFAULT_URL: &str = aterm_types::macos_setup::DEFAULT_VAULT_URL;
 /// The ALab vault's signing key (standard padded base64 of the Ed25519 public key), the
 /// pin a machine that accepts [`ALAB_DEFAULT_URL`] uses instead of trusting on first use,
 /// and the pin `aterm secrets serve` holds for `alab`: the key `aterm secrets create` made
-/// on m22 on 2026-10-20 (fingerprint `fed4-97da-a265-0615`). An empty pin would mean the
-/// default URL is trusted on first use like any other.
+/// on m22 on 2026-10-20 (fingerprint `fed4-97da-a265-0615-9f56`). An empty pin would mean
+/// the default URL is trusted on first use like any other.
 ///
 /// After a rotation of the ALab vault the next release sets this to the new key and adds
 /// the old one to [`ALAB_RETIRED`] (the rotating `aterm secrets` command prints both, for a
@@ -71,6 +71,16 @@ pub const ALAB_RETIRED: &[&str] = &[];
 
 /// The port `aterm secrets serve` listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 7484;
+
+/// The mDNS name `aterm secrets serve` registers on macOS unless told otherwise: the
+/// `<label>.local` of [`ALAB_DEFAULT_URL`] (`alab-secrets`), so a Mac serving the default vault
+/// answers the URL every new Mac's setup joins.
+pub fn alab_advertised() -> &'static str {
+    ALAB_DEFAULT_URL
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once(".local"))
+        .map_or("", |(label, _)| label)
+}
 
 /// An error that names what failed, never a secret value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,7 +117,10 @@ mod tests {
     fn the_alab_signer_is_the_ed25519_key_of_the_vault_m22_made() {
         let key = crate::b64::decode_padded(super::ALAB_SIGNER).expect("base64");
         let key = <[u8; 32]>::try_from(key.as_slice()).expect("32 bytes");
-        assert_eq!(crate::envelope::fingerprint(&key), "fed4-97da-a265-0615");
+        assert_eq!(
+            crate::envelope::fingerprint(&key),
+            "fed4-97da-a265-0615-9f56"
+        );
     }
 
     /// A retired entry that does not decode would retire nothing, and a retired
@@ -124,6 +137,21 @@ mod tests {
         assert_eq!(
             compiled.current.map(|key| crate::b64::encode_padded(&key)),
             Some(super::ALAB_SIGNER.to_string())
+        );
+    }
+
+    /// What a server advertises by default is the name the default URL reaches, on the port
+    /// it listens on by default.
+    #[test]
+    fn the_server_advertises_the_name_and_port_the_default_url_reaches() {
+        let label = super::alab_advertised();
+        assert_eq!(label, "alab-secrets");
+        assert!(crate::envelope::valid_name(label));
+        assert!(
+            super::ALAB_DEFAULT_URL
+                .starts_with(&format!("http://{label}.local:{}/v1/", super::DEFAULT_PORT)),
+            "{}",
+            super::ALAB_DEFAULT_URL
         );
     }
 }

@@ -175,7 +175,6 @@ impl Grid {
             })
             .collect();
         apply_deferred_extras(&mut self.storage.extras, row_idx, deferred);
-        // Set HAS_EXTRAS flags on cells that got deferred extras.
         if !deferred_cols.is_empty()
             && let Some(idx) = self.storage.row_index(row_idx)
             && let Some(r) = self.storage.rows.get_mut(idx)

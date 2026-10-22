@@ -1,33 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE MESSAGE CENTER'S HOST — the `App` glue of the unified message system
-//! (docs/DESIGN-unified-messages-2026-09-21.md §3.2, §3.6): the fields that
-//! hold the center, the committed band rows and the log writer; the
-//! post/restate/resolve seam every reporter calls; the settle-commit-persist
-//! sync that runs after every input and on every wake; the deadline the loop
-//! folds; the inbox drain at the park; and the INTENT PERFORMER — the one
-//! place a plain-data [`Intent`] the engine returned becomes a host action
-//! (`ATERM_DESIGN` §2.2: the engine requests, the frontend performs).
+//! The message center's host: the `App` glue of the unified message system
+//! (docs/DESIGN-unified-messages-2026-09-21.md §3.2, §3.6). It holds the center, the committed
+//! band rows and the log writer; gives reporters the post/restate/resolve seam; runs the
+//! settle-commit-persist sync after every input and wake; and performs each plain-data
+//! [`Intent`] the engine returns.
 //!
-//! # Clocks (D4)
+//! # Clocks
 //!
-//! The engine never reads a clock: the host mints every [`WallStamp`] at
-//! ingress ([`wall_stamp_now`]) and passes `Instant::now()` into every call.
-//! A message queued before `App` exists carries the instant it was queued
-//! ([`crate::message_inbox`]), not the instant it was drained.
+//! The engine never reads a clock: the host mints every [`WallStamp`] at ingress
+//! ([`wall_stamp_now`]) and passes `Instant::now()` into every call. A message queued before
+//! `App` exists carries the instant it was queued ([`crate::message_inbox`]).
 //!
 //! # The handoff freeze
 //!
-//! While a seamless self-update is pending — this process parking its readers
-//! for the successor, or this process the successor waiting for Commit — ONE
-//! predicate ([`App::message_holds_frozen`]) suspends the holds (a row
-//! folding on its hold would paint the committed row as a hole for the rest
-//! of the freeze) and refuses the re-grid (the successor's layout must match
-//! the parent's capture). The staleness caps keep running: a successor whose
-//! Commit never arrives must not hold a carried row for the life of the
-//! process. The deadline the loop arms is read through the same predicate,
-//! so it never arms a wake the settle would decline to act on.
+//! While a seamless self-update is pending (this process parked for its successor, or the
+//! successor awaiting Commit), [`App::message_holds_frozen`] suspends the holds (a fold would
+//! paint the committed row as a hole) and refuses the re-grid (the successor's layout must match
+//! the parent's capture). The staleness caps keep running, so a successor whose Commit never
+//! comes does not hold a carried row forever; the loop's deadline reads the same predicate.
 //!
 //! The LOG is not frozen with the holds. The parent's record is its own to
 //! the end: it keeps appending through the park and flushes it right before
@@ -46,17 +38,11 @@
 //! the freeze (the manifest needs it), so it shipped nothing, and every
 //! line posted under the freeze died with the parent (review, 2026-09-22).
 //!
-//! # The reporters' glue
+//! # Reporters
 //!
-//! The wake arms in `lib.rs` are thin producers (design §3.10): each calls a
-//! words builder (`toolchain_words`, `update_words`) and posts, records or
-//! restates. What a builder cannot hold — whether a first-run toolchain child
-//! is still live, the live meter's high-water mark, the words an "Installing"
-//! row replaced so a refusal can put them back — lives here, on `App`, next
-//! to the seam that reads it. The toolchain lane is SILENT BY DEFAULT since
-//! the origin/main merge (upstream dbf97ecff + ac7942234, the design's
-//! rulings of 2026-09-23): one first-run row, every other toolchain word a
-//! [`Hold::LogOnly`] record ([`App::record_message`]).
+//! The wake arms in `lib.rs` call a words builder (`toolchain_words`, `update_words`) and post,
+//! record or restate; the state a builder cannot hold lives here on `App`. The toolchain lane is
+//! silent by default: one first-run row, every other word a [`Hold::LogOnly`] record.
 //!
 //! # The Settings ▸ Messages page
 //!
@@ -104,20 +90,14 @@ pub(crate) const MESSAGES_FLUSH_UI_WAIT: std::time::Duration = std::time::Durati
 pub(crate) const MESSAGES_FLUSH_EXIT_WAIT: std::time::Duration =
     std::time::Duration::from_millis(250);
 
-// THE PAGE'S MODEL IS THE ENGINE'S (design ruling 382): the projection, its
-// words, the tag order, the filter, the day clock and the feedback line live
-// in `aterm_messages::page`, under the names they had here (ruling 385), so
-// the Settings page and its tests read on; the host answers the page's seam
-// ([`PageDesk`]).
+// The page's model is the engine's, re-exported for the Settings page and its tests.
 #[cfg(test)]
 pub(crate) use aterm_messages::page::MessageActionView;
 pub(crate) use aterm_messages::page::{MessageView, MessagesState, tag_words};
 
-/// THE PAGE'S HOST SEAM on this host ([`page::Host`], design ruling 382):
-/// what only the App knows about one projection. The staged build and the
-/// upgrade clock are read ONCE, as the desk is made for a build, so every
-/// `Install now` and every upgrade word of one projection is judged against
-/// the same facts; the rest is read when the engine asks.
+/// The page's host seam ([`page::Host`]): what only the App knows about one projection. The
+/// staged build and the upgrade clock are read once, when the desk is made, so every
+/// `Install now` and upgrade word of one projection is judged against the same facts.
 struct PageDesk<'a> {
     app: &'a App,
     /// The build the updater holds staged and ready, if any.
@@ -172,10 +152,8 @@ impl page::Host for PageDesk<'_> {
         self.staged
     }
 
-    /// `symlink_metadata`, as [`admissible_log_path`] does at press time: a
-    /// symlink planted in the log dir is refused there, so it is not offered
-    /// here (the rest of that test needs the log dir, which is a directory
-    /// probe per view; the press re-validates the whole rule).
+    /// `symlink_metadata`, as [`admissible_log_path`] reads it at press time: a planted symlink
+    /// is refused there, so it is not offered here (the press re-validates the whole rule).
     fn is_regular_file(&self, path: &str) -> bool {
         std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
     }
@@ -214,21 +192,21 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
-    /// The update-health desktop banners `App::post_update_health_banner`
-    /// would have posted ON THIS THREAD, as `(title, banner)` (test-only).
+    /// The update-health desktop banners `App::post_update_health_banner` would have posted on
+    /// this thread, as `(title, banner)`.
     pub(crate) static UPDATE_HEALTH_BANNERS: std::cell::RefCell<Vec<(String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
 thread_local! {
-    /// The updater classes `adopt_announced_health` would have been handed ON
-    /// THIS THREAD (test-only): a test never touches the process's updater.
+    /// The updater classes `adopt_announced_health` would have been handed on this thread: a
+    /// test never touches the process's updater.
     pub(crate) static UPDATER_ADOPTED_HEALTH: std::cell::RefCell<Vec<&'static str>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Hand `class` to this process's updater as ANNOUNCED by its parent
+/// Hand `class` to this process's updater as announced by its parent
 /// ([`aterm_update::adopt_announced_health`]; recorded instead under
 /// `cfg(test)`, [`UPDATER_ADOPTED_HEALTH`]).
 fn adopt_updater_announced_health(class: &'static str) {
@@ -278,26 +256,17 @@ pub(crate) fn restatement_of(msg: &Message) -> Restatement {
     }
 }
 
-/// R16 — the words a decision row takes after *Open Settings*: a TERSE
-/// restate (the owner's attention rule, 2026-09-23 — design ruling 46),
-/// each further clause of the consent card's caption a line behind Details,
-/// the actions cleared (the row stays for the watcher, answered only by the
-/// grant or its hold), and the route's SHORT hold. The caption is
-/// `consent_card::opened_settings_caption`'s, split at its dash into the
-/// title and the tail and at its `; ` joints into lines; the route line drops
-/// its leading `System Settings ▸` (the title already names Settings).
+/// The words a decision row takes after *Open Settings*: the actions cleared (the row stays,
+/// answered by the grant or its hold), the route's short hold, and the clauses of
+/// `consent_card::opened_settings_caption`, split at its dash (title, tail) and its `; `
+/// joints (lines behind Details), the route line without its `System Settings ▸` lead.
 ///
-/// * Opened: the INSTRUCTION is the title — `Enable aterm in Full Disk
-///   Access` — and the route in words is the painted excerpt: `openURL:`
-///   reports only that Settings TOOK the URL, never that it scrolled to the
-///   row, so the route goes out on every outcome. `Opened System Settings`
-///   was a confirmation of what the window already shows (review
-///   2026-09-24).
-/// * Refused: the route IS the title, verb first — `Open Privacy & Security
-///   ▸ Full Disk Access` — and `Settings did not open` is the first line
-///   behind it: at 60 columns `Settings did not open` alone read as an FYI
-///   and lost the one part a person can act on (review round 2, 2026-09-23).
-///   It is a failure, so it wears the warning's tone and glyph.
+/// * Opened: the title is the instruction (`Enable aterm in Full Disk Access`) and the route
+///   is the painted excerpt on every outcome: `openURL:` reports only that Settings took the
+///   URL, not that it scrolled to the row.
+/// * Refused: the title is the route, verb first (`Open Privacy & Security ▸ Full Disk
+///   Access`), then `Settings did not open`, in the warning's tone and glyph; that line alone
+///   reads as an FYI and drops the one part a person can act on.
 fn route_words(opened: bool, route: &str) -> Restatement {
     let caption = crate::consent_card::opened_settings_caption(opened, route);
     let (title, tail) = caption
@@ -358,12 +327,9 @@ fn privacy_pane(pane: &str) -> Option<crate::menu::PrivacyPane> {
     }
 }
 
-/// The path `Open log` may open, or `None`: absolute; every component a
-/// plain name — `Path::starts_with` is lexical, so a `..` under the log dir
-/// would pass it and escape; a REGULAR file by `symlink_metadata` (a symlink
-/// planted in the log dir opens whatever it points at, and the editor would
-/// follow it); under `log_dir`. Pure, so the refusals are pinned against a
-/// scratch dir standing in for `logging::log_dir()`.
+/// The path `Open log` may open, or `None`: absolute; every component a plain name
+/// (`Path::starts_with` is lexical, so a `..` would escape `log_dir`); a regular file by
+/// `symlink_metadata` (a planted symlink would open whatever it points at); under `log_dir`.
 fn admissible_log_path(path: &str, log_dir: &Path) -> Option<PathBuf> {
     use std::path::Component;
     let p = Path::new(path);
@@ -391,15 +357,11 @@ fn openable_link(url: &str) -> bool {
     aterm_messages::link_host(url).is_some() && crate::is_safe_url(url)
 }
 
-/// Open `path` in the platform's text editor, OFF the UI thread, if and only
-/// if [`admissible_log_path`] admits it under `logging::log_dir()` — the
-/// host-minted paths the crash reporter carries, re-validated at press time
-/// because the intent came back from a log or a carry. macOS `open -t` (the
-/// default text editor — the artifact's `.log.seen` extension has no
-/// registered handler, and `-t` opens it as text), Linux `xdg-open`, Windows
-/// `notepad.exe`. No main-thread gate, so `menu::open_in_workspace` is not
-/// widened and `is_safe_url` is not touched. `false` when refused or nothing
-/// could be spawned.
+/// Open `path` in the platform's text editor, off the UI thread, if [`admissible_log_path`]
+/// admits it under `logging::log_dir()`; the path is re-validated at press time because the
+/// intent came back from a log or a carry. macOS uses `open -t` (the `.log.seen` extension has
+/// no registered handler), Linux `xdg-open`, Windows `notepad.exe`. `false` when refused or
+/// nothing could be spawned.
 fn open_path_external(path: &str) -> bool {
     let Some(log_dir) = crate::logging::log_dir() else {
         return false;
@@ -450,27 +412,16 @@ impl App {
         id
     }
 
-    /// A RECORD — a message that never touches the glass: posted as
-    /// [`Hold::LogOnly`] whatever hold it was built with, so it is in the log,
-    /// on `appstatus` (a finished activity) and on Settings ▸ Messages, and
-    /// never a row. No settle and no repaint: nothing on the glass moved, and
-    /// the park's sweep (`settle_messages`, then the page's publish) persists
-    /// it within the loop's next turn — the bars' ledger rows, which the
-    /// silent toolchain lane (upstream 2026-09-22) records instead of rows,
-    /// never repainted a window either.
+    /// A record: posted as [`Hold::LogOnly`] whatever hold it was built with, so it reaches the
+    /// log, `appstatus` and Settings ▸ Messages but never the glass. No settle and no repaint:
+    /// the park's sweep persists it within the loop's next turn.
     pub(crate) fn record_message(&mut self, msg: Message) -> MessageId {
         self.post_unsynced(msg.hold(Hold::LogOnly), wall_stamp_now())
     }
 
-    /// A config reload's warnings REPLACE the band's config rows as a set
-    /// (design §3.10, R4), one settle for the whole of it. This is the FULL
-    /// reload's replace, the one that re-derived every family, so every live
-    /// `config.`-keyed row is in scope: a fixed config takes its row down (an
-    /// empty set is how a fixed typo clears its row), and a family whose words
-    /// are unchanged leaves its row alone — see [`Self::replace_config_set`]
-    /// for why a repeat never comes back to the glass. A reload that
-    /// re-derived only some families scopes to those
-    /// ([`Self::replace_config_messages_keyed`]).
+    /// A full config reload's warnings replace the band's config rows as a set (design §3.10),
+    /// with one settle: every live `config.`-keyed row is in scope ([`Self::replace_config_set`]),
+    /// so an empty set clears every fixed family's row.
     ///
     /// The backend build's `font_family` verdict
     /// ([`crate::message_reporters::KEY_FONT_FAMILY`]) is in scope only when
@@ -504,9 +455,8 @@ impl App {
             .filter_map(|l| l.msg.key.clone())
             .filter(reloads)
             .collect();
-        // Every family was re-derived, so every `config.` key this process
-        // has said something under is in the reload's verdict — but the
-        // backend thread's family verdict, unless the font work admitted it.
+        // Every family was re-derived: every `config.` key this process has spoken under is in
+        // the verdict (the font family only as `reloads` admits it).
         let mut rederived: std::collections::BTreeSet<String> = self
             .messages
             .log()
@@ -530,13 +480,10 @@ impl App {
         );
     }
 
-    /// [`Self::replace_config_messages_after_font_work`] for a reload that re-derived only
-    /// the rows under `keys` — the content-equal reload, which reads the raw
-    /// text for the ignored-key and unaccepted-value families and recomputes
-    /// nothing from the parse (`app_config.rs`, the dedupe arm; the contract
-    /// its test pins). The prefix resolve there took a still-true keybinding
-    /// or font row down on a comment-only save and logged it `resolved` for a
-    /// config that was still broken (Phase 3 review, ruling 28).
+    /// [`Self::replace_config_messages_after_font_work`] for a reload that re-derived only the
+    /// rows under `keys`: the content-equal reload (`app_config.rs`'s dedupe arm), which re-reads
+    /// only the ignored-key and unaccepted-value families. A prefix resolve there would take a
+    /// still-true keybinding or font row down on a comment-only save.
     pub(crate) fn replace_config_messages_keyed(
         &mut self,
         keys: &[&str],
@@ -624,9 +571,8 @@ impl App {
                 continue;
             };
             if next.hold == Hold::LogOnly {
-                // Still a problem, now a record only: the row comes down
-                // WITHOUT the fix's words, so its record keeps its title and
-                // its ⚠ and stays in Problems (design ruling 266).
+                // Still a problem, now a record only: the row comes down without the fix's
+                // words, so its record keeps its title and its ⚠ and stays in Problems.
                 self.messages.restate(
                     id,
                     Restatement {
@@ -647,13 +593,10 @@ impl App {
         self.post_config_set(resolved, msgs);
     }
 
-    /// The posting half of a config replace: `msgs` under one stamp, then
-    /// ONE settle when anything was resolved or posted to the glass. A family
-    /// whose live row still says the same words is not posted at all; a
-    /// repeat of words already off the glass is posted as a record
-    /// ([`Self::config_repeat`]); a `Hold::LogOnly` family
-    /// (`ConfigFamily::RetiredKeys`) is a record, and a record alone moves
-    /// nothing on the glass ([`Self::record_message`]).
+    /// The posting half of a config replace: `msgs` under one stamp, then one settle when
+    /// anything was resolved or reached the glass. A family whose live row says the same words
+    /// is skipped; a repeat of words already off the glass ([`Self::config_repeat`]) and a
+    /// `Hold::LogOnly` family (`ConfigFamily::RetiredKeys`) are records.
     fn post_config_set(&mut self, resolved: usize, msgs: Vec<Message>) {
         let stamp = wall_stamp_now();
         let mut posted = 0usize;
@@ -666,7 +609,7 @@ impl App {
             {
                 continue;
             }
-            // A RECORD, not a bare `LogOnly` hold: the door re-derives a
+            // A record, not a bare `LogOnly` hold: the door re-derives a
             // classified row's hold from its class, so a repeat must change
             // the class for it to stay off the glass.
             let msg = if msg.hold != Hold::LogOnly && self.config_repeat(&msg) {
@@ -687,16 +630,12 @@ impl App {
         }
     }
 
-    /// Whether `msg` repeats words that already LEFT the glass: the latest
-    /// record under its key, from THIS process (a record replayed from disk
-    /// was a previous launch's, and a launch says its config problems once),
-    /// has the same title and detail and retired by running out — its hold
-    /// ended, it was read or dismissed, it went unseen or was evicted, or it
-    /// was recorded as a repeat already. A row RESOLVED by a reload means the
-    /// problem was fixed or changed, and a family a reload found fixed after
-    /// its row had left the glass is remembered as fixed
-    /// (`App::config_cleared`): either way the same words coming back later
-    /// are news again.
+    /// Whether `msg` repeats words that already left the glass: the latest record under its key
+    /// from this process (a record replayed from disk was a previous launch's, and a launch says
+    /// its config problems once) has the same title and detail and retired by running out (hold
+    /// ended, read or dismissed, unseen, evicted, stale, or recorded as a repeat). A row resolved
+    /// by a reload, or a family a reload found fixed after its row left the glass
+    /// (`App::config_cleared`), means the same words coming back later are news again.
     fn config_repeat(&self, msg: &Message) -> bool {
         use aterm_messages::Retired;
         let Some(key) = msg.key.as_deref() else {
@@ -731,8 +670,7 @@ impl App {
             })
     }
 
-    /// Whether a live row's title or detail contains `needle` — the tests'
-    /// question for a reporter that used to write a banner line.
+    /// Whether a live row's title or detail contains `needle`.
     #[cfg(test)]
     pub(crate) fn has_live_message(&self, needle: &str) -> bool {
         self.messages.live_rows().any(|l| {
@@ -757,11 +695,10 @@ impl App {
         posted.id
     }
 
-    /// Re-word a live row in place; `false` when `id` is not live. A restate
-    /// costs no log line (the final words land on the row's Retired line).
-    /// One that changed nothing the row says — a heartbeat re-feeding the same
-    /// reading — moves no revision, so it syncs and repaints nothing (review
-    /// 2026-09-24); its staleness cap is re-armed all the same.
+    /// Re-word a live row in place; `false` when `id` is not live. A restate costs no log line
+    /// (the final words land on the row's Retired line). One that changed nothing the row says
+    /// (a heartbeat re-feeding the same reading) moves no revision, so it syncs and repaints
+    /// nothing; its staleness cap is re-armed all the same.
     pub(crate) fn restate_message(&mut self, id: MessageId, r: Restatement) -> bool {
         let revision = self.messages.revision();
         let live = self.messages.restate(id, r, Instant::now());
@@ -772,12 +709,9 @@ impl App {
         live
     }
 
-    /// A RECORD ([`Self::record_message`]) re-worded in place to `msg`'s
-    /// words — no new entry, one more log line
-    /// ([`aterm_messages::MessageCenter::reword_record`]); `false` when `id`
-    /// is no record or already says them. As a record's post, no settle and
-    /// no repaint: nothing on the glass moved, and the park's sweep persists
-    /// and publishes it.
+    /// A record ([`Self::record_message`]) re-worded in place to `msg`'s words: no new entry, one
+    /// more log line ([`aterm_messages::MessageCenter::reword_record`]); `false` when `id` is no
+    /// record or already says them. No settle and no repaint, as for a record's post.
     pub(crate) fn reword_record(&mut self, id: MessageId, msg: &Message) -> bool {
         self.messages.reword_record(id, msg)
     }
@@ -863,7 +797,7 @@ impl App {
         kept
     }
 
-    /// A live row that becomes its own RECORD in place, in `msg`'s words
+    /// A live row that becomes its own record in place, in `msg`'s words
     /// ([`aterm_messages::MessageCenter::keep_as_record`]); `false` when `id`
     /// is not live. The row left the glass: synced as a withdraw is.
     pub(crate) fn keep_as_record(&mut self, id: MessageId, msg: &Message) -> bool {
@@ -884,12 +818,10 @@ impl App {
         resolved
     }
 
-    /// The reporter withdrew a live row with NO outcome to claim — the
-    /// tailer's file vanished under a live meter before any marker said how
-    /// the pass ended. The log keeps the row (`Retired::Withdrawn`);
-    /// `appstatus` lists no finished activity for it, as the bars listed
-    /// none (status_bars.rs:1176-1181 dropped the bar silently); the marker,
-    /// when it comes, posts the outcome under the same key.
+    /// The reporter withdrew a live row with no outcome to claim (the tailer's file vanished
+    /// under a live meter before any marker said how the pass ended). The log keeps the row
+    /// (`Retired::Withdrawn`); `appstatus` lists no finished activity for it; the marker, when
+    /// it comes, posts the outcome under the same key.
     pub(crate) fn withdraw_message(&mut self, id: MessageId) -> bool {
         let withdrawn = self.messages.withdraw(id, Instant::now());
         if withdrawn {
@@ -898,9 +830,8 @@ impl App {
         withdrawn
     }
 
-    /// The person's word on a live row was TAKEN (ruling 270): it retires
-    /// `Answered { label }` — the record says `answered: <label>`, never
-    /// `took` — for a capsule whose word is written off this thread and so
+    /// The person's word on a live row was taken: it retires `Answered { label }` (the record
+    /// says `answered: <label>`), for a capsule whose word is written off this thread and so
     /// could not close the row at the press. `false` when `id` is not live.
     pub(crate) fn answer_message(&mut self, id: MessageId, label: &str) -> bool {
         let answered = self.messages.answer(id, label, Instant::now());
@@ -910,18 +841,15 @@ impl App {
         answered
     }
 
-    /// After any message input, on the timer-wake sweep, at the park and
-    /// when a handoff finishes: retire what has expired (holds suspended
-    /// under a freeze), commit the row count, append what the log drained
-    /// (never under a freeze), and repaint every window — the band is chrome
-    /// in each of them; the RepaintKey's band fingerprint keeps a
-    /// byte-identical tick from re-presenting.
+    /// After any message input and when a handoff finishes: retire what has expired (holds
+    /// suspended under a freeze), commit the row count, append what the log drained (held only in
+    /// a successor before Commit), and repaint every window. The band is chrome in each; the
+    /// RepaintKey's band fingerprint keeps a byte-identical tick from re-presenting.
     pub(crate) fn sync_messages(&mut self) {
         let now = Instant::now();
-        // A host verb (a post, a retire, a restate) moved the glass BEFORE
-        // this settle, whose `glass_changed` compares the glass across the
-        // settle alone: the lit chip is resolved again whatever it reports
-        // (round 44's review, ruling 418 (a)).
+        // A host verb (a post, a retire, a restate) moved the glass before this settle, whose
+        // `glass_changed` compares across the settle alone, so the lit chip is resolved again
+        // whatever it reports.
         if !self.settle_messages(now) {
             self.refresh_band_hover();
         }
@@ -931,17 +859,10 @@ impl App {
         self.request_redraw_all_windows();
     }
 
-    /// [`Self::sync_messages`] without the repaint request, for the loop's
-    /// own sweeps — the timer wake and the park — which collect what to
-    /// repaint themselves: retire what has expired (holds suspended under a
-    /// freeze), commit the row count, drain the log. `true` when the GLASS
-    /// changed — a row folded, arrived or re-worded, or the count moved — so
-    /// the caller repaints exactly then (the bars' `settle || sync` answer).
-    ///
-    /// The step is the engine's (`aterm_messages::drive`, design ruling 336):
-    /// this host gives it the instant, the handoff freeze, what its windows
-    /// afford and the rows its geometry reserves, re-grids between the two
-    /// halves, and hands the drained lines to its writer.
+    /// [`Self::sync_messages`] without the repaint request, for the loop's own sweeps (the timer
+    /// wake and the park), which repaint themselves; `true` when the glass changed. The step is
+    /// the engine's (`aterm_messages::drive`); the host supplies the instant, the freeze, what its
+    /// windows afford and the rows its geometry reserves, and re-grids between the two halves.
     pub(crate) fn settle_messages(&mut self, now: Instant) -> bool {
         // The tab strip's fall a Settings edit made inside the regrow floor
         // commits here once the floor has run, like the band's below.
@@ -961,15 +882,15 @@ impl App {
         let commit = self.band_commit(now);
         let step = drive::settle_and_commit(&mut self.messages, commit);
         let committed = self.regrid_message_band(step.regrid, now);
-        // A `notice progress` restate the wire's pacing held back (ruling 170):
-        // its one paced paint falls due here, however many lines arrived.
+        // A `notice progress` restate the wire's pacing held back falls due here as one paced
+        // paint, however many lines arrived.
         let persist = !self.message_persist_frozen();
         let (lines, wire) =
             drive::drain_and_pace(&mut self.messages, &mut self.wire_gate, now, persist);
         self.append_message_lines(&lines);
         let changed = step.glass_changed || committed || wire || strip;
         if changed {
-            // The chips moved under a still pointer (round 44).
+            // The chips moved under a still pointer.
             self.refresh_band_hover();
         }
         changed
@@ -1046,12 +967,10 @@ impl App {
             .close_uncarried(&self.handoff_carried_messages, Instant::now())
     }
 
-    /// THE GRACEFUL EXIT'S LAST WORD (design ruling 267): every row still
-    /// open — live work, a held warning, one still queued — is recorded as
-    /// cut off by aterm quitting (`Retired::Quit`, with the percent a
-    /// determinate row had reached), and the log is flushed, because the
-    /// exit seam `forget`s the App and its writer's drop-time join never
-    /// runs. A successor still frozen before its handoff commit writes
+    /// The graceful exit's last word: every row still open (live work, a held warning, one still
+    /// queued) is recorded as cut off by aterm quitting (`Retired::Quit`, with the percent a
+    /// determinate row reached), and the log is flushed, because the exit seam `forget`s the App
+    /// and its writer's drop-time join never runs. A successor still frozen before Commit writes
     /// nothing: those rows are its parent's.
     pub(crate) fn close_messages_at_exit(&mut self) -> usize {
         if self.message_persist_frozen() {
@@ -1065,87 +984,45 @@ impl App {
         closed
     }
 
-    /// Whether the persist drain waits right now: only in the SUCCESSOR of a
-    /// seamless handoff before Commit, whose lines are about rows the parent
-    /// still owns — a refused successor must have written nothing. The
-    /// parent's drain never waits (module doc).
+    /// Whether the persist drain waits: only in a seamless successor before Commit, whose lines
+    /// are about rows the parent still owns, so a refused successor writes nothing. The parent's
+    /// drain never waits (module doc).
     pub(crate) fn message_persist_frozen(&self) -> bool {
         self.incoming_handoff_pending
     }
 
-    /// Commit the band's row count to the window geometry. `true` when the
-    /// count moved (and every window was re-gridded). The committed count
-    /// (`message_band_rows`) is what the chrome-row law reads, so a row is
-    /// reserved and released in the SAME step as the PTY resize — the compose
-    /// can never prepend a row the grid still owns, or vice versa.
+    /// Commit the band's row count to the window geometry; `true` when the count moved (and every
+    /// window was re-gridded). The committed count (`message_band_rows`) is what the chrome-row
+    /// law reads, so a row is reserved and released in the same step as the PTY resize.
     ///
-    /// NEVER MID-HANDOFF. A seamless self-update parks the readers and hands
-    /// the successor an exact window layout; a re-grid here moves `ws.rows`
-    /// outside `window_event`, so at Commit the layout no longer matches and
-    /// the handoff is refused as a topology change — after the user sat
-    /// through the frozen echo. The band keeps its row count until the
-    /// handoff finishes (`Wake::UpdateHandoffFinished` re-syncs); the rows
-    /// themselves keep updating, painted within the committed count. BOTH
-    /// SIDES OF THAT SEAM: the outgoing process holds `pending_update_handoff`;
-    /// the INCOMING one holds `incoming_handoff_pending` instead, and its
-    /// layout is the one the proof compares against what the parent captured.
+    /// Never mid-handoff: the successor must get the parent's exact layout, and a re-grid here
+    /// moves `ws.rows` outside `window_event`, which Commit refuses as a topology change; the band
+    /// keeps its count until `Wake::UpdateHandoffFinished` re-syncs. Not deferred before a handoff
+    /// either: the "update staged" row rises seconds before the park, and its resize is ordinary
+    /// state the checkpoint carries (bounded by `seamless::checkpoint_meta_bound_violation`).
     ///
-    /// AND NOT BEFORE IT EITHER — by design, and recorded here so nobody
-    /// "fixes" it by deferring the row. The "update staged" row is raised
-    /// when a build is ARMED, before any attempt exists, so its one row
-    /// lands on every session seconds before the park: on 2026-09-22 it
-    /// shrank 56-row sessions to 55, and a Claude Code tab whose DECSC slot
-    /// sat on row 55 refused the visible-checkpoint set on every release
-    /// from v0.87.0 to v0.90.0. The fix was the wire's bound on that slot
-    /// (`seamless::checkpoint_meta_bound_violation`), not this shrink: a
-    /// resize a second before a handoff is ordinary desk state the
-    /// checkpoint must carry, and a 55-row refusal in the log under a
-    /// 56-row window is this shrink, not a mystery.
+    /// Never more rows than the glass can spare: `grid_dims_for` floors the terminal at one row,
+    /// so chrome that outgrew the window would be clipped; the band yields instead. Each window
+    /// affords its terminal rows plus the committed band rows, so the answer does not depend on
+    /// the re-grid it triggers, and the smallest window decides. The center's hysteresis
+    /// (`commit_rows`) grows at once and shrinks after its quiet, and anchors a row's hold only
+    /// within the committed count, so a clamped row never burns its hold unpainted.
     ///
-    /// …AND NEVER MORE ROWS THAN THE GLASS CAN SPARE. `grid_dims_for` floors
-    /// the terminal at one row, so chrome that outgrows the window does not
-    /// shrink the grid — it makes the COMPOSED frame taller than the window,
-    /// and the surplus is simply clipped. The band yields instead: it is
-    /// chrome about background work, and background work never outranks the
-    /// one row of terminal the user is actually looking at. Measured against
-    /// what each window CURRENTLY affords — its terminal rows plus whatever
-    /// band rows are already committed — so the answer does not depend on the
-    /// re-grid it is about to trigger; the smallest window decides, because
-    /// the count is global. The clamp is passed INTO the center
-    /// (`commit_rows`), whose D1 hysteresis grows at once and shrinks after
-    /// its quiet — measured against `now`, the instant the caller's settle
-    /// ran at, so the two agree on the clock — and which anchors a row's hold
-    /// only when the row is within the committed count — a clamped third row
-    /// never burns its hold unpainted.
-    ///
-    /// THE TWO COUNTS CONVERGE HERE. The geometry's count (`message_band_rows`)
-    /// and the center's (`committed_rows`) agree on every step this method
-    /// takes, and disagree in exactly one state: the successor of a seamless
-    /// handoff, which reserved the rows its parent had COMMITTED (the layout
-    /// the proof compares) while the center it re-seeded counts the rows the
-    /// parent CARRIED — a row the parent's frozen count had queued makes the
-    /// center's count one higher (`seed_carried`). Once the freeze lifts the
-    /// geometry takes the center's count whether or not `commit_rows` moved
-    /// it this step, so a carried row is never presented into a row the
-    /// window does not own.
-    ///
-    /// The commit and the convergence are the engine's (`drive::commit`); the
-    /// window set it measures and the re-grid are this host's.
+    /// The geometry's count and the center's (`committed_rows`) differ only in a seamless
+    /// successor: it reserves the rows its parent committed while its re-seeded center counts the
+    /// rows carried, one more when the parent's frozen count had queued a row (`seed_carried`).
+    /// Once the freeze lifts the geometry takes the center's count, so a carried row never paints
+    /// into a row the window does not own.
     pub(crate) fn sync_message_band_rows(&mut self, now: Instant) -> bool {
         let commit = self.band_commit(now);
         let regrid = drive::commit(&mut self.messages, commit);
         self.regrid_message_band(regrid, now)
     }
 
-    /// What this host's step commits against: the instant, the handoff
-    /// freeze, the rows every window WITH GLASS affords (a headless window
-    /// has none to spare, so it never clamps; "glass" is
-    /// `app_presence::chrome_regrids_grid`, which is `os_window.is_some()`
-    /// outside the tests; inside a chrome re-grid batch, the rows its pending
-    /// re-grid gives — `App::chrome_commit_grid_rows`), the rows its geometry
-    /// reserves, and the windows' chrome regrow floor — the latest of every
-    /// window whose grid the band's re-grid resizes (`App::band_regrow_floor`,
-    /// ruling 414).
+    /// What this host's step commits against: the instant, the handoff freeze, the rows every
+    /// window with glass affords (`App::chrome_commit_grid_rows`; a headless window has none to
+    /// spare, so it never clamps), the rows its geometry reserves, and the regrow floor of the
+    /// windows the band's re-grid resizes (`App::band_regrow_floor`).
     fn band_commit(&self, now: Instant) -> drive::Commit {
         drive::Commit {
             now,
@@ -1163,12 +1040,10 @@ impl App {
         }
     }
 
-    /// Take the row count the engine committed into the window geometry and
-    /// re-grid every window. `true` when there was one to take. A RISE
-    /// (`aterm_messages::chrome::is_rise`) is noted on every window's regrow
-    /// floor at the step's `now`, before the re-grid, so no other chrome
-    /// source's fall re-grids a window back inside the settle (ruling 414,
-    /// proposed).
+    /// Take the row count the engine committed into the window geometry and re-grid every
+    /// window; `true` when there was one to take. A rise (`aterm_messages::chrome::is_rise`) is
+    /// noted on every window's regrow floor at `now`, before the re-grid, so no other chrome
+    /// source's fall re-grids a window back inside the settle.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1207,30 +1082,22 @@ impl App {
         true
     }
 
-    /// Whether a handoff is freezing the holds, the re-grid and the persist
-    /// drain right now. ONE predicate, read by the settle and by the deadline
-    /// that arms it, so the loop can never arm a wake its own settle will
-    /// decline to act on.
+    /// Whether a handoff is freezing the holds and the re-grid right now. One predicate, read by
+    /// the settle and by the deadline that arms it, so the loop never arms a wake its own settle
+    /// will decline to act on.
     pub(crate) fn message_holds_frozen(&self) -> bool {
         self.update_handoff_parked() || self.incoming_handoff_pending
     }
 
-    /// The next instant the band needs the loop back — what
-    /// [`Self::sync_messages`] would act on, freeze included — or the
-    /// instant the next Settings ▸ Messages publish falls due
-    /// (`messages_publish_due_at`: a publish the 2 Hz gap held back, or the
-    /// minute tick while a view is on the route; performed by
-    /// `publish_native_messages_state_if_due` at the park that wake ends
-    /// in). `None` with nothing armed: an idle band never wakes the loop
-    /// (FL-1).
+    /// The next instant the band needs the loop back (what [`Self::sync_messages`] would act on,
+    /// freeze included), or the instant the next Settings ▸ Messages publish falls due
+    /// (`messages_publish_due_at`: a publish the 2 Hz gap held back, or the minute tick while a
+    /// view is on the route). `None` with nothing armed: an idle band never wakes the loop.
     pub(crate) fn messages_deadline(&self) -> Option<Instant> {
-        // The engine's state deadline (holds, echoes, patience, the wire's
-        // one paced paint, ruling 170) and this host's own publish; `None`
-        // when idle (FL-1).
+        // Holds, echoes, patience and the wire's one paced paint.
         let state =
             drive::state_deadline(&self.messages, &self.wire_gate, self.message_holds_frozen());
-        // ... and the instant the digest next has something to end on its own
-        // (an entry no reporter named for ten minutes); `None` when idle.
+        // The digest ends an entry no reporter named for ten minutes.
         [
             state,
             self.messages_publish_due_at(),
@@ -1338,19 +1205,14 @@ impl App {
         Self::update_bar_press_applies(offered, staged_ready, handoff_available)
     }
 
-    /// Perform one plain-data intent the engine returned for row `id` in
-    /// window `wid` — a capsule press, a body press, a screen reader's
-    /// activate, a button on Settings ▸ Messages. The row's own lifecycle is
-    /// the engine's (`act` retired it already if the intent closes it); this
-    /// only does the thing. `true` when it was done, `false` when it was
-    /// refused (a route this build has no page for, a path that is not a
-    /// crash log, a system pane that did not open) — the page words its
-    /// feedback from it; the band's press paths have nothing to say back.
+    /// Perform one plain-data intent the engine returned for row `id` in window `wid` (a capsule,
+    /// a body press, a screen reader's activate, a Settings ▸ Messages button). The row's
+    /// lifecycle is the engine's (`act` already retired it if the intent closes it). `false` when
+    /// refused (no page for the route, not a crash log, the system pane did not open).
     pub(crate) fn perform_intent(&mut self, wid: WindowId, id: MessageId, intent: Intent) -> bool {
         let now = Instant::now();
-        // A NAVIGATION press (a Settings page, `aterm.toml`, the crash log) that
-        // took the person there READ the row (design §10.5 H6): a held or
-        // standing row folds once they have gone to fix it; live and ask rows
+        // A navigation press (a Settings page, `aterm.toml`, the crash log) that took the person
+        // there read the row (design §10.5 H6): a held or standing row folds; live and ask rows
         // stay, and a record re-offered from the page is a no-op.
         let navigation = matches!(
             intent,
@@ -1374,17 +1236,14 @@ impl App {
         now: Instant,
     ) -> bool {
         match intent {
-            // THE DETAILS PRESS (design §2.2, §3.6): the row is read — the
-            // engine marks it seen, which folds a held row now — and Settings
-            // ▸ Messages opens at this entry in the pressed window. Seen
-            // FIRST: the open publishes the page's projection, and the entry
-            // it selects should already read as folded, not as a row about
-            // to leave (a second publish inside the 2 Hz gate would wait).
+            // Details (design §2.2, §3.6): mark the row seen (a held row folds now), then open
+            // Settings ▸ Messages at this entry in the pressed window. Seen first, so the open's
+            // publish already shows it folded (a second publish inside the 2 Hz gate would wait).
             Intent::Details => {
                 if self.messages.mark_seen(id, now) {
                     self.sync_messages();
                 }
-                // The file-access question READ: never re-offered in this
+                // The file-access question was read: never re-offered in this
                 // process, and its fold is not the unanswered path (the
                 // watch for the grant continues).
                 if self.consent_card_message == Some(id) {
@@ -1399,11 +1258,8 @@ impl App {
                     false
                 }
             },
-            // The config reporters (`message_reporters`, R1–R4, R6, R12, R13)
-            // carry no line — the editor host has no line target today
-            // (`ConfigEditorTarget` is a key or a search) — so the editor opens
-            // at the top, through the existing `AppEffect::OpenConfigEditor`
-            // body.
+            // The config reporters carry no line and `ConfigEditorTarget` is a key or a search,
+            // so the editor opens at the top.
             Intent::OpenConfigEditor { line: _ } => {
                 match self.ensure_and_open_config_editor_at_in_window(wid, None) {
                     Ok(_) => true,
@@ -1505,8 +1361,8 @@ impl App {
                 Some(proxy) => proxy.send_event(crate::Wake::CreateWindow).is_ok(),
                 None => false,
             },
-            // `Stop paste` (ruling 231): the rest of the paste is dropped, the
-            // input after it goes through, and the row fades.
+            // `Stop paste`: the rest of the paste is dropped, the input after it goes through,
+            // and the row fades.
             Intent::StopPaste { session } => self.stop_paste(session),
             // `End sessions` on the PTY keeper's recovery row: every shell
             // this launch reattached is hung up (`keeper_link`).
@@ -1544,16 +1400,10 @@ impl App {
         }
     }
 
-    /// SETTINGS ▸ MESSAGES, AT AN ENTRY, IN THIS WINDOW (design §4.5, D5):
-    /// install or reuse `wid`'s own Settings view on the Messages route —
-    /// `open_settings_tab_in_window`, so a press in a background window opens
-    /// the page there and raises it — then, with an id, select that entry
-    /// through the page's own `settings/messages/select` action (the
-    /// `settings/route` host path `open_settings_tab` itself uses): the
-    /// reducer expands it, clears a chip that would hide it and pages to
-    /// it. The overflow row and its a11y link pass `None`: the page, top of
-    /// the log, nothing expanded. `false` when the window has no Settings
-    /// to show — a window with no tabs to install into.
+    /// Settings ▸ Messages at an entry, in this window (design §4.5): install or reuse `wid`'s
+    /// Settings view on the Messages route, then, with an id, select the entry through
+    /// `settings/messages/select` (the reducer expands it, clears a chip that would hide it and
+    /// pages to it). `None` opens the page at the top. `false` when the window has no Settings.
     pub(crate) fn open_messages_entry(&mut self, wid: WindowId, id: Option<MessageId>) -> bool {
         if !self.open_settings_tab_in_window(wid, SettingsRoute::Messages) {
             return false;
@@ -1589,20 +1439,12 @@ impl App {
             .then_some(wid)
     }
 
-    /// THE PAGE'S OWN PRESS on an entry's button (design §4.4,
-    /// `AppEffect::MessageAct`): the reducer named the entry and the button
-    /// by IDENTITY — an id and an index, never a path or a route — and the
-    /// host resolves both here. A LIVE row goes through the engine's `act`
-    /// (the press is logged, a `Not now` retires its row) exactly as a band
-    /// capsule does; a RETIRED record re-offers the intent the log kept
-    /// (design §1.3: every intent is codec-able for exactly this), except a
-    /// decision, which only a live row can answer, and anything else the
-    /// record no longer offers ([`aterm_messages::LogRecord::still_offers`],
-    /// the page's and the wire's one rule: an intent that acted on the live
-    /// row, or the word it was answered with — a stale page press performed
-    /// `Show tab` or `Stop paste` for a row already gone, round 44). Then the
-    /// intent is performed in `wid` and the outcome worded for the page's
-    /// feedback.
+    /// The page's own press on an entry's button (design §4.4, `AppEffect::MessageAct`), named
+    /// by id and index. A live row goes through the engine's `act` as a band capsule does; an
+    /// open exception through `act_digest`; a retired record re-offers the intent the log kept,
+    /// unless it is a decision (only a live row answers one) or the record no longer offers it
+    /// ([`aterm_messages::LogRecord::still_offers`]). The intent is performed in `wid` and the
+    /// outcome worded for the page's feedback.
     pub(crate) fn perform_message_act(
         &mut self,
         wid: WindowId,
@@ -1612,9 +1454,9 @@ impl App {
         let Some(id) = MessageId::from_raw(id) else {
             return MessageActOutcome::Gone;
         };
-        // THE PAGE'S OWN CAPSULES on an open exception (view-time: no intent, nothing
-        // stored): `Dismiss` files this entry, `Dismiss all` the whole digest, each
-        // flushed to the log before the press returns.
+        // The page's own capsules on an open exception (view-time, no intent stored): `Dismiss`
+        // files this entry, `Dismiss all` the whole digest, each flushed to the log before the
+        // press returns.
         if action == page::DISMISS_ACTION && self.messages.digest_entry(id).is_some() {
             return if self.dismiss_exception(id) {
                 MessageActOutcome::Performed {
@@ -1641,7 +1483,7 @@ impl App {
             intent
         } else if self.messages.digest_entry(id).is_some() {
             // An open exception: the press is on record (`Acted`), the
-            // entry's own action files it ANSWERED (the owner did what it
+            // entry's own action files it answered (the owner did what it
             // asked), a navigation leaves it (`MessageCenter::act_digest`).
             let intent =
                 self.messages
@@ -1686,21 +1528,15 @@ impl App {
         )
     }
 
-    /// `notice …` on the main thread (design §5.2, rulings 163-198): the
-    /// engine decides — verdict, caps, mint budget, pacing, reply words — and
-    /// the host paints. `act` is the one form the host performs: the engine
-    /// names the capsule and spends its press budget (`wire::press_target`),
-    /// then the page's own press ([`Self::perform_message_act`]) runs in the
-    /// front window (window 0 on a headless instance), exactly what a click on
-    /// the capsule does. Returns the whole reply line without its `\n`.
+    /// `notice …` on the main thread (design §5.2): the engine decides (verdict, caps, mint
+    /// budget, pacing, reply words) and the host paints. `act` is the one form the host performs:
+    /// the engine names the capsule and spends its press budget (`wire::press_target`), then
+    /// [`Self::perform_message_act`] runs in the front window (window 0 when headless). Returns
+    /// the reply line without its `\n`.
     ///
-    /// NOT WHILE PARKED (round-seven update audit, finding 32): the band
-    /// crossed to the successor in the carry the park captured, and this
-    /// process `_exit`s at Commit — a row posted now would never be shown (and
-    /// a script is told its id for the row it asked for), and a dismiss, a
-    /// re-word or a press would be undone there. The script is told to retry
-    /// ([`wire::switching_reply`]), and its retry reaches the new version (or
-    /// this one, if the switch stood down).
+    /// Refused while parked for an update ([`wire::switching_reply`]): the band crossed in the
+    /// carry and this process `_exit`s at Commit, so the script's retry reaches whichever version
+    /// stands.
     pub(crate) fn take_notice(&mut self, req: wire::NoticeRequest) -> String {
         self.take_notice_within(req, MESSAGES_FLUSH_UI_WAIT)
     }
@@ -1768,14 +1604,8 @@ impl App {
         applied.reply
     }
 
-    /// THE PROJECTION, built once from the ring (design §4.2) by the engine
-    /// ([`MessagesState::of`], design ruling 382) over this App's facts
-    /// ([`PageDesk`]): every record newest first, the live rows in their
-    /// current words, the band row each is on, and whether each authored
-    /// intent can still be pressed — the staged build read once for every
-    /// `Install now`, the crash log's file stat'd per `Open log` (a few
-    /// records at most; the publish runs at 2 Hz at the most). Tag counts in
-    /// the chips' order.
+    /// The page's projection, built by the engine ([`MessagesState::of`]) over this App's facts
+    /// ([`PageDesk`]).
     pub(crate) fn messages_state(&self) -> MessagesState {
         MessagesState::of(&self.messages, &PageDesk::of(self))
     }
@@ -1786,17 +1616,10 @@ impl App {
 // ---------------------------------------------------------------------------
 
 impl App {
-    /// THE BODY PRESS — one law everywhere (design §2.2, interim answer 2):
-    /// a press on any part of a row that is not a capsule is the row's
-    /// `Details ›` — Settings ▸ Messages opens at that entry in the pressed
-    /// window and the row is marked seen (a held row folds; the config
-    /// band's "click at a notice you have read", now recorded and with a
-    /// destination). A decision row is answered only by its capsules. The
-    /// mouse (`press_band`) and a screen reader's activate on the row share
-    /// this one entry, so the two can never disagree about what a press on
-    /// the body does. Phase 1's law — the body performed the first authored
-    /// intent while the page a Details press opens did not exist — is gone
-    /// with the page's arrival.
+    /// The body press: a press on any part of a row that is not a capsule is the row's
+    /// `Details ›` (Settings ▸ Messages opens at that entry in the pressed window and the row is
+    /// marked seen). A decision row is answered only by its capsules. The mouse (`press_band`)
+    /// and a screen reader's activate share this entry, so they never disagree.
     pub(crate) fn press_message_body(&mut self, wid: WindowId, id: MessageId) {
         if self.messages.live(id).is_none() {
             return;
@@ -1806,16 +1629,13 @@ impl App {
 }
 
 // ---------------------------------------------------------------------------
-// The toolchain reporters' glue (R25–R34).
+// The toolchain reporters' glue.
 // ---------------------------------------------------------------------------
 
 impl App {
-    /// The dialect of the atpkg hook the frozen-tab note tells a person to
-    /// source ([`HookDialect`]): the shell this window spawns, read from the
-    /// spawn configuration (`--shell` / config `shell` / `$SHELL`) the way
-    /// the spawn seam reads it, so a config `shell = "fish"` gets fish's
-    /// `source`. The bars pinned it once at construction; read at post time
-    /// it can never go stale against a reloaded config.
+    /// The dialect of the atpkg hook the frozen-tab note tells a person to source: the shell this
+    /// window spawns, read from the spawn configuration (`--shell` / config `shell` / `$SHELL`)
+    /// as the spawn seam reads it, at post time so it follows a reloaded config.
     pub(crate) fn hook_dialect(&self) -> HookDialect {
         HookDialect::from(crate::spawn::detect_spawn_shell(
             self.session_factory.shell_override.as_deref(),
@@ -1855,9 +1675,8 @@ impl App {
             return false;
         };
         let versions = toolchain_words::managed_items(text);
-        // The record re-worded must still be one: past the ring's cap, or
-        // retired otherwise, the counts it would carry are a new record's —
-        // never silence until the versions move (review of 2026-10-09).
+        // Re-word only a record still in the ring as `Recorded`; otherwise the counts are a new
+        // record's.
         if let Some((said, id)) = &self.managed_current_recorded
             && *said == versions
             && self
@@ -1874,12 +1693,9 @@ impl App {
         true
     }
 
-    /// A HARNESS NOTE (`aterm ctl appnotice harness <text>`, an agent
-    /// harness's acts): a `harness`-tagged record, never a row
-    /// ([`crate::message_reporters::harness_note`], design ruling 61) — on
-    /// `appstatus` as `kind=harness`, in `messages.log` and on Settings ▸
-    /// Messages. A note repeated word for word is not written again. `true`
-    /// when a record was written.
+    /// A harness note (`aterm ctl appnotice harness <text>`): a `harness`-tagged record, never a
+    /// row ([`crate::message_reporters::harness_note`]); a note repeated word for word is not
+    /// written again. `true` when a record was written.
     pub(crate) fn record_harness_note(&mut self, text: &str) -> bool {
         let msg = crate::message_reporters::harness_note(text);
         if self.harness_note_recorded.as_deref() == Some(msg.title.as_str()) {
@@ -1890,7 +1706,7 @@ impl App {
         true
     }
 
-    /// R33 — `machine-settings:`: one record per item, in wire order
+    /// `machine-settings:`: one record per item, in wire order
     /// ([`toolchain_words::machine_settings`]), never a row.
     pub(crate) fn post_machine_settings(&mut self, text: &str) {
         for msg in toolchain_words::machine_settings(text) {
@@ -1898,14 +1714,11 @@ impl App {
         }
     }
 
-    /// `foreign:` — what one of a pass's looks found that aterm LEAVES ALONE, with
-    /// atpkg's fix ([`toolchain_words::foreign_report`]; audit 2026-10-09: a foreign
-    /// rustup `trust` link and a managed tool shadowed on PATH were prose 30-odd passes
-    /// printed, logged and shown to no one). Each look — the rustup seam, the PATH
-    /// shadow reconcile — reports every time it runs, so each has ONE exceptions entry
-    /// of its own ([`toolchain_words::foreign_tools_entry`]): raised, or re-worded in
-    /// place, while its report names something, and ended by its first report that
-    /// names nothing. A body this build cannot read changes nothing.
+    /// `foreign:`: what one of a pass's looks found that aterm leaves alone, with atpkg's fix
+    /// ([`toolchain_words::foreign_report`]). Each look (the rustup seam, the PATH shadow
+    /// reconcile) reports on every run and owns one exceptions entry
+    /// ([`toolchain_words::foreign_tools_entry`]): raised or re-worded while its report names
+    /// something, ended by one that names nothing.
     pub(crate) fn note_foreign_tools(&mut self, body: &str) {
         let Some((scope, items)) = toolchain_words::foreign_report(body) else {
             aterm_log::info!("atpkg foreign: a report this build cannot read: {body}");
@@ -1951,18 +1764,15 @@ impl App {
         }
     }
 
-    /// R25 — a pass opens (`net-starting:`). Only a FIRST
-    /// RUN opens the row (`first_run`, the lane's verdict for the child that
-    /// printed it: `crate::pass_is_first_run`); a routine pass's announcement
-    /// is the arm's log line alone (the silent lane, upstream dbf97ecff). The
-    /// first-run child LATCHES the row from here until its exit
-    /// ([`Self::toolchain_pass_ended`]).
+    /// A pass opens (`net-starting:`). Only a first run opens the row (`first_run`, the lane's
+    /// verdict for the child that printed it: `crate::pass_is_first_run`); a routine pass's
+    /// announcement is the arm's log line alone. The first-run child latches the row until its
+    /// exit ([`Self::toolchain_pass_ended`]).
     pub(crate) fn announce_toolchain_pass(&mut self, detail: &str, first_run: bool) {
         if !first_run {
-            // A person's verb (ruling 224): its busy row takes the size the
-            // announcement names — how big the wait is — until the plan lands.
-            // While it queues, an announcement is the holder's (the lane's
-            // own child), not the size of the person's wait (ruling 229).
+            // A person's verb: its busy row takes the size the announcement names until the plan
+            // lands. While it queues, an announcement is the holder's, not the size of the
+            // person's wait.
             if let Some(verb) = self.toolchain_person
                 && !self.toolchain_person_waiting
             {
@@ -2034,32 +1844,20 @@ impl App {
         }
     }
 
-    /// R26 — one classified `progress.json` read from the child-scoped
-    /// tailer (`Wake::PkgProgress`; `None` = the file vanished at child
-    /// exit), applied against the row that carries the pass
-    /// ([`toolchain_words::KEY_PASS`]). `first_run` is the lane's verdict for
-    /// the child the tailer is scoped to:
+    /// One classified `progress.json` read from the child-scoped tailer (`Wake::PkgProgress`;
+    /// `None` = the file vanished at child exit), applied to the pass's row
+    /// ([`toolchain_words::KEY_PASS`]); `first_run` is the lane's verdict for the tailed child.
     ///
-    /// * a FIRST RUN paints, and so does a VERY HEAVY routine pass — one that
-    ///   planned at least [`toolchain_words::HEAVY_PASS_BYTES`] (design §10.5
-    ///   H8, ruling 84): `Updating ALab tools`, posted after the
-    ///   progress grace so a pass that ends quickly never touches the glass.
-    ///   Either LATCHES the row: one open, one fold, at the child's exit. A
-    ///   read restates the live row in place (a restate costs no log line, so
-    ///   the 10 Hz tailer is free) or posts it when none is up, and records the
-    ///   meter's high-water mark for the next read's clamp. A light routine
-    ///   pass's reads paint nothing;
-    /// * a read of a pass that is OVER, and a vanished file, claim NO outcome
-    ///   (the markers' records do): an UNLATCHED live row is withdrawn at once
-    ///   (its fade); a latched one is the child's exit's to fold;
-    /// * a plan of nothing leaves the glass alone (an announced row keeps its
-    ///   announcement until the plan lands);
-    /// * a HELD row on the key — a carried one, from a build before the
-    ///   silent lane — is left alone. A first run's FAILURE row
-    ///   ([`toolchain_words::first_run_short`], held too) is an outcome, not
-    ///   work: a read of a pass that paints replaces it by key — a retry from
-    ///   Settings ▸ Packages shows its progress at once, never behind the
-    ///   failure it is answering — and an over or vanished read leaves it.
+    /// * A first run paints, and so does a routine pass that planned at least
+    ///   [`toolchain_words::HEAVY_PASS_BYTES`] (design §10.5 H8), revealed after the progress
+    ///   grace. Either latches the row: one open, one fold, at the child's exit. A read restates
+    ///   the live row in place (no log line) or posts it, and records the meter's high-water mark
+    ///   for the next read's clamp. A light routine pass paints nothing.
+    /// * A read of a pass that is over, or a vanished file, claims no outcome (the markers'
+    ///   records do): an unlatched row is withdrawn at once; a latched one is the exit's to fold.
+    /// * A plan of nothing leaves the glass alone, and so does a held (carried) row. A first
+    ///   run's failure row ([`toolchain_words::first_run_short`]) is replaced by a painting read,
+    ///   so a retry shows its progress at once; an over or vanished read leaves it.
     pub(crate) fn apply_toolchain_snapshot(
         &mut self,
         snap: Option<&crate::PkgProgressSnapshot>,
@@ -2080,9 +1878,9 @@ impl App {
             && snap.is_some_and(|s| {
                 s.running && s.file.overall.bytes_total >= toolchain_words::HEAVY_PASS_BYTES
             });
-        // WHO WAITS DECIDES (rulings 220, 224; the rule is the engine's): a
-        // first run and a person's Settings verb are waited on and paint
-        // whatever they weigh; a routine pass paints only while very heavy.
+        // Who waits decides (the rule is the engine's): a first run and a person's Settings verb
+        // are waited on and paint whatever they weigh; a routine pass paints only while very
+        // heavy.
         let person = self.toolchain_person;
         let waiter = aterm_messages::Waiter::of(first_run || person.is_some());
         let paints = waiter.takes_row(heavy) || self.toolchain_row_latched;
@@ -2095,8 +1893,8 @@ impl App {
             SnapshotWords::Vanished | SnapshotWords::Over => match person {
                 _ if self.toolchain_row_latched => {}
                 None => self.retire_live_toolchain(None),
-                // The HOLDER the person queued behind is done: its last frame
-                // leaves, and the row says again that they wait (ruling 229).
+                // The holder the person queued behind is done: its last frame leaves, and the
+                // row says again that they wait.
                 Some(verb) if self.toolchain_person_waiting => {
                     self.restore_person_row(crate::message_reporters::packages_waiting_row(verb))
                 }
@@ -2142,13 +1940,10 @@ impl App {
         }
     }
 
-    /// Fold the LIVE toolchain row — the meter or its announcement — with no
-    /// words of its own: the pass it tracked is over, and what it came to is
-    /// a marker's record. WITHDRAWN, so `appstatus` lists no finished activity
-    /// for it (the bars dropped the bar without a ledger row, ruling 13); the
-    /// glass ends its indicator with `echo` (the child's exit names Complete
-    /// or Fault; a vanished read, a fade). A held row (a carried one) is left
-    /// standing.
+    /// Withdraw the live toolchain row (meter or announcement): its pass is over and its outcome
+    /// is a marker's record, so `appstatus` lists no finished activity for it. The indicator ends
+    /// with `echo` (Complete or Fault at the child's exit; a fade for a vanished read). A held
+    /// (carried) row stands.
     fn retire_live_toolchain(&mut self, echo: Option<EchoKind>) {
         self.toolchain_pass_peak = None;
         let Some(id) = self
@@ -2171,12 +1966,10 @@ impl App {
         }
     }
 
-    /// A marker ANSWERED a pass: the outcome is `msg`'s RECORD
-    /// ([`toolchain_words::installed`] / `ended` / `failed` — each
-    /// [`Hold::LogOnly`]), and the live row folds — unless it is LATCHED (a
-    /// first run, or a heavy routine pass), whose answer may be one
-    /// sub-pass's (the vendor lane's, before the ALab set's; upstream
-    /// ac7942234): its child's exit folds it.
+    /// A marker answered a pass: the outcome is `msg`'s record ([`toolchain_words::installed`] /
+    /// `ended` / `failed`, each [`Hold::LogOnly`]), and the live row folds, unless it is latched
+    /// (a first run or a heavy routine pass, whose answer may be one sub-pass's) or a person's
+    /// verb holds it: then its child's exit folds it.
     pub(crate) fn record_toolchain_outcome(&mut self, msg: Message) {
         if !self.toolchain_row_latched && self.toolchain_person.is_none() {
             self.retire_live_toolchain(None);
@@ -2184,12 +1977,11 @@ impl App {
         self.record_message(msg);
     }
 
-    /// A marker said the latched FIRST RUN is ending short (`seed-failed:`,
-    /// `net-failed:`, `seed-partial:`, `seed-nothing:`, a `seed-unusable:`
-    /// that is not a fact about the machine): its failure row is held for the
-    /// child's exit ([`Self::toolchain_pass_ended`]). Not a first run — a
-    /// heavy routine pass, or no latched row at all — keeps only the record:
-    /// the versions already installed keep working.
+    /// A marker said the latched first run is ending short (`seed-failed:`, `net-failed:`,
+    /// `seed-partial:`, `seed-nothing:`, a `seed-unusable:` that is not a fact about the
+    /// machine): its failure row is held for the child's exit ([`Self::toolchain_pass_ended`]).
+    /// Otherwise (a heavy routine pass, or no latched row) only the record stays: the versions
+    /// already installed keep working.
     pub(crate) fn note_toolchain_first_run_short(
         &mut self,
         how: toolchain_words::FirstRunShort,
@@ -2200,15 +1992,11 @@ impl App {
         }
     }
 
-    /// The lane's child EXITED (`Wake::PkgPassEnded`): whatever it held on the
-    /// glass folds now — ONE open and ONE fold per latched child, however
-    /// many sub-passes it ran — and its indicator ends by how the child
-    /// exited: Complete when `clean`, Fault when not. The record stays
-    /// `Withdrawn` (ruling 13: `appstatus` claims no outcome for it). A FIRST
-    /// RUN that exits unclean after a marker said it ended short leaves its
-    /// failure row behind the Fault echo — the deliverable the row told the
-    /// person to wait for did not arrive, and they have something to do
-    /// (review 2026-09-24).
+    /// The lane's child exited (`Wake::PkgPassEnded`): whatever it held on the glass folds now
+    /// (one open and one fold per latched child, however many sub-passes it ran), its indicator
+    /// ending Complete when `clean`, Fault when not. The record stays `Withdrawn` (`appstatus`
+    /// claims no outcome for it). A first run that exits unclean after a marker said it ended
+    /// short leaves its failure row behind the Fault echo: the person has something to do.
     pub(crate) fn toolchain_pass_ended(&mut self, clean: bool) {
         // The LANE'S row outlives its launch seed (`Self::open_first_run_ahead`): the
         // update that follows takes it over, and that child's exit is the one fold.
@@ -2231,10 +2019,9 @@ impl App {
         let first_run = std::mem::take(&mut self.toolchain_first_run);
         let short = self.toolchain_first_run_short.take();
         if let Some(verb) = self.toolchain_person {
-            // A person's verb is waiting (queued behind this child, or
-            // running beside its exit): the row is theirs. A latched lane row
-            // ends as the lane's work did, and the person's own row comes back
-            // after the grace if their verb is still running (ruling 224).
+            // A person's verb is waiting (queued behind this child, or running beside its exit):
+            // the row is theirs. A latched lane row ends as the lane's work did, and the person's
+            // row comes back after the grace if their verb is still running.
             if latched {
                 self.retire_live_toolchain(echo);
                 match short {
@@ -2262,17 +2049,12 @@ impl App {
         }
     }
 
-    /// A PERSON'S SETTINGS ▸ PACKAGES VERB (`Wake::PkgPersonPass`, design
-    /// ruling 224). They pressed it and wait for it, so its pass takes the
-    /// band's row whatever it weighs — the 250 MB bar is for work nobody
-    /// asked for. `Began` puts up the verb's busy row, revealed after the
-    /// progress grace (a 1–4 s no-op Check never reaches the glass);
-    /// `Waiting` says it is queued behind another pass, `Running` that it took
-    /// the lock; the tailer's reads restate it with the fill and the ETA once
-    /// the plan lands (`apply_toolchain_snapshot`); `Ended` folds it with the
-    /// echo the worker names — Complete with the verb's finished words, Fault,
-    /// or a Vanish for a wait that ran out. The outcome stays the markers'
-    /// records (`ALab tools checked`, …) and the page's headline.
+    /// A person's Settings ▸ Packages verb (`Wake::PkgPersonPass`). They wait for it, so its
+    /// pass takes the band's row whatever it weighs. `Began` puts up the verb's busy row after
+    /// the progress grace (a quick no-op Check never reaches the glass); `Waiting` and `Running`
+    /// say it queued behind another pass or took the lock; the tailer's reads add the fill and
+    /// ETA (`apply_toolchain_snapshot`); `Ended` folds it with the worker's echo. The outcome is
+    /// the markers' records and the page's headline.
     pub(crate) fn person_pass(&mut self, event: PersonPass) {
         use crate::message_reporters::{packages_verb_row, packages_waiting_row};
         match event {
@@ -2289,9 +2071,8 @@ impl App {
                 }
             }
             PersonPass::Running => {
-                // Back to the verb's own busy row, whatever the holder's
-                // reads left on it — its fill, its ETA, its finished words
-                // (ruling 229). A latched lane row is the lane's until its
+                // Back to the verb's own busy row, whatever the holder's reads left on it (its
+                // fill, its ETA, its finished words). A latched lane row is the lane's until its
                 // exit, which puts the person's row back itself.
                 let waited = std::mem::take(&mut self.toolchain_person_waiting);
                 if let Some(verb) = self.toolchain_person
@@ -2313,11 +2094,10 @@ impl App {
         }
     }
 
-    /// Put `row` (a person's busy verb or waiting row) on the lane's key: a
-    /// row that is not up yet is posted (its grace from now; it supersedes a
-    /// first run's failure row, as a retry's reads do); a BUSY row already up
-    /// is restated in place — its reveal kept — when `restate`; a row with a
-    /// fill (a plan's meter) or a held one is left alone.
+    /// Put `row` (a person's busy verb or waiting row) on the lane's key: a row not up yet is
+    /// posted (its grace from now; it supersedes a first run's failure row, as a retry's reads
+    /// do); a busy row already up is restated in place, its reveal kept, when `restate`; a row
+    /// with a fill (a plan's meter) or a held one is left alone.
     fn show_person_row(&mut self, row: Message, restate: bool) {
         let live = self
             .messages
@@ -2343,10 +2123,9 @@ impl App {
         }
     }
 
-    /// Put the person's `row` back over whatever the HOLDER'S reads left on
-    /// the lane's key — its fill included, which [`Self::show_person_row`]
-    /// keeps (ruling 229). The holder's high-water mark goes with it. A held
-    /// row is left alone; a failure row, or none, is posted over.
+    /// Put the person's `row` back over whatever the holder's reads left on the lane's key, its
+    /// fill included (which [`Self::show_person_row`] keeps), and drop the holder's high-water
+    /// mark. A held row is left alone; a failure row, or none, is posted over.
     fn restore_person_row(&mut self, row: Message) {
         self.toolchain_pass_peak = None;
         let live = self
@@ -2362,17 +2141,15 @@ impl App {
         }
     }
 
-    /// Whether a painting read is the HOLDER'S and must not paint the
-    /// person's row (ruling 229):
+    /// Whether a painting read is the holder's and must not paint the person's row:
     ///
-    /// * a read tailed while the person queues is the holder's — noted by the
-    ///   pid that wrote it, and painted, as what they wait behind;
-    /// * once the lock is taken, a read of that pid is late (another thread's
-    ///   tailer can land it after `lock-acquired:`) and paints nothing;
-    /// * a LATCHED FIRST RUN is painted by the lane's own tailer: the
-    ///   person's tailer follows the same file (`first_run` false), and its
-    ///   reads would restate the first run's row in the person's words
-    ///   (`Updating`, not `Installing`), turn and turn about with the lane's.
+    /// * a read tailed while the person queues is the holder's: its pid is noted, and it paints,
+    ///   as what they wait behind;
+    /// * once the lock is taken, a read of that pid is late (another thread's tailer can land it
+    ///   after `lock-acquired:`) and paints nothing;
+    /// * a latched first run is painted by the lane's own tailer: the person's tailer follows the
+    ///   same file (`first_run` false), and its reads would restate the first run's row in the
+    ///   person's words, turn about with the lane's.
     fn holder_read_not_the_persons(
         &mut self,
         snap: Option<&crate::PkgProgressSnapshot>,
@@ -2393,7 +2170,7 @@ impl App {
 }
 
 /// What the packages worker reports about a person's Settings ▸ Packages verb
-/// (`Wake::PkgPersonPass`, design ruling 224; `App::person_pass`).
+/// (`Wake::PkgPersonPass`; `App::person_pass`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PersonPass {
     /// The verb's child is about to run.
@@ -2407,14 +2184,13 @@ pub(crate) enum PersonPass {
 }
 
 // ---------------------------------------------------------------------------
-// The update reporters' glue (R35–R38).
+// The update reporters' glue.
 // ---------------------------------------------------------------------------
 
-/// THE UPDATE'S FLOW ROW, as state (`App::update_flow`): the live
-/// `update.progress` row that is the lane's, the version it names and the
-/// phase it is in. What a row IS is state, never its glyph or title (ruling
-/// 57). A reader re-validates `id` against the center: a row that folded,
-/// went stale or was superseded by a wire post is not the flow.
+/// The update's flow row, as state (`App::update_flow`): the lane's live `update.progress` row,
+/// the version it names and its phase. What a row is lives in state, never in its glyph or
+/// title; a reader re-validates `id` against the center (a row that folded, went stale or was
+/// superseded by a wire post is not the flow).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UpdateFlow {
     /// The live row.
@@ -2445,20 +2221,18 @@ pub(crate) enum FlowPhase {
 }
 
 impl App {
-    /// The lane's flow state while its row is still live — never a stale
-    /// memory of one that folded or was superseded.
+    /// The lane's flow state while its row is still live, never a stale memory of one that folded
+    /// or was superseded.
     pub(crate) fn live_update_flow(&self) -> Option<&UpdateFlow> {
         self.update_flow
             .as_ref()
             .filter(|flow| self.messages.live(flow.id).is_some())
     }
 
-    /// Post `msg` as the lane's flow row (it carries [`update_words::KEY_PROGRESS`])
-    /// in `phase`, and remember it as the flow. A HELD row the lane replaces — a
-    /// ready row — is resolved first, so
-    /// `appstatus` keeps it as a finished activity (a live row replaced is only
-    /// superseded, and records nothing); the design's own §5.3 edge ("an
-    /// announcement over a HELD terminal row first resolves that row"). One sync.
+    /// Post `msg` as the lane's flow row (it carries [`update_words::KEY_PROGRESS`]) in `phase`,
+    /// and remember it as the flow. A held row the lane replaces (a ready row) is resolved first,
+    /// so `appstatus` keeps it as a finished activity (a live row replaced is only superseded and
+    /// records nothing; design §5.3). One sync.
     pub(crate) fn post_update_row(
         &mut self,
         msg: Message,
@@ -2475,8 +2249,8 @@ impl App {
         id
     }
 
-    /// A live row under `key` that is HELD (a `Default` / `For` hold): resolved
-    /// now by its tone, no sync — the post that replaces it syncs once.
+    /// A live row under `key` that is held (a `Default` / `For` hold): resolved now by its tone,
+    /// with no sync; the post that replaces it syncs once.
     pub(crate) fn resolve_held_row_under(&mut self, key: &str) {
         let held = self
             .messages
@@ -2533,24 +2307,12 @@ impl App {
     ///   process, its cause cut off at 110 columns. What it said is kept, so the
     ///   healing is recorded against it.
     ///
-    /// THE LATCH IS HERE, AT THE ONE DOOR (the review of the update audit's
-    /// merge onto this surface). Three producers now announce "Couldn't
-    /// install updates": the updater's persistent streak, its overdue notice
-    /// (a newer build waiting over an hour) and the automatic lane's
-    /// convergence (`App::announce_automatic_apply_stranded`), each with its
-    /// own latch — so one stuck build could raise the ⚠ row and the OS banner
-    /// two or three times in one launch. A failing title this process has
-    /// already said, and that no proof has answered since
-    /// (`update_health_latched`), is a log line and `false`: no row, no
-    /// banner. A healing that answers the title re-opens it, so a new episode
-    /// speaks again.
-    ///
-    /// KEYED BY KIND, NOT BY WORDS (design ruling 311): the failing title is
-    /// read back to the half it names once, here
-    /// ([`update_words::HealthKind::of_updater_title`]), and the latch, the row's
-    /// key, the heal proof and the record of the healing all carry that kind —
-    /// so the words can take the family grammar and a warning an older build
-    /// raised in its own words still heals.
+    /// The latch is here, at the one door: several producers announce "Couldn't install updates"
+    /// (the updater's streak, its overdue notice, `App::announce_automatic_apply_stranded`), so a
+    /// kind this process already said that no proof has answered (`update_health_latched`) is a
+    /// log line and `false`; a healing that answers it re-opens the latch for the next episode.
+    /// Keyed by kind, not words ([`update_words::HealthKind::of_updater_title`]), so a warning an
+    /// older build raised in its own words still heals.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2620,12 +2382,10 @@ impl App {
         }
         self.update_health_latched.push(kind);
         aterm_log::warn!("update-health: {title}: {body}");
-        // AN ATTEMPT STILL IN FLIGHT KEEPS ITS ROW AND ITS RIM (round six,
-        // finding 44): a warning that lands while the successor boots or holds
-        // for its park is not that attempt's refusal — the install goes on to
-        // Commit, and the rim is the only explanation of the frozen frame the
-        // park is about to show. The attempt's own completion retires them if
-        // it does not take over (`reduce_returned_handoff_completion`).
+        // An attempt still in flight keeps its row and its rim: a warning that lands while the
+        // successor boots or holds for its park is not that attempt's refusal (the install goes
+        // on to Commit, and the rim explains the frozen frame the park shows). The attempt's own
+        // completion retires them if it does not take over (`reduce_returned_handoff_completion`).
         if !self.update_handoff_in_flight() {
             self.retire_update_installing();
         }
@@ -2837,12 +2597,11 @@ impl App {
         );
     }
 
-    /// A health warning of `kind` ALREADY SAID this launch whose remedy no
-    /// longer holds (the automatic lane's stranded warning, its retry
-    /// withdrawn): the live row takes the new words in place — no new row, no
-    /// banner, its hold as it was — and one already folded off the glass is
-    /// followed by a record in them, so Messages never keeps a promise the
-    /// lane withdrew. The healing is recorded against the new words.
+    /// A health warning of `kind` already said this launch whose remedy no longer holds (the
+    /// automatic lane's stranded warning, its retry withdrawn): the live row takes the new words
+    /// in place (no new row, no banner, its hold as it was), and one already folded off the glass
+    /// is followed by a record in them, so Messages never keeps a promise the lane withdrew. The
+    /// healing is recorded against the new words.
     pub(crate) fn restate_update_health(
         &mut self,
         kind: update_words::HealthKind,
@@ -2867,30 +2626,15 @@ impl App {
         }
     }
 
-    /// THE ONE DOOR OF THE OS BANNER an update-health ANNOUNCEMENT owes (the
-    /// caller has just had [`Self::note_update_health`] or
-    /// [`Self::note_update_health_as`] return `true`), and it opens only when no
-    /// lane can install until the owner acts
-    /// ([`crate::update_apply_trouble::ApplyRetry::NeedsPerson`]): the installed
-    /// copy is not the signed release, or its folder cannot be written. The
-    /// banner names that remedy. Every other
-    /// failure is a record now and, after a day, a line of the digest
-    /// ([`update_words::update_health_entry`]): a banner that says "updates
-    /// failed" when the owner can do nothing about it that minute is the
-    /// non-actionable alert the owner ruled out (2026-09-28), and the banner of a
-    /// failure the next check may end is the noise this door used to make.
-    ///
-    /// Off the UI thread — `notify::deliver` blocks on a notifier subprocess —
-    /// and in the banner's words ([`update_words::health_notification_body`]). No
-    /// focus suppression: updater health belongs to no tab. Both producers of an
-    /// install warning (`Wake::UpdateHealth`, the automatic lane's convergence)
-    /// call it, so ONE check holds `desktop_alerts`: off (the default) posts
-    /// nothing, and the record, Settings ▸ Software Update and `messages.log`
-    /// still say it. `true` when a banner was posted. Under `cfg(test)` the
-    /// banner is recorded ([`UPDATE_HEALTH_BANNERS`]) instead, so no test ever
-    /// posts to the desktop of whoever runs the suite. It is the one caller of
-    /// `notify::deliver_update_health_banner` (only this module mints its
-    /// `HealthBannerVoice`); `notify::deliver` is private.
+    /// The one door of the OS banner an update-health announcement owes (after
+    /// [`Self::note_update_health`] or [`Self::note_update_health_as`] returned `true`). It opens
+    /// only when no lane can install until the owner acts
+    /// ([`crate::update_apply_trouble::ApplyRetry::NeedsPerson`]: the installed copy is not the
+    /// signed release, or its folder cannot be written), and the banner names that remedy; any
+    /// other failure is a record and, after a day, a digest line. `desktop_alerts` off (the
+    /// default) posts nothing. Delivered off the UI thread (`notify::deliver` blocks on a
+    /// notifier subprocess), with no focus suppression (updater health belongs to no tab);
+    /// recorded instead under `cfg(test)` ([`UPDATE_HEALTH_BANNERS`]). `true` when posted.
     pub(crate) fn post_update_health_banner(
         &self,
         kind: update_words::HealthKind,
@@ -2944,7 +2688,7 @@ impl App {
             });
             true
         }
-        // No desktop banner for update health here (it never had one off macOS).
+        // No desktop banner for update health off macOS.
         #[cfg(all(not(target_os = "macos"), not(test)))]
         {
             let _ = (title, body, remedy);
@@ -2952,28 +2696,20 @@ impl App {
         }
     }
 
-    /// THE LEDGER HEALED as far as `proof` can tell: the health warning
-    /// ([`update_words::KEY_HEALTH`]), if it is still up, is over — resolved
-    /// with the outcome it stood for (a warning) — and, once per announced
-    /// episode (after the warning's 45 s fold too), the healing is ON RECORD
-    /// against what the warning said ([`update_words::health_recovered`]).
-    ///
-    /// ONLY WHERE THE PROOF ANSWERS THE WARNING ([`HealthProof`]). The kind
-    /// names the broken half, so a download cannot heal "Couldn't install
-    /// updates": the record would read "aterm updates work again" while the
-    /// install streak the updater's ledger still holds says otherwise — the
-    /// ledger itself clears every streak on a whole-pipeline success but an
-    /// install streak, which only an install clears. A warning the proof does
-    /// not answer stays up (and remembered), for the proof that does.
+    /// The ledger healed as far as `proof` can tell: each health warning
+    /// ([`update_words::KEY_HEALTH`]) the proof answers ([`HealthProof`]) resolves if still up,
+    /// and its healing is recorded once against what it said ([`update_words::health_recovered`]).
+    /// The kind names the broken half, so a download cannot heal "Couldn't install updates" (the
+    /// ledger clears every streak on a whole-pipeline success except an install streak). A
+    /// warning the proof does not answer stays, remembered, for the proof that does.
     pub(crate) fn heal_update_health(&mut self, proof: HealthProof) {
         self.heal_update_health_where(|kind| proof.answers(kind));
     }
 
-    /// [`Self::heal_update_health`] over the kinds `answered` picks: their
-    /// latch, their rows, their day's entry and the record of their healing
-    /// go, the rest stay. The ONE heal of an update-health warning: the
-    /// ledger's recovery, this process's own proof and the checker watchdog's
-    /// stall and lock-held heals all come through here.
+    /// [`Self::heal_update_health`] over the kinds `answered` picks: their latch, their rows,
+    /// their day's entry and the record of their healing go, the rest stay. The one heal of an
+    /// update-health warning: the ledger's recovery, this process's own proof and the checker
+    /// watchdog's stall and lock-held heals all come through here.
     pub(crate) fn heal_update_health_where(
         &mut self,
         answered: impl Fn(update_words::HealthKind) -> bool,
@@ -2993,10 +2729,9 @@ impl App {
         self.record_update_health_healed(answered);
     }
 
-    /// What a health warning of this kind said, kept for its record of healing
-    /// — ONE ENTRY PER KIND (design ruling 318): the same kind said again
-    /// replaces its own entry, and another kind's stays, so each healing is
-    /// recorded against the warning it answers.
+    /// What a health warning of this kind said, kept for its record of healing, one entry per
+    /// kind: the same kind said again replaces its own entry and another kind's stays, so each
+    /// healing is recorded against the warning it answers.
     fn remember_update_health_said(&mut self, said: HealthSaid) {
         match self
             .update_health_said
@@ -3008,10 +2743,9 @@ impl App {
         }
     }
 
-    /// The healing of every remembered warning whose kind `healed` picks goes
-    /// ON RECORD — one record per warning, each against its own words, oldest
-    /// first — and leaves the memory; the others stay for the proof that
-    /// answers them (design ruling 318).
+    /// The healing of every remembered warning whose kind `healed` picks goes on record (one
+    /// record per warning, each against its own words, oldest first) and leaves the memory; the
+    /// others stay for the proof that answers them.
     pub(crate) fn record_update_health_healed(
         &mut self,
         healed: impl Fn(update_words::HealthKind) -> bool,
@@ -3039,21 +2773,11 @@ impl App {
             .collect()
     }
 
-    /// R36 — THE NEW BUILD TOOK OVER (or a cold-lane boot found it already
-    /// running): the lane's live flow row — the carried Finishing row, or an
-    /// Installing row — is resolved `Ok` (the work was delivered: its Complete
-    /// echo is the landing's moment, ruling 141), and the good
-    /// news is a RECORD in main's words ([`update_words::landed`]: "Updated to
-    /// aterm vX") — and, when this process (or the predecessor that handed
-    /// over) downloaded THIS build, how long the update took, a line of that
-    /// same record. Never for a build met already on disk, nor for another
-    /// build's download.
-    ///
-    /// `repainted` is how many tabs the seamless successor adopted onto a
-    /// blank screen (the 2026-09-22/23 update audit, plan P1-5 —
-    /// [`Self::seamless_repainted_tabs`]; 0 on the cold lane, which carried no
-    /// screen): the landing record names them and says why they came over
-    /// blank. A record only, like the landing itself — one fact, one entry.
+    /// The new build took over (or a cold-lane boot found it already running): the lane's live
+    /// flow row resolves `Ok` and the news is a record ([`update_words::landed`]: "Updated to
+    /// aterm vX"), with how long the update took when this process or its predecessor downloaded
+    /// this build. `repainted` is how many tabs the seamless successor adopted onto a blank
+    /// screen ([`Self::seamless_repainted_tabs`]; 0 on the cold lane): the record names them.
     pub(crate) fn post_update_landed(&mut self, version: &str, build: u64, repainted: usize) {
         self.heal_update_health(HealthProof::Landed);
         let took = self
@@ -3061,8 +2785,8 @@ impl App {
             .take()
             .filter(|(verified, _)| *verified == build)
             .map(|(_, at)| Instant::now().saturating_duration_since(at));
-        // The flow row by STATE (ruling 57), or — a carry from a build before
-        // the flow state — the live row on the lane's key.
+        // The flow row by state or, for a carry from a build before the flow state, the live
+        // row on the lane's key.
         let live = self.live_update_flow().map(|flow| flow.id).or_else(|| {
             self.messages
                 .live_by_key(update_words::KEY_PROGRESS)
@@ -3073,14 +2797,9 @@ impl App {
         if let Some(id) = live {
             self.resolve_message(id, Outcome::Ok);
         }
-        // THE APPLY LANE'S LAST OUTCOME is answered by the landing (round-seven
-        // update audit, finding 30): "Update waits for you" (transient, or the
-        // standing row of round eight's U38) or "Couldn't install aterm vX ·
-        // Install now" — raised before the attempt that landed, carried across
-        // it on glass — would otherwise take a fresh hold beside "Updated to
-        // aterm vX", its press opening Settings for a build already running.
-        // Withdrawn, not resolved: no ✓ stands on a failure's words, and the
-        // record keeps what it said.
+        // The landing answers the apply lane's last outcome ("Update waits for you", "Couldn't
+        // install aterm vX · Install now"), which would otherwise take a fresh hold beside
+        // "Updated to aterm vX". Withdrawn, not resolved: no ✓ stands on a failure's words.
         for key in [update_words::KEY_OUTCOME, update_words::KEY_WAITS_FOR_YOU] {
             if let Some(id) = self.messages.live_by_key(key).map(|l| l.id) {
                 self.messages.withdraw(id, Instant::now());
@@ -3094,27 +2813,20 @@ impl App {
         }
     }
 
-    /// How many tabs this seamless successor adopted onto a blank screen (the
-    /// 2026-09-22/23 update audit, plan P1-5): `App::handoff_repainted_tabs`,
-    /// the count the boot took from the adopted set before the restore drained
-    /// it — what [`Self::post_update_landed`] names on the seamless lane.
+    /// How many tabs this seamless successor adopted onto a blank screen
+    /// (`App::handoff_repainted_tabs`, counted at boot before the restore drained the adopted
+    /// set): what [`Self::post_update_landed`] names on the seamless lane.
     pub(crate) fn seamless_repainted_tabs(&self) -> usize {
         self.handoff_repainted_tabs
     }
 
-    /// THE STAGED DECISION, raised once (design §10.5 H2, ruling 119): when
-    /// `build` is the staged build, its posture is one where a press installs
-    /// it, and no staged row is up, the `aterm vX is ready` decision row is
-    /// posted as the lane's flow row — the lane that stopped hands the person
-    /// the one thing they can do. ONCE per build and posture: every reconcile
-    /// re-states the posture, and after the person let the question lapse (its
-    /// hold ran out, or they read it) the same question on the next check was a
-    /// nag (review 2026-09-24) — the Version menu and Software Update still
-    /// offer it. A posture that has just become a decision (a lane that
-    /// stopped) raises it again.
-    ///
-    /// `posture` is the caller's `apply_posture_for(build)` — or a test's,
-    /// since a headless App's own posture is always the handoff-off record.
+    /// The staged decision, raised once (design §10.5 H2): when `build` is the staged build, its
+    /// posture is one where a press installs it, and no staged row is up, post the `aterm vX is
+    /// ready` decision as the lane's flow row. Once per build and posture: every reconcile
+    /// re-states the posture, and the same question after the person let it lapse would be a
+    /// nag; a posture that has just become a decision (a lane that stopped) raises it again.
+    /// `posture` is the caller's `apply_posture_for(build)` (a headless App's own is always the
+    /// handoff-off record).
     pub(crate) fn ensure_staged_decision_in(
         &mut self,
         build: u64,
@@ -3144,19 +2856,18 @@ impl App {
         );
     }
 
-    /// The id of the lane's flow row while it is the STAGED one — the state in
-    /// which the build is ready (and, where a press installs, a press may).
+    /// The id of the lane's flow row while it is the staged one: the build is ready (and, where a
+    /// press installs, a press may).
     pub(crate) fn staged_update_row(&self) -> Option<MessageId> {
         self.live_update_flow()
             .filter(|flow| matches!(flow.phase, FlowPhase::Staged { .. }))
             .map(|flow| flow.id)
     }
 
-    /// The staged row is obsolete — its bytes are installed and activating
-    /// (`delivered`: it resolves `Ok`, which is true), or the artifact it offered is gone
-    /// (withdrawn with no outcome: nothing was installed, so no ✓ may stand
-    /// beside `Couldn't finish the update`) — so it leaves now rather than standing
-    /// beside the outcome that says so.
+    /// The staged row is obsolete (its bytes are installed and activating, `delivered`: it
+    /// resolves `Ok`; or the artifact it offered is gone: withdrawn with no outcome, since nothing
+    /// was installed and no ✓ may stand beside `Couldn't finish the update`), so it leaves now
+    /// rather than standing beside the outcome that says so.
     pub(crate) fn retire_staged_update_row(&mut self, delivered: bool) {
         if let Some(id) = self.staged_update_row() {
             if delivered {
@@ -3168,20 +2879,16 @@ impl App {
         }
     }
 
-    /// THE SWITCH TO A NEW VERSION BEGINS, on record ([`update_words::switch_started`])
-    /// — and flushed to `messages.log` NOW: a line queued for after the process
-    /// execs, or inside the park's few milliseconds, is a line never written (the
-    /// seamless parent flushes again, bounded, right before Commit `_exit`s it:
-    /// [`Self::flush_messages_log_within`]). `build` is the
-    /// RUNNING build; a same-image switch (`same_image`: a reload of this very
-    /// build) installs nothing, whatever is staged. A switch that then stops says
-    /// so ([`Self::record_update_switch_stopped`]).
+    /// The switch to a new version begins, on record ([`update_words::switch_started`]), flushed
+    /// to `messages.log` now: a line queued for after the exec, or inside the park's few
+    /// milliseconds, is never written. `build` is the running build; a same-image switch
+    /// (`same_image`) installs nothing, whatever is staged. A switch that then stops says so
+    /// ([`Self::record_update_switch_stopped`]).
     ///
-    /// NOISE BOUND: every attempt a person makes is on record (a press held for
-    /// the candidate's read and run again is one attempt); the automatic
-    /// lane's are, only its FIRST for a build in this process — its ladder
-    /// retries every few seconds while someone types, and the 512-record ring
-    /// (`LOG_CAP`) is every reporter's. `aterm.log` keeps each attempt.
+    /// Noise bound: every attempt a person makes is on record (a press held for the candidate's
+    /// read and run again is one); of the automatic lane's, only its first for a build in this
+    /// process, since its ladder retries every few seconds and the ring (`LOG_CAP`) is every
+    /// reporter's. `aterm.log` keeps each attempt.
     #[cfg(unix)]
     pub(crate) fn record_update_switch_started(
         &mut self,
@@ -3194,11 +2901,9 @@ impl App {
         }
     }
 
-    /// [`Self::record_update_switch_started`] without its flush, for a caller
-    /// that flushes once, bounded, right after — the cold lane's
-    /// `prepare_cold_exec`, where every wait on the writer thread is time the
-    /// person sits through a frozen window. `false` when nothing was put on
-    /// record (the noise bound).
+    /// [`Self::record_update_switch_started`] without its flush, for the cold lane's
+    /// `prepare_cold_exec`, which flushes once, bounded, right after (the person sits through
+    /// every wait frozen). `false` when nothing was put on record (the noise bound).
     #[cfg(unix)]
     pub(crate) fn note_update_switch_started(
         &mut self,
@@ -3222,10 +2927,9 @@ impl App {
         } else {
             staged.as_ref().map_or(build, |(b, _)| *b)
         };
-        // The automatic lane's later attempts at a build, and a person's press
-        // held for the candidate's read and run again (round eight, U35's
-        // review), whose start is still on record with no stop since: one fact,
-        // one entry.
+        // The automatic lane's later attempts at a build, and a person's press held for the
+        // candidate's read and run again, whose start is still on record with no stop since: one
+        // fact, one entry.
         if self.update_switch_recorded_for == Some(target_build)
             && (automatic || self.update_switch_on_record.is_some())
         {
@@ -3237,10 +2941,9 @@ impl App {
             "update switch started: target {:?} (build {target_build}) from build {build}",
             target
         );
-        // ONE FACT, ONE ENTRY: an Installing row this attempt POSTED (the
-        // explicit lane with nothing up) is already that line in the log; a
-        // row re-worded in place, or none (the automatic lane), is not
-        // (audit 2026-09-24).
+        // One fact, one entry: an Installing row this attempt posted (the explicit lane with
+        // nothing up) is already that line in the log; a row re-worded in place, or none (the
+        // automatic lane), is not.
         let posted_row = self.update_row_before_install.is_none()
             && self
                 .live_update_flow()
@@ -3254,12 +2957,11 @@ impl App {
         true
     }
 
-    /// THE SWITCH THAT DID NOT HAPPEN, on record ([`update_words::switch_stopped`]):
-    /// an attempt [`Self::record_update_switch_started`] wrote down ended with
-    /// this process still running — refused, failed, or stood down to try again
-    /// by itself (`routine`, in `why`'s words) — so the record never leaves an
-    /// "Installing" that was not. Nothing for an attempt that never reached the
-    /// record.
+    /// The switch that did not happen, on record ([`update_words::switch_stopped`]): an attempt
+    /// [`Self::record_update_switch_started`] wrote down ended with this process still running
+    /// (refused, failed, or stood down to try again by itself: `routine`, in `why`'s words), so
+    /// the record never leaves an "Installing" that was not. Nothing for an attempt that never
+    /// reached the record.
     #[cfg(unix)]
     pub(crate) fn record_update_switch_stopped(&mut self, routine: bool, why: &str) {
         let Some(target) = self.update_switch_on_record.take() else {
@@ -3309,15 +3011,12 @@ pub(crate) fn band_on_screen(ws: &crate::WindowState) -> bool {
 }
 
 impl App {
-    /// How window `wid`'s band draws motion (design ruling 140, the gating
-    /// UNION of the two sides): MOVING while its effect policy animates
-    /// `BandProgress` (focused or recorded, no Reduce Motion, no
-    /// `motion = "reduced"`, no load-shed latch), Serious Mode allows it, the
-    /// band is on screen, and no handoff freezes the band
-    /// ([`Self::message_holds_frozen`]: the screen is parked, and the rows are
-    /// the committed ones — main's busy-frame rule); STILL otherwise. GRADED
-    /// unless an OS High Contrast palette owns the chrome. The rule is the
-    /// engine's (`drive::look`); the readings are this host's.
+    /// How window `wid`'s band draws motion: moving while its effect policy animates
+    /// `BandProgress` (focused or recorded, no Reduce Motion, no `motion = "reduced"`, no
+    /// load-shed latch), Serious Mode allows it, the band is on screen, and no handoff freezes
+    /// the band ([`Self::message_holds_frozen`]: the screen is parked); still otherwise. Graded
+    /// unless an OS High Contrast palette owns the chrome. The rule is the engine's
+    /// (`drive::look`); the readings are this host's.
     pub(crate) fn band_look(&self, wid: WindowId) -> aterm_messages::Look {
         use crate::motion::{MotionEffect, SeriousEffect};
         let (focused, on_screen) = self
@@ -3339,18 +3038,11 @@ impl App {
         })
     }
 
-    /// The next instant any ON-SCREEN window's band needs a motion frame (or a
-    /// time word's tick) — the loop's `DeadlineOwner::MessageBandMotion`, the
-    /// band's ONLY clock (ruling 140; main's 125 ms busy frame retired into
-    /// it). `None` with no committed row, or none on screen, or nothing live
-    /// or echoing on the glass: an idle band arms nothing. `None` too while a
-    /// handoff freezes the band: the frame on glass STAYS where it is — the
-    /// screen is parked, and not even a move to the still form repaints it
-    /// (main's freeze rule) — so the loop never arms a wake it would not act
-    /// on. The fold is the engine's (`drive::motion_deadline_over`: each
-    /// view's memoised next change from its prepared frame, never in the
-    /// past); which windows are on screen, and each one's look, are this
-    /// host's.
+    /// The next instant any on-screen window's band needs a motion frame (or a time word's
+    /// tick): the loop's `DeadlineOwner::MessageBandMotion`, the band's only clock. `None` when
+    /// idle (no committed row, none on screen, nothing live or echoing) and while a handoff
+    /// freezes the band (the parked frame stays as it is). The fold is the engine's
+    /// (`drive::motion_deadline_over`).
     pub(crate) fn band_motion_deadline(&self, now: Instant) -> Option<Instant> {
         drive::motion_deadline_over(
             &self.messages,
@@ -3370,15 +3062,11 @@ impl App {
         )
     }
 
-    /// The on-screen windows whose band is due a new motion frame at `now`:
-    /// the deadline read at the frame each last presented has passed (or none
-    /// was prepared yet while something moves), or the frame on glass was
-    /// drawn in ANOTHER look — focus, Reduce Motion, Serious Mode, the
-    /// load-shed latch or a recording changed it — so the move to (or from)
-    /// the still form never depends on each of those triggers asking for its
-    /// own redraw. Nothing while a handoff freezes the band (the frame stays,
-    /// [`Self::band_motion_deadline`]). The rule is the engine's
-    /// (`drive::due_views`).
+    /// The on-screen windows whose band is due a new motion frame at `now`: the deadline read at
+    /// the frame each last presented has passed (or none was prepared while something moves), or
+    /// the frame on glass was drawn in another look, so the move to or from the still form never
+    /// depends on each trigger asking for its own redraw. Nothing while a handoff freezes the
+    /// band. The rule is the engine's (`drive::due_views`).
     pub(crate) fn band_motion_due(&self, now: Instant) -> Vec<WindowId> {
         drive::due_views(
             &self.messages,
@@ -3441,10 +3129,9 @@ impl App {
         carry
     }
 
-    /// What this process's update-health warnings said that no proof has
-    /// answered, in the shape a successor takes up
-    /// ([`Self::take_up_carried_health_said`]) — the seamless lanes' window carry
-    /// and the cold lane's `exec` (round eight, finding 79) alike.
+    /// What this process's update-health warnings said that no proof has answered, in the shape
+    /// a successor takes up ([`Self::take_up_carried_health_said`]), for the seamless lanes'
+    /// window carry and the cold lane's `exec` alike.
     #[cfg(any(unix, test))]
     pub(crate) fn carried_health_said(&self) -> Vec<crate::session_store::CarriedHealthSaid> {
         self.update_health_said
@@ -3462,26 +3149,16 @@ impl App {
             .collect()
     }
 
-    /// THE FILE READ AGAIN AT COMMIT (round-seven update audit, findings 41
-    /// and 18): a late-park successor loaded `messages.log` at its boot, and
-    /// its parent kept recording — posting, retiring, pressing, taking
-    /// `appnotice` records — until Commit, flushing its last line first
-    /// ([`Self::flush_messages_log_within`]). Merged here
-    /// ([`aterm_messages::MessageCenter::merge_reloaded_log`]), so the history
-    /// holds the parent's records since this process booted and each row it
-    /// closed with its real ending, and every id minted from now on is above
-    /// the file's.
+    /// The file read again at Commit: a late-park successor loaded `messages.log` at its boot,
+    /// and its parent recorded until Commit, flushing its last line first. Merged here
+    /// ([`aterm_messages::MessageCenter::merge_reloaded_log`]), so the history holds the
+    /// parent's records since this process booted and each row it closed with its real ending,
+    /// and every id minted from now on is above the file's.
     ///
-    /// SYNCHRONOUS, AND FIRST: the Commit wake calls this before anything else
-    /// it does can mint ("Updated to aterm vX" among them) and before a
-    /// `messages since=` reader can reach this process's ring, so no record of
-    /// the parent's appears later BELOW an id a reader has already been handed
-    /// (the review of the first cut, which read it on a worker). The read is
-    /// the launch load's own, bounded by size ([`crate::messages_store::load_tail`]:
-    /// at most [`crate::messages_store::TAIL_BYTES`] of the log and
-    /// [`crate::messages_store::WIRE_TAIL_BYTES`] of the wire's, regular files,
-    /// no-follow) — a message log is tens of kilobytes. Nothing with no writer:
-    /// no file was opened, so there is none to read.
+    /// Synchronous and first in the Commit wake: before anything it does can mint ("Updated to
+    /// aterm vX" among them) and before a `messages since=` reader reaches this ring, so no
+    /// parent record appears below an id a reader already holds. The read is the launch load's,
+    /// bounded ([`crate::messages_store::load_tail`]). Nothing with no writer.
     #[cfg(unix)]
     pub(crate) fn reload_messages_log_at_commit(&mut self) {
         let Some(path) = self
@@ -3496,9 +3173,8 @@ impl App {
         // The Commit wake republishes (its own `sync_messages`) once the
         // carried windows are shown; nothing is painted from here.
         self.messages.merge_reloaded_log(&disk);
-        // …and a carried row the PARKED PARENT ended after the capture (a press,
-        // a resolve, a heal) stays ended (round eight of the update audit, lead
-        // U62). That ends the ROW, and nothing beside it.
+        // …and a carried row the parked parent ended after the capture (a press, a resolve, a
+        // heal) stays ended. That ends the row, and nothing beside it.
         let ended = self
             .messages
             .end_carried_rows_the_parent_ended(&disk, Instant::now());
@@ -3508,62 +3184,32 @@ impl App {
                 ended.len()
             );
         }
-        // A health warning the parked parent HEALED is no longer this process's
-        // to heal: its healing is on record already, and a second would say it
-        // twice. Decided by THAT RECORD, never by how the row ended (the second
-        // review of U62): the parent records a healing from what the warning
-        // said, whether its row was still up, dismissed by the person, or folded
-        // off the glass 45 s after it was said (the usual state at a park), and a
-        // dismissal, an answer or a withdrawal there records none.
+        // A health warning the parked parent healed is no longer this process's to heal.
+        // Decided by the parent's record of the healing, never by how the row ended: a row up,
+        // dismissed or folded (the usual state at a park) heals alike, and a dismissal, an
+        // answer or a withdrawal records none.
         if let Some(parent) = self.parked_parent.take() {
             self.forget_health_the_parked_parent_healed(&disk, parent);
         }
     }
 
-    /// Each update-health warning this process remembers
-    /// (`App::update_health_said`) whose healing the PARKED PARENT put on
-    /// record after the capture is healed here as the parent healed it, with no
-    /// second record: what it said, its latch, its day's entry and any live row
-    /// of its kind go ([`Self::heal_update_health_where`] less the record).
+    /// Each update-health warning this process remembers whose healing the parked parent
+    /// recorded after the capture is healed here as the parent healed it, with no second record
+    /// ([`Self::heal_update_health_where`] less the record). Its carried row resolves too, with
+    /// no repaint (the Commit wake republishes): the parent may heal it with no row left to end
+    /// there, and the carried row here would come back with a fresh hold.
     ///
-    /// The parent's record is read from `disk`, the file read again at Commit:
-    /// a record in [`update_words::health_recovered`]'s words for what the
-    /// warning said that the PARENT wrote AFTER THE CAPTURE ([`ParkedParent`]):
-    /// written under an id of the parent's band — from the carry's next id, the
-    /// [`PARKED_PARENT_ID_RESERVE`] it keeps below — as the file numbered it
-    /// (a record a collision moved to a fresh id is judged by the number it was
-    /// written under, [`aterm_messages::MessageLog::file_id_of`]), and stamped
-    /// at or after the capture. The id alone was no such proof (the U5 group's
-    /// review): every aterm of the user writes this file from its own counter,
-    /// so another window's healing of the same words — the same day's — sat at
-    /// an id above the parent's, and a record of any writer that collided
-    /// loaded above the file's top, and either one dropped a warning still
-    /// failing here, its day's entry with it (L5). A warning the parent did not
-    /// heal stays, whatever its row did there, for the proof here that answers
-    /// it.
+    /// The parent's record is read from `disk`, the file re-read at Commit: one in
+    /// [`update_words::health_recovered`]'s words, written under an id in the parent's band (from
+    /// the carry's next id, [`PARKED_PARENT_ID_RESERVE`] wide) as the file numbered it
+    /// ([`aterm_messages::MessageLog::file_id_of`]), and stamped at or after the capture
+    /// ([`ParkedParent`]). The id alone is no proof: every aterm of the user writes this file
+    /// from its own counter.
     ///
-    /// WHAT IT STILL CANNOT TELL APART (the second review of #909): the band
-    /// and the stamp single out the parent's records only from writers outside
-    /// them both. Every aterm counts its ids from the file's top at its launch
-    /// and then from its own writes alone, so a window launched the same day
-    /// mints, as a rule, within [`PARKED_PARENT_ID_RESERVE`] of the parent's
-    /// next id, and the band seldom shuts it out; the stamp does, except for
-    /// what it records during the park itself. So another window that records
-    /// the healing of the same kind, in the same day's words, while the parent
-    /// is parked after the capture (seconds; the automatic lane's hold is
-    /// capped at two minutes) is read as the parent's, and a warning still
-    /// failing here is dropped with its latch and its day's entry, as #909
-    /// described. Nothing in the file says which process wrote a record:
-    /// telling the two apart needs a writer's mark on every record, a change
-    /// to the file every aterm of the user shares, not made for a race this
-    /// narrow.
-    ///
-    /// ITS ROW ENDS TOO (the U5 group's review): the parent heals a warning
-    /// whose row it no longer shows (one that folded off its glass after the
-    /// capture, say) with no row to resolve, and the carried row of it here,
-    /// which the parent's ending of the row cannot end, would come back on
-    /// glass with a fresh hold at Commit. It is resolved as a warning, as the
-    /// heal resolves it, with no repaint (the Commit wake republishes).
+    /// Known limit: another window minting within the parent's band that records the same
+    /// kind's healing in the same words during the park (seconds) is read as the parent's;
+    /// telling them apart needs a writer's mark on every record, not worth it for so narrow a
+    /// race.
     #[cfg(unix)]
     fn forget_health_the_parked_parent_healed(
         &mut self,
@@ -3604,20 +3250,13 @@ impl App {
         }
     }
 
-    /// THE SUCCESSOR'S FIRST FRAMES, before Commit: re-seed the rows the
-    /// outgoing process carried into the center (each keeps its id, words and
-    /// hold under the handoff's staleness cap until Commit), queue the lines
-    /// the parent never wrote, and — when this process is the handed-off
-    /// successor with a carried progress row — say its own phase in that row
-    /// ("almost done — what you type is kept", [`update_words::finishing`])
-    /// rather than the parent's "installing…", and adopt it as this process's
-    /// flow row. A carried warning that installing fails leaves with it: the
-    /// build that landed is the proof ([`HealthProof::Landed`]). A carried
-    /// check, download, stall or lock-held warning stays up: a landing proves
-    /// nothing about those halves, and the producer here whose own proof heals
-    /// each takes it up ([`Self::take_up_carried_update_health`]). No sync
-    /// here: the row count is the carried one until Commit, and nothing paints
-    /// yet. `finishing` is the running build's version.
+    /// The successor's first frames, before Commit: re-seed the rows the outgoing process
+    /// carried (each keeps its id, words and hold under the handoff's staleness cap), queue the
+    /// lines the parent never wrote, and, as the handed-off successor with a carried progress
+    /// row, say its own phase there ([`update_words::finishing`]) and adopt it as the flow row. A
+    /// carried install warning leaves ([`HealthProof::Landed`]); any other stays for the producer
+    /// here whose proof heals it ([`Self::take_up_carried_update_health`]). No sync: the row
+    /// count is the carried one until Commit. `finishing` is the running build's version.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -3633,36 +3272,25 @@ impl App {
     ) {
         let now = Instant::now();
         let mut carried: Carry = carry.message_carry();
-        // AN INTENT ONLY THE OLD PROCESS COULD PERFORM DOES NOT CROSS (ruling
-        // 265 / 417 (j), 441 (w)): `End sessions` hangs up the shells THIS
-        // launch reattached from the keeper (`keeper_recovered`), and an update
-        // successor reattached none, so the press would end nothing and the
-        // page would say the running sessions "had already ended". The
-        // recovery row keeps its words: they are the crashed launch's history.
+        // An intent only the old process could perform does not cross: `End sessions` hangs up
+        // the shells this launch reattached from the keeper (`keeper_recovered`), and an update
+        // successor reattached none, so the press would end nothing. The recovery row keeps its
+        // words: they are the crashed launch's history.
         if self.keeper_recovered.is_empty() {
             let end = Intent::EndRecovered.encode();
             for message in &mut carried.live {
                 message.actions.retain(|action| *action != end);
             }
         }
-        // THE PARENT'S NEXT ID crosses even when no row does (round-seven
-        // update audit, finding 18): the automatic lane parks with nothing on
-        // the band, and the parent recorded past what this process loaded at
-        // its boot — `seed_carried` raises the ids first, rows or none.
+        // The parent's next id crosses even when no row does: the automatic lane parks with
+        // nothing on the band, and the parent recorded past what this process loaded at its
+        // boot; `seed_carried` raises the ids first, rows or none.
         let nothing_carried = carried.is_empty() && carried.next_id == 0;
-        // THE PARENT RECORDS ON UNTIL COMMIT (round-seven update audit,
-        // finding 18, as reviewed): the carry's next id was taken at the park,
-        // and the parent keeps minting from it — a harness note, a toolchain
-        // or `appnotice` record, an update record — while this process mints
-        // too (before Commit, and "Updated to aterm vX" at it). The parent
-        // keeps the band below `next_id + PARKED_PARENT_ID_RESERVE`; this
-        // process mints above it, so no id is handed out twice and none of
-        // this process's records sits below one a `messages since=` reader
-        // took from the parent. The records themselves cross in the file
-        // ([`Self::reload_messages_log_at_commit`]). BEFORE the seed: a record
-        // of another writer the seed moves off a carried number takes a fresh
-        // id, and it must be above the band too, never the parent's next one
-        // (design ruling 415 (d)).
+        // The parent mints on from the carry's next id until Commit while this process mints
+        // too: the parent keeps below `next_id + PARKED_PARENT_ID_RESERVE` and this process
+        // mints above it, so no id is handed out twice and none of this process's records sits
+        // below one a `messages since=` reader took from the parent. Before the seed: a record
+        // the seed moves off a carried number takes a fresh id, which must be above the band too.
         if self.incoming_handoff_pending && !nothing_carried {
             self.messages.raise_next_id(
                 carried
@@ -3670,12 +3298,9 @@ impl App {
                     .max(1)
                     .saturating_add(PARKED_PARENT_ID_RESERVE),
             );
-            // Where and when the parent's records after the capture begin: a
-            // healing it records while parked is read back at Commit by those
-            // bounds ([`Self::forget_health_the_parked_parent_healed`]). A parent
-            // older than the band's carry hands no next id, and one older than
-            // the capture's stamp hands no time: nothing then marks its records
-            // after the capture, and none is read as a healing.
+            // Where and when the parent's records after the capture begin, read back at Commit
+            // (`forget_health_the_parked_parent_healed`). A parent that hands no next id or no
+            // capture stamp marks nothing, and none of its records is read as a healing.
             #[cfg(unix)]
             {
                 self.parked_parent = carry
@@ -3687,12 +3312,10 @@ impl App {
                     });
             }
         }
-        // WHAT THE PARENT'S WARNINGS SAID, whether or not their rows still
-        // stand (round six, finding 54; round 44 for a row that folded or never
-        // crossed): the landing at Commit is the proof, and it is this
-        // process's to record — the parent `_exit`s at Commit. A plain restart
-        // (`finishing` None) carries nothing it could heal. After the raise:
-        // taking a warning up claims its digest line, which may mint an id.
+        // What the parent's warnings said, whether or not their rows still stand: the landing at
+        // Commit is the proof, and it is this process's to record (the parent `_exit`s at
+        // Commit). A plain restart (`finishing` None) carries nothing it could heal. After the
+        // raise: taking a warning up claims its digest line, which may mint an id.
         if finishing.is_some() {
             self.take_up_carried_health_said(&carry.update_health_said);
         }
@@ -3700,12 +3323,10 @@ impl App {
             return;
         }
         self.messages.seed_carried(&carried, wall_stamp_now(), now);
-        // A row about the OLD PROCESS leaves with it: a session's wait (a
-        // paste on its way, a rewrap) is the process's that watches it
-        // (rulings 231–234), and this one watches nothing it did not start;
-        // the dead accessibility publisher's "restart aterm to retry" is
-        // answered by this very process, whose publisher is its own (finding
-        // 42) — carried, either would stand for good.
+        // A row about the old process leaves with it: a session's wait (a paste on its way, a
+        // rewrap) belongs to the process that watches it, and this one watches nothing it did
+        // not start; the dead accessibility publisher's "restart aterm to retry" is answered by
+        // this very process, whose publisher is its own. Carried, either would stand for good.
         let old_process: Vec<MessageId> = self
             .messages
             .live_rows()
@@ -3730,18 +3351,9 @@ impl App {
                 version: version.to_string(),
                 phase: FlowPhase::Finishing,
             });
-            // The landing at Commit is the proof, and it is this process's to
-            // record against what the parent's warning said
-            // (`post_update_landed` → `heal_update_health`): the parent `_exit`s
-            // at Commit and never learns its warning healed. It answers ONLY an
-            // install warning (round-seven update audit, finding 54): a build
-            // staged before the check or download streak began lands without
-            // proving that checking or downloading works, and the updater's
-            // ledger keeps those streaks (`record_apply_success` clears the
-            // apply streak only). Such a warning stays up, TAKEN UP by the
-            // producer here whose own proof heals it
-            // ([`Self::take_up_carried_update_health`]) — never latched, which
-            // stood for the launch (round eight, findings 15 and 301).
+            // A carried install warning leaves now; the landing at Commit records its healing
+            // against what the parent said (the parent `_exit`s and never learns). Any other
+            // stays up for its producer here.
             let carried: Vec<_> = self
                 .messages
                 .live_rows()
@@ -3754,10 +3366,9 @@ impl App {
                 if HealthProof::Landed.answers(said.kind) {
                     self.messages.resolve(health, Outcome::Warn, now);
                 }
-                // Remembered and taken up above with what the parent said,
-                // unless an older parent carried the row alone. One entry per
-                // carried row: two kinds the parent raised are two records at
-                // their healings (ruling 318), never only the first.
+                // Remembered and taken up above with what the parent said, unless an older
+                // parent carried the row alone. One entry per carried row: two kinds the parent
+                // raised are two records at their healings.
                 if carry
                     .update_health_said
                     .iter()
@@ -3826,44 +3437,25 @@ impl App {
         }
     }
 
-    /// A HEALTH WARNING THE PARENT RAISED AND THE LANDING DOES NOT ANSWER (round
-    /// eight, findings 15 and 301; round seven, finding 206), handed to the
-    /// producer in THIS process whose own proof heals it — and NEVER LATCHED
-    /// here. A latch only a proof lifts stood for the launch: this process's
-    /// updater had announced nothing, so its first up-to-date check cleared the
-    /// streak in the ledger and sent no recovery; the watchdog's stall heal
-    /// needed a stall THIS watchdog had announced; the lock-held heal needed
-    /// this process's own streak. The next episode of the kind — a new one,
-    /// hours later — then reached only the log, with no row (L5), and its
-    /// healing was recorded against the parent's old words.
+    /// A health warning the parent raised and the landing does not answer, handed to the
+    /// producer here whose own proof heals it, never latched: a latch only a proof lifts would
+    /// stand for the launch (this process's updater announced nothing, so its first good check
+    /// clears the streak with no recovery), muting the kind's next episode.
     ///
-    /// * The ledger's check and download warnings: this process's updater takes
-    ///   the class up as announced ([`aterm_update::adopt_announced_health`]),
-    ///   so a streak still failing is restated quietly — the person is not told
-    ///   twice — and the ledger's healing, which a successor's first up-to-date
-    ///   check brings, sends the recovery this process heals by
-    ///   ([`Self::note_update_health`]). ONLY WHEN `title`, the warning's own
-    ///   words, names a ledger class (`aterm_update::health_failing_class`): the
-    ///   window reads a title it does not know as the check kind, the strand
-    ///   notice's among them ([`aterm_update::STRANDED_TITLE`]), which is no
-    ///   ledger failure — adopted as `manifest`, the successor's first cycle
-    ///   over a ledger that never failed "healed" it while the machine stayed
-    ///   stranded (round seven, group RL). Such a warning is only remembered;
-    ///   this process says its own strand once, as every process does.
-    /// * The watchdog's stall and lock-held warnings: this process's checker
-    ///   stands to the parent's as a replacement generation does, and heals
-    ///   them by a replacement's proof
-    ///   ([`crate::update_checker_watch::CheckerWatchState`]'s
-    ///   `adopt_carried_stall`, `adopt_carried_lock_held`). A stall of THIS
-    ///   process's own checker is a new episode, said with its row; the
-    ///   sibling still holding the lock is the same streak, followed rather
-    ///   than said again.
+    /// * Check and download: this process's updater takes the class up as announced
+    ///   ([`aterm_update::adopt_announced_health`]), so a streak still failing is restated
+    ///   quietly and the ledger's healing sends the recovery ([`Self::note_update_health`]).
+    ///   Only when `title` names a ledger class (`aterm_update::health_failing_class`): an
+    ///   unknown title reads as the check kind, the strand notice's among them
+    ///   ([`aterm_update::STRANDED_TITLE`]), and adopting that would let a ledger that never
+    ///   failed "heal" a machine still stranded.
+    /// * Stall and lock-held: this process's checker heals them as a replacement generation
+    ///   would ([`crate::update_checker_watch::CheckerWatchState`]'s `adopt_carried_stall`,
+    ///   `adopt_carried_lock_held`).
     ///
-    /// Its digest line is claimed again here, in `words`, the parent's
-    /// sentence: the parent's pending claim died with it, and a warning taken
-    /// up is not said again, so a failure that spans an update never reached
-    /// "To look at". A parent older than the sentence's carry hands its excerpt
-    /// alone (`since Sep 14`), which still dates the line.
+    /// Its digest line is claimed again in `words`, the parent's sentence (the parent's pending
+    /// claim died with it); an older parent hands its excerpt alone (`since Sep 14`), which still
+    /// dates the line.
     fn take_up_carried_update_health(
         &mut self,
         kind: update_words::HealthKind,
@@ -3899,11 +3491,9 @@ pub(crate) struct OwedRow {
     seen: bool,
 }
 
-/// What an update-health warning said ([`App::remember_update_health_said`]):
-/// its kind, the title and first line its record of healing is written
-/// against, and the sentence it was raised with, which its "To look at" line
-/// quotes when a successor takes it up
-/// ([`App::take_up_carried_update_health`]).
+/// What an update-health warning said ([`App::remember_update_health_said`]): its kind, the
+/// title and first line its record of healing is written against, and the sentence it was
+/// raised with, which a successor's "To look at" line quotes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HealthSaid {
     pub kind: update_words::HealthKind,
@@ -3925,24 +3515,17 @@ impl HealthSaid {
     }
 }
 
-/// The ids a seamless successor leaves its parent, which records on from the
-/// carry's next id until Commit (round-seven update audit, finding 18;
-/// [`App::seed_carried_messages`]). The park lasts seconds (the automatic
-/// lane's hold is capped at two minutes), `notice` is refused while parked
-/// ([`App::take_notice`]), and what the parent still records then is the odd
-/// harness note or toolchain and update record — a thousand is far past it.
-/// Beyond it the two processes' ids could meet again; the merge at Commit
-/// still keeps both records, the parent's under a fresh id
-/// ([`aterm_messages::MessageCenter::merge_reloaded_log`]).
+/// The ids a seamless successor leaves its parent, which records on from the carry's next id
+/// until Commit ([`App::seed_carried_messages`]). The park lasts seconds (the automatic lane's
+/// hold is capped at two minutes) and `notice` is refused while parked, so a thousand is far
+/// past what the parent records then; beyond it the merge at Commit still keeps both records,
+/// the parent's under a fresh id ([`aterm_messages::MessageCenter::merge_reloaded_log`]).
 pub(crate) const PARKED_PARENT_ID_RESERVE: u64 = 1000;
 
-/// What marks the PARKED PARENT's records after the capture, in the file every
-/// aterm of the user shares ([`App::forget_health_the_parked_parent_healed`]):
-/// the carry's next id, from which the parent mints below
-/// [`PARKED_PARENT_ID_RESERVE`] more, and the capture's wall-clock stamp
-/// (`WindowCarry::messages_captured_unix_ms`), at or after which it stamps them.
-/// Neither names the writer: another window's record made during the park can
-/// pass for the parent's (the limit that function's docs state).
+/// What marks the parked parent's records after the capture in the file every aterm of the user
+/// shares ([`App::forget_health_the_parked_parent_healed`]): the carry's next id, from which the
+/// parent mints below [`PARKED_PARENT_ID_RESERVE`] more, and the capture's stamp
+/// (`WindowCarry::messages_captured_unix_ms`). Neither names the writer.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ParkedParent {
@@ -3950,34 +3533,29 @@ pub(crate) struct ParkedParent {
     pub(crate) captured_unix_ms: u64,
 }
 
-/// Whether a carried row keyed `key` states a fact about the PROCESS that
-/// posted it — one a successor, a new process, has made untrue by existing
-/// ([`App::seed_carried_messages`]): a session wait's row (the waits belong to
-/// the process that watches them), or the dead accessibility publisher's (a
+/// Whether a carried row keyed `key` states a fact about the process that posted it, made
+/// untrue by a successor's existing ([`App::seed_carried_messages`]): a session wait's row (the
+/// waits belong to the process that watches them), or the dead accessibility publisher's (a
 /// process gets one publisher; the successor starts its own).
 fn describes_the_old_process(key: &str) -> bool {
     aterm_messages::waits::is_wait_key(key) || key == crate::message_reporters::KEY_A11Y_PUBLISHER
 }
 
-/// Tier-1 for `NativeUpdateCarriedHealth` (findings 206/207).
+/// Tier-1 conformance for `NativeUpdateCarriedHealth`.
 #[cfg(all(test, unix))]
 #[path = "carried_health_conformance.rs"]
 pub(crate) mod carried_health_conformance;
 
-/// The band's motion on the host side — the idle law, hidden windows, the
-/// frame cadence, the per-frame cost, the still looks, the faces that must
-/// not move (review 2026-09-24).
+/// The band's motion on the host side: the idle law, hidden windows, the frame cadence, the
+/// per-frame cost, the still looks, the faces that must not move.
 #[cfg(test)]
 #[path = "band_motion_tests.rs"]
 mod band_motion_tests;
 
-/// What a heal of the update-health warning rests on ([`App::heal_update_health`]).
-/// Each proves one more half of updating than the last, so each heals only the
-/// warnings it answers — the warning's kind names the broken half
-/// ([`update_words::HealthKind`]), and the updater's own ledger reads the
-/// same way: a whole-pipeline success clears every streak but an install streak.
-/// [`Self::Landed`] stands apart from that ladder (its order is never read):
-/// it answers the install warning only ([`Self::answers`]).
+/// What a heal of the update-health warning rests on ([`App::heal_update_health`]). Each proves
+/// one more half of updating than the last, so each heals only the warnings it answers, as the
+/// updater's ledger does: a whole-pipeline success clears every streak but an install streak.
+/// [`Self::Landed`] stands off that ladder and answers the install warning only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum HealthProof {
     /// The check reached a release and its bytes are arriving (`Downloading`,
@@ -3989,23 +3567,19 @@ pub(crate) enum HealthProof {
     /// The ledger healed (`HEALTH_RECOVERED_TITLE`, sent only once no class is
     /// failing): installing works too.
     Installed,
-    /// A build LANDED (`post_update_landed`): installing works — and nothing
-    /// more is proved (round-seven update audit, finding 54). Off the ladder:
-    /// the build may have been staged before a check or download streak
-    /// began, and the updater's ledger keeps those streaks through the
-    /// install (`record_apply_success` clears the apply streak only), so a
-    /// landing answers an install warning alone.
+    /// A build landed (`post_update_landed`): installing works, and nothing more is proved. Off
+    /// the ladder: the build may have been staged before a check or download streak began, and
+    /// the updater's ledger keeps those streaks through the install (`record_apply_success`
+    /// clears the apply streak only), so a landing answers an install warning alone.
     Landed,
 }
 
 impl HealthProof {
-    /// What the updater's `HEALTH_RECOVERED_TITLE` proves, from the class it
-    /// names as the body (`aterm_update::HealthNotify`): the healing of that
-    /// class answers exactly the warning that class raised. A heal of the
-    /// download or check streak is no proof that installing works, and an
-    /// install warning another producer raised stays up for the proof that
-    /// answers it. An empty body — the heal before it named its class — keeps
-    /// main's reading: the whole ledger healed.
+    /// What the updater's `HEALTH_RECOVERED_TITLE` proves, from the class it names as the body
+    /// (`aterm_update::HealthNotify`): the healing of that class answers exactly the warning
+    /// that class raised, so a heal of the download or check streak leaves an install warning
+    /// another producer raised up for its own proof. An empty body (a heal that names no class)
+    /// reads as the whole ledger healed.
     fn healed_by_ledger(class: &str) -> Self {
         if class.is_empty() {
             Self::Installed
@@ -4014,14 +3588,12 @@ impl HealthProof {
         }
     }
 
-    /// The proof a warning of `kind` needs before it may leave and its healing
-    /// be recorded. The check half and the watchdog's stall need the least:
-    /// the lane's old rule, "a check that downloads is a check that works" —
-    /// for the stall, a check THIS process ran, never the shared ledger's
-    /// healing ([`Self::answers_from_the_ledger`]). `None` for a warning no
-    /// proof of this process's own answers: another
-    /// aterm holding the update check's lock (round six, finding 53) is healed
-    /// only by its streak ending, by the watchdog that said it.
+    /// The proof a warning of `kind` needs before it may leave and its healing be recorded. The
+    /// check half and the watchdog's stall need the least (a check that downloads is a check
+    /// that works); for the stall, a check this process ran, never the shared ledger's healing
+    /// ([`Self::answers_from_the_ledger`]). `None` for a warning no proof of this process's own
+    /// answers: another aterm holding the update check's lock is healed only by its streak
+    /// ending, by the watchdog that said it.
     fn needed_for(kind: update_words::HealthKind) -> Option<Self> {
         match kind {
             update_words::HealthKind::Install => Some(Self::Installed),
@@ -4041,22 +3613,11 @@ impl HealthProof {
         Self::needed_for(kind).is_some_and(|needed| self >= needed)
     }
 
-    /// Whether this proof, as THE LEDGER'S HEALING ([`Self::healed_by_ledger`]),
-    /// answers a warning of `kind`: [`Self::answers`], but never the window
-    /// watchdog's stall (round-seven update audit, group RL).
-    ///
-    /// The ledger is the MACHINE's — a sibling aterm's good check heals it — and
-    /// "Update check stopped" is about THIS process's check thread. Every
-    /// generation ticks with what the process announced
-    /// (`aterm_update::adopt_announced_health`), so a replacement the watchdog
-    /// started behind a generation still holding the check lane, which can
-    /// never check itself, sends the recovery of the class the process had
-    /// announced once a sibling heals the ledger. As `Checked` it answered the
-    /// stall: the row withdrawn, its latch lifted and "aterm updates work
-    /// again" recorded against "Update check stopped" while no check could run
-    /// here — the notice gone while updates were stopped (L5). The stall's own
-    /// proof is this process's completed check (the watchdog's
-    /// `heal_update_checker_stall`) or its progress ([`Self::answers`]).
+    /// [`Self::answers`] for the ledger's healing ([`Self::healed_by_ledger`]), never the window
+    /// watchdog's stall: the ledger is the machine's (a sibling's good check heals it), while
+    /// "Update check stopped" is about this process's check thread, which a sibling's healing
+    /// does not prove. The stall's own proof is this process's completed check (the watchdog's
+    /// `heal_update_checker_stall`) or its progress.
     fn answers_from_the_ledger(self, kind: update_words::HealthKind) -> bool {
         kind != update_words::HealthKind::Stalled && self.answers(kind)
     }

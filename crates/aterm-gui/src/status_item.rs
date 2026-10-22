@@ -383,9 +383,8 @@ pub(crate) struct SiblingNeed {
 /// The stall half of a session's need facts — `input_stall::menu_row`'s words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InputStallRow {
-    /// The server's own attention words for the stall (`<prog> is frozen:
-    /// not reading input since <HH:MM> (…) — restart it: …`), the text its
-    /// `meta attention=` entry carries.
+    /// The server's own attention words for the stall (`<prog> is frozen: not reading input
+    /// since <HH:MM> (…) — restart it: …`), as its `meta attention=` entry carries them.
     pub text: String,
     /// The episode's identity (a hash of when its oldest unread byte was
     /// accepted): one notification per stall, however its text moves.
@@ -531,26 +530,19 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
     })
 }
 
-/// The shortest spacing between two notifications for ONE session. A verdict
-/// that flaps (a misread box re-read a moment later as a new one) costs one
-/// notification per window, never one per flap; the menu row stays current.
+/// The shortest spacing between two notifications for one session: a flapping verdict costs
+/// one notification per floor, never one per flap. The menu row stays current.
 pub(crate) const NOTIFY_SESSION_FLOOR: std::time::Duration = std::time::Duration::from_secs(20);
-/// At most [`NOTIFY_BURST`] notifications per [`NOTIFY_BURST_WINDOW`] across
-/// the instance — ten agents hitting one usage limit together page once or a
-/// few times, not ten times. The menu lists every one of them regardless.
+/// At most [`NOTIFY_BURST`] notifications per [`NOTIFY_BURST_WINDOW`] across the instance: ten
+/// agents hitting one usage limit page a few times, not ten. The menu lists every one.
 pub(crate) const NOTIFY_BURST: usize = 3;
 /// The window [`NOTIFY_BURST`] is counted over.
 pub(crate) const NOTIFY_BURST_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-/// How long a session whose notice `notify.rs`'s queue refused
-/// ([`Herald::refused`]) waits before that notice is tried again. The wait is
-/// the refused session's alone: every other session's notices — which the
-/// queue never refused — are held by nothing but [`NOTIFY_SESSION_FLOOR`] and
-/// [`NOTIFY_BURST`]. The queue is ONE, shared with program notifications and
-/// drained one notifier subprocess (~100 ms) at a time, so a full one has
-/// room again within about two seconds unless a program is flooding it; a
-/// refusal that persists (that flood, or the delivery thread gone) costs one
-/// `warn` per this interval for each session that owes a notice, never one
-/// per wake of the event loop.
+/// How long a session whose notice `notify.rs`'s queue refused ([`Herald::refused`]) waits
+/// before that notice is tried again; no other session waits on it. The queue is shared with
+/// program notifications and drains one notifier subprocess (~100 ms) at a time, so a full one
+/// has room within about two seconds unless a program floods it; a persistent refusal costs one
+/// `warn` per interval per owing session, never one per loop wake.
 pub(crate) const NOTIFY_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One native notification the herald decided to post.
@@ -574,10 +566,8 @@ pub(crate) struct HeraldOutcome {
     pub row_moved: bool,
     /// Post exactly this notification.
     pub notice: Option<HeraldNotice>,
-    /// This note met a NEW `(kind, key)`: a transition into an escalation —
-    /// not a re-read of the one shown, and not the App's timer re-heralding
-    /// a notice the limit held back ([`Herald::due`]). `false` when nothing
-    /// escalates.
+    /// This note met a new `(kind, key)`: not a re-read of the one shown, and not the timer
+    /// re-heralding an owed notice ([`Herald::due`]).
     pub transition: bool,
     /// The transitions awaiting a notice when this note decided, its own
     /// included: what a post pays (`aterm.log`'s `(+n-1 more)`), what
@@ -605,8 +595,8 @@ pub(crate) enum HeraldQuiet {
     Same,
     /// The human is looking at the tab in the active app.
     Looking,
-    /// Desktop alerts are disabled. The row still moves, but the notice is
-    /// spent before rate limiting and cannot arm a retry.
+    /// Desktop alerts are off. The row still moves; the notice is spent before rate limiting
+    /// and arms no retry.
     Disabled,
     /// [`NOTIFY_SESSION_FLOOR`] or [`NOTIFY_BURST`] held it back, or the
     /// notifier's queue refused this session's notice less than
@@ -655,10 +645,8 @@ impl HeraldSlot {
         self.retry_at = None;
     }
 
-    /// Whether a quiet decision made at `now` is the first `aterm.log`
-    /// records at `info` for this session ([`HeraldOutcome::first_quiet`]):
-    /// none since the later of its last post and a [`NOTIFY_SESSION_FLOOR`]
-    /// ago. Spends the window when it is.
+    /// Whether a quiet decision at `now` is this session's first `info` log line since the
+    /// later of its last post and a [`NOTIFY_SESSION_FLOOR`] ago; spends the window when it is.
     fn first_quiet(&mut self, now: std::time::Instant) -> bool {
         let open = self
             .quiet_logged_at
@@ -1007,8 +995,8 @@ impl Herald {
     ) -> HeraldOutcome {
         self.last_quiet = None;
         if current.is_none() && !self.slots.contains_key(&session) {
-            // Nothing escalates and nothing ever did: keep no slot (a retired
-            // session's late refresh must not re-grow the map).
+            // Nothing escalates and nothing did: keep no slot, so a retired session's late
+            // refresh cannot re-grow the map.
             return HeraldOutcome::default();
         }
         let slot = self.slots.entry(session).or_default();
@@ -1042,9 +1030,8 @@ impl Herald {
             slot.shown = ident;
             slot.owed += 1;
         }
-        // What this decision covers — read before a branch below spends it,
-        // so the outcome (and the log line it earns, `herald_log_line`) says
-        // how many transitions it posted, held, or dropped.
+        // Read before a branch below spends it, so the outcome (and `herald_log_line`) says how
+        // many transitions it posted, held or dropped.
         let owed = slot.owed;
         let quiet = |herald: &mut Self, why, first_quiet| {
             herald.last_quiet = Some(why);
@@ -1068,10 +1055,8 @@ impl Herald {
             let first_quiet = slot.first_quiet(now);
             return quiet(self, HeraldQuiet::Looking, first_quiet);
         }
-        // Suppress BEFORE the rate limit: a disabled notice must not become
-        // debt merely because this session or another one notified recently.
-        // Keep the row and its transition key, so enabling alerts later does
-        // not replay an escalation the person chose to leave in the app.
+        // Suppress before the rate limit, so a disabled notice never becomes debt. Keep the row
+        // and its key, so enabling alerts later does not replay this escalation.
         if !desktop_alerts {
             slot.suppress_desktop_notice();
             let first_quiet = slot.first_quiet(now);
@@ -1086,9 +1071,8 @@ impl Herald {
             self.recent.pop_front();
         }
         if Self::free_at(&self.recent, notified_at, retry_at, now) > now {
-            // Only the FIRST hold can be the line: a re-read while the notice
-            // is owed recurs at change rate, and a further box held behind it
-            // is counted by the post that pays it (`aterm.log`'s `(+n more)`).
+            // Only the first hold earns the line: a re-read while owed recurs at change rate,
+            // and a further box behind it is counted by the post that pays it.
             let first_quiet = transition && owed == 1 && slot.first_quiet(now);
             return quiet(self, HeraldQuiet::Limited, first_quiet);
         }
@@ -1098,16 +1082,13 @@ impl Herald {
         slot.owed = 0;
         slot.notified_before = slot.notified_at;
         slot.notified_at = Some(now);
-        // The refused notice's wait is over: this is its retry, or a later
-        // post. A refusal of THIS post starts a new one (`Self::refused`).
+        // The refused notice's wait is over; a refusal of this post starts a new one.
         slot.retry_at = None;
-        // A post reopens the log's window: the first hold behind THIS notice
-        // is news, however recently the last one was logged.
+        // A post reopens the log's window: the first hold behind this notice is news.
         slot.quiet_logged_at = None;
         self.recent.push_back(now);
-        // The box on screen now, alone: a transition the limit held back was
-        // REPLACED by it (one escalation per session), so a count here would
-        // read as a second box waiting. `aterm.log` keeps the count.
+        // The box on screen now, alone: a held-back transition was replaced by it, so a count
+        // here would read as a second box waiting. `aterm.log` keeps the count.
         HeraldOutcome {
             row_moved,
             notice: Some(HeraldNotice {
@@ -1150,10 +1131,8 @@ impl Herald {
         slot.owed += owed;
     }
 
-    /// Turning desktop alerts off cancels existing rate-limit and queue-refusal
-    /// retries, without retiring the labels or transition keys the menu uses.
-    /// Runs at config-commit rate; the normal disabled observation consumes its
-    /// own notice in [`Self::note`] before it can create more debt.
+    /// Turning desktop alerts off cancels pending rate-limit and refusal retries, keeping the
+    /// labels and transition keys the menu uses.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1168,11 +1147,9 @@ impl Herald {
         }
     }
 
-    /// When a session last notified at `notified_at` may notify again: the
-    /// later of its [`NOTIFY_SESSION_FLOOR`], the instance's [`NOTIFY_BURST`]
-    /// window freeing a place (posts older than the window do not count), and
-    /// its own `retry_at` — [`NOTIFY_RETRY`] after the notifier's queue last
-    /// refused ITS notice ([`Self::refused`]). `now` means now.
+    /// When a session last notified at `notified_at` may notify again: the latest of its
+    /// [`NOTIFY_SESSION_FLOOR`], a [`NOTIFY_BURST`] place freeing in the window, and its own
+    /// `retry_at` ([`Self::refused`]). `now` means now.
     fn free_at(
         recent: &std::collections::VecDeque<std::time::Instant>,
         notified_at: Option<std::time::Instant>,

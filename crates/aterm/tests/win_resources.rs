@@ -128,9 +128,8 @@ fn manifest_leaves_dpi_awareness_to_winit() {
     );
 }
 
-/// `build.rs` reaches across into aterm-gui for the icon rather than keeping a
-/// second copy. That cross-crate path is exactly the kind of thing a directory
-/// move breaks quietly — the build would only warn, and the exe would ship blank.
+/// `build.rs` reaches into aterm-gui for the icon rather than keeping a second copy, and a
+/// directory move breaks that quietly: the build only warns, and the exe ships blank.
 #[test]
 fn icon_the_build_script_embeds_exists_and_is_an_ico() {
     let icon = crate_dir().join("../aterm-gui/assets/aterm.ico");

@@ -2764,10 +2764,8 @@ fn a_held_flip_no_group_holds_is_ended_by_the_next_pass() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE LAST LOOK: quiet when the pass began, but a build started while the tree was
-/// being extracted — the flip is held after all, the extracted trees go (no complete
-/// inactive build is left above the live one), and the archives stay for the flip that
-/// follows.
+/// The last look: quiet when the pass began, but a build started during the extract, so the
+/// flip is held after all, the extracted trees go, and the archives stay for the next flip.
 #[test]
 fn a_build_started_during_the_extract_holds_the_flip_after_all() {
     let dir = scratch("quiet-last-look");
@@ -3300,9 +3298,9 @@ fn an_installed_group_whose_new_pin_lacks_this_triple_is_held_whole() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// The hold reads only the members the pass would move. ay is up to date on build 18,
-// whose signed manifest has no row for this triple; trust moves 4820 → 4821, which is
-// published here. Nothing of ay's is staged, so its manifest is never even fetched.
+// The hold reads only the members the pass would move: ay is up to date on 18, whose
+// manifest has no row for this triple, and trust moves 4820 → 4821, published here. ay's
+// manifest is never fetched.
 #[test]
 fn an_up_to_date_member_whose_pin_lacks_this_triple_never_holds_its_sibling() {
     let dir = scratch("group-uptodate-unserved");
@@ -3342,7 +3340,7 @@ fn an_up_to_date_member_whose_pin_lacks_this_triple_never_holds_its_sibling() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// --- rollback + local pin + apply_program (steps 9/10/11) --------------------------
+// --- rollback + local pin + apply_program -------------------------------------------
 
 /// A complete build dir with `bin/<program>`; `activate` also shims and activates it.
 fn seed_build(layout: &Layout, program: &str, build: u64, activate: bool) {
@@ -4022,12 +4020,10 @@ fn rollback_refuses_a_target_whose_tools_are_gone_and_takes_the_one_below() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE PINS THAT HOLD A ROLLED-BACK PROGRAM where it lands, as the update pass's pin
-/// gate reads them: its own when ungrouped, any member's of its coherence group, never an
-/// uninstalled or excluded sibling's (the pass drops that member unread), none while a
-/// member's current build is revoked (the pass moves the tuple whatever is pinned), and
-/// none when nothing is pinned. Each case then runs that pass: it holds the group on
-/// exactly the reported pins, or not at all.
+/// The pins that hold a rolled-back program, as the update pass's pin gate reads them: its
+/// own when ungrouped, any group member's, never an uninstalled or excluded sibling's, and
+/// none while a member's current build is revoked. Each case then runs that pass, which
+/// must hold the group on exactly the reported pins.
 #[test]
 fn rollback_reports_the_pins_that_hold_it() {
     type Next = (Vec<String>, Option<(String, u64)>);
@@ -5480,9 +5476,8 @@ fn a_group_starts_a_bundles_resolve_check_before_the_next_member_stages() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Where the link write fails ATOMICALLY (POSIX: `store/<program>/` read-only, so
-/// the temp link cannot be made) the link is exactly as it was and the repair only
-/// re-writes the same target — the shape every real POSIX failure takes.
+/// Where the link write fails atomically (POSIX: `store/<program>/` read-only), the link is
+/// as it was and the repair re-writes the same target.
 #[cfg(unix)] // read-only dir injection
 #[test]
 fn an_atomic_link_write_failure_leaves_the_witness_on_the_prior_build() {
@@ -5511,12 +5506,9 @@ fn an_atomic_link_write_failure_leaves_the_witness_on_the_prior_build() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The strandage bound a resumable download needs: OUR partial survives (the next
-/// attempt continues it), every other program-staging partial is reclaimed, and
-/// nothing else in the directory is touched.
-///
-/// Without the sweep a resumable lane trades "re-fetch 630 MB on every retry" for
-/// "leak a 600 MB prefix per abandoned build", which is not a trade worth making.
+/// The strandage bound a resumable download needs: our partial survives, every other
+/// partial or archive in the program's staging dir is reclaimed, and nothing else is
+/// touched.
 #[test]
 fn a_resumable_download_strands_at_most_one_partial_per_program() {
     let dir = crate::testdir::dir("atpkg-sweep-part-");

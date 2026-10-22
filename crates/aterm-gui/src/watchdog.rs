@@ -1025,10 +1025,9 @@ impl TurnLedger {
             .collect()
     }
 
-    /// Clear the window, INCLUDING the open stamp: the turn straddling a reset
-    /// began before the window it would be booked to, and a driver that resets,
-    /// drives a workload and reads must see that workload's worst turn. The
-    /// heartbeat's timestamp (`last_beat_ns`) is not a window stat and stays.
+    /// Clear the window, including the open stamp: the turn straddling a reset began
+    /// before the window, and a driver that resets, drives a workload and reads must see
+    /// that workload's worst turn. `last_beat_ns` is not a window stat and stays.
     fn reset(&self) {
         self.window_from_ns
             .store(crate::metrics::now_ns(), Ordering::Relaxed);
@@ -1996,16 +1995,10 @@ mod tests {
         );
     }
 
-    /// THE READING THAT HAD NO PRODUCER. A `Wake::Output` turn parks 312 ms in
-    /// the bookkeeping that runs ahead of the redraw fan-out; `present_latency`
-    /// and `input_present` both book it, `redraw_total` cannot see it, and the
-    /// 5 s release sampler never fires. This is the census that names it, with
-    /// the counts that say whether it was one hitch or a habit.
-    ///
-    /// Driven against a LOCAL ledger on a synthetic clock: the process-global one
-    /// is written by every other test in this binary and cleared by
-    /// `metrics::reset`, so asserting against it would be schedule-dependent —
-    /// exactly the flake the key-queue split was rewritten to avoid.
+    /// A 312 ms park in a work root, which the redraw timer and the release sampler both
+    /// miss, is named with its owner, when it ended, and the counts that say whether it was
+    /// one hitch or a habit. A local ledger on a synthetic clock: the process-global one is
+    /// written by other tests and cleared by `metrics::reset`.
     #[test]
     fn the_turn_census_names_the_worst_root_and_counts_the_long_turns() {
         const T0: u64 = 5_000_000_000;
@@ -2344,7 +2337,7 @@ mod tests {
         );
     }
 
-    /// A REPORTED stall that ends says so, once, with how long it lasted and where —
+    /// A reported stall that ends says so, once, with how long it lasted and where:
     /// the line that lets the next launch's recovery census tell a stall the run
     /// survived from one it died in. A freeze that never crossed the bar was never
     /// reported, so its end is not news either.
@@ -2408,11 +2401,7 @@ mod tests {
         }
     }
 
-    /// REGRESSION (2026-08-30, v0.65.0): the shipped binary must ARM this. The
-    /// watchdog was `cfg!(debug_assertions) || $ATERM_WATCHDOG`, so the release
-    /// that parked its main thread inside `user_event` for five hours spawned no
-    /// sampler and logged nothing — and the only evidence left was a macOS hang
-    /// report that had to be hand-symbolicated against a stripped binary.
+    /// A shipped binary arms the watchdog; only a development seam switches it off.
     #[test]
     fn the_watchdog_is_armed_unless_explicitly_switched_off() {
         // `enabled()` reads the environment, which is process-global and shared
@@ -2459,10 +2448,8 @@ mod tests {
         );
     }
 
-    /// TWO SEPARATE WEDGES READ AS TWO. The report counter used to live in the
-    /// sampler LOOP rather than in the sampler, so it never re-armed: a stall
-    /// hours after the first announced itself as "STALL CONTINUES", and two
-    /// distinct incidents read as one. Found by `codex review`.
+    /// The report count re-arms on recovery: a second wedge reports as a first, not as
+    /// "STALL CONTINUES".
     #[test]
     fn a_second_stall_after_recovery_reports_as_a_first_again() {
         let t0 = Instant::now();

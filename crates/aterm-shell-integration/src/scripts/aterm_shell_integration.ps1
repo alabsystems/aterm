@@ -46,6 +46,12 @@ if ((Test-Path -LiteralPath Variable:\__aterm_bin) -and ($__aterm_bin -is [strin
     }
 }
 
+# Enable agy's fast prompt editor by default so U+202F narrow no-break spaces
+# in macOS screenshot filenames do not desynchronize Bubble Tea's cursor.
+if (-not (Test-Path Env:AGY_CLI_FAST_PROMPT_EDITOR)) {
+    $env:AGY_CLI_FAST_PROMPT_EDITOR = 'true'
+}
+
 # Skip if already loaded
 if ($env:ATERM_SHELL_INTEGRATION_INSTALLED) { return }
 $env:ATERM_SHELL_INTEGRATION_INSTALLED = '1'
@@ -63,9 +69,6 @@ if (($env:ATERM_CHILD -or $env:ATERM_SESSION_ID) -and
 }
 
 # Source package shell hooks (`~/.aterm/shell.d/*.ps1`).
-if (-not (Test-Path Env:AGY_CLI_FAST_PROMPT_EDITOR)) {
-    $env:AGY_CLI_FAST_PROMPT_EDITOR = 'true'
-}
 if ($HOME) {
     $__aterm_hooks = Join-Path $HOME '.aterm/shell.d'
     if (Test-Path -LiteralPath $__aterm_hooks) {

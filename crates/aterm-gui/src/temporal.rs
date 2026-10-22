@@ -776,9 +776,8 @@ impl TemporalRecorder {
         self.host_resyncs_alt_screen = on;
     }
 
-    /// The current tick on this recorder's timeline (micros since the epoch).
-    /// Both the reader-thread (RawIn/Reply) and main-thread (Resize/Keyframe)
-    /// taps call this so one session shares a single monotone tick timeline.
+    /// The current tick on this recorder's timeline (micros since the epoch):
+    /// every append stamps it, so a session has one monotone timeline.
     #[must_use]
     pub(crate) fn now(&self) -> Ticks {
         Ticks(u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX))

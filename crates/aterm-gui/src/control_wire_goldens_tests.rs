@@ -59,9 +59,9 @@ pub(crate) fn title(plant: bool) -> &'static str {
 /// last, retired, each through its production writer but two (below).
 /// Returns the session.
 ///
-/// The writers: the store's `register`, `set_title`, `set_state` and
-/// `deregister_local_as`; the `meta` verb; the timeline's
-/// `record_cwd_change`, `publish_agent` (the agent sweep's publication),
+/// The writers: the store's `register`, `set_state` and
+/// `deregister_local_as`; the `meta` verb; the timeline's `record_title`
+/// (the drift flush's), `record_cwd_change`, `publish_agent` (the agent sweep's publication),
 /// `mark_task`, `record_render` (the resize ledger's), `note_harness_act`,
 /// `note_program_state`; the status sweep's payload
 /// ([`crate::session_status::status_event_payload`], a failed command at
@@ -84,8 +84,16 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
     {
         let mut g = store.write().unwrap_or_else(|p| p.into_inner());
         g.register(h.clone()); // spawned
-        g.set_title(5, title(plant)); // title-change
+        g.set_title(5, title(plant));
     }
+    // title-change: the drift flush's writer, the title mark's row (phase 6,
+    // 6F-8, ruling U13).
+    assert!(
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record_title(title(plant))
+    );
     let reply = crate::control::meta_line_for_test(
         &store,
         &h.term,

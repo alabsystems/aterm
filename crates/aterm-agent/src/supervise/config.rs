@@ -2009,10 +2009,9 @@ fn autocompact_size(value: &str) -> Option<Option<u32>> {
         .then_some(Some(k))
 }
 
-/// Whether a value's text says off for any key: a switch's off
-/// ([`switch_word`]), or `none` / `never` / `disabled`, the one kind of value
-/// that limits a key it is not the key's own value for (only an explicit
-/// setting takes power away) (owner, 2026-09-25).
+/// Whether a value's text says off for any key: a switch's off ([`switch_word`]), or `none` /
+/// `never` / `disabled`. An off is the one value that limits a key it is not the key's own
+/// value for.
 #[must_use]
 pub fn spells_off(value: &str) -> bool {
     switch_word(value) == Some(false)
@@ -3850,10 +3849,8 @@ trust_dialog = false
         assert!(is_unknown_key_note(&notes[0]), "{notes:?}");
     }
 
-    /// `disk` under [harness] is the disk reader's: a `[disk]` knob TOML files
-    /// there turns every automatic removal off, so its note is the reader's,
-    /// never "not a harness key, ignored" (which invites the deletion that
-    /// turns removal back on). Control: an unknown key beside it still is one.
+    /// `disk` under [harness] carries the disk reader's note, never "not a harness key".
+    /// Control: an unknown key beside it still is one.
     #[test]
     fn a_disk_knob_under_harness_is_the_disk_readers_not_an_unknown_key() {
         let text = "[harness]\ndisk.auto_free_gib = 0\n";
@@ -3917,12 +3914,9 @@ trust_dialog = false
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `memory_ceiling`: `auto` by default; a number of GiB (a TOML integer or
-    /// a text with a unit) or `off` taken. A value it cannot take is no
-    /// setting: the default stands and the note says so (only an off-word
-    /// reads as a key's limit, [`SupervisorConfig::set`]). Written below
-    /// another table, `off` limits and a lower number never grants (a lower
-    /// ceiling warns and restarts more) (owner, 2026-09-25).
+    /// `memory_ceiling`: `auto` by default, a number of GiB or `off`; a value it cannot take
+    /// keeps the default. Misplaced, `off` limits and a lower number (which acts sooner) never
+    /// grants.
     #[test]
     fn the_memory_ceiling_reads_auto_off_or_gibibytes_and_limits_to_off() {
         use super::super::memory::MemoryCeiling;

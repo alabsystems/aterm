@@ -674,17 +674,9 @@ pub(crate) fn main() -> ExitCode {
             });
     }
 
-    // Startup environment changes are now complete. The foreground countdown
-    // finishes before the shell starts; its worker must not race the PATH and
-    // agent-directory writes above with its own environment reads or children.
-    #[cfg(target_os = "macos")]
-    if first_run_doctor_eligible(
-        &rest,
-        argv0 != "aterm-cli" && stdin_is_terminal(),
-        doctor_startup_env(),
-    ) {
-        apply_first_run_doctor_in_session();
-    }
+    // First-run setup is offered by the window's System State surface or an
+    // explicit doctor command. The transparent session never owns the tty or
+    // waits for a setup decision before starting its shell.
 
     // The session update lane: the window's background check/stage loop, so a terminal-only
     // machine updates too. Checkers dedupe across processes (a shared flock and a
@@ -1259,14 +1251,13 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     ExitCode::SUCCESS
 }
 
-/// First-run setup belongs to an interactive launch, never a nested transparent
-/// shell or a laboratory's private state root. A window (including an update successor)
-/// waits until it has presented and its handoff has committed before calling
-/// the action; the transparent route calls it after parsing and before its shell.
+/// First-run setup belongs to an interactive window launch, never a nested
+/// transparent shell or a laboratory's private state root. A window
+/// (including an update successor) waits until it has presented and its
+/// handoff has committed before calling the action.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Default)]
 struct DoctorStartupEnv {
-    nested: bool,
     isolated: bool,
     outside_person_scope: bool,
 }
@@ -1274,35 +1265,10 @@ struct DoctorStartupEnv {
 #[cfg(target_os = "macos")]
 fn doctor_startup_env() -> DoctorStartupEnv {
     DoctorStartupEnv {
-        nested: std::env::var_os("ATERM_CHILD").is_some()
-            || std::env::var_os("TERM_PROGRAM").as_deref() == Some(std::ffi::OsStr::new("aterm")),
         isolated: std::env::var_os("ATERM_STATE_HOME").is_some()
             || std::env::var_os("CI").is_some(),
         outside_person_scope: aterm_cli::macos_doctor::lasting_scope_refusal().is_some(),
     }
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn first_run_doctor_eligible(args: &[OsString], interactive: bool, env: DoctorStartupEnv) -> bool {
-    if !interactive || env.nested || env.isolated || env.outside_person_scope {
-        return false;
-    }
-    // Fail closed to the ordinary launch grammar. In particular, no command
-    // payload, diagnostic, private socket, headless lab or unknown flag can
-    // turn a read-only or automated invocation into machine setup.
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        match arg.to_str() {
-            Some("--window" | "--session" | "--quiet" | "-q" | "--verbose" | "--no-reroute") => {}
-            Some("-d" | "--working-directory") => {
-                if args.next().is_none() {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
-    true
 }
 
 /// A new GUI window has its own setup surface even when it inherits markers
@@ -1356,40 +1322,6 @@ fn apply_first_run_doctor() -> bool {
             aterm_gui::report_workstation_setup_failure();
             false
         }
-    }
-}
-
-#[cfg(target_os = "macos")]
-mod setup_terminal;
-
-/// The tty countdown owns input before the shell does. Never read the person's
-/// keystrokes from a background thread once the transparent session has started.
-#[cfg(target_os = "macos")]
-fn apply_first_run_doctor_in_session() {
-    // Reserve a worker before offering a choice. Once input has been accepted,
-    // a failed thread spawn must never release that unsaved decision's claim.
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    if let Err(why) = std::thread::Builder::new()
-        .name("aterm-workstation-setup".into())
-        .spawn(move || {
-            if let Ok(prepared) = receiver.recv() {
-                run_prepared_setup(prepared, None);
-            }
-        })
-    {
-        aterm_log::warn!("first-run macOS doctor worker could not start: {why}");
-        aterm_gui::report_workstation_setup_failure();
-        setup_terminal::worker_unavailable(false);
-        return;
-    }
-    let prepared = prepare_first_run_doctor(|plan| setup_terminal::countdown(plan).into(), false);
-    if let PreparedSetup::Pending { choice, .. } = &prepared.setup {
-        setup_terminal::saving_choice(matches!(choice, SetupChoice::Cancel));
-    }
-    if sender.send(prepared).is_err() {
-        aterm_log::warn!("first-run macOS doctor worker ended before receiving the decision");
-        aterm_gui::report_workstation_setup_failure();
-        setup_terminal::worker_unavailable(true);
     }
 }
 
@@ -5769,30 +5701,22 @@ mod tests {
     }
 
     #[test]
-    fn setup_windows_ignore_inherited_shell_markers_but_keep_scope_and_command_guards() {
-        let nested = DoctorStartupEnv {
-            nested: true,
-            ..DoctorStartupEnv::default()
-        };
+    fn setup_windows_keep_scope_and_command_guards() {
+        let plain = DoctorStartupEnv::default();
         let window = [OsString::from("--window")];
-        assert!(first_run_window_eligible(&window, nested));
+        assert!(first_run_window_eligible(&window, plain));
         assert!(
-            first_run_window_eligible(&[], nested),
+            first_run_window_eligible(&[], plain),
             "Dock and updater launches have a GUI offer surface"
         );
-        assert!(!first_run_doctor_eligible(
-            &[OsString::from("--session")],
-            true,
-            nested
-        ));
         for env in [
             DoctorStartupEnv {
                 isolated: true,
-                ..nested
+                ..plain
             },
             DoctorStartupEnv {
                 outside_person_scope: true,
-                ..nested
+                ..plain
             },
         ] {
             assert!(!first_run_window_eligible(&window, env));
@@ -5805,7 +5729,7 @@ mod tests {
             vec![OsString::from("-e"), OsString::from("zsh")],
             vec![OsString::from("--headless")],
         ] {
-            assert!(!first_run_window_eligible(&args, nested));
+            assert!(!first_run_window_eligible(&args, plain));
         }
     }
 
@@ -5818,25 +5742,22 @@ mod tests {
             osv(&["--headless", "-e", "zsh"]),
         ] {
             assert!(
-                !first_run_doctor_eligible(
+                !first_run_window_eligible(
                     first_run_window_args(&args, true),
-                    true,
                     DoctorStartupEnv::default(),
                 ),
                 "a relaunch hint must preserve {args:?}",
             );
         }
         let ordinary = osv(&["--window", "-d", "/tmp"]);
-        assert!(first_run_doctor_eligible(
+        assert!(first_run_window_eligible(
             first_run_window_args(&ordinary, true),
-            true,
             DoctorStartupEnv::default(),
         ));
         let carried = osv(&["--window", "-d", "/tmp", "-e", "zsh", "--control-sock"]);
         assert_eq!(first_run_window_args(&carried, true), ordinary.as_slice());
-        assert!(!first_run_doctor_eligible(
+        assert!(!first_run_window_eligible(
             first_run_window_args(&carried, false),
-            true,
             DoctorStartupEnv::default(),
         ));
     }
@@ -5873,65 +5794,6 @@ mod tests {
             assert!(
                 !first_run_window_eligible(&args, DoctorStartupEnv::default()),
                 "ordinary options cannot erase a scope/command refusal: {args:?}",
-            );
-        }
-    }
-
-    #[test]
-    fn first_run_setup_admits_only_ordinary_interactive_launches() {
-        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
-        for args in [
-            osv(&[]),
-            osv(&["--window"]),
-            osv(&["--session", "--quiet"]),
-            osv(&["--window", "-d", "/tmp", "--no-reroute"]),
-        ] {
-            assert!(first_run_doctor_eligible(
-                &args,
-                true,
-                DoctorStartupEnv::default(),
-            ));
-            assert!(!first_run_doctor_eligible(
-                &args,
-                false,
-                DoctorStartupEnv::default(),
-            ));
-            for env in [
-                DoctorStartupEnv {
-                    nested: true,
-                    ..DoctorStartupEnv::default()
-                },
-                DoctorStartupEnv {
-                    isolated: true,
-                    ..DoctorStartupEnv::default()
-                },
-                DoctorStartupEnv {
-                    outside_person_scope: true,
-                    ..DoctorStartupEnv::default()
-                },
-            ] {
-                assert!(!first_run_doctor_eligible(&args, true, env));
-            }
-        }
-        for args in [
-            osv(&["doctor"]),
-            osv(&["help"]),
-            osv(&["--help"]),
-            osv(&["--version"]),
-            osv(&["--window", "--headless"]),
-            osv(&["--diagnose"]),
-            osv(&["-e", "zsh"]),
-            osv(&["--command", "zsh"]),
-            osv(&["--", "zsh"]),
-            osv(&["--control-sock", "/tmp/test.sock"]),
-            osv(&["--lifeline-fd", "3"]),
-            osv(&["--ready-fd", "4"]),
-            osv(&["--bogus"]),
-            osv(&["-d"]),
-        ] {
-            assert!(
-                !first_run_doctor_eligible(&args, true, DoctorStartupEnv::default()),
-                "{args:?}",
             );
         }
     }
@@ -6638,15 +6500,10 @@ mod tests {
         }
     }
 
-    /// THE HOST TABLE for a window-shaped front-door launch. On Windows the
-    /// console image hands a real window to the windowed sibling, and keeps
-    /// the WINDOW in-process only for the launches whose output a harness
-    /// reads through its pipes: `--headless` (its one spelling) and
-    /// `--diagnose`. A flag the window's parser answers by printing takes the
-    /// sibling route too — whose first step is that parser, run in this
-    /// process (`aterm_gui::check_window_args`), so it still prints here; the
-    /// end-to-end proof is `tests/windows_console_image.rs`. Off Windows there
-    /// is one image and one answer.
+    /// On Windows the console image hands a window to the windowed sibling, except `--headless`
+    /// and `--diagnose`, whose output a harness reads through its pipes. A flag the window's
+    /// parser answers by printing still prints here (`aterm_gui::check_window_args` runs first);
+    /// end to end: `tests/windows_console_image.rs`. Off Windows there is one image.
     #[test]
     fn a_console_window_launch_goes_to_the_sibling_unless_a_harness_reads_it() {
         let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };

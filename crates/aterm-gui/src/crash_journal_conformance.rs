@@ -520,12 +520,11 @@ fn transition_cover(
     cover.iter().filter(|s| !longer(s)).cloned().collect()
 }
 
-/// Replay `schedule` on the real owner and claim, on `desk` (handed back
-/// emptied) — with the evidence read
-/// first by a launch that does not claim before every claim when
-/// `consumed_first` (`consumed` counts the reads that found some). After every
-/// step, where the committed model forbids a claim, the real claim runs anyway
-/// and must leave the projection unchanged (`refused` counts those).
+/// Replay `schedule` on the real owner and claim on `desk` (handed back emptied). With
+/// `consumed_first`, a launch that does not claim reads the evidence before every claim
+/// (`consumed` counts the reads that found some). After each step at which the model forbids a
+/// claim, the real claim runs anyway and must leave the projection unchanged (`refused` counts
+/// those).
 fn replay(
     desk: Desk,
     schedule: &[&'static str],

@@ -647,10 +647,8 @@ mod tests {
     // The pure fold
     // -----------------------------------------------------------------------
 
-    /// The one item whose probe path may legitimately not exist reads `ENOENT`
-    /// as permission, and no other item does. Everything else about the fold
-    /// stays identical across items — in particular `EPERM` is a denial for
-    /// all four and `EACCES` is a denial for none.
+    /// Only the app-data item reads `ENOENT` as permission; `EPERM` and `EACCES` fold the same
+    /// for every item.
     #[test]
     fn a_missing_path_is_permission_for_the_app_data_item_alone() {
         const EACCES: i32 = 13;
@@ -714,10 +712,6 @@ mod tests {
         );
         assert_eq!(WarmupRow::default(), WarmupRow::Unknown);
     }
-
-    // -----------------------------------------------------------------------
-    // The probe arms
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_headless_instance_gets_the_arm_that_cannot_reach_the_filesystem() {
@@ -877,10 +871,6 @@ mod tests {
         state.end_pass();
         assert!(!state.holds_automatic_apply(started));
     }
-
-    // -----------------------------------------------------------------------
-    // The successor
-    // -----------------------------------------------------------------------
 
     #[test]
     fn a_successor_starts_with_no_rows_no_hold_and_no_claim() {

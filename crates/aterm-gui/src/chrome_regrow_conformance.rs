@@ -546,11 +546,9 @@ fn a_settings_edit_down_outside_the_floor_takes_the_strip_at_once() {
     });
 }
 
-/// THE WINDOW'S OWN SHRINK, the band's: a band row rises and is dismissed,
-/// and 100 ms later — inside the floor its own rise noted, and inside its
-/// own quiet — the window loses its room. The window takes the row at the
-/// next wake (D1's exception), neither quiet nor the floor applying: the
-/// model's `BandTaken`.
+/// The window's own shrink, band row: a band row rises and is dismissed, and 100 ms later,
+/// inside both its floor and its own quiet, the window loses its room. The window takes
+/// the row at the next wake, neither quiet nor floor applying: `BandTaken`.
 fn band_taken(rig: &mut Rig) {
     let ms = Duration::from_millis;
     rig.run(&[
@@ -589,9 +587,8 @@ fn a_window_that_loses_its_room_takes_the_bands_waiting_row_inside_the_floor() {
     });
 }
 
-/// A window that never re-grids for its chrome (headless, no stand-in) has
-/// no floor at all — its falls keep the law before — and one that does reads
-/// the latest rise of any source.
+/// A window that never re-grids for its chrome (headless, no stand-in) has no floor; one
+/// that does reads the latest rise of any source.
 #[test]
 fn only_a_window_whose_grid_moves_for_its_chrome_has_a_floor() {
     crate::fabric::with_link_reset(|| {

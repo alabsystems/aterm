@@ -153,8 +153,7 @@ mod tests {
         }
     }
 
-    /// Determinism: one key ⇒ byte-identical texels, across repeated lookups,
-    /// across independent bakers, and against a direct [`bake_breed`].
+    /// One key bakes byte-identical texels: on a hit, in another baker, and from [`bake_breed`].
     #[test]
     fn same_key_bakes_byte_identical_tiles() {
         let k = key(5);

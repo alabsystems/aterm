@@ -59,10 +59,7 @@ impl Grid {
             self.storage
                 .extras
                 .shift_cols_right(cursor_row, cursor_col, count, right_bound);
-            // A pair the insert bisected or pushed off the bound loses its blanked
-            // halves' extras (the head left of the cursor, the continuation the
-            // shift carried right, the head shifted to the bound and the
-            // continuation past it).
+            // As in `insert_chars`.
             self.drop_unclaimed_extras(
                 cursor_row,
                 cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
@@ -105,9 +102,7 @@ impl Grid {
             self.storage
                 .extras
                 .shift_cols_left(cursor_row, cursor_col, count, right_bound);
-            // A pair the delete bisected loses its blanked halves' extras (the head
-            // left of the cursor, the continuation shifted onto it, the
-            // continuation past the bound).
+            // As in `delete_chars`.
             self.drop_unclaimed_extras(
                 cursor_row,
                 cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
@@ -303,8 +298,7 @@ impl Grid {
         // (column 0, or the left margin under DECLRMM; it is 0 without).
         self.storage.cursor.col = self.storage.horizontal_margins().left;
 
-        // Row index arithmetic requires display_offset == 0. Reset
-        // defensively for callers that may not have done so.
+        // Row index arithmetic requires display_offset == 0.
         self.reset_display_offset_with_damage();
 
         let start_row = usize::from(cursor_row);
@@ -455,11 +449,8 @@ impl Grid {
                         *c = fill;
                     }
                 }
-                // Wide char fixup at rectangle boundaries.
+                // As in `insert_lines_margined`.
                 r.fixup_wide_boundary(left_usize, right_usize, cols, true);
-                // The BCE fill via get_mut bypasses len maintenance: an empty
-                // cursor_template can orphan the tail, a colored one extends it.
-                // Recompute the true extent.
                 r.recompute_len();
             }
         }
@@ -1299,7 +1290,6 @@ mod tests {
         assert!(grid.row(1).unwrap().is_wrapped());
     }
 
-    // =========================================================================
     // DECLRMM IL/DL horizontal containment
 
     /// IL and DL with DECLRMM active are no-ops when the cursor column is

@@ -2,30 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Regression tests for keyboard encoding internals (write_u32), plus the
-//! KEYBOARD-SHIFT REFINEMENT obligation (the always-on twin of the Trust
-//! `a7_keyboard_shift` SMT bundle).
+//! Keyboard encoding obligations: the shift refinement (the always-on twin of the Trust
+//! `a7_keyboard_shift` SMT bundle), exhaustive mode sweeps, kitty and keypad witnesses, and
+//! win32-input-mode records.
 
 use super::{
     Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, conhost_holds_once_switched, encode_key,
     encode_key_with_event, encode_key_with_layout, encode_kitty, shifted_character, write_u32,
 };
 
-// =========================================================================
-// KEYBOARD-SHIFT SPEC — the single source of truth, authored INDEPENDENTLY of
-// the implementation (from the ANSI US-QWERTY layout), so this is a genuine
-// refinement check, not a tautology against the code's own table.
-//
-// This is the spec the "Shift doesn't work" regression violated: the legacy
-// encoder applied Shift with `to_ascii_uppercase`, which is the identity on
-// every non-letter, so Shift+2 emitted '2' instead of '@'. The two load-bearing
-// properties below — REFINEMENT (the encoder equals this spec) and EFFECTIVENESS
-// (Shift changes every shiftable key) — each independently forbid that bug.
-// =========================================================================
+// The keyboard-shift spec, authored independently of the implementation, so the refinement
+// check is not a tautology against the code's own table.
 
-/// SPEC: the US-QWERTY glyph produced by holding Shift on the key whose
-/// unshifted character is `c`. `None` for keys with no distinct shifted form.
-/// Authored from the physical ANSI layout, NOT from `shifted_character`.
+/// The US-QWERTY glyph Shift gives the key whose unshifted character is `c`, or `None`.
+/// Authored from the physical ANSI layout, not from `shifted_character`.
 fn spec_shifted(c: char) -> Option<char> {
     Some(match c {
         'a'..='z' => c.to_ascii_uppercase(),
@@ -54,12 +44,8 @@ fn spec_shifted(c: char) -> Option<char> {
     })
 }
 
-/// THEOREM (refinement; the `a7_keyboard_shift` `.smt2` lemmas state the spec
-/// alone, so this Rust test is the only half that binds the engine): for
-/// every key with a distinct shifted glyph, the engine's single shift map
-/// `shifted_character` — the one BOTH the legacy and Kitty paths now use —
-/// equals the independent spec. A second shift table that disagreed (the
-/// original `to_ascii_uppercase` legacy branch) cannot pass this.
+/// The engine's shift map equals the independent spec for every shiftable key. The
+/// `a7_keyboard_shift` `.smt2` lemmas state the spec alone; this test binds the engine.
 #[test]
 fn shifted_character_refines_independent_spec() {
     for b in 0u8..=127 {
@@ -74,10 +60,7 @@ fn shifted_character_refines_independent_spec() {
     }
 }
 
-/// THEOREM (effectiveness, `shift_is_effective.smt2` twin): Shift must CHANGE
-/// every shiftable key end-to-end in legacy mode. This is the property the bug
-/// most directly broke and the one that needs no knowledge of the exact glyph:
-/// `encode(Shift+c) != encode(c)` for every key that has a shifted form.
+/// Shift changes every shiftable key's legacy bytes (`shift_is_effective.smt2`'s twin).
 #[test]
 fn legacy_shift_changes_every_shiftable_key() {
     for b in 0u8..=127 {
@@ -97,10 +80,7 @@ fn legacy_shift_changes_every_shiftable_key() {
     }
 }
 
-/// `write_u32` renders every magnitude, zero and `u32::MAX` included.
-///
-/// Regression (#2775): from 2,000,000,000 up, a `u32` divisor overflowed at
-/// `divisor * 10` and the digit loop never ended.
+/// `write_u32` renders every magnitude, zero and `u32::MAX` included (#2775).
 #[test]
 fn write_u32_renders_every_magnitude() {
     for (val, want) in [
@@ -117,34 +97,18 @@ fn write_u32_renders_every_magnitude() {
     }
 }
 
-// =========================================================================
-// SHIFT-ENTER DISTINGUISHABILITY obligation — the always-on, exhaustively
-// MODEL-CHECKED proof behind "Shift+Enter inserts a newline".
-//
-// THE property: in EVERY keyboard mode, Shift+Enter encodes to DIFFERENT bytes
-// than a plain Enter — so an app can ALWAYS tell the two apart. aterm guarantees
-// this two ways: via the negotiated protocol (ESC[13;2u / ESC[27;2;13~) when one
-// is active, and via aterm's INPUT POLICY (Shift+Enter -> LF 0x0a) in plain legacy
-// mode. The legacy half is aterm FORCING the useful behaviour from the terminal
-// side — no protocol handshake, and no faking aterm's identity — so Shift+Enter is
-// a newline for cooperating apps (agent TUIs, readline, vim) out of the box.
-//
-// A genuine PROOF, not a sample: KeyboardMode defines 15 flag bits, so the whole
-// 2^15 = 32768-point mode space is enumerated below. For a finite, fully-enumerated
-// input space, exhaustive checking is sound AND complete. It has teeth:
-// it FAILS on the pre-policy encoder (legacy Enter == legacy Shift+Enter == CR).
-// =========================================================================
+// Shift+Enter is distinguishable from Enter in every mode: by the negotiated protocol
+// (ESC[13;2u / ESC[27;2;13~) or, in plain legacy mode, by aterm's Shift+Enter LF.
 
-/// Number of defined `KeyboardMode` flag bits (see `mode.rs`: bits 0..=14).
+/// The `KeyboardMode` bits the sweeps enumerate, 0..=14 (2^15 modes); WIN32_INPUT, bit 15, has
+/// its own tests below.
 const KEYBOARD_MODE_DEFINED_BITS: u32 = 15;
 
 fn encode_enter(mode: KeyboardMode, mods: Modifiers) -> Vec<u8> {
     encode_key(&Key::Named(NamedKey::Enter), mods, mode)
 }
 
-/// EXHAUSTIVE: over all 2^15 keyboard modes, Shift+Enter is byte-DISTINCT from a
-/// plain Enter, and neither ever encodes to nothing — so "Shift+Enter = newline"
-/// works in EVERY mode (protocol-negotiated OR aterm's legacy LF policy).
+/// In every swept mode Shift+Enter differs from plain Enter, and neither encodes to nothing.
 #[test]
 fn shift_enter_distinct_from_enter_in_every_mode() {
     for bits in 0u32..(1u32 << KEYBOARD_MODE_DEFINED_BITS) {
@@ -230,16 +194,9 @@ fn release_encodes_to_nothing_without_report_event_types() {
     }
 }
 
-/// THEOREM (text-release silence): REPORT_EVENT_TYPES alone cannot represent
-/// releases for keys whose press/repeat is delivered as plain UTF-8. Across the
-/// complete mode space without REPORT_ALL_KEYS_AS_ESC, bare and Shift-only
-/// Characters/Space therefore emit no release bytes. This is the exact Codex
-/// mode (1|2|4) regression: `ESC[99;1:3u` must never be fabricated for `c`.
-///
-/// The spec's "type reset" escape hatch rides the same boundary: releases of
-/// the legacy recovery keys Enter/Tab/Backspace are silent in every modifier
-/// form unless report-all is set (below REPORT_EVENT_TYPES the release-silence
-/// theorem above already covers them), and report-all opts them in.
+/// Without REPORT_ALL_KEYS_AS_ESC, keys whose press is plain UTF-8 (bare and Shift-only
+/// characters and Space) and the recovery keys Enter/Tab/Backspace (any modifiers) have no
+/// release, even under REPORT_EVENT_TYPES; report-all opts them in.
 #[test]
 fn text_and_recovery_key_releases_require_report_all_keys() {
     let text_keys = [Key::Character('a'), Key::Named(NamedKey::Space)];
@@ -293,9 +250,7 @@ fn text_and_recovery_key_releases_require_report_all_keys() {
     );
 }
 
-/// THEOREM (distinguishability): in EVERY mode, a reported (non-empty) release
-/// is byte-DISTINCT from the same key's press — so no app, whatever it
-/// negotiated, can mistake a release report for another keystroke.
+/// In every mode a reported release differs from the same key's press.
 #[test]
 fn reported_release_is_never_byte_identical_to_press() {
     let mods_grid = [Modifiers::empty(), Modifiers::SHIFT, Modifiers::CTRL];
@@ -318,13 +273,8 @@ fn reported_release_is_never_byte_identical_to_press() {
     }
 }
 
-/// PROVE-AND-CATCH (teeth): the hazard the silence gate defends against is
-/// REAL — the raw CSI-u encoder genuinely CANNOT distinguish a release from a
-/// press under disambiguate-only, because the `:3` subfield is (correctly)
-/// gated on REPORT_EVENT_TYPES. Routing a release into it (the pre-fix
-/// behavior) yields bytes any kitty-protocol app parses as a PRESS of 'a'.
-/// If this collision ever stops holding, the silence theorem above has lost
-/// its justification and the gate should be re-derived from the spec.
+/// Negative control: the raw CSI-u encoder cannot tell a disambiguate-only release from a press
+/// (the `:3` subfield needs REPORT_EVENT_TYPES), so only the gate keeps releases silent.
 #[test]
 fn ungated_release_would_collide_with_a_press_report() {
     let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES;
@@ -352,26 +302,13 @@ fn ungated_release_would_collide_with_a_press_report() {
     );
 }
 
-// =========================================================================
-// KITTY TEXT-STAYS-TEXT obligation — exhaustively MODEL-CHECKED refinement
-// of the spec's disambiguation list.
-//
-// THE property: kitty's disambiguate flag escapes exactly "the Esc, alt+key,
-// ctrl+key, ctrl+alt+key, shift+alt+key keys" — a bare or SHIFT-only chord on
-// a text-producing key COMPOSES TEXT and must arrive as exactly the bytes the
-// pure-legacy encoder would send ('a', 'A', '@', ' ', \r, \t, \x7f). The
-// pre-fix encoder escaped Shift+a to `ESC[97;2u` under disambiguate mode, and
-// escaped every press once REPORT_EVENT_TYPES was on.
-//
-// Quantified over every kitty-flag combination WITHOUT report-all-keys
-// (which legitimately escapes text), crossed with the legacy mode bits that
-// affect these keys' byte forms — the refinement says: kitty-text modes
-// encode text events byte-identically to the same mode with kitty (and the
-// superseded modifyOtherKeys) stripped.
-// =========================================================================
+// Kitty text stays text: disambiguate escapes only "the Esc, alt+key, ctrl+key, ctrl+alt+key,
+// shift+alt+key keys", so a bare or Shift-only text key sends what the legacy encoder sends.
+// Checked over every kitty mode without report-all, crossed with the legacy bits that change
+// these keys' bytes.
 
-/// Kitty flag combinations that must keep text as text (all subsets of the
-/// five kitty bits minus those containing REPORT_ALL_KEYS_AS_ESC).
+/// Kitty flag combinations that keep text as text: the non-empty subsets of the four kitty
+/// bits other than REPORT_ALL_KEYS_AS_ESC.
 fn kitty_text_preserving_modes() -> Vec<KeyboardMode> {
     let kitty_bits = [
         KeyboardMode::DISAMBIGUATE_ESC_CODES,
@@ -440,12 +377,8 @@ fn kitty_text_events_encode_exactly_like_legacy() {
     }
 }
 
-// =========================================================================
-// A MODIFIER KEY's own bit: a press sets it whatever the caller's state; a
-// release reports the state it LEAVES, which only the caller knows — set
-// while the other side is still held (kitty keeps `shift` when one of two held
-// Shifts is let go), clear otherwise.
-// =========================================================================
+// A modifier key's own bit: a press sets it; a release carries it only as the caller states
+// it (set while the other side is still held).
 
 #[test]
 fn a_modifier_release_carries_its_bit_only_as_the_caller_states_it() {
@@ -485,12 +418,8 @@ fn a_modifier_release_carries_its_bit_only_as_the_caller_states_it() {
     assert_eq!(NamedKey::Enter.modifier_twin(), None);
 }
 
-// =========================================================================
-// MODIFIER-KEY SILENCE obligation — modifier and lock keys are reported ONLY
-// under REPORT_ALL_KEYS_AS_ESC (spec: "Additionally, with this mode, events
-// for pressing modifier keys are reported"). Exhaustive over the whole 2^15
-// mode space minus report-all modes, all modifier/lock keys, all event types.
-// =========================================================================
+// Modifier and lock keys report only under REPORT_ALL_KEYS_AS_ESC: every other mode, every
+// event type.
 
 #[test]
 fn modifier_keys_silent_in_every_mode_without_report_all() {
@@ -533,12 +462,8 @@ fn modifier_keys_silent_in_every_mode_without_report_all() {
     }
 }
 
-// =========================================================================
-// Functional-form witnesses: the spec's functional table forms are permanent
-// (not gated on report-all), F3 is tilde-only (its CSI R form was REMOVED for
-// colliding with the Cursor Position Report), and keypad keys fold onto their
-// plain equivalents unless disambiguate/report-all distinguishes them.
-// =========================================================================
+// The spec's functional forms hold in every kitty mode, F3 is tilde-only, and keypad keys fold
+// onto their plain twins unless disambiguate or report-all is set.
 
 #[test]
 fn functional_form_witnesses() {
@@ -556,9 +481,7 @@ fn functional_form_witnesses() {
         b"\x1b[13;2~"
     );
 
-    // Shift+F10 keeps its legacy tilde form (terminfo kf22) under disambiguate:
-    // the host tab-menu chord defers it only under report-all, so this is the
-    // sequence a kitty-aware TUI that binds it receives.
+    // Shift+F10 keeps its legacy tilde form (terminfo kf22) under disambiguate.
     assert_eq!(
         encode_key(&Key::Named(NamedKey::F10), Modifiers::SHIFT, disamb),
         b"\x1b[21;2~"
@@ -623,8 +546,8 @@ fn functional_form_witnesses() {
         .is_empty(),
         "folded NumpadEnter inherits Enter's release escape hatch"
     );
-    // …and WITH disambiguate they are dedicated CSI-u keys (incl. NumpadEnter,
-    // which kitty does NOT convert to Enter once the app can tell them apart).
+    // …and with disambiguate they are dedicated CSI-u keys (incl. NumpadEnter,
+    // which kitty does not convert to Enter once the app can tell them apart).
     assert_eq!(
         encode_key(
             &Key::Named(NamedKey::NumpadEnter),
@@ -643,9 +566,7 @@ fn functional_form_witnesses() {
     );
 }
 
-/// The kitty protocol supersedes xterm modifyOtherKeys: agent TUIs can set BOTH
-/// (`CSI > ... u` and `CSI > 4;2 m`), and a key the kitty gate deliberately
-/// leaves as text must not be re-escaped in the xterm dialect.
+/// The kitty protocol supersedes xterm modifyOtherKeys when an app sets both.
 #[test]
 fn kitty_flags_suppress_modify_other_keys() {
     let both = KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
@@ -666,9 +587,8 @@ fn kitty_flags_suppress_modify_other_keys() {
     );
 }
 
-/// Concrete witnesses for the Codex mode observed in the incident (`1|2|4`):
-/// presses keep their text bytes, repeats stay text, and text/recovery-key
-/// releases are silent because report-all (`0b1000`) is not set.
+/// Mode `1|2|4` (disambiguate, event types, alternate keys), as Codex pushes it: presses and
+/// repeats keep their text bytes, and text and recovery-key releases are silent.
 #[test]
 fn codex_progressive_keyboard_mode_witnesses() {
     let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES
@@ -696,8 +616,7 @@ fn codex_progressive_keyboard_mode_witnesses() {
         encode_key_with_event(&enter, none, mode, KeyEventType::Repeat),
         b"\r"
     );
-    // Releases: SILENT. A CSI-u packet here would be an extra input packet for
-    // every character typed into Codex.
+    // Releases are silent: a CSI-u packet here would be an extra input for every character.
     assert!(encode_key_with_event(&a, none, mode, KeyEventType::Release).is_empty());
     assert!(encode_key_with_event(&enter, none, mode, KeyEventType::Release).is_empty());
     // The protocol still works: a non-text chord reports both its press and
@@ -712,11 +631,10 @@ fn codex_progressive_keyboard_mode_witnesses() {
     );
 }
 
-/// The concrete witnesses the proof guarantees, for the modes an app actually hits.
+/// Shift+Enter in the modes apps actually use.
 #[test]
 fn shift_enter_concrete_witnesses() {
-    // Legacy (no protocol): plain Enter is CR; Shift+Enter is aterm's imposed LF —
-    // This is the compatibility case for apps that have not negotiated kitty.
+    // Legacy: plain Enter is CR, Shift+Enter aterm's LF.
     assert_eq!(
         encode_enter(KeyboardMode::empty(), Modifiers::empty()),
         vec![0x0d]
@@ -727,8 +645,7 @@ fn shift_enter_concrete_witnesses() {
     );
     // Ctrl+Enter keeps the CR (the win32 record, not this, is Ctrl+Enter's LF).
     assert_eq!(encode_enter(KeyboardMode::empty(), Modifiers::CTRL), b"\r");
-    // Kitty disambiguate: Shift+Enter is the CSI-u report (what an app that DOES
-    // negotiate the protocol — like Ghostty/Kitty — receives).
+    // Kitty disambiguate: Shift+Enter is the CSI-u report.
     let kitty = KeyboardMode::DISAMBIGUATE_ESC_CODES;
     assert_eq!(encode_enter(kitty, Modifiers::empty()), vec![0x0d]);
     assert_eq!(encode_enter(kitty, Modifiers::SHIFT), b"\x1b[13;2u");
@@ -737,10 +654,8 @@ fn shift_enter_concrete_witnesses() {
     assert_eq!(encode_enter(mok2, Modifiers::SHIFT), b"\x1b[27;2;13~");
 }
 
-/// `Key::main_block_twin` is the ONE keypad fold — the kitty legacy rule's
-/// "equivalent non-keypad key", shared with the GUI's native pages and its
-/// press classifier. Every keypad key has a twin except KP_Begin, which the
-/// main block cannot name; a main-block key never folds.
+/// `Key::main_block_twin`, the one keypad fold: every keypad key has a twin except KP_Begin,
+/// and a main-block key never folds.
 #[test]
 fn main_block_twin_table() {
     use Key::{Character, Named};
@@ -777,12 +692,9 @@ fn main_block_twin_table() {
     }
 }
 
-/// A physical KP_5 reaches the encoder as `Numpad5` (the winit seam keeps
-/// the keypad identity). Under a kitty mode that has NOT asked to tell the
-/// keypad apart it is the `5` kitty sends — a text press AND a text repeat —
-/// where the unfolded key reported a dedicated `CSI 57404;1:2 u` repeat no
-/// kitty client emits. Disambiguate keeps the dedicated key, and with no kitty
-/// flag at all DECKPAM still owns the keypad (SS3 u).
+/// Under a kitty mode that has not asked to tell the keypad apart, a KP_5 (`Numpad5`) press or
+/// repeat is the `5` kitty sends. Disambiguate keeps the dedicated key; with no kitty flag
+/// DECKPAM owns the keypad (SS3 u).
 #[test]
 fn kitty_legacy_folds_keypad_digits_to_their_glyph() {
     let events_only = KeyboardMode::REPORT_EVENT_TYPES;
@@ -816,11 +728,8 @@ fn kitty_legacy_folds_keypad_digits_to_their_glyph() {
     );
 }
 
-/// DECKPAM OUTRANKS THE KITTY LEGACY FOLD. The fold stands in for "the app has
-/// not asked to tell the keypad from the main block" — and application keypad
-/// mode IS that request, spelled in the very legacy encoding the fold folds
-/// into. Folding there threw the mode away and answered an SS3-reading app the
-/// main row's `5` for its KP_5.
+/// DECKPAM outranks the kitty legacy fold: application keypad mode is the legacy spelling of
+/// "tell the keypad apart".
 #[test]
 fn kitty_legacy_fold_yields_to_application_keypad_mode() {
     let events_only = KeyboardMode::REPORT_EVENT_TYPES;
@@ -852,14 +761,12 @@ fn kitty_legacy_fold_yields_to_application_keypad_mode() {
         ),
         b"5"
     );
-    // …and without DECKPAM the fold is exactly as it was.
+    // Without DECKPAM the fold applies.
     assert_eq!(encode_key(&kp5, Modifiers::empty(), events_only), b"5");
 }
 
-/// `REPORT_ASSOCIATED_TEXT` answers "what did this press put on the screen",
-/// and a keypad glyph key puts its glyph there. The keypad arrives as
-/// `Key::Named(Numpad5)`, so its twin supplies the text; the CODE is still the
-/// keypad's own.
+/// `REPORT_ASSOCIATED_TEXT` carries a keypad glyph key's glyph (from its twin); the code stays
+/// the keypad's own.
 #[test]
 fn kitty_associated_text_carries_the_keypad_glyph() {
     let full = KeyboardMode::DISAMBIGUATE_ESC_CODES
@@ -888,7 +795,7 @@ fn kitty_associated_text_carries_the_keypad_glyph() {
         ),
         b"\x1b[57416;1;44u"
     );
-    // A keypad key whose twin is NAMED carries no text, exactly as its twin
+    // A keypad key whose twin is named carries no text, exactly as its twin
     // does — and KP_Begin, which has no twin, carries none either.
     assert_eq!(
         encode_key(&Key::Named(NamedKey::NumpadEnd), Modifiers::empty(), full),
@@ -906,24 +813,8 @@ fn kitty_associated_text_carries_the_keypad_glyph() {
     );
 }
 
-/// THE SPACEBAR TYPES A SPACE, and `REPORT_ASSOCIATED_TEXT` must say so.
-/// The flag's whole purpose is to carry the text the press produced — it is
-/// how a non-US layout or an IME-composed key delivers the character actually
-/// typed — and the kitty spec names exactly ONE exclusion: "the associated
-/// text must not contain control codes (control codes are code points below
-/// U+0020 and codepoints in the C0 and C1 blocks)". U+0020 is not BELOW
-/// U+0020, so the rule that correctly silences Enter (`\r`), Tab (`\t`) and
-/// Backspace (`\x7f`) does not reach Space. kitty agrees in code: its
-/// `startswith_ascii_control_char` is `codep < 32 || codep == 127`, which 32
-/// passes.
-///
-/// The `Key::Named` arm derived its text SOLELY from `main_block_twin()`, the
-/// KEYPAD fold — and Space is a main-block key, so it has no twin and fell to
-/// `None`. A physical spacebar reaches this encoder as
-/// `Key::Named(NamedKey::Space)` (the winit seam's
-/// `WinitNamed::Space => NamedKey::Space`), so a client that inserts strictly
-/// from the associated-text field typed every letter, digit, symbol and
-/// keypad glyph but never a space: `ESC[32u`, with no text field at all.
+/// The spacebar's associated text is a space: kitty's one exclusion is control codes (below
+/// U+0020, and C0/C1), which drops Enter, Tab and Backspace but not U+0020.
 #[test]
 fn kitty_associated_text_carries_the_spacebars_space() {
     let report_all_text = KeyboardMode::REPORT_ALL_KEYS_AS_ESC
@@ -944,7 +835,7 @@ fn kitty_associated_text_carries_the_spacebars_space() {
             encode_key(&Key::Named(NamedKey::Space), Modifiers::SHIFT, mode),
             b"\x1b[32;2;32u"
         );
-        // The ONE exclusion, unmoved: the legacy text keys type control codes
+        // The one exclusion, unmoved: the legacy text keys type control codes
         // and therefore carry no text.
         assert_eq!(
             encode_key(&Key::Named(NamedKey::Enter), Modifiers::empty(), mode),
@@ -959,7 +850,7 @@ fn kitty_associated_text_carries_the_spacebars_space() {
             encode_key(&Key::Named(NamedKey::Backspace), Modifiers::empty(), mode),
             b"\x1b[127u"
         );
-        // A Ctrl/Alt/Super chord is not a text event on ANY key (Ctrl+Space is
+        // A Ctrl/Alt/Super chord is not a text event on any key (Ctrl+Space is
         // NUL, not a space), so the payload stays off.
         assert_eq!(
             encode_key(&Key::Named(NamedKey::Space), Modifiers::CTRL, mode),
@@ -971,7 +862,7 @@ fn kitty_associated_text_carries_the_spacebars_space() {
         );
     }
 
-    // A RELEASE reports no text, exactly as a character release does.
+    // A release reports no text, exactly as a character release does.
     assert_eq!(
         encode_key_with_event(
             &Key::Named(NamedKey::Space),
@@ -992,31 +883,24 @@ fn kitty_associated_text_carries_the_spacebars_space() {
     );
 }
 
-/// A KEYPAD KEY DOES NOT COMPOSE, and a kitty REPORTING flag cannot make it.
-/// The legacy fold above names the key for the CSI-u report; handing that name
-/// to the legacy encoder too ran the MAIN ROW's tables over it, so under a bare
-/// `REPORT_EVENT_TYPES` a Shift+KP_5 typed `%` and a Ctrl+KP_5 typed 0x1D —
-/// glyphs no keypad emits, and a strict regression for the NumLock-OFF shifted
-/// press (xkb's KEYPAD type is `map[Shift] = Level2`, the level holding the
-/// digit, so that press IS KP_5 and arrives here as `Numpad5` + SHIFT). xterm's
-/// keypad rule is that SHIFT only cancels application keypad mode, and kitty's
-/// legacy rule is to send the text the key produced; both say `5`.
+/// A keypad key does not compose, and a kitty reporting flag cannot make it: under
+/// `REPORT_EVENT_TYPES` Shift+KP_5 and Ctrl+KP_5 are `5`, not the main row's `%` and 0x1D.
+/// xterm's Shift only cancels application keypad mode; kitty sends the text the key produced.
 #[test]
 fn a_modified_keypad_key_never_composes_the_main_rows_glyph() {
     use NamedKey as N;
     let events_only = KeyboardMode::REPORT_EVENT_TYPES;
 
-    // The shifted keypad types its own glyph; the trailing comment is what the
-    // fold composed before — the main row's shifted character.
+    // The shifted keypad types its own glyph, not the main row's shifted one.
     for (named, want) in [
-        (N::Numpad0, &b"0"[..]),    // was ")"
-        (N::Numpad1, b"1"),         // was "!"
-        (N::Numpad5, b"5"),         // was "%"
-        (N::Numpad9, b"9"),         // was "("
-        (N::NumpadDecimal, b"."),   // was ">"
-        (N::NumpadSeparator, b","), // was "<"
-        (N::NumpadDivide, b"/"),    // was "?"
-        (N::NumpadSubtract, b"-"),  // was "_"
+        (N::Numpad0, &b"0"[..]),    // not ")"
+        (N::Numpad1, b"1"),         // not "!"
+        (N::Numpad5, b"5"),         // not "%"
+        (N::Numpad9, b"9"),         // not "("
+        (N::NumpadDecimal, b"."),   // not ">"
+        (N::NumpadSeparator, b","), // not "<"
+        (N::NumpadDivide, b"/"),    // not "?"
+        (N::NumpadSubtract, b"-"),  // not "_"
     ] {
         assert_eq!(
             encode_key(&Key::Named(named), Modifiers::SHIFT, events_only),
@@ -1025,9 +909,7 @@ fn a_modified_keypad_key_never_composes_the_main_rows_glyph() {
         );
     }
 
-    // …and no kitty reporting flag changes what the keypad types, for any
-    // chord: the same physical key must answer the same bytes with the flag on
-    // and off. CTRL is the other table the fold used to reach.
+    // No kitty reporting flag changes what the keypad types, for any chord.
     for (named, mods) in [
         (N::Numpad1, Modifiers::SHIFT),
         (N::Numpad5, Modifiers::SHIFT),
@@ -1047,8 +929,7 @@ fn a_modified_keypad_key_never_composes_the_main_rows_glyph() {
         );
     }
 
-    // The NEGATIVE CONTROL: the main row still composes. The fold is what must
-    // not compose, not the shift table.
+    // Negative control: the main row still composes.
     assert_eq!(
         encode_key(&Key::Character('5'), Modifiers::SHIFT, events_only),
         b"%"
@@ -1058,7 +939,7 @@ fn a_modified_keypad_key_never_composes_the_main_rows_glyph() {
         b"\x1d"
     );
 
-    // The unshifted fold is exactly as it was: the digit is still the digit.
+    // Unshifted, the folded digit is the digit.
     assert_eq!(
         encode_key(&Key::Named(N::Numpad5), Modifiers::empty(), events_only),
         b"5"
@@ -1068,8 +949,7 @@ fn a_modified_keypad_key_never_composes_the_main_rows_glyph() {
         b"+"
     );
 
-    // CTRL on the keypad is the engine's documented keypad rule (#7480: the
-    // keypad encoder ignores it), the same in every mode.
+    // Ctrl on the keypad is ignored in every mode (#7480).
     assert_eq!(
         encode_key(&Key::Named(N::NumpadDivide), Modifiers::CTRL, events_only),
         b"/"
@@ -1083,9 +963,8 @@ fn a_modified_keypad_key_never_composes_the_main_rows_glyph() {
         b"/"
     );
 
-    // The KITTY side of the split is untouched: where the fold reaches the
-    // CSI-u encoder it still reports the twin's code AND the full modifier
-    // set, SHIFT bit included (`5`=53, Ctrl+Shift=6, release=`:3`).
+    // Where the fold reaches the CSI-u encoder it reports the twin's code and the full
+    // modifier set (`5`=53, Ctrl+Shift=6, release=`:3`).
     assert_eq!(
         encode_key_with_event(
             &Key::Named(N::Numpad5),
@@ -1117,14 +996,9 @@ fn a_modified_keypad_key_never_composes_the_main_rows_glyph() {
     );
 }
 
-// =========================================================================
-// ConPTY win32-input-mode (DEC 9001) — the INPUT_RECORD pair for Enter chords.
-//
-// Spec: microsoft/terminal doc/specs/#4999-win32-input-mode.md,
-// `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`. Bytes here are pinned EXACTLY, because
-// conhost's input parser is the consumer and it is not forgiving: a field out
-// of place is a different key.
-// =========================================================================
+// ConPTY win32-input-mode (DEC 9001): `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`
+// (microsoft/terminal doc/specs/#4999-win32-input-mode.md). Bytes are pinned exactly: conhost
+// reads a field out of place as a different key.
 
 /// The key-down/key-up record pair `CSI vk;sc;uc;Kd;cs;1 _` — the oracle the
 /// assertions below compare against, written out from the spec rather than
@@ -1158,13 +1032,8 @@ fn win32_input_is_not_a_kitty_flag() {
 fn win32_enter_chords_are_record_pairs_and_plain_enter_stays_legacy() {
     let enter = Key::Named(NamedKey::Enter);
     for (mods, want) in [
-        // Shift+Enter: SHIFT_PRESSED (0x10), UnicodeChar CR (13) — the record a
-        // physical Shift+Enter carries under Windows Terminal, NOT aterm's Unix
-        // Shift+Enter LF policy. Measured 2026-09-22: `[Console]::ReadKey` reports
-        // `Enter MODS=Shift CHAR=13` for these bytes, PSReadLine runs AddLine on
-        // them, and cmd.exe's cooked reader runs the pending line on them (as it
-        // does under WT) where it stayed inert on an LF record no Windows keyboard
-        // produces.
+        // Shift+Enter: SHIFT_PRESSED (0x10), UnicodeChar CR (13), the record a physical
+        // Shift+Enter carries under Windows Terminal, not aterm's Unix LF.
         (Modifiers::SHIFT, win32_enter_pair(13, 0x10)),
         // CTRL decides the char: LF (10), Windows' own translation of Ctrl+Enter
         // (the one conhost applies in reverse to a bare 0x0A), with or without
@@ -1185,8 +1054,8 @@ fn win32_enter_chords_are_record_pairs_and_plain_enter_stays_legacy() {
             Modifiers::CTRL | Modifiers::SHIFT | Modifiers::ALT,
             win32_enter_pair(10, 0x1a),
         ),
-        // Both measured working through conhost's legacy translation: plain Enter
-        // is CR, Alt+Enter is Meta-Enter. Neither needs — or gets — a record.
+        // Plain Enter (CR) and Alt+Enter (ESC CR) read correctly through conhost's legacy
+        // translation: no record.
         (Modifiers::empty(), b"\r".to_vec()),
         (Modifiers::ALT, b"\x1b\r".to_vec()),
         // CapsLock/NumLock are lock state, not chord modifiers: a plain Enter with
@@ -1204,7 +1073,7 @@ fn win32_enter_chords_are_record_pairs_and_plain_enter_stays_legacy() {
 
 #[test]
 fn win32_release_emits_nothing_and_repeat_emits_the_pair() {
-    // The pair is self-contained (key-down AND key-up from the press), so a
+    // The pair is self-contained (key-down and key-up from the press), so a
     // Release must add no second key-up — conhost would see Enter released
     // twice. Repeat is a press to Windows (another key-down record).
     assert!(
@@ -1238,13 +1107,9 @@ fn win32_release_emits_nothing_and_repeat_emits_the_pair() {
 
 #[test]
 fn win32_outranks_a_negotiated_kitty_mode() {
-    // An application under ConPTY can push kitty flags — conhost forwards the
-    // `CSI > 1 u` verbatim — but conhost stays the reader, and its input parser
-    // DROPS the `CSI 13;2 u` the terminal would write back (measured
-    // 2026-09-22: no record reached a `ReadKey` loop, while the win32 pair
-    // arrived as Enter+Shift). So with 9001 set the record is the only
-    // spelling of the chord that reaches the application that asked for
-    // kitty; the kitty flags stay set for everything the record does not cover.
+    // An application under ConPTY can push kitty flags, but conhost stays the reader and drops
+    // the `CSI 13;2 u` written back, so under 9001 the record is the chord's only spelling; the
+    // kitty flags still govern everything the record does not cover.
     let disambiguate = WIN32 | KeyboardMode::DISAMBIGUATE_ESC_CODES;
     assert_eq!(
         encode_key(&Key::Named(NamedKey::Enter), Modifiers::SHIFT, disambiguate),
@@ -1275,8 +1140,7 @@ fn win32_outranks_a_negotiated_kitty_mode() {
         )
         .is_empty()
     );
-    // …while a key the record does not cover follows the kitty flags exactly
-    // as it did without 9001: the plain Enter release is whatever kitty says.
+    // A key the record does not cover follows the kitty flags as it does without 9001.
     assert_eq!(
         encode_key_with_event(
             &Key::Named(NamedKey::Enter),
@@ -1291,7 +1155,7 @@ fn win32_outranks_a_negotiated_kitty_mode() {
             KeyEventType::Release,
         )
     );
-    // The same kitty modes without 9001 are byte-identical to before (Unix).
+    // Without 9001 the kitty modes are unchanged.
     assert_eq!(
         encode_key(
             &Key::Named(NamedKey::Enter),
@@ -1319,7 +1183,7 @@ fn win32_outranks_xterm_modify_other_keys() {
         encode_key(&Key::Named(NamedKey::Enter), Modifiers::SHIFT, l2),
         win32_enter_pair(13, 0x10)
     );
-    // …and without 9001 the xterm form is exactly what it was.
+    // Without 9001 the xterm form stands.
     assert_eq!(
         encode_key(
             &Key::Named(NamedKey::Enter),
@@ -1332,12 +1196,9 @@ fn win32_outranks_xterm_modify_other_keys() {
 
 #[test]
 fn win32_keys_conhost_still_reads_keep_their_bytes() {
-    // Every key conhost reads correctly from legacy VT — before AND after its
-    // parser has seen a record — is byte-identical with 9001 on. Each case
-    // below was fed raw into a ConPTY tab after one Shift+Enter record
-    // (2026-09-27, conhost 10.0.26200) and arrived as its key in `ReadKey`:
-    // ESC + a letter / digit / most punctuation / a C0 is Alt+that key, and a
-    // complete CSI or SS3 sequence is its key.
+    // Every key conhost reads correctly from legacy VT, before and after the switch, keeps its
+    // bytes under 9001: ESC + a letter / digit / most punctuation / a C0 is Alt+that key, and
+    // a complete CSI or SS3 sequence is its key.
     let cases: &[(Key, Modifiers)] = &[
         (Key::Named(NamedKey::Tab), Modifiers::SHIFT),
         (Key::Named(NamedKey::Tab), Modifiers::CTRL),
@@ -1401,9 +1262,8 @@ fn win32_keys_conhost_still_reads_keep_their_bytes() {
 
 #[test]
 fn conhost_holds_exactly_the_measured_forms() {
-    // The measured table (2026-09-27, conhost 10.0.26200, each form fed raw
-    // then `z`, after one Shift+Enter record). HELD: nothing arrived, or the
-    // `z` arrived as Alt+Z, or the `z` vanished into an opened sequence.
+    // conhost 10.0.26200 after one record, each form followed by `z`. HELD: nothing arrived,
+    // the `z` arrived as Alt+Z, or it vanished into an opened sequence.
     for held in [
         &b"\x1b"[..],
         b"\x1b\x1b",
@@ -1455,7 +1315,7 @@ fn conhost_holds_exactly_the_measured_forms() {
 }
 
 /// Parse a win32-input-mode record pair into its two six-field records, so a
-/// sweep can check SHAPE without restating every key's fields.
+/// sweep can check shape without restating every key's fields.
 fn parse_win32_pair(bytes: &[u8]) -> Option<[[u32; 6]; 2]> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut records = text.strip_suffix('_')?.split('_');
@@ -1473,11 +1333,8 @@ fn parse_win32_pair(bytes: &[u8]) -> Option<[[u32; 6]; 2]> {
 
 #[test]
 fn win32_escape_is_a_record_pair() {
-    // The regression: after one Shift+Enter record, a lone ESC never reached
-    // `ReadKey` again (6 s idle: nothing; the next `a` arrived as Alt+A) —
-    // PSReadLine's RevertLine, vim's leave-insert and Claude Code's
-    // Esc-to-interrupt all died. The record arrives as `Escape CHAR=0x1B`
-    // whether or not the parser has switched (measured 2026-09-27).
+    // Once conhost has read a record it holds a lone ESC; the record reads as
+    // `Escape CHAR=0x1B` before and after the switch.
     let esc = Key::Named(NamedKey::Escape);
     assert_eq!(
         encode_key(&esc, Modifiers::empty(), WIN32),
@@ -1488,10 +1345,8 @@ fn win32_escape_is_a_record_pair() {
         win32_pair(27, 1, 27, 0x10),
         "measured: Escape MODS=Shift CHAR=0x1B"
     );
-    // Ctrl+Escape and Alt+Escape carry their modifiers like any key. conhost
-    // drops both (measured: nothing reached `ReadKey`, the next key arrived
-    // plain) — its Start-menu / window-cycling rule for any terminal's
-    // records — where the legacy `ESC` / `ESC ESC` would poison the next key.
+    // Ctrl+Escape and Alt+Escape carry their modifiers; conhost drops both records, where the
+    // legacy `ESC` / `ESC ESC` would poison the next key.
     assert_eq!(
         encode_key(&esc, Modifiers::CTRL, WIN32),
         win32_pair(27, 1, 27, 0x08)
@@ -1514,7 +1369,7 @@ fn win32_escape_is_a_record_pair() {
         encode_key_with_event(&esc, Modifiers::empty(), WIN32, KeyEventType::Repeat),
         win32_pair(27, 1, 27, 0)
     );
-    // Without 9001 (Unix, and a conhost that never asked) nothing changed.
+    // Without 9001 the legacy bytes stand.
     assert_eq!(
         encode_key(&esc, Modifiers::empty(), KeyboardMode::empty()),
         b"\x1b"
@@ -1527,11 +1382,8 @@ fn win32_escape_is_a_record_pair() {
 
 #[test]
 fn win32_ctrl_bracket_and_ctrl_3_are_records_of_their_own_key() {
-    // Ctrl+[ is a lone ESC in legacy VT, so it dies with Escape; its record is
-    // the physical key, VK_OEM_4 / scan 0x1A, with the ESC char a Windows
-    // keyboard gives it. Measured: `Oem4 MODS=Control CHAR=0x1B`, which vim
-    // (Git's, through the MSYS console reader) takes as ESC — and which
-    // PSReadLine's Windows mode, with nothing bound to Ctrl+[, inserts as `^[`.
+    // Ctrl+[ is a lone ESC in legacy VT, so conhost holds it with Escape; its record is the
+    // physical key, VK_OEM_4 / scan 0x1A, with char 0x1B (`Oem4 MODS=Control CHAR=0x1B`).
     let bracket = Key::Character('[');
     assert_eq!(
         encode_key_with_layout(
@@ -1549,8 +1401,7 @@ fn win32_ctrl_bracket_and_ctrl_3_are_records_of_their_own_key() {
         encode_key(&bracket, Modifiers::CTRL, WIN32),
         win32_pair(219, 26, 27, 0x08)
     );
-    // Measured: `Oem4 MODS=Shift, Control CHAR=0x1B` and
-    // `Oem4 MODS=Alt, Control CHAR=0x1B`.
+    // `Oem4 MODS=Shift, Control CHAR=0x1B` and `Oem4 MODS=Alt, Control CHAR=0x1B`.
     assert_eq!(
         encode_key(&bracket, Modifiers::CTRL | Modifiers::SHIFT, WIN32),
         win32_pair(219, 26, 27, 0x18)
@@ -1559,7 +1410,7 @@ fn win32_ctrl_bracket_and_ctrl_3_are_records_of_their_own_key() {
         encode_key(&bracket, Modifiers::CTRL | Modifiers::ALT, WIN32),
         win32_pair(219, 26, 27, 0x0a)
     );
-    // Ctrl+3 is xterm's other ESC. Measured: `D3 MODS=Control CHAR=0x1B`.
+    // Ctrl+3 is xterm's other ESC: `D3 MODS=Control CHAR=0x1B`.
     assert_eq!(
         encode_key(&Key::Character('3'), Modifiers::CTRL, WIN32),
         win32_pair(51, 4, 27, 0x08)
@@ -1577,10 +1428,9 @@ fn win32_ctrl_bracket_and_ctrl_3_are_records_of_their_own_key() {
 
 #[test]
 fn win32_alt_chords_that_open_a_sequence_are_records() {
-    // Alt+<key> is `ESC <key>`, which conhost still reads as Alt+key after the
-    // switch — except where <key> opens a sequence (`[ O P ] X ^ _`) or is DEL.
-    // Each record below was fed after the switch and read back as the key
-    // conhost itself decoded the legacy pair to before it (2026-09-27).
+    // Alt+<key> is `ESC <key>`, which conhost still reads after the switch unless <key> opens
+    // a sequence (`[ O P ] X ^ _`) or is DEL. Each record names the key conhost decoded the
+    // legacy pair to before the switch.
     let alt = Modifiers::ALT;
     let alt_shift = Modifiers::ALT | Modifiers::SHIFT;
     let rec = |key: Key, mods: Modifiers, base: Option<char>| {
@@ -1624,14 +1474,13 @@ fn win32_alt_chords_that_open_a_sequence_are_records() {
         rec(Key::Character('_'), alt, None),
         win32_pair(189, 12, 95, 0x12)
     );
-    // The PHYSICAL key wins over the glyph: on AZERTY `_` is the unshifted
+    // The physical key wins over the glyph: on AZERTY `_` is the unshifted
     // 8 key, and a real record names that key (scan 0x09) with no Shift.
     assert_eq!(
         rec(Key::Character('_'), alt, Some('8')),
         win32_pair(56, 9, 95, 0x02)
     );
-    // Alt+Backspace is `ESC DEL`: `Backspace MODS=Alt CHAR=0x8`, the char a
-    // Windows keyboard gives Backspace (and the one conhost decoded before).
+    // Alt+Backspace is `ESC DEL`; its record carries Backspace's Windows char, BS.
     let bksp = Key::Named(NamedKey::Backspace);
     assert_eq!(rec(bksp.clone(), alt, None), win32_pair(8, 14, 8, 0x02));
     // Ctrl+Alt+8 is `ESC DEL` too: `D8 MODS=Alt, Control CHAR=0x7F`.
@@ -1639,10 +1488,8 @@ fn win32_alt_chords_that_open_a_sequence_are_records() {
         rec(Key::Character('8'), Modifiers::CTRL | alt, Some('8')),
         win32_pair(56, 9, 127, 0x0a)
     );
-    // Forms that do not dangle keep their bytes: DECBKM's Alt+Backspace is
-    // `ESC BS` (read as `Backspace MODS=Alt, Control` either side of the
-    // switch), and with altSendsEscape reset (DECRST 1039) Alt+[ is a bare
-    // `[` — no prefix, nothing held.
+    // Forms that do not dangle keep their bytes: DECBKM's Alt+Backspace (`ESC BS`), and Alt+[
+    // with altSendsEscape reset (a bare `[`).
     assert_eq!(
         encode_key(&bksp, alt, WIN32 | KeyboardMode::BACKARROW_SENDS_BS),
         b"\x1b\x08"
@@ -1661,11 +1508,8 @@ fn win32_alt_chords_that_open_a_sequence_are_records() {
 
 #[test]
 fn win32_escape_records_outrank_kitty_and_modify_other_keys() {
-    // conhost drops the protocol spellings of these keys exactly as it drops
-    // `CSI 13;2 u` — measured 2026-09-27: `CSI 27 u` (kitty Escape),
-    // `CSI 99;5 u`, `CSI 97;3 u` and `CSI 27;5;91 ~` (xterm Ctrl+[) all reached
-    // `ReadKey` as nothing — so under 9001 the record goes first, as it does
-    // for the Enter chords.
+    // conhost drops the protocol spellings of these keys too (kitty `CSI 27 u`, xterm
+    // `CSI 27;5;91 ~`), so under 9001 the record goes first.
     let esc = Key::Named(NamedKey::Escape);
     let disambiguate = WIN32 | KeyboardMode::DISAMBIGUATE_ESC_CODES;
     assert_eq!(
@@ -1686,7 +1530,7 @@ fn win32_escape_records_outrank_kitty_and_modify_other_keys() {
         encode_key(&esc, Modifiers::CTRL, l1),
         win32_pair(27, 1, 27, 0x08)
     );
-    // Without 9001 the protocols answer exactly as before.
+    // Without 9001 the protocol forms stand.
     assert_eq!(
         encode_key(
             &esc,
@@ -2031,8 +1875,8 @@ fn win32_changes_only_the_held_forms_across_the_whole_ascii_keyboard() {
             );
         }
     }
-    // Escape ×8, Backspace+Alt ×2, and the character chords that dangle —
-    // non-zero is the non-vacuity check; the exact count is not the contract.
+    // Escape ×8, Backspace+Alt ×2, and the character chords that dangle: the floor is the
+    // non-vacuity check; the exact count is not the contract.
     assert!(routed > 20, "only {routed} keys were routed");
     // The carve-outs are exactly the four Ctrl+H and four Ctrl+J chords, each
     // of them reached.
@@ -2045,10 +1889,8 @@ fn win32_changes_only_the_held_forms_across_the_whole_ascii_keyboard() {
 
 #[test]
 fn win32_numpad_enter_chord_is_an_enhanced_key_record() {
-    // The keypad's Enter is VK_RETURN / scan 28 behind the E0 prefix: a real
-    // record flags it ENHANCED_KEY (0x100). Without a record the legacy keypad
-    // arm falls back to the main Enter's bare LF — the byte conhost reads as
-    // Ctrl+Enter — so Shift+KP_Enter in a PowerShell tab ran InsertLineAbove.
+    // The keypad's Enter is the main Enter's pair flagged ENHANCED_KEY (0x100), as a real
+    // E0-prefixed record is.
     let kp = Key::Named(NamedKey::NumpadEnter);
     assert_eq!(
         encode_key(&kp, Modifiers::SHIFT, WIN32),

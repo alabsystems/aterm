@@ -7,9 +7,9 @@
 
 use aterm_slog::vocab::{
     ACT_WORDS, ASK_WORDS, BOX_WORDS, CAUSE_WORDS, CHANGE_WORDS, CLASS_WORDS, CLS_WORDS, DIR_WORDS,
-    END_WORDS, HEALED_BY_WORDS, MAIL_KIND_WORDS, NEED_WORDS, NET_WORDS, ORIGIN_WORDS, OUT_WORDS,
-    PHASE_WORDS, POOL_WORDS, SOURCE_WORDS, STATE_WORDS, VERB_WORDS, WALL_WORDS, WHY_WORDS,
-    WORD_WORDS,
+    END_WORDS, HEALED_BY_WORDS, HELD_WORDS, MAIL_KIND_WORDS, NEED_WORDS, NET_WORDS, ORIGIN_WORDS,
+    OUT_WORDS, PHASE_WORDS, POOL_WORDS, SEV_WORDS, SOURCE_WORDS, STATE_WORDS, VERB_WORDS,
+    WALL_WORDS, WHY_WORDS, WORD_WORDS,
 };
 use aterm_slog::{
     Actor, Cap, Conf, DecodeError, EncodeError, FIELDS, Fields, Key, Kind, Lvl, MAX_RECORD_BYTES,
@@ -118,6 +118,8 @@ fn every_vocabulary_word_is_one_wire_token_named_once() {
         CLASS_WORDS,
         HEALED_BY_WORDS,
         SOURCE_WORDS,
+        SEV_WORDS,
+        HELD_WORDS,
     ] {
         for (i, w) in list.iter().enumerate() {
             assert!(
@@ -1268,7 +1270,7 @@ fn phase_6_session_row_keys_are_appended_at_their_tiers() {
 }
 
 /// PHASE 6 (the review of 6F-7): `harness_act=` is appended after 6F-7's
-/// `reply=`, the last key, HOST as `holder=` is: a self-claim's act as its
+/// `reply=`, the last key then, HOST as `holder=` is: a self-claim's act as its
 /// holder told it, an owner token whose `/` and `@` no wire id holds, so the
 /// `harness-act` row is its record whole, an act with no word too
 /// (`word=unknown`). It round-trips at the host tier and leaves no trace on
@@ -1279,9 +1281,9 @@ fn phase_6_harness_act_is_appended_host_only() {
     let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
     assert_eq!(at(Key::HarnessAct), at(Key::Reply).map(|i| i + 1));
     assert_eq!(
-        FIELDS.len(),
-        at(Key::HarnessAct).map_or(0, |i| i + 1),
-        "the last key"
+        at(Key::LandAt),
+        at(Key::HarnessAct).map(|i| i + 1),
+        "6F-8's `land_at=` follows"
     );
     assert_eq!(
         (
@@ -1327,5 +1329,145 @@ fn phase_6_harness_act_is_appended_host_only() {
     assert!(
         Fields::new().id(Key::Rule, act).is_err(),
         "no rule holds it"
+    );
+}
+
+/// PHASE 6 (6F-8, ruling U13): `land_at=` is appended after `harness_act=`,
+/// HOST, a signed integer: the Autopilot pair's timer (whole seconds) on
+/// its `meta` mark, as its `meta-change` row says it, so the row is its
+/// record's; and a meta value (`value=`) holds 256 encoded bytes, every
+/// byte a row's 256-byte payload shows. It round-trips at the host tier,
+/// leaves no trace on the wire, and an older reader skips it. NEGATIVE
+/// CONTROL: a timer before the epoch is no `U`.
+#[test]
+fn phase_6_land_at_is_appended_host_only() {
+    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
+    assert_eq!(at(Key::LandAt), at(Key::HarnessAct).map(|i| i + 1));
+    assert_eq!(
+        at(Key::Sev),
+        at(Key::LandAt).map(|i| i + 1),
+        "6F-9's `sev=` follows"
+    );
+    assert_eq!(
+        (Key::LandAt.word(), Key::LandAt.tier(), Key::LandAt.cap()),
+        ("land_at", Tier::Host, Cap::I)
+    );
+    assert_eq!(Key::Value.cap(), Cap::Text(256));
+    let r = Rec {
+        seq: 53,
+        t: 9,
+        op: Op::Mark,
+        node: Node::SESSION,
+        par: None,
+        k: Kind::Meta,
+        f: Fields::new()
+            .tok(Key::Field, "autopilot")
+            .and_then(|f| f.text(Key::Value, "cruise"))
+            .and_then(|f| f.i(Key::LandAt, -1))
+            .expect("a meta mark's fields"),
+        src: Src::Meta,
+        conf: Conf::Exact,
+        by: Actor::Ctl,
+    };
+    let host = encode(&r, Tier::Host).expect("fits");
+    assert_eq!(
+        host,
+        "53 mark - meta field=autopilot value=cruise land_at=-1 by=ctl src=meta conf=exact t=9"
+    );
+    assert_eq!(decode(&host), Ok(r.clone()), "{host}");
+    let wire = encode(&r, Tier::Wire).expect("fits");
+    assert!(!wire.contains("land_at="), "{wire}");
+    let older = host.replace(" land_at=", " zz_land_at=");
+    let mut without = r.clone();
+    without.f.remove(Key::LandAt);
+    assert_eq!(decode(&older), Ok(without), "{older}");
+    assert!(
+        Fields::new().u(Key::LandAt, 1).is_err(),
+        "NEGATIVE CONTROL: a timer is signed, no U"
+    );
+}
+
+/// PHASE 6 (6F-9, ruling U26): what the person is shown of a session's
+/// need is a `shown` mark keyed on the printed tuple: `need=` (6F-9
+/// appends the printed need words, `aterm_types::needs::NeedWord`'s, to
+/// the need vocabulary), and `sev=` and `held=`, appended after
+/// `land_at=`, WIRE closed words, each absent for none. The mark
+/// round-trips; it is LOCAL, no bus class, so the mirror refuses it; and AN
+/// OLDER READER maps the kind to `unknown` and skips the new keys.
+/// NEGATIVE CONTROL: a word outside a list (`-`, a hold's `fleet` origin) is
+/// refused.
+#[test]
+fn phase_6_shown_keys_are_appended_wire_and_the_mark_is_local() {
+    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
+    assert_eq!(at(Key::Sev), at(Key::LandAt).map(|i| i + 1));
+    assert_eq!(at(Key::Held), at(Key::Sev).map(|i| i + 1));
+    assert_eq!(
+        FIELDS.len(),
+        at(Key::Held).map_or(0, |i| i + 1),
+        "the last key"
+    );
+    assert_eq!(
+        (Key::Sev.word(), Key::Sev.tier(), Key::Sev.cap()),
+        ("sev", Tier::Wire, Cap::Word(SEV_WORDS))
+    );
+    assert_eq!(
+        (Key::Held.word(), Key::Held.tier(), Key::Held.cap()),
+        ("held", Tier::Wire, Cap::Word(HELD_WORDS))
+    );
+    assert_eq!(SEV_WORDS, ["stuck", "decide"]);
+    assert_eq!(HELD_WORDS, ["person", "remote", "local", "bridge"]);
+    for w in [
+        "frozen", "stopped", "stalled", "login", "memory", "wall", "ask", "approval", "question",
+    ] {
+        assert!(NEED_WORDS.contains(&w), "{w}");
+    }
+    let r = Rec {
+        seq: 54,
+        t: 9,
+        op: Op::Mark,
+        node: Node::SESSION,
+        par: None,
+        k: Kind::Shown,
+        f: Fields::new()
+            .word(Key::Need, "approval")
+            .and_then(|f| f.word(Key::Sev, "decide"))
+            .and_then(|f| f.word(Key::Held, "person"))
+            .and_then(|f| f.u(Key::Coalesced, 3))
+            .expect("a shown mark's fields"),
+        src: Src::Aterm,
+        conf: Conf::Strong,
+        by: Actor::Aterm,
+    };
+    let line = encode(&r, Tier::Wire).expect("fits");
+    assert_eq!(
+        line,
+        "54 mark - shown need=approval sev=decide held=person coalesced=3 by=aterm src=aterm \
+         conf=strong t=9"
+    );
+    assert_eq!(decode(&line), Ok(r.clone()), "{line}");
+    assert!(!r.is_bus_class(), "local: no bus class");
+    assert_eq!(
+        aterm_slog::encode_mirror(&r, Tier::Wire, 1, None, &|_| None),
+        Err(EncodeError::NotBusClass)
+    );
+    let older = line
+        .replace(" shown ", " zz-kind-of-phase-9 ")
+        .replace(" sev=", " zz_sev=")
+        .replace(" held=", " zz_held=");
+    let read = decode(&older).expect("an older reader still reads it");
+    assert_eq!(read.k, Kind::Unknown, "{older}");
+    assert_eq!(read.f.get(Key::Sev), None, "{older}");
+    assert_eq!(read.f.get(Key::Held), None, "{older}");
+    assert!(
+        Fields::new().word(Key::Need, "-").is_err(),
+        "none is no word"
+    );
+    assert!(
+        Fields::new().word(Key::Sev, "-").is_err(),
+        "none is no word"
+    );
+    assert!(
+        Fields::new().word(Key::Held, "fleet").is_err(),
+        "an origin is no hold word"
     );
 }

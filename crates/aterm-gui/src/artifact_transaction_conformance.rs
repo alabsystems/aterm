@@ -1347,9 +1347,9 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
     );
     assert!(!model.check_invariant("AnchoredAccessNeverOutside", &outside_read));
 
-    // WRITE: the shipping write stages its bytes through the retained handle;
-    // the authorizer runs once they are down, which is where they are measured.
-    // Its final path validation then fails closed and removes them.
+    // Write: the shipping write stages its bytes through the retained handle and the
+    // authorizer measures them once they are down; the final path validation then fails
+    // closed and removes them.
     let mut write_target = None;
     write_pin
         .write_private_authorized(OsStr::new("shot.png"), b"write-after-swap", || {

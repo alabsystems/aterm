@@ -1516,10 +1516,16 @@ impl SettingsPreviewSpec {
         if self.animation() != PreviewAnimation::Continuous {
             return None;
         }
-        // Focusing the card (to pause it) is the same demonstration.
+        // Focusing the card (to pause it) is the same demonstration, and so is
+        // its face landing: the host's cadence probe asks without the
+        // prepared face and paint with it, so a ready epoch in the identity
+        // made the two name different loops, and a paint that came more than
+        // `PreviewClock::RESUME_MS` after the last one (every headless
+        // capture, a stalled window) restarted the cycle at its first frame.
         let mut probe = self.clone().with_phase(0);
         probe.focused = false;
         probe.focus_visible = false;
+        probe.font_ready_epoch = 0;
         Some(probe.paint_fingerprint())
     }
 
@@ -1529,8 +1535,17 @@ impl SettingsPreviewSpec {
     /// demo (which rests on its own, [`PreviewPause::Resting`]), have nothing
     /// to pause.
     pub(crate) fn pause_control(&self) -> bool {
+        self.control_slot() && !self.reduced_motion
+    }
+
+    /// Whether the header keeps the Pause/Play slot at its right edge: the
+    /// cursor scene loops, or would loop but for Reduce Motion, an unfocused
+    /// window or load shed. The slot follows the scene, not the moment, so
+    /// the header wraps at one width whether the loop plays or stands
+    /// reduced, and the card does not re-flow as the loop stops; a reduced
+    /// preview leaves its slot empty ([`Self::pause_control`] draws the glyph).
+    fn control_slot(&self) -> bool {
         self.scene == PreviewScene::CursorMotion
-            && !self.reduced_motion
             && self.animation_without_reduction() == PreviewAnimation::Continuous
     }
 
@@ -1885,13 +1900,13 @@ impl SettingsPreviewSpec {
                     ),
                     None => "Cursor preview".to_string(),
                 };
-                // The focused row's verdict when it changes nothing now.
-                let idle = spec
-                    .focused_effect
-                    .as_deref()
-                    .map_or_else(String::new, |effect| {
-                        format!(" {} · {effect}.", spec.focused_label)
-                    });
+                // The focused row's verdict when it changes nothing now, the
+                // one the header paints ([`Self::focused_idle`]): the row's
+                // own, else the scene's ("Shown over blank cells only",
+                // "Covers this N-cell jump").
+                let idle = spec.focused_idle().map_or_else(String::new, |effect| {
+                    format!(" {} · {effect}.", spec.focused_label)
+                });
                 // On an HDR display the preview, standard range, cannot show
                 // HDR glow at the terminal's brightness: said where one of
                 // the brightness rows has the keyboard.
@@ -2136,11 +2151,10 @@ impl SettingsPreviewSpec {
         })
     }
 
-    /// Paint-only identity folded into [`crate::native_ui::CompiledUi`]'s
-    /// retained-raster key. Animation phase deliberately stays out of the
-    /// accessibility value, but it must invalidate pixels while motion runs.
-    /// Under reduced motion phase cannot affect paint and is normalized to 0,
-    /// preventing a frozen preview from needlessly re-rasterizing.
+    /// Paint-only identity folded into [`crate::native_ui::CompiledUi`]'s retained-raster
+    /// key. Animation phase stays out of the accessibility value but invalidates pixels while
+    /// motion runs; under reduced motion it is normalized to 0 so a frozen preview does not
+    /// re-rasterize.
     pub(crate) fn paint_fingerprint(&self) -> u64 {
         let fingerprint = self.paint_identity_hash();
         // Drift guard for the invariant on `paint_identity_hash`: a raw field leaking into
@@ -2391,7 +2405,7 @@ impl SettingsPreviewSpec {
         let px = header_caption().get();
         let measure =
             |text: &str| crate::tray_raster::ui_text_width_for(TextFace::UiBold, text, px);
-        let control_reserve = if self.pause_control() {
+        let control_reserve = if self.control_slot() {
             PAUSE_GLYPH_W + 6.0
         } else {
             0.0
@@ -2652,11 +2666,18 @@ impl SettingsPreviewSpec {
     /// scrolling list instead, never dropping it, and [`Self::paint`] draws
     /// only the header below it.
     pub(crate) fn minimum_height(&self, floor: f32) -> f32 {
-        let spec = self.normalized();
+        let mut spec = self.normalized();
         floor.max(match self.scene {
             PreviewScene::Typography => self.typography_height(1),
             PreviewScene::CursorMotion => {
-                (spec.header_height() + 15.0 + spec.typography_row_height())
+                // The header as it loops and as it stands reduced, the taller:
+                // the slot already wraps both at one width, and this keeps a
+                // state-only header's words ("Live trail" against the pause's)
+                // from moving the floor either.
+                let row = spec.typography_row_height();
+                let header = spec.header_height();
+                spec.reduced_motion = !spec.reduced_motion;
+                (header.max(spec.header_height()) + 15.0 + row)
                     .max(crate::native_settings::scaled_control_height())
             }
             PreviewScene::Appearance => {
@@ -3229,8 +3250,10 @@ impl SettingsPreviewSpec {
         let caption_y =
             crate::tray_raster::row_baseline(rect.y + 4.0, first_line, caption_size.get());
         // A looping preview is its own Pause/Play control: its glyph sits at
-        // the header's right edge and the state yields that slot.
-        let control_reserve = if spec.pause_control() {
+        // the header's right edge and the state yields that slot, which a
+        // reduced loop keeps empty ([`Self::control_slot`]), as the layout
+        // that wrapped these lines did.
+        let control_reserve = if spec.control_slot() {
             PAUSE_GLYPH_W + 6.0
         } else {
             0.0
@@ -5509,15 +5532,10 @@ impl CursorScene {
     }
 }
 
-/// Fold a string's trimmed, ASCII-lowercased form into `hash` without
-/// materializing it.
-///
-/// `normalized()` lowercases `window_theme` and `motion_raw`, so the paint
-/// identity must hash the lowered bytes; doing it in place keeps the per-frame
-/// key allocation-free. The trailing sentinel is load-bearing: `Hash for str`
-/// appends a terminator after the bytes, and a hand-rolled byte loop must
-/// supply its own or two adjacent string fields become concatenation-collidable
-/// ("auto" + "full" hashing the same as "autof" + "ull").
+/// Fold a string's trimmed, ASCII-lowercased form into `hash` without allocating
+/// (`normalized()` lowercases `window_theme` and `motion_raw`). The trailing sentinel
+/// stands in for the terminator `Hash for str` appends, so adjacent fields cannot collide
+/// by concatenation ("auto" + "full" vs "autof" + "ull").
 fn hash_trimmed_lowercase<H: std::hash::Hasher>(value: &str, hash: &mut H) {
     for byte in value.trim().bytes() {
         H::write_u8(hash, byte.to_ascii_lowercase());
@@ -9505,6 +9523,15 @@ mod tests {
         };
         let long = focused(24);
         assert_eq!(long.live_state(), "Covers this 6-cell jump");
+        // The spoken value says the verdict the header paints.
+        let spoken = long
+            .clone()
+            .with_focus_label("Trail length")
+            .semantic_value();
+        assert!(
+            spoken.contains(&format!("Trail length · {}.", long.live_state())),
+            "{spoken}"
+        );
         assert!(
             long.header_rungs()
                 .iter()
@@ -9514,6 +9541,15 @@ mod tests {
         let cut = focused(3);
         assert!(cut.reads_live(), "{}", cut.live_state());
         assert!(!cut.live_state().contains("jump"));
+        // NEGATIVE CONTROL: a live length is spoken with no verdict.
+        let spoken = cut
+            .clone()
+            .with_focus_label("Trail length")
+            .semantic_value();
+        assert!(
+            !spoken.contains("jump") && !spoken.contains("blank cells"),
+            "{spoken}"
+        );
         // A count of one reads in the singular, in the header as on the row.
         let one = focused(1).with_focus_label("Trail length");
         assert!(
@@ -9538,7 +9574,91 @@ mod tests {
         for length in [2, 24] {
             assert_eq!(fire(length).live_state(), "Shown over blank cells only");
             assert!(!fire(length).reads_live());
+            let spoken = fire(length)
+                .with_focus_label("Trail length")
+                .semantic_value();
+            assert!(
+                spoken.contains(&format!("Trail length · {}.", fire(length).live_state())),
+                "{spoken}"
+            );
         }
+    }
+
+    /// THE FLOOR DOES NOT MOVE AS THE LOOP STOPS (looks4 settings-2): the
+    /// header kept its Pause/Play slot only while the loop played, so where
+    /// the least statement (the bare "Rainbow kitty") fit one line without
+    /// the slot but not with it, a reduced header (an unfocused window, load
+    /// shed, Reduce Motion) took one line and the looping one two, and
+    /// `minimum_height`, which promises the same floor while motion is
+    /// reduced, moved by a caption pitch whenever the Settings window lost or
+    /// regained focus. Over a width sweep at 1x, 1.25x and 2x text, a looping
+    /// cursor preview and the same preview reduced have one floor and one
+    /// header height. CONTROL: the sweep reaches widths where the header
+    /// wraps, so it covers the band where the two used to differ.
+    #[test]
+    fn a_reduced_preview_keeps_the_looping_previews_floor() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        let looping = SettingsPreviewSpec::cursor(rainbow_cursor("rainbow kitty"))
+            .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, "rainbow kitty")
+            .with_phase(300);
+        assert!(looping.pause_control(), "fixture: a looping preview");
+        let mut wrapped = 0;
+        for scale in [1.0_f32, 1.25, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            for step in 0..=180_u16 {
+                let width = 60.0 + f32::from(step) * 2.0;
+                let playing = looping.clone().with_measure_width(width);
+                let reduced = playing.clone().with_reduced_motion(true);
+                assert!(
+                    !reduced.pause_control(),
+                    "fixture: reduced, nothing to pause"
+                );
+                assert_eq!(
+                    playing.header_layout(width).height,
+                    reduced.header_layout(width).height,
+                    "{scale}x, {width}pt: {:?} against {:?}",
+                    playing.header_layout(width).lines,
+                    reduced.header_layout(width).lines
+                );
+                assert_eq!(
+                    playing.minimum_height(48.0),
+                    reduced.minimum_height(48.0),
+                    "{scale}x, {width}pt"
+                );
+                wrapped += usize::from(playing.header_layout(width).lines.len() > 1);
+            }
+        }
+        let _ = install_preferences(AppearancePreferences::default());
+        assert!(
+            wrapped > 0,
+            "control: the sweep reaches widths where the header wraps"
+        );
+    }
+
+    /// A FACE LANDING IS THE SAME DEMONSTRATION: the host's cadence probe
+    /// builds the preview without the prepared face and paint builds it with
+    /// it, so a loop identity (`PreviewClock`'s key) that saw the face's
+    /// ready epoch named two loops for one demonstration, and a paint more
+    /// than `PreviewClock::RESUME_MS` after the last (every headless
+    /// capture, a stalled window) restarted the cycle at its first frame.
+    /// NEGATIVE CONTROLS: the retained raster's key still sees the epoch (the
+    /// glyphs change), and another style is another loop.
+    #[test]
+    fn a_faces_landing_is_the_same_demonstration() {
+        let probe = SettingsPreviewSpec::cursor(rainbow_cursor("rainbow kitty")).with_phase(300);
+        let mut painted = probe.clone();
+        painted.font_ready_epoch = 7;
+        assert!(
+            probe.loop_identity().is_some(),
+            "fixture: a looping preview"
+        );
+        assert_eq!(probe.loop_identity(), painted.loop_identity());
+        assert_ne!(probe.paint_fingerprint(), painted.paint_fingerprint());
+        let other = SettingsPreviewSpec::cursor(rainbow_cursor("rainbow dog")).with_phase(300);
+        assert_ne!(probe.loop_identity(), other.loop_identity());
     }
 
     /// THE FLYING KITTY IS EARNED, in the preview as in the terminal: the
@@ -9693,11 +9813,9 @@ mod tests {
         );
     }
 
-    /// A TYPO PREVIEWS THE DEFAULT, not an empty box: `resolve_trail_style`
-    /// substitutes [`crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE`] for an
-    /// unrecognized spelling, so the preview has to show the same trail — and
-    /// the same COMPANION, which is the half that reads the style token rather
-    /// than the resolved `GlowStyle`. The badge still quotes what was authored.
+    /// An unknown spelling previews the default trail and companion, as
+    /// `resolve_trail_style` substitutes [`crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE`];
+    /// the badge still quotes what was authored.
     #[test]
     fn unknown_style_previews_the_default_trail_and_companion() {
         let cursor = CursorPreviewSpec {

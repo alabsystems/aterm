@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Display-offset damage: which rows need redrawing when the scroll position
-//! into history changes. The viewport-scroll paths in `grid/scroll.rs` and
-//! `grid/scrollback_offload.rs` delegate here.
+//! into history changes. The viewport-scroll paths in `grid/scroll.rs` delegate
+//! here.
 
 use super::Damage;
 

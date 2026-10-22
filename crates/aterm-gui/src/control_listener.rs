@@ -46,7 +46,7 @@ pub(crate) const WEDGE_AFTER: Duration = Duration::from_secs(3);
 #[cfg(unix)]
 const REBIND_BACKOFF: Duration = Duration::from_secs(10);
 
-/// The turn length while the queue stands still (see [`Supervisor::tick`]).
+/// The turn length while the queue stands still (see [`AcceptThread::run`]).
 #[cfg(unix)]
 const STALL_PACE: Duration = Duration::from_millis(100);
 
@@ -346,13 +346,11 @@ pub(crate) struct Retired {
 
 #[cfg(unix)]
 impl Endpoint {
-    /// Stop answering, at once, without waiting on any other thread: close
-    /// the serving listening socket — every connection still queued on it is
-    /// reset and a new connect is refused — and shut down, both ways, every
-    /// connection it accepted, wherever it is held, so its client reads EOF
-    /// now rather than when the process is finally replaced. The token and
-    /// the socket file stay where they are, for [`Self::reopen`] or the
-    /// process that replaces this one.
+    /// Stop answering at once, without waiting on any other thread: close the serving
+    /// listening socket (queued connections reset, new connects refused) and shut down,
+    /// both ways, every connection it accepted, wherever it is held, so its client reads
+    /// EOF now. The token and the socket file stay, for [`Self::reopen`] or the process
+    /// that replaces this one.
     pub(crate) fn retire(&self) -> Retired {
         let (listener, names) = {
             let mut endpoint = self
@@ -924,9 +922,8 @@ impl AcceptThread {
     /// Serve until retired. Each turn: park until readable (or [`TICK`]),
     /// drain, read the queue, beat.
     ///
-    /// While the queue stands still the socket stays READABLE, so `poll` would
-    /// return at once and the loop would spin; a stalled turn paces itself
-    /// with [`STALL_PACE`] instead.
+    /// While the queue stands still the socket stays readable, so `poll` would return at
+    /// once and the loop spin; a stalled turn paces itself with [`STALL_PACE`] instead.
     fn run(self) {
         let serve = |stream: CtlStream| {
             (self.serve)(stream);
@@ -1048,9 +1045,9 @@ fn drain(
                 if n.is_power_of_two() || n == 0 {
                     aterm_log::warn!("control listener accept failed ({} so far): {error}", n + 1);
                 }
-                // Descriptor or buffer exhaustion comes straight back on the
-                // next `accept`: pause (10 ms, doubling to 1 s — well inside the
-                // watchdog's patience) and say so once per streak.
+                // Descriptor or buffer exhaustion comes straight back on the next
+                // `accept`: pause (10 ms doubling to 1 s, inside the watchdog's
+                // patience) and say so once per streak.
                 if let Some(wait) = crate::control::accept_error_backoff(&error, *backoff) {
                     if backoff.is_none() {
                         crate::logging::stderr_line!(
@@ -1077,9 +1074,8 @@ pub(crate) fn queue_pending(listener: &CtlListener) -> Option<u32> {
     const SOI_FAMILY: usize = 184;
     const SOI_OPTIONS: usize = 188;
     const SOI_QLEN: usize = 194;
-    // libproc's entry point (in libSystem). Declared here rather than in the
-    // first-party `libc` crate: this is its one caller, and the reply is read
-    // by offset below, not through a bound struct.
+    // libproc's entry point (in libSystem), declared here: this is its one caller, and
+    // the reply is read by offset, not through a bound struct.
     unsafe extern "C" {
         fn proc_pidfdinfo(
             pid: libc::c_int,
@@ -1282,11 +1278,10 @@ mod tests {
         }
     }
 
-    /// The one line a fresh client on `path` is answered — `OK served` — or
-    /// "" when the connection ends with none. A LINE, not the stream to its
-    /// end: the end is read only once every descriptor of the supervisor's
-    /// side has closed, and a sibling test's fork holds a copy of one until
-    /// its child execs, past `patience` under load.
+    /// The one line a fresh client on `path` is answered (`OK served`), or "" when the
+    /// connection ends with none. A line, not the stream to its end: the end comes only
+    /// once every descriptor of the supervisor's side has closed, and a sibling test's fork
+    /// holds a copy of one until its child execs.
     fn ask(path: &std::path::Path, patience: Duration) -> std::io::Result<String> {
         let stream = CtlStream::connect(path)?;
         arm(&stream, patience)?;
@@ -1300,14 +1295,12 @@ mod tests {
         Ok(reply)
     }
 
-    /// The one line a new client on `path` is answered once the watchdog has
-    /// rebound it — two facts, each waited for with a hang detector
-    /// ([`aterm_spec::wait::MUST_HAPPEN`]), never a clock: the path names a
-    /// socket other than `before` (the rename is the rebind's last step, and
-    /// the fresh socket listens from before it, so a client connecting now is
-    /// queued on it), and then that client is answered. No client is sent
-    /// into the retiring queue, which a sibling test's fork can hold open
-    /// past its close.
+    /// The one line a new client on `path` is answered once the watchdog has rebound it,
+    /// each step waited for with a hang detector ([`aterm_spec::wait::MUST_HAPPEN`]): the
+    /// path names a socket other than `before` (the rename is the rebind's last step, and
+    /// the fresh socket listens before it), then that client is answered. No client is
+    /// sent into the retiring queue, which a sibling test's fork can hold open past its
+    /// close.
     fn served_after_rebind(path: &std::path::Path, before: Option<(u64, u64)>) -> String {
         let published = path.to_str().expect("utf8");
         aterm_spec::wait::until_within(
@@ -1361,8 +1354,8 @@ mod tests {
         let queued = CtlStream::connect(&path).expect("connect into the wedged queue");
         arm(&queued, aterm_spec::wait::MUST_HAPPEN).expect("deadline");
 
-        // The queued client is released when the retired socket closes (reset
-        // or EOF) — not served, and not left for 900 s.
+        // The queued client is released when the retired socket closes (reset or EOF),
+        // not served and not left hanging.
         let mut sink = String::new();
         let released = (&queued).read_to_string(&mut sink);
         assert!(
@@ -1396,10 +1389,9 @@ mod tests {
             "a healthy listener serves"
         );
 
-        // Generation 0 parks inside its accept step on its next turn (it wakes
-        // at least every TICK), and only once it is IN the park is anything
-        // connected: a thread already past its park check would drain the
-        // queue and serve it (see `Seams::parked`).
+        // Generation 0 parks inside its accept step on its next turn (it wakes at least
+        // every TICK), and only once it is in the park is anything connected: a thread
+        // past its park check would drain the queue and serve it.
         seams.park.store(0, Ordering::Release);
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
@@ -1437,11 +1429,10 @@ mod tests {
         }
     }
 
-    /// The judgement, tick by tick. A beat that moves is healthy however full
-    /// the queue; a beat that stands still is stuck only after [`STUCK_TICKS`]
-    /// ticks AND [`WEDGE_AFTER`] (a process waking from suspension turns
-    /// within a tick); a turning thread whose queue stands still is stalled
-    /// after [`WEDGE_AFTER`]; and a rebind backs off.
+    /// The judgement, tick by tick. A beat that moves is healthy however full the queue; a
+    /// beat that stands still is stuck only after [`STUCK_TICKS`] ticks and [`WEDGE_AFTER`]
+    /// (a process waking from suspension turns within a tick); a turning thread whose
+    /// queue stands still is stalled after [`WEDGE_AFTER`]; and a rebind backs off.
     #[test]
     fn the_watch_judges_stuck_stalled_and_healthy() {
         let t0 = Instant::now();

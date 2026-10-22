@@ -391,9 +391,8 @@ impl OutputEchoInput {
 impl OutputEchoTracker {
     /// Begin immediately before the real PTY seam (never at FIFO admission).
     fn begin(&self, kind: OutputEchoInput) -> OutputEchoWrite<'_> {
-        if kind != OutputEchoInput::Ignored {
-            self.sent.fetch_add(1, Ordering::AcqRel);
-        }
+        // In flight BEFORE counted ([`Self::input_settled`]): a read that sees
+        // this write counted sees it in flight too, until it is over.
         let counted = kind != OutputEchoInput::Ignored
             && self
                 .active_writes
@@ -401,6 +400,9 @@ impl OutputEchoTracker {
                     active.checked_add(1)
                 })
                 .is_ok();
+        if kind != OutputEchoInput::Ignored {
+            self.sent.fetch_add(1, Ordering::AcqRel);
+        }
         // On the physically unreachable overflow case the saturated non-zero
         // count is already fail-closed (hot), and this guard must not decrement
         // a write it did not count.
@@ -432,6 +434,22 @@ impl OutputEchoTracker {
     #[must_use]
     pub(crate) fn input_sent(&self) -> u64 {
         self.sent.load(Ordering::Acquire)
+    }
+
+    /// [`Self::input_sent`] where no input write is in flight: every write it
+    /// counts has reached the sink or failed by the time this returns, so a
+    /// screen read after it shows whatever those writes could have changed
+    /// by then, and any later write is past the count. `text --json`'s
+    /// `"inputs"` reads it before the rows ([`crate::control_query`]): the
+    /// count a later read's is set against, so that no key, submitting or
+    /// not, reached the session in between. `None` while a write is in
+    /// flight: it is counted but may land after the rows are read. A write
+    /// is in flight from before it is counted until it is over
+    /// ([`Self::begin`]).
+    #[must_use]
+    pub(crate) fn input_settled(&self) -> Option<u64> {
+        let sent = self.sent.load(Ordering::Acquire);
+        (self.active_writes.load(Ordering::Acquire) == 0).then_some(sent)
     }
 
     /// How many Enters written to the session submitted something typed
@@ -3927,8 +3945,13 @@ pub(crate) fn note_person_reaching(
 }
 
 /// The timeline half of [`note_person_reaching`], for the gesture `noted`
-/// counted: a burst's row and its delivery under the lock, any other's
-/// delivery through a `try_lock`.
+/// counted: a burst's delivery and its row under the lock, any other's
+/// delivery through a `try_lock`. The `human` row is the burst mark's
+/// (phase 6, the review of 6F-8; ruling U13): paid after the delivery wrote
+/// the mark ([`crate::session_timeline::SessionTimeline::pay_burst_rows`]),
+/// and none here for a burst a reconciling entry marked first while this
+/// waited on the lock, whose row that entry's hold owed and paid where the
+/// mark stands.
 pub(crate) fn deliver_noted(
     ctx: &crate::SessionCtx,
     noted: crate::human_input::Noted,
@@ -3936,13 +3959,13 @@ pub(crate) fn deliver_noted(
 ) -> bool {
     if noted.burst {
         let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-        tl.record("human", String::new());
         let at = tl.slog().now();
         let own = crate::session_log::PersonGesture {
             burst: Some(noted.seq),
             reaches,
         };
         tl.slog_mut().person_input(Some(own), at);
+        tl.pay_burst_rows();
         tl.slog_take_wake()
     } else if let Ok(mut tl) = ctx.timeline.try_lock() {
         let at = tl.slog().now();
@@ -3951,6 +3974,7 @@ pub(crate) fn deliver_noted(
             reaches,
         };
         tl.slog_mut().person_input(Some(own), at);
+        tl.pay_burst_rows();
         false
     } else {
         false
@@ -4974,15 +4998,11 @@ impl App {
         }
     }
 
-    /// Delivers a held-key payload to a session no longer frontmost in any window.
-    /// Terminal-side semantics (live-viewport snap, selection clear, paste FIFO order)
-    /// still apply, but no visible window's animator, predictor or cursor state is
-    /// touched.
-    ///
-    /// A confirmed paste arrives here too: a deferred delivery (the X11 clipboard read,
-    /// the Linux banner or macOS sheet answer) is pinned to the session that owned the
-    /// gesture, which may no longer front a window. Its bytes still land on it, framed
-    /// by the gesture's [`InputEvent::Paste`]; a closed owner gets nothing.
+    /// Delivers a held-key payload to a session no longer frontmost in any window:
+    /// terminal-side semantics (snap, deselect, paste FIFO order) apply, but no
+    /// window's presentation state is touched. A confirmed deferred paste (the X11
+    /// clipboard read, the banner or sheet answer) lands here too, pinned to the
+    /// session that owned the gesture; a closed owner gets nothing.
     fn input_to_hidden_session(
         &mut self,
         target_session: u64,
@@ -9107,23 +9127,10 @@ impl App {
             self.note_press_disposition(wid, &ev, None);
             return;
         }
-        // The Menu key (and, under `tab_menu_chord = "on"`, Shift+F10) pops that
-        // menu for the focused window's active tab: the OS "context menu for the
-        // focused thing" chord, the keyboard route to the popup. Not a
-        // rebindable `Action` (an OS convention like Alt+Space; a config typo
-        // must not shadow the only keyboard route). `tab_menu_chord`'s `policy`
-        // is the escape hatch, a knob that can only surrender keys. Its default
-        // claims only the Menu key: Shift+F10 is terminfo `kf22`, which legacy
-        // applications bind.
-        //
-        // Windows and Linux (the in-grid-strip platforms; see the
-        // `RightPressPlan::Chrome` arm in `app_mouse`). macOS chips carry a real
-        // `NSMenu`.
-        //
-        // Two things decline the claim: `front_defers_…` hands the key back to a
-        // kitty-protocol client that negotiated for it, and
-        // `open_active_tab_context_menu` returns `false` for a window with no
-        // strip / no terminal tab. Either way the key falls through untouched.
+        // The Menu key (and, under `tab_menu_chord = "on"`, Shift+F10) pops the tab
+        // menu for the active tab ([`tab_menu_chord`]). Windows and Linux only (macOS
+        // chips carry a real `NSMenu`). It falls through untouched when a
+        // kitty-protocol client negotiated for it or the window has no strip.
         #[cfg(any(windows, target_os = "linux"))]
         if let Some(ekey) = aterm_winit_keymap::map_logical_key(&ev.logical_key)
             && tab_menu_chord(
@@ -10076,13 +10083,10 @@ impl App {
         true
     }
 
-    /// The window half of the press-path viewport snap: cancel any in-flight
-    /// wheel glide, elastic-overscroll bounce, and banked sub-row residual, so
-    /// a momentum tail cannot ease the viewport off the prompt after a key.
-    /// Split from [`App::snap_to_bottom`] because the terminal half
-    /// (`display_offset` → bottom) is done in the seam's term-lock scope for
-    /// every key that reaches it, and this half needs no lock. Arms that end a
-    /// press before the seam still call the full `snap_to_bottom`.
+    /// The window half of the press-path viewport snap: cancel any wheel glide, bounce
+    /// and sub-row residual, so a momentum tail cannot ease the viewport off the
+    /// prompt. The terminal half runs in the seam's term-lock scope; arms that end a
+    /// press before the seam call the full [`App::snap_to_bottom`].
     fn cancel_press_scroll_motion(&mut self, wid: WindowId) {
         self.drop_front_scroll_motion(wid);
     }
@@ -10919,11 +10923,9 @@ impl App {
         )
     }
 
-    /// Where composed text on window `wid` lands: the one routing precedence
-    /// [`Self::on_ime_commit`]'s dispatch and [`Self::preedit_owner`]'s paint
-    /// both read (a frontmost native view, then the inline rename field, then
-    /// the open find field, then the grid). Says nothing about whether a
-    /// composition is in flight (`preedit_owner` adds that gate);
+    /// Where composed text on window `wid` lands, the one precedence
+    /// [`Self::on_ime_commit`] and [`Self::preedit_owner`] both read: a frontmost
+    /// native view, the inline rename field, the open find field, then the grid.
     /// [`PreeditOwner::None`] only when the window is gone.
     fn ime_route(&self, wid: WindowId) -> PreeditOwner {
         let Some(ws) = self.windows.get(&wid) else {
@@ -12659,14 +12661,10 @@ mod predictive_echo_input_gate_tests {
     }
 }
 
-/// TYPED-WORD SUMMON plumbing. The detector's own laws (once-per-completion,
-/// cooldown without restamp, backspace tolerance, session keying) are proven
-/// in `aterm_effects::kitty_summon`; this module binds the App seams: the press path
-/// feeds ONLY typed keys (never screen bytes), a granted feline completion
-/// reaches the Kitty Log's ordinary episode rules and NOTHING else (the cat the
-/// user sees is the ambient word-cat the echoed word grows), the canine arm
-/// pops its visiting dog, and the effects master gate keeps everything inert
-/// when nothing could draw.
+/// Typed-word summon plumbing (the detector's laws are proven in
+/// `aterm_effects::kitty_summon`): only typed keys feed it, a feline completion
+/// reaches only the Kitty Log, the canine arm pops its dog, and the master gate
+/// keeps everything inert.
 #[cfg(test)]
 #[path = "app_input_typed_kitty_summon_tests.rs"]
 mod typed_kitty_summon_tests;
@@ -12701,10 +12699,8 @@ mod favourite_kitty_tests;
 #[path = "app_input_homecoming_rate_law_tests.rs"]
 mod homecoming_rate_law_tests;
 
-/// Keyboard parity for the tab context menu, driven through the shipping
-/// `on_key` routing with real winit events. Windows and Linux, gated like the
-/// chord arm itself (macOS's native strip carries a real `NSMenu` and compiles
-/// the arm out).
+/// Keyboard parity for the tab context menu through the shipping `on_key` with real
+/// winit events.
 #[cfg(all(test, any(windows, target_os = "linux")))]
 #[path = "app_input_tab_menu_key_tests.rs"]
 mod tab_menu_key_tests;

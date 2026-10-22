@@ -606,6 +606,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     // One system call reads every process at once: the
                     // caller stamps them all with its time.
                     read_at: None,
+                    coalition: None,
                 },
                 i64_at(rec, offset_of!(ProcessInformation64, create_time)).unwrap_or(0),
             ));

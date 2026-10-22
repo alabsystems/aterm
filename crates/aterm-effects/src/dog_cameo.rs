@@ -176,8 +176,7 @@ mod tests {
         );
     }
 
-    /// A re-summon while the dog is visible rolls a different breed, and many
-    /// seeds reach many breeds.
+    /// A re-summon while the dog is visible rolls a different breed; many seeds reach many.
     #[test]
     fn resummons_parade_distinct_breeds() {
         let t = t0();

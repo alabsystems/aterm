@@ -10,11 +10,10 @@
 //! entry with the reason's closing `)` kept; a box with no command, path or question is named
 //! by its own first row ([`prompt_box_first_row`]). A limit's reads `limited: <message>`.
 //!
-//! The attention is keyed: this loop writes and clears only its own entry
-//! (`meta set|unset attention owner=supervisor`), never the bare form, which
-//! is the human's. The key proves ownership; the text
-//! ([`Session::attention_ours`]) only tells a box's badge from a limit's. A
-//! loop watching behind another supervisor's claim writes none.
+//! The attention is keyed: this loop writes and clears only its own entry (`meta set|unset
+//! attention owner=supervisor`), never the bare form, which is the human's. The key proves
+//! ownership; the text ([`Session::attention_ours`]) only tells a box's badge from a limit's.
+//! A loop watching behind another supervisor's claim writes none.
 
 use super::super::journal::{
     AGAIN_ADOPTED, AGAIN_RETRY, ATTENTION_KEPT, ATTENTION_SKIPPED, CLEARED_BOX, CLEARED_NEEDS,

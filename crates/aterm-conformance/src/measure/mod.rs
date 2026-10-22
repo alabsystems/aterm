@@ -12,7 +12,7 @@
 //!   the binary's own `ctl` ([`instance`]);
 //! * the stand-in TUIs the scenes run are the crate's `fake-tui` binary.
 //!
-//! The explicit measurement matrices are `benches/paint.rs` and `benches/spin.rs`.
+//! The matrices themselves are `tests/paint.rs` and `tests/spin.rs`.
 
 pub mod frame;
 pub mod instance;

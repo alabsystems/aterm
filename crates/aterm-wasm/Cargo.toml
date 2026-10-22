@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 # aterm-font, shaping via aterm-font's shaper), all wasm32-safe.
 aterm-core = { path = "../aterm-core", default-features = false }
 aterm-render = { path = "../aterm-render", default-features = false }
-# The cursor-wake + sparkle-words engines the native app runs; wasm32-clean.
+# Cursor-wake and sparkle-words effects; wasm32-clean.
 aterm-effects = { path = "../aterm-effects" }
 # The mosh-style predictive-echo state machine the native app runs.
 aterm-predict = { workspace = true }

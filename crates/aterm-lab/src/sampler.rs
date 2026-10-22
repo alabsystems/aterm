@@ -129,7 +129,14 @@ pub fn keep_from_the_cleaner(run_dir: &Path, sockdir: &str, now: SystemTime) -> 
     made
 }
 
-/// The `cmd[pid] proto kind endpoint[  EXTERNAL]` lines of `lsof -F pcPtn` output.
+/// The `cmd[pid] proto kind endpoint[  EXTERNAL]` lines of `lsof -F pcPtn`
+/// output. `kind` is `conn` for a socket with a peer (`->`), `unbound` for
+/// one bound to no address and no port (`*:*`: it can receive nothing, and
+/// no peer can reach it — the private instance's vitals open one AF_INET
+/// datagram socket per reading to ask each interface's functional type,
+/// `aterm_sysprobe`'s `ioctl_socket`, and the witness caught one as
+/// `aterm[82057] UDP listen *:*` in the 2.1.308 read's `ea8`), and `listen`
+/// for one bound to an address or a port with no peer.
 #[must_use]
 pub fn endpoints(lsof_f: &str) -> BTreeSet<String> {
     let (mut pid, mut cmd, mut proto) = (String::new(), String::new(), String::new());
@@ -143,6 +150,7 @@ pub fn endpoints(lsof_f: &str) -> BTreeSet<String> {
             "n" => {
                 let (kind, remote) = match rest.split_once("->") {
                     Some((_, r)) => ("conn", r),
+                    None if rest.split(" (").next() == Some("*:*") => ("unbound", rest),
                     None => ("listen", rest),
                 };
                 let remote = remote.split(" (").next().unwrap_or(remote);
@@ -296,7 +304,19 @@ mod tests {
         assert!(e.contains(&"claude[2] TCP conn 127.0.0.1:50130".to_string()));
         assert!(e.contains(&"claude[2] TCP conn 160.79.104.10:443  EXTERNAL".to_string()));
         assert!(e.contains(&"claude[2] UDP listen [::1]:53".to_string()));
-        assert!(e.contains(&"claude[2] UDP listen *:*".to_string()));
+        assert!(e.contains(&"claude[2] UDP unbound *:*".to_string()));
+        // NEGATIVE CONTROLS: a socket bound to every address on a port is
+        // listening, and an unbound one is never external
+        let f = "p3\ncaterm\nPUDP\nn*:*\nn*:5353\nPTCP\nn*:8080\n";
+        let e: Vec<String> = endpoints(f).into_iter().collect();
+        assert_eq!(
+            e,
+            [
+                "aterm[3] TCP listen *:8080",
+                "aterm[3] UDP listen *:5353",
+                "aterm[3] UDP unbound *:*",
+            ]
+        );
     }
 
     /// The empty directories under `top` that `tmp_cleaner`'s own test

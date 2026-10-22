@@ -12,9 +12,8 @@
 //! in use. Its header says `computed=client`.
 //!
 //! The offline form reads saved files and needs no socket:
-//! `aterm ctl cast drift --file <cast> [--screen <text>] [--until <t>] [k=v…]`
-//! (with no screen it compares the faithful replay with the stable one:
-//! `fidelity=-`).
+//! `aterm ctl cast drift --file <cast> [--screen <text>] [--until <t>] [k=v…]`; with no
+//! screen it compares the faithful replay with the stable one (`fidelity=-`).
 //!
 //! The analyzer is injected, not linked: this crate is the dependency-free
 //! client (workspace-only dependencies), and the `aterm` binary, which
@@ -507,19 +506,17 @@ enum Probe {
 }
 
 /// Send `request` (`[@<sid> ]cast drift …\n`) and read the answer. A report
-/// (`OK <n> verdict=…`) is printed header first; an `ERR` goes to stderr as in
-/// `exchange`; a lone byte count is an older server's bare cast, read and
-/// dropped.
+/// (`OK <n> verdict=…`) is printed header first; an `ERR` goes to stderr as in `exchange`;
+/// a lone byte count is an older server's bare cast, read and dropped.
 fn probe(
     path: &str,
     origin: TargetOrigin,
     request: &str,
     deadline: Option<Duration>,
 ) -> io::Result<Probe> {
-    // `exchange`'s connect phase ([`converse_served`]): an unaccepted connection
-    // is reported within seconds, and a busy listener's refusal as itself. The
-    // fallback's own reads ([`fetch`]) run only once this connection proved the
-    // instance is serving.
+    // `exchange`'s connect phase ([`converse_served`]): an unaccepted connection is reported
+    // within seconds, and a busy listener's refusal as itself. The fallback's reads
+    // ([`fetch`]) run only once this connection proved the instance is serving.
     let served = converse_served(path, origin, deadline, |stream| {
         if let Some(code) = send_served(&stream, request.as_bytes())? {
             return Ok(Probe::Answered(code));
@@ -704,8 +701,7 @@ mod tests {
         }
     }
 
-    /// A fake analyzer that echoes what it was handed, so the test sees exactly
-    /// the material the client read.
+    /// A fake analyzer that echoes the material it was handed.
     fn echo(job: &CastDriftJob<'_>) -> Result<String, String> {
         let screen = job.screen.map_or(0, <[String]>::len);
         Ok(format!(
@@ -719,10 +715,9 @@ mod tests {
         ))
     }
 
-    /// The fallback end to end against a mock older server that answers `cast
-    /// drift` with the bare cast: the client reads status/text/cursor/modes/
-    /// cast itself (unmoved stamp: quiescent) and hands the analyzer the
-    /// material; the standalone client without one refuses by name.
+    /// Against a mock older server that answers `cast drift` with the bare cast, the client
+    /// reads the material itself (unmoved stamp: quiescent) and hands it to the analyzer;
+    /// without an analyzer it refuses by name.
     #[cfg(unix)]
     #[test]
     fn an_older_server_gets_the_report_computed_client_side() {
@@ -825,8 +820,7 @@ mod tests {
             missing.to_string().contains("/nonexistent.cast"),
             "{missing}"
         );
-        // A readable file: the analyzer is told nothing about which aterm made
-        // it (a live fallback's peer would be refused here).
+        // A readable file: the peer is unknown (a live fallback's peer is refused here).
         let dir = std::env::temp_dir().join(format!("aterm-ctl-offline-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("saved.cast");

@@ -144,6 +144,9 @@ pub struct Caps {
     pub throttle: Cap,
     /// A volume's size and free space.
     pub volume: Cap,
+    /// The kernel's resource coalitions, every user's ([`crate::coalitions`]):
+    /// `yes` on macOS once [`crate::coalitions::self_check`] passes.
+    pub coalitions: Cap,
     /// What capacity figures are computed against.
     pub capacity: CapSource,
 }
@@ -170,6 +173,7 @@ impl Caps {
             cap("proc_memory_others", self.proc_memory_others),
             cap("throttle", self.throttle),
             cap("volume", self.volume),
+            cap("coalitions", self.coalitions),
             ("capacity", self.capacity.word().to_owned()),
         ]
     }
@@ -196,6 +200,7 @@ impl Caps {
             proc_memory_others: no,
             throttle: no,
             volume: no,
+            coalitions: no,
             capacity: CapSource::Host,
         }
     }

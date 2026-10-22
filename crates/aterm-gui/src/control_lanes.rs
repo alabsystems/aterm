@@ -164,10 +164,9 @@ pub(super) enum Held {
     Whole,
 }
 
-/// What `buffered` holds of the request at its head: the wire's grammar, so
-/// a lane and the parker agree on when a request is whole. Before the
-/// handshake only its line counts: a verb folded into it is the connection's
-/// first request, judged when the lane unfolds it.
+/// What `buffered` holds of the request at its head, by the wire's grammar, so a lane and
+/// the parker agree on when a request is whole. Before the handshake only its line
+/// counts: a verb folded into it is judged when the lane unfolds it.
 pub(super) fn held(buffered: &[u8], authenticated: bool) -> Held {
     let scan = &buffered[..buffered.len().min(MAX_REQUEST_LINE + 1)];
     let Some(end) = scan.iter().position(|byte| *byte == b'\n') else {
@@ -1899,12 +1898,11 @@ impl Lanes {
 
     /// Serve `conn` on this lane until it must leave it (see [`Here`]).
     ///
-    /// While a parker can take the connection (`may_park`, or once a request
-    /// has been served here), the lane never waits on its peer: it delivers
-    /// what the peer takes of an answer now and parks the rest, and it serves
-    /// only a request that is whole, parking a connection whose next one is
-    /// not. Once a park was refused (a parker that stopped), the next request
-    /// is read and answered here, waiting, as without a parker.
+    /// While a parker can take the connection (`may_park`, or once a request has been
+    /// served here), the lane never waits on its peer: it delivers what the peer takes of
+    /// an answer and parks the rest, and serves only a whole request, parking a connection
+    /// whose next one is not. Once a park was refused (a stopped parker), the next request
+    /// is read and answered here, waiting.
     fn serve_here(
         &self,
         conn: &mut Conn,
@@ -2284,11 +2282,9 @@ impl Lanes {
         self.stop_parker(parker, parked, &why);
     }
 
-    /// The parker cannot go on: from now on no connection parks (a lane keeps
-    /// its idle connection, and the lanes bound the connections, as without a
-    /// parker), and every connection it holds — polled, or handed over and not
-    /// yet polled — is closed: its client sees a hang-up, which it rides out by
-    /// dialling again, instead of a request nobody will ever read.
+    /// The parker cannot go on: no connection parks from now on (as without a parker), and
+    /// every connection it holds, polled or not yet, is closed. Its client sees a hang-up it
+    /// rides out by redialling, not a request nobody reads.
     #[cfg(unix)]
     fn stop_parker(&self, parker: &Parker, parked: Vec<Conn>, why: &str) {
         let arrivals = {
@@ -2745,9 +2741,11 @@ impl Lanes {
     /// Move what lanes handed the parker into its polled set, then place each
     /// fresh connection admitted at the cap.
     fn take_arrivals(&self, parker: &Parker, parked: &mut Vec<Conn>) {
-        #[cfg(test)]
-        drop(parker.pause.lock().unwrap_or_else(PoisonError::into_inner));
         let fresh = {
+            // Held across the take, so a pass already under way when a test takes the pause
+            // finishes taking before the test hands anything over, and none takes after.
+            #[cfg(test)]
+            let _pause = parker.pause.lock().unwrap_or_else(PoisonError::into_inner);
             let mut inbox = parker.inbox.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(inbox) = inbox.as_mut() else {
                 return;
@@ -2922,12 +2920,9 @@ impl Parker {
     }
 }
 
-/// A wait no lane may take — every wait lane taken (a wait with requests
-/// pipelined behind it moves too, carrying them), and the request lanes' wait
-/// budget spent — is answered with the busy reply, at once: nothing was
-/// served, and the client may send it again. The connection stays (it parks,
-/// idle, like any answered one, or serves what is pipelined behind the wait);
-/// only a failed delivery ends it.
+/// A wait no lane may take (every wait lane taken and the request lanes' wait budget
+/// spent) is answered busy at once: nothing was served, and the client may send it again.
+/// The connection stays; only a failed delivery ends it.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(

@@ -71,8 +71,8 @@ fn resize_to_one_column_preserves_protected_cells_with_reflow() {
 
 #[test]
 fn resize_to_one_column_preserves_protected_cell_after_wide_char() {
-    // A protected cell right after a wide char + spacer: only cells following a
-    // replaced wide char are skipped, not every cell with bit 10 set.
+    // PROTECTED shares bit 10 with WIDE_CONTINUATION: only the cell after a
+    // replaced wide char is skipped, not every cell with bit 10 set.
     let mut grid = Grid::new(2, 4);
 
     grid.write_wide_char_wrap_styled(

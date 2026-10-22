@@ -69,7 +69,6 @@ fn sgr_attr_reset_returns_to_default_style() {
     // Setting then clearing each attribute by its reset form restores the
     // default fingerprint (the flags-only fast path's round trip).
     let default = run(b"").style_fingerprint();
-    // bold(1)/un-bold(22), reverse(7)/un-reverse(27), underline(4)/un-underline(24).
     let round_trip = run(b"\x1b[1m\x1b[7m\x1b[4mX\x1b[22m\x1b[27m\x1b[24m").style_fingerprint();
     assert_eq!(
         round_trip, default,

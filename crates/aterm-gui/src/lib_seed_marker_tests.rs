@@ -3,9 +3,8 @@
 
 use super::{Wake, parse_seed_line};
 
-/// The STREAMING contract: `net-starting:` must raise its event from a single
-/// line, because that is the whole point — it arrives before the multi-GB
-/// download, not bundled with the output after it. A quiet line raises nothing.
+/// `net-starting:` raises its event from a single line: it arrives before the multi-GB
+/// download, not with the output after it. A quiet line raises nothing.
 #[test]
 fn a_streamed_start_marker_raises_the_started_wake() {
     let started = parse_seed_line(

@@ -233,9 +233,8 @@ pub(crate) fn successor_reads_session_log(target_build: u64, running_build: u64)
     target_build >= running_build
 }
 
-/// Which turn-status words the receiving build reads, so [`export_for`]
-/// spells every record in its vocabulary (round eight of the update audit,
-/// finding 714). A receiver leaves out a record whose word it does not know.
+/// Which turn-status words the receiving build reads, so [`export_for`] spells every record in
+/// its vocabulary; a receiver leaves out a record whose word it does not know.
 #[cfg(any(unix, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StatusWords {
@@ -844,11 +843,10 @@ fn with_log(
     sidecar(&take.skeleton.lines).filter(fits)
 }
 
-/// Each session's share of `budget` for its CORE ([`core_len`], `cores` in
-/// pool order): the whole core while every core fits; past that, the most
-/// every session can have alike — a core under that keeps all of it, and
-/// what it leaves goes to the longer ones, cut alike (max-min fair). The
-/// shares never sum past `budget`, and pool order buys nothing.
+/// Each session's share of `budget` for its core ([`core_len`], `cores` in pool order): the
+/// whole core while every core fits; past that, max-min fair (a core under the common share
+/// keeps all of it, the longer ones are cut alike). The shares never sum past `budget`, and
+/// pool order buys nothing.
 #[cfg(any(unix, test))]
 fn core_shares(cores: &[u64], budget: u64) -> Vec<u64> {
     if cores.iter().fold(0_u64, |sum, c| sum.saturating_add(*c)) <= budget {
@@ -1019,11 +1017,10 @@ pub(crate) fn decode_crash_carry(bytes: &[u8]) -> Result<ControlCarry, &'static 
     Ok(carry)
 }
 
-/// Where the carried tail starts: after the EARLIEST mark among the newest
-/// [`TAIL_TURNS`] submitted turns (the newest turn when none was submitted)
-/// that were minted under this archive's origin, and no later than the rows
-/// the screen shows again. With no such turn, from the oldest row (the byte
-/// cap then keeps the newest).
+/// Where the carried tail starts: after the earliest mark among the newest [`TAIL_TURNS`]
+/// submitted turns (the newest turn when none was submitted) that were minted under this
+/// archive's origin, and no later than the rows the screen shows again. With no such turn,
+/// from the oldest row (the byte cap then keeps the newest).
 #[cfg(any(unix, test))]
 fn tail_from(
     turns: &[TurnRecord],

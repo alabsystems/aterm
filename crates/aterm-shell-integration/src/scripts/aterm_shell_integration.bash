@@ -440,7 +440,7 @@ if [[ -z ${__aterm_osc_tty+x} ]]; then
     if [[ -t 1 ]]; then __aterm_osc_tty=1; else __aterm_osc_tty=0; fi
 fi
 
-# OSC escape sequences
+# OSC escape sequences (`printf '%s'`: see the zsh script's `__aterm_osc`).
 __aterm_osc() {
     if [[ -t 1 || ${__aterm_osc_tty-} != 1 ]]; then
         printf '\033]%s\a' "$1"
@@ -667,17 +667,14 @@ __aterm_report_cwd() {
     __aterm_osc "7;${uri}"
 }
 
-# Mark prompt start (OSC 133;A)
 __aterm_mark_prompt_start() {
     __aterm_osc "133;A${__aterm_id_suffix_str}"
 }
 
-# Mark command line start (OSC 133;B) - after prompt, before user input
 __aterm_mark_command_start() {
     __aterm_osc "133;B${__aterm_id_suffix_str}"
 }
 
-# Mark command execution start (OSC 133;C)
 __aterm_mark_exec_start() {
     __aterm_osc "133;C${__aterm_id_suffix_str}"
 }

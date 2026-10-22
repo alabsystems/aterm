@@ -483,7 +483,7 @@ where
         sky_census = Some(sky);
     }
 
-    // Step 2 — the mirror: the body's RIGHT edge `lead_px` before the caret
+    // Step 2 — the mirror: the body's right edge `lead_px` before the caret
     // cell's left edge, held on the grid like the shipped seat is.
     let behind_x = caret_left
         .saturating_sub(query.lead_px)

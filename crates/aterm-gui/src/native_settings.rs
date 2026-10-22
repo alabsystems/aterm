@@ -12745,6 +12745,20 @@ fn focused_preview_key(state: &SettingsViewState) -> Option<String> {
         state.preview_subject.set(Some((key, preview_path)));
         Some(key.to_string())
     };
+    // A Cursor Styles row is a value of `cursor_trail_style`: with the
+    // keyboard on a row, and wherever a style is being tried (the row under
+    // the pointer, the keyboard's row, or the one the preview's own control
+    // keeps), whatever control has the keyboard, the preview demonstrates
+    // that setting and remembers it as this page's subject. With any other
+    // subject (a tuning control of the Adjust card, still cached for the
+    // preview's own focus) the preview drew the tried style unsaved under
+    // that control's words, with no "Trying" and no way back named.
+    if (focused.is_some_and(|focus| focus.starts_with("settings/cursor-style/"))
+        || cursor_style_trial_from(state).is_some())
+        && let Some(key) = subject(prefs::EDIT_CURSOR_TRAIL_STYLE)
+    {
+        return Some(key);
+    }
     if let Some(key) = focused
         .and_then(|focus| focus.strip_prefix("settings/control/"))
         .and_then(subject)
@@ -30781,8 +30795,9 @@ fn debugger_press_refusal(
 
 /// Who raises [`debugger_access_alert`]: the owner's press on the Security
 /// page, or the App's once-per-Mac launch ask (owner ruling O29), whose alert
-/// says first that aterm asks this once per Mac and sends the undo to the
-/// Security page.
+/// says first that aterm asks this once on this Mac — once for each account:
+/// the record of the Macs asked lives in the account's config folder — and sends
+/// the undo to the Security page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DebuggerAlertFrom {
     Press,
@@ -30882,7 +30897,7 @@ pub(crate) fn debugger_access_alert(
             };
             let mut paragraphs = Vec::new();
             if from == DebuggerAlertFrom::Launch {
-                paragraphs.push("aterm asks this once per Mac.".to_owned());
+                paragraphs.push("aterm asks you this once on this Mac.".to_owned());
             }
             paragraphs.extend([
                 "Afterwards, programs you run can debug your other programs without a password, \
@@ -31280,7 +31295,7 @@ impl OwnerQuiet {
 /// `ConsentGestures::confirm` raised the alert and the owner chose its proceed
 /// button. It has two callers: the Security page's presses
 /// ([`SettingsViewState::owner_confirms`]) and the App's once-per-Mac
-/// debugger-access launch ask (`App::offer_debugger_access_at_launch`, through
+/// debugger-access launch ask (`App::spend_debugger_offer_at_launch`, through
 /// `DebuggerChangeLane::offer`; owner ruling O29). The debugger-access change is built on it all the way down: only
 /// `DebuggerChangeLane::begin` mints a `debugger_access::ChangeTicket`, and
 /// only from a yes; a `DevtoolsJob` — what the worker that runs

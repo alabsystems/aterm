@@ -48,6 +48,9 @@ use aterm_agent::supervise::policy::turn_end::{
 use crate::codex_rig::{Answered, call_item, message_item, request_view};
 use crate::pyjson::J;
 
+#[path = "codex_alab_policy_model.rs"]
+pub mod policy;
+
 /// `[harness]`'s continuation as older aterm builds spelled it, which an
 /// older codex-alab may still type; aterm's Cruise continuation
 /// ([`CONTINUE_TEXT`]) carries the same words.
@@ -382,6 +385,9 @@ fn approval_call() -> J {
 #[must_use]
 pub fn answer(body: &J) -> Answered {
     let leg = leg_of(body).unwrap_or_else(|| "-".to_string());
+    if let Some(answer) = policy::answer(body, &leg) {
+        return answer;
+    }
     let say = |text: &str| Answered::items(vec![message_item(text)]);
     let slow = |text: &str, delay: Duration| {
         let mut a = say(text);
@@ -445,6 +451,7 @@ pub fn answer(body: &J) -> Answered {
                 headers: crate::stub::usage_limit_headers("five_hour", reset),
                 delay: Duration::ZERO,
                 tag: String::new(),
+                gate: None,
             }
         }
         ("usage", Step::Continue) => say("Resumed after the reset."),

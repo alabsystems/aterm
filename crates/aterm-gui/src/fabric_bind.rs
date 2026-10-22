@@ -105,15 +105,18 @@ impl Timeline for crate::session_timeline::SessionTimeline {
         crate::session_timeline::SessionTimeline::record(self, kind, payload);
     }
 
-    /// THE ONE FABRIC HOOK (session log phase 3B, addendum A14): the timeline
-    /// row and the session log's typed mark in this one hold, then whether
+    /// THE ONE FABRIC HOOK (session log phase 3B, addendum A14): the session
+    /// log's typed mark and the timeline row in this one hold, then whether
     /// the log's readers were owed a wake, which
     /// [`crate::session_timeline::SessionTimeline::slog_take_wake`] has rung
-    /// on the session's watchers in this hold.
+    /// on the session's watchers in this hold. The mark first (the review
+    /// of 6F-8): its entry reconciles the person (ruling T2), and a key it
+    /// marks there owes its `human` row, which the fact's row pays before
+    /// its own, so the ring's order is the log's.
     fn record_fact(&mut self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
-        crate::session_timeline::SessionTimeline::record(self, kind, payload);
         let at = self.slog().now();
         self.slog_mut().observe_fabric(fact, at);
+        crate::session_timeline::SessionTimeline::record(self, kind, payload);
         self.slog_take_wake()
     }
 }

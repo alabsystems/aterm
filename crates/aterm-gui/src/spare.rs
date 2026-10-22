@@ -3021,6 +3021,7 @@ fn debug_ms(name: &'static str) -> Option<Duration> {
         "PERSON" => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_PERSON_MS"),
         "READY_AGE" => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_READY_AGE_MS"),
         "SCAN" => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_SCAN_MS"),
+        "PARKED" => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_PARKED_MS"),
         _ => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_SETTLE_MS"),
     }?;
     raw.to_str()?.parse().ok().map(Duration::from_millis)
@@ -3041,6 +3042,14 @@ fn ready_max_age() -> Duration {
 /// once the spacing since the last scan has passed).
 fn scan_every() -> Duration {
     debug_ms("SCAN").unwrap_or(SCAN_EVERY)
+}
+
+/// [`PARKED_DEADLINE`] (its dev seam lengthens it to the live suite's hang
+/// detector, whose proofs are never the deadline: on a loaded host a one-line
+/// rc's spare parked past the 1 s and turned spares off for the instance, 2 of
+/// 160 module runs at load ~189, so a slow park there is only slow).
+fn parked_deadline() -> Duration {
+    debug_ms("PARKED").unwrap_or(PARKED_DEADLINE)
 }
 
 /// The mirror the thread keeps.
@@ -4471,10 +4480,11 @@ impl App {
         };
         let age = now.saturating_duration_since(slot.since);
         let (state, t_ready) = (slot.state, slot.t_ready);
+        let parked_by = parked_deadline();
         match state {
-            SlotState::Spawned if age >= PARKED_DEADLINE => {
+            SlotState::Spawned if age >= parked_by => {
                 // The wrapper did not hold: the rc may be running unasked.
-                aterm_log::warn!("spare: no parked mark within {PARKED_DEADLINE:?}; spares off");
+                aterm_log::warn!("spare: no parked mark within {parked_by:?}; spares off");
                 self.spares.parked_failed = Some(parked_key(&slot.inputs));
                 self.retire_spare("no_park", None);
             }
@@ -4491,7 +4501,7 @@ impl App {
         }
         if let Some(slot) = &self.spares.slot {
             let at = match slot.state {
-                SlotState::Spawned => Some(slot.since + PARKED_DEADLINE),
+                SlotState::Spawned => Some(slot.since + parked_by),
                 SlotState::Parked => Some(slot.since + PARKED_MAX_AGE),
                 SlotState::Warming => Some(slot.since + slot.t_ready),
                 SlotState::Ready => Some(slot.since + ready_max_age()),

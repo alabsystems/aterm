@@ -493,14 +493,14 @@ fn uninstall_bundle(p: &Places) -> Option<PathBuf> {
         })
 }
 
+/// Where the Caffeine mug keeps the copies of the app it runs from:
+/// `<label>/<id>/X.app` (`<label>/X.app` before 2026-10-20), each copy's directory holding
+/// [`aterm_uds::deadline::RAN`] once a mug ran from it ([`sweep_caffeine_code`]).
+const CAFFEINE_CODE: &str = "caffeine-code.noindex";
+
 /// What `aterm caffeine` keeps in the support dir: the copy of the app the mug runs from,
 /// the session plists, the mode and the one-mug lock.
-const CAFFEINE_FILES: [&str; 4] = [
-    "caffeine-code.noindex",
-    "caffeine",
-    "caffeine.state",
-    "caffeine.lock",
-];
+const CAFFEINE_FILES: [&str; 4] = [CAFFEINE_CODE, "caffeine", "caffeine.state", "caffeine.lock"];
 
 /// The line a self-uninstall adds to the toolset decline its own sweep recorded but left for an
 /// aterm it kept: the run that removes that aterm then knows the decline for the sweep's, not
@@ -510,12 +510,16 @@ const SWEPT_DECLINE_TAG: &str = "# Recorded by aterm pkg self-uninstall for an a
 /// The prefix of every launchd label `aterm caffeine` makes, its login plists' names.
 const CAFFEINE_LABEL_PREFIX: &str = "com.aterm.aterm.caffeine";
 
-/// Retire the going builds' startup jobs and the running mug through their own command.
-/// Shared files go only after every admitted step succeeded and the mug lock is acquired for
-/// the whole cleanup. A refusal, unsupported helper, or unknown/busy lock keeps them. The
-/// lock rendezvous itself stays: unlinking a held lock would let another serve create a
-/// different inode while this cleanup still holds the old one. Returns the bundles whose
-/// step failed: each is kept, as its `aterm caffeine` is what that step needs again.
+/// Retire the going builds' startup jobs and the running mug through their own command:
+/// each going bundle's `aterm`, and the store's (the source lane's, which step 3 removes; a
+/// bare build's mug runs from it where it is). With another aterm staying on the account,
+/// only a going build's own mug is quit (`caffeine quit own`; a build from before it answers
+/// a usage error, exit 2, and its mug is left as before). Shared files go only after every
+/// admitted step succeeded and the mug lock is acquired for the whole cleanup. A refusal,
+/// unsupported helper, or unknown/busy lock keeps them. The lock rendezvous itself stays:
+/// unlinking a held lock would let another serve create a different inode while this cleanup
+/// still holds the old one. Returns what holds each helper whose step failed (its bundle, or
+/// the store's `aterm`): each is kept, as its `aterm caffeine` is what that step needs again.
 fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let support = p.support();
     let listed = || -> Vec<PathBuf> {
@@ -533,19 +537,28 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<Pa
     if files.is_empty() && !login_plist {
         return Vec::new();
     }
+    let own_quit: &[&str] = &["caffeine", "quit", "own"];
     let steps: &[&[&str]] = if s.outsider.is_some() {
-        &[&["caffeine", "startup", "off"]]
+        &[&["caffeine", "startup", "off"], own_quit]
     } else {
         &[&["caffeine", "startup", "off"], &["caffeine", "quit"]]
     };
+    let mut helpers: Vec<(PathBuf, PathBuf)> = app_dirs
+        .iter()
+        .map(|dir| dir.join("aterm.app"))
+        .filter_map(|app| {
+            let aterm = app.join("Contents/MacOS/aterm");
+            (bundle_is_ours(&app) && crate::toolchain::is_executable_file(&aterm))
+                .then_some((app, aterm))
+        })
+        .collect();
+    let stored = p.store_dir.join("aterm");
+    if store_left(p).is_none() && store_entry_is_ours(&stored) {
+        helpers.push((stored.clone(), stored));
+    }
     let mut supported = false;
     let mut failed = Vec::new();
-    for dir in app_dirs {
-        let app = dir.join("aterm.app");
-        let aterm = app.join("Contents/MacOS/aterm");
-        if !bundle_is_ours(&app) || !crate::toolchain::is_executable_file(&aterm) {
-            continue;
-        }
+    for (app, aterm) in helpers {
         if s.dry {
             s.say(&format!(
                 "would ask {} help caffeine, then if supported:",
@@ -564,6 +577,9 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<Pa
             let line = format!("{} {}", aterm.display(), args.join(" "));
             match run_quietly(&aterm, args) {
                 0 => s.say(&format!("ran {line}")),
+                2 if *args == own_quit => s.say(&format!(
+                    "{line}: this build cannot quit only its own mug; one it runs keeps running"
+                )),
                 rc => {
                     if !failed.contains(&app) {
                         failed.push(app.clone());
@@ -620,11 +636,65 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<Pa
                 path.display()
             ));
             s.kept += 1;
+        } else if path == support.join(CAFFEINE_CODE) {
+            sweep_caffeine_code(s, &path, std::time::SystemTime::now());
         } else {
             s.rm_shared(&path, "Caffeine file");
         }
     }
     failed
+}
+
+/// Remove the mug's code directory `code` at `now` as the mug's own sweep does: all of it but
+/// a copy no mug said it ran from that is younger than the first-exec hang
+/// ([`aterm_uds::deadline::copy_may_go`]). Its mug was stopped before it said so, so macOS may
+/// still be assessing that copy's first exec, and on macOS 27.0.1 removing the file then
+/// crashes `syspolicyd`, stranding every exec on the host. Such a copy, and the directories
+/// holding it, stay, SKIPPED with when it may go: no aterm is left to remove it later.
+fn sweep_caffeine_code(s: &mut Sweep<'_>, code: &Path, now: std::time::SystemTime) {
+    let real_dir = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    let partial = |path: &Path| path.extension().is_some_and(|e| e == "partial");
+    let labels: Vec<PathBuf> = if real_dir(code) {
+        sorted_entries(code)
+    } else {
+        Vec::new()
+    };
+    let young = |copy: &Path| {
+        real_dir(copy) && !partial(copy) && !aterm_uds::deadline::copy_may_go(copy, now)
+    };
+    let holds_young = |label: &Path| {
+        real_dir(label) && !partial(label) && sorted_entries(label).iter().any(|c| young(c))
+    };
+    if !labels.iter().any(|label| holds_young(label)) {
+        s.rm_shared(code, "Caffeine file");
+        return;
+    }
+    for label in labels {
+        if !holds_young(&label) {
+            s.rm(&label, "Caffeine file");
+            continue;
+        }
+        for copy in sorted_entries(&label) {
+            // The keep rule's own reading of what is left: time awake since the exec.
+            let left = real_dir(&copy)
+                .then(|| aterm_uds::deadline::copy_wait_left(&copy, now))
+                .flatten()
+                .filter(|_| !partial(&copy));
+            let Some(left) = left else {
+                s.rm(&copy, "Caffeine copy");
+                continue;
+            };
+            s.skip(
+                &copy.display().to_string(),
+                &format!(
+                    "no Caffeine mug said it ran from this copy, so macOS may still be assessing \
+                     its first exec, and removing it now can crash syspolicyd; remove it by hand \
+                     once the Mac has been awake {} more minute(s)",
+                    left.as_secs().div_ceil(60).max(1)
+                ),
+            );
+        }
+    }
 }
 
 /// Hold the physical, owned regular rendezvous without waiting, made (`0600`) when no mug
@@ -864,8 +934,9 @@ pub fn self_uninstall(
     }
 
     // 3. The store the source and Linux lanes fill: only what store_entry_is_ours
-    //    recognises goes, and the directory with it only when it holds nothing else.
-    sweep_store(&mut s, p);
+    //    recognises goes, and the directory with it only when it holds nothing else. An
+    //    `aterm` whose Caffeine step failed stays, for that step.
+    sweep_store(&mut s, p, &caffeine_kept);
 
     // 4. Man pages — only names aterm ships (or the checkout handed in ships): the glob is
     //    no authorisation, `aterm*` pages that are not ours exist in the wild.
@@ -1041,34 +1112,70 @@ fn sorted_entries(dir: &Path) -> Vec<PathBuf> {
     names.into_iter().map(|n| dir.join(n)).collect()
 }
 
-/// Step 3 of [`self_uninstall`].
-fn sweep_store(s: &mut Sweep<'_>, p: &Places) {
+/// Why step 3 leaves the store as it is, when it does ([`sweep_store`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreLeft {
+    /// No directory is there.
+    Absent,
+    /// It is a PATH directory, not a store of its own.
+    PathDir,
+    /// It cannot be listed.
+    Unlisted,
+}
+
+/// Whether step 3 leaves the store as it is ([`StoreLeft`]); `None` when it sweeps it.
+fn store_left(p: &Places) -> Option<StoreLeft> {
     let store = &p.store_dir;
     if !store.is_dir() {
-        return;
+        Some(StoreLeft::Absent)
+    } else if p.bin_dirs().iter().any(|bd| same_file(store, bd)) {
+        Some(StoreLeft::PathDir)
+    } else if std::fs::read_dir(store).is_err() {
+        Some(StoreLeft::Unlisted)
+    } else {
+        None
     }
-    if p.bin_dirs().iter().any(|bd| same_file(store, bd)) {
-        s.skip(
-            &store.display().to_string(),
-            "it is the PATH directory itself, not a store of its own — nothing in it was \
-             removed as the store's (ATERM_STORE_DIR needs a directory of its own)",
-        );
-        return;
-    }
-    if std::fs::read_dir(store).is_err() {
-        s.skip(
-            &store.display().to_string(),
-            "cannot be listed, so what it holds cannot be judged — left in place",
-        );
-        return;
+}
+
+/// Step 3 of [`self_uninstall`]; an entry in `caffeine_kept` is kept ([`sweep_caffeine`]).
+fn sweep_store(s: &mut Sweep<'_>, p: &Places, caffeine_kept: &[PathBuf]) {
+    let store = &p.store_dir;
+    match store_left(p) {
+        None => {}
+        Some(StoreLeft::Absent) => return,
+        Some(StoreLeft::PathDir) => {
+            s.skip(
+                &store.display().to_string(),
+                "it is the PATH directory itself, not a store of its own — nothing in it was \
+                 removed as the store's (ATERM_STORE_DIR needs a directory of its own)",
+            );
+            return;
+        }
+        Some(StoreLeft::Unlisted) => {
+            s.skip(
+                &store.display().to_string(),
+                "cannot be listed, so what it holds cannot be judged — left in place",
+            );
+            return;
+        }
     }
     let (own, foreign): (Vec<PathBuf>, Vec<PathBuf>) = sorted_entries(store)
         .into_iter()
         .partition(|entry| store_entry_is_ours(entry));
+    let (kept, own): (Vec<PathBuf>, Vec<PathBuf>) = own
+        .into_iter()
+        .partition(|entry| caffeine_kept.contains(entry));
     let is_link = std::fs::symlink_metadata(store).is_ok_and(|m| m.file_type().is_symlink());
-    if foreign.is_empty() && !is_link {
+    if foreign.is_empty() && kept.is_empty() && !is_link {
         s.rm(store, "source-built toolset");
         return;
+    }
+    for entry in &kept {
+        s.skip(
+            &entry.display().to_string(),
+            "kept: its `aterm caffeine` is what stops the Caffeine mug, and that did not \
+             finish (above)",
+        );
     }
     // A symlinked store is the person's link: what it leads to that is ours goes.
     for entry in &own {

@@ -414,7 +414,134 @@ fn served_on_loopback_it_answers_as_the_modes_say_and_logs_each_request() {
         assert!(logged.contains(w), "{w:?} is not in the log:\n{logged}");
     }
     assert!(dir.join("dump/req-00001.json").is_file());
+    // a side call (no tools: Claude Code's `aux`) is dumped apart from the
+    // turns, under the same count (the mode file back at `ok`)
+    std::fs::write(&mode_file, "ok\n").unwrap();
+    let n = std::fs::read_dir(dir.join("dump")).unwrap().count() as u64;
+    let aux =
+        r#"{"model":"claude-x","max_tokens":32,"messages":[{"role":"user","content":"a title"}]}"#;
+    assert_eq!(post("/v1/messages", aux).status(), 200);
+    assert!(
+        dir.join(format!("dump/side-{:05}.json", n + 1)).is_file(),
+        "{:?}",
+        std::fs::read_dir(dir.join("dump"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !crate::stub::turn_dumps(&dir.join("dump"))
+            .iter()
+            .any(|(i, _)| *i == n + 1),
+        "the side call is no turn"
+    );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A SIDE CALL IS DUMPED APART FROM THE TURNS (`side-<n>.json`, `req-<n>.json`
+/// for a turn, one count over both), and the turns' reader reads `req-`
+/// alone, newest first: every kind the stub logs is a turn or a side call by
+/// [`is_side`]. NEGATIVE CONTROLS: each API's turn (`main`, `codex`, `muse`,
+/// `gemini`) and an unreadable body (`opaque`) stay turns.
+#[test]
+fn a_side_call_is_dumped_apart_from_the_turns() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let stub = Stub::new(Args {
+        dump_dir: Some(dir.path().to_path_buf()),
+        ..Args::default()
+    });
+    let kinds = [
+        ("main", false),
+        ("aux", true),
+        ("quota", true),
+        ("compact", true),
+        ("codex", false),
+        ("codex-json", true),
+        ("muse", false),
+        ("muse-json", true),
+        ("muse-side", true),
+        ("gemini", false),
+        ("gemini-json", true),
+        ("gemini-aux", true),
+        ("opaque", false),
+    ];
+    for (i, (kind, side)) in kinds.iter().enumerate() {
+        assert_eq!(is_side(kind), *side, "{kind}");
+        stub.dump(format!("body {i} {kind}").as_bytes(), kind);
+    }
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    let mut want: Vec<String> = kinds
+        .iter()
+        .enumerate()
+        .map(|(i, (_, side))| format!("{}{:05}.json", if *side { "side-" } else { "req-" }, i + 1))
+        .collect();
+    want.sort();
+    assert_eq!(names, want);
+    let turns: Vec<(u64, String)> = turn_dumps(dir.path())
+        .into_iter()
+        .map(|(n, p)| (n, std::fs::read_to_string(p).unwrap()))
+        .collect();
+    assert_eq!(
+        turns,
+        [
+            (13, "body 12 opaque".to_string()),
+            (10, "body 9 gemini".to_string()),
+            (7, "body 6 muse".to_string()),
+            (5, "body 4 codex".to_string()),
+            (1, "body 0 main".to_string()),
+        ]
+    );
+}
+
+/// ONLY THE NEWEST [`DUMPS_KEPT`] DUMPS STAY, turns and side calls alike:
+/// once the one count passes an old dump's index by [`DUMPS_KEPT`], that
+/// dump goes, whichever it was. NEGATIVE CONTROLS: a dump the count has not
+/// passed by that much stays, and so does each newer one.
+#[test]
+fn the_oldest_dumps_go_turns_and_side_calls_alike() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let stub = Stub::new(Args {
+        dump_dir: Some(dir.path().to_path_buf()),
+        ..Args::default()
+    });
+    stub.dump(b"a side call", "muse-side");
+    stub.dump(b"a turn", "main");
+    stub.dump(b"a side call", "aux");
+    let names = || {
+        let mut n: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        n.sort();
+        n
+    };
+    assert_eq!(
+        names(),
+        ["req-00002.json", "side-00001.json", "side-00003.json"]
+    );
+    // the count as if DUMPS_KEPT - 3 more had come between
+    stub.dumped.store(DUMPS_KEPT, Ordering::Relaxed);
+    stub.dump(b"a turn", "main");
+    let newest = format!("req-{:05}.json", DUMPS_KEPT + 1);
+    assert_eq!(
+        names(),
+        ["req-00002.json", newest.as_str(), "side-00003.json"],
+        "the side call #1 went"
+    );
+    stub.dump(b"a side call", "gemini-json");
+    let side = format!("side-{:05}.json", DUMPS_KEPT + 2);
+    assert_eq!(
+        names(),
+        [newest.as_str(), "side-00003.json", side.as_str()],
+        "the turn #2 went"
+    );
 }
 
 #[test]
@@ -1309,7 +1436,7 @@ fn requests_in_flight_together_are_each_dumped() {
             let (stub, gate) = (Arc::clone(&stub), Arc::clone(&gate));
             std::thread::spawn(move || {
                 gate.wait();
-                stub.dump(format!("body {i}").as_bytes());
+                stub.dump(format!("body {i}").as_bytes(), "main");
             })
         })
         .collect();
