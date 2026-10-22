@@ -613,7 +613,7 @@ parse_manifest_identity_fields() { # <manifest-text>
 OFFICIAL_REPO_SLUG="alabsystems/aterm"
 OFFICIAL_TEAM_ID="A66A9P66Z7"
 
-# One bare GitHub name segment (an owner OR a repo): the alphabet and bounds of
+# One bare GitHub name segment (an owner or a repo): the alphabet and bounds of
 # crates/aterm-update-core/src/source.rs `is_valid_slug`. In the C locale, as
 # the other validators here: under a glibc UTF-8 locale a bracket range follows
 # collation order, and [A-Za-z] matches é and fullwidth Ａ, which the updater
@@ -818,12 +818,10 @@ would_create_writable() {
 	[[ -d "$d" && -w "$d" ]]
 }
 
-# Destination pre-flight, shared by every half: create the dir(s) and prove
-# them writable. `mkdir -p` succeeds on an EXISTING unwritable dir, hence the
-# explicit -w pass. Under install-mode --dry-run — whose contract is ZERO
-# mutations — nothing is created: the verdict comes from would_create_writable
-# instead, so a dry run reports the same skip reasons the real run would hit
-# without manufacturing the directories along the way.
+# Destination pre-flight, shared by every half: create the dir(s) and prove them
+# writable (`mkdir -p` succeeds on an existing unwritable dir). Under
+# install-mode --dry-run nothing is created: would_create_writable gives the
+# verdict, so a dry run reports the skips the real run would hit.
 #
 # What it makes, it makes writable by this user alone: the caller's umask with
 # group and other write added. Ubuntu's user-private-group umask (002) would
@@ -1062,7 +1060,7 @@ elect_install_lane() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 # fetch.
 #
 # Read-only: no file is created, so the --dry-run zero-mutation contract holds.
-# One file's PHYSICAL path: symlinks followed hop by hop with readlink (the
+# One file's physical path: symlinks followed hop by hop with readlink (the
 # installer's floor is macOS's stock bash 3.2, and `realpath` is not on every
 # Mac), the directory spelled as getcwd() spells it. Empty, exit 1, when the
 # file does not exist.
@@ -3483,13 +3481,12 @@ install_cli() {
 	[[ "$LINUX_APP_INSTALLED" -eq 1 ]] || target="$(find_bundle_cli)"
 	if [[ "$LINUX_APP_INSTALLED" -eq 1 ]]; then
 		# The app half already landed the released Linux binary in the store and
-		# exposed the ONE `aterm` symlink (place_store_binary). Building from
-		# source here would silently replace that digest-verified release with
-		# an unverified dev build — only the trimmings below are left to do.
+		# exposed the `aterm` symlink (place_store_binary); a source build here
+		# would replace that verified release with an unverified dev build.
 		PLACED_ATERM="$STORE_DIR/aterm"
 	elif [[ -n "$target" ]]; then
 		PLACED_ATERM="$target"
-		# ONE name on PATH (the [workspace.metadata.atpkg] expose declaration):
+		# One name on PATH (the [workspace.metadata.atpkg] expose declaration):
 		# `aterm` alone — a symlink at the bundle's one binary (or, against a
 		# previous-generation bundle, its aterm-cli front door).
 		claim_bin_aterm || return 0
@@ -3513,10 +3510,8 @@ install_cli() {
 	fi
 	retire_exposed_siblings
 	setup_completions_and_man
-	# The hand-edit PATH hint is DEFERRED to the end of the run: printed here
-	# it told the user to edit the very profile wire_shell_path was about to
-	# edit for them (with a block that now carries $BIN_DIR). The final
-	# dispatch prints it only when no managed block exists.
+	# The hand-edit PATH hint waits for the end of the run, which prints it only
+	# when no managed PATH block exists (wire_shell_path edits that profile).
 	CLI_PATH_HINT_WANTED=1
 	INSTALLED_ANY=1
 }
