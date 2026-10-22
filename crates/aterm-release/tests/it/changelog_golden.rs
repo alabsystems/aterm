@@ -8,9 +8,7 @@
 
 use crate::changelog;
 
-// --------------------------------------------------------------------------
 // fixtures
-// --------------------------------------------------------------------------
 
 /// Real CHANGELOG.md entries (one with indented sub-bullets), and the header prose that
 /// sits outside any section.
@@ -101,9 +99,7 @@ const FIX_SMALL_ROLLED: &str = "\
 - old.
 ";
 
-// --------------------------------------------------------------------------
 // real_body goldens
-// --------------------------------------------------------------------------
 
 #[test]
 fn real_body_strips_comments_scaffolds_and_blanks() {
@@ -149,9 +145,7 @@ fn real_body_reads_a_dated_section_to_the_end_of_the_file() {
     );
 }
 
-// --------------------------------------------------------------------------
 // the pre-claim gate
-// --------------------------------------------------------------------------
 
 #[test]
 fn gate_passes_and_counts_top_level_bullets() {
@@ -253,9 +247,7 @@ fn gate_refuses_triple_quote_with_the_file_line_number() {
     assert!(changelog::gate_unreleased(elsewhere).is_ok());
 }
 
-// --------------------------------------------------------------------------
 // roll
-// --------------------------------------------------------------------------
 
 #[test]
 fn roll_matches_the_byte_exact_golden() {
@@ -277,9 +269,7 @@ fn roll_refuses_missing_unreleased_and_double_roll() {
     assert!(err.contains("already"), "{err}");
 }
 
-// --------------------------------------------------------------------------
 // extract (the verbatim body that ships in the manifest and release notes)
-// --------------------------------------------------------------------------
 
 #[test]
 fn rolled_body_extracts_verbatim_with_scaffolds_and_comments_kept() {
@@ -309,9 +299,7 @@ fn rolled_body_extracts_verbatim_with_scaffolds_and_comments_kept() {
     );
 }
 
-// --------------------------------------------------------------------------
 // odds and ends
-// --------------------------------------------------------------------------
 
 #[test]
 fn has_section_is_exact_about_versions() {

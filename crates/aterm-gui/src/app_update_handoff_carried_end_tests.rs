@@ -35,7 +35,7 @@ fn idle_host() -> crate::harness_host::HostHandle {
 }
 
 /// An App whose host supervises nothing and whose table's default is Land
-/// (`[harness] autopilot = "land"`): under FOREVER LAND only Land ends a
+/// (`[harness] autopilot = "land"`): under Autopilot Land only Land ends a
 /// task, and a session that follows the default keeps no user field (the
 /// review's R6).
 fn desk(host: &crate::harness_host::HostHandle) -> App {

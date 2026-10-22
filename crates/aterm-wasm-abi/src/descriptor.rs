@@ -326,9 +326,7 @@ pub const fn class_tag(name: &str) -> u32 {
     if h == 0 { 1 } else { h }
 }
 
-// ---------------------------------------------------------------------------
 // Decoding: what the generator reads.
-// ---------------------------------------------------------------------------
 
 /// A described type.
 #[derive(Clone, Debug, PartialEq, Eq)]

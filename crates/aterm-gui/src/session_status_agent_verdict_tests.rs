@@ -2387,3 +2387,137 @@ fn a_regrid_and_the_programs_repaint_are_no_text_move() {
         ("prompt", held.verdict_moves + 2)
     );
 }
+
+/// Claude Code 2.1.308's MEASURED split frame (the lab's cast, three tabs at once: aterm-core's
+/// `tests/fixtures/half-drawn/claude-2.1.308`, `docs/measured/half-drawn-frame-2026-10-22.md`).
+mod half_drawn {
+    pub(super) const BEFORE: &[u8] =
+        include_bytes!("../../aterm-core/tests/fixtures/half-drawn/claude-2.1.308/before.bin");
+    pub(super) const HALF: &[u8] =
+        include_bytes!("../../aterm-core/tests/fixtures/half-drawn/claude-2.1.308/half.bin");
+    pub(super) const REST: &[u8] =
+        include_bytes!("../../aterm-core/tests/fixtures/half-drawn/claude-2.1.308/rest.bin");
+    pub(super) const END: &[u8] =
+        include_bytes!("../../aterm-core/tests/fixtures/half-drawn/claude-2.1.308/end.bin");
+}
+
+fn feed(app: &App, sid: u64, bytes: &[u8]) {
+    let pooled = app.pool.get(sid).expect("pooled");
+    let mut t = crate::term_lock(&pooled.term);
+    if t.cols() != 144 || t.rows() != 50 {
+        t.resize(50, 144);
+    }
+    t.process(bytes);
+}
+
+/// THE AGENT VERDICT READS WHOLE FRAMES: the sweep never classifies the rows of a DEC 2026
+/// frame the program has not finished. Claude Code's measured split frame, its composer drawn
+/// and its busy footer not yet under it, holds the published `busy`, and the classifier is
+/// not called on it; the frame's close is read (busy), and the reply's real end is `idle`.
+/// NEGATIVE CONTROL (the defect): the same half frame's rows painted with no frame open are
+/// classified, and read `idle` mid-reply.
+#[test]
+fn the_verdict_never_reads_an_unfinished_frame() {
+    let (mut app, sid) = app_with_stub();
+    let step = Duration::from_millis(300);
+    let mut t = Instant::now();
+    feed(&app, sid, b"\x1b[H\x1b[2J\x1b[47;3H");
+    feed(&app, sid, half_drawn::BEFORE);
+    let _ = app.observe_session_statuses(t);
+    t += step;
+    let busy = published(&app, sid);
+    assert_eq!(busy.word, "busy", "the frame before the split");
+
+    feed(&app, sid, half_drawn::HALF);
+    let half_rows: Vec<String> = {
+        let pooled = app.pool.get(sid).expect("pooled");
+        let term = crate::term_lock(&pooled.term);
+        assert!(
+            term.sync_frame_unfinished(),
+            "the read ended inside the frame"
+        );
+        (0..50)
+            .map(|r| term.row_text(r).unwrap_or_default())
+            .collect()
+    };
+    let calls = crate::presence::classifier_calls();
+    let _ = app.observe_session_statuses(t);
+    t += step;
+    assert_eq!(crate::presence::classifier_calls(), calls, "not classified");
+    assert_eq!(
+        published(&app, sid).word,
+        "busy",
+        "the half frame is not read"
+    );
+
+    feed(&app, sid, half_drawn::REST);
+    let _ = app.observe_session_statuses(t);
+    t += step;
+    assert!(
+        crate::presence::classifier_calls() > calls,
+        "the close is read"
+    );
+    assert_eq!(published(&app, sid).word, "busy", "the whole frame is busy");
+
+    feed(&app, sid, half_drawn::END);
+    let _ = app.observe_session_statuses(t);
+    t += step;
+    assert_eq!(published(&app, sid).word, "idle", "the reply's end");
+
+    // NEGATIVE CONTROL: the half frame's rows with no frame open, at a fresh tab.
+    let (mut control, csid) = app_with_stub();
+    {
+        let pooled = control.pool.get(csid).expect("pooled");
+        let mut term = crate::term_lock(&pooled.term);
+        term.resize(50, 144);
+        let mut bytes = String::from("\x1b[H\x1b[2J");
+        for (i, row) in half_rows.iter().enumerate() {
+            bytes.push_str(&format!("\x1b[{};1H{}", i + 1, row.trim_end()));
+        }
+        // The cursor where the split read left it: the cut bottom rule's end.
+        bytes.push_str("\x1b[50;110H");
+        term.process(bytes.as_bytes());
+        assert!(!term.sync_frame_unfinished());
+    }
+    let _ = control.observe_session_statuses(t);
+    assert_eq!(
+        published(&control, csid).word,
+        "idle",
+        "the half frame, read, is idle mid-reply"
+    );
+}
+
+/// The verdict's hold on an unfinished frame is bounded by the frame's hang detector: the same
+/// measured half frame, its run of reads ending inside unfinished frames begun FRAME_HANG
+/// before the sweep, is read as it stands. MUTANT (the hold on the frame's level alone, with
+/// no hang detector): the classifier is never called and the verdict never moves again.
+#[test]
+fn the_verdict_reads_a_frame_past_its_hang_detector() {
+    let (mut app, sid) = app_with_stub();
+    let t = Instant::now();
+    feed(&app, sid, b"\x1b[H\x1b[2J\x1b[47;3H");
+    feed(&app, sid, half_drawn::BEFORE);
+    let _ = app.observe_session_statuses(t);
+    assert_eq!(published(&app, sid).word, "busy");
+    {
+        let pooled = app.pool.get(sid).expect("pooled");
+        let mut term = crate::term_lock(&pooled.term);
+        let begun = t
+            .checked_sub(aterm_core::terminal::FRAME_HANG)
+            .expect("an instant a minute back");
+        term.process_at(
+            half_drawn::HALF,
+            aterm_core::terminal::ClockReading {
+                monotonic: begun,
+                wall_ms: None,
+            },
+        );
+        assert!(term.sync_frame_unfinished());
+    }
+    let calls = crate::presence::classifier_calls();
+    let _ = app.observe_session_statuses(t + Duration::from_millis(300));
+    assert!(
+        crate::presence::classifier_calls() > calls,
+        "past its hang detector the frame is read as it stands"
+    );
+}

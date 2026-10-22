@@ -22,9 +22,8 @@ aterm-spec-macros = { workspace = true, optional = true }
 # re-exported as `aterm_spec::{registry, xref}` so there is one registry. Anchored
 # crates name the anchor attributes through `aterm_spec_anchor` itself.
 aterm-spec-anchor = { workspace = true }
-# The `ty` co-process protocol (`verify::ty_trace_verdict`'s `--cases` pool and
-# the `ty capabilities --json` probe) is one JSON object per line; first-party,
-# serde its only dependency (docs/design/TY-TRACE-CASES-AND-FAIL-CLOSED-2026-10-01.md §9.10).
+# The `ty` co-process protocol (`--cases`, `capabilities --json`) is one JSON object per line
+# (docs/design/TY-TRACE-CASES-AND-FAIL-CLOSED-2026-10-01.md §9.10).
 aterm-json.workspace = true
 # The pooled `ty --cases` co-process outlives its caller, so `spawnfd::command` spawns it with
 # stdio and nothing else inherited.

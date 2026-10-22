@@ -51,12 +51,10 @@ fn block_succeeds_only_on_zero_and_fails_on_any_other_exit_code() {
     assert!(block.failed());
 }
 
-// ========================================================================
 // Regression: u64::MAX overflow (#5715)
 //
 // Before the fix, `start + 1` wrapped to 0 when start == u64::MAX,
 // creating an inverted row range where start > end.
-// ========================================================================
 
 #[test]
 fn command_and_output_rows_saturate_at_u64_max() {

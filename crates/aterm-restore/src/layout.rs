@@ -58,9 +58,7 @@ pub const TAIL_CAP_V1: usize = 256 * 1024;
 /// v1 control slot capacity (increment 7's turn-ledger carry).
 pub const CTL_CAP_V1: usize = 64 * 1024;
 
-// ---------------------------------------------------------------------------
 // Header words: byte offsets of naturally aligned little-endian u64 words.
-// ---------------------------------------------------------------------------
 
 /// `b"ATRJ"`, the layout version, three zero bytes. Written last by the creator.
 pub const OFF_MAGIC: usize = 0;

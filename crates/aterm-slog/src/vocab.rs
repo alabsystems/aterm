@@ -696,9 +696,7 @@ impl Actor {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Word lists. Each is the closed vocabulary of a word-valued key.
-// ---------------------------------------------------------------------------
 
 /// The approval box kinds: `aterm_phase::PromptKind::name()`'s words, and
 /// Bash with the read-only verdict `prompt_detail` writes (§3.3), and the
@@ -886,7 +884,7 @@ pub const WORD_WORDS: &[&str] = &[
     "interrupt",
     "dispatch",
     // a self-supervising agent's landing (`aterm_agent::harness::acts::
-    // self_claim_act`: codex-alab's `landed@v1`, FOREVER LAND), written only
+    // self_claim_act`: codex-alab's `landed@v1`, Autopilot Land), written only
     // beside its `harness-act` row, never by `mark`
     "landed",
     // verdict
@@ -933,7 +931,7 @@ pub const WHY_WORDS: &[&str] = &[
     "unknown",
     // phase 5 (5C-1): what moved a worker's task (`task why=`), the closed
     // `aterm-gui` task vocabulary, held by `task_record`'s tests (T16).
-    // `landed` is FOREVER LAND's one `done` reason; `marker` and `done-check`
+    // `landed` is Autopilot Land's one `done` reason; `marker` and `done-check`
     // stay so an older build's lines still read.
     "landed",
     "marker",

@@ -125,19 +125,9 @@ pub trait ActionSink {
         final_byte: u8,
     );
 
-    /// A CSI sequence has been parsed (extended version with subparameter info).
-    ///
-    /// This method is called instead of `csi_dispatch` when subparameters are present.
-    /// The `subparam_mask` indicates which params were preceded by a colon (`:`)
-    /// rather than a semicolon (`;`), marking them as subparameters.
-    ///
-    /// # Parameters
-    /// - `params`: Numeric parameters
-    /// - `intermediates`: Intermediate bytes
-    /// - `final_byte`: The final byte
-    /// - `subparam_mask`: Bitmask where bit `i` is set if `params[i]` is a subparameter
-    ///
-    /// Default implementation calls `csi_dispatch`, ignoring subparam info.
+    /// A CSI sequence with colon subparameters has been parsed, in place of
+    /// `csi_dispatch`: bit `i` of `subparam_mask` is set if `params[i]` follows
+    /// a `:`. Default: `csi_dispatch`, ignoring the mask.
     #[inline]
     fn csi_dispatch_with_subparams(
         &mut self,
@@ -161,14 +151,9 @@ pub trait ActionSink {
     #[inline]
     fn osc_dispatch(&mut self, _params: &Provenance<[&[u8]], Pty>) {}
 
-    /// An OSC sequence has been parsed, with terminator type.
-    ///
-    /// `bel_terminated` is true when the OSC was ended by BEL (0x07),
-    /// false when ended by ST (ESC \\ or C1 0x9C). Response-generating
-    /// handlers (e.g., OSC 52 clipboard query) should echo the same
-    /// terminator in their response (#7548).
-    ///
-    /// Default delegates to `osc_dispatch` for backward compatibility.
+    /// An OSC sequence has been parsed. `bel_terminated`: BEL (0x07) ended it,
+    /// not ST; a handler that replies (an OSC 52 query) echoes the same
+    /// terminator. Default: `osc_dispatch`.
     #[inline]
     fn osc_dispatch_with_terminator(
         &mut self,
@@ -196,10 +181,8 @@ pub trait ActionSink {
     #[inline]
     fn dcs_put(&mut self, _byte: u8) {}
 
-    /// Bulk data bytes within a DCS sequence.
-    ///
-    /// Default falls back to per-byte `dcs_put`. Implementations can
-    /// override for better throughput on Sixel, tmux passthrough, etc.
+    /// Bulk data bytes within a DCS sequence (sixel, tmux passthrough).
+    /// Default: per-byte `dcs_put`.
     #[inline]
     fn dcs_put_bulk(&mut self, data: &Provenance<[u8], Pty>) {
         for &b in data.as_ref() {
@@ -233,11 +216,8 @@ pub trait ActionSink {
     #[inline]
     fn apc_put(&mut self, _byte: u8) {}
 
-    /// Bulk data bytes within an APC sequence.
-    ///
-    /// Default falls back to per-byte `apc_put`. Implementations can
-    /// override for better throughput on Kitty graphics payloads, which
-    /// stream multi-MB base64 through this path (kitten icat, chafa, timg).
+    /// Bulk data bytes within an APC sequence; kitty graphics streams multi-MB
+    /// base64 through it. Default: per-byte `apc_put`.
     #[inline]
     fn apc_put_bulk(&mut self, data: &Provenance<[u8], Pty>) {
         for &b in data.as_ref() {

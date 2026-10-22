@@ -41,9 +41,7 @@ use aterm_containment::consent::Folder;
 /// dropped final message.
 const RESULT_QUEUE_CAP: usize = 16;
 
-// ---------------------------------------------------------------------------
 // The pure fold: what one directory listing means
-// ---------------------------------------------------------------------------
 
 /// What one folder's listing attempt returned. `Failed` carries the raw errno: only
 /// [`fold_read_dir`] decides what it means.
@@ -124,9 +122,7 @@ pub(crate) const fn fold_read_dir(folder: Folder, outcome: ReadDirOutcome) -> Wa
     }
 }
 
-// ---------------------------------------------------------------------------
 // The injected listing probe
-// ---------------------------------------------------------------------------
 
 /// The one OS question this module asks, injected like every consent probe
 /// (`control_privacy::ConsentProbes`).
@@ -213,9 +209,7 @@ fn live_read_dir(_path: &Path) -> ReadDirOutcome {
     ReadDirOutcome::Refused
 }
 
-// ---------------------------------------------------------------------------
 // Worker → main-thread messages
-// ---------------------------------------------------------------------------
 
 /// One message from a warm-up worker.
 ///
@@ -279,9 +273,7 @@ impl StartOutcome {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The instance's warm-up state
-// ---------------------------------------------------------------------------
 
 /// The live pass's bookkeeping.
 #[derive(Clone, Copy, Debug)]
@@ -543,9 +535,7 @@ impl std::fmt::Debug for WarmupState {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Pure helpers
-// ---------------------------------------------------------------------------
 
 /// Whether a hold armed at `started_at` with cap `hold_cap` is still active at
 /// `now`. Saturating, so a clock that went backwards holds rather than panics,
@@ -577,9 +567,7 @@ fn folders_to_unknown_rows(folders: &[(Folder, PathBuf)]) -> Vec<(Folder, Warmup
         .collect()
 }
 
-// ---------------------------------------------------------------------------
 // The worker
-// ---------------------------------------------------------------------------
 
 /// Queue one message, dropped when the queue is full (never block, never coalesce), and poke
 /// the event loop either way: the drain discovers the messages and, at the end, the disconnect.
@@ -642,10 +630,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // The pure fold
-    // -----------------------------------------------------------------------
 
     /// Only the app-data item reads `ENOENT` as permission; `EPERM` and `EACCES` fold the same
     /// for every item.

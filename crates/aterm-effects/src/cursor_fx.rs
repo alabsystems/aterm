@@ -258,14 +258,9 @@ pub const fn momentum_glow_allowed(
 /// Who owns the block cursor's body this frame and the colour they built it
 /// from: the reading behind `trail status`'s `block_fill=…` fields.
 ///
-/// A body effect's fill becomes `RenderInput::cursor_fill_override`, which
-/// `draw_cursor` and its GPU twin apply instead of `frame_cursor(input)`, so
-/// while it is `Some` the caret is not the terminal's cursor colour.
-///
-/// Two colours: `fill` is what the override carried to the renderer; `base` is
-/// what the host handed that owner to build from (the resolved cursor or trail
-/// colour, per [`BlockFillOwner::base_from`]; `None` for owners whose style is
-/// their colour). A body that ignores its base shows as the two disagreeing.
+/// `fill` is what the override carried; `base` is what the host handed that
+/// owner ([`BlockFillOwner::base_from`]; `None` for owners whose style is their
+/// colour). A body that ignores its base shows as the two disagreeing.
 #[inline]
 #[must_use]
 pub const fn resolve_block_fill(
@@ -678,7 +673,7 @@ pub const fn default_trail_intensity(style: Option<GlowStyle>, classic_mono: boo
     }
 }
 
-/// A non-finite knob is OFF, never NaN in the engine; a finite one clamps.
+/// A non-finite knob is off, never NaN in the engine; a finite one clamps.
 #[inline]
 const fn finite_clamp_or_off(value: f32, min: f32, max: f32) -> f32 {
     if value.is_finite() {
@@ -1651,8 +1646,8 @@ impl CursorFx {
             floor_block_fill(owned, ground, f.live_cursor, pinned_base)
         });
         let block_fill = project_block_fill(candidate, f.live_cursor, f.shed_envelope);
-        // The opaque replacement channel's FINAL RGB must move the repaint key
-        // even when an engine's raw fill rounded to the same adjacent sample.
+        // The final caret RGB must move the repaint key even when an engine's
+        // raw fill rounded to the same adjacent sample.
         let glow_fp = block_fill.map_or(glow_fp, |owned| {
             glow_fp
                 .wrapping_mul(1_000_003)

@@ -108,9 +108,7 @@ const KEY_DOMAIN: &[u8] = b"aterm-account-v1";
 /// The digest bytes a key keeps: twelve hex digits.
 const KEY_BYTES: usize = 6;
 
-// ---------------------------------------------------------------------------
 // The key
-// ---------------------------------------------------------------------------
 
 /// ONE ACCOUNT'S KEY, the same on every machine and holding no secret
 /// (design §3.1): `<c|x>-` and the first twelve hex digits of
@@ -205,9 +203,7 @@ impl fmt::Debug for AccountKey {
     }
 }
 
-// ---------------------------------------------------------------------------
 // What is answered
-// ---------------------------------------------------------------------------
 
 /// A WORD FROM THE VENDOR'S FILE: kept only when it is 1 to [`WORD_MAX`]
 /// bytes of printable ASCII, so nothing kept from the file can carry an
@@ -588,9 +584,7 @@ impl NoProfile {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Where, and the read
-// ---------------------------------------------------------------------------
 
 /// THE PROFILE CLAUDE CODE KEEPS FOR THE HOME a process's environment names
 /// — its raw `CLAUDE_CONFIG_DIR` (`config`, `None` unset) and its raw
@@ -1780,9 +1774,7 @@ pub fn instant(text: &str) -> Option<i64> {
     Some(at - sign * (hours * 3600 + minutes * 60))
 }
 
-// ---------------------------------------------------------------------------
 // The typed reader: the allowlist's shapes, every leaf lenient
-// ---------------------------------------------------------------------------
 
 /// A MODEL FAMILY'S NAME as a key or a flag spells it (`Fable`, `nimbus`),
 /// lowercased: letters alone, at most 32 — an id (digits, hyphens) is none.

@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A foreground process whose first argv lookup misses still gets named on a
-//! static screen. The GUI's StatusObserver is the Tier-1 binding.
+//! A foreground process whose first argv lookup misses still gets named on a static screen.
+//! The GUI's StatusObserver is the Tier-1 binding.
 
 use aterm_spec::derive::*;
 
-/// One foreground group and its two bounded naming schedules. `attempts`
-/// projects the real saturating unknown-name counter (1 = 250 ms, 2 = 1 s,
-/// 3 = 5 s); `Elapse` abstracts passage of the current deadline, and `Decide`
-/// is the GUI's unknown-name `program_due` guard. A Claude name disarms both
-/// timers. A transient shell name instead owns one short confirmation; after
-/// that, a later single screen move owns a delayed recheck even when the
-/// screen becomes static. `Buggy=1` restores the missing timers and
-/// same-generation rejection that stranded Claude's approval screen.
+/// One foreground group and its two bounded naming schedules. `attempts` projects the real
+/// saturating unknown-name counter (1 = 250 ms, 2 = 1 s, 3 = 5 s); `Elapse` abstracts the
+/// current deadline passing, and `Decide` is the GUI's unknown-name `program_due` guard. A
+/// Claude name disarms both timers. A transient shell name owns one short confirmation; after
+/// that, a later single screen move owns a delayed recheck even when the screen goes static.
+/// `Buggy=1` drops the timers and rejects same-generation retries, stranding a Claude approval
+/// screen unnamed.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn program_resolution_retry_model() -> Model {

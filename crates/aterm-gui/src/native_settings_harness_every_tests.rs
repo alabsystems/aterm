@@ -805,7 +805,7 @@ fn the_every_rows_open_timer_shows_its_last_choice_to_a_press_and_to_the_keyboar
                 let Some(AppViewState::Settings(settings)) = runtime.view_state_mut(view) else {
                     unreachable!()
                 };
-                settings.page_scroll = page;
+                settings.scroll_page_to(page);
                 settings.page_reveal = None;
                 settings.drop_list_nudge();
             };
@@ -941,7 +941,7 @@ fn a_timer_closed_gives_back_the_place_its_opening_scrolled() {
                     else {
                         unreachable!()
                     };
-                    settings.page_scroll = page;
+                    settings.scroll_page_to(page);
                     settings.page_reveal = None;
                     settings.drop_list_nudge();
                     let shown = compile_settings_view(&runtime, instance, view, &cx);
@@ -1106,7 +1106,7 @@ fn an_open_timers_choices_show_together_and_with_its_button() {
                 let Some(AppViewState::Settings(settings)) = runtime.view_state_mut(view) else {
                     unreachable!()
                 };
-                settings.page_scroll = page;
+                settings.scroll_page_to(page);
                 settings.page_reveal = None;
                 settings.drop_list_nudge();
                 let shown = compile_settings_view(&runtime, instance, view, &cx);

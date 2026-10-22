@@ -363,7 +363,7 @@ mod tests {
         let formulae = vec![
             formula("zlib-ng", ":any_skip_relocation", &[]),
             formula("tool", ":any_skip_relocation", &["zlib-ng"]),
-            formula("openssl", ":any", &[]),
+            formula("openssl", "/opt/homebrew/Cellar", &[]),
             formula("curl-ish", ":any_skip_relocation", &["openssl"]),
             with(
                 formula("old", ":any_skip_relocation", &[]),
@@ -375,7 +375,7 @@ mod tests {
                 "requirements",
                 aterm_json::json!([{"name": "macos", "version": "30", "contexts": [], "specs": ["stable"]}]),
             ),
-            formula("libgit", ":any", &[]),
+            formula("libgit", "/opt/homebrew/Cellar", &[]),
             formula("client", ":any_skip_relocation", &["openssl", "libgit"]),
         ];
         let casks = vec![
@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(
             census.solo.refusals,
             BTreeMap::from([
-                ("<name> needs its Homebrew build/relocation recipe (its bottle relocates: cellar :any)".to_string(), (2, 2)),
+                ("<name> needs its Homebrew build/relocation recipe (its bottle relocates: cellar /opt/homebrew/Cellar)".to_string(), (2, 2)),
                 ("<name> needs a newer macOS".to_string(), (1, 1)),
                 ("abrew: <name> is disabled upstream".to_string(), (1, 1)),
             ])
@@ -423,11 +423,11 @@ mod tests {
             census.closure.refusals,
             BTreeMap::from([
                 (
-                    "openssl needs its Homebrew build/relocation recipe (its bottle relocates: cellar :any)".to_string(),
+                    "openssl needs its Homebrew build/relocation recipe (its bottle relocates: cellar /opt/homebrew/Cellar)".to_string(),
                     (2, 1)
                 ),
                 (
-                    "libgit needs its Homebrew build/relocation recipe (its bottle relocates: cellar :any)".to_string(),
+                    "libgit needs its Homebrew build/relocation recipe (its bottle relocates: cellar /opt/homebrew/Cellar)".to_string(),
                     (1, 0)
                 ),
             ])
@@ -447,7 +447,7 @@ mod tests {
                     1
                 ),
                 (
-                    "openssl needs its Homebrew build/relocation recipe (its bottle relocates: cellar :any)",
+                    "openssl needs its Homebrew build/relocation recipe (its bottle relocates: cellar /opt/homebrew/Cellar)",
                     1,
                     1
                 ),
@@ -459,7 +459,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("  admitted solo, refused with closure: 2\n   openssl needs its Homebrew build/relocation recipe (its bottle relocates: cellar :any): 2 (1 alone)\n"),
+            text.contains("  admitted solo, refused with closure: 2\n   openssl needs its Homebrew build/relocation recipe (its bottle relocates: cellar /opt/homebrew/Cellar): 2 (1 alone)\n"),
             "{text}"
         );
         assert!(text.contains("casks: 2/4 (50.0%)\n"), "{text}");

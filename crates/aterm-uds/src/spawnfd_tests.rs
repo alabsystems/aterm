@@ -302,9 +302,7 @@ pub(super) fn raise_soft_limit(want: u64) -> u64 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The lanes, end to end
-// ---------------------------------------------------------------------------
 
 /// The lane child inherits its two lanes and nothing else above stdio. An
 /// unflagged descriptor of this process (from 64 up) must not reach it, while
@@ -324,9 +322,7 @@ fn the_two_fd_child_inherits_nothing_but_its_two_lanes() {
     assert_eq!(got, "got:hello:clear");
 }
 
-// ---------------------------------------------------------------------------
 // Lane placement: the collisions, staged in a fresh table
-// ---------------------------------------------------------------------------
 
 /// Where the high stage puts the verb source: Darwin's `OPEN_MAX`, the first
 /// number a file action may not name.
@@ -453,9 +449,7 @@ fn off_the_targets_moves_only_what_a_file_action_cannot_take() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The handle: exec failures, reaping, kill
-// ---------------------------------------------------------------------------
 
 fn lanes() -> (OwnedFd, OwnedFd) {
     let (_, a) = UnixStream::pair().expect("socketpair");
@@ -677,9 +671,7 @@ fn a_helper_spawned_without_lanes_holds_its_stdio_and_nothing_else() {
     assert_eq!(got.trim_end(), "end");
 }
 
-// ---------------------------------------------------------------------------
 // Above 65,536, and racing the spawn
-// ---------------------------------------------------------------------------
 
 /// A 65,536 ceiling below Darwin's `kern.maxfilesperproc`.
 const OLD_CAP: RawFd = 65_536;
@@ -901,9 +893,7 @@ fn no_descriptor_reaches_a_lane_child_while_another_thread_races_the_spawn() {
     print!("{out}");
 }
 
-// ---------------------------------------------------------------------------
 // The strip and its bound
-// ---------------------------------------------------------------------------
 
 /// A stripped child inherits nothing above stdio. A descriptor this process
 /// holds without close-on-exec rides a leaky spawn (the control) and not a
@@ -1021,9 +1011,7 @@ fn the_darwin_strip_lists_the_table_and_probes_only_past_a_full_listing() {
     assert!(out.contains("STAGED listing ok"), "{out}");
 }
 
-// ---------------------------------------------------------------------------
 // libSystem's fork child handler
-// ---------------------------------------------------------------------------
 
 /// libnotify's once-gate, read where libSystem keeps it: `_os_alloc_once_table`
 /// (exported by libsystem_kernel, `<os/alloc_once_private.h>`), one

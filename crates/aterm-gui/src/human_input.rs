@@ -73,7 +73,7 @@
 //! ([`HumanInputStamp::counts`]).
 //!
 //! **Across a seamless update** ([`HumanInputStamp::carry`], LC-4 of
-//! ATERM-KI-1016-1): the clock is this process's, so the stamp itself cannot
+//! ): the clock is this process's, so the stamp itself cannot
 //! cross. The outgoing process writes each session's age at its Commit's
 //! write — after the last input it dispatches, so a key typed in the overlap
 //! is in it ([`crate::App::write_person_stamps_at_commit`]) — and the
@@ -102,10 +102,9 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use crate::input::InputEvent;
 
-/// When a person last gave this session input — [`crate::metrics::now_us`]
-/// plus one (so `0` stays "never"), or `0` when no person ever has since the
-/// session started in this process — and how many gestures that has been
-/// ([`Self::seq`]). Lives on [`crate::SessionCtx`].
+/// When a person last gave this session input ([`crate::metrics::now_us`] plus one, so `0` is
+/// "never" in this process) and how many gestures that has been ([`Self::seq`]). Lives on
+/// [`crate::SessionCtx`].
 #[derive(Debug)]
 pub(crate) struct HumanInputStamp {
     at: AtomicU64,
@@ -271,12 +270,9 @@ impl HumanInputStamp {
         reaches: bool,
         between: impl FnOnce(),
     ) -> Noted {
-        // THE STAMP BEFORE THE COUNT, the count's add a Release and
-        // [`Self::seq`]'s load an Acquire: a reader that sees this gesture
-        // counted sees its stamp too. Counted first (as it was until
-        // 2026-09-29), a read landing between the two stores paired the new
-        // count with the OLD age — "quiet" — and a key fenced on that count
-        // passed the fence the gesture should have moved.
+        // The stamp before the count, the add Release and `seq`'s load Acquire: a reader that
+        // sees this gesture counted sees its stamp too, so a key fenced on that count cannot
+        // pass on a stale "quiet" age.
         let before = self.at.swap(now_us.saturating_add(1), Ordering::Relaxed);
         if let Some(ms) = aterm_uds::process::continuous_ms() {
             self.at_continuous
@@ -696,7 +692,7 @@ mod tests {
     }
 
     /// A CARRIED STAMP READS ITS AGE ON, AND A GESTURE HERE TAKES OVER (LC-4
-    /// of ATERM-KI-1016-1): carried 90 s old, the session reads 90 s at the
+    /// of ): carried 90 s old, the session reads 90 s at the
     /// carry and 100 s ten seconds on — never "never" — with its count still
     /// this process's; a gesture here then reads from itself.
     #[test]
@@ -829,7 +825,7 @@ mod tests {
         );
     }
 
-    /// THE PERSON'S STAMPS CROSS A SEAMLESS UPDATE (LC-4 of ATERM-KI-1016-1):
+    /// THE PERSON'S STAMPS CROSS A SEAMLESS UPDATE (LC-4 of ):
     /// the outgoing process writes, for the sessions it hands over, the age
     /// of each one's last person's gesture — a stamp it carried itself from
     /// an earlier update included — and for a session nobody keyed, how long

@@ -443,9 +443,7 @@ pub fn resolve_rm_line(cmd: &str, scope: &RmScope<'_>) -> Result<Vec<String>, St
     Ok(ev.targets)
 }
 
-// ---------------------------------------------------------------------------
 // Lexing: words made of literal, variable and substitution parts
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Part {
@@ -879,9 +877,7 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
     Ok(lx.toks)
 }
 
-// ---------------------------------------------------------------------------
 // Simple commands, in order, with the operators on either side
-// ---------------------------------------------------------------------------
 
 struct Cmd {
     words: Vec<Word>,
@@ -952,9 +948,7 @@ fn commands(toks: Vec<Tok>) -> Result<Vec<Cmd>, String> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
 // Straight-line evaluation
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Val {

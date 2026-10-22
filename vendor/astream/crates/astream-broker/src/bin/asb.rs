@@ -249,8 +249,9 @@ use astream_broker::{
 // `cap` feature — yet it still reads `--cap-file` (a malformed line is
 // exit 2 naming file:line in every build; only the attach needs the MAC), and
 // still holds a `--key-file` to the owner-only rule. So it compiles that module's
-// std-only source file in by path, rather than keeping a second reader (or a
-// second secret-file rule, which this binary did) that could drift from the first.
+// source file (std and astream-sys only) in by path, rather than keeping a second
+// reader (or a second secret-file rule, which this binary did) that could drift from
+// the first.
 #[cfg(feature = "cap")]
 use astream_cap::capfile;
 #[cfg(not(feature = "cap"))]

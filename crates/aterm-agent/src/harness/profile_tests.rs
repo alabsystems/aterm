@@ -573,9 +573,7 @@ fn word(text: &str) -> Option<Word> {
     Word::new(text)
 }
 
-// ---------------------------------------------------------------------------
 // The allowlist
-// ---------------------------------------------------------------------------
 
 /// Every allowlisted field of a whole composed profile reads, in aterm's
 /// words.
@@ -945,9 +943,7 @@ fn a_cached_body_of_another_account_is_dropped() {
     assert_eq!(parsed(&composed()).usage_of_another_at, None);
 }
 
-// ---------------------------------------------------------------------------
 // The Fable plan answer
-// ---------------------------------------------------------------------------
 
 fn fable_of(plan: &str, seat: &str, features: Value) -> FablePlan {
     fable_at(plan, seat, "default_claude_max_5x", features)
@@ -1176,9 +1172,7 @@ fn the_fable_plan_answer_is_decided_in_claude_codes_order() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The key
-// ---------------------------------------------------------------------------
 
 /// The key is design §3.1's hash, computed here independently: one id gives
 /// one key wherever it is read, the agent is in the hash, and the id is in
@@ -1224,9 +1218,7 @@ fn the_key_is_the_designs_hash_of_the_id() {
     assert_eq!(AccountKey::claude(&"a".repeat(129)), None);
 }
 
-// ---------------------------------------------------------------------------
 // Instants
-// ---------------------------------------------------------------------------
 
 /// Every instant shape the vendor writes: UTC with and without a fraction,
 /// an offset applied, a bare date at midnight UTC; anything else none.
@@ -1251,9 +1243,7 @@ fn instants_read_in_every_shape_the_vendor_writes() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Where, and the read
-// ---------------------------------------------------------------------------
 
 /// The profile's path is aterm's home rule: beside the user's own
 /// `~/.claude` with no `CLAUDE_CONFIG_DIR`, inside any set one — the user's

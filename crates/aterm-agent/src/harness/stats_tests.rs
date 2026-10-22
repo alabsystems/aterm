@@ -2565,7 +2565,7 @@ fn a_burst_stays_separate_across_the_whole_timestamp_domain() {
 }
 
 /// THE WORKER'S NEEDS ON THE PERSON'S SCREEN ARE COUNTED APART (FOREVER
-/// CRUISE / FOREVER LAND): a `NEEDS` line whose entry went up
+/// CRUISE / Autopilot Land): a `NEEDS` line whose entry went up
 /// (`attention=OK`) is a need told ([`HarnessStats::needs_told`]) — never an
 /// escalation, never a person's wait — and its `CLEARED … needs` closes no
 /// badge's wait. NEGATIVE CONTROLS: a refused set (`attention=ERR …`) and a

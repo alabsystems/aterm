@@ -3,61 +3,27 @@
 
 //! **The recoveries the design names actually run.**
 //!
-//! §6.2's refill covers sessions an instance already hosts when the bridge
-//! starts, not only ones it learns of later. The feed retry's budget is time,
-//! not a count of scheduler rounds, so a keystroke refused cleanly for two
-//! seconds is retried, not published as unknowable. §6.6 row 5's mirror is
-//! withdrawn, and the lease renewal does not take the mirror the handoff table
-//! refuses. A `control` claim moves the keyboard only once the row it travels
-//! on can no longer be refused.
-//!
-//! Every assertion here is an `until` over something the fabric PUBLISHES, and
-//! every induced condition is opened and closed from INSIDE the bridge under
-//! `$ATERM_LINK_FAULT` — a marker file the test creates and removes — rather
-//! than raced from outside.
+//! Every assertion is an `until` over something the fabric publishes, and every
+//! induced condition is opened and closed from inside the bridge under
+//! `$ATERM_LINK_FAULT` (a marker file the test creates and removes).
 
 use crate::harness;
 
 use harness::{FLEET, World, until};
 
-/// The `msg` row ids and texts a session's ring holds, `--peek` so nothing is
-/// listed or marked by looking.
+/// A session's `msg` rows, `--peek` so looking marks nothing.
 fn rows(w: &World, sid: &str) -> Vec<String> {
     w.inbox(sid)
 }
 
-/// **THE FLEET FACE RESUMES FROM ITS LAST RECORD, NOT FROM OFFSET ZERO.**
+/// The fleet face resumes from its last record, not from offset zero.
 ///
-/// The fleet face is a last-value face: `on_fleet_record` keeps only
-/// `fleet/h-*/halt`, and the standing verdict is the newest row per human. The
-/// attach already reads exactly that with a `Last` walk and REBUILDS the halt
-/// table from it (`read_fleet_halts` → `apply_fleet_halts`). Subscribing from
-/// zero afterwards re-delivered every halt record ever published, to re-derive
-/// the state that read had just derived.
-///
-/// HOW THIS TEST SEES IT — and the answer is worse than the wasted work.
-///
-/// The replay is not merely redundant, it is briefly WRONG. `on_fleet_record`
-/// applies each halt as it arrives, so a from-zero resume walks the fleet's
-/// history re-applying every barrier it ever carried: the first `state=on` in
-/// the log HOLDS every session on this instance, and they stay held until the
-/// replay reaches the matching `off`. `apply_fleet_halts` had already computed
-/// the correct standing verdict from the `Last` read moments earlier, so the
-/// hold this produces is one nothing on the bus justifies. Measured here: with
-/// the from-zero subscribe restored, the assertion that fails FIRST is not the
-/// ack count below but `hold=0` immediately after the restart — the session
-/// was held, by a barrier that had been lifted three records ago.
-///
-/// The second assertion is the ack count. Deleting `halt-acked` leaves the
-/// node where a halt published while its bridge was away leaves it: the newest
-/// standing row is above the watermark. The attach answers THAT row, once —
-/// the face resumes from the read's mark, so the tail never will — and a
-/// from-zero resume would re-answer every barrier in the history besides. So
-/// the ack face grows by exactly two: the standing row, then the fresh barrier.
-///
-/// It also pins the half that must NOT change: the standing verdict after the
-/// restart is still the newest row's, and a halt published while the bridge
-/// was away still arrives.
+/// The attach rebuilds the halt table from a `Last` walk (`read_fleet_halts` →
+/// `apply_fleet_halts`); a from-zero subscription afterwards would re-apply every
+/// halt in the history, holding every session from the first `state=on` until the
+/// replay reached its `off`. With `halt-acked` deleted, the node stands where a halt
+/// published while its bridge was away leaves it: the attach answers the standing
+/// row once, so the ack face grows by exactly two (that row, then a fresh barrier).
 #[test]
 fn the_fleet_face_resumes_from_its_last_record_and_does_not_re_answer_history() {
     let w = World::boot("r21fleetresume", &[]);
@@ -68,7 +34,7 @@ fn the_fleet_face_resumes_from_its_last_record_and_does_not_re_answer_history() 
     let subject = format!("/f/{FLEET}/fleet/h-x/halt");
     let ack = format!("/f/{FLEET}/pub/{}/node/ack", w.node);
 
-    // A HISTORY WORTH REPLAYING: four barriers, ending lifted.
+    // A history worth replaying: four barriers, ending lifted.
     let mut seq = 0;
     let mut offsets: Vec<u64> = Vec::new();
     for (state, want_hold) in [("on", true), ("off", false), ("on", true), ("off", false)] {
@@ -99,12 +65,9 @@ fn the_fleet_face_resumes_from_its_last_record_and_does_not_re_answer_history() 
             .map(|(o, _, b)| format!("@{o} {}", String::from_utf8_lossy(b)))
             .collect()
     };
-    // WAIT FOR THE NODE TO ANSWER THE LAST BARRIER BEFORE TAKING THE BASELINE.
-    // `on_fleet_record` applies the halt and THEN publishes the ack, so
-    // `hold=0` becomes visible one publish before the ack does; a baseline read
-    // in that gap undercounts by one and the comparison below then blames the
-    // resume for an ack the bridge was always going to write. Measured as a
-    // flake before this wait was added.
+    // Wait for the node to answer the last barrier before the baseline:
+    // `on_fleet_record` applies the halt, then publishes the ack, so `hold=0` shows
+    // one publish early.
     let last_barrier = *offsets.last().expect("four barriers were published");
     until("the node to answer the last barrier", || {
         ack_bodies(&w)
@@ -119,27 +82,21 @@ fn the_fleet_face_resumes_from_its_last_record_and_does_not_re_answer_history() 
         "the node answered the barriers while it was up: {before_bodies:#?}"
     );
 
-    // AND FOR ITS WATERMARK. `ack_halt` writes `halt-acked` only once the
-    // ack's publish has returned, so the ack is on the bus a moment before the
-    // file says so; a removal in that gap is undone by the old bridge, and the
-    // restart then answers nothing (measured as a flake under a loaded suite).
+    // And for its watermark: `ack_halt` writes `halt-acked` only once the ack's
+    // publish returned, and a removal in that gap would be undone by the old bridge.
     until("the node to record the last barrier as answered", || {
         let have = std::fs::read_to_string(w.state.join("halt-acked")).ok()?;
         (have.trim().parse::<u64>().ok()? >= last_barrier).then_some(())
     });
 
-    // REMOVE THE SUPPRESSOR. Nothing else changes; the node now stands where a
-    // halt published while its bridge was away leaves it, its newest standing
-    // row above what it has answered, so the attach answers that row once.
+    // Remove the suppressor: the newest standing row is now above what the node has
+    // answered, so the attach answers it once.
     std::fs::remove_file(w.state.join("halt-acked")).expect("drop the halt-acked watermark");
 
     w.restart_bridge();
 
-    // NO SESSION IS HELD BY A BARRIER THAT WAS LIFTED. This is the assertion
-    // the from-zero resume actually fails: the replay re-applies the history's
-    // first `state=on` and the session is held until the walk reaches the `off`
-    // that lifted it. Read immediately after the attach, with no settling
-    // wait, because the window is the defect.
+    // No session is held by a lifted barrier. Read right after the attach, with no
+    // settling wait: the window is the defect.
     assert!(
         w.verb(&format!("@{a} status")).header().contains("hold=0"),
         "a lifted halt must not be re-applied by a reconnect replaying the \
@@ -147,8 +104,8 @@ fn the_fleet_face_resumes_from_its_last_record_and_does_not_re_answer_history() 
         w.log_tail()
     );
 
-    // A BARRIER PUBLISHED AFTER THE SNAPSHOT STILL ARRIVES: the mark is a
-    // splice, not a truncation.
+    // A barrier published after the snapshot still arrives: the mark is a splice,
+    // not a truncation.
     let (fresh, _) = god
         .publish(5_000, seq + 1, &subject, b"v=1 t=1 state=on reason=after")
         .expect("publish after the restart");
@@ -159,10 +116,9 @@ fn the_fleet_face_resumes_from_its_last_record_and_does_not_re_answer_history() 
             .then_some(())
     });
 
-    // AND THE ACK FACE GREW BY EXACTLY TWO, in this order: the attach answered
-    // the standing row before its fleet subscription opened, and the tail
-    // answered the fresh barrier. Both are publishes on the one publisher
-    // connection, so the order is the log's.
+    // And the ack face grew by exactly two, in log order on the one publisher
+    // connection: the attach answered the standing row before its fleet subscription
+    // opened, then the tail answered the fresh barrier.
     until("the node to answer the fresh barrier", || {
         ack_bodies(&w)
             .iter()
@@ -184,40 +140,24 @@ fn the_fleet_face_resumes_from_its_last_record_and_does_not_re_answer_history() 
     );
 }
 
-/// **§6.2's REFILL RUNS FOR A SESSION THAT ALREADY EXISTED.**
+/// §6.2's refill runs for a session that already existed when the bridge started.
 ///
-/// `Bridge::refill` had exactly two triggers and both iterate the sids
-/// `refresh_sessions` NEWLY inserted — and `Bridge::run` opened by calling
-/// `refresh_sessions` into `let _`, so by the time either trigger could fire,
-/// every session the instance hosts had already been inserted and neither one
-/// ever named it again. aterm's `sessions` push stream reports a
-/// `session-created` only for a session that appears after the subscription, so
-/// no event arrived for them either. The refill's own doc (`cmd_deliver`, in
-/// `fabric.rs`) promises re-delivery "on every `session-created` and on the
-/// roster tick"; the roster half was unreachable for precisely the sessions it
-/// was written for — a seamless update preserves the sid, the endpoint's ring
-/// starts empty, and the durable group cursor is already committed past every
-/// row.
-///
-/// THE ROW THIS RECOVERS IS ONE THE ENDPOINT NEVER TOOK. A 65th message from
-/// one peer is refused `ERR quota` at `deliver` — accounted for, so the group
-/// cursor commits straight past it — while the session's HANDLED watermark
-/// stays at the 64th. That is the state the refill exists to repair: a row on
-/// the log, above `seen`, that no live subscription will ever offer again.
-///
-/// AND THE REFILL RE-OFFERS ROWS THE RING ALREADY HOLDS, safely. The handled
-/// watermark is put at the 32nd row, so the restart's refill walks rows 33 to
-/// 65: thirty-two the ring holds, then the one it never took. A refill
-/// delivers in offset order, so the 65th's arrival is the barrier — every held
-/// row has been re-offered before it — and each still appears once, because
-/// `deliver` is idempotent on the bus `off=`.
+/// The refill must cover the sessions the first roster read inserts: aterm's
+/// `sessions` push reports `session-created` only for sessions that appear later,
+/// and after a seamless update the sid is kept, the endpoint's ring starts empty, and
+/// the group cursor is already past every row. The row recovered here is one the
+/// endpoint never took: a 65th message from one peer, refused `ERR quota` (accounted
+/// for, so the cursor commits past it) while the handled watermark stays below. With
+/// the watermark at the 32nd row the refill walks rows 33 to 65 in offset order, so
+/// the 65th's arrival is the barrier, and each row still appears once (`deliver` is
+/// idempotent on `off=`).
 #[test]
 fn a_session_that_existed_when_the_bridge_started_is_still_refilled() {
     let w = World::boot("r3refill", &[]);
     w.wait_ready();
     let (a, _b) = w.two_sessions();
 
-    // SENDER_QUOTA is 64 UNLISTED rows per peer; the 65th is refused.
+    // `SENDER_QUOTA` is 64 unlisted rows per peer; the 65th is refused.
     let lane = format!("/f/{FLEET}/in/{}/{a}/h-andrew/note", w.node);
     // Pipelined (`harness::publish_pipelined`): the same 65 in order; nothing
     // lists the ring while they land, so the quota refuses the same 65th.
@@ -241,9 +181,8 @@ fn a_session_that_existed_when_the_bridge_started_is_still_refilled() {
         "the quota refusal means the endpoint never took the row: {refused}"
     );
 
-    // LIST them (which is what frees the per-peer quota: it counts UNLISTED
-    // rows) and HANDLE the 32nd, which is what moves the watermark the refill
-    // resumes from.
+    // List them (which frees the per-peer quota, counted over unlisted rows) and
+    // handle the 32nd, moving the watermark the refill resumes from.
     assert!(w.verb(&format!("@{a} inbox")).ok(), "list the ring");
     let mid_id = rows(&w, &a)
         .iter()
@@ -257,8 +196,8 @@ fn a_session_that_existed_when_the_bridge_started_is_still_refilled() {
             .map(|_| ())
     });
 
-    // The bridge restarts against the same state dir, and `s-a` is a session
-    // that EXISTS at its first roster read — the case with no trigger.
+    // The bridge restarts against the same state dir, and the session exists at its
+    // first roster read.
     w.restart_bridge();
 
     until("the refill to re-offer the row the quota refused", || {
@@ -267,9 +206,8 @@ fn a_session_that_existed_when_the_bridge_started_is_still_refilled() {
             .any(|r| r.ends_with("text=row65"))
             .then_some(())
     });
-    // AND EXACTLY ONCE, the re-offered rows 33..64 among them. `deliver` is
-    // idempotent on `off=`, which is what makes running the refill
-    // unconditionally safe.
+    // Exactly once, the re-offered rows 33..64 among them: `deliver` is idempotent
+    // on `off=`.
     let held = rows(&w, &a);
     for n in [1u64, 32, 33, 48, 64, 65] {
         // `ends_with`, not `contains`: `text=row1` is a prefix of `text=row10`.
@@ -283,24 +221,14 @@ fn a_session_that_existed_when_the_bridge_started_is_still_refilled() {
     }
 }
 
-/// **A POST THAT DIES AT THE DOOR TAKES ITS DURABLE RESERVATION WITH IT — AND
-/// AN EXITED SESSION IS NOT A ROUTE.**
+/// A post that becomes unroutable takes its durable reservation with it, and an
+/// exited session is not a route.
 ///
-/// Two findings meet on one path. `drain_outbox` reserves a durable producer
-/// sequence in the `Route::To` arm and clears it only when the endpoint accepts
-/// the retirement; the `route =>` arm retires the post and never cleared
-/// anything, so a post that was resolvable on one drain and unroutable on the
-/// next left `sent/<sid>.<id>` behind for the life of the node — no reader, no
-/// sweep, and no operator undo but deleting files by hand.
-///
-/// Getting there needs the address to STOP resolving between two drains, and
-/// that is the other finding: `advertisers` took the roster map's keys and threw
-/// the `state=` away, while `holder_is_live` — reading the same rows — answered
-/// on `state == "live"`. A session whose only row is the `state=exited`
-/// withdrawal its own node published was therefore not live and WAS the single
-/// routing candidate, so the post was published to a lane whose node answers
-/// `NotHosted`, and a permanent TOFU pin was written for a session that no
-/// longer exists.
+/// `drain_outbox` reserves a durable producer sequence when a post resolves; a post
+/// retired as unroutable on a later drain must clear `sent/<sid>.<id>` too, or it
+/// stays for the life of the node. A session whose only roster row is its node's
+/// `state=exited` withdrawal is not a routing candidate, so nothing is published to a
+/// lane that answers `NotHosted` and no TOFU pin is written for it.
 #[test]
 fn a_post_that_becomes_unroutable_leaves_no_reservation_and_no_pin() {
     let w = World::boot_with(
@@ -311,8 +239,7 @@ fn a_post_that_becomes_unroutable_leaves_no_reservation_and_no_pin() {
     w.wait_ready();
     let (a, b) = w.two_sessions();
 
-    // THE PUBLISH FAILS, WHICH IS WHAT LEAVES THE RESERVATION ON DISK. The
-    // drain returns and keeps the file, correctly — the retry needs it.
+    // The publish fails, leaving the reservation on disk for the retry.
     let marker = w.state.join("fail-post-publish");
     std::fs::write(&marker, b"*\n").expect("arm the failing publish");
     let posted = w.verb(&format!("@{a} post to=@{b} kind=note hello"));
@@ -328,8 +255,7 @@ fn a_post_that_becomes_unroutable_leaves_no_reservation_and_no_pin() {
         reservation.exists().then_some(())
     });
 
-    // THE ADDRESS STOPS RESOLVING: the peer session exits, and its node's own
-    // roster row says so.
+    // The address stops resolving: the peer exits, and its node's roster row says so.
     assert!(w.verb(&format!("@{b} close")).ok(), "close the peer");
     until("the peer to leave the roster", || {
         (!w.sessions().iter().any(|(_, sid, _)| *sid == b)).then_some(())
@@ -386,31 +312,15 @@ fn a_post_that_becomes_unroutable_leaves_no_reservation_and_no_pin() {
     );
 }
 
-/// **A POST TO A SESSION WHOSE `session-exited` LINE NEVER ARRIVES IS STILL
-/// RETIRED AT THE DOOR.**
+/// A post to a session whose `session-exited` line never arrives is still retired at
+/// the door.
 ///
-/// The sibling above stages the same defect through a RACE — the window between
-/// aterm dropping a session and the bridge taking `session-exited` off its
-/// mailbox — and a race needs a loaded machine to lose. This one holds that
-/// window open for as long as the assertion takes, with
-/// `ATERM_LINK_FAULT=drop-session-exited-while-marked`, so the property is
-/// asserted rather than sampled.
-///
-/// THE LINE GENUINELY GOES MISSING. §4.2's `GAP` is aterm saying frames were
-/// coalesced away and a line "may simply not exist any more"; a bridge that
-/// attaches after the exit never had it; either half of the verb/push pair can
-/// be lost while the process lives. What every one of those leaves behind is a
-/// bridge whose picture of which sessions exist is older than the endpoint's,
-/// and the door is the one consumer of that picture that can LOSE A MESSAGE: it
-/// routed the post to the departed session's own `in` face and answered its
-/// sender `off=<n>` — landed — for a face nothing will ever fetch from.
-///
-/// Both halves of the repair are asserted here, because either alone still
-/// delivers the post: `epochs` must be re-derived before the address is
-/// resolved (or the door routes it as hosted), and the departure must withdraw
-/// the presence row in the same breath (or `advertisers` still names this node
-/// as the single claimant, writes a TOFU pin for a sid that no longer exists,
-/// and routes it anyway).
+/// `ATERM_LINK_FAULT=drop-session-exited-while-marked` holds open the window between
+/// aterm dropping a session and the bridge hearing of it (a §4.2 `GAP`, an attach
+/// after the exit, a lost lane half). Both halves of the repair are needed: `epochs`
+/// is re-derived before the address is resolved (or the door routes it as hosted),
+/// and the departure withdraws the presence row at once (or `advertisers` still names
+/// this node, pins the sid and routes the post to a face nothing will fetch from).
 #[test]
 fn a_post_to_a_session_whose_exit_line_never_arrives_is_still_retired() {
     let w = World::boot_with(
@@ -419,13 +329,12 @@ fn a_post_to_a_session_whose_exit_line_never_arrives_is_still_retired() {
         &[("ATERM_LINK_FAULT", "drop-session-exited-while-marked")],
     );
     w.wait_ready();
-    // OPEN THE WINDOW BEFORE THE SESSION THAT WILL FALL INTO IT EXISTS.
+    // Open the window before the session that will fall into it exists.
     std::fs::write(w.state.join("drop-session-exited"), b"1\n").expect("arm the dropped line");
     let (a, b) = w.two_sessions();
 
-    // THE FABRIC HAS ADVERTISED THE PEER. Without this the test could not fail:
-    // a sid with no `live` row anywhere is unroutable for the ordinary reason,
-    // and the defect is precisely that a STALE `live` row keeps answering.
+    // The fabric has advertised the peer: a sid with no `live` row is unroutable for
+    // the ordinary reason, and the defect is a stale `live` row answering.
     let presence = format!("/f/{FLEET}/pub/{}/{b}/presence", w.node);
     until("the peer's presence row to say live", || {
         w.row(&presence)
@@ -433,7 +342,7 @@ fn a_post_to_a_session_whose_exit_line_never_arrives_is_still_retired() {
             .map(|_| ())
     });
 
-    // THE PEER GOES, and the bridge is never told.
+    // The peer goes, and the bridge is never told.
     assert!(w.verb(&format!("@{b} close")).ok(), "close the peer");
     until("the peer to leave the roster", || {
         (!w.sessions().iter().any(|(_, sid, _)| *sid == b)).then_some(())
@@ -454,8 +363,7 @@ fn a_post_to_a_session_whose_exit_line_never_arrives_is_still_retired() {
         verdict.contains("reason=unroutable"),
         "a session aterm's own roster no longer lists is not a route: {verdict}"
     );
-    // AND NOTHING WAS PUT ON THE DEAD SESSION'S FACE. The `undeliverable` row is
-    // the verdict; this is the loss it exists to prevent.
+    // And nothing was put on the dead session's face: the loss the verdict prevents.
     let inbound = format!("/f/{FLEET}/in/{}/{b}/{}/note", w.node, w.node);
     let mut c = w.god();
     let landed = c.last(&inbound, "", 8).map_or(0, |(rows, _)| rows.len());

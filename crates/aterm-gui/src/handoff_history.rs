@@ -289,9 +289,7 @@ impl Drop for OwnedFile {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The outgoing side: export, head, join
-// ---------------------------------------------------------------------------
 
 /// What one finished export fenced: the history `[first, fence.end)`, as
 /// `lines` lines. `first` is above `fence.oldest` only when the history was
@@ -1884,9 +1882,7 @@ pub(crate) fn log_verdicts(verdicts: &[(u64, Joined)]) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The incoming side: take before the proof, import after Commit
-// ---------------------------------------------------------------------------
 
 /// One session's carried history, read only after Commit (an update) or after the
 /// recovery's restore drain (a crash restore): where its lines come from, and how many.

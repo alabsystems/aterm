@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! A sink's input writer blocked inside ConPTY's `WriteFile`, released, on a
-//! real ConPTY (ATERM-KI-1014-6): `Stop paste` ([`BulkMeter::request_stop`])
+//! real ConPTY: `Stop paste` ([`BulkMeter::request_stop`])
 //! and a tab's close ([`SinkWriter::sever_input`]) reach the blocked call
 //! (`CancelSynchronousIo`, `aterm_pty::input_release`), a write that begins
 //! after either writes nothing, the close a stopped paste still owes waits for

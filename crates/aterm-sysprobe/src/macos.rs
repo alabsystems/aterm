@@ -117,6 +117,34 @@ pub(crate) fn sysctl_int(name: &CStr) -> Option<i64> {
     }
 }
 
+/// One `struct timeval` sysctl by name (`kern.boottime`, `kern.waketime`),
+/// unix milliseconds; `None` if the kernel refuses it or answers another
+/// width.
+pub(crate) fn sysctl_timeval_ms(name: &CStr) -> Option<i64> {
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut len: libc::size_t = std::mem::size_of::<libc::timeval>();
+    // SAFETY: `name` is NUL-terminated; `tv` is writable for `len` bytes and
+    // the kernel writes at most `len`, reporting how many in `len`.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut tv).cast::<c_void>(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len != std::mem::size_of::<libc::timeval>() {
+        return None;
+    }
+    tv.tv_sec
+        .checked_mul(1000)?
+        .checked_add(i64::from(tv.tv_usec) / 1000)
+}
+
 /// One process's physical footprint, KiB (`proc_pid_rusage(RUSAGE_INFO_V4)`'s
 /// `ri_phys_footprint`); `None` when the process is gone or not ours.
 fn footprint_kib(pid: i32) -> Option<u64> {
@@ -513,7 +541,13 @@ pub(crate) fn machine_words() -> crate::MachineWords {
 /// A string sysctl (at most 63 bytes), NUL-trimmed; `None` where unreadable
 /// or empty.
 fn sysctl_text(name: &CStr) -> Option<String> {
-    let mut buf = [0u8; 64];
+    sysctl_text_in::<64>(name)
+}
+
+/// A string sysctl read into `N` bytes (at most `N - 1` of text: the kernel
+/// refuses a longer one), NUL-trimmed; `None` where unreadable or empty.
+pub(crate) fn sysctl_text_in<const N: usize>(name: &CStr) -> Option<String> {
+    let mut buf = [0u8; N];
     let mut len: libc::size_t = buf.len();
     // SAFETY: `name` is NUL-terminated; `buf` is writable for `len` bytes and
     // the kernel writes at most `len`, reporting how many in `len`.

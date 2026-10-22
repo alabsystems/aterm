@@ -575,7 +575,7 @@ pub(super) fn round_notices(phase: &Phase, streak_why: &str, stop_streak: u32) -
 /// (`upgrade_wake::wait_exit`, nothing sent; [`St::seen_gone`]) — its signal, as the stale
 /// bound reads an exit no look saw (`relaunch::expired`). A tab no worker visits any more
 /// (Autopilot Off or the agent's own switch off after a relaunch that waited out a slow
-/// shutdown: lifecycle-5 of ATERM-KI-1016-1) has no look to stamp it, and read off the record
+/// shutdown: lifecycle-5 of ) has no look to stamp it, and read off the record
 /// alone its row said `hung-exit` ("Press Ctrl-C") over an agent long gone, for good, with no
 /// line that resumes it. A record that names no process is read as it stands.
 ///
@@ -1686,7 +1686,7 @@ impl Row {
     ///
     /// A fresh restart's row is also answered once an agent leads its tab again — a Claude Code
     /// of any conversation, or the tab's Codex TUI ([`Self::answered_by_its_tabs_agent`], LC-2 of
-    /// ATERM-KI-1015-1): its remedy, a plain `claude`, starts another conversation by its nature
+    /// ): its remedy, a plain `claude`, starts another conversation by its nature
     /// (so do `/clear` and a fresh relaunch's own agent that lands late), and a person who starts
     /// Codex there instead has the tab back for other work, so read by its conversation alone it
     /// stood a whole day ([`EXITED_FAILURE_SHOWN_S`]). A row whose remedy is `claude --resume
@@ -1794,7 +1794,7 @@ impl Row {
     }
 
     /// WHICH OF ONE TAB'S ROWS SPEAKS FOR THE TAB ([`tab_rows`],
-    /// ATERM-KI-1015-1 LC-9). Several conversations' records stand in one
+    /// LC-9). Several conversations' records stand in one
     /// tab at once — a move that finished ([`DONE_SHOWN_S`]) or failed after
     /// its exit ([`EXITED_FAILURE_SHOWN_S`]) beside the newer conversation
     /// the tab runs now, or a conversation suspended behind the one in front
@@ -2865,7 +2865,7 @@ enum Special {
 /// not there, is no Claude Code's resume, or holds a word a blind read cannot take exactly
 /// ([`launch_of`]). What the owner is told of it within the mark is [`Row::resume_said`]'s. With
 /// the Claude home the line carries in front of it ([`home_exports`],
-/// [`crate::harness::resume::with_env`]; ATERM-KI-1015-1 LC-4): told bare, an agent the relaunch
+/// [`crate::harness::resume::with_env`] LC-4): told bare, an agent the relaunch
 /// started under another home was resumed under the tab's shell's, which holds no transcript of
 /// it.
 fn resume_command(line: &str, session: &str) -> Option<String> {
@@ -4063,7 +4063,7 @@ impl Row {
     /// order: the head, the flags past [`RESUME_FLAGS_MAX`] and every flag that sets no
     /// permission mode ([`crate::harness::resume::mode_of`]), the login clause, then the
     /// permission mode itself, so the conversation id is never cut. Every form keeps the Claude
-    /// home the relaunch line carried in front of it ([`resume_command`]; ATERM-KI-1015-1 LC-4):
+    /// home the relaunch line carried in front of it ([`resume_command`] LC-4):
     /// where none with it fits, or the line cannot be read whole, no command is told (the
     /// sentence alone, never a line that resumes nothing under the tab's shell's home).
     fn resume_said(&self, then: &str) -> (String, Option<String>) {
@@ -4141,9 +4141,9 @@ impl Row {
     /// THE COMMAND THAT STARTS AGAIN BY HAND AN AGENT THIS ROW'S RESTART STARTED AFRESH
     /// ([`Self::fresh`]): a plain `claude` — Claude refuses `--resume` of a conversation with no
     /// message — under the Claude home the relaunch line carried ([`home_exports`], as
-    /// [`resume_command`] keeps it, ATERM-KI-1015-1 LC-4). The one command of such a row: the
+    /// [`resume_command`] keeps it). The one command of such a row: the
     /// tab's mark ([`Self::agent_down`]), the band's remedy and `--now`'s refusal
-    /// (ATERM-KI-1016-1: those two said `claude --resume <id>` where the mark said `claude`).
+    /// (those two said `claude --resume <id>` where the mark said `claude`).
     /// `None` where that home cannot be told on a line ([`crate::harness::resume::with_env`]).
     #[must_use]
     pub fn fresh_command(&self) -> Option<String> {
@@ -5055,7 +5055,7 @@ fn status_rows_with(
     (shown, vetted)
 }
 
-/// TAB `tab`'s ROW (LC-9 of ATERM-KI-1015-1): the one of `rows` that speaks
+/// TAB `tab`'s ROW (LC-9 of ): the one of `rows` that speaks
 /// for the tab by [`Row::tab_rank`] — its agent in front before one held only
 /// aside, a restart in flight, a move still down after its exit, a
 /// conversation a live process holds, then its NEWEST move (the one minted
@@ -5153,7 +5153,7 @@ fn not_in_front(pid: u32) -> bool {
 /// conversation, which the vetted files alone never name. While such a row's SHELL IS GONE, its
 /// remedy a new tab, the one Claude Code proven in another tab that [`answering_shell_gone`]
 /// gives it is returned too, naming it ([`Holder::answers`]). No other tab's agent costs a read
-/// (LC-2 of ATERM-KI-1015-1, and its review: a resume row's tab is answered by its conversation
+/// (LC-2 of , and its review: a resume row's tab is answered by its conversation
 /// alone). Every other reader of these holders matches by conversation, so the extra ones change
 /// nothing else. Only the files of `sessions` cost a read (a `ps` and a `KERN_PROCARGS2` each);
 /// while such a tab is down, every live interactive file costs a group and a `KERN_PROCARGS2`
@@ -5556,7 +5556,7 @@ fn ask_within(
                     // the rows the window shows ([`St::is_upgrade`]), the
                     // upgrade's own afresh restart included — taken by an
                     // empty cause alone, a word on that row found none
-                    // (ATERM-KI-1016-1).
+                    // .
                     let st = load(opts, &session).filter(St::is_upgrade)?;
                     // A state with no recorded tab (an older build's pending
                     // one) is a candidate only once a live holder is proven in
@@ -5824,7 +5824,7 @@ pub struct View {
     /// The tabs whose row the last whole look read off its live holder's
     /// status, or whose agent the move ended ([`Self::follows`]).
     follows: Vec<String>,
-    /// THE TABS' AGENTS BACK ([`Row::held_again`], ATERM-KI-1015-1 LC-2):
+    /// THE TABS' AGENTS BACK ([`Row::held_again`]):
     /// each Claude Code move down after its exit (failed after it, or a
     /// restart in flight whose agent was read gone, DR-LC-2) whose tab, or
     /// conversation, a look of this view found held again, by conversation,
@@ -5835,7 +5835,7 @@ pub struct View {
     /// raised again over a tab whose owner acted. A record that left the
     /// down state, or a later exit of the move (another `exited_at`), is a
     /// new fact. Forgotten with its record's down state. KEPT BESIDE THE
-    /// RECORDS ([`BACK_FILE`], ATERM-KI-1016-1's LC-2): read at this view's
+    /// RECORDS ([`BACK_FILE`]'s LC-2): read at this view's
     /// first look and written as it changes, so a restart of aterm inside the
     /// day the row is shown does not raise it again over a tab whose owner
     /// acted; it was this process's alone.
@@ -5950,7 +5950,7 @@ impl View {
     }
 
     /// [`Self::refresh`], handing over with the rows THE TABS THEY LEAVE AS
-    /// THEY STAND (ATERM-KI-1016-1): each tab whose record this look cannot
+    /// THEY STAND: each tab whose record this look cannot
     /// read — its read panicking, its file unreadable — whether this view
     /// read it before or not: the tab its text names, else the tab its last
     /// read gave ([`Self::placed`]), and, where neither names one, every
@@ -6020,7 +6020,7 @@ impl View {
         let (mut all, whole, unread) = read_records(opts, now);
         self.unlisted = (!whole).then(|| state_dir(opts));
         // A RECORD THAT CANNOT BE READ NOW LEAVES ITS TAB AS IT STANDS
-        // (ATERM-KI-1016-1): left out of a look that then counted as not
+        // : left out of a look that then counted as not
         // whole, one record whose read panicked at every look (a line this
         // build cannot read) kept every tab's rows and marks at the last
         // whole look for as long as it stood. Now only its tab is kept as it
@@ -6110,7 +6110,7 @@ impl View {
             };
             Some(held)
         };
-        // AN UNREAD RECORD NO TAB IS KNOWN FOR (ATERM-KI-1016-1 host-8, the
+        // AN UNREAD RECORD NO TAB IS KNOWN FOR (host-8, the
         // review of its first cut) keeps the tab its conversation's live
         // process is proven in — its file is named by that conversation — and
         // every live tab only where no process holds it in one. Every live
@@ -6331,7 +6331,7 @@ impl View {
         &self.follows
     }
 
-    /// THE RECORDS' FOLDER THIS VIEW CANNOT LIST (ATERM-KI-1016-1): the
+    /// THE RECORDS' FOLDER THIS VIEW CANNOT LIST: the
     /// folder the last look that read the roster could not list whole — an
     /// unlistable folder, or a listing that broke off — so which records it
     /// holds is not known. Such a look renews no row and lowers no mark, and
@@ -6346,7 +6346,7 @@ impl View {
     }
 
     /// THE RECORDS THIS VIEW CANNOT READ THAT KEEP A LIVE TAB AS IT STANDS
-    /// (ATERM-KI-1016-1 host-8): each record the last whole look listed but
+    /// (host-8): each record the last whole look listed but
     /// could not read ([`read_records`]) whose tab is live, or, its tab not
     /// known, while any tab is ([`Self::refresh_keeping`]). What the window
     /// shows of those tabs stays as it is, and until this was named nothing
@@ -6471,7 +6471,7 @@ impl View {
     }
 }
 
-/// EACH TAB'S ROW (ATERM-KI-1015-1 LC-9): `rows` less every row its tab has
+/// EACH TAB'S ROW (LC-9): `rows` less every row its tab has
 /// a higher [`Row::tab_rank`] for, in the order they came; a row with no tab
 /// speaks for none and is kept. What a TAB says of its upgrade — its
 /// `upgrade=` column and footer note, its menu, its band row, its

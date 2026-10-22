@@ -432,7 +432,7 @@ fn a_repositorys_own_home_relative_path_is_read_under_the_persons_home() {
     assert_eq!(w.paths, ["notes.md"], "{w:?}");
 }
 
-/// THE PROBE COUNTS WHAT THE REMOTE'S DEFAULT BRANCH LACKS (FOREVER LAND:
+/// THE PROBE COUNTS WHAT THE REMOTE'S DEFAULT BRANCH LACKS (Autopilot Land:
 /// all of the work in the remote main, no exceptions): a commit pushed only
 /// to a feature branch is no unpushed commit, and it is unlanded, named
 /// against `origin/main`; merged into the remote main (a fast-forward push)

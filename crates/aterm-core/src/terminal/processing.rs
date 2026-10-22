@@ -183,9 +183,6 @@ impl Terminal {
             )]
             let entry = aterm_time::Instant::now();
             let parse_start = entry;
-            // Split after every ESU (and one byte short of every alt-screen exit)
-            // so the alt-screen archive sees each committed frame; otherwise one
-            // `advance_fast` over the whole input (see `alt_archive.rs`).
             self.advance_parser_archiving(input);
             // RIS side effects, as in the gated branch above.
             if self.transient.pending_parser_reset {
@@ -206,6 +203,8 @@ impl Terminal {
             // Alt-screen archive: a sync-timeout close `post_process` just forced,
             // and the rate-limited commit for apps that never use 2026.
             self.alt_archive_epilogue();
+            // The batch's end: the run of unfinished frames and the screen's last change.
+            self.note_batch_end();
             // Observation kernel: evaluate and latch armed watchers where this
             // batch's mutation has landed. `process_now` is the injected clock, so
             // this is replay-deterministic.
@@ -235,6 +234,7 @@ impl Terminal {
             }
             damage_class = self.post_process(lines_before, was_alt);
             self.alt_archive_epilogue();
+            self.note_batch_end();
             self.observe_at(self.transient.process_now);
 
             // Lightweight: just bump sequence counter and record byte count.

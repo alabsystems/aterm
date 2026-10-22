@@ -53,7 +53,7 @@ fn ready(path: &str, w: u32, h: u32) -> crate::app_config::WallpaperAsset {
 /// a long path, cut mid-word), says the whole path, and fits, from a
 /// 22-column window to a wide one, at 1×, 1.25×, 1.5× and 2× text — every
 /// letter of the file's name painted, the size given up first, then the
-/// name set on lines, never cut (the round-14 audit: elided from its end on
+/// name set on lines, never cut (the audit: elided from its end on
 /// one line it read "sun…" at 178pt and 2×, "sunset-over-the…" at 320pt).
 /// Negative control: an image that did not load is named by its file
 /// alone.

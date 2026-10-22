@@ -770,7 +770,7 @@ fn prove_self_claim(app: &App) {
     assert!(app.beside_proven_self_claim(0));
 }
 
-/// A PROVEN SELF-CLAIM CLEARS A STANDING HOLD (§12.3.3 item 3, FOREVER LAND
+/// A PROVEN SELF-CLAIM CLEARS A STANDING HOLD (§12.3.3 item 3, Autopilot Land
 /// §10.4): beside a proven self-claim the hosted loop's hold is not the
 /// session's. A hold standing as the proof arrives goes at the hosted
 /// loop's next hold fact, which shows none, at its next task face, which

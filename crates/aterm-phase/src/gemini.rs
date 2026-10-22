@@ -976,9 +976,7 @@ pub(crate) fn is_gemini_screen(rows: &[String]) -> bool {
         })
 }
 
-// ---------------------------------------------------------------------------
 // The boxes.
-// ---------------------------------------------------------------------------
 
 /// A box's rows: its border's column, its top border's row (`None` with its
 /// head off the rows read), the first row inside it and its bottom border.
@@ -1730,6 +1728,13 @@ pub mod fixtures {
         include_str!("fixtures/gemini-0.46.0-question-answered.txt");
     /// `/quit` sent: the farewell box, the resume line, the shell's prompt.
     pub const EXIT: &str = include_str!("fixtures/gemini-0.46.0-exit.txt");
+    /// A full-screen redraw (`ESC[2J ESC[3J ESC[H`, no DEC 2026 bracket) cut by one
+    /// 1024-byte PTY read, three tabs at once (measured 2026-10-22,
+    /// `docs/measured/half-drawn-frame-2026-10-22.md`): the banner and its tips, every row
+    /// under them blank. No screen Gemini CLI drew whole, so no layout names it.
+    pub const ERASE_HALF: &str = include_str!("fixtures/gemini-0.46.0-lab-erase-half.txt");
+    /// [`ERASE_HALF`]'s redraw whole, 0.4 ms on: the spinner over the composer.
+    pub const ERASE_WHOLE: &str = include_str!("fixtures/gemini-0.46.0-lab-erase-whole.txt");
     /// A per-day quota's 429: the usage-limit dialog, before any key.
     pub const LIMIT_DIALOG: &str = include_str!("fixtures/gemini-0.46.0-wall-429-per-day.txt");
     /// A Google account's spent quota (`QUOTA_EXHAUSTED`, its reset in

@@ -25,9 +25,7 @@ pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-// ---------------------------------------------------------------------------
 // Registry (advapi32)
-// ---------------------------------------------------------------------------
 
 pub(crate) type Hkey = isize;
 pub(crate) const HKEY_CURRENT_USER: Hkey = 0x8000_0001u32 as Hkey;

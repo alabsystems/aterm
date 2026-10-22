@@ -212,24 +212,9 @@ impl Cell {
         self.colors
     }
 
-    /// Set the character (BMP only, use overflow for non-BMP).
-    ///
-    /// For BMP characters (U+0000-U+FFFF), stores the codepoint directly.
-    /// For non-BMP characters, stores U+FFFD (replacement character) and
-    /// triggers a debug assertion. Callers handling non-BMP characters
-    /// should use `set_overflow_index` with the CellExtras overflow table.
-    ///
-    /// # Verification
-    ///
-    /// The non-BMP `debug_assert!` is a deliberate caller-misuse check, so
-    /// Trust's L0 gate reports it as an accepted refutation at `cp = 0x10000`.
-    /// Discharging it would need a `requires` precondition or removing the
-    /// assert, so it stays documented. `cell_packing_is_lossless_over_every_input`
-    /// covers the BMP contract over every BMP char.
-    ///
-    /// The masked cast `(cp & 0xFFFF) as u16` is lossless; the interval engine
-    /// reports UNKNOWN here because of a toolchain transport gap, not a logic
-    /// gap.
+    /// Set the character (BMP only). A non-BMP character stores U+FFFD and trips a
+    /// deliberate misuse `debug_assert!` (Trust's L0 gate reports it as an accepted
+    /// refutation at `cp = 0x10000`); those go through `set_overflow_index`.
     #[inline]
     #[allow(
         clippy::cast_possible_truncation,

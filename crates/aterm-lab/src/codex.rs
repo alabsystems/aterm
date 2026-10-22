@@ -284,16 +284,65 @@ pub fn safe_args(tab: bool, args: &[String]) -> Result<(), String> {
 }
 
 /// Whether the Codex at `bin` takes `--no-daemon`, by what it is: codex-alab
-/// does — its package root, the one whose manifest names `bin`, carries
-/// ALab's build mark (`aterm_agent::harness::codex_alab::alab_bytes`, the
-/// host's own reader: files only, never a run) — and its default starts the
-/// app server as a background daemon that leaves the tree and outlives it,
-/// from a copy of the package it installs into `CODEX_HOME`. A vendor
-/// `codex` has no such flag: 0.151.0 refuses it (`unexpected argument
-/// '--no-daemon'`).
+/// does, and its default starts the app server as a background daemon that
+/// leaves the tree and outlives it, from a copy of the package it installs
+/// into `CODEX_HOME`. A vendor `codex` has no such flag: 0.151.0 refuses it
+/// (`unexpected argument '--no-daemon'`). Files only, never a run, and the
+/// package says it where there is one (the one whose manifest names `bin`,
+/// as the host's readers find it):
+///
+/// * its root carries ALab's build mark
+///   (`aterm_agent::harness::codex_alab::alab_bytes`): codex-alab;
+/// * its manifest's version is a release
+///   (`aterm_agent::harness::codex_alab::package_version`, which no ALab
+///   build's pre-release answers): a vendor `codex`, as 0.151.0's cask lays
+///   it;
+/// * else — a binary in no package (a `target/…/codex` dev build, a copy),
+///   or a package that says neither — its own bytes decide
+///   ([`names_no_daemon`]): a codex-alab outside a marked package takes the
+///   flag as surely, and a daemon left out of the jail is silent where a
+///   refused flag is loud. Vendor 0.151.0's bytes hold no `no-daemon`.
 #[must_use]
 pub fn takes_no_daemon(bin: &str) -> bool {
-    aterm_agent::harness::codex_alab::alab_bytes(Path::new(bin))
+    use aterm_agent::harness::codex_alab::{alab_bytes, package_version};
+    let bin = Path::new(bin);
+    alab_bytes(bin) || (package_version(bin).is_none() && names_no_daemon(bin))
+}
+
+/// Whether the regular file at `bin` holds the bytes `no-daemon` (clap keeps
+/// a long flag's name as a literal, so a binary that takes `--no-daemon`
+/// holds it), read in 4 MiB blocks with the needle's length less one carried
+/// across each seam. `false` for a file that cannot be read and for anything
+/// not a regular file (a FIFO would park the launch). Read only for a binary
+/// no package speaks for ([`takes_no_daemon`]): a debug lab reads a 250 MB
+/// build in a second or two.
+#[must_use]
+pub fn names_no_daemon(bin: &Path) -> bool {
+    use std::io::Read as _;
+    const NEEDLE: &[u8] = b"no-daemon";
+    const BLOCK: usize = 4 << 20;
+    if !fs::metadata(bin).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let Ok(mut file) = fs::File::open(bin) else {
+        return false;
+    };
+    let mut buf = vec![0u8; BLOCK];
+    let mut kept = 0;
+    loop {
+        let n = match file.read(&mut buf[kept..]) {
+            Ok(0) => return false,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        };
+        let filled = kept + n;
+        if buf[..filled].windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+            return true;
+        }
+        kept = filled.min(NEEDLE.len() - 1);
+        buf.copy_within(filled - kept..filled, 0);
+    }
 }
 
 /// The launcher: the line the tab types (`clear`, then `exec`), or
@@ -476,7 +525,8 @@ pub fn cmd_codex(args: &[String]) -> Res {
 
 /// `codex-run [tag] [--lab|--chatgpt|--signed-out] -- <codex args>`: a
 /// non-interactive Codex command inside the jail (scratch `HOME` and
-/// `CODEX_HOME`, `--no-daemon`), on the config of the login asked for (by
+/// `CODEX_HOME`, `--no-daemon` where the binary takes it,
+/// [`takes_no_daemon`]), on the config of the login asked for (by
 /// default the tab's): `config.toml` is rewritten when it is another login's,
 /// which a Codex running in the tab then finds on disk too. It runs outside
 /// the instance's tree, so it is started where the witness watches it
@@ -817,15 +867,19 @@ mod tests {
         assert!(ratelimit_headers(&["1".into(), "2".into(), "bogus=1".into()]).is_err());
     }
 
-    /// A Codex package at `root` (layout 1, `bin/codex` its entrypoint),
-    /// ALab's when `alab` (its `alab-build.json` beside the manifest): the
-    /// binary's path.
-    fn package_at(root: &Path, alab: bool) -> String {
+    /// The bytes of a stand-in codex-alab binary: clap's literal for the
+    /// flag among other text, as the store's build holds it.
+    const NAMES_IT: &[u8] = b"\x00\xcf\xfa\xed\xfeno-daemon cannot be used with --remote\x00";
+
+    /// A Codex package at `root` (layout 1, `bin/codex` its entrypoint,
+    /// holding `exe`), its manifest's version `version`, ALab's when `alab`
+    /// (its `alab-build.json` beside the manifest): the binary's path.
+    fn package_at(root: &Path, version: &str, alab: bool, exe: &[u8]) -> String {
         fs::create_dir_all(root.join("bin")).unwrap();
-        fs::write(root.join("bin/codex"), "").unwrap();
+        fs::write(root.join("bin/codex"), exe).unwrap();
         fs::write(
             root.join(aterm_agent::harness::codex_alab::PACKAGE_JSON),
-            r#"{"layoutVersion":1,"version":"0.164.0-dev.1+gabc","entrypoint":"bin/codex"}"#,
+            format!(r#"{{"layoutVersion":1,"version":"{version}","entrypoint":"bin/codex"}}"#),
         )
         .unwrap();
         let mark = root.join(aterm_agent::harness::codex_alab::ALAB_BUILD_JSON);
@@ -840,16 +894,40 @@ mod tests {
     /// THE LAUNCHER EXECS CODEX BY PATH, `--no-daemon` ONLY WHERE IT IS
     /// TAKEN: codex-alab's package (its ALab build mark beside the manifest)
     /// is launched with `--no-daemon` before the caller's arguments, in the
-    /// tab and in `codex-run`; vendor `codex`'s — the same package without
-    /// the mark, as 0.151.0's cask lays it — and a path in no package are
-    /// launched without it, the arguments straight after the binary.
+    /// tab and in `codex-run`; vendor `codex`'s — a release's package without
+    /// the mark, as 0.151.0's cask lays it, whatever its bytes — and a path
+    /// that is no file are launched without it, the arguments straight after
+    /// the binary. A binary in NO package (`LAB_CODEX` at a `target/…/codex`
+    /// dev build or a copy) is read: codex-alab's bytes name the flag and it
+    /// gets it, a binary whose bytes do not is launched without; and so is
+    /// one in a package that says neither (an unmarked pre-release).
     /// NEGATIVE CONTROL: the mark written back into the vendor's package
-    /// brings `--no-daemon` back, so the mark alone decides.
+    /// brings `--no-daemon` back, and the dev build's bytes without the
+    /// literal take it away.
     #[test]
     fn the_launcher_execs_codex_by_path_with_no_daemon_only_for_codex_alab() {
         let scratch = aterm_tempfile::tempdir().expect("exclusive package fixture");
-        let alab = package_at(&scratch.path().join("alab b"), true);
-        let vendor = package_at(&scratch.path().join("vendor"), false);
+        let alab = package_at(
+            &scratch.path().join("alab b"),
+            "0.164.0-dev.1+gabc",
+            true,
+            b"",
+        );
+        let vendor = package_at(&scratch.path().join("vendor"), "0.151.0", false, NAMES_IT);
+        let dev = scratch.path().join("codex-rs/target/release/codex");
+        fs::create_dir_all(dev.parent().unwrap()).unwrap();
+        fs::write(&dev, NAMES_IT).unwrap();
+        let dev = dev.to_string_lossy().into_owned();
+        let other = scratch.path().join("other/codex");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(&other, b"\x00\xcf\xfa\xed\xfeno-daemo\x00n-daemon\x00").unwrap();
+        let other = other.to_string_lossy().into_owned();
+        let neither = package_at(
+            &scratch.path().join("neither"),
+            "0.152.0-alpha.1",
+            false,
+            NAMES_IT,
+        );
         let run = |codex_bin: &str| Run {
             tag: "t".into(),
             run: "/s/runs/t".into(),
@@ -866,30 +944,70 @@ mod tests {
             s.contains("  LAB_CODEX_KEY=lab-not-a-key \\\n  'K=v 1' \\\n"),
             "{s}"
         );
-        let quoted = shell_quote(&alab);
-        assert!(
-            s.ends_with(&format!("  {quoted} --no-daemon -C '/x y'\n")),
-            "codex-alab takes --no-daemon: {s}"
+        let takes = |bin: &str| {
+            [(true, "lab"), (false, "chatgpt")].map(|(tab, mode)| {
+                let v = launcher(&run(bin), tab, mode, &[], &args);
+                let quoted = shell_quote(bin);
+                if v.ends_with(&format!("  {quoted} --no-daemon -C '/x y'\n")) {
+                    Some(true)
+                } else if v.ends_with(&format!("  {quoted} -C '/x y'\n"))
+                    && !v.contains("--no-daemon")
+                {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+        };
+        assert_eq!(
+            takes(&alab),
+            [Some(true); 2],
+            "codex-alab, tab and codex-run"
         );
         let r = launcher(&run(&alab), false, "chatgpt", &[], &[]);
         assert!(!r.contains("clear") && !r.contains("LAB_CODEX_KEY="), "{r}");
         assert!(r.ends_with(" --no-daemon\n"), "codex-run's too: {r}");
-        for bin in [vendor.as_str(), "/a b/codex"] {
-            for (tab, mode) in [(true, "lab"), (false, "chatgpt")] {
-                let v = launcher(&run(bin), tab, mode, &[], &args);
-                assert!(
-                    v.ends_with(&format!("  {} -C '/x y'\n", shell_quote(bin)))
-                        && !v.contains("--no-daemon"),
-                    "{bin} has no --no-daemon: {v}"
-                );
-            }
-        }
-        // CONTROL: the mark alone decides.
-        let marked = package_at(&scratch.path().join("vendor"), true);
-        assert_eq!(marked, vendor);
-        assert!(
-            launcher(&run(&marked), true, "lab", &[], &args).ends_with(" --no-daemon -C '/x y'\n"),
-            "CONTROL: the mark brings --no-daemon back"
+        assert_eq!(
+            takes(&vendor),
+            [Some(false); 2],
+            "a vendor release's package"
         );
+        assert_eq!(takes("/a b/codex"), [Some(false); 2], "no file");
+        assert_eq!(takes(&dev), [Some(true); 2], "a codex-alab dev build");
+        assert_eq!(takes(&other), [Some(false); 2], "a binary naming no flag");
+        assert_eq!(
+            takes(&neither),
+            [Some(true); 2],
+            "a package that says neither"
+        );
+        // CONTROL: the mark brings it back to the vendor's package, and the
+        // dev build loses it with the literal.
+        let marked = package_at(&scratch.path().join("vendor"), "0.151.0", true, NAMES_IT);
+        assert_eq!(marked, vendor);
+        assert_eq!(takes(&marked), [Some(true); 2], "CONTROL: the mark");
+        fs::write(&dev, b"\x00\xcf\xfa\xed\xfeno-daemoN\x00").unwrap();
+        assert_eq!(takes(&dev), [Some(false); 2], "CONTROL: the literal");
+    }
+
+    /// The literal is found wherever it lies, across the seam of two read
+    /// blocks too, and nowhere it is not: a file whose only `no-daemon`
+    /// straddles the first 4 MiB block's end is read as naming it, the same
+    /// file with one byte of it changed is not, and a directory is never
+    /// opened.
+    #[test]
+    fn a_binary_names_the_flag_across_a_block_seam() {
+        let scratch = aterm_tempfile::tempdir().expect("exclusive binary fixture");
+        let bin = scratch.path().join("codex");
+        let mut bytes = vec![0u8; (4 << 20) - 4];
+        bytes.extend_from_slice(b"no-daemon");
+        bytes.extend_from_slice(&[0u8; 64]);
+        fs::write(&bin, &bytes).unwrap();
+        assert!(names_no_daemon(&bin), "across the seam");
+        let at = (4 << 20) - 4 + 4;
+        assert_eq!(bytes[at], b'a');
+        bytes[at] = b'A';
+        fs::write(&bin, &bytes).unwrap();
+        assert!(!names_no_daemon(&bin), "CONTROL: one byte changed");
+        assert!(!names_no_daemon(scratch.path()), "a directory");
     }
 }

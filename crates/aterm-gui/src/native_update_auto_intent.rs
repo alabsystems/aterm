@@ -223,15 +223,12 @@ pub(crate) enum ArmDecision {
     Set(u64),
 }
 
-/// Whether arming `incoming_build` owes the candidate's pre-park read (its
-/// verdict and the handoff policy it seals) now: whenever it is newer than the
-/// running build and nothing already armed outranks it — not only when the
-/// automatic lane takes it (round eight of the update audit, U35). A person's
-/// Install on the fork lane parks before its worker verifies, so with
-/// `[update] auto_apply = false` (`Clear`), or a build latched manual-only
-/// (`SuppressManualOnly`), a policy first read there was read only after the
-/// capture it was sealed to forbid. `Keep` reads nothing: an armed intent at
-/// least as new was read when it was set.
+/// Whether arming `incoming_build` owes the candidate's pre-park read (its verdict and the
+/// handoff policy it seals) now: whenever it is newer than the running build and nothing armed
+/// outranks it, not only when the automatic lane takes it. A person's Install on the fork lane
+/// parks before its worker verifies, so with `auto_apply = false` (`Clear`) or a manual-only
+/// latch (`SuppressManualOnly`) a policy first read there would come after the capture it
+/// forbids. `Keep` reads nothing: an armed intent at least as new was read when it was set.
 #[cfg(any(unix, test))]
 #[must_use]
 pub(crate) fn arm_reads_candidate(

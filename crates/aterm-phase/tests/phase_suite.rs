@@ -14,6 +14,7 @@
 mod fixture_files;
 
 mod busy_zone_sweep;
+mod frame_torn_sweep;
 mod live_zone_sweep;
 
 /// `f` of each of `items`, on every core, in `items`' order. The sweeps'

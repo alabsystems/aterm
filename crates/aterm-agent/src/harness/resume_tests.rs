@@ -272,7 +272,7 @@ fn a_named_resume_line_is_kept_whole_bare_or_not_at_all() {
     }
 }
 
-/// A SHORTER FORM NEVER DROPS THE CLAUDE HOME IT CARRIES (ATERM-KI-1015-1
+/// A SHORTER FORM NEVER DROPS THE CLAUDE HOME IT CARRIES (
 /// LC-4): a told line carries the home its agent ran under in front of it
 /// ([`with_env`]: plain where it can be, quoted otherwise), and every form a
 /// tight budget steps down to — its permission mode alone, then the
@@ -335,7 +335,7 @@ fn a_shorter_form_never_drops_the_home_it_carries() {
 }
 
 /// THE FOOTER'S RESUME LINE CARRIES THE CLAUDE HOME ITS PROCESS RUNS UNDER
-/// (ATERM-KI-1015-1 LC-4; [`crate::harness::footer::read_pid`], [`home_env`]):
+/// (LC-4; [`crate::harness::footer::read_pid`], [`home_env`]):
 /// the frozen-program remedy and the menu-bar row tell the line every other
 /// surface tells — `HOME=<it>` for a process whose records are another
 /// `HOME`'s `.claude`, its `CLAUDE_CONFIG_DIR` where its environment named

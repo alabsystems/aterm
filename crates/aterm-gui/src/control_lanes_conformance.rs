@@ -1642,7 +1642,7 @@ fn a_steady_reader_keeps_its_answer_when_a_later_one_parks() {
     // Taking, as the parker can see it: the room a peer makes wakes the parker,
     // and Linux makes none it can see until the peer has read a whole queued
     // buffer of the socket's (half its 208 KiB send buffer each, consumed whole
-    // before the kernel frees it; then `unix_writable`'s quarter). The round-7
+    // before the kernel frees it; then `unix_writable`'s quarter). the
     // integration's Linux lane cut the reader at 219264 bytes when the later
     // one parked after the reader's first 16 KiB: nothing had told the parker
     // the reader was reading. So the later one parks once the reader has read

@@ -257,32 +257,12 @@ pub(super) fn assert_only_over_cap_links_dropped(
     stripped
 }
 
-/// EVERY REACHABLE ENGINE STATE IS ADMITTED BY THE WIRE — now over the hostile
-/// grammar ([`hostile_walk_step`]) and with NO state skipped (the 2026-09-22/23
-/// update audit, plan P0-4d). The old walk drove only cursor and mode
-/// sequences at up to 64x96 and `continue`d past every non-Ground state, which
-/// is exactly where two of the refusals lived; through the pre-ladder pipeline
-/// this walk is red on 105 mid-sequence states, 285 dimension refusals and 514
-/// non-canonical grids (measured before the fix).
-///
-/// Every state is carried by [`carry_for_wire`] and must be committed by
-/// `screen_digest` and adopted exactly by the consumer. Two fidelity
-/// properties ride along: an honest engine never breaks a meta bound (no state
-/// may need the Sanitized rung — one that did would be the 2026-09-22 class,
-/// a producer/predicate disagreement), and a Full carry of a Ground engine is
-/// byte-identical to the pre-ladder `checkpoint_carry`, so healthy handoffs
-/// are unchanged.
-///
-/// A link-dense line past the record cap used to be the one Repaint the
-/// grammar reached — 588 of these 3000 states, a blank tab each, and 16 more
-/// lost their whole scrollback to one in it (VisibleOnly). Plan P2-4 carries
-/// them at the StrippedLinks rung instead: the screen and scrollback exact but
-/// for the links of the over-cap lines, which is asserted state by state.
-/// Measured 2026-09-24 with it in: rungs [full 2396, visible-only 0,
-/// stripped-links 604, sanitized 0, repaint 0], 993 lines losing their links.
-/// The bound on Repaint is therefore ZERO: the walk is deterministic, so any
-/// blank carry at all is a new cause, and names its step. RED before P2-4: no
-/// state reaches StrippedLinks, and 588 are carried blank.
+/// Every reachable engine state is admitted by the wire: 3000 steps of the hostile
+/// grammar, mid-sequence states included, each carried by [`carry_for_wire`], committed
+/// by `screen_digest` and adopted exactly. An honest engine never needs Sanitized, a
+/// Full carry of a Ground engine is byte-identical to `checkpoint_carry`, a
+/// StrippedLinks carry drops only the over-cap lines' links, and no step repaints (the
+/// walk is deterministic, so a blank carry is a new cause and names its step).
 ///
 /// Each state's admission ([`assert_wire_admits`], five sixths of the walk's
 /// time) is checked a batch at a time on four threads

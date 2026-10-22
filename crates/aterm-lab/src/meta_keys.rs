@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `meta-keys --window`: Option as Meta, end to end through aterm's own window,
-//! on the U.S., German and French layouts (ATERM-KI-1015-9). It OPENS A WINDOW
+//! on the U.S., German and French layouts. It OPENS A WINDOW
 //! on the desktop of whoever runs it and SELECTS EACH LAYOUT for the login
 //! session while it runs, so it runs only when `--window` says so, never from a
 //! check.

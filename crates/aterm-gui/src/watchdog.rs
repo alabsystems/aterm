@@ -1120,11 +1120,10 @@ fn beat_into(
     bc: Breadcrumb,
     now_ns: u64,
 ) -> Option<u64> {
-    // The heartbeat's timestamp, for `main_stall`: the clock value this beat
-    // already read, stamped BEFORE the root is published (the swap below is
-    // `Release`, and `main_stall_now` reads the root with `Acquire` before the
-    // stamp), so a reader never pairs this root with the previous beat's time.
-    // `max(1)` keeps 0 meaning "no beat yet".
+    // The heartbeat's timestamp, for `main_stall`, stamped before the root is published
+    // (the `Release` swap below; `main_stall_now` reads the root with `Acquire` first), so
+    // a reader never pairs this root with the previous beat's time. `max(1)` keeps 0
+    // meaning "no beat yet".
     turns.last_beat_ns.store(now_ns.max(1), Ordering::Relaxed);
     let previous = Breadcrumb::from_u8(main.breadcrumb.swap(bc as u8, Ordering::Release));
     let booked = turns.close(previous, now_ns);
@@ -1176,9 +1175,8 @@ fn enter_about_to_wait_in(main: &'static MainWatch) -> RootGuard {
 pub(crate) struct RootGuard {
     /// The watch the root was entered on.
     main: &'static MainWatch,
-    /// The park point the thread goes to as the handler returns, beaten on
-    /// drop (closing the handler's turn); `None`: the root's turn runs on to
-    /// the next root's beat.
+    /// The park point beaten on drop, as the handler returns (closing the handler's turn);
+    /// `None`: the root's turn runs on to the next root's beat.
     park: Option<Breadcrumb>,
 }
 
@@ -1698,16 +1696,9 @@ fn abort_on_stall() -> bool {
     seam().is_some_and(|v| v.eq_ignore_ascii_case("abort"))
 }
 
-/// Spawn the background stall sampler. Call once from `main` just before
-/// `run_app`. A no-op (spawns nothing) only when [`enabled`] is false — and
-/// [`enabled`] defaults TRUE, so a shipped binary DOES run this thread; what it
-/// pays is one wake per [`sample_interval`], which in a release build is half of
-/// [`RELEASE_STALL_THRESHOLD`] = 2.5 s. (This doc said "release binaries pay
-/// nothing" while the sampler woke four times a second in every shipped build;
-/// the 2026-09-22 efficiency audit measured it as the largest single source of
-/// aterm's kernel wakeups at rest.) No self-terminate handshake is needed — the
-/// process is exiting when this thread would otherwise notice, and it is a
-/// daemon by nature.
+/// Spawn the background stall sampler; call once, just before `run_app`. A no-op only when
+/// [`enabled`] is false, so a shipped binary runs it, at one wake per [`sample_interval`]
+/// (2.5 s in release). The thread needs no stop handshake: the process exits under it.
 ///
 /// `on_wall_moved` is called on this thread at each wake that finds the wall
 /// clock far ahead of the monotonic one ([`SamplerWake::wall_moved`]: the Mac
@@ -1763,12 +1754,9 @@ pub(crate) fn start(on_wall_moved: impl Fn() + Send + 'static) {
                 aterm_log::warn!("{line}");
             }
             if let Some(hit) = wake.hit {
-                // The phase and the locus are read AT the report, just after
-                // the sample that decided it. If the main thread beat in that
-                // instant they read the next root's; either way they describe
-                // the root the main thread is in now (a beat clears both). A
-                // nested phase that ended before the report reads as the phase
-                // around it.
+                // The phase and locus are read at the report, just after the sample that
+                // decided it, so they describe the root the main thread is in now (a beat
+                // clears both); a nested phase that ended first reads as the one around it.
                 let locus = if MAIN.returned.load(Ordering::Relaxed) {
                     Locus::Returned
                 } else {
@@ -1909,14 +1897,9 @@ mod tests {
         // The stale guard finds its announcement gone and restores nothing.
         drop(held);
         assert_eq!(phase_in(&PH), Phase::None);
-        // The wrong-work case the `PHASE` doc rules out: a beat between a
-        // NESTED guard's creation and its drop. The inner guard sampled the
-        // outer phase, and a plain store on drop would re-announce that outer
-        // phase into the new root — work the new root is not doing. The
-        // compare-exchange leaves the beat's clean slate alone, and so does
-        // the outer guard's drop after it. Unreachable today (neither
-        // `render_image` nor `ensure_pixel_backend` beats or parks); pinned
-        // so it stays a non-event if either ever does.
+        // A beat between a nested guard's creation and its drop: a plain store on drop
+        // would re-announce the outer phase into the new root; the compare-exchange leaves
+        // the beat's clean slate alone, and so does the outer guard's drop after it.
         beat_into(&watch, &turns, &PH, Breadcrumb::UserEvent, T0 + 2 * MS);
         let outer = announce(&PH, Phase::ImageCapture);
         let inner = announce(&PH, Phase::PixelBackendRedeem);
@@ -2177,9 +2160,9 @@ mod tests {
         assert!(Breadcrumb::from_u8(200).is_park_point());
     }
 
-    /// `about_to_wait`'s BODY is booked to `about_to_wait` and its wait never
-    /// is: a 2 ms settle is a turn, the ten idle minutes after it are not, and
-    /// the window's busy time is the sum of the turns booked in it.
+    /// `about_to_wait`'s body is booked to `about_to_wait` and its wait never is: a 2 ms
+    /// settle is a turn, the ten idle minutes after it are not, and the window's busy time is
+    /// the sum of the turns booked in it.
     #[test]
     fn the_about_to_wait_body_is_booked_and_the_wait_after_it_never_is() {
         const MS: u64 = 1_000_000;
@@ -2280,8 +2263,8 @@ mod tests {
         }));
     }
 
-    /// The guard `about_to_wait` holds stamps its body as the work root, and
-    /// the idle park point as it drops, with the root marked returned.
+    /// The guard `about_to_wait` holds stamps its body as the work root, and the idle park
+    /// point as it drops, with the root marked returned.
     #[test]
     fn about_to_wait_s_guard_parks_only_as_the_handler_returns() {
         static WATCH: MainWatch = MainWatch::new();
@@ -2517,7 +2500,7 @@ mod tests {
         assert!(line.contains("since `NewEvents` returned"), "{line}");
         assert!(line.contains("ON-CPU"), "{line}");
         assert!(!line.contains("while inside"), "{line}");
-        // A modal restores the OUTER root as still running.
+        // A modal restores the outer root as still running.
         {
             let _root = enter_in(&WATCH, Breadcrumb::UserEvent);
             drop(park_modal_in(&WATCH));

@@ -4,9 +4,7 @@
 
 //! Core terminal types: capabilities.
 
-// ============================================================================
 // Terminal Capabilities
-// ============================================================================
 
 /// Terminal capabilities query result.
 ///

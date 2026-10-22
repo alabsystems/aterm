@@ -731,19 +731,16 @@ mod non_macos {
         _proxy: &EventLoopProxy<Wake>,
         _wid: WindowId,
     ) -> Option<ToolbarHandle> {
-        // A fresh window has no synced tabs yet, so it carries the bare app name
-        // until `App::apply_title` takes over the live per-tab title.
+        // Until `App::apply_title` sets the live per-tab title.
         crate::elevated_caption::set_title(window, "aterm");
         Some(ToolbarHandle {
             chrome: RefCell::new(TabChrome::default()),
         })
     }
 
-    /// Store `titles` and the 0-based `active` index in the handle's [`TabChrome`],
-    /// so [`read_tab_chrome`] reports the live set.
-    ///
-    /// Does not set the window title: `App::apply_title` owns it. `_ids` is unused
-    /// off macOS (no native context menu) but keeps the signature uniform.
+    /// Store the synced tab set in the handle's [`TabChrome`] for
+    /// [`read_tab_chrome`]. The window title is `App::apply_title`'s; `_ids`
+    /// keeps the signature uniform (no native context menu off macOS).
     #[allow(
         clippy::too_many_arguments,
         reason = "the macOS strip's signature: every per-tab vector, the active index and the window's pill"
@@ -2171,8 +2168,8 @@ mod macos {
         /// ▽ inbound, hourglass both); `closable` (a non-closable tab keeps the close
         /// geometry but never reveals or dispatches it).
         metadata: Cell<TabStripMetadata>,
-        /// Whether the pointer is currently inside this tab (hover) — reveals the × on
-        /// an inactive tab. Toggled by the tracking-area enter/exit.
+        /// Whether the pointer is inside this tab, which reveals its ×. Toggled by
+        /// the tracking-area enter/exit.
         hovered: Cell<bool>,
         /// The mouse-down location in the tab's own coordinates, kept so `mouseDragged:`
         /// can measure horizontal travel and decide a reorder direction.
@@ -4978,7 +4975,7 @@ mod macos {
                     format!("{b}@:"),
                 ),
                 (NeedsPill::class(), sel!(dealloc), "v@:".into()),
-                // --- TabView, 13 methods + dealloc ---
+                // --- TabView (without `tabMenuUpgrade:`) ---
                 (TabView::class(), sel!(drawRect:), format!("v@:{rect}")),
                 (TabView::class(), sel!(mouseDown:), "v@:@".into()),
                 (TabView::class(), sel!(rightMouseDown:), "v@:@".into()),

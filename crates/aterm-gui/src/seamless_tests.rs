@@ -265,9 +265,8 @@ fn a_target_refused_after_a_passing_deferral_exits_75() {
             Some(EXIT_SUCCESSOR_PASSING),
             "{outcome:?}"
         );
-        // The same outcome, but the target was admitted or IS this build:
-        // nothing was refused because of it. And a parent that never said
-        // it reads 75 is owed the ending it has always filed.
+        // Admitted, or this build: nothing was refused because of it. A parent that
+        // never declared it reads 75 gets the ordinary ending.
         assert_eq!(passing_refusal_exit(&outcome, false, true, true), None);
         assert_eq!(passing_refusal_exit(&outcome, true, false, true), None);
         assert_eq!(passing_refusal_exit(&outcome, false, false, false), None);
@@ -1938,21 +1937,10 @@ fn a_refused_grid_write_carries_its_io_error_kind_out() {
     );
 }
 
-/// RECOVERABLE AUTHORITY GIVES WAY BEFORE CONTENT THAT IS LOST FOR GOOD
-/// (round eight of the update audit, U23's order, from the U2 group's
-/// review). One tab with a waiting post, one `--hold` pane, and 50,000
-/// carried connection rows from one source: the rows alone put the
-/// manifest past its cap, and leaving them out alone brings it under. They
-/// go, and the held pane's screen and the queued post cross. RED before
-/// the fix: the held pane was dropped (its placeholder shown) and the post
-/// retired dead `not-carried` first, both for good, and only then were the
-/// connections — which a `connect` makes again — left out, which alone
-/// would have fitted.
-///
-/// CONTROL: when the connections CANNOT cover what is over, the content
-/// that has to go anyway goes first, and the few connections the smaller
-/// excess leaves are kept: a post past the cap is shed, the peer's three
-/// rows cross, and nothing is left out for the Commit to audit.
+/// Recoverable authority gives way before content that is lost for good: when leaving out
+/// the connection rows alone brings the manifest under its cap, they go (`connect` makes
+/// them again) and the held pane and the queued post cross. Control: when they cannot
+/// cover the excess, the content that must go anyway goes first and they are kept.
 ///
 /// The rows left out are RETURNED, never audited by the writer (U23's
 /// review): the Commit audits each as dropped
@@ -2389,8 +2377,7 @@ fn final_exec_env_requires_valid_parent_authority() {
         vec![pair(ENV_PARENT_PID, "4242")]
     );
     // A birth witness republishes the record too, so the re-exec'd image can
-    // re-attest without a parent link — the property a LaunchServices
-    // successor depends on.
+    // re-attest without a parent link, as a LaunchServices successor must.
     let birth = ParentWitness::Birth(ProcessBirth {
         seconds: 17,
         microseconds: 42,
@@ -3553,7 +3540,6 @@ fn a_mismatched_commit_stops_the_successor_with_74() {
     );
 }
 
-// ======================================================================
 // THE HAPPY PATH. Until 2026-07 there was no test anywhere that a full
 // seamless handoff COMPLETES — every test proved a way for it to fail
 // closed, and the RFC said in as many words that the models prove safety
@@ -3561,7 +3547,6 @@ fn a_mismatched_commit_stops_the_successor_with_74() {
 // completed: not once, across three releases. These tests drive the real
 // handshake end to end and assert SUCCESS, plus the three ways it must
 // still fail closed.
-// ======================================================================
 
 /// One full outgoing-side preparation, ready to be consumed by the child
 /// half of the same process. `layout_wire_override` writes a DIFFERENT byte

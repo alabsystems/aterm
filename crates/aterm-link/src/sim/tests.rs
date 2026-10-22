@@ -2014,7 +2014,8 @@ fn an_ordered_write_reaches_the_media_before_every_later_one() {
 /// changed (the next boot's sweep is that one's). NEGATIVE CONTROLS
 /// ([`crate::state::StopRules`]): the record written first, the directories
 /// left unflushed, and the files left unflushed — each leaves a clean record
-/// over files the cut changed, at some seed.
+/// over files the cut changed, at some seed, where its sweep stops (all three
+/// were at seed 1, within 17 of the 744 kill points the law's own sweep takes).
 #[test]
 fn a_clean_stop_keeps_the_runs_files_exactly_under_its_record() {
     use crate::state::{StateDir, StopRules};
@@ -2030,8 +2031,11 @@ fn a_clean_stop_keeps_the_runs_files_exactly_under_its_record() {
     };
     for rule in ["", "record_last", "flush_dirs", "flush_files"] {
         let (mut clean, mut open, mut open_changed, mut broken) = (0u64, 0u64, 0u64, 0u64);
-        for seed in 1..=24u64 {
+        'sweep: for seed in 1..=24u64 {
             for kill_at in 0..=30u64 {
+                if !rule.is_empty() && broken > 0 {
+                    break 'sweep;
+                }
                 let dir = aterm_tempfile::Builder::new()
                     .prefix("sim-stop")
                     .tempdir_in("/tmp")
@@ -2103,6 +2107,191 @@ fn a_clean_stop_keeps_the_runs_files_exactly_under_its_record() {
     }
 }
 
+/// **AN OPEN ORDERED BY THE BARRIER KEEPS A CLEAN RECORD TRUE, WHEREVER A
+/// KILL AND A POWER CUT LAND** (B07: [`crate::state::StateDir::begin_run`]
+/// orders its OPEN by two barriers, the record's temp and the root, where it
+/// flushed both in full). A run of boot 1 writes a file of every kind a power
+/// cut may tear and stops cleanly. A second process then starts a run — in
+/// the same boot, over that clean stop (two full flushes), or in boot 2, over
+/// an earlier boot's (two barriers) — killed at each of its writes, between
+/// its rename and its root's barrier among them (the visible OPEN its
+/// successor must fence again, 768104f73e), or not at all. Its successor
+/// starts a run in that boot — in full over the second's visible OPEN, which
+/// may hide CLEAN after a failed publication, or by the barrier over an
+/// earlier boot's record where the kill came before the rename — and rewrites
+/// every one of those kinds with no flush, and the machine loses power on a
+/// tearing device. In the boot after, wherever `run` says the last run
+/// stopped cleanly, every one of those files holds exactly what the clean
+/// stop left: none torn, none of the successor's versions, no unlink
+/// undone. The law is exercised: clean records and open ones are both
+/// drawn, open ones over files the cut changed, and the successor's start
+/// ordered by the barrier. NEGATIVE CONTROLS
+/// ([`crate::state::StartRules`], for both starts): the OPEN published
+/// atomically with no flush, and its temp flushed by the barrier with no
+/// barrier on the root after the rename — each leaves a clean record over
+/// files the cut changed, at some seed.
+#[test]
+fn an_open_ordered_by_the_barrier_keeps_a_clean_record_true() {
+    use crate::state::{StartRules, StateDir};
+    let rules = |control: &str| match control {
+        "atomic" => StartRules {
+            flush_record: false,
+            flush_root: false,
+        },
+        "no_root" => StartRules {
+            flush_record: true,
+            flush_root: false,
+        },
+        _ => StartRules::ALL,
+    };
+    let boot = |n| crate::state::IncSeam {
+        boot: Some(Some(crate::durability::test_boot(n))),
+        off_volume: false,
+        kill_at: None,
+        mutant: 0,
+        span: None,
+    };
+    for control in ["", "atomic", "no_root"] {
+        let (mut clean, mut open, mut open_changed, mut broken, mut ordered) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
+        for reboot in [false, true] {
+            let b = if reboot { 2 } else { 1 };
+            for seed in 1..=16u64 {
+                for kill_at in 0..=5u64 {
+                    let dir = aterm_tempfile::Builder::new()
+                        .prefix("sim-start")
+                        .tempdir_in("/tmp")
+                        .expect("scratch");
+                    let root = dir.path();
+                    let mut device = Device::new(root);
+                    device.tears = true;
+                    let core = super::Core::new(
+                        seed,
+                        bus::Broker::new(Tier::Strict, Escalation::aterm()),
+                        device,
+                    );
+                    let on = |pid| {
+                        let process = super::Process::new(std::sync::Arc::clone(&core), pid);
+                        StateDir::open_on(root, crate::fx::Disk::Sim(process))
+                            .expect("the state dir on the device")
+                    };
+                    // BOOT 1: a run, stopped cleanly.
+                    let first = on(1);
+                    first.set_inc_seam(boot(1));
+                    first.begin_run().expect("boot 1's run");
+                    write_every_torn_kind(&first);
+                    first.end_run_clean().expect("its clean stop");
+                    drop(first);
+                    let left = torn_kinds_as_they_stand(root);
+                    if reboot {
+                        core.device.power_cut(&mut Rng::new(seed));
+                        assert_eq!(
+                            torn_kinds_as_they_stand(root),
+                            left,
+                            "a clean stop keeps its files across a reboot"
+                        );
+                    }
+                    // A SECOND PROCESS'S START, killed at its `kill_at`-th step.
+                    let second = on(2);
+                    second.set_inc_seam(boot(b));
+                    if kill_at > 0 {
+                        core.arm_kill(2, kill_at);
+                    }
+                    let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        second.begin_run_with(rules(control))
+                    }));
+                    match started {
+                        Err(payload) => {
+                            assert!(payload.is::<super::SimKill>(), "a real panic in the start");
+                        }
+                        Ok(began) => {
+                            began.expect("the second start");
+                        }
+                    }
+                    core.disarm_kill();
+                    drop(second);
+                    // ITS SUCCESSOR, in the same boot: a start, then every
+                    // torn kind rewritten with no flush.
+                    let successor = on(3);
+                    successor.set_inc_seam(boot(b));
+                    let began = successor
+                        .begin_run_with(rules(control))
+                        .expect("the successor's start");
+                    ordered += u64::from((began.ordered, began.full) == (2, 0));
+                    rewrite_every_torn_kind(&successor);
+                    core.device.power_cut(&mut Rng::new(seed * 64 + kill_at));
+                    let kept = torn_kinds_as_they_stand(root) == left;
+                    let next = StateDir::open(root).expect("the next boot's look");
+                    next.set_inc_seam(boot(b + 1));
+                    match next.last_run() {
+                        Ok(Some(run)) if run.clean => {
+                            clean += 1;
+                            broken += u64::from(!kept);
+                        }
+                        _ => {
+                            open += 1;
+                            open_changed += u64::from(!kept);
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "start, control {control:?}: {clean} clean, {broken} of them over files the cut \
+             changed; {open} open, {open_changed} of them over files the cut changed; {ordered} \
+             successors' starts ordered by the barrier"
+        );
+        if control.is_empty() {
+            assert_eq!(broken, 0, "a clean record over files the cut changed");
+            assert!(
+                clean > 0 && open > 0 && open_changed > 0 && ordered > 0,
+                "the law was exercised"
+            );
+        } else {
+            assert!(
+                broken > 0,
+                "CONTROL {control}: never a clean record over a change"
+            );
+        }
+    }
+}
+
+/// Every file kind a power cut may tear written AGAIN, as a run after a clean
+/// stop writes them, with no flush and none of the mirror's pin (whose first
+/// write in a StateDir open is durable, a full flush that would settle the
+/// start's order on its own): a new in-flight entry and an unlink of the
+/// clean stop's, a reservation rewritten, a second receipt's, a second key's
+/// and a refill floor rewritten.
+fn rewrite_every_torn_kind(st: &crate::state::StateDir) {
+    let pin = |seq| crate::state::PublishPin {
+        seq,
+        via_key: false,
+        identity: None,
+        original: None,
+        original_off: None,
+        owner: None,
+    };
+    st.set_in_flight(&crate::state::InFlight {
+        pin: pin(10),
+        subject: "/f/sim/in/n-1/s-a/n-1/note".to_string(),
+        body: b"v=1 t=6 text=again".to_vec(),
+        log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
+    })
+    .expect("a new in-flight entry");
+    st.clear_in_flight(7)
+        .expect("the clean stop's entry cleared");
+    st.set_post_pin("s-a", 1, &pin(11))
+        .expect("the reservation rewritten");
+    st.set_receipt_pin("s-a", 5, &pin(11))
+        .expect("a second receipt's");
+    st.set_key_seq("s-a", "k2", 11).expect("a second key's");
+    st.set_topic_floors(
+        "s-a",
+        &std::collections::BTreeMap::from([("t".to_string(), 3), ("u".to_string(), 5)]),
+    )
+    .expect("a refill floor rewritten");
+}
+
 /// **A DURABLE WRITE WHOSE FLUSH FAILED AFTER ITS RENAME IS NOT TRUSTED, AND
 /// IS WRITTEN AGAIN** (sim item S7). Its new version is what every reader of
 /// the dir sees, and the media may still hold the one before it; a write
@@ -2111,8 +2300,9 @@ fn a_clean_stop_keeps_the_runs_files_exactly_under_its_record() {
 ///
 /// * `run`: the start's record reads as this boot's run and is not taken for
 ///   one (main's per-open admission, `StateDir::begin_run`'s run fence), and
-///   the next `begin_run` writes it again — where after a record that
-///   finished it writes nothing (the control: the rewrite is the failure's);
+///   the next `begin_run` writes it again in full over this boot's visible
+///   OPEN — where after a record that finished it writes
+///   nothing (the control: the rewrite is the failure's);
 /// * `logfloor`: a floor raised with its flush failed covers no batch
 ///   (`StateDir::logfloor_admitted`), and a raise to below it writes it again,
 ///   as it stands; after that, a raise to below it writes nothing. A fresh
@@ -2165,10 +2355,15 @@ fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
         this_boots,
         "it reads as this boot's"
     );
-    assert_eq!(st.begin_run().unwrap().full, 2, "written again, durably");
+    let again = st.begin_run().unwrap();
     assert_eq!(
-        st.begin_run().unwrap().full,
-        0,
+        (again.ordered, again.full),
+        (0, 2),
+        "written again in full: visible OPEN does not prove what is on media"
+    );
+    assert_eq!(
+        st.begin_run().unwrap(),
+        crate::state::Flushed::default(),
         "CONTROL: a record that finished is not written again"
     );
     // A refused required directory barrier, or any other failure after the

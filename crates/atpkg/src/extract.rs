@@ -1316,8 +1316,7 @@ pub fn extract_tar_zst(
     max_total_bytes: u64,
     max_entries: u64,
 ) -> Result<(), ExtractError> {
-    // `fold = false`: the historical write-only extraction, with no content hashing and
-    // no per-file `fstat` — its callers want only the bytes on disk.
+    // `fold = false`: no content hashing and no per-file `fstat`.
     extract_stream(
         zstd_decoder(archive, FrameChecksum::IfPresent)?,
         dest_root,
@@ -1603,8 +1602,6 @@ fn write_capped(
         dest,
         mode,
     } = sink;
-    // One `Option` test per 64 KiB chunk when folding is off — unmeasurable next to the
-    // decompress and the write it sits between.
     let mut hasher = fold.then(crate::tree::BulkSha256::new);
     let mut len: u64 = 0;
     loop {
@@ -3765,9 +3762,8 @@ mod tests {
         std::fs::create_dir_all(dest_path.parent().unwrap()).unwrap();
         let payload = b"the binary";
         let w = stage_file(&payload[..], &dest_path, 0o755, 1 << 20).unwrap();
-        // The folded mode is the one requested on EVERY platform: read back on Unix,
-        // declared on Windows — a `0` here is the exact defect that made every Windows
-        // `claude` install fail its re-verify (2026-09-22).
+        // The folded mode is the one requested on every platform: read back on Unix,
+        // declared on Windows.
         assert_eq!(w.mode, 0o755, "the raw-binary lane folds mode 0755");
         let mut tree = TreeAccumulator::new();
         tree.record_file(b"bin/claude".to_vec(), w.mode, w.content_sha_hex);

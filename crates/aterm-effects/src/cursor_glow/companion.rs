@@ -77,10 +77,9 @@ impl CursorGlow {
             .map(|pulse| pulse.at)
     }
 
-    /// Read and clear the lossless cursor-cat motion pulse for this tick.
-    /// Unlike `Self::take_momentum_pulse`, this preserves the authenticated
-    /// forward/reverse fold shape so the placement layer never infers a wrap
-    /// from an arbitrary large cursor relocation.
+    /// Read and clear this tick's cursor-cat motion pulse, which keeps the
+    /// authenticated fold shape so the placement layer never infers a wrap from
+    /// a large cursor relocation.
     #[inline]
     #[must_use]
     pub fn take_cursor_cat_motion_pulse(&mut self) -> Option<CursorCatMotionPulse> {
@@ -155,10 +154,9 @@ impl CursorGlow {
     }
 
     /// The caret seam (§7.1): the instant a v2 meteor's frame-0 flare fired,
-    /// while its spring-snap relax is live; `None` otherwise and when v2 is
-    /// not engaged. The host copies it into
-    /// [`crate::cursor_rainbow::RainbowConfig::flare_at`]; v2 does not own
-    /// the block fill.
+    /// while its spring-snap relax is live; `None` otherwise or when v2 is not
+    /// engaged. The host copies it into
+    /// [`crate::cursor_rainbow::RainbowConfig::flare_at`].
     #[inline]
     #[must_use]
     pub fn caret_flare_at(&self) -> Option<Instant> {
@@ -183,11 +181,9 @@ impl CursorGlow {
     }
 
     /// The pet's one-shot: `true` exactly once per flow entry (the drain on
-    /// which [`rk::Flow::open`] first reads true), never on an exit. The host
-    /// drains it once per frame into
-    /// [`crate::kitty_pet::PetBrain::note_flow`]. An edge over the engine's
-    /// counter with one `bool` of memo: a run that opens, breaks and opens
-    /// again is two entries. It requests no frame and spawns nothing.
+    /// which [`rk::Flow::open`] first reads true), never on an exit; the host
+    /// drains it once per frame into [`crate::kitty_pet::PetBrain::note_flow`].
+    /// A run that opens, breaks and opens again is two entries.
     #[inline]
     pub fn take_flow_entry(&mut self) -> bool {
         let open = self.flow_status().open();

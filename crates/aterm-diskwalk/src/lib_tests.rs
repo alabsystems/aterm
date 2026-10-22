@@ -55,9 +55,7 @@ fn refused(path: &str) -> Option<Refusal> {
     refuse(None, Path::new(path), &table(), &deny())
 }
 
-// ---------------------------------------------------------------------------
 // The path test
-// ---------------------------------------------------------------------------
 
 #[test]
 fn every_privacy_protected_place_is_refused_before_any_syscall() {

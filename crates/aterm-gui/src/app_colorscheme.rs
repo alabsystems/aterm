@@ -61,7 +61,6 @@ pub(crate) fn theme_to_appearance(
 ) -> aterm_types::Appearance {
     match theme {
         Some(aterm_window::window::Theme::Light) => aterm_types::Appearance::Light,
-        // Dark, or an indeterminate OS appearance, both resolve to the engine default.
         Some(aterm_window::window::Theme::Dark) | None => aterm_types::Appearance::Dark,
     }
 }

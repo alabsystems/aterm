@@ -783,8 +783,8 @@ impl App {
                     indicators: crate::tab_model::TabIndicators {
                         dirty: presentation.indicators.dirty,
                         busy: presentation.indicators.busy,
-                        // A native leaf is the OUT-OF-BAND attention owner; it
-                        // has no session and therefore no classified status.
+                        // A native leaf owns out-of-band attention; with no
+                        // session it has no classified status.
                         attention: presentation.indicators.attention
                             || self.edit_view_attention(view),
                         status_attention: false,
@@ -1037,6 +1037,15 @@ impl App {
             return false;
         };
         self.open_system_state_tab_in_window(wid)
+    }
+
+    /// aterm ▸ System State… and its palette row (`MenuAction::SystemState`): what
+    /// `aterm ctl open app system-state` does ([`Self::open_app`]), with a refusal left
+    /// for `invoke` to report.
+    pub(crate) fn open_system_state_from_menu(&mut self) {
+        if let Err(why) = self.open_app(crate::app_control::OpenRequest::SystemState) {
+            self.pending_action_refusal = Some(why);
+        }
     }
 
     pub(crate) fn open_system_state_tab_in_window(&mut self, wid: WindowId) -> bool {
@@ -7468,6 +7477,43 @@ mod system_state_runtime_tests {
             "native opens and restore never create a PTY"
         );
         assert!(app.structural_invariants_ok());
+    }
+
+    /// aterm ▸ System State… (`MenuAction::SystemState`, the arm `dispatch_menu_action`
+    /// runs) opens the tab `open app system-state` opens, in the front window, over the
+    /// terminal it was chosen from; chosen again from another tab it brings that one tab
+    /// back rather than adding a second. With no front window it refuses in words, which
+    /// `invoke SystemState` reports instead of `invoked`.
+    #[test]
+    fn the_system_state_menu_row_opens_the_one_system_state_tab() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let front_kind = |app: &App| {
+            let (instance, _) = app.active_native_view(wid)?;
+            Some(app.native_runtime.app(instance)?.kind())
+        };
+        let terminal_only = app.windows[&wid].tab_set.len();
+        assert_eq!(front_kind(&app), None, "a terminal tab is in front");
+        app.open_system_state_from_menu();
+        assert_eq!(app.pending_action_refusal, None);
+        assert_eq!(
+            front_kind(&app),
+            Some(crate::native_app::AppKind::SystemState)
+        );
+        let opened = app.active_native_view(wid).unwrap();
+        assert_eq!(app.windows[&wid].tab_set.len(), terminal_only + 1);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        assert_eq!(front_kind(&app), Some(crate::native_app::AppKind::Settings));
+        app.open_system_state_from_menu();
+        assert_eq!(app.pending_action_refusal, None);
+        assert_eq!(app.active_native_view(wid), Some(opened));
+        assert_eq!(app.windows[&wid].tab_set.len(), terminal_only + 2);
+        assert!(app.structural_invariants_ok());
+
+        app.frontmost_window = None;
+        app.open_system_state_from_menu();
+        let refusal = app.pending_action_refusal.take().expect("no front window");
+        assert!(refusal.contains("System State"), "{refusal}");
     }
 
     #[test]

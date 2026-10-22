@@ -835,9 +835,10 @@ fn split_lines(text: &str) -> Result<Vec<String>, TextError> {
         .collect())
 }
 
-/// Lines joined by LF with a final LF (nothing for no lines).
-fn render_lines<'a>(lines: impl Iterator<Item = &'a str>) -> SecretBytes {
-    let mut out = Vec::new();
+/// Lines joined by LF with a final LF (nothing for no lines), in one buffer sized up front:
+/// one that grew would free each smaller block it outgrew, holding the text so far, unwiped.
+fn render_lines<'a>(lines: impl Iterator<Item = &'a str> + Clone) -> SecretBytes {
+    let mut out = Vec::with_capacity(lines.clone().map(|line| line.len() + 1).sum());
     for line in lines {
         out.extend_from_slice(line.as_bytes());
         out.push(b'\n');

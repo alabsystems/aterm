@@ -179,9 +179,7 @@ pub(crate) fn take_timer_resolves() -> usize {
     take(&TIMER_RESOLVES)
 }
 
-// ---------------------------------------------------------------------------
 // The strip's hovers, as pushed
-// ---------------------------------------------------------------------------
 
 thread_local! {
     /// Each window's tab hovers as its strip was last stamped
@@ -241,9 +239,7 @@ pub(crate) fn last_tooltips_pushed(window: crate::WindowId) -> Option<Vec<Option
     })
 }
 
-// ---------------------------------------------------------------------------
 // Heap allocations, per thread
-// ---------------------------------------------------------------------------
 
 thread_local! {
     /// Whether [`allocations_in`] is counting on this thread.
@@ -309,9 +305,7 @@ pub(crate) fn allocations_in<R>(f: impl FnOnce() -> R) -> (R, usize) {
     (out, ALLOCATIONS.with(|n| n.replace(0)))
 }
 
-// ---------------------------------------------------------------------------
 // The harness card and chips (`claude_card`, `claude_lights`)
-// ---------------------------------------------------------------------------
 
 thread_local! {
     /// Clock reads the harness's per-frame and per-wake paths made
@@ -701,9 +695,7 @@ pub(crate) fn take_footer_wakes_armed() -> usize {
     take(&FOOTER_WAKES_ARMED)
 }
 
-// ---------------------------------------------------------------------------
 // The renderer's (`aterm_render::test_counters`)
-// ---------------------------------------------------------------------------
 
 /// Window cell geometries the renderer derived off its primary face
 /// (`aterm_render::Renderer::cell_geometry` with none kept for the px): a

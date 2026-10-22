@@ -24,7 +24,7 @@
 //!   window still opens tabs; `aterm ctl` at the cap is answered, for a sent verb and for its
 //!   own discovery, and the drivers it displaced are the stalest. Until 2026-10-19 the
 //!   connection past the cap got the busy line for as long as the drivers stayed
-//!   (ATERM-KI-1015-13). At a cap of waits, where nothing gives way, the connection past it
+//!   . At a cap of waits, where nothing gives way, the connection past it
 //!   gets the busy line, and `aterm ctl` prints it for a sent verb and for its discovery.
 //! * `peers_that_stop_mid_exchange_take_no_lane`: peers that dialled and said nothing,
 //!   stopped half way through a request line or a frame's body, or did not read a large
@@ -485,7 +485,7 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
     roomy_test_process();
     let world = world("s");
     let sock = world.0.join("run/aterm/lanes.sock");
-    // The budget of the window the owner starts from the Dock.
+    // The budget of a window started from the Dock.
     let _instance = boot(&world.0, &sock, LAUNCHD_SOFT_LIMIT);
     let token = token(&sock);
 

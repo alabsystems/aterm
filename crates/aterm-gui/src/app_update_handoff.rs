@@ -722,7 +722,7 @@ pub(crate) fn commit_layout_topology(
 /// What the handoff layout's leaves carry of the supervisor host's agents, in layout
 /// order: each terminal leaf's session, the agent the successor relaunches there, the
 /// process it watches (pid and kernel start), and the host's word that the tab's agent
-/// cannot be brought back (LC-4 of ATERM-KI-1016-1). Compared at Commit apart from
+/// cannot be brought back (LC-4 of ). Compared at Commit apart from
 /// topology (`HandoffCommitFacts::exact_agent_carry`): it moves with nothing on screen
 /// moving (an agent crashing, a relaunch landing during the boot, a word ended as its
 /// conversation is held again), and a change missed here would be lost or decided twice.
@@ -5539,6 +5539,11 @@ impl App {
             .flatten()
     }
 
+    /// The capture ladder, under the park: every session's screen and as much scrollback as
+    /// the budgets allow, plus the control carry's head. Each session is carried at the most
+    /// faithful rung `caps` and `ceiling` admit, at worst blank, so `Err` is only timing,
+    /// storage, or a refusal about no single screen; the caller rolls the readers back on
+    /// `Err`.
     #[cfg(unix)]
     fn start_unix_update_handoff(
         &mut self,
@@ -8982,7 +8987,7 @@ impl App {
             crate::fabric_launch::bye_at_handoff(&self.store, attempt_id);
             // The person's stamps as they stand at the write, after the drain gate's last
             // dispatch of input, for the successor's Commit to carry (LC-4 of
-            // ATERM-KI-1016-1); removed below if the Commit fails.
+            // ); removed below if the Commit fails.
             let person_stamps = nonce
                 .as_deref()
                 .and_then(|nonce| self.write_person_stamps_at_commit(nonce));
@@ -9981,7 +9986,7 @@ impl App {
     /// readers, and owes every draft journal a re-seat (queued to the document worker: this
     /// half does no filesystem I/O), since a candidate that restored may have republished it.
     ///
-    /// IT NEVER WAITS ON AN ENGINE (ATERM-KI-1015-2, U44): a size whose engine another
+    /// IT NEVER WAITS ON AN ENGINE: a size whose engine another
     /// thread holds stays owed to the reader resume's retry
     /// ([`Self::reassert_owed_winsizes`]). The size reassert took each engine with a
     /// blocking lock while every reader was still parked, so a park that missed because
@@ -10021,7 +10026,7 @@ impl App {
 
     /// Puts each owed PTY back at its engine's size, never waiting on an engine: one
     /// another thread holds stays owed, and the reader resume's event-loop retry tries
-    /// it again (ATERM-KI-1015-2, U44's review). A blocking lock here waited the holder
+    /// it again (U44's review). A blocking lock here waited the holder
     /// out on the event loop, every reader still parked. `true` once none is owed; a
     /// session that closed, or whose master is another PTY now, is owed nothing.
     #[cfg(unix)]
@@ -12935,7 +12940,7 @@ mod rollback_winsize_tests {
         }
     }
 
-    /// A ROLLBACK NEVER WAITS ON AN ENGINE (ATERM-KI-1015-2, U44's review): a parked PTY
+    /// A ROLLBACK NEVER WAITS ON AN ENGINE (U44's review): a parked PTY
     /// whose engine another thread holds keeps the successor's size until the holder lets
     /// go, and the reader resume's retry puts it back then. The rollback took each engine
     /// with a blocking lock while every reader was still parked, so it returned only when

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! THE LANDING in the window (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-//! §9.4, FOREVER LAND): the three faces on the chip under Land and none under
+//! §9.4, Autopilot Land): the three faces on the chip under Land and none under
 //! Cruise or Off, the record of a landing and of nothing else, a proven
 //! self-claim's own landing and its reopening at anyone's later turn, and a
 //! person's own exchange typed through the App's input after a landing, read
@@ -362,7 +362,7 @@ fn ends(app: &App) -> crate::harness_ab::AbEnds {
 /// one `harness.landing.<sid>` record; unknown then landed again (a loop's
 /// restart restating it) leaves both at one; a person's exchange (`theirs`)
 /// counts nothing. The count is the record's rule (`is_an_end`), so the two
-/// agree. Under Cruise nothing is counted: FOREVER CRUISE ends nothing.
+/// agree. Under Cruise nothing is counted: Autopilot Cruise ends nothing.
 /// NEGATIVE CONTROL: a new task's landing (open between) is a second count
 /// and a second record.
 #[test]
@@ -906,7 +906,7 @@ fn a_persons_own_exchange_typed_into_the_app_after_a_landing_reads_task_theirs()
     assert_eq!(run(false), "open");
 }
 
-/// THE FACE A PROVEN SELF-CLAIM'S ACT TELLS (FOREVER LAND §10.4): its landing
+/// THE FACE A PROVEN SELF-CLAIM'S ACT TELLS (Autopilot Land): its landing
 /// `landed@v1` is `landed`, recorded by `meta set harness_act` alone; a point
 /// it left to a person's own exchange (`left-to-person@v1`, aterm's own
 /// loop's `LEFT` rule, recorded and never typed) is `theirs`; its re-exec
@@ -1002,7 +1002,7 @@ fn paint_claude(app: &App, session: u64, busy: bool) {
     term.process(bytes.as_bytes());
 }
 
-/// THE STATUS SWEEP REOPENS A PROVEN SELF-CLAIM'S LANDING (FOREVER LAND
+/// THE STATUS SWEEP REOPENS A PROVEN SELF-CLAIM'S LANDING (Autopilot Land
 /// §10.4): after the claim's `landed@v1`, the sweep that reads Claude Code
 /// busy — someone's later turn — makes the face `open`, through the sweep
 /// itself. NEGATIVE CONTROL: sweeps over Claude Code idle at its prompt
@@ -1074,7 +1074,7 @@ fn the_status_sweep_reopens_a_proven_self_claims_landing_at_a_later_turn() {
     host.shutdown_and_join();
 }
 
-/// THE WIRE OF A PROVEN SELF-CLAIM'S ACT (FOREVER LAND §10.4): `meta set
+/// THE WIRE OF A PROVEN SELF-CLAIM'S ACT (Autopilot Land): `meta set
 /// harness_act landed@v1` on the claim's own connection is recorded, the
 /// `meta` arm posts the face it tells, and — its wakes applied as the app
 /// loop applies them — `status task=` reads `landed`; the claim's next act
@@ -1157,7 +1157,7 @@ fn a_proven_self_claims_landed_act_on_the_wire_reads_task_landed_then_open() {
 }
 
 /// A PROVEN SELF-CLAIM'S OWN LANDING SHOWS, AND ANYONE'S LATER TURN REOPENS
-/// IT (FOREVER LAND §10.4): beside a proven self-claim the hosted loop tells
+/// IT (Autopilot Land): beside a proven self-claim the hosted loop tells
 /// no face (it only watches), the claim's `landed@v1` act makes the face
 /// `landed` — recorded once as a landing under Land — and its holder's quiet
 /// leaves it there; once someone else's turn begins (the agent reads busy)
@@ -1245,7 +1245,7 @@ fn a_proven_self_claims_landing_shows_and_anyones_later_turn_reopens_it() {
     host.shutdown_and_join();
 }
 
-/// A PROVEN SELF-CLAIM LANDS NOTHING UNDER CRUISE OR OFF (FOREVER CRUISE:
+/// A PROVEN SELF-CLAIM LANDS NOTHING UNDER CRUISE OR OFF (Autopilot Cruise:
 /// nothing ends a Cruise task): its `landed@v1` act, told as
 /// `HarnessFact::SelfTask(Landed)` while the session runs under Cruise or
 /// Off, leaves the face as it was — no `task=landed`, no landing recorded —

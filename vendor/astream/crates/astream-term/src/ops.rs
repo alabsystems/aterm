@@ -13,7 +13,7 @@
 //! op set is a lossless projection of the current fold's bounded subset, not of
 //! full xterm.
 
-use crate::screen::Color;
+use crate::screen::{Charset, Color};
 
 /// One normalized terminal operation: the top-level mutation a VT dispatch made.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +65,8 @@ pub enum ScreenOp {
         /// Resolved attribute bits.
         attrs: u8,
     },
-    /// Set/reset DEC private modes (cursor visibility, alternate screen).
+    /// Set/reset DEC private modes (cursor visibility, origin mode, alternate
+    /// screen).
     SetMode {
         /// The mode numbers.
         params: Vec<u16>,
@@ -86,6 +87,29 @@ pub enum ScreenOp {
         /// Bottom row of the region (0-based, inclusive).
         bottom: u16,
     },
+    /// Set (`true`) or reset insert mode (IRM, `CSI 4 h`/`l`).
+    SetInsertMode(bool),
+    /// Set (`true`) or reset newline mode (LNM, `CSI 20 h`/`l`). The carriage
+    /// return it adds to a line feed is its own [`ScreenOp::CarriageReturn`].
+    SetNewlineMode(bool),
+    /// Designate `charset` into G1 (`g1`) or G0 (`ESC ) F`, `ESC ( F`). A
+    /// [`ScreenOp::Print`] carries the glyph already translated; the
+    /// designation keeps the state a DECSC saves.
+    Designate {
+        /// G1 rather than G0.
+        g1: bool,
+        /// The set designated.
+        charset: Charset,
+    },
+    /// Map G1 (`g1`, SO) or G0 (SI) into GL.
+    LockShift {
+        /// G1 rather than G0.
+        g1: bool,
+    },
+    /// Scroll the region up `n` lines (`SU`); the cursor stays.
+    ScrollUp(u16),
+    /// Scroll the region down `n` lines (`SD`); the cursor stays.
+    ScrollDown(u16),
     /// Full reset (`RIS`).
     Reset,
     /// Resize the viewport to `(cols, rows)`.

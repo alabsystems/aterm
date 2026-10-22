@@ -29,7 +29,7 @@
 //!    answers, and where the bridge's one loop spent the window — blocked on
 //!    broker replies, on the verb lane, on state-dir writes, parked, woken —
 //!    counted inside the bridge by its wait-tally seam (`aterm_link::wait_tally`,
-//!    v=2); then a paced sub-phase, each round 20 ms after the last, so each
+//!    v=2); then a paced sub-phase, each ms after the last, so each
 //!    finds the loop idle (`paced=`, default 50). With `bystanders=N`, N idle
 //!    sessions beside the messaging and ping-pong worlds' two.
 //! 4. **attach time**: a bridge starting with N sessions (default 1, 8, 32),

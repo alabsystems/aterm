@@ -15,15 +15,19 @@
 //! plus bold/underline/reverse), the alternate screen (`?1049`/`?47`/`?1047`),
 //! cursor visibility (`?25`), save/restore cursor (DECSC/DECRC and `CSI s`/`u`,
 //! one slot per screen buffer as in xterm), the DEC scrolling region (`DECSTBM`),
-//! RIS, and inline [`Record::Resize`]. The scroll region is cross-validated
-//! against the production aterm engine (see `term.fold.scroll-region`).
+//! origin mode (DECOM, `?6`), insert and newline mode (IRM and LNM, `CSI 4 h`,
+//! `CSI 20 h`), scroll up and down
+//! (SU/SD, `CSI S`/`CSI T`), RIS, and inline [`Record::Resize`]. The scroll
+//! region is cross-validated against the production aterm engine (see
+//! `term.fold.scroll-region`).
 //!
 //! Everything else in the byte stream is **consumed, never painted**, following
 //! the ECMA-48 parser: OSC/DCS/APC/PM/SOS string sequences (window titles,
 //! OSC-133 shell marks, image payloads) are swallowed up to their terminator
-//! (`ESC \`, or BEL for OSC); two-byte escapes (`ESC ( B` charset designations,
-//! `ESC =`/`ESC >`) and CSI sequences outside the subset (any with an
-//! intermediate byte, or a private marker other than `?`) are skipped whole;
+//! (`ESC \`, or BEL for OSC); escapes outside the subset (charset
+//! designations other than the G0/G1 ones below, `ESC =`/`ESC >`) and CSI
+//! sequences outside it (any with an intermediate byte, or a private marker
+//! other than `?`) are skipped whole;
 //! truecolour SGR (`38;2;r;g;b`, `38:2::r:g:b`) is consumed *with* its
 //! sub-parameters and leaves the pen unchanged; DEL, and C1 controls arriving
 //! as UTF-8 (U+0080..U+009F), are ignored; malformed UTF-8 (overlong,
@@ -62,19 +66,50 @@
 //!   `srm_OPT_ALTBUF`, `srm_OPT_ALTBUF_CURSOR`), which resets the pending
 //!   wrap. The cursor is otherwise shared between the buffers and never moved
 //!   by a switch.
-//! * Character sets, origin mode, insert mode (IRM), left/right margins,
-//!   SU/SD and truecolour are not modelled (consumed and ignored). ICH/DCH/IL/DL
+//! * Left/right margins and truecolour are not modelled (consumed and
+//!   ignored). ICH/DCH/IL/DL
 //!   and ECH follow xterm's `InsertChar`/`DeleteChar`/`InsertLine`/
 //!   `DeleteLine`/`ClearRight`: each resets a pending wrap, IL/DL act only on a
 //!   cursor inside the scrolling region and move it to column 0, and every
 //!   vacated cell takes the bce blank.
+//! * **Origin mode** is xterm's `ORIGIN` flag read through `CursorSet`
+//!   (cursor.c): setting or resetting `?6` homes the cursor (to the top margin
+//!   when set), CUP/HVP and VPA count rows from the top margin and stop at the
+//!   bottom one, CHA keeps the cursor's row counted from the top margin
+//!   (`CursorRow`, never below 0), and DECSTBM homes to the top margin. A
+//!   restored cursor is `CursorSet` from the restored flags: under origin mode
+//!   its row stops at the bottom margin, not the top one. DECSC saves the
+//!   flag (`DECSC_FLAGS` holds `ORIGIN`), a restore of a slot never saved
+//!   clears it, and RIS clears it.
+//! * **Insert mode** (IRM, the ANSI mode 4) shifts the rest of the line right
+//!   before each glyph lands, as xterm's `WriteText` runs `InsertChar` first;
+//!   what passes the last column is lost. **Newline mode** (LNM, ANSI mode
+//!   20) makes LF, VT and FF return the carriage after the line feed, as
+//!   xterm's `CASE_VMOT` does under `LINEFEED` (IND and NEL are untouched).
+//!   DECSC saves neither mode; RIS clears both.
+//! * **SU/SD** (`CSI n S`, `CSI n T`) scroll the region up or down `n` lines
+//!   (xterm `xtermScroll`/`RevScroll`) wherever the cursor is, never move it,
+//!   and keep a pending wrap; lines scrolled in take the bce blank. As in
+//!   xterm's `CASE_TRACK_MOUSE`, only a lone nonzero (or defaulted) parameter
+//!   is SD: `CSI 0 T` and a `T` with more than one parameter start highlight
+//!   mouse tracking, which the fold consumes with no effect.
+//! * **Character sets**: G0 and G1, each ASCII (`ESC ( B`, `ESC ) B`) or DEC
+//!   Special Graphics (`ESC ( 0`, `ESC ) 0`, xterm's table in
+//!   [`dec_special_graphic`]), with SO/SI mapping G1/G0 into GL; a byte in
+//!   `0x20..=0x7E` paints the glyph GL's set gives it, and a decoded UTF-8
+//!   character paints itself. DECSC saves the sets and the shift, a restore
+//!   of a slot never saved resets them (xterm `resetCharsets`: ASCII in G0
+//!   and G1, G0 in GL), and RIS resets them. G2/G3, single shifts, the
+//!   national and 96-character sets are not modelled: their designations
+//!   are consumed and change nothing.
 //! * **One codepoint per cell**: an East Asian wide character takes one cell,
 //!   not two, and a combining (zero-width) mark takes a cell of its own.
 //! * DECSC/DECRC save and restore the cursor position (with a pending wrap)
 //!   and the SGR rendition, as xterm's `CursorSave`/`CursorRestore` do; a
 //!   restore from a slot never saved homes the cursor and resets the
-//!   rendition (xterm's zeroed `SavedCursor`). The charsets and origin mode
-//!   xterm also saves are not modelled. There is no scrollback, so `ED 3` (xterm's
+//!   rendition (xterm's zeroed `SavedCursor`). Origin mode is saved with them
+//!   (above), and so are the character sets (below). There is no
+//!   scrollback, so `ED 3` (xterm's
 //!   "erase saved lines", `do_erase_display` case 3) changes nothing here: the
 //!   visible screen is not saved lines.
 //! * **Resize clips/extends**; it does not reflow wrapped lines.
@@ -150,6 +185,87 @@ impl Cell {
     };
 }
 
+/// A 94-character set the fold can designate into G0 or G1 (SCS, `ESC ( F`
+/// and `ESC ) F`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Charset {
+    /// US ASCII (`F` = `B`): every byte is itself.
+    #[default]
+    Ascii,
+    /// DEC Special Graphics (`F` = `0`): `0x5F..=0x7E` are the line-drawing
+    /// and symbol glyphs ([`dec_special_graphic`]).
+    DecSpecial,
+}
+
+/// The glyph DEC Special Graphics draws for the ASCII byte `b`, as xterm's
+/// table has it (charsets.c; `_` is xterm's blank, where the DEC manual
+/// shows a no-break space). Every byte outside `0x5F..=0x7E` is itself.
+#[must_use]
+pub const fn dec_special_graphic(b: u8) -> char {
+    match b {
+        b'_' => ' ',
+        b'`' => '\u{25c6}',
+        b'a' => '\u{2592}',
+        b'b' => '\u{2409}',
+        b'c' => '\u{240c}',
+        b'd' => '\u{240d}',
+        b'e' => '\u{240a}',
+        b'f' => '\u{00b0}',
+        b'g' => '\u{00b1}',
+        b'h' => '\u{2424}',
+        b'i' => '\u{240b}',
+        b'j' => '\u{2518}',
+        b'k' => '\u{2510}',
+        b'l' => '\u{250c}',
+        b'm' => '\u{2514}',
+        b'n' => '\u{253c}',
+        b'o' => '\u{23ba}',
+        b'p' => '\u{23bb}',
+        b'q' => '\u{2500}',
+        b'r' => '\u{23bc}',
+        b's' => '\u{23bd}',
+        b't' => '\u{251c}',
+        b'u' => '\u{2524}',
+        b'v' => '\u{2534}',
+        b'w' => '\u{252c}',
+        b'x' => '\u{2502}',
+        b'y' => '\u{2264}',
+        b'z' => '\u{2265}',
+        b'{' => '\u{03c0}',
+        b'|' => '\u{2260}',
+        b'}' => '\u{00a3}',
+        b'~' => '\u{00b7}',
+        other => other as char,
+    }
+}
+
+/// The character-set state: what G0 and G1 hold, and which one GL maps
+/// (SI/LS0 maps G0, SO/LS1 maps G1). xterm's `resetCharsets` puts ASCII in
+/// every G-set and G0 in GL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Charsets {
+    g0: Charset,
+    g1: Charset,
+    /// GL is G1 (after SO), not G0.
+    shifted: bool,
+}
+
+impl Charsets {
+    /// The glyph an ASCII byte paints through GL.
+    const fn translate(self, b: u8) -> char {
+        let set = if self.shifted { self.g1 } else { self.g0 };
+        match set {
+            Charset::Ascii => b as char,
+            Charset::DecSpecial => dec_special_graphic(b),
+        }
+    }
+
+    /// One byte: G0's set, G1's, and the shift.
+    const fn encode(self) -> u8 {
+        (self.g0 as u8) | ((self.g1 as u8) << 1) | ((self.shifted as u8) << 2)
+    }
+}
+
 /// The current drawing pen (SGR state).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Pen {
@@ -159,12 +275,15 @@ struct Pen {
 }
 
 /// What DECSC saves (xterm `CursorSave2`, within this fold's state): the
-/// position, a pending wrap as `col == cols`, and the SGR pen.
+/// position, a pending wrap as `col == cols`, the SGR pen, origin mode, and
+/// the character sets (`sc->gsets`, `sc->curgl`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SavedCursor {
     row: u16,
     col: u16,
     pen: Pen,
+    origin: bool,
+    charsets: Charsets,
 }
 
 impl Pen {
@@ -204,6 +323,15 @@ pub struct Screen {
     /// Bottom row of the DEC scrolling region (`DECSTBM`), 0-based inclusive.
     /// `(scroll_top, scroll_bottom) == (0, rows-1)` means the full screen scrolls.
     scroll_bottom: u16,
+    /// Origin mode (DECOM, `?6`): cursor addressing counts from the top margin.
+    origin: bool,
+    /// Insert mode (IRM, ANSI mode 4): a glyph shifts the line right first.
+    insert: bool,
+    /// Newline mode (LNM, ANSI mode 20): LF, VT and FF also return the
+    /// carriage.
+    newline: bool,
+    /// G0, G1 and the GL shift.
+    charsets: Charsets,
 }
 
 /// Fold an ordered slice of records into the screen they produce.
@@ -327,6 +455,14 @@ impl Screen {
             alt_saved_cursor: None,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
+            origin: false,
+            insert: false,
+            newline: false,
+            charsets: Charsets {
+                g0: Charset::Ascii,
+                g1: Charset::Ascii,
+                shifted: false,
+            },
         }
     }
 
@@ -455,6 +591,31 @@ impl Screen {
             self.scroll_top,
             self.scroll_bottom,
         ));
+        // The state the fold gained after this encoding was fixed, written only
+        // when some of it is away from its reset value: every screen an earlier
+        // fold could make keeps its bytes (and its pinned hashes). It stays
+        // injective because everything above is self-delimiting (a decoder
+        // knows where it ends), so the trailer is either absent or starts with
+        // its own tag byte.
+        let modes = encode_modes_bytes(
+            self.origin,
+            self.insert,
+            self.newline,
+            self.saved_cursor.is_some_and(|s| s.origin),
+            self.alt_saved_cursor.is_some_and(|s| s.origin),
+        );
+        // The character sets in use and as each DECSC slot saved them (an
+        // empty slot reads as the reset sets, all zero).
+        let charsets = [
+            self.charsets.encode(),
+            self.saved_cursor.map_or(0, |s| s.charsets.encode()),
+            self.alt_saved_cursor.map_or(0, |s| s.charsets.encode()),
+        ];
+        if modes != MODES_AT_RESET || charsets != [0; 3] {
+            out.push(1);
+            out.extend_from_slice(&modes);
+            out.extend_from_slice(&charsets);
+        }
     }
 
     // --- internal mutators ------------------------------------------------
@@ -481,6 +642,13 @@ impl Screen {
         if self.col >= self.cols {
             self.col = 0;
             self.line_feed();
+        }
+        if self.insert {
+            // IRM: xterm's WriteText runs InsertChar before it writes, so
+            // the line shifts right under the glyph and what passes the last
+            // column is lost. The shift's blank is overwritten at once, so
+            // its colour never shows.
+            self.shift_right(1);
         }
         let i = self.idx(self.row, self.col);
         if let Some(slot) = self.grid.get_mut(i) {
@@ -595,6 +763,12 @@ impl Screen {
     /// of the line shifts right; what passes the last column is lost.
     fn insert_chars(&mut self, n: u16) {
         self.clear_pending_wrap();
+        self.shift_right(n);
+    }
+
+    /// The body of ICH: `n` bce blanks open at the cursor, which is on the
+    /// grid (no wrap pending), and the rest of the line shifts right.
+    fn shift_right(&mut self, n: u16) {
         let n = n.min(self.cols.saturating_sub(self.col)) as usize;
         let at = self.idx(self.row, self.col);
         let end = self
@@ -678,19 +852,73 @@ impl Screen {
     }
 
     /// `DECSTBM`: set the scrolling region to 0-based inclusive `[top, bottom]`
-    /// and home the cursor. As in xterm's `CASE_DECSTBM`, a `bottom` past the
-    /// screen means the last row, and a region that is empty after that clamp
-    /// (`top >= bottom`) is ignored entirely: neither the margins nor the cursor
-    /// change.
+    /// and home the cursor (to the new top margin under origin mode: xterm's
+    /// `CursorSet(screen, 0, 0, xw->flags)`). As in xterm's `CASE_DECSTBM`, a
+    /// `bottom` past the screen means the last row, and a region that is empty
+    /// after that clamp (`top >= bottom`) is ignored entirely: neither the
+    /// margins nor the cursor change.
     const fn set_scroll_region(&mut self, top: u16, bottom: u16) {
         let last_row = self.rows.saturating_sub(1);
         let bottom = if bottom < last_row { bottom } else { last_row };
         if top < bottom {
             self.scroll_top = top;
             self.scroll_bottom = bottom;
-            self.row = 0;
-            self.col = 0;
+            self.home();
         }
+    }
+
+    /// xterm's `CursorSet(screen, 0, 0, xw->flags)`: the top-left corner, or
+    /// the top margin's first column under origin mode. Resolves a wrap.
+    const fn home(&mut self) {
+        self.row = if self.origin { self.scroll_top } else { 0 };
+        self.col = 0;
+    }
+
+    /// The absolute row of row `rel` counted as cursor addressing counts it:
+    /// from the top margin and stopping at the bottom one under origin mode
+    /// (xterm `CursorSet`), from row 0 otherwise (where [`Self::move_to`]
+    /// clamps it to the screen).
+    const fn addressed_row(&self, rel: u16) -> u16 {
+        if self.origin {
+            let row = self.scroll_top.saturating_add(rel);
+            if row < self.scroll_bottom {
+                row
+            } else {
+                self.scroll_bottom
+            }
+        } else {
+            rel
+        }
+    }
+
+    /// The cursor's row as an addressing row: xterm's `CursorRow`, counted
+    /// from the top margin under origin mode and never below 0.
+    const fn cursor_row_addressed(&self) -> u16 {
+        if self.origin {
+            self.row.saturating_sub(self.scroll_top)
+        } else {
+            self.row
+        }
+    }
+
+    /// SU (xterm `xtermScroll`): the region scrolls up `n` lines, bce blanks
+    /// entering at its bottom. The cursor stays, and so does a pending wrap.
+    fn scroll_up_lines(&mut self, n: u16) {
+        let height = self
+            .scroll_bottom
+            .saturating_sub(self.scroll_top)
+            .saturating_add(1);
+        self.shift_up(self.scroll_top, n.min(height));
+    }
+
+    /// SD (xterm `RevScroll`): the region scrolls down `n` lines, bce blanks
+    /// entering at its top. The cursor stays, and so does a pending wrap.
+    fn scroll_down_lines(&mut self, n: u16) {
+        let height = self
+            .scroll_bottom
+            .saturating_sub(self.scroll_top)
+            .saturating_add(1);
+        self.shift_down(self.scroll_top, n.min(height));
     }
 
     const fn tab(&mut self) {
@@ -904,6 +1132,12 @@ impl Screen {
         for &p in params {
             match p {
                 25 => self.cursor_visible = set,
+                // DECOM: either way the cursor homes (xterm `srm_DECOM` runs
+                // `CursorSet(screen, 0, 0, xw->flags)` with the new flag).
+                6 => {
+                    self.origin = set;
+                    self.home();
+                }
                 // `?1049` is DECSC + switch + clear on set, switch + DECRC on reset
                 // (xterm `srm_OPT_ALTBUF_CURSOR`), each half unconditional but the
                 // switch: a second set clears again, a stray reset still restores.
@@ -939,6 +1173,27 @@ impl Screen {
                         self.leave_alt();
                     }
                 }
+                _ => {}
+            }
+        }
+    }
+
+    /// SCS: put `charset` in G1 (`g1`) or G0.
+    const fn designate(&mut self, g1: bool, charset: Charset) {
+        if g1 {
+            self.charsets.g1 = charset;
+        } else {
+            self.charsets.g0 = charset;
+        }
+    }
+
+    /// SM/RM (`CSI Pm h`/`l`, no private marker): the ANSI modes. IRM (4) and
+    /// LNM (20) are modelled; the rest are consumed.
+    fn set_ansi_mode(&mut self, params: &[u16], set: bool) {
+        for &p in params {
+            match p {
+                4 => self.insert = set,
+                20 => self.newline = set,
                 _ => {}
             }
         }
@@ -986,6 +1241,8 @@ impl Screen {
             row: self.row,
             col: self.col,
             pen: self.pen,
+            origin: self.origin,
+            charsets: self.charsets,
         };
         let slot = if self.altscreen {
             &mut self.alt_saved_cursor
@@ -995,10 +1252,14 @@ impl Screen {
         *slot = Some(saved);
     }
 
-    /// DECRC: restore the cursor and the pen from the active buffer's slot
-    /// without consuming it (a saved pending wrap is kept). With nothing saved
-    /// the cursor homes and the pen resets, per DEC STD 070 and xterm (whose
-    /// `CursorRestore` then reads a zeroed `SavedCursor`).
+    /// DECRC: restore the cursor, the pen and origin mode from the active
+    /// buffer's slot without consuming it (a saved pending wrap is kept). With
+    /// nothing saved the cursor homes, the pen resets and origin mode is off,
+    /// per DEC STD 070 and xterm (whose `CursorRestore` then reads a zeroed
+    /// `SavedCursor`). The position goes through `CursorSet` under the
+    /// restored flags, the row given relative to the top margin under origin
+    /// mode: xterm adds the margin back and clamps the sum to `[0, bottom
+    /// margin]`, so a row saved above the region stays where it was.
     const fn restore_cursor(&mut self) {
         let slot = if self.altscreen {
             self.alt_saved_cursor
@@ -1011,9 +1272,21 @@ impl Screen {
                 row: 0,
                 col: 0,
                 pen: Pen::reset(),
+                origin: false,
+                charsets: Charsets {
+                    g0: Charset::Ascii,
+                    g1: Charset::Ascii,
+                    shifted: false,
+                },
             },
         };
-        let last_row = self.rows.saturating_sub(1);
+        self.origin = saved.origin;
+        self.charsets = saved.charsets;
+        let last_row = if saved.origin {
+            self.scroll_bottom
+        } else {
+            self.rows.saturating_sub(1)
+        };
         self.row = if saved.row < last_row {
             saved.row
         } else {
@@ -1247,6 +1520,27 @@ pub const fn decode_scroll_region_bytes(raw: &[u8; 4]) -> (u16, u16) {
     (top, bottom)
 }
 
+/// Encode the modes the fold gained after its encoding was fixed: origin,
+/// insert and newline mode, then origin mode as each DECSC slot saved it (the
+/// main screen's, the alternate's; `false` for an empty slot).
+#[must_use]
+pub const fn encode_modes_bytes(
+    origin: bool,
+    insert: bool,
+    newline: bool,
+    main_saved_origin: bool,
+    alt_saved_origin: bool,
+) -> [u8; 2] {
+    [
+        (origin as u8) | ((insert as u8) << 1) | ((newline as u8) << 2),
+        (main_saved_origin as u8) | ((alt_saved_origin as u8) << 1),
+    ]
+}
+
+/// [`encode_modes_bytes`] of a screen with every one of those modes at its
+/// reset value: such a screen writes no trailer.
+const MODES_AT_RESET: [u8; 2] = encode_modes_bytes(false, false, false, false, false);
+
 /// Encode a `u32` length field in little-endian bytes.
 #[must_use]
 pub const fn encode_u32_le_bytes(v: u32) -> [u8; 4] {
@@ -1467,6 +1761,10 @@ struct Parser {
     /// The CSI is malformed or outside the subset (an intermediate byte, or a
     /// marker after parameters): its final byte dispatches nothing.
     csi_ignore: bool,
+    /// The first intermediate byte of the escape being read (`(` in
+    /// `ESC ( 0`), and whether a second one followed it.
+    esc_inter: u8,
+    esc_inter_more: bool,
     /// When `true`, each top-level dispatch records its [`ScreenOp`] into `ops`.
     /// Off for the normal fold; on only inside [`emit_ops`].
     recording: bool,
@@ -1480,6 +1778,8 @@ impl Parser {
             params: String::new(),
             marker: 0,
             csi_ignore: false,
+            esc_inter: 0,
+            esc_inter_more: false,
             recording: false,
             ops: Vec::new(),
         }
@@ -1517,9 +1817,15 @@ impl Parser {
             0x1b => self.state = State::Esc,
             // VT and FF are line feeds too (xterm `CASE_VMOT`: "form feed, line
             // feed, vertical tab" all take `xtermIndex`).
+            // Under LNM each also returns the carriage (`if (xw->flags &
+            // LINEFEED) CarriageReturn(xw)`).
             b'\n' | 0x0b | 0x0c => {
                 screen.line_feed();
                 self.rec(ScreenOp::LineFeed);
+                if screen.newline {
+                    screen.carriage_return();
+                    self.rec(ScreenOp::CarriageReturn);
+                }
             }
             b'\r' => {
                 screen.carriage_return();
@@ -1533,10 +1839,19 @@ impl Parser {
                 screen.backspace();
                 self.rec(ScreenOp::Backspace);
             }
+            // SO (LS1) maps G1 into GL, SI (LS0) maps G0 back.
+            0x0e | 0x0f => {
+                let g1 = b == 0x0e;
+                screen.charsets.shifted = g1;
+                self.rec(ScreenOp::LockShift { g1 });
+            }
             0x00..=0x1f | 0x7f => {} // other C0 controls and DEL: ignored
+            // A GL byte paints the glyph the set mapped into GL gives it; the
+            // op carries that glyph.
             0x20..=0x7e => {
-                screen.put(b as char);
-                self.rec(ScreenOp::Print(b as char));
+                let ch = screen.charsets.translate(b);
+                screen.put(ch);
+                self.rec(ScreenOp::Print(ch));
             }
             _ => self.begin_utf8(screen, b),
         }
@@ -1650,7 +1965,12 @@ impl Parser {
                 self.rec(ScreenOp::Reset);
                 self.state = State::Ground;
             }
-            0x20..=0x2f => self.state = State::EscIntermediate, // ESC ( B etc.
+            // ESC ( B etc.: remember the intermediate for the final byte.
+            0x20..=0x2f => {
+                self.esc_inter = b;
+                self.esc_inter_more = false;
+                self.state = State::EscIntermediate;
+            }
             0x1b => {} // ESC ESC: stay, treat the next byte as the escape
             0x18 | 0x1a => self.state = State::Ground, // CAN/SUB abort
             0x00..=0x1f => self.ground(screen, b), // a C0 control executes; the escape continues
@@ -1669,8 +1989,29 @@ impl Parser {
             0x1b => self.state = State::Esc,
             0x18 | 0x1a => self.state = State::Ground,
             0x00..=0x1f => self.ground(screen, b),
-            0x20..=0x2f | 0x7f => {}
-            0x30..=0x7e => self.state = State::Ground, // the final byte: consumed
+            0x20..=0x2f => self.esc_inter_more = true,
+            0x7f => {}
+            // The final byte. SCS into G0 (`ESC ( F`) or G1 (`ESC ) F`) of
+            // ASCII (`B`) or DEC Special Graphics (`0`) designates it; any
+            // other set, a G2/G3 or 96-character designation, a two-byte
+            // set name (`ESC ( % 5`) and every other escape with an
+            // intermediate is consumed, leaving the designations as they
+            // were (xterm ignores a set it cannot name).
+            0x30..=0x7e => {
+                self.state = State::Ground;
+                let charset = match b {
+                    b'B' => Some(Charset::Ascii),
+                    b'0' => Some(Charset::DecSpecial),
+                    _ => None,
+                };
+                if let (false, b'(' | b')', Some(charset)) =
+                    (self.esc_inter_more, self.esc_inter, charset)
+                {
+                    let g1 = self.esc_inter == b')';
+                    screen.designate(g1, charset);
+                    self.rec(ScreenOp::Designate { g1, charset });
+                }
+            }
             _ => {
                 self.state = State::Ground;
                 self.ground(screen, b);
@@ -1731,12 +2072,12 @@ impl Parser {
     }
 
     fn dispatch_csi(&mut self, screen: &mut Screen, final_byte: u8) {
-        // Which (marker, final) pairs the fold models: plain sequences (SM/RM
-        // `h`/`l` excepted), DEC private modes, and DECSED/DECSEL (`? J`/`? K`,
-        // which erase like ED/EL with no protected cells). `>`/`=`/`<`-marked
-        // sequences (XTMODKEYS `> Ps m`, tertiary DA, …) are consumed whole.
+        // Which (marker, final) pairs the fold models: plain sequences (the
+        // ANSI modes of SM/RM among them), DEC private modes, and DECSED/DECSEL
+        // (`? J`/`? K`, which erase like ED/EL with no protected cells).
+        // `>`/`=`/`<`-marked sequences (XTMODKEYS `> Ps m`, tertiary DA, …)
+        // are consumed whole.
         match (self.marker, final_byte) {
-            (0, b'h' | b'l') => return,
             (b'?', b'h' | b'l' | b'J' | b'K') | (0, _) => {}
             _ => return,
         }
@@ -1819,23 +2160,39 @@ impl Parser {
                 self.rec(ScreenOp::CursorUp(n));
                 self.rec(ScreenOp::CarriageReturn);
             }
+            // Absolute addressing is xterm's `CursorSet`: rows count from the
+            // top margin under origin mode, so the op records the absolute
+            // row the cursor went to.
             b'G' => {
-                let (r, _) = screen.cursor();
+                let r = screen.addressed_row(screen.cursor_row_addressed());
                 let c = csi_coord0(nums);
                 screen.move_to(r, c);
                 self.rec(ScreenOp::MoveTo(r, c));
             }
             b'd' => {
                 let (_, c) = screen.cursor();
-                let r = csi_coord0(nums);
+                let r = screen.addressed_row(csi_coord0(nums));
                 screen.move_to(r, c);
                 self.rec(ScreenOp::MoveTo(r, c));
             }
             b'H' | b'f' => {
-                let r = csi_coord0(nums);
+                let r = screen.addressed_row(csi_coord0(nums));
                 let c = csi_coord1(nums);
                 screen.move_to(r, c);
                 self.rec(ScreenOp::MoveTo(r, c));
+            }
+            b'S' => {
+                let n = csi_count0(nums);
+                screen.scroll_up_lines(n);
+                self.rec(ScreenOp::ScrollUp(n));
+            }
+            // xterm `CASE_TRACK_MOUSE`: a lone nonzero (or defaulted)
+            // parameter is SD; `CSI 0 T` or more than one parameter starts
+            // highlight mouse tracking, which paints nothing.
+            b'T' if nums.len() <= 1 && !matches!(nums, &[0]) => {
+                let n = csi_count0(nums);
+                screen.scroll_down_lines(n);
+                self.rec(ScreenOp::ScrollDown(n));
             }
             b'J' => {
                 let m = csi_mode0(nums);
@@ -1857,7 +2214,7 @@ impl Parser {
                     attrs: screen.pen.attrs,
                 });
             }
-            b'h' | b'l' => {
+            b'h' | b'l' if self.marker == b'?' => {
                 let set = final_byte == b'h';
                 screen.set_mode(nums, set);
                 if self.recording {
@@ -1865,6 +2222,16 @@ impl Parser {
                         params: nums.to_vec(),
                         set,
                     });
+                }
+            }
+            b'h' | b'l' => {
+                let set = final_byte == b'h';
+                screen.set_ansi_mode(nums, set);
+                if nums.contains(&4) {
+                    self.rec(ScreenOp::SetInsertMode(set));
+                }
+                if nums.contains(&20) {
+                    self.rec(ScreenOp::SetNewlineMode(set));
                 }
             }
             b'r' => {
@@ -1965,6 +2332,12 @@ pub fn apply_ops(cols: u16, rows: u16, ops: &[ScreenOp]) -> Screen {
             ScreenOp::SaveCursor => screen.save_cursor(),
             ScreenOp::RestoreCursor => screen.restore_cursor(),
             ScreenOp::SetScrollRegion { top, bottom } => screen.set_scroll_region(*top, *bottom),
+            ScreenOp::SetInsertMode(set) => screen.insert = *set,
+            ScreenOp::SetNewlineMode(set) => screen.newline = *set,
+            ScreenOp::Designate { g1, charset } => screen.designate(*g1, *charset),
+            ScreenOp::LockShift { g1 } => screen.charsets.shifted = *g1,
+            ScreenOp::ScrollUp(n) => screen.scroll_up_lines(*n),
+            ScreenOp::ScrollDown(n) => screen.scroll_down_lines(*n),
             ScreenOp::Reset => screen.reset(),
             ScreenOp::Resize(c, r) => screen.resize(*c, *r),
         }

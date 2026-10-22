@@ -2041,9 +2041,9 @@ fn the_lane_thread_is_raised_while_it_holds_the_first_run_and_rests_after() {
     .expect("the lane thread's assertions");
 }
 
-/// TC-5 — the lane starts before the event loop exists: what it posts meanwhile is
-/// delivered once the loop goes live, in order and once, and later posts go straight
-/// through behind them.
+/// The lane starts before the event loop exists: what it posts meanwhile is delivered once
+/// the loop goes live, in order and exactly once, and later posts go straight through behind
+/// them.
 #[test]
 fn lane_posts_before_the_loop_exists_are_delivered_when_it_goes_live() {
     use std::sync::Arc;
@@ -2103,10 +2103,9 @@ fn a_reader_posting_through_the_sink_is_accepted_then_answered_by_the_loop() {
     assert_eq!(delivered.load(Ordering::SeqCst), 3);
 }
 
-/// TC-5 — the row goes up ahead only for a first run this machine consents to and
-/// no pass has served yet: an empty consenting store; never a declined one, an
-/// `auto_install = false` one, one holding an ALab program, one a pass already
-/// reached the index for, or no store at all.
+/// The row opens ahead only for a first run this machine consents to and no pass has served:
+/// an empty consenting store, never a declined one, an `auto_install = false` one, one holding
+/// an ALab program, one a pass already reached the index for, or no store at all.
 #[test]
 fn the_first_run_row_opens_ahead_only_where_the_seed_will_adopt() {
     let dir = aterm_tempfile::tempdir().unwrap();

@@ -21,9 +21,7 @@ use std::path::{Path, PathBuf};
 /// Where the corpus lives, relative to this crate.
 const CORPUS: &str = "tests/testdata/vendor";
 
-// ---------------------------------------------------------------------------
 // Reading the corpus
-// ---------------------------------------------------------------------------
 
 /// One captured payload: the bytes, and where they came from.
 #[derive(Debug, Clone)]
@@ -107,9 +105,7 @@ fn collect(base: &Path, dir: &Path, out: &mut Vec<Fixture>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The replay
-// ---------------------------------------------------------------------------
 
 /// Full power over the commands the vendor really asked about. Every
 /// `PermissionRequest` payload carries the command its Bash box asked about;

@@ -361,7 +361,7 @@ fn status_rows_come_from_the_state_files_and_filter_by_tab() {
     assert_eq!(json.get("stalled").and_then(Value::as_str), Some("overdue"));
 }
 
-/// AN AFRESH MOVE'S ROW TAKES A WORD AND NAMES ITS MARK'S COMMAND (ATERM-KI-1016-1): the
+/// AN AFRESH MOVE'S ROW TAKES A WORD AND NAMES ITS MARK'S COMMAND: the
 /// upgrade's restart of a conversation nobody had asked anything
 /// (`relaunch::CAUSE_UPGRADE_FRESH`) is a row of the owner's view (`St::is_upgrade`), and its
 /// agent, ended and not brought back, is started again by hand with a plain `claude` — the tab
@@ -1511,7 +1511,7 @@ fn a_tab_whose_autopilot_is_off_reads_its_off_never_aterms_own_fault() {
 }
 
 /// AN AGENT THE UPGRADE ENDED IS SAID DOWN IN A TAB SET ASIDE TOO
-/// (ATERM-KI-1016-1, lifecycle-1; the rule decided 2026-10-18). Autopilot Off
+/// (lifecycle-1; the rule decided 2026-10-18). Autopilot Off
 /// and an agent's own switch set a move aside: one still owed there reads as
 /// held by them, quiet (above). A move that has already ended its agent is
 /// past setting aside: Off stops the tab's worker before its relaunch, the
@@ -1625,7 +1625,7 @@ fn an_agent_the_upgrade_ended_is_said_down_in_a_tab_set_aside_too() {
 }
 
 /// A RESTART'S AGENT NO LOOK SAW GONE IS READ GONE BY THE PROCESS TABLE
-/// (ATERM-KI-1016-1 lifecycle-5, found deciding lifecycle-1): the upgrade's
+/// (lifecycle-5, found deciding lifecycle-1): the upgrade's
 /// SIGTERM is recorded `Exiting` before it is sent, and only a look of the
 /// restart stamps the exit ([`St::seen_gone`]). One whose relaunch waited out
 /// its 30 s for a slow shutdown (`wait:exiting`) and whose tab then went
@@ -2317,7 +2317,7 @@ fn the_host_sends_its_tabs_rows_only_when_they_change() {
 /// withdraw stall rows. An unlistable state directory hands over nothing; an
 /// unreadable listed record never read, naming no tab it can be read for,
 /// hands over the rows that read with EVERY live tab left as it stands
-/// (ATERM-KI-1016-1: it handed over nothing, and every tab's rows stood for
+/// (it handed over nothing, and every tab's rows stood for
 /// as long as that record did); `--status` shows what reads. No directory at
 /// all is a look. The view names the directory it cannot list for as long
 /// as it cannot ([`View::unlisted`]: until then nothing was said to the
@@ -3416,7 +3416,7 @@ fn a_move_that_failed_after_its_exit_stands_with_no_holder() {
 const NEW: &str = "5eed0000-1111-2222-3333-444455556666";
 
 /// AN AGENT BACK IN ITS TAB LOWERS `agent-down`, WHATEVER CONVERSATION IT
-/// HOLDS (ATERM-KI-1015-1 LC-2): a move that started its agent afresh and
+/// HOLDS (LC-2): a move that started its agent afresh and
 /// could not bring it back says "Start Claude Code again in that tab with
 /// this command: claude", and the owner's `claude` there holds a NEW
 /// conversation — the row was lowered only by its own, so it stood for a day
@@ -3545,7 +3545,7 @@ fn a_claude_move_down_after_its_exit_is_lowered_by_any_agent_back_in_its_tab() {
     );
     // A VIEW STARTED AFRESH (aterm restarted inside the day the row is
     // shown) keeps what the last one saw, beside the records
-    // (ATERM-KI-1016-1's LC-2: it was that process's alone, and the row was
+    // ('s LC-2: it was that process's alone, and the row was
     // raised again over the tab whose owner acted); `--status`, a record,
     // lists it.
     let mut afresh = (View::default(), Vec::new());
@@ -5116,7 +5116,7 @@ fn a_quiet_wait_turns_a_fault_line_at_its_own_horizon() {
         ..row("box", 100 * 86_400)
     };
     assert_eq!(asked.attention(NOW), Attention::Quiet);
-    // NEGATIVE CONTROL: a row that names no record.
+    // Negative control: a row that names no record.
     let live = Row {
         minted_at: 0,
         ..row("box", 100 * 86_400)
@@ -5697,7 +5697,7 @@ fn next_attention_at_names_every_change_by_time() {
     assert!(rows > 500, "{rows} rows swept");
 }
 
-/// A MARK ON A TAB LEFT AS IT STANDS STAYS (ATERM-KI-1016-1): while a record
+/// A MARK ON A TAB LEFT AS IT STANDS STAYS: while a record
 /// this view never read cannot be read and names no tab — so every live tab
 /// is left as it stands ([`View::refresh_keeping`]) — a tab's mark this view
 /// raised is not lowered though its own record no longer wants it: what the
@@ -7030,7 +7030,7 @@ fn the_ask_count_survives_a_retarget_and_the_state_file() {
     assert_eq!(need.kind, "own-work");
     let more = row.more_lines(&need, NOW);
     assert!(more[0].contains(" 6 "), "{more:?}");
-    // NEGATIVE CONTROL: the conversation held by another process.
+    // Negative control: the conversation held by another process.
     let other = super::super::Proc {
         start: "Fri Oct  2 09:00:00 2026",
         started_s: NOW - 60,
@@ -7636,9 +7636,8 @@ fn a_build_that_fails_to_start_is_one_fault_per_build() {
     let row = held(TAB, "2.1.999");
     assert_eq!(row.interrupt(NOW), None);
     assert_eq!(row.cause_word(NOW), "build-fails");
-    // A round the build's hold STOPPED (`upgrade::build_hold`: it had asked
-    // its agent, released since) is the same fact while it rests: the same
-    // one fault, never a stop of its own to tell or an agent down.
+    // A round the build's hold stopped (`upgrade::build_hold`) is the same one fault while it
+    // rests, never a stop of its own or an agent down.
     let stopped = Row {
         phase: Phase::Failed(BUILD_FAILS.to_string()),
         wait: "failed".to_string(),
@@ -7651,7 +7650,7 @@ fn a_build_that_fails_to_start_is_one_fault_per_build() {
 }
 
 /// TWO MOVES OF ONE TAB BOTH REACH THE WINDOW, AND THE TAB'S ROW IS THE
-/// NEWER (ATERM-KI-1015-1 LC-9): a conversation's finished move stands its
+/// NEWER (LC-9): a conversation's finished move stands its
 /// ten minutes beside the newer conversation the tab runs now, whose own
 /// move failed after its exit, and the summary lists them by session id —
 /// so the window's first-row readers named the finished move half the time.
@@ -8079,7 +8078,7 @@ fn the_owners_word_lands_on_the_row_the_window_shows() {
 }
 
 /// A RESUME BY HAND CARRIES THE CLAUDE HOME ITS RELAUNCH LINE CARRIED
-/// (ATERM-KI-1015-1 LC-4): the row's command for an agent the upgrade ended
+/// (LC-4): the row's command for an agent the upgrade ended
 /// and could not start again is the line its relaunch planned — its
 /// `CLAUDE_CONFIG_DIR` and `HOME` exports in front, read among the words
 /// before the program — never its login nor the survey switch; told bare,
@@ -8165,7 +8164,7 @@ fn a_resume_by_hand_carries_the_claude_home_its_relaunch_line_carried() {
     );
 }
 
-/// LC-2 OF ATERM-KI-1015-1 — A FRESH AGENT IN THE TAB ENDS THE ALARM OF A
+/// LC-2 OF — A FRESH AGENT IN THE TAB ENDS THE ALARM OF A
 /// FRESH RESTART THAT STOPPED AFTER ITS EXIT: its agent-down row (`Start
 /// Claude Code again … claude`) asks the owner to start an agent in that
 /// tab; once a live Claude Code leads the tab again it is answered,
@@ -8253,7 +8252,7 @@ fn a_fresh_agent_in_the_tab_ends_the_alarm_of_a_move_that_stopped_after_its_exit
 }
 
 /// THE HOLDERS' READ NAMES THE AGENT LEADING A FRESH RESTART'S TAB,
-/// WHATEVER IT HOLDS (LC-2 of ATERM-KI-1015-1, through the real reads): a
+/// WHATEVER IT HOLDS (LC-2 of , through the real reads): a
 /// Claude Code whose conversation no record vets, leading the tab a fresh
 /// restart's failed move names, is a holder in that tab — what answers that
 /// move's alarm there ([`Row::held_again`]). NEGATIVE CONTROLS: with no
@@ -8545,7 +8544,7 @@ fn a_recorded_line_ending_cd_reads_to_its_end_and_the_view_stands() {
 /// its watch meanwhile was never watched — and the GUI host could only ask
 /// the whole view again later. Each record is read under its own catch now:
 /// the one that panics is left out, while every other record's watch is
-/// named and listed as ever — and its row handed over (ATERM-KI-1016-1: the
+/// named and listed as ever — and its row handed over (the
 /// look counted as not whole then, and every tab's rows and marks stood at
 /// the last whole look for as long as that record panicked). CONTROL: with
 /// no such record, the same look hands the same row.
@@ -8653,7 +8652,7 @@ fn an_agys_need_names_a_command_that_runs() {
 }
 
 /// A RECORD THAT CANNOT BE READ ANY MORE LEAVES ITS TAB AS IT STANDS
-/// (ATERM-KI-1016-1): once a record read at one look panics at the next (a
+/// : once a record read at one look panics at the next (a
 /// line this build cannot read written over it) or its file cannot be read,
 /// the look counted as not whole, so no tab's rows or marks were renewed for
 /// as long as it stood. Its tab is left as it stands now — the tab its text
@@ -8795,7 +8794,7 @@ fn a_record_that_cannot_be_read_any_more_leaves_its_tab_as_it_stands() {
 }
 
 /// A RECORD THIS LOOK CANNOT READ NEITHER RAISES NOR LOWERS ITS TAB'S MARK
-/// (ATERM-KI-1016-1 host-8, the review of its first cut): an `Exiting`
+/// (host-8, the review of its first cut): an `Exiting`
 /// record whose agent was gone ten seconds at the read, then unreadable — its
 /// file (read whole before) or its read panicking (never read) — while the
 /// relaunch landed and its process holds the conversation in the tab. Its
@@ -8959,7 +8958,7 @@ fn a_record_this_look_cannot_read_neither_raises_nor_lowers_its_tabs_mark() {
 }
 
 /// AN UNREAD RECORD NO TAB IS KNOWN FOR KEEPS ITS CONVERSATION'S TAB, AND IS
-/// SAID (ATERM-KI-1016-1 host-8, the review of its first cut): a listed
+/// SAID (host-8, the review of its first cut): a listed
 /// record that cannot be read at all (a link that loops; a root-owned file
 /// `sudo aterm …` wrote is the same) and that no look of this view read
 /// before names no tab. It kept EVERY live tab as it stands, no mark lowered

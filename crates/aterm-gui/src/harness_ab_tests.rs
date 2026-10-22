@@ -808,7 +808,7 @@ fn the_held_row_gives_way_to_the_lead_alone() {
 /// THE ENDS ROW (§11.6.1, §11.6.7): after Land, its parts only where they
 /// counted — Land's landings, the time from Land to landed with its n (`not
 /// enough yet (2)` under three) — and `none yet` with nothing to count.
-/// Under FOREVER CRUISE / FOREVER LAND a landing is the one end: no Cruise
+/// Under Autopilot Cruise / Land a landing is the one end: no Cruise
 /// done and no quiet end is ever named. NEGATIVE CONTROL: nothing counted
 /// reads no words, and the card says `none yet`.
 #[test]

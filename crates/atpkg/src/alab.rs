@@ -342,6 +342,120 @@ pub fn upstream_of_exe(exe: &Path) -> Option<Upstream> {
     upstream_of(&alab_root_of_exe(exe)?)
 }
 
+/// AN ATERM VERSION as the minimum-aterm pairing compares one ([`pairs_with`]):
+/// `(MAJOR, MINOR, PATCH)`, numerically. A dev build's `+g<sha>` and a pre-release tail are
+/// no part of it.
+pub type AtermVersion = (u64, u64, u64);
+
+/// The longest aterm version [`parse_aterm_version`] reads.
+const MAX_ATERM_VERSION_BYTES: usize = 64;
+
+/// `MAJOR.MINOR.PATCH`, with any `-<pre-release>` or `+<build>` tail ignored, as aterm writes
+/// its versions (`0.110.0`, a dev build's `0.110.0+g0123456789`): the three numbers, or
+/// `None` for any other shape.
+#[must_use]
+pub fn parse_aterm_version(text: &str) -> Option<AtermVersion> {
+    if text.len() > MAX_ATERM_VERSION_BYTES {
+        return None;
+    }
+    let core = text.split(['+', '-']).next()?;
+    let mut parts = core.split('.');
+    let mut number = || -> Option<u64> {
+        let part = parts.next()?;
+        if part.is_empty() || part.len() > 9 || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        part.parse().ok()
+    };
+    let version = (number()?, number()?, number()?);
+    parts.next().is_none().then_some(version)
+}
+
+/// `0.110.0`, as a line names an [`AtermVersion`].
+#[must_use]
+pub fn aterm_version_words(v: AtermVersion) -> String {
+    format!("{}.{}.{}", v.0, v.1, v.2)
+}
+
+/// What one `alab-build.json` says of the aterm its build needs: `"aterm": {"min":
+/// "0.110.0"}`. `Ok(None)` when the record names no `aterm`; `Ok(Some(_))` for that shape;
+/// `Err` for any other (an `aterm` that is no object, or whose `min` is no aterm version,
+/// [`parse_aterm_version`]): a pairing this client cannot read pairs with no aterm.
+///
+/// # Errors
+/// The record is not JSON, or names an `aterm` in another shape.
+pub fn parse_aterm_min(text: &str) -> Result<Option<AtermVersion>, String> {
+    let v: aterm_json::Value =
+        aterm_json::from_str(text).map_err(|_| "alab-build.json is not JSON".to_string())?;
+    let Some(aterm) = v.get("aterm") else {
+        return Ok(None);
+    };
+    aterm
+        .get("min")
+        .and_then(aterm_json::Value::as_str)
+        .and_then(parse_aterm_version)
+        .map(Some)
+        .ok_or_else(|| {
+            "alab-build.json names an aterm pairing in no shape this aterm reads (\"aterm\": \
+             {\"min\": \"MAJOR.MINOR.PATCH\"})"
+                .to_string()
+        })
+}
+
+/// THE ATERM THE ALAB PACKAGE AT `root` NEEDS: its record's `aterm.min` ([`parse_aterm_min`]),
+/// or `None` where the record names none, which pairs with every aterm.
+///
+/// NO DEFAULT FLOOR (review of parity-4, R3): a floor for records that name none would be
+/// judged only by an aterm that has this pairing, and every such aterm already has what the
+/// floor asked for: the act lease (`meta prepare harness_act`, bf9d401e40) came before the
+/// 0.110.0 bump (83a22b5ca9), and the pairing after it. An aterm from before the pairing
+/// reads no record at all, whatever it names. So the pairing refuses only where a build's
+/// record names an aterm newer than the one about to lay it: codex-alab's `alab-build.json`
+/// names `"aterm": {"min": …}` once a build needs a release past the first that pairs.
+///
+/// # Errors
+/// `root` is no ALab package ([`is_alab_package`]), its record cannot be read, or the record
+/// names a pairing in another shape.
+pub fn pairing_floor(root: &Path) -> Result<Option<AtermVersion>, String> {
+    if !is_alab_package(root) {
+        return Err("not an ALab package".to_string());
+    }
+    let text = crate::metadata_io::read_bounded_regular_utf8(
+        &root.join(ALAB_BUILD_JSON),
+        MAX_PACKAGE_JSON_BYTES,
+    )
+    .map_err(|e| format!("alab-build.json cannot be read: {e}"))?;
+    parse_aterm_min(&text)
+}
+
+/// THIS ATERM's version: the workspace's, which atpkg ships in. An unreadable one is
+/// `0.0.0`, which pairs with no ALab build.
+#[must_use]
+pub fn this_aterm() -> AtermVersion {
+    parse_aterm_version(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0, 0))
+}
+
+/// THE MINIMUM-ATERM PAIRING: whether the ALab package at `root` may be handed to an aterm at
+/// version `aterm` ([`pairing_floor`]): what the client's stage holds an ALab pack to before
+/// it is laid (`flow`'s pack gate), never the producer's (which pins a build for every aterm
+/// the index serves, its own version aside, and holds the record only to a shape this rule
+/// reads: `install::check_alab_pack`). A refusal keeps the build installed now.
+///
+/// # Errors
+/// Why not, in a line that names both versions.
+pub fn pairs_with(root: &Path, aterm: AtermVersion) -> Result<(), String> {
+    let needs = pairing_floor(root).map_err(|why| format!("alab pairing: {why}"))?;
+    let Some(needs) = needs.filter(|&needs| aterm < needs) else {
+        return Ok(());
+    };
+    Err(format!(
+        "alab pairing: this ALab build needs aterm {} or later; this aterm is {} (update aterm, \
+         then this build)",
+        aterm_version_words(needs),
+        aterm_version_words(aterm)
+    ))
+}
+
 /// The [`Upstream`] of the copy `program`'s managed shim runs ([`crate::which`]): its store
 /// build, or the package a dev link names. `None` for a program ALab does not build.
 #[must_use]

@@ -3501,9 +3501,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The render epoch (`crate::resize_epoch`): the engine's debt as one epoch.
-    // -----------------------------------------------------------------------
 
     /// A probe with the engine owing `shift` rows, the grid at `geom`.
     fn owing(ordinal: u64, content_seq: u64, shift: i32, geom: (u16, u16)) -> EngineProbe {

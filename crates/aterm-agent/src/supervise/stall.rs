@@ -485,8 +485,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         let reply = reply_line(&r);
         if r.is_err("restart unavailable") && !refusal_lifts(&r) {
-            // The server cannot carry the restart here: counted, and the
-            // warning said instead, naming what a person can do.
+            // The server cannot carry the restart here: counted, the warning said instead.
             self.stall_termed = true;
             let after = self.stall_host.as_ref().map_or(AfterRestart::Unknown, |h| {
                 h.resume_command()

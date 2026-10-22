@@ -1189,7 +1189,7 @@ pub fn harness_upgrade_work_end_model() -> Model {
 /// session moves onto the new login, relaunched at its wall (`Relaunch`) or at an idle point
 /// ahead of any wall (`Follow`).
 ///
-/// THE LOST LOGIN CARRIED (the owner's ruling of 2026-10-19, after v0.106.0 left one to them,
+/// THE LOST LOGIN CARRIED (the owner's , after v0.106.0 left one to them,
 /// silent: a one-row roster's login was waited at for a renewal nobody was asked for, and the
 /// wall over a finished task was never decided). Every lost login with no renewed one to follow
 /// — rostered or not — gets `/login` ONCE (`TypeLogin`), and the owner is told now (`TellNow`:

@@ -398,13 +398,13 @@ pub(crate) fn control_fence(
 /// cross-session arms).
 pub(crate) const KEY_USAGE: &str = "ERR usage: key [id=<epoch>:<producer>:<seq>] [if=<re>] \
                                     [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] \
-                                    [if-supervisor=<holder>] [unread=ok] <name> — enter tab esc space backspace delete \
-                                    up down left right home end pageup pagedown f1..f12 (opt \
-                                    +mods, e.g. ctrl+c)\n";
+                                    [if-supervisor=<holder>] [unread=ok] [<mod>+]<name|char> \
+                                    [mods=<list>] [type=press|repeat|release] [base=<c>] — \
+                                    names include enter tab esc space backspace delete insert \
+                                    up down left right home end pageup pagedown f1..f35 \
+                                    kp0..kp9; e.g. key ctrl+c, key y\n";
 
-// ---------------------------------------------------------------------------
 // `if=<re>`: the guarded press, one check-and-press under the terminal lock
-// ---------------------------------------------------------------------------
 
 /// The leading `k=v` options a `send`/`key`/`turn` line may carry, taken off the tail at
 /// the dispatch so every arm parses the tail without them.
@@ -445,10 +445,9 @@ pub(crate) struct LeadingInputOptions {
     /// `key`); the box's close reads it only from a proven author
     /// ([`aterm_slog::Actor::is_proven`]).
     pub act: Option<aterm_slog::ActWord>,
-    /// A leading option that was recognized but malformed (a guard with no
-    /// pattern, an option given twice). Carried rather than answered here so the
-    /// dispatch answers it AFTER the halt gate: a halted session must say
-    /// `ERR halted` whatever the rest of the line looks like.
+    /// A recognized but malformed leading option (a guard with no pattern, an option
+    /// given twice), answered by the dispatch after the halt gate, so a halted session
+    /// says `ERR halted` whatever the rest of the line is.
     pub refusal: Option<String>,
     /// `as=person` (a development seam, [`PERSON_SEAM`]): the write goes in as
     /// a PERSON's gesture, [`Source::Human`] through the App input seam
@@ -624,8 +623,8 @@ pub(crate) fn take_leading_options(class: Input, rest: &str) -> (LeadingInputOpt
         }
         if guarded && head.starts_with("if-seq=") {
             opts.refusal = Some(
-                "ERR usage: if-seq= is not a fence — seq= is per grid and repeats after an \
-                 alternate-screen re-entry; fence on if-gen=<status gen=>\n"
+                "ERR usage: if-seq= is not a fence (seq= repeats when an alternate screen is \
+                 re-entered); use if-gen=<status gen=>\n"
                     .to_string(),
             );
             cur = tail;
@@ -836,12 +835,10 @@ pub(crate) struct InputFence<'a> {
     /// The published foreground identity the decision belongs to. Checked
     /// after the terminal fence, with the timeline held through delivery.
     pub foreground: Option<&'a crate::session_timeline::ForegroundStamp>,
-    /// Match `guard` against the CURSOR's row only, not every visible row.
-    /// The guarded submit's binding: a composer holds the cursor, a select
-    /// box does not, and a transcript row that happens to match (Claude Code
-    /// draws earlier prompts with the composer's own `❯` at column 0) never
-    /// does — so an any-row guard such as `^❯` cannot vouch for an Enter
-    /// that an approval box would take as "Yes".
+    /// Match `guard` against the cursor's row only. A composer holds the cursor and a
+    /// select box does not, so a transcript row that matches (Claude Code draws earlier
+    /// prompts with the composer's `❯`) cannot vouch for an Enter an approval box would
+    /// take as "Yes".
     pub guard_at_cursor: bool,
     /// The worker's initial command still targets an input-ready shell
     /// block. Checked under the same terminal lock as the generation/write.
@@ -1083,10 +1080,9 @@ pub(crate) fn cmd_key_guarded(
     )
 }
 
-/// `key [if=<re>] [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] <name>`:
-/// the fenced press — [`cmd_key_guarded`] with every [`InputFence`]
-/// condition. A moved screen answers `OK skipped reason=changed`, a person
-/// who keyed since the read `OK skipped reason=person`; either writes nothing.
+/// `key [if=<re>] [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] <name>`: the
+/// fenced press. A moved screen answers `OK skipped reason=changed`, a person who keyed
+/// since the read `OK skipped reason=person`; either writes nothing.
 #[cfg(all(test, unix))]
 pub(crate) fn cmd_key_fenced(
     term: &Arc<Mutex<Terminal>>,
@@ -1188,9 +1184,9 @@ pub(crate) fn cmd_hwkey(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
         Ok(s) => s,
         Err(e) => return e,
     };
-    // ONE main-thread round trip for the window number, then nothing else touches
-    // the main thread: the posting loop must be able to run — and the posted keys
-    // must be able to wait — while that thread is parked inside `nextDrawable`.
+    // One main-thread round trip for the window number, then nothing else touches the
+    // main thread: the posting loop must run, and the posted keys wait, while that thread
+    // is parked inside `nextDrawable`.
     // A GATEWAY CARD (the palette, Overview, a tab menu) open on the window is
     // refused there too: the posted keys reach the person's own unmarked key
     // path, so they could press Take Over through it (`App::hwkey_target`).
@@ -1675,9 +1671,8 @@ pub(crate) fn apply_copy_on_select_policy(scope: super::Scope, ev: InputEvent) -
     }
 }
 
-/// The `paste` verb's event: its text ([`paste_text`]), framed at the drain.
-/// One builder for the verb and the fence that classifies it
-/// ([`control_press`]).
+/// The `paste` verb's event, framed at the drain: one builder for the verb and for the
+/// fence that classifies it ([`control_press`]).
 ///
 /// `paste <text>` writes `<text>` to the PTY exactly as if the user pasted it:
 /// [`Terminal::format_paste`] strips control bytes that could escape the guards
@@ -1954,10 +1949,8 @@ pub(crate) fn cmd_pane(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// PURE parser for `pointer [move <r> <c>|leave|status]`. `Err` is the exact usage
-/// or range line the verb replies with — an out-of-range cell is REFUSED here
-/// rather than clamped, so a caller is never told the pointer went where it asked
-/// when it went somewhere else.
+/// Pure parser for `pointer [move <r> <c>|click|leave|status]`. `Err` is the reply line;
+/// an out-of-range cell is refused, never clamped.
 const POINTER_MODS_USAGE: &str =
     "ERR usage: pointer mods <none|link|cmd|ctrl|alt|shift joined by +>\n";
 

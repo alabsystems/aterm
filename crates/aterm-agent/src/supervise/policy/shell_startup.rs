@@ -7,15 +7,27 @@
 //! options with no user alias or function; this module says where that model
 //! does not hold ([`read`], [`ShellStartup::admits`]).
 //!
-//! Claude Code writes a shell snapshot at session start
+//! Claude Code writes a shell snapshot
 //! (`<claude dir>/shell-snapshots/snapshot-<zsh|bash>-…sh`: the login shell's
-//! non-default options, functions and aliases) and runs every Bash command as
-//! `$SHELL -c 'source <snapshot> && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL
-//! && eval <command>'`, so what the snapshot carries is in force, as are
-//! `.zshenv`, `BASH_ENV`, `CLAUDE_ENV_FILE` and SessionStart hook env scripts.
-//! Snapshots are not named per session, so every snapshot of the Bash tool's
-//! shell ([`tool_kinds`]) is judged; with none, or one unreadable, the startup
-//! is unknown.
+//! non-default options, functions and aliases) when its Bash tool first runs
+//! in a session, and runs every Bash command as `$SHELL -c 'source <snapshot>
+//! && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL && eval <command>'`, so what
+//! the snapshot carries is in force, as are `.zshenv`, `BASH_ENV`,
+//! `CLAUDE_ENV_FILE` and SessionStart hook env scripts. Snapshots are not
+//! named per session, so every snapshot of the Bash tool's shell
+//! ([`tool_kinds`]) is judged; with none, or one unreadable, the startup is
+//! unknown.
+//!
+//! A SESSION'S FIRST BASH BOX THEREFORE HAS NO SNAPSHOT OF ITS OWN (MEASURED
+//! 2026-10-22, 2.1.308 in the real-Claude lab, its scratch Claude directory
+//! polled every millisecond, `docs/measured/breaker-transcript-and-zsh-2026-10-22.md`
+//! §F): no `shell-snapshots/` at session start, none through an Edit and a
+//! Write box and their answers, none while a first Bash box stood (1.7 s and
+//! 8 s); the folder and its one snapshot appeared 42 to 99 ms after that box
+//! was answered `Yes` (three runs), and a session ended by `/exit` had
+//! removed its own. The snapshot is written only once the box is answered, so it cannot
+//! be read by the box's settle: with no other session's snapshot of the same
+//! shell, the first box's startup is unknown and the box goes to a person.
 //!
 //! Every line fails ([`read`]) on an option outside the inert lists, a function
 //! the shell runs unasked ([`ALWAYS_RUN`]), a `.zshenv` that changes options or
@@ -28,9 +40,17 @@
 //! availability` line) are not read.
 //!
 //! Residuals: a `.zshenv` that sources nothing and names no option is taken as
-//! setting none; another session's snapshot of the same shell stands in for a
-//! missing one; a function named by an expansion is not seen (the line models
-//! approve no command named by an expansion).
+//! setting none; another session's snapshot of the same shell stands in for
+//! a missing one (a session's first Bash box while the same Claude directory
+//! holds one), whether that session is live or left it behind: Claude Code
+//! 2.1.308 removes a session's snapshot in a cleanup it registers at exit
+//! and otherwise only in its cleanup sweep of `shell-snapshots/` (`Xt`,
+//! beside its sweeps of other folders; read in the bundle's bytes), so a
+//! session killed or crashed leaves its own, which may be of an
+//! older shell startup than the one now in force, and `snapshots` reads
+//! every one with no check of its age or its session; a function named by an
+//! expansion is not seen (the line models approve no command named by an
+//! expansion).
 
 use std::path::{Path, PathBuf};
 
@@ -477,7 +497,8 @@ fn snapshots(claude: &Path, kinds: &[Kind]) -> Result<Vec<(Kind, PathBuf)>, Stri
     let names: Vec<&str> = kinds.iter().map(|k| k.name()).collect();
     let unknown = || {
         format!(
-            "no shell snapshot of {} in {}: the Bash tool's shell startup is unknown",
+            "no shell snapshot of {} in {}: the Bash tool's shell startup is unknown (Claude \
+             Code writes one only once its Bash tool has run in a session)",
             names.join(" or "),
             dir.display()
         )

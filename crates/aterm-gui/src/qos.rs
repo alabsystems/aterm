@@ -17,30 +17,10 @@
 //! `Interactive` and `Responsive` are an EEVDF slice request (see the Linux section
 //! below), and elsewhere a role is a no-op.
 //!
-//! Declaring the role makes the priority ORDER explicit and reviewable, instead
-//! of an accident of which threads happened to get a `pthread_set_qos_class`
-//! call. The scale is deliberately coarse — four roles, chosen by asking "who is
-//! waiting for this?" — because a finer one invites per-thread tuning that no
-//! one can reason about globally.
-//!
-//! Call sites stay platform-neutral: on macOS a role is a QoS class, on Linux
-//! (x86_64/aarch64) the two roles at or above the UI thread are an EEVDF slice
-//! request (see "LINUX" below), and everywhere else a role is a no-op.
-//!
-//! PROVENANCE. This module is a HAND-PORT of commit `61a6c8b62`
-//! (`fix/event-loop-wake-spin-v2`, 2026-08-11), which found thread QoS to be
-//! the second cause of the measured keystroke-dequeue lag: 41 named threads,
-//! 2 declaring a class. It is a port and not a merge because main moved ~2100
-//! commits past that branch's base before it could land, so no hunk of it
-//! applies textually. The enum, its class mapping and `set_self` are carried
-//! over verbatim; the docs gain the port-time floor rule below and the tests
-//! gain one extra rank assertion; each worker's role is re-derived against
-//! today's spawn site. One rule was added at port time
-//! that the branch only applied to `aterm-scrollback-compress`: a worker that
-//! initialises or holds a lock the UI thread contends (a `Mutex`, or a
-//! `OnceLock` the UI thread's own first use would block on) is NOT demoted
-//! below [`Role::Responsive`], because a descheduled lock holder at a lower
-//! class is a priority inversion — the one hazard a QoS port can introduce.
+//! A worker that initialises or holds a lock the UI thread contends (a `Mutex`, or a
+//! `OnceLock` the UI thread's own first use would block on) is never demoted below
+//! [`Role::Responsive`]: a descheduled lock holder at a lower class is a priority
+//! inversion.
 //!
 //! NO WORK INTERVAL (LAG-12, 2026-10-19; LAG-13, 2026-10-20). No role here, and
 //! no `os_workgroup` interval either, lifts a spawn out of the idle slow clock.
@@ -446,7 +426,6 @@ pub(crate) fn slice_of_self() -> Option<(u64, u64)> {
         .map(|attr| (attr.sched_runtime, attr.sched_flags))
 }
 
-// ---------------------------------------------------------------------------
 // CHILD PROCESSES. A role is a THREAD attribute, and it stops at the spawn.
 //
 // Measured 2026-09-15 on macOS: a thread at UTILITY (`ps` pri 20) or BACKGROUND
@@ -458,7 +437,6 @@ pub(crate) fn slice_of_self() -> Option<(u64, u64)> {
 // as an equal of the foreground TUI: the thread yielded, and the process doing
 // the actual CPU work did not. Nothing in aterm attributes the lost time either,
 // because the starved party is a sibling process aterm launched.
-// ---------------------------------------------------------------------------
 
 /// macOS's QoS launcher — the one `aterm-verify` wraps compile-only children in.
 /// Absent elsewhere, where a [`command`] child runs as is.
@@ -804,10 +782,6 @@ mod tests {
             }
         }
     }
-
-    // -----------------------------------------------------------------------
-    // WHAT THE SCHEDULER ACTUALLY SEES
-    // -----------------------------------------------------------------------
 
     /// A [`Boost`] raises the worker's base priority while it stands and puts
     /// it back when it drops, read off the kernel's own record of the thread

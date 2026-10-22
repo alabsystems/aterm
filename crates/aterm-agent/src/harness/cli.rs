@@ -126,9 +126,7 @@ use crate::supervise::run::{Ctl, Session};
 use crate::supervise::transport::{Endpoint, RelayCtl};
 use crate::supervise::{SupervisorConfig, approvals, limit};
 
-// ---------------------------------------------------------------------------
 // Constants
-// ---------------------------------------------------------------------------
 
 /// The harness name, which is also the state directory's name (design §1.3).
 pub const HARNESS: &str = "claude-harness";
@@ -1057,9 +1055,7 @@ it names: pressed after the upgrade moved on to a newer one, nothing is
 written.
 ";
 
-// ---------------------------------------------------------------------------
 // Injected environment
-// ---------------------------------------------------------------------------
 
 /// The variable [`Env::from_process`] reads the owner's home from: the one the
 /// agents read theirs from ([`accounts::HOMEDIR_ENV`]; `USERPROFILE` on
@@ -1267,9 +1263,7 @@ impl Env {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The grammar
-// ---------------------------------------------------------------------------
 
 /// Which ledger `ledger` reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2072,9 +2066,7 @@ pub fn parse_defer(v: &str) -> Result<u64, String> {
     Ok(secs)
 }
 
-// ---------------------------------------------------------------------------
 // usage
-// ---------------------------------------------------------------------------
 
 /// How many directory entries the transcript search looks at: a fence against
 /// a project directory that holds something other than one file per session.
@@ -2626,9 +2618,7 @@ fn run_codex_usage(env: &Env, thread: &str, json: bool, out: &mut dyn Write) -> 
     ExitCode::SUCCESS
 }
 
-// ---------------------------------------------------------------------------
 // limits
-// ---------------------------------------------------------------------------
 
 /// What one screen read says about a limit: the wall the worker's last turn
 /// ended on, read by the tab's own reader ([`aterm_phase::identify`]: the
@@ -2945,9 +2935,7 @@ fn run_limits(
     run_limits_with(&mut ctl, env, sid, limit::tz_offset_s(), json, out, err)
 }
 
-// ---------------------------------------------------------------------------
 // disk
-// ---------------------------------------------------------------------------
 
 /// The folders tier 3's clause 5 reads under `home` ([`disk::idle::link_dirs`]),
 /// atpkg's own `bin/` among them.
@@ -3058,11 +3046,10 @@ fn disk_roots(env: &Env, targets: &[PathBuf]) -> disk::Roots {
     }
 }
 
-/// The `[disk]` knobs that govern a removal. A value of one that this
-/// reader cannot read turns every removal off ([`removal_off`]): what the
-/// owner meant by it is unknown, and a reading that removes nothing cannot
-/// remove against them. `warn_free_gib` words a warning and removes nothing,
-/// so an unreadable value of it is its default.
+/// The `[disk]` knobs that govern a removal. A value of one this reader cannot
+/// read turns every removal off ([`removal_off`]): what the owner meant is
+/// unknown. `warn_free_gib` only words a warning, so an unreadable value of it
+/// is its default.
 const DISK_REMOVAL_KEYS: [&str; 6] = [
     "apply",
     "target_stale_days",
@@ -3643,8 +3630,8 @@ pub fn disk_tick(
     )
     .unwrap_or_default();
     let done = disk::Applied { unfinished, ..done };
-    // A build directory is named only while it is there: one SEEN gone
-    // (`NotFound`) holds nothing. One that cannot be looked at stays named.
+    // A build directory is named only while it is there: one seen gone
+    // (`NotFound`) holds nothing; one that cannot be looked at stays named.
     let there = |p: &Path| {
         !std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
     };
@@ -4048,7 +4035,7 @@ thread_local! {
 }
 
 /// `aterm harness disk` (design §5.5). Report-only unless a class is named
-/// AND `disk.apply` is on; every refusal becomes a denial row.
+/// and `disk.apply` is on; every refusal becomes a denial row.
 ///
 /// The whole verb runs with the system's error boxes off
 /// ([`aterm_sysprobe::quiet_errors`], the caller's mode restored as it
@@ -4361,9 +4348,7 @@ fn run_disk(
     ExitCode::SUCCESS
 }
 
-// ---------------------------------------------------------------------------
 // ledger
-// ---------------------------------------------------------------------------
 
 /// The newest `max` lines of the JSONL file at `path`, streamed through a ring
 /// of at most [`READ_MAX_ROWS`] so the file is never held whole. A missing
@@ -4396,14 +4381,11 @@ pub fn tail_lines(path: &Path, max: usize) -> io::Result<Vec<String>> {
     Ok(ring.into_iter().collect())
 }
 
-/// Cut the journal at `path` back to its newest `keep` rows once it is larger
-/// than `max_bytes`, so it stays within `max_bytes` plus one run's rows. The
-/// rows are streamed through [`tail_lines`]' ring (never read whole), written
-/// to a sibling `.tmp` file (`0600`) and renamed over the journal, so a reader
-/// sees the old file or the cut one and never half of either. A missing or
-/// small file is left alone. Two `disk` runs cutting at once can lose the
-/// rows the other appended between its read and its rename; each run's own
-/// report row is appended after its cut.
+/// Cut the journal at `path` back to its newest `keep` rows once it is larger than `max_bytes`.
+/// The rows stream through [`tail_lines`]' ring into a sibling `.tmp` file (`0600`) renamed over
+/// the journal, so a reader sees the old file or the cut one, never half of either. A missing or
+/// small file is left alone. Two runs cutting at once can lose the rows the other appended
+/// between its read and its rename; each run appends its own report row after its cut.
 ///
 /// # Errors
 ///
@@ -4434,7 +4416,7 @@ pub type LedgerCut<'a> = dyn Fn(&mut dyn Iterator<Item = String>, &dyn Fn(&Path)
 /// it read by the reader `cut` is handed. A missing or small file is left
 /// alone. The rows are streamed from one held descriptor, so large files of
 /// individually bounded rows can be cut (the 171 MB journal an older build
-/// wrote, ATERM-KI-1016-1). The approval cut's held-byte limit also bounds one
+/// wrote). The approval cut's held-byte limit also bounds one
 /// row (including its line ending) and the total predecessor input.
 /// A file that changes while it is read, is no regular file or holds a row
 /// that is not UTF-8, a cut that leaves rows unread or keeps the file, and a
@@ -4784,9 +4766,7 @@ fn run_ledger(
     ExitCode::SUCCESS
 }
 
-// ---------------------------------------------------------------------------
 // upgrade
-// ---------------------------------------------------------------------------
 
 /// The step a hand-run `upgrade` answers while `[harness] enabled` reads off
 /// ([`upgrade_pass`]), kept stable so scripts that key on it still read it.
@@ -4874,7 +4854,6 @@ fn run_upgrade_models(
         usage_credits: SupervisorConfig::from_path(env.config.as_deref())
             .0
             .usage_credits,
-        // Reads the list, or writes it: no line is typed.
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Machine,
         agents_off: Vec::new(),
@@ -4953,9 +4932,6 @@ fn upgrade_opts(
         // `[harness] usage_credits`: off, no session is moved onto a model
         // the account bills to usage credits.
         usage_credits: policy.usage_credits,
-        // `[harness] usage_tap`, under the master switch: a relaunch line
-        // this pass types carries the tap where its gate holds — on the
-        // login of the machine's one account too.
         usage_tap: (policy.enabled && policy.usage_tap)
             .then(super::tap::stable_exe)
             .flatten()
@@ -5339,9 +5315,7 @@ fn upgrade_line_with(
     );
 }
 
-// ---------------------------------------------------------------------------
 // accounts
-// ---------------------------------------------------------------------------
 
 /// What `accounts use` says once the owner's word is recorded. A window's
 /// supervisor reads the pin at each hosted session's turn end
@@ -8260,9 +8234,7 @@ fn stats_label(env: &Env, key: Option<profile::AccountKey>) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The retired verbs, and the router
-// ---------------------------------------------------------------------------
 
 /// The front door's answer to a retired verb, with stdin injected: from a
 /// pipe `hook`/`statusline` drain the payload to its end and say nothing;

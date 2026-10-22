@@ -8,8 +8,8 @@
 //! A request belongs to the leg its first `LEG-<name>` user text names
 //! ([`leg_of`]), and is at the STEP its last user text says ([`step_of`]):
 //! the person's own prompt, or the act codex-alab typed, told by aterm's own
-//! words — the texts `harness policy` hands codex-alab (FOREVER CRUISE /
-//! FOREVER LAND, the codex-alab contract's §3): Cruise's continuation
+//! words — the texts `harness policy` hands codex-alab (Autopilot Cruise /
+//! Autopilot Land, the codex-alab contract's §3): Cruise's continuation
 //! ([`CONTINUE_TEXT`]), its defend-and-find-more prompt ([`DONE_CHECK`]),
 //! Land's instruction ([`LAND`]), its nudge ([`LAND_NUDGE`], counted over the
 //! conversation) and its answer ([`LAND_ANSWER`]). A word an older codex-alab
@@ -110,7 +110,7 @@ pub const RESETS_IN_S: i64 = 5;
 pub const NUDGES_BEFORE_DEFENSE: usize = 4;
 
 /// The first leg's reply: the retired token alone, a done claim and nothing
-/// more (FOREVER CRUISE: it ends nothing).
+/// more (Autopilot Cruise: it ends nothing).
 pub const FIRST_DONE: &str = "Hello from the lab model. Nothing else to do.\n\nATERM-TASK-DONE";
 
 /// A Cruise leg's answer to the defend-and-find-more prompt: a defense that

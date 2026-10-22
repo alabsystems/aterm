@@ -26,7 +26,7 @@ fn fuzz_advance_never_panics() {
         let len = (next() % 64) as usize;
         let input: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
         parser.advance_fast(&input, &mut sink);
-        // Occasionally reset to also cover fresh-state entry paths.
+        // Fresh-state entry paths too.
         if next() % 101 == 0 {
             parser.reset();
         }

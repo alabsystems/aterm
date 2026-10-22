@@ -970,11 +970,11 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
     // The window's launch flags and aterm.toml keys.
     (
         "ATERM_CPU",
-        "gpu = false (Settings ▸ Performance), or launch with --cpu",
+        "gpu = false (Settings ▸ Performance), or aterm --window --cpu",
     ),
     (
         "ATERM_GPU",
-        "the default: the GPU renderer is on unless gpu = false (--gpu forces it for one launch)",
+        "the default: the GPU renderer is on unless gpu = false",
     ),
     (
         "ATERM_GPU_BACKEND",
@@ -986,26 +986,23 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
     ),
     (
         "ATERM_FONT",
-        "font_family (Settings ▸ Typography), or launch with --font",
+        "font_family (Settings ▸ Text & Fonts), or aterm --window --font",
     ),
     (
         "ATERM_FONT_PX",
-        "font_px (Settings ▸ Typography), or launch with --font-px",
+        "font_px (Settings ▸ Text & Fonts), or aterm --window --font-px",
     ),
     ("ATERM_FONT_HINTING", "font_hinting in aterm.toml"),
     ("ATERM_FONT_SUBPIXEL", "font_subpixel in aterm.toml"),
     (
         "ATERM_FALLBACK_FONT",
-        "fallback_fonts (Settings ▸ Typography)",
+        "fallback_fonts (Settings ▸ Text & Fonts)",
     ),
-    ("ATERM_SYMBOL_FONT", "symbol_font (Settings ▸ Typography)"),
-    ("ATERM_EMOJI_FONT", "emoji_font (Settings ▸ Typography)"),
-    ("ATERM_STEM_GAMMA", "stem_gamma (Settings ▸ Typography)"),
-    ("ATERM_FORCE_SCALE", "launch with --scale"),
-    (
-        "ATERM_TAB_STRIP_ROWS",
-        "tab_strip_rows (Settings ▸ Window & Tabs)",
-    ),
+    ("ATERM_SYMBOL_FONT", "symbol_font (Settings ▸ Text & Fonts)"),
+    ("ATERM_EMOJI_FONT", "emoji_font (Settings ▸ Text & Fonts)"),
+    ("ATERM_STEM_GAMMA", "stem_gamma (Settings ▸ Text & Fonts)"),
+    ("ATERM_FORCE_SCALE", "aterm --window --scale <f>"),
+    ("ATERM_TAB_STRIP_ROWS", "tab_strip_rows (Settings ▸ Window)"),
     (
         "ATERM_NO_DARK_CHROME",
         "window_theme = \"auto\" (Settings ▸ Appearance)",
@@ -1014,10 +1011,7 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
         "ATERM_WINDOWING_BEHAVIOR",
         "windowing_behavior in aterm.toml",
     ),
-    (
-        "ATERM_LATENCY_TRACE",
-        "`aterm ctl metrics` (the latency numbers, in every build)",
-    ),
+    ("ATERM_LATENCY_TRACE", "`aterm ctl metrics percentiles`"),
     (
         "ATERM_SNAPSHOT_PATH",
         "`aterm ctl image <file>` (SIGUSR1 writes to the control directory)",
@@ -1026,14 +1020,18 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
     ("ATERM_HEADLESS", "aterm --headless"),
     (
         "ATERM_COLUMNS",
-        "aterm --columns <n> (or columns in aterm.toml)",
+        "columns in aterm.toml, or aterm --window --columns <n>",
     ),
-    ("ATERM_LINES", "aterm --lines <n> (or lines in aterm.toml)"),
+    (
+        "ATERM_LINES",
+        "lines in aterm.toml, or aterm --window --lines <n>",
+    ),
     (
         "ATERM_CONTROL_SOCK",
-        "aterm --control-sock <path> for the window, aterm ctl --sock <path> for a client",
+        "aterm --window --control-sock <path> for the window, aterm ctl --sock <path> for a \
+         client",
     ),
-    ("ATERM_NO_CONTROL_SOCK", "aterm --no-control-sock"),
+    ("ATERM_NO_CONTROL_SOCK", "aterm --window --no-control-sock"),
     (
         "ATERM_CONTROL_TOKEN",
         "the token file beside the socket (aterm drive --socket <path>)",
@@ -1041,11 +1039,11 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
     ("ATERM_CTL", "the aterm-ctl beside aterm, or on PATH"),
     (
         "ATERM_SHELL",
-        "shell in aterm.toml, or aterm --shell <name>",
+        "shell in aterm.toml, or aterm --window --shell <name>",
     ),
     (
         "ATERM_EXEC",
-        "aterm -e <command> (with --hold to keep the window)",
+        "aterm --window -e <command> (with --hold to keep the window)",
     ),
     ("ATERM_TERM_PROGRAM", "TERM_PROGRAM set in your shell rc"),
     ("ATERM_AI_HINT", "aterm help"),
@@ -1061,7 +1059,10 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
         "ATERM_NO_PATH_REFRESH",
         "the default (the registry PATH is always merged)",
     ),
-    ("ATERM_NO_SHELL_INTEGRATION", "aterm --no-shell-integration"),
+    (
+        "ATERM_NO_SHELL_INTEGRATION",
+        "aterm --window --no-shell-integration",
+    ),
     // The embedded operator was removed (2026-10-15); a manager session takes
     // its place.
     (
@@ -4509,8 +4510,17 @@ fn vendor_update_clause(layout: &Layout, probes: &Probes) -> String {
         [one] => format!("; {one} updates from its vendor without it"),
         many => format!(
             "; {} update from their vendors without it",
-            many.join(" and ")
+            spoken_list(many, "and")
         ),
+    }
+}
+
+/// `names` as a sentence lists them: `a`, `a and b`, `a, b and c` (`conj` the last joint).
+fn spoken_list(names: &[&str], conj: &str) -> String {
+    match names {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [rest @ .., last] => format!("{} {conj} {last}", rest.join(", ")),
     }
 }
 
@@ -4541,7 +4551,7 @@ fn head_watch_line(layout: &Layout, probes: &Probes) -> Option<Row> {
     if names.is_empty() {
         return None;
     }
-    let names = names.join(" and ");
+    let names = spoken_list(&names, "or");
     let (level, text) = match crate::vendor_direct::watch::watcher(layout) {
         Watcher::Window => (
             Level::Ok,

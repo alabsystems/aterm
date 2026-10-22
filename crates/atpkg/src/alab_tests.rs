@@ -54,13 +54,12 @@ fn host_entry() -> String {
 
 /// A complete, active store build of codex at `build`, an ALab package when `alab`.
 fn store_build(l: &Layout, build: u64, alab: bool) -> PathBuf {
+    store_build_with(l, build, alab, b"#!/bin/sh\nexit 0\n")
+}
+
+fn store_build_with(l: &Layout, build: u64, alab: bool, exe: &[u8]) -> PathBuf {
     let dir = l.build_dir("codex", build);
-    package(
-        &dir,
-        &format!("0.164.0-dev.{build}+gabc"),
-        b"#!/bin/sh\nexit 0\n",
-        alab,
-    );
+    package(&dir, &format!("0.164.0-dev.{build}+gabc"), exe, alab);
     crate::store::mark_build_ready(&dir).unwrap();
     crate::activate::activate_build(l, &dir).unwrap();
     crate::activate::install_shims(l, &dir, &["codex".to_string()], crate::Aliases::Off).unwrap();
@@ -171,7 +170,7 @@ fn a_pin_routes_only_from_alab_repo_on_alab_targets() {
     assert_eq!(index_pin(&good, "ay", ARM_MAC), None);
 }
 
-/// CODEX-OLD NEVER ROUTES TO ALAB (owner ruling 2026-10-20: `codex` is codex-alab, upstream
+/// CODEX-OLD NEVER ROUTES TO ALAB (`codex` is codex-alab, upstream
 /// Codex is `codex-old`): an index naming `codex-old` from ALab's repo with a pin in the
 /// window, on the target ALab builds for, pins nothing for it; its source is the vendor's
 /// lane, a recorded vendor choice is none of its business, and the planner never takes it.
@@ -766,6 +765,36 @@ fn link_ino(entry: &Path) -> u64 {
     std::fs::symlink_metadata(entry).unwrap().ino()
 }
 
+#[cfg(unix)]
+const LAUNCH_PROBE: &[u8] = b"#!/bin/sh\nprintf '%s|%s\\n' \"$0\" \"${DISABLE_AUTOUPDATER-unset}\" >> \"$ATPKG_LAUNCH_LOG\"\n";
+
+#[cfg(unix)]
+fn observed_launch(shim: &Path, log: &Path, target: &Path, count: usize, env: &str) {
+    let mut command = aterm_uds::spawnfd::command("/bin/sh");
+    command
+        .arg(shim)
+        .arg("--version")
+        .env_clear()
+        .env("ATPKG_LAUNCH_LOG", log);
+    let result = aterm_uds::deadline::outputs_until(
+        &mut [&mut command],
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .pop()
+    .expect("one owned shell")
+    .expect("owned shell completes");
+    assert!(result.status.success(), "{result:?}");
+    let written = std::fs::read_to_string(log).unwrap();
+    assert_eq!(
+        written.lines().count(),
+        count,
+        "one target ran per invocation"
+    );
+    let expected = format!("{}|{env}", target.display());
+    assert_eq!(written.lines().last(), Some(expected.as_str()));
+}
+
 /// An index-sourced ALab build's twin execs `store/codex/exec/codex`, the stable path whose
 /// OWN directory takes the rename when the next build lands — what codex-alab's live
 /// upgrade watches (argv0's parent, non-recursively). It carries the self-update block,
@@ -777,8 +806,26 @@ fn link_ino(entry: &Path) -> u64 {
 #[test]
 fn an_alab_twin_execs_an_entry_its_own_directory_re_points() {
     let l = scratch("twin");
-    let first = store_build(&l, BUILD, true);
+    let first = store_build_with(&l, BUILD, true, LAUNCH_PROBE);
+    let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+    crate::activate::install_shims_env(
+        &l,
+        &first,
+        &["codex".to_string()],
+        crate::Aliases::Off,
+        &env,
+    )
+    .unwrap();
     let entry = crate::activate::exec_dir(&l, "codex").join("codex");
+    let primary = l.shim(&crate::store::ToolName::new("codex").unwrap());
+    let log = l.prefix.join("launches");
+    let first_bytes = std::fs::read(first.join("bin/codex")).unwrap();
+    observed_launch(&primary, &log, &entry, 1, "1");
+    observed_launch(&twin(&l), &log, &entry, 2, "1");
+    assert_eq!(
+        crate::platform::resolve_shim(&primary),
+        Some(first.join("bin/codex"))
+    );
     assert_eq!(
         exec_line(&twin(&l)),
         format!("exec '{}' \"$@\"", entry.display())
@@ -796,7 +843,22 @@ fn an_alab_twin_execs_an_entry_its_own_directory_re_points() {
     let (before, ino) = (std::fs::read(twin(&l)).unwrap(), link_ino(&entry));
     // The next build: the entry is replaced by a rename in its own directory (a new link
     // inode there), argv0 now resolves to the new build's file, and the twin's bytes stay.
-    let second = store_build(&l, BUILD + 1, true);
+    let second = store_build_with(&l, BUILD + 1, true, LAUNCH_PROBE);
+    crate::activate::install_shims_env(
+        &l,
+        &second,
+        &["codex".to_string()],
+        crate::Aliases::Off,
+        &env,
+    )
+    .unwrap();
+    observed_launch(&primary, &log, &entry, 3, "1");
+    observed_launch(&twin(&l), &log, &entry, 4, "1");
+    assert_eq!(std::fs::read(first.join("bin/codex")).unwrap(), first_bytes);
+    assert_eq!(
+        crate::platform::resolve_shim(&primary),
+        Some(second.join("bin/codex"))
+    );
     assert_eq!(std::fs::read(twin(&l)).unwrap(), before);
     assert_ne!(link_ino(&entry), ino, "the entry was re-laid in exec/");
     assert_eq!(
@@ -810,6 +872,22 @@ fn an_alab_twin_execs_an_entry_its_own_directory_re_points() {
     assert!(crate::cli::agent_twin_current(&l, "codex", BUILD + 1));
     // The harness's reader resolves the stable path to ALab bytes.
     assert!(exe_is_alab(&entry));
+    // A missing stable entry falls through to the recorded physical target. The next
+    // reconcile repairs the entry without rewriting either package's executable.
+    std::fs::remove_file(&entry).unwrap();
+    observed_launch(&primary, &log, &second.join("bin/codex"), 5, "1");
+    let primary_before = std::fs::read(&primary).unwrap();
+    let primary_ino = {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(&primary).unwrap().ino()
+    };
+    crate::activate::reconcile_agents(&l);
+    observed_launch(&primary, &log, &entry, 6, "1");
+    assert_eq!(std::fs::read(&primary).unwrap(), primary_before);
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(std::fs::metadata(&primary).unwrap().ino(), primary_ino);
+    }
 
     // A person's vendor build becomes the primary: its twin names the vendor build, and the
     // entry a running codex-alab watches still names the ALab build.
@@ -817,11 +895,13 @@ fn an_alab_twin_execs_an_entry_its_own_directory_re_points() {
         .unwrap()
         .build_id();
     let vendor = l.build_dir("codex", vendor_id);
-    package(&vendor, "0.165.0", b"#!/bin/sh\nexit 0\n", false);
+    package(&vendor, "0.165.0", LAUNCH_PROBE, false);
     crate::store::mark_build_ready(&vendor).unwrap();
     crate::activate::activate_build(&l, &vendor).unwrap();
     crate::activate::install_shims(&l, &vendor, &["codex".to_string()], crate::Aliases::Off)
         .unwrap();
+    observed_launch(&primary, &log, &vendor.join("bin/codex"), 7, "unset");
+    observed_launch(&twin(&l), &log, &vendor.join("bin/codex"), 8, "unset");
     assert_eq!(
         exec_line(&twin(&l)),
         format!("exec '{}' \"$@\"", vendor.join("bin/codex").display())
@@ -830,6 +910,21 @@ fn an_alab_twin_execs_an_entry_its_own_directory_re_points() {
         std::fs::read_link(&entry).unwrap(),
         second.join("bin/codex")
     );
+
+    // A package outside both store and link ownership keeps its exact hand-written
+    // primary, and cannot re-point the ALab entry or earn an agent twin.
+    let foreign = crate::testdir::dir("atpkg-alab-unmanaged-");
+    package(&foreign, "0.164.0-dev.9+gforeign", LAUNCH_PROBE, true);
+    crate::platform::install_shim_to(&primary, &foreign.join("bin/codex")).unwrap();
+    let unmanaged = std::fs::read(&primary).unwrap();
+    crate::activate::reconcile_agents(&l);
+    assert_eq!(std::fs::read(&primary).unwrap(), unmanaged);
+    assert!(!twin(&l).exists());
+    assert_eq!(
+        std::fs::read_link(&entry).unwrap(),
+        second.join("bin/codex")
+    );
+    observed_launch(&primary, &log, &foreign.join("bin/codex"), 9, "unset");
 
     // Negative control: the vendor's bytes (no record) get today's twin, and no entry.
     let v = scratch("twin-vendor");
@@ -855,12 +950,21 @@ fn an_alab_dev_link_twin_execs_an_entry_a_relink_re_points() {
     let l = scratch("devlink");
     let d = crate::testdir::dir("atpkg-alab-devlink-pkgs-");
     let (a, b) = (d.join("a"), d.join("b"));
-    package(&a, "0.164.0-dev.1+ga", b"a", true);
-    package(&b, "0.164.0-dev.2+gb", b"b", true);
+    package(&a, "0.164.0-dev.1+ga", LAUNCH_PROBE, true);
+    package(&b, "0.164.0-dev.2+gb", LAUNCH_PROBE, true);
     let a = std::path::absolute(&a).unwrap();
     let b = std::path::absolute(&b).unwrap();
     crate::link(&l, "codex", &a, &[PathBuf::from("bin/codex")]).unwrap();
     let entry = crate::activate::exec_dir(&l, "codex").join("codex");
+    let primary = l.shim(&crate::store::ToolName::new("codex").unwrap());
+    let log = l.prefix.join("launches");
+    let a_bytes = std::fs::read(a.join("bin/codex")).unwrap();
+    observed_launch(&primary, &log, &entry, 1, "unset");
+    observed_launch(&twin(&l), &log, &entry, 2, "unset");
+    assert_eq!(
+        crate::platform::resolve_shim(&primary),
+        Some(a.join("bin/codex"))
+    );
     assert_eq!(
         exec_line(&twin(&l)),
         format!("exec '{}' \"$@\"", entry.display())
@@ -874,6 +978,13 @@ fn an_alab_dev_link_twin_execs_an_entry_a_relink_re_points() {
     );
     let (before, ino) = (std::fs::read(twin(&l)).unwrap(), link_ino(&entry));
     crate::link(&l, "codex", &b, &[PathBuf::from("bin/codex")]).unwrap();
+    observed_launch(&primary, &log, &entry, 3, "unset");
+    observed_launch(&twin(&l), &log, &entry, 4, "unset");
+    assert_eq!(std::fs::read(a.join("bin/codex")).unwrap(), a_bytes);
+    assert_eq!(
+        crate::platform::resolve_shim(&primary),
+        Some(b.join("bin/codex"))
+    );
     assert_eq!(
         std::fs::read_link(&entry).unwrap(),
         b.join("bin/codex"),
@@ -887,6 +998,9 @@ fn an_alab_dev_link_twin_execs_an_entry_a_relink_re_points() {
     );
     crate::activate::sweep_agents_dir(&l);
     assert!(twin(&l).exists());
+    crate::linkmode::unlink(&l, "codex").unwrap();
+    assert!(!primary.exists() && !twin(&l).exists());
+    assert!(!crate::linkmode::is_linked(&l, "codex"));
 
     // Negative control: a cargo checkout's link.
     let v = scratch("devlink-plain");
@@ -1011,6 +1125,12 @@ impl Fetcher for Both<'_> {
 /// An ALab pack's archive: `codex-package.json`, `alab-build.json` and `bin/codex` holding
 /// `exe`, as `alab/package.sh` lays them ([`host_entry`]).
 pub(crate) fn pack_archive(build: u64, exe: &[u8], alab: bool) -> Vec<u8> {
+    pack_archive_recording(build, exe, alab.then_some(&br#"{"source":"0"}"#[..]))
+}
+
+/// [`pack_archive`] whose `alab-build.json` holds `record` (none: no record, so no ALab
+/// package).
+fn pack_archive_recording(build: u64, exe: &[u8], record: Option<&[u8]>) -> Vec<u8> {
     let entry = host_entry();
     let manifest = package_json_naming(&format!("0.164.0-dev.{build}+gabc"), &entry);
     let mut entries: Vec<(&str, u8, &str, &[u8], u32)> = vec![
@@ -1018,8 +1138,8 @@ pub(crate) fn pack_archive(build: u64, exe: &[u8], alab: bool) -> Vec<u8> {
         (&entry, b'0', "", exe, 0o755),
         (PACKAGE_JSON, b'0', "", manifest.as_bytes(), 0o644),
     ];
-    if alab {
-        entries.push((ALAB_BUILD_JSON, b'0', "", br#"{"source":"0"}"#, 0o644));
+    if let Some(record) = record {
+        entries.push((ALAB_BUILD_JSON, b'0', "", record, 0o644));
     }
     crate::extract::fixtures::zstd_bytes(&crate::extract::fixtures::tar_bytes(&entries))
 }
@@ -1184,6 +1304,164 @@ fn the_pack_gate_refuses_a_pack_that_is_not_alab_or_not_signed() {
         let e = install(&l, &f, ARM_MAC).expect_err("an unsigned Mach-O");
         assert!(e.to_string().contains("codesign --verify --strict"), "{e}");
         assert!(crate::ops::active_builds(&l).is_empty());
+    }
+}
+
+/// THE MINIMUM-ATERM PAIRING in the client's stage: a pack whose record names an aterm newer
+/// than this one (`"aterm": {"min": …}`), or names one in a shape this aterm cannot read, is
+/// refused with nothing laid, and says which aterm it needs. Negative control: the same pack
+/// naming this aterm's own version installs.
+#[test]
+fn an_alab_pack_this_aterm_is_too_old_for_is_never_laid() {
+    let this = aterm_version_words(this_aterm());
+    for (label, record, refused) in [
+        (
+            "newer",
+            r#"{"source":"0","aterm":{"min":"999.0.0"}}"#.to_string(),
+            Some("999.0.0"),
+        ),
+        (
+            "unread",
+            r#"{"source":"0","aterm":{"min":"soon"}}"#.to_string(),
+            Some("no shape"),
+        ),
+        (
+            "this",
+            format!(r#"{{"source":"0","aterm":{{"min":"{this}"}}}}"#),
+            None,
+        ),
+    ] {
+        let l = scratch(&format!("pairing-{label}"));
+        let archive = pack_archive_recording(BUILD, &signed_exe(), Some(record.as_bytes()));
+        let f = channel("codex-alab", BUILD, archive);
+        match refused {
+            Some(said) => {
+                let e = install(&l, &f, ARM_MAC).expect_err(label);
+                assert!(
+                    e.to_string().contains("alab pairing") && e.to_string().contains(said),
+                    "{label}: {e}"
+                );
+                assert!(crate::ops::active_builds(&l).is_empty(), "{label}");
+                assert!(!l.build_dir("codex", BUILD).exists(), "{label}");
+            }
+            None => {
+                let report = install(&l, &f, ARM_MAC).expect(label);
+                assert_eq!(report.build, BUILD, "{label}");
+                assert_eq!(active_alab_build(&l, "codex", ARM_MAC), Some(BUILD));
+            }
+        }
+    }
+}
+
+/// The pairing's rule, pure of this aterm's version: a record's `aterm.min` is the package's
+/// word, low or high; a record that names none pairs with every aterm, the oldest included
+/// (no default floor: every aterm that reads a pairing already answers `meta prepare
+/// harness_act`, review of parity-4, R3). Negative controls: one patch below a named floor
+/// is refused, the floor itself pairs, and a record in another shape pairs with none.
+#[test]
+fn the_pairing_reads_the_records_aterm_min_and_names_no_floor_of_its_own() {
+    let d = crate::testdir::dir("atpkg-alab-pairing-");
+    let root = d.join("pkg");
+    package(&root, "0.164.0-dev.1+gabc", b"#!/bin/sh\nexit 0\n", true);
+    assert_eq!(pairing_floor(&root), Ok(None));
+    for aterm in [(0, 0, 0), (0, 109, 9), (0, 110, 0), this_aterm()] {
+        assert_eq!(pairs_with(&root, aterm), Ok(()), "{aterm:?}");
+    }
+    for (record, floor, below) in [
+        (r#"{"aterm":{"min":"0.100.0"}}"#, (0, 100, 0), (0, 99, 99)),
+        (
+            r#"{"aterm":{"min":"0.112.3+g0123abc"}}"#,
+            (0, 112, 3),
+            (0, 112, 2),
+        ),
+    ] {
+        std::fs::write(root.join(ALAB_BUILD_JSON), record).unwrap();
+        assert_eq!(pairing_floor(&root), Ok(Some(floor)), "{record}");
+        assert_eq!(pairs_with(&root, floor), Ok(()), "{record}");
+        let e = pairs_with(&root, below).expect_err(record);
+        assert!(
+            e.contains(&format!("needs aterm {}", aterm_version_words(floor)))
+                && e.contains(&aterm_version_words(below)),
+            "{e}"
+        );
+    }
+    for bad in [
+        r#"{"aterm":"0.110.0"}"#,
+        r#"{"aterm":{"min":"0.110"}}"#,
+        "not json",
+    ] {
+        std::fs::write(root.join(ALAB_BUILD_JSON), bad).unwrap();
+        assert!(pairing_floor(&root).is_err(), "{bad}");
+        assert!(pairs_with(&root, (99, 0, 0)).is_err(), "{bad}");
+    }
+    std::fs::remove_file(root.join(ALAB_BUILD_JSON)).unwrap();
+    assert!(
+        pairs_with(&root, (99, 0, 0)).is_err(),
+        "no record, no ALab package"
+    );
+    assert_eq!(parse_aterm_version("0.110.0"), Some((0, 110, 0)));
+    assert_eq!(
+        parse_aterm_version("0.110.0+g0123456789"),
+        Some((0, 110, 0))
+    );
+    assert_eq!(parse_aterm_version("1.2.3-dev.4"), Some((1, 2, 3)));
+    for bad in ["", "0.110", "0.110.0.1", "v0.110.0", "0.x.0", "0..0"] {
+        assert_eq!(parse_aterm_version(bad), None, "{bad:?}");
+    }
+    assert_eq!(
+        Some(this_aterm()),
+        parse_aterm_version(env!("CARGO_PKG_VERSION")),
+        "this aterm is the workspace's version"
+    );
+}
+
+/// THE PRODUCER HOLDS THE PAIRING'S SHAPE (review of parity-4, R2): `check_alab_pack`, what
+/// `atpkg-publish` signs and pins a pack by, refuses a record whose `aterm` every client's
+/// stage refuses, so no index pins a build no aterm lays. The version it names is not judged
+/// (the producer pins for every aterm): a record naming an aterm far newer than this one
+/// passes. Negative controls: a record naming no `aterm`, and one naming this aterm, pass.
+#[test]
+fn the_producer_refuses_a_pairing_no_client_reads() {
+    let d = crate::testdir::dir("atpkg-alab-producer-pairing-");
+    let exposes = vec!["codex".to_string()];
+    let this = aterm_version_words(this_aterm());
+    for (label, record, refused) in [
+        ("none", r#"{"source":"0"}"#.to_string(), false),
+        (
+            "this",
+            format!(r#"{{"source":"0","aterm":{{"min":"{this}"}}}}"#),
+            false,
+        ),
+        (
+            "newer",
+            r#"{"source":"0","aterm":{"min":"999.0.0"}}"#.to_string(),
+            false,
+        ),
+        (
+            "no object",
+            r#"{"source":"0","aterm":"0.110.0"}"#.to_string(),
+            true,
+        ),
+        (
+            "unread",
+            r#"{"source":"0","aterm":{"min":"soon"}}"#.to_string(),
+            true,
+        ),
+    ] {
+        let root = d.join(label.replace(' ', "-"));
+        package(&root, "0.164.0-dev.1+gabc", &signed_exe(), true);
+        std::fs::write(root.join(ALAB_BUILD_JSON), &record).unwrap();
+        match crate::install::check_alab_pack(&root, &exposes) {
+            Ok(()) => assert!(!refused, "{label}: the producer passed {record}"),
+            Err(e) => {
+                assert!(refused, "{label}: {e}");
+                let e = e.to_string();
+                assert!(
+                    e.contains("alab pairing") && e.contains("no shape"),
+                    "{label}: {e}"
+                );
+            }
+        }
     }
 }
 

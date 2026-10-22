@@ -1152,7 +1152,7 @@ fn a_missed_park_resumes_the_history_export_for_the_repark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE PARK NEVER WAITS ON THE EXPORT'S LAST LOOK (ATERM-KI-1015-2, U20). Every park — and
+/// THE PARK NEVER WAITS ON THE EXPORT'S LAST LOOK. Every park — and
 /// so every free mid-sequence re-park of a flood — pauses the history export before it freezes
 /// anything, and the export's worker answers only after its last look: on a desk of 32
 /// flooding tabs, 10–20 ms each, measured. The park waited for that answer on the event loop,
@@ -1277,7 +1277,7 @@ fn a_park_asks_the_export_to_pause_and_never_waits_for_its_last_look() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A MISSED PARK'S ROLLBACK NEVER WAITS ON AN ENGINE (ATERM-KI-1015-2, U44). A park whose
+/// A MISSED PARK'S ROLLBACK NEVER WAITS ON AN ENGINE. A park whose
 /// capture misses because another thread holds a session's engine
 /// (`CaptureFailure::EngineBusy`) rolls back before any successor held a PTY: nothing resized
 /// one, so no size is put back, and the rollback must not wait the holder out while every

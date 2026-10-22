@@ -334,10 +334,16 @@ struct Inks {
 }
 
 impl Inks {
-    /// The inks of a row of `blank`'s under `accent`.
+    /// The inks of a row of `blank`'s under `accent`: the instance theme's,
+    /// chosen for the instance's own ground, which a tab in a theme of its
+    /// own (`session_theme`) does not lay the row on — an instance in Dracula
+    /// put Cruise's `∞` at 1.0:1 on a Default Light tab — so it is floored
+    /// along its own hue to the chips' floor on the row's ground, as the top
+    /// line's accent is (`claude_footer::legible_on`). An accent that already
+    /// reads is kept as it is.
     fn of(blank: RenderCell, accent: [u8; 3]) -> Self {
         Self {
-            accent,
+            accent: crate::claude_footer::legible_on(accent, blank.bg),
             amber: land_ink(blank.bg),
             ink: blank.fg,
             dim: dim_of(blank),
@@ -359,12 +365,10 @@ impl Inks {
 
 pub(crate) use crate::harness_glass::Stamp;
 
-/// A LOCAL CLOCK TIME, `HH:MM` in 24-hour time, as the tab's wait already
-/// writes it (`→ 14:05`): what the harness's glass shows of an instant —
-/// never an age, which would freeze at rest
-/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.0). Formatted ONCE,
-/// where its instant is learned (an act's arrival, a face's move, a timer's
-/// arming), then copied: a frame formats nothing.
+/// A local clock time, `HH:MM` in 24-hour time, as the tab's wait writes it (`→ 14:05`):
+/// what the harness's glass shows of an instant, never an age, which would freeze at rest
+/// (design §9.0). Formatted once, where its instant is learned (an act's arrival, a face's
+/// move, a timer's arming), then copied: a frame formats nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Clock([u8; 5]);
 
@@ -515,9 +519,8 @@ pub(crate) struct ChipGlass {
     /// the chip's spoken description is read from the trail itself:
     /// `harness_glass::spoken_last_now`).
     pub(crate) last: Option<(Act, Stamp)>,
-    /// The trail's generation: moves with each act the trail takes, so a
-    /// title someone is reading is built again — folded into the repaint key
-    /// only while the chip is hovered or selected
+    /// The trail's generation: moves with each act the trail takes, so a title being read is
+    /// built again. Folded into the repaint key only while the chip is hovered or selected
     /// ([`WindowLights::autopilot_term`]).
     pub(crate) trail: u8,
     /// The loop's pause after short turns while one stands (§10.5.3): the
@@ -536,7 +539,7 @@ pub(crate) struct ChipGlass {
 /// switch off, `⊘ off` naming the switch. (`⤓ held`, for a running Codex
 /// `/goal`, went with the Codex chips, 2026-10-16; Cruise's `✓ done` and
 /// `✓ landed`, Land's `✓ done` and its spent `⤓ quiet` went with Forever
-/// Cruise / Forever Land, 2026-10-19.)
+/// Cruise / Autopilot Land, 2026-10-19.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ChipFace {
     /// `∞`: Cruise.
@@ -1457,11 +1460,11 @@ pub(crate) fn fit_anew_in<R>(f: impl FnOnce() -> R) -> R {
     out
 }
 
-/// The lights' clock on the footer's per-frame paths — the repaint key's
-/// term ([`WindowLights::fingerprint`], read only while something timed is
-/// held) and the block the rule draws: the wall clock, each read counted
-/// (`work_counts::footer_clock_read`), the floor the harness's per-frame
-/// cost is measured against.
+/// The lights' clock on the footer's per-frame paths: the repaint key's term
+/// ([`WindowLights::fingerprint`], read only while something timed is held) and the block
+/// the rule draws. The wall clock, each read counted in tests
+/// (`work_counts::footer_clock_read`), the floor the harness's per-frame cost is measured
+/// against.
 pub(crate) fn lights_now() -> Instant {
     #[cfg(test)]
     crate::work_counts::footer_clock_read();
@@ -1745,7 +1748,7 @@ impl WindowLights {
     /// | 35 | spare (the retired Codex goal hold) |
     /// | 36–46 | the timer's minute of the day + 1 (0: none) |
     /// | 47 | the timer lands on another local date than it was set on |
-    /// | 48–55 | the trail's generation, ONLY while this chip is hovered or selected: an act that lights nothing repaints nothing unless someone is reading the title |
+    /// | 48–55 | the trail's generation, only while this chip is hovered or selected: an act that lights nothing repaints nothing unless someone is reading the title |
     /// | 56–58 | the timer's displayed weekday + 1 (0: none) |
     ///
     /// The default glass leaves bits 24–55 at 0.
@@ -2885,9 +2888,7 @@ fn light_face(
     }
 }
 
-// ---------------------------------------------------------------------------
 // The face table (`docs/DESIGN-harness-autopilot-2026-10-15.md` §§9.2–9.5)
-// ---------------------------------------------------------------------------
 
 impl ChipFace {
     /// Every face, in §9.6.0's order, §10.2's after the timer's.
@@ -3443,11 +3444,10 @@ pub(crate) fn lean_titles(whole: &str) -> [(&str, &str); LEAN_FORMS] {
     [without_trail, v1, clicks, click_only]
 }
 
-/// THE ACT'S LABEL (§9.2.1): its glyph and its word a space apart
-/// (`✓ approved`), drawn right of the chips for its dwell in the CHIP'S ink —
-/// Cruise's accent, Land's amber, dim where no harness carries the work.
-/// Static text: no short form (a lone glyph in the rule reads as a stray
-/// mark), and nothing to format.
+/// The act's label (§9.2.1): its glyph and its word a space apart (`✓ approved`), drawn
+/// right of the chips for its dwell in the chip's ink (Cruise's accent, Land's amber, dim
+/// where no harness carries the work). Static text with no short form: a lone glyph in
+/// the rule reads as a stray mark.
 #[must_use]
 pub(crate) const fn act_label(
     view: AutopilotView,
@@ -4073,12 +4073,11 @@ impl App {
     /// paint lays them again, the last frame's cells are not where the window
     /// now puts them, so the pointer is told nothing is there rather than
     /// what was (a switch drawn hovered columns from the pointer, a press on
-    /// a switch the glass no longer shows there).
+    /// a switch the glass no longer shows there): the one gate every target
+    /// a frame lays asks ([`App::laid_cell_at`]).
     pub(crate) fn glass_cell_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(usize, usize)> {
-        let drawn = self.windows.get(&wid)?.claude_lights.drawn_at?;
-        (self.glass_grid(wid)? == drawn)
-            .then(|| drawn.cell_at(x, y))
-            .flatten()
+        let drawn = self.windows.get(&wid)?.claude_lights.drawn_at;
+        self.laid_cell_at(wid, drawn, x, y)
     }
 
     /// The pointer left the window: no chip is hovered any more.
@@ -5107,10 +5106,9 @@ impl App {
         {
             return true;
         }
-        // Ordinary typing cannot change the lights when nothing is selected.
-        // Avoid resolving the focused pane and scanning the painted hits on
-        // every key in that common case. A selected chip still needs the full
-        // path so a key can dismiss it, even if its pane has since moved.
+        // Ordinary typing cannot change the lights when nothing is selected, so that common
+        // case skips the focused-pane lookup; a selected chip takes the full path so any
+        // key can let it go, even if its pane has since moved.
         let select_chord = cfg!(target_os = "macos")
             && mods.control_key()
             && mods.shift_key()
@@ -6499,9 +6497,9 @@ mod gesture_tests {
         (app, wid, session, reader)
     }
 
-    /// The window's harness host in a test: one that supervises nothing
-    /// (`Acts` inert, no sessions) — what the harness's chips are drawn for —
-    /// shut down when the guard drops, a failing test's included.
+    /// The window's harness host in a test, which the harness's chips are drawn for: one that
+    /// supervises nothing (`Acts` inert, no sessions), shut down when the guard drops, a
+    /// failing test's included.
     pub(super) struct Hosted(crate::harness_host::HostHandle);
 
     impl Drop for Hosted {
@@ -6532,10 +6530,8 @@ mod gesture_tests {
         app.windows.get_mut(&wid).expect("window").mods = ModifiersState::empty();
     }
 
-    /// [`app`] in a 120-column pane: room for a light's WHOLE title beside
-    /// the owner's whole facts. A hover's or a selection's title gives way
-    /// first in a narrower rule (`footer::fit_rule`), so a test about what
-    /// such a title SAYS runs here; a reason shows at 80 columns too.
+    /// [`app`] in a 120-column pane: room for a light's whole title beside the whole facts;
+    /// a narrower rule gives a hover's or selection's title up first (`footer::fit_rule`).
     pub(super) fn wide_app() -> (App, WindowId, u64, UnixStream) {
         let (mut app, wid, session, reader) = app();
         assert!(app.apply_term_resize(wid, 24, 120));
@@ -6558,7 +6554,7 @@ mod gesture_tests {
         usize::from(term_lock(&term).cols())
     }
 
-    /// The owner's whole facts, as [`publish_facts`] publishes them.
+    /// The whole facts, as [`publish_facts`] publishes them.
     pub(super) const WHOLE_FACTS: &str =
         "\u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main \u{2500}";
 
@@ -6592,11 +6588,10 @@ mod gesture_tests {
         term_lock(&term).process(bytes);
     }
 
-    /// Claude Code's bottom block on the 24-row engine (80 columns unless a
-    /// test widened it, [`wide_app`]): a transcript row, the composer between
-    /// its two pane-wide rules with an EMPTY draft and the cursor at its
-    /// caret (row 21, column 2), and `mode` on the last row — with bracketed
-    /// paste ON, as Claude Code always has it.
+    /// Claude Code's bottom block on the 24-row engine (80 columns unless a test widened
+    /// it, [`wide_app`]): a transcript row, the composer between its two pane-wide rules
+    /// with an empty draft and the cursor at its caret (row 21, column 2), and `mode` on
+    /// the last row, with bracketed paste on, as Claude Code always has it.
     pub(super) fn draw_claude(app: &App, session: u64, mode: &str) {
         let rule = "\u{2500}".repeat(cols(app, session));
         let screen = format!(

@@ -258,10 +258,8 @@ fn store_shim_resolution_is_fail_closed() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-// -----------------------------------------------------------------------
 // Discovery. Every test below runs over a temp home and store prefix through the explicit-env
 // resolver, so none reads or mutates the process environment or depends on what is installed.
-// -----------------------------------------------------------------------
 
 /// A scratch HOME and atpkg prefix for one test (unix, as every test using it is: the store's
 /// `current` links and the `/bin/sh` stand-ins).

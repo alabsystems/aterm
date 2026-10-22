@@ -527,11 +527,10 @@ impl App {
         crate::native_appearance::resolve_chrome_palette(self.window_theme, self.theme)
     }
 
-    /// The palette native pages (Settings, documents) draw from: the chrome
-    /// palette of the color theme itself, before the per-key color overrides,
-    /// so a Foreground or Background picked for the terminal does not recolor
-    /// the app's own pages. The terminal theme still reaches the pages' live
-    /// previews.
+    /// The palette native pages (Settings, documents) draw from: the chrome palette of the
+    /// color theme before the per-key color overrides, so a Foreground or Background picked for
+    /// the terminal does not recolor the app's own pages. The pages' live previews still use
+    /// the terminal theme.
     ///
     /// Read off the installed resolution ([`Self::install_colors`] is the one
     /// install path, for a config or catalog reload, an OS flip and a theme
@@ -682,8 +681,7 @@ impl App {
         // (`active_handle_conformance`).
         self.frontmost_window = Some(wid);
         self.sync_active_session();
-        // The status-item glance lists windows now, so a create moves it
-        // (fingerprint-gated; runs after every structural mutation above).
+        // The status-item glance lists windows, so a create refreshes it (fingerprint-gated).
         self.mark_status_dirty();
         debug_assert!(
             self.structural_invariants_ok(),
@@ -1201,13 +1199,11 @@ impl App {
                 .with_window_icon(small)
                 .with_taskbar_icon(big)
                 .with_class_name("aterm");
-            // A window presented through the DirectComposition visual swapchain is
-            // created without the GDI redirection bitmap
-            // (`WS_EX_NOREDIRECTIONBITMAP`); DWM would composite it, filled with
-            // the class brush, under the visual tree and hide the Mica/Acrylic
-            // backdrop. Keyed to the request latch because the GPU context may
-            // still be building; the build thread's failure arm withdraws it.
-            // Scoped to the backdrop opt-in so default windows are unchanged.
+            // A window presented through the DirectComposition visual swapchain is created
+            // without the GDI redirection bitmap (`WS_EX_NOREDIRECTIONBITMAP`), which DWM would
+            // composite, filled with the class brush, over the Mica/Acrylic backdrop. Keyed to
+            // the request latch because the GPU context may still be building; the build
+            // thread's failure arm withdraws it.
             if aterm_gpu::visual_swapchain_requested() {
                 attrs.with_no_redirection_bitmap(true)
             } else {
@@ -1216,9 +1212,9 @@ impl App {
         };
         // Linux identity and minimum size. `with_name` is the Wayland `app_id` and
         // X11 `WM_CLASS`; it must equal the `aterm.desktop` basename for icon,
-        // grouping and launcher matching, so keep it `"aterm"`. The minimum is
-        // the smallest legal grid (20 cols × 5 rows at the 12 px base font plus
-        // strip row and padding), in logical px.
+        // grouping and launcher matching, so keep it `"aterm"`. The minimum is the smallest
+        // legal grid (20 cols × 5 rows at the 12 px base font plus strip row and padding), in
+        // logical px.
         //
         // On X11 the window also carries the app icon (`_NET_WM_ICON`), which panels
         // and window switchers that read the window property show; Wayland has no
@@ -1352,18 +1348,16 @@ impl App {
             self._reduce_motion = self.apprt.observe_reduce_motion(proxy);
         }
         window.set_ime_allowed(true);
-        // Declare the field a terminal (Wayland `content_purpose.terminal`), so IMs
-        // and on-screen keyboards drop autocapitalisation and prediction. Stored on
-        // the window so every `text_input.enter` re-announces it. No-op on other
-        // platforms.
+        // Declare the field a terminal (Wayland `content_purpose.terminal`) so IMs and
+        // on-screen keyboards drop autocapitalisation and prediction; the window re-announces
+        // it on every `text_input.enter`. No-op on other platforms.
         window.set_ime_purpose(aterm_window::window::ImePurpose::Terminal);
-        // The desktop light/dark appearance: start its observer once, then
-        // install what it reads now. It picks the side of a `dark:…,light:…`
-        // `theme`, and the engine reports that palette's appearance to apps (DEC
-        // 2031, DSR ?996n). Launch already built everything for the appearance
-        // it read (`warm_config`), so this is a no-op unless the desktop flipped
-        // since. Never the window's own theme off Windows: a forced
-        // `window_theme` pins it on macOS, and Linux reports aterm's decoration.
+        // The desktop light/dark appearance: start its observer once, then install what it
+        // reads now. It picks the side of a `dark:…,light:…` `theme`, and the engine reports
+        // that palette's appearance to apps (DEC 2031, DSR ?996n). Launch already built for the
+        // appearance it read (`warm_config`), so this is a no-op unless the desktop flipped
+        // since. Only Windows reads the window's own theme: a forced `window_theme` pins it on
+        // macOS, and on Linux it reports aterm's decoration.
         if self.os_appearance_observer.is_none()
             && let Some(proxy) = self.proxy.as_ref()
         {
@@ -2317,7 +2311,6 @@ impl App {
         }
         self.close_banner_queue.retain(|q| q.wid != wid);
         self.ask_next_queued_close();
-        // Clear the winit→logical mapping for this window (its OS id is gone).
         self.winit_to_window.retain(|_, &mut v| v != wid);
         // So the closed window can never be picked as a survivor below.
         self.focus_order.retain(|w| *w != wid);
@@ -2343,8 +2336,7 @@ impl App {
                 self.structural_invariant_violation().unwrap_or_default(),
             );
         }
-        // Refresh the status item after deregistration so it shows post-close
-        // state.
+        // After deregistration, so the status item shows the post-close state.
         self.mark_status_dirty();
         if self.windows.is_empty() {
             CloseOutcome::Exit
@@ -2711,14 +2703,12 @@ impl App {
         busy: bool,
         replay: crate::close_confirm::CloseReplay,
     ) -> Option<crate::quit_safety::ConfirmPrompt> {
-        // Windows follows Windows Terminal's convention, not macOS's: prompt when
-        // the gesture closes MULTIPLE tabs or a running job, never for a single
-        // idle tab — see `quit_safety::confirm_prompt_windows`. The tab count is
-        // the gesture's blast radius: every window's tabs for a whole-app quit,
-        // the closing window's for a window close. A last-tab close
-        // (`window_exit_close_allowed`) reaches here with the window already down
-        // to one tab, so it stays instant while idle under both policies.
-        // A quit with restore on loses the shells, not the layout: the copy says so.
+        // Windows follows Windows Terminal's convention: prompt when the gesture closes
+        // several tabs or a running job, never for a single idle tab
+        // (`quit_safety::confirm_prompt_windows`). The tab count is the gesture's blast
+        // radius: every window's tabs for a quit, the closing window's for a window close (a
+        // last-tab close arrives with one tab left, so it stays instant while idle). A quit
+        // with restore on loses the shells, not the layout, and the copy says so.
         let reopens = self.config.restore_session_or_default();
         // A tab or pane close leaves its window standing: it asks only while a job
         // runs, in its own words, on every platform's policy.
@@ -2781,7 +2771,7 @@ impl App {
         let by_person = !pending.wire_may_answer();
         if let Some(standing) = self.close_banner.as_ref() {
             let standing_wid = standing.wid;
-            // The STANDING question is what a wire caller must answer.
+            // The standing question is what a wire caller must answer.
             self.pending_action_refusal = Some(standing.wire_refusal());
             let waits = by_person
                 && wid != standing_wid

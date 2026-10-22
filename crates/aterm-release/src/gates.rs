@@ -657,9 +657,7 @@ pub fn staged_bundle_liveness_gate(
     )))
 }
 
-// ---------------------------------------------------------------------------
 // the published commit
-// ---------------------------------------------------------------------------
 
 /// Where the publication engine keeps its ledger: `$PUBLICATION_ENGINE/mappings.json`,
 /// default `~/publication/mappings.json` (a location, not a skip switch; `ship release`
@@ -991,10 +989,9 @@ fn refuse_rewriting_info_attributes(git: &dyn GitRunner) -> Result<()> {
 /// Judge the cut tree both before and after a move. A removed ignore rule can
 /// expose files without establishing who wrote them, so preserve them and refuse.
 fn require_clean_cut_tree(path: &Path) -> Result<()> {
-    // THE ONE CLEAN-TREE JUDGE ([`dirty_paths`]'s, which `clean_tree` asks of this tree
-    // right after): never `git status --porcelain`, which also reads
-    // `.git/info/exclude` and `core.excludesFile` and so passed what that judge then
-    // refused. A submodule not populated is the alignment's to fix (below), not work.
+    // The one clean-tree judge (the one `clean_tree` asks right after), never `git status
+    // --porcelain`, which reads `.git/info/exclude` and `core.excludesFile` and so passes
+    // what that judge refuses. An unpopulated submodule is the alignment's to fix, not work.
     let changes: Vec<String> = crate::clean::dirty_against_head(path)
         .ok_or_else(|| {
             Error::new(format!(
@@ -4554,16 +4551,10 @@ mod published_commit_tests {
         assert!(newest_published_source("not json").is_err());
     }
 
-    /// THE SOURCE IS NEVER PUBLISHED AHEAD OF A BINARY THAT CANNOT FOLLOW IT,
-    /// against real git: `ship check` judges the COMMIT it is
-    /// named — its objects and the records for it, never this checkout — with
-    /// the cut's own gates in the cut's order, runs every gate after the
-    /// cutter identity whatever the one before it said, and names each one
-    /// that would refuse, in the cut's words. With the predecessor's fixtures,
-    /// release notes and a handoff policy in the commit, its bundle built in this
-    /// clone (the release journal names it) with a verified record naming the bundle's
-    /// executable ([`verified`]), it passes, however far HEAD and the working
-    /// tree have moved.
+    /// `ship check` judges the named commit's objects and records, never this checkout,
+    /// with the cut's gates in the cut's order, runs every gate after the cutter identity
+    /// whatever the one before said, and names each that would refuse; a releasable commit
+    /// passes however far HEAD and the working tree have moved.
     #[test]
     fn ship_check_judges_the_named_commit_with_the_cuts_own_gates() {
         use aterm_update_core::handoff_policy::SOURCE_PATH;
@@ -4915,7 +4906,7 @@ mod published_commit_tests {
         let found = precheck_with(&git, &candidate, Ok(&candidate)).expect("its own");
         assert_eq!(found.gates[0].name, "cutter identity");
         assert!(matches!(found.gates[0].outcome, Outcome::Pass(_)));
-        // NEGATIVE CONTROLS: other rules answer nothing — a checker built before the
+        // Negative controls: other rules answer nothing, a checker built before the
         // judged commit (even one that moved only a doc)...
         let docs = repo.commit("a doc", &[("docs/NOTE.md", "prose\n")]);
         let not_run = |stamp: std::result::Result<&str, &crate::cutter::NotOwn>| {

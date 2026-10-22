@@ -7,17 +7,12 @@
 //! read views and policy, plus the relaunch and upgrade adapters that act on
 //! a session through the control protocol.
 //!
-//! * [`source`] — WHERE DID THIS FACT COME FROM, once: the one [`source::Source`]
-//!   vocabulary [`usage`] and `harness limits` print.
-//! * [`usage`] — the transcript's usage rows, read into one view; the HUD
-//!   line and the `harness usage --json` shape (design §5.2; `"windows"`
-//!   stays an empty object there); and the windows Claude Code's `/usage`
-//!   panel and Codex's `/status` card paint, which `harness limits` prints
-//!   beside the wall the engine's own reader names (`aterm_phase::wall`, the
-//!   one wall classifier).
-//! * [`disk`] — DISK WATCH AND CLEANUP (design §5.5): the free-space figure
-//!   and the stale targets, each row carrying the WITNESS that makes it safe
-//!   to remove. Report-only is the shape of the function, not a flag.
+//! * [`source`] — the one [`source::Source`] vocabulary for where a fact came from.
+//! * [`usage`] — the transcript's usage rows as one view: the HUD line, the
+//!   `harness usage --json` shape, and the windows Claude Code's `/usage` panel and
+//!   Codex's `/status` card paint, which `harness limits` prints.
+//! * [`disk`] — free space and stale targets, each row carrying the witness that
+//!   makes it safe to remove. Report-only is the shape of the function, not a flag.
 //! * [`align`] — the bounded child runner: a child read to a deadline.
 //! * [`footer`] — the Claude Code footer aterm paints in place of the vendor's
 //!   permission-mode row: model + effort, working directory, branch, read

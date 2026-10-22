@@ -1,11 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pack-time relocation (§10.1 "self-contained" bundle path) — make a staged
-//! sysroot/toolchain payload run on a machine that lacks the BUILDER's layout
+//! Pack-time relocation (§10.1 "self-contained" bundle path): make a staged
+//! sysroot/toolchain payload run on a machine that lacks the builder's layout
 //! (`/Users/<builder>`, `/home/<builder>`, a declared donor toolchain), so a
-//! `trust`/`trust-mc` bundle can be installed with NO rustup and NO Developer ID on
-//! the user side.
+//! `trust`/`trust-mc` bundle installs with no rustup and no Developer ID on the user side.
 //!
 //! WHAT MAY BE VENDORED (owner order 2026-09-29, "NO STOCK RUST IN THE TOOLCHAIN FOR
 //! TRUST"; audit TP-7). This pass used to copy whatever a payload loaded from
@@ -28,22 +27,20 @@
 //!      (`install_name_tool`/`patchelf`) exists on every USER's machine — but it
 //!      is always present on the (single) build box.
 //!
-//! Cross-platform by construction: one OS-agnostic orchestration
-//! ([`relocate_stage`]) over a per-OS [`Backend`] — Mach-O
-//! (`install_name_tool`/`otool`/`codesign`, `@loader_path`/`@rpath`) on macOS,
-//! ELF (`patchelf`, `$ORIGIN` `RUNPATH`, no code signature) on Linux. The wire
-//! anchor is the Ed25519 signature over the tarball, so nothing here depends on
-//! Apple signing.
+//! One OS-agnostic orchestration ([`relocate_stage`]) runs over a per-OS [`Backend`]:
+//! Mach-O (`install_name_tool`/`otool`/`codesign`, `@loader_path`/`@rpath`) on macOS, ELF
+//! (`patchelf`, `$ORIGIN` `RUNPATH`, no code signature) on Linux. The wire anchor is the
+//! Ed25519 signature over the tarball, not Apple signing.
 //!
-//! Self-containment is fail-closed: any machine-local reference the pass cannot
-//! vendor is a HARD error (a "portable" bundle that still dlopens the builder's
-//! `~/.rustup` is worse than none).
+//! Fail-closed: a self-contained bundle fails on any machine-local reference the pass
+//! cannot vendor ([`Report::require_self_contained`]); one that still dlopens the
+//! builder's `~/.rustup` is worse than none.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// Where vendored machine-local shared libraries are copied, relative to the
-/// stage root. Kept distinct from any real `lib/` content the toolchain ships.
+/// Where vendored shared libraries are copied, relative to the stage root. Kept distinct
+/// from any real `lib/` content the toolchain ships.
 pub const VENDOR_REL: &str = "lib/atpkg-vendored";
 
 /// The record of what was vendored, inside [`VENDOR_REL`]: one line per copy,
@@ -87,10 +84,9 @@ pub trait Backend {
     fn set_id_portable(&self, path: &Path, basename: &str) -> Result<(), String>;
     /// Repoint an absolute machine-local dependency to the portable form.
     fn repoint_dep(&self, path: &Path, from: &str, basename: &str) -> Result<(), String>;
-    /// Ensure the object searches `rel_origin` (an `@loader_path`/`$ORIGIN`
-    /// relative dir) and NO machine-local rpath. `drop` lists the absolute rpaths
-    /// to remove. Backends that can only set the whole rpath (ELF `patchelf`) use
-    /// `keep`+`rel_origin` and ignore `drop`.
+    /// Ensure the object searches `rel_origin` (an `@loader_path`/`$ORIGIN` relative dir)
+    /// and no machine-local rpath. `drop` lists the absolute rpaths to remove; a backend
+    /// that can only set the whole rpath (ELF `patchelf`) uses `keep` + `rel_origin`.
     fn fix_rpaths(
         &self,
         path: &Path,
@@ -126,8 +122,8 @@ pub struct Report {
     pub vendored_from: Vec<Vendored>,
     /// Objects whose load commands were rewritten.
     pub rewritten: usize,
-    /// Machine-local references that could NOT be resolved — for a self-contained
-    /// bundle the caller MUST treat a non-empty list as a hard failure.
+    /// Machine-local references that could not be resolved: a self-contained bundle treats
+    /// a non-empty list as a hard failure.
     pub unresolved: Vec<String>,
 }
 
@@ -168,22 +164,16 @@ pub fn backend_for_host() -> Result<Box<dyn Backend>, String> {
     }
 }
 
-/// Relocate a staged payload in place. Vendors every builder-path dependency
-/// (transitively) into `lib/atpkg-vendored/` — from inside `donor_roots` only —,
-/// rewrites objects to reference them through a relative-origin rpath, deletes
-/// builder rpaths, and re-signs. A hard-link group (one inode under several names) is
-/// rewritten and signed once and its names are re-linked onto the result, so it leaves
-/// as one file.
-///
-/// A BUILDER PATH is a machine-local one ([`is_machine_local`]) or one inside a donor
-/// root: both name the build box's layout, and neither may survive in the bundle.
+/// Relocate a staged payload in place: vendor every builder-path dependency (transitively,
+/// from inside `donor_roots` only) into `lib/atpkg-vendored/`, point objects at it through a
+/// relative-origin rpath, delete builder rpaths, and re-sign. A builder path is a
+/// machine-local one ([`is_machine_local`]) or one inside a donor root. A hard-link group is
+/// rewritten and signed once and its names re-linked onto the result.
 ///
 /// # Errors
-/// I/O, a missing relocation tool, a rewrite failure, or a library that would be
-/// vendored from a stock toolchain (rustup's directory, `~/.cargo`, Homebrew).
-/// Unresolved builder refs — including a library outside every donor root — are
-/// returned in the [`Report`] (not an error here) so the caller decides self-contained
-/// (hard fail) vs advisory.
+/// I/O, a missing relocation tool, a rewrite failure, or a library that would be vendored
+/// from a stock toolchain. Unresolved builder refs, including a library outside every donor
+/// root, are returned in the [`Report`] so the caller decides hard fail or advisory.
 pub fn relocate_stage(
     stage: &Path,
     sign_id: Option<&str>,
@@ -206,9 +196,7 @@ pub fn relocate_with(
     let vendored = stage.join(VENDOR_REL);
     let builder = |p: &str| is_machine_local(p) || in_donor_root(p, donor_roots).is_some();
 
-    // ONE recursive traversal of the stage feeds BOTH passes below. The stage is a
-    // multi-GB toolchain payload, so walking it twice was a second full `read_dir` +
-    // sort over tens of thousands of entries for a list we already had.
+    // One traversal of the multi-GB stage feeds both passes below.
     let files = walk_files(stage)?;
 
     // Shared libs already in the payload, by basename — never re-vendor them.
@@ -221,27 +209,21 @@ pub fn relocate_with(
         }
     }
 
-    // Machine-local rpath dirs anywhere in the payload are the donor search path
-    // for `@rpath/<name>` / soname deps that don't resolve inside the payload.
+    // Builder rpath dirs anywhere in the payload are the donor search path for
+    // `@rpath/<name>` / soname deps that don't resolve inside the payload.
     let mut donors: BTreeSet<PathBuf> = BTreeSet::new();
     let mut queue: Vec<PathBuf> = Vec::new();
-    // The pre-scan's load commands, KEPT rather than thrown away. `read_refs` is not a
-    // parse — it SPAWNS a subprocess per object (`otool -l` on macOS; three `patchelf`
-    // calls on Linux) — and the queue loop below immediately re-read every object the
-    // pre-scan had just read. A staged sysroot holds hundreds to thousands of native
-    // objects, so that was hundreds-to-thousands of redundant fork+exec cycles.
+    // The pre-scan's load commands, kept for the queue loop: `read_refs` spawns a process
+    // per object (`otool -l`; three `patchelf` calls on Linux), over hundreds to thousands
+    // of objects.
     let mut prescanned: BTreeMap<PathBuf, ObjectRefs> = BTreeMap::new();
-    // HARD-LINK GROUPS are relocated ONCE, never name by name. A sysroot carries one
-    // program under several names by inode — `bin/rustc` beside `bin/trustc` (tippy
-    // refuses any `rustc` that is not the selected `trustc`), `cargo` beside `targo`,
-    // librustc_driver in both `lib/` and `lib/rustlib/<triple>/lib/` — and the pack's
-    // strip pass keeps each group one signed file. But `install_name_tool` and
-    // `codesign` REPLACE the file they rewrite (a new inode; measured 2026-09-12), so
-    // rewriting each name in turn severed the group and signed every copy under its
-    // own file name: `rustc-<uuid>` beside `trustc-<uuid>`, one program as two files
-    // that differ inside their signatures — the pair tippy refuses. So the first name
-    // of a group (sorted order) is its one object here; the other names are left out of
-    // the queue and re-linked onto it once it has been rewritten and re-signed.
+    // Hard-link groups are relocated once, not name by name. A sysroot carries one program
+    // under several names by inode (`bin/rustc` beside `bin/trustc`, `cargo` beside
+    // `targo`, librustc_driver in `lib/` and `lib/rustlib/<triple>/lib/`), and
+    // `install_name_tool`/`codesign` replace the file they rewrite (a new inode), so
+    // rewriting each name would split the group into copies signed under different names,
+    // the pair tippy refuses. The first name (sorted) is the group's one object; the others
+    // are re-linked onto it after its rewrite and re-sign.
     let mut group_first: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
     let mut aliases: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     for rel in &files {
@@ -274,13 +256,10 @@ pub fn relocate_with(
         if !processed.insert(obj.clone()) {
             continue;
         }
-        // Serve the pre-scan when it has this object, else read it. The miss case is
-        // exactly the files VENDORED mid-loop (pushed below): those are freshly copied
-        // and re-id'd, so they must never be served from a pre-mutation entry — hence
-        // both push sites also drop any pre-scan entry for the destination. Everything
-        // else is read strictly before the loop's first mutation and `processed`
-        // guarantees each object is handled at most once, so a served entry is exactly
-        // what a fresh read would return.
+        // Serve the pre-scan when it has this object. A miss is a file vendored mid-loop,
+        // which both push sites drop from the pre-scan (freshly copied and re-id'd);
+        // everything else was read before the first mutation and is handled once
+        // (`processed`), so a served entry equals a fresh read.
         let refs = match prescanned.remove(&obj) {
             Some(refs) => refs,
             None => backend.read_refs(&obj)?,
@@ -289,7 +268,7 @@ pub fn relocate_with(
         let group: &[PathBuf] = aliases.get(&obj).map_or(&[], Vec::as_slice);
         let mut changed = false;
 
-        // 1. A machine-local install-id → the portable form.
+        // 1. A builder-path install-id → the portable form.
         if let Some(id) = &refs.id
             && builder(id)
         {
@@ -325,9 +304,8 @@ pub fn relocate_with(
                 let base = basename(dep);
                 let unresolved_in_payload =
                     dep.starts_with("@rpath/") || is_shared_lib_basename(&base);
-                // A soname resolvable via the system loader (libc, …) is NOT in a
-                // donor dir → `find_in_donors` returns None and it is left alone
-                // (correct: never vendor system libs).
+                // A system-loader soname (libc, …) is in no donor dir, so it is left
+                // alone: system libs are never vendored.
                 if unresolved_in_payload
                     && !have.contains(&base)
                     && let Some(src) = find_in_donors(&base, &donors)
@@ -353,7 +331,7 @@ pub fn relocate_with(
         }
 
         // 3./4. Point the object at the vendored dir via a relative rpath and drop
-        // machine-local rpaths.
+        // builder rpaths.
         let ml_rpaths: Vec<String> = refs.rpaths.iter().filter(|r| builder(r)).cloned().collect();
         let mut keep: Vec<String> = refs
             .rpaths
@@ -366,11 +344,9 @@ pub fn relocate_with(
                 n.starts_with("@rpath/") || builder(n) || is_shared_lib_basename(&basename(n))
             });
         if needs_vendor || !ml_rpaths.is_empty() {
-            // One origin-relative rpath per DIRECTORY the object is reachable from. A
-            // group spanning directories (librustc_driver in `lib/` and in
-            // `lib/rustlib/<triple>/lib/`) is one set of bytes, so it carries the
-            // vendored dir as seen from each of them; a plain object has one directory
-            // and gets exactly the single rewrite it always got.
+            // One origin-relative rpath per directory the object is reachable from: a group
+            // spanning directories (librustc_driver in `lib/` and `lib/rustlib/<triple>/lib/`)
+            // is one set of bytes seen from each.
             let mut dirs: Vec<&Path> = vec![obj.parent().unwrap_or(stage)];
             for alias in group {
                 let d = alias.parent().unwrap_or(stage);
@@ -393,7 +369,7 @@ pub fn relocate_with(
                 }
                 changed = true;
                 // What this rewrite left behind is the next one's baseline: the rpath
-                // it added is now kept, and the machine-local ones are already gone.
+                // it added is now kept, and the builder ones are already gone.
                 if !keep.contains(&rel) {
                     keep.push(rel);
                 }
@@ -460,13 +436,13 @@ fn stock_vendor_refusal(base: &str, src: &Path, place: &str) -> String {
     )
 }
 
-/// Copy `src` → `<to.dir>/<base>` once — from inside a donor root only, byte-identical
-/// before the re-sign, recorded — make its own id portable, and re-sign ad-hoc. Returns
-/// whether a NEW file was vendored (so the caller chases ITS deps). Records an
-/// unresolved entry when the source is missing or outside every donor root.
+/// Copy `src` → `<to.dir>/<base>` once (from inside a donor root only, byte-identical
+/// before the re-sign, recorded), make its own id portable, and re-sign ad hoc. Returns
+/// whether a new file was vendored, so the caller chases its deps. Records an unresolved
+/// entry when the source is missing or outside every donor root.
 ///
 /// # Errors
-/// A stock toolchain's library (checked on the path as named AND as resolved, before
+/// A stock toolchain's library (checked on the path as named and as resolved, before
 /// anything is read or written), or a copy that differs from its donor.
 fn vendor_file(
     src: &Path,
@@ -545,10 +521,9 @@ fn hard_link_key(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
-/// Point every other name of `obj`'s hard-link group back at `obj`'s inode — the one
-/// the rewrite and the re-sign just produced. Each alias is linked to a hidden sibling
-/// and RENAMED over, so it is never absent: a failure leaves it on its old bytes, and
-/// the error names it (the pack's one-compiler gate would refuse that tree anyway).
+/// Point every other name of `obj`'s hard-link group at `obj`'s new inode. Each alias is
+/// linked to a hidden sibling and renamed over, so it is never absent: a failure leaves it
+/// on its old bytes, and the error names it.
 fn relink_aliases(stage: &Path, obj: &Path, aliases: &[PathBuf]) -> Result<(), String> {
     for alias in aliases {
         if hard_link_key(obj).is_some() && hard_link_key(obj) == hard_link_key(alias) {
@@ -582,11 +557,9 @@ fn basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-/// A relative path from a Mach-O/ELF file's directory to the vendored dir,
-/// prefixed with the platform origin token. Joined with `/` explicitly — the token is
-/// consumed by the TARGET binary's loader (dyld/ld.so), whose path syntax is always
-/// `/`-separated, so a Windows host (whose `Path` renders `\`) must never leak
-/// backslashes into an rpath. (On Unix this is byte-identical to `Path` display.)
+/// A relative path from a Mach-O/ELF file's directory to the vendored dir, prefixed with
+/// the platform origin token. Joined with `/` explicitly: the target's loader (dyld/ld.so)
+/// always reads `/`, so a Windows host must not leak `\` into an rpath.
 pub fn origin_relative(origin_token: &str, macho_dir: &Path, vendored: &Path) -> String {
     let rel = relative(macho_dir, vendored);
     let mut out = String::from(origin_token);
@@ -627,8 +600,8 @@ fn is_shared_lib_basename(name: &str) -> bool {
     name.ends_with(".dylib") || name.contains(".so.") || name.ends_with(".so")
 }
 
-/// Recursively collect regular files under `dir` (symlinks NOT followed), paths
-/// relative to `dir`, sorted.
+/// Recursively collect regular files under `dir` (symlinks not followed), paths relative
+/// to `dir`, sorted.
 pub fn walk_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -651,9 +624,8 @@ pub fn walk_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-/// Whether `path` is a native executable/shared object (Mach-O OR ELF) — the
-/// only files a dynamic-loader resolve check is meaningful for. Cross-platform
-/// (no backend needed): a script/data file has no dylib deps to resolve.
+/// Whether `path` is a native executable or shared object (Mach-O or ELF), the only files
+/// a dynamic-loader resolve check means anything for. Needs no backend.
 #[must_use]
 pub fn is_native_object(path: &Path) -> bool {
     magic4(path).is_some_and(|m| macho::is_macho_magic(&m) || elf::is_elf_magic(&m))
@@ -677,14 +649,7 @@ fn run(tool: &str, args: &[&str], file: &Path) -> Result<std::process::Output, S
         .map_err(|e| format!("spawn {tool}: {e}"))
 }
 
-// ---------------------------------------------------------------------------
-// macOS / Mach-O backend. Proven end to end 2026-09-29 with a Trust seal as the donor:
-// a cc-built tool loading `@rpath/librustc_driver-<hash>.dylib` through an rpath into
-// ~/toolchains/trust-7d5533b2/lib was relocated with `--donor-root` that seal, the
-// 470 MB driver vendored byte-identical to the seal's before its ad-hoc re-sign, and the
-// tool ran with HOME hidden. (The earlier proof vendored trust-mc's STOCK nightly
-// driver out of rustup — the case this pass now refuses.)
-// ---------------------------------------------------------------------------
+// macOS / Mach-O backend.
 pub mod macho {
     #[cfg(any(target_os = "macos", test))]
     use super::*;
@@ -801,25 +766,10 @@ pub mod macho {
             // Mach-O rpaths are additive: DELETE each machine-local one first, then add
             // the vendored search path (keep the rest untouched).
             //
-            // Order matters, and the other way round is not merely untidy. LC_RPATH lives
-            // in the Mach-O header, whose size is fixed at link time; adding before
-            // deleting makes the object momentarily hold BOTH sets, and if that peak does
-            // not fit, `install_name_tool` refuses with "larger updated load commands do
-            // not fit ... the program must be relinked". Deleting first means the load
-            // commands never exceed their original size, so an object with no headerpad
-            // slack still relocates. Observed 2026-08-21 on the x86_64 trust bundle: six
-            // binaries (ay, targo-fmt, targo-miri, trust-wp, cargo-trust-wp,
-            // targo-trust-wp) failed this way while their arm64 counterparts, built with
-            // more slack, happened to fit. The payload is a staging tree, so the window
-            // between delete and add is not observable by anything.
-            //
-            // "Is `rel_origin` already there?" is answered from `keep` instead of a THIRD
-            // `otool -l` spawn on this object. `keep` and `drop` ARE the caller's exact
-            // `is_machine_local` partition of this object's rpaths, and neither `-id` nor
-            // `-change` (the only rewrites between that read and here) touches LC_RPATH —
-            // so `keep ∪ drop` is still the live rpath set. `rel_origin` is an
-            // `@loader_path`-relative path, never machine-local, so it can only ever land
-            // in `keep` (asserted by `origin_relative_rpath_is_never_machine_local`).
+            // "Is `rel_origin` already there?" is answered from `keep`, not a third
+            // `otool -l`: `keep ∪ drop` is the caller's partition of this object's rpaths,
+            // `-id`/`-change` do not touch LC_RPATH, and an origin-relative `rel_origin`
+            // can only be in `keep` (`origin_relative_rpath_is_never_machine_local`).
             for d in drop {
                 install_name_tool(&["-delete_rpath", d], path)?;
             }
@@ -835,10 +785,9 @@ pub mod macho {
                 Some(id) => c.args(["--timestamp", "--sign", id]),
                 None => c.args(["--sign", "-"]), // ad-hoc: arm64 needs a valid sig to exec
             };
-            // A hang detector, not a budget: signing one object takes well under
-            // a second (a timestamped one adds a round-trip to Apple). A codesign
-            // that macOS's code-signing service (trustd) never answers is killed,
-            // and the object stays unsigned, so the tree is never tarred.
+            // A hang detector, not a budget: signing one object takes well under a second
+            // (a timestamp adds a round-trip to Apple). A codesign that trustd never
+            // answers is killed and the object stays unsigned, so the tree is never tarred.
             let out = aterm_uds::deadline::output_until(
                 c.arg(path),
                 std::time::Instant::now() + RESIGN_HANG,
@@ -868,11 +817,7 @@ pub mod macho {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Linux / ELF backend (implemented; the pure parsing/command logic is unit-
-// tested, but it has NOT been executed against real ELF on this macOS box —
-// needs a Linux validation run with `patchelf` present).
-// ---------------------------------------------------------------------------
+// Linux / ELF backend. Only the pure parsing is unit-tested.
 pub mod elf {
     #[cfg(any(target_os = "linux", test))]
     use super::*;
@@ -1043,13 +988,9 @@ mod tests {
         );
     }
 
-    // The Mach-O `fix_rpaths` decides "is the vendored rpath already on this object?"
-    // from the caller's `keep` list rather than re-spawning `otool -l`. That is sound
-    // because `keep`/`drop` are the exact `is_machine_local` partition of the object's
-    // rpaths AND the rpath being added is origin-relative, so it can only ever be
-    // classified into `keep` — never into `drop`, and never missed. It holds even when
-    // the stage itself sits under a machine-local prefix, because `origin_relative`
-    // strips the common prefix before emitting the token-relative tail.
+    // Mach-O `fix_rpaths` answers "already there?" from `keep`, sound only if the
+    // origin-relative rpath always lands in `keep`, even for a stage under a machine-local
+    // prefix.
     #[test]
     fn origin_relative_rpath_is_never_machine_local() {
         for stage in [
@@ -1118,12 +1059,10 @@ mod tests {
         );
     }
 
-    /// A backend that behaves like `install_name_tool` and `codesign` where it matters
-    /// here: every rewrite REPLACES the file (a sibling written, then renamed over — a
-    /// new inode), and the "signature" names the file it was written under, the way an
-    /// ad-hoc identifier is `<file name>-<uuid>`. Objects are the files starting `OBJ`;
-    /// each carries one machine-local rpath and no deps, so every object needs exactly
-    /// the rpath rewrite plus a re-sign, and nothing is vendored.
+    /// A backend that behaves like `install_name_tool` and `codesign` where it matters here:
+    /// every rewrite replaces the file (a sibling renamed over, a new inode), and the
+    /// "signature" names the file it was written under, as an ad-hoc identifier does.
+    /// Objects are the files starting `OBJ`, each with one machine-local rpath and no deps.
     #[cfg(unix)]
     struct ReplacingBackend {
         log: std::cell::RefCell<Vec<String>>,
@@ -1234,9 +1173,9 @@ mod tests {
         (dir, path)
     }
 
-    /// trust-mc 20065's shape: a tool loading rustup's nightly `librustc_driver`, by
-    /// absolute path or through an rpath into rustup's directory. Refused before a byte
-    /// is copied — and declaring that directory a donor root does not launder it.
+    /// A tool loading rustup's nightly `librustc_driver`, by absolute path or through an
+    /// rpath into rustup's directory, is refused before a byte is copied, and declaring that
+    /// directory a donor root does not launder it.
     #[cfg(unix)]
     #[test]
     fn a_stock_toolchain_library_is_never_vendored() {
@@ -1323,9 +1262,8 @@ mod tests {
         );
     }
 
-    /// The Trust shape: the library comes from inside a declared donor root, is copied
+    /// The Trust shape: a library from inside a declared donor root is copied
     /// byte-identical (the only later change is the re-sign), and the copy is recorded.
-    /// (A library outside every donor root: the next test.)
     #[cfg(unix)]
     #[test]
     fn a_donor_root_library_is_vendored_byte_identical_and_recorded() {
@@ -1379,10 +1317,8 @@ mod tests {
         );
     }
 
-    /// A library that EXISTS but lies outside every declared donor root is never
-    /// vendored: it is left unresolved (so the self-contained audit fails the pack) and
-    /// not one byte is copied. The file is real on purpose: a missing one is unresolved
-    /// as "source not found" whether or not the donor-root rule exists.
+    /// A library that exists outside every declared donor root is left unresolved and not
+    /// one byte is copied. The file is real: a missing one is "source not found" anyway.
     #[cfg(unix)]
     #[test]
     fn a_library_outside_every_donor_root_is_never_vendored() {
@@ -1401,8 +1337,7 @@ mod tests {
         };
 
         // The rule itself, called directly: through relocate a path outside every donor
-        // root reaches it only when it is machine-local (/Users/, /home/), and a scratch
-        // dir is neither.
+        // root reaches it only when machine-local, and a scratch dir is not.
         let backend = ScriptedBackend {
             refs: BTreeMap::new(),
         };
@@ -1426,9 +1361,8 @@ mod tests {
         assert!(have.is_empty());
         assert!(!vendored.exists(), "nothing may be written to {VENDOR_REL}");
 
-        // Through relocate: an @rpath load whose rpath IS the donor root's lib/, where
-        // the library is a symlink out of the root. The rpath names the donor; the bytes
-        // are not the donor's, so they are not vendored.
+        // Through relocate: an @rpath load whose rpath is the donor root's lib/, where the
+        // library is a symlink out of the root, is not vendored.
         std::os::unix::fs::symlink(&outside, seal.join("lib/libfoo.dylib")).unwrap();
         let tool = stage.join("bin/tool");
         std::fs::write(&tool, b"OBJ tool").unwrap();
@@ -1453,14 +1387,9 @@ mod tests {
         );
     }
 
-    /// A hard-link group leaves relocation as ONE file: rewritten and signed once, under
-    /// its first name, with the other names re-linked onto the result. Relocating name
-    /// by name — what this pass did — severed the group, because the real tools replace
-    /// the file they rewrite, and signed each copy under its own name: `bin/rustc` and
-    /// `bin/trustc` came out as one program in two files that differ inside their
-    /// signatures, the pair tippy refuses ("rustc-compatible sibling … is not the
-    /// selected Trust compiler"). A group spanning directories gets the vendored-dir
-    /// rpath as seen from each directory, because it is one set of bytes in both.
+    /// A hard-link group leaves relocation as one file: rewritten and signed once under its
+    /// first name, the other names re-linked onto the result. A group spanning directories
+    /// gets the vendored-dir rpath as seen from each.
     #[cfg(unix)]
     #[test]
     fn a_hard_link_group_is_relocated_once_and_stays_one_file() {

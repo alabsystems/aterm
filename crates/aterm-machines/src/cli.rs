@@ -95,6 +95,9 @@ CHANGE
     attach <host> [<run>]     follow a run whose connection dropped
     run <host>…|--all [--user <u>] -- <argv>
                               run one program (no shell) as root, or as the account <u>
+    github login              store the [github] machine user's token in the login
+                              keychain (typed, not echoed) once GitHub signs it in as
+                              that account with the admin:public_key scope
     github revoke <host>      delete the host's GitHub keys from the machine user; those
                               keys are never registered again (a key it makes anew is)
     rekey <host>…|--all --signers <file> [--key <private key>]
@@ -519,8 +522,9 @@ fn controller(sys: &dyn System, paths: Paths, verb: &str, args: &[String]) -> Ex
         "unenroll" => words(&o, 1, 1, "one <host>"),
         "rename" | "name" => words(&o, 2, 2, "<host> <new-name>"),
         "github" => match o.words.first().map(String::as_str) {
+            Some("login") => words(&o, 1, 1, "login"),
             Some("revoke") => words(&o, 2, 2, "revoke <host>"),
-            _ => Err("takes revoke <host>".to_owned()),
+            _ => Err("takes login or revoke <host>".to_owned()),
         },
         "screen" => words(&o, 1, 2, "<host> [<step>]"),
         "person" if o.here => words(&o, 1, 1, "one <host> with --here"),
@@ -552,6 +556,7 @@ fn controller(sys: &dyn System, paths: Paths, verb: &str, args: &[String]) -> Ex
         "apply" => commands::plan_or_apply_only(&env, &o.words, o.all, Mode::Apply, o.now, &o.only),
         "attach" => commands::attach(&env, &o.words[0], o.words.get(1).map(String::as_str)),
         "run" => commands::run(&env, &o.words, o.all, o.user.as_deref(), &o.argv),
+        "github" if o.words[0] == "login" => commands::github_login(&env),
         "github" => commands::github_revoke(&env, &o.words[1]),
         "rekey" => commands::rekey(
             &env,

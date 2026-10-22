@@ -13,7 +13,7 @@ fn parse_csi_colon_subparams() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // SGR 4:3 - curly underline (colon-separated subparameter)
+    // SGR 4:3 (curly underline).
     parser.advance_fast(b"\x1b[4:3m", &mut sink);
 
     assert_eq!(sink.csi_dispatches.len(), 0);
@@ -32,7 +32,7 @@ fn parse_csi_mixed_colon_semicolon() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // Mixed: bold (1), then curly underline (4:3) using both ; and :
+    // Bold, then curly underline.
     parser.advance_fast(b"\x1b[1;4:3m", &mut sink);
 
     assert_eq!(sink.csi_dispatches_with_subparams.len(), 1);
@@ -47,7 +47,6 @@ fn parse_csi_no_colon_no_subparams() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // No colons - should use regular csi_dispatch
     parser.advance_fast(b"\x1b[1;4m", &mut sink);
 
     assert_eq!(sink.csi_dispatches.len(), 1);
@@ -57,8 +56,8 @@ fn parse_csi_no_colon_no_subparams() {
 
 #[test]
 fn parse_csi_subparam_flag_survives_past_index_16() {
-    // MAX_PARAMS is 24; the mask must carry colon flags for indices >= 16
-    // (Kakoune-style long SGR runs with trailing colon groups).
+    // The mask carries colon flags past index 16 (MAX_PARAMS is 24): long SGR
+    // runs with trailing colon groups.
     // 16 semicolon params, then underline-color colon group 58:5:196
     // landing at indices 16..=18 (subparams at 17 and 18). Fed whole (the CSI
     // fast path) and one byte at a time (dispatch.rs finalize_param).

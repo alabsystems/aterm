@@ -182,7 +182,8 @@ impl WindowRequest {
     }
 }
 
-/// Usage text for one windowing verb, printed on a grammar error.
+/// The usage line for one windowing verb: `--help` starts with it and an option error ends
+/// with it.
 #[must_use]
 pub fn window_verb_usage(verb: &str) -> String {
     let mut s = String::from("usage: aterm ");

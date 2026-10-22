@@ -19,7 +19,7 @@
 //! cleared and drew a few lines, a short prompt), every such flap left every
 //! row and the cursor lower than the program drew them, and a program whose
 //! SIGWINCH handler read only the final size never redrew (S2R-F4,
-//! ATERM-KI-1015-1).
+//! ).
 //!
 //! The grid keeps the edge moves the natural resize would not take back
 //! ([`Edge`]), with the natural ones made after them, and a resize the other
@@ -2577,7 +2577,7 @@ mod tests {
         ]);
     }
 
-    /// S2R-F4 (ATERM-KI-1015-1) through a flap with a half that grows the rows
+    /// S2R-F4 through a flap with a half that grows the rows
     /// while it narrows the columns (a window corner dragged down and in, then
     /// back; a zoom out that adds rows and a zoom in), on a screen whose lines
     /// fit every width on the way. That half ran as one pass and forgot what
@@ -2610,7 +2610,7 @@ mod tests {
         }
     }
 
-    /// THE BOTTOM-PUSH CORNER (S2R-F4, ATERM-KI-1015-1): a shrink past the
+    /// THE BOTTOM-PUSH CORNER (S2R-F4): a shrink past the
     /// blank rows under a cursor too near the top to demote pushes the bottom
     /// rows into history, and the grow back puts them back under the screen,
     /// the topmost first, before it reveals or appends anything. The grid
@@ -3177,7 +3177,7 @@ mod tests {
         }
     }
 
-    /// THE REWRAP CORNER (S2R-F4, ATERM-KI-1015-1): a line that rewraps into
+    /// THE REWRAP CORNER (S2R-F4): a line that rewraps into
     /// another number of rows on the way. Under the current law
     /// ([`ResizeLaw::Rewrap`]) a resize lays the rows out from the window the
     /// run started from (`Grid::prepare_rewrap`), so every size shows what the

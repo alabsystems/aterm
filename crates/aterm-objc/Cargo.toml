@@ -27,11 +27,10 @@ autotests = false
 [lints]
 workspace = true
 
-# THE CONTAINER DRIVE, as a test with no libtest harness. libtest runs every
-# `#[test]` on a worker and parks its main thread, so neither branch of
-# `run_on_main` (which `MainThreadBound`'s `Drop` goes through) can be driven
-# from one. Without the harness `main` is the process main thread; the file
-# answers libtest's argv itself, as one test of this name.
+# No libtest harness: libtest runs each `#[test]` on a worker and parks the
+# main thread, so neither branch of `run_on_main` (which `MainThreadBound`'s
+# `Drop` goes through) is reachable from one. Here `main` is the process main
+# thread; the file answers libtest's argv itself, as one test of this name.
 [[test]]
 name = "main_thread_bound_drive"
 harness = false
@@ -42,8 +41,7 @@ harness = false
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-core = { workspace = true }
-# The SDK-constant probes' scratch directories, removed on drop. Workspace crate,
-# std-only, zero dependencies; already in the dev graph via aterm-spec.
+# Scratch directories for the SDK-constant probes.
 aterm-tempfile = { workspace = true }
 
 [[test]]

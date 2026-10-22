@@ -533,11 +533,9 @@ impl Terminal {
         }
     }
 
-    /// Capture a [`TerminalCheckpoint`] — a pure read, no host effects, no fs.
-    ///
-    /// The parser must be in Ground state: a checkpoint taken
-    /// mid-sequence would silently lose the parser's partial state (which is not
-    /// in the projection). This is `debug_assert`ed.
+    /// Capture a [`TerminalCheckpoint`]: a pure read, no host effects, no fs.
+    /// The parser must be at Ground (`debug_assert`ed): its partial state is
+    /// not in this projection.
     #[inline]
     #[must_use]
     pub fn checkpoint(&self) -> TerminalCheckpoint {
@@ -545,15 +543,11 @@ impl Terminal {
     }
 
     /// [`Self::checkpoint`] for an engine that may be parked inside a partial
-    /// sequence: the same full projection without the Ground precondition,
-    /// carrying the partial state in [`TerminalCheckpoint::parser`] so a
-    /// restored terminal continues the sequence with the next byte. `None`
-    /// only for a partial sequence no carry can hold
-    /// ([`Self::partial_sequence_uncarried`], a hooked DCS string).
-    ///
-    /// Needed because an adopted engine can be restored mid-sequence, and the
-    /// recorder's first keyframe of it is taken before its reader runs. Like
-    /// `checkpoint`, it carries no shell-integration nonce.
+    /// sequence: the same projection without the Ground precondition, the
+    /// partial state in [`TerminalCheckpoint::parser`]. `None` only for a
+    /// partial sequence no carry can hold ([`Self::partial_sequence_uncarried`]).
+    /// An adopted engine can be restored mid-sequence, and the recorder's first
+    /// keyframe of it is taken before its reader runs. Carries no nonce.
     #[inline]
     #[must_use]
     pub fn checkpoint_continuing(&self) -> Option<TerminalCheckpoint> {
@@ -614,11 +608,9 @@ impl Terminal {
         c
     }
 
-    /// Capture the exact visible terminal state without copying scrollback history.
-    ///
-    /// This is the latency-bounded process-handoff projection: screen continuity
-    /// needs the visible rows, cursor, modes, and saved alternate grid, but it must
-    /// not turn an update click into work proportional to an arbitrarily deep history.
+    /// Capture the exact visible terminal state without scrollback: the
+    /// latency-bounded handoff projection, so an update never costs work
+    /// proportional to an arbitrarily deep history.
     #[inline]
     #[must_use]
     pub fn checkpoint_visible(&self) -> Option<TerminalCheckpoint> {
@@ -987,11 +979,9 @@ impl Terminal {
 
     /// Whether the engine holds an inactive grid, the one a checkpoint carries
     /// as `alt_grid` (the saved primary while the alternate screen is up, or
-    /// the alternate screen's grid kept after it was left).
-    ///
-    /// The seamless capture prices a carry's cell cost with this (the inactive
-    /// grid is a second visible grid) exactly as the consumer and
-    /// `screen_digest` will, before paying for the projection. A pure read.
+    /// the alternate grid kept after it was left). The seamless capture prices
+    /// a carry's cell cost with this before paying for the projection. A pure
+    /// read.
     #[inline]
     #[must_use]
     pub const fn has_inactive_grid(&self) -> bool {
@@ -1161,7 +1151,7 @@ impl Terminal {
         let on_alt = c.modes.alternate_screen;
         let mut active_grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt);
         active_grid.continue_absolute_numbering(c.absolute_row_counter);
-        // Saved grid (same restore path; alt buffer ⟺ we are not on alt), if present.
+        // The saved grid, if present (the alt buffer iff not on alt).
         let saved_grid = match (&c.alt_grid, &c.alt_cursor) {
             (Some(alt_bytes), Some(alt_cursor)) => {
                 let mut saved = restore_grid(c.rows, c.cols, alt_bytes, alt_cursor, !on_alt);

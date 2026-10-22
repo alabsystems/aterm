@@ -35,9 +35,7 @@ fn scrollback_incremental_counters_match_recomputed() {
     check(&sb, "budget eviction");
 }
 
-// =========================================================================
 // Budget/diagnostic split tests
-// =========================================================================
 
 /// Proves that read-only warm-cache fills do not perturb the budget counter.
 #[test]

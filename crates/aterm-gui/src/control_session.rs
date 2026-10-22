@@ -71,8 +71,7 @@ use crate::{SessionCtx, term_lock};
 /// is no event loop to ask (a worker-thread test): the window columns then read
 /// `-`, never a guess.
 pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wake>>) -> String {
-    // The frozen-path marks are read under the SAME guard as the snapshot, so a
-    // session cannot be listed with a mark taken from a different registry state.
+    // The frozen-path marks are read under the snapshot's own guard, so the two agree.
     let (snapshot, frozen, posture) = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         let snapshot = g.snapshot();
@@ -914,6 +913,26 @@ pub(crate) fn exit_probe(store: &Store, session: u64) -> impl Fn(&Store) -> bool
 /// Fully event-driven (no poll): arms an `IdleFor` watcher and parks on the
 /// session's watchers ([`Park`]), woken by output, by the exit's timeline
 /// record and by the idle deadline, so an exit is reported promptly.
+/// `ready [timeout_ms]` -> block until the target session is ALIVE and IDLE, then
+/// `OK ready <reason>\n`; `OK timeout\n` if it does not become ready in time
+/// (default 30 000 ms, capped at 600 000); `ERR exited\n` if the session has
+/// exited (it will never become ready). Lets an agent CHAIN sessions — spawn one,
+/// `ready` on it, then drive it — without busy-polling a screen read.
+///
+/// Exactly two ready reasons are emitted:
+///   * `prompt` — the newest OSC-133 block is at a fresh prompt (`PromptOnly`)
+///     or a finished command (`Complete`): the shell is waiting for input. The
+///     precise "prompt-end" signal, used when shell integration is present.
+///   * `idle`   — the kernel's `IdleFor` watcher latched: `content_seq` held
+///     stable across the settle window (output stopped changing). This is the
+///     fallback for a session with no in-flight completed block — covering plain
+///     shells (no shell integration) and the between-commands case alike.
+///
+/// Event-driven: arms an `IdleFor` watcher, registers a subscriber, and parks on
+/// its wake — driven by output / exit notifications and the idle deadline (it
+/// polls, every [`PARKED_POLL`], only while an update parks the session's
+/// reader). The registry lifecycle is re-checked on each wake, and a session
+/// exit `notify`s us (`Wake::Exit`), so an exit is reported promptly.
 pub(crate) fn cmd_ready(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -1003,16 +1022,25 @@ pub(crate) fn cmd_ready(
 }
 
 /// `await <idle <ms> | seq [<n>] | match <re> [rows <a> <b>] | gone <re> [rows <a> <b>]
-/// | block | inbox since=<id> [kinds=<k,...>] [topic=<t>]> [timeout <ms>]` — block until the
+/// | block | frame | inbox since=<id> [kinds=<k,...>] [topic=<t>]> [timeout <ms>]` — block until the
 /// Observation Kernel (L0) latches the predicate, then return `OK <kind> <seq>`;
 /// `OK timeout` if the overall deadline elapses; `ERR exited` if the session dies.
+///
+/// `match` and `gone` read whole frames only: never the rows of a DEC 2026 frame the program
+/// has not finished (a redraw the PTY's reads split leaves its prefix on the grid, with a busy
+/// footer it has not reached yet missing), and `frame` waits for that frame to be whole, or
+/// for its one-minute hang detector (`docs/measured/half-drawn-frame-2026-10-22.md`). A
+/// program that brackets nothing gives no frame to wait for, so `gone` latches at once only
+/// on a frame the program closed, and elsewhere once the range has read clear for
+/// [`aterm_core::terminal::GONE_SETTLE`]: the park wakes at that deadline as at an idle one.
 /// (`await consent [kind=debugger] [timeout=<ms>]` is dispatched to `control_privacy` before this
 /// handler is reached; the usage line names it so the alternation stays complete.)
 ///
 /// `gone` latches when no visible row in range matches: an agent's turn often ends with a row
 /// leaving (Claude Code's `esc to interrupt` footer) while its composer glyph stays on screen
 /// and the screen can sit still mid-turn, so neither `match` nor `idle` says the turn is over.
-/// Like `match` and `seq` it is level-triggered.
+/// Like `match` and `seq` it is level-triggered (a screen clear at arm and unchanged for
+/// [`aterm_core::terminal::GONE_SETTLE`] latches at arm).
 ///
 /// This is the L1 exposure of the core primitive. The CORRECTNESS — no-silent-
 /// loss for content/match/block, and a deterministic idle deadline — lives in the
@@ -1022,8 +1050,9 @@ pub(crate) fn cmd_ready(
 /// sleeps until a REAL event arrives —
 ///   * an output burst   (the PTY reader rings the session's watchers) for
 ///     content/match/gone/block predicates,
-///   * the next idle deadline (the exact `IdleFor` fire instant, via
-///     `watch_next_deadline`) for `await idle`,
+///   * the next deadline (via `watch_next_deadline`): the exact `IdleFor` fire
+///     instant for `await idle`, a `gone` settle's end, an unfinished frame's
+///     hang detector for `frame` and a held `match`/`gone`,
 ///   * session exit       (the `state-change` or `closing` record rings them)
 ///     → `ERR exited`,
 ///   * the overall timeout (the ultimate liveness backstop) → `OK timeout`.
@@ -1047,7 +1076,7 @@ pub(crate) fn cmd_await(
     use aterm_core::terminal::{RowRange, WatcherSpec};
 
     const USAGE: &str = "ERR usage: await <idle <ms>|seq [<n>]|match <re> [rows <a> <b>]|\
-                         gone <re> [rows <a> <b>]|block|inbox since=<id> [kinds=<k,...>] [topic=<t>]|\
+                         gone <re> [rows <a> <b>]|block|frame|inbox since=<id> [kinds=<k,...>] [topic=<t>]|\
                          agent <word>[,<word>...] [since=<rev>]|task [@<sel>[:<rev>][,...]] [any|all] [since=<rev>]|\
                          log need|open=<lvl>|close=<lvl>|kind=<k> [since=<seq> ep=<e>]> \
                          [timeout <ms>] | await consent [kind=debugger] [timeout=<ms>] | await momentum <floor 0..=1> [timeout <ms>]\n";
@@ -1200,6 +1229,9 @@ pub(crate) fn cmd_await(
                 t.watch(WatcherSpec::SeqAdvanced { after }, now0)
             }
             "block" => t.watch(WatcherSpec::BlockComplete, now0),
+            // The program's DEC 2026 frame is whole: latched at arm when it is, else at its
+            // close or its one-minute hang detector (`aterm_core::terminal::FRAME_HANG`).
+            "frame" => t.watch(WatcherSpec::FrameWhole, now0),
             _ => return USAGE.to_string(),
         }
     };
@@ -2529,8 +2561,8 @@ pub(crate) fn park_until_momentum_below(
         };
         let park = Park::new(sub, exited, OnHangup::Abort, Stretch::None);
         match park.run(until, watcher_look(term, id), disarm_watch(term, id)) {
-            // The crossing passed: confirm on a fresh reading (the loop head),
-            // which is also where a re-lit ribbon gets its next crossing.
+            // The crossing passed: confirm on a fresh reading at the loop head, where a re-lit
+            // ribbon gets its next crossing.
             Parked::Done(_) => {}
             Parked::Deadline => {
                 let now_v = read().map_or(v, |(v, _)| v);
@@ -2893,10 +2925,8 @@ type TurnMatchers = (
 );
 
 fn turn_matchers(o: &TurnOptions<'_>) -> Result<TurnMatchers, String> {
-    // Compile a `settle=match:<re>`/`settle=gone:<re>` pattern up front (untrusted
-    // regex, bounded by `row_matcher`) OUTSIDE the terminal lock and BEFORE the
-    // lease/paste, so a bad pattern fails fast without ever typing into the target
-    // or holding the lease.
+    // Compile a settle pattern (untrusted, bounded by `row_matcher`) before the lease and
+    // outside the terminal lock, so a bad pattern fails without typing or holding anything.
     let settle_matcher = match &o.settle_match {
         Some((gone, pat)) => match aterm_observe::row_matcher(pat) {
             Ok(m) => Some((*gone, m)),
@@ -4645,15 +4675,13 @@ fn attention_owned_reply(
 /// print `supervisor=<holder|->`). `None` when `rest` is not a supervisor write, so the caller
 /// falls through to [`cmd_meta`].
 ///
-/// Owner-class only: a supervisor answers the session's prompts, and an edge
-/// token (even a write edge) must not be able to claim to be one or hide the
-/// real one. Without `ttl=` the claim is bound to `conn`, the connection this
-/// request arrived on, and is cleared when it stops serving; with `ttl=<ms>`
-/// (1..=600000) it is a lease a one-shot client renews. A different holder's
-/// live claim answers `ERR busy supervisor=<holder>`; the same holder renews.
-/// A bare unset clears any holder's claim; `holder=<h>` clears it only while
-/// `<h>` holds it (`OK` either way). Returns `(reply, changed)` like
-/// [`cmd_meta`].
+/// Owner-class only: a supervisor answers the session's prompts, and an edge token (even a
+/// write edge) must not claim to be one or hide the real one. Without `ttl=` the claim is bound
+/// to `conn`, the connection this request arrived on, and cleared when it stops serving; with
+/// `ttl=<ms>` (1..=600000) it is a lease a one-shot client renews. A different holder's live
+/// claim answers `ERR busy supervisor=<holder>`; the same holder renews. A bare unset clears
+/// any holder's claim; `holder=<h>` clears it only while `<h>` holds it (`OK` either way).
+/// Returns `(reply, changed)` like [`cmd_meta`].
 ///
 /// The proven self-claim ([`crate::self_claim`]): `prove` reads the proof of
 /// a set's holder from the connection and the session (the kernel's peer pid,
@@ -4763,7 +4791,9 @@ enum HarnessActRequest<'a> {
     Set { act: &'a str, until_us: Option<u64> },
 }
 
-/// Counts and report state read together before a task-face act is admitted.
+/// Counts and report state read together before a task-face act is admitted:
+/// a landing's or a point left to a person's mark, and an opening act's turn
+/// (`SessionTimeline::note_typed_act`, read only at rest).
 #[derive(Clone, Copy)]
 pub(crate) struct HarnessActSnapshot {
     pub mark: crate::session_timeline::LandingMark,
@@ -4941,12 +4971,37 @@ pub(super) fn cmd_meta_harness_act_with_clock(
             }
         }
         timeline.note_harness_act(act, &holder, by);
-        if harness_act_face(rest).is_some_and(crate::harness_task::holds_until_another_turn)
-            && let Some(point) = snapshot
+        let face = crate::harness_task::self_claim_act_face(act);
+        if face.is_some_and(crate::harness_task::holds_until_another_turn) {
+            // The landing's own turn, by the program's order: where the
+            // holder's last act came at rest and no turn has been counted
+            // since, the turn that act typed is still unparsed and is this
+            // landing's (`harness_task::landing_turns`). A point left to a
+            // person only takes the act (it is no landing over that turn).
+            let typed_at = timeline.take_typed_turn();
+            if let Some(point) = snapshot {
+                let mut mark = point.mark;
+                if face == Some(aterm_agent::harness::acts::TaskFace::Landed) {
+                    mark.program_turns =
+                        crate::harness_task::landing_turns(mark.program_turns, typed_at);
+                }
+                timeline.mark_landing(mark);
+            }
+        } else if face == Some(aterm_agent::harness::acts::TaskFace::Open)
+            && aterm_agent::harness::acts::self_claim_types_turn(act)
         {
-            timeline.mark_landing(point.mark);
+            // Only an act that starts a turn names the turn a landing after
+            // it is marked by. One that starts none (an approval, a box's
+            // answer, a report mailed) leaves it as it was: recorded at rest
+            // after the land turn ended, it would read as a turn still to
+            // come, and the next turn after the landing would reopen nothing.
+            timeline.note_typed_act(
+                snapshot
+                    .filter(|point| point.left_at_rest)
+                    .map(|point| point.mark.program_turns),
+            );
         }
-        if let Some(face) = crate::harness_task::self_claim_act_face(act) {
+        if let Some(face) = face {
             timeline.queue_self_task(face);
         }
         // The `harness-act` row rang the session's watchers; the log's owed
@@ -5729,9 +5784,8 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
         return "ERR temporal unreachable\n".to_string();
     };
     let term = plan.run();
-    // A replay at the spine's end lacks the pending resizes: said on the header,
-    // after the byte count the client reads (the key only when there are any, so
-    // the common header is unchanged).
+    // A replay at the spine's end lacks the pending resizes: said on the header after the byte
+    // count, and only when there are any.
     let pending = if at_end && pending > 0 {
         format!(" pending_resizes={pending}")
     } else {
@@ -5876,7 +5930,7 @@ fn revoke_in(edges: &Mutex<EdgeTable>, dst: &SessionId, rest: &str) -> String {
         if removed == 0 {
             return "ERR no such edge\n".to_string();
         }
-        // ONE event for the whole sweep: `op=*` (every op the source held).
+        // One event for the whole sweep: `op=*` (every op the source held).
         session_edge_audit::emit(EdgeAction::RevokeSrc, "wire", &src, dst, "*");
         return format!("OK {removed}\n");
     }
@@ -7414,8 +7468,8 @@ mod tests {
         );
     }
 
-    /// The five published columns ride every row LAST, after `path=`, read
-    /// from the session timeline the status sweep writes (`-` until it has).
+    /// The published program and agent columns ride every row after `path=`, read from the
+    /// session timeline the status sweep writes (`-` until it has).
     /// `autopilot=` beside `supervisor=` is `-` until the session runs an agent
     /// the harness supervises, then its effective Autopilot.
     #[test]
@@ -9121,6 +9175,125 @@ mod update_anchor_tests {
             ),
             "OK timeout\n"
         );
+    }
+
+    /// `await frame` and `await gone` on Claude Code 2.1.308's MEASURED split frame (the lab's
+    /// cast, three tabs at once: aterm-core's `tests/fixtures/half-drawn`,
+    /// `docs/measured/half-drawn-frame-2026-10-22.md`): `frame` answers on a whole frame and
+    /// waits on the half one; `gone esc.to.interrupt` does not latch on the half frame, whose
+    /// busy footer the split read has not reached, nor on the whole busy frame its close
+    /// makes, and latches on the reply's end. `text --json` says `"frame":"open"` on the half
+    /// frame alone.
+    #[test]
+    fn await_frame_waits_on_a_half_frame_and_gone_reads_only_whole_ones() {
+        const BEFORE: &[u8] =
+            include_bytes!("../../aterm-core/tests/fixtures/half-drawn/claude-2.1.308/before.bin");
+        const HALF: &[u8] =
+            include_bytes!("../../aterm-core/tests/fixtures/half-drawn/claude-2.1.308/half.bin");
+        const REST: &[u8] =
+            include_bytes!("../../aterm-core/tests/fixtures/half-drawn/claude-2.1.308/rest.bin");
+        const END: &[u8] =
+            include_bytes!("../../aterm-core/tests/fixtures/half-drawn/claude-2.1.308/end.bin");
+        let handle = test_handle(0);
+        let store = new_store();
+        let feed = |bytes: &[u8]| handle.term.lock().unwrap().process(bytes);
+        let await_ = |rest: &str| cmd_await(&handle.term, &store, 0, &handle.ctx, rest);
+        let text = || {
+            super::super::control_query::cmd_text_json_read(
+                &handle.term,
+                &crate::frame_memo::FrameSlot::default(),
+                super::super::control_query::TextArgs::default(),
+                None,
+                None,
+                0,
+                None,
+                None,
+            )
+        };
+        const GONE: &str = "gone esc.to.interrupt rows 10 49 timeout=0";
+        handle.term.lock().unwrap().resize(50, 144);
+        feed(b"\x1b[47;3H");
+        feed(BEFORE);
+        assert!(await_("frame timeout=0").starts_with("OK frame "));
+        assert_eq!(await_(GONE), "OK timeout\n", "busy before the split");
+        assert!(!text().contains("\"frame\""), "whole: no frame field");
+
+        feed(HALF);
+        assert_eq!(
+            await_("frame timeout=0"),
+            "OK timeout\n",
+            "the frame is open"
+        );
+        assert_eq!(await_(GONE), "OK timeout\n", "the half frame is not read");
+        assert!(text().ends_with(",\"frame\":\"open\"}\n"), "{}", text());
+
+        feed(REST);
+        assert!(await_("frame timeout=0").starts_with("OK frame "));
+        assert_eq!(await_(GONE), "OK timeout\n", "the whole frame is busy");
+        assert!(!text().contains("\"frame\""));
+
+        feed(END);
+        assert!(await_(GONE).starts_with("OK gone "), "the reply's end");
+    }
+
+    /// The park wakes at the hang detector with no output to wake it: Claude Code's measured
+    /// half frame, the run of reads ending inside unfinished frames begun FRAME_HANG less
+    /// 300 ms ago, holds `await frame` (and `text --json` says `"frame":"open"`) until the
+    /// hang detector, where the wait answers and the frame reads as it stands. The wait's
+    /// own timeout, a minute past it, is the hang detector of the test.
+    #[test]
+    fn await_frame_wakes_at_the_hang_detector_in_the_park() {
+        use aterm_core::terminal::{ClockReading, FRAME_HANG};
+        use std::time::{Duration, Instant};
+
+        const BEFORE: &[u8] =
+            include_bytes!("../../aterm-core/tests/fixtures/half-drawn/claude-2.1.308/before.bin");
+        const HALF: &[u8] =
+            include_bytes!("../../aterm-core/tests/fixtures/half-drawn/claude-2.1.308/half.bin");
+        let handle = test_handle(0);
+        let store = new_store();
+        let text = || {
+            super::super::control_query::cmd_text_json_read(
+                &handle.term,
+                &crate::frame_memo::FrameSlot::default(),
+                super::super::control_query::TextArgs::default(),
+                None,
+                None,
+                0,
+                None,
+                None,
+            )
+        };
+        {
+            let mut t = handle.term.lock().unwrap();
+            t.resize(50, 144);
+            t.process(b"\x1b[47;3H");
+            t.process(BEFORE);
+            let begun = Instant::now()
+                .checked_sub(FRAME_HANG - Duration::from_millis(300))
+                .expect("an instant a minute back");
+            t.process_at(
+                HALF,
+                ClockReading {
+                    monotonic: begun,
+                    wall_ms: None,
+                },
+            );
+            assert!(t.sync_frame_unfinished());
+        }
+        assert!(text().ends_with(",\"frame\":\"open\"}\n"), "{}", text());
+        let started = Instant::now();
+        let out = cmd_await(&handle.term, &store, 0, &handle.ctx, "frame timeout=120000");
+        assert!(out.starts_with("OK frame "), "{out}");
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "woken by the hang detector, not the timeout"
+        );
+        assert!(
+            !text().contains("\"frame\""),
+            "past its hang detector the frame reads as it stands"
+        );
+        assert!(handle.term.lock().unwrap().sync_frame_unfinished());
     }
 }
 

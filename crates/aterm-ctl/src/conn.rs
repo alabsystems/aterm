@@ -26,53 +26,52 @@ pub(crate) const CONN_SUBVERBS: &str = "ls add set rm spawn show map help";
 const CONN_USAGE: &str = "\
 aterm conn — session connections: standing pull/push wiring between sessions.
 
-A connection lets one session drive another as a human could, at minimum:
-push = keystrokes on the peer's PTY (plus the ^C signal), pull = read what a
-human would see (the rendered screen). Kinds: pull | push | both (default).
+A connection src -> dst lets src act on dst as a person at its terminal:
+push = type into its PTY and signal its foreground job, pull = read its
+rendered screen. Kinds: pull | push | both.
 
 USAGE:
     aterm conn [--sock PATH | --pid PID] [<subverb> ...]
 
 SUBVERBS:
-    (none)              THIS session's connections, one line each:
-                        \u{21e5} outgoing (this session drives the peer),
-                        \u{21e4} incoming (the peer drives this session),
-                        \u{21c6} both ways — then kind, peer sid, peer title
-    ls [--json]         every session connection in the instance
-    add <sel> [--kind pull|push|both] [--to-me | --from <sel>]
-                        connect. Default @self -> <sel> (\"I take control of
-                        it\"); --to-me inverts (<sel> -> @self: invite a
-                        controller); --from <sel2> wires the third-party pair
-                        <sel2> -> <sel>
-    set <sel> --kind pull|push|both [--to-me | --from <sel>]
-                        make the connection exactly --kind; a half not named
-                        is removed
-    rm <sel> [--kind pull|push|both] [--to-me | --from <sel>]
-                        disconnect (kind-filtered: --kind pull removes only
-                        the pull half)
+    (none)              this session's connections: \u{21e5} it drives the peer,
+                        \u{21e4} the peer drives it, \u{21c6} both ways at the same kind
+    ls [--json]         every connection in the instance, one line per
+                        src -> dst pair (--json: the `flows --json` object)
+    add <sel> [--kind pull|push|both] [--to-me | --from <sel2>]
+                        connect @self -> <sel> (take control of it), or set
+                        that connection to exactly --kind (default both).
+                        --to-me: <sel> -> @self (invite a controller);
+                        --from <sel2>: <sel2> -> <sel>
+    set <sel> --kind pull|push|both [--to-me | --from <sel2>]
+                        add, with --kind required
+    rm <sel> [--kind pull|push|both] [--to-me | --from <sel2>]
+                        disconnect; --kind removes only that half
     spawn controlled|controller [--tab|--window] [--of <sel>]
-                        spawn a new session wired both ways: controlled = @of
-                        drives it; controller = it drives @of (its shell gets
-                        ATERM_OBSERVE_SESSION_ID). --window by default; --of
-                        is @self inside aterm, required outside
-    show <sel>          raise the peer's window and select its tab
+                        spawn a session connected (both) with --of:
+                        controlled = --of drives it; controller = it drives
+                        --of, its shell given ATERM_OBSERVE_SESSION_ID.
+                        --tab lands beside --of; --window (default) needs a
+                        GUI. --of defaults to @self; outside aterm, name it
+    show <sel>          raise the session's window and select its tab
     map                 open the GUI Overview (every session; was the connection map)
     help                this help
 
 SELECTORS:
     @self               this session ($ATERM_PARENT_SESSION_ID)
-    @<sid>              a stable session id (discover with `aterm ctl ls`)
-    @<local-id>         the <local> column of `aterm ctl ls` (ids are per instance)
-    Titles are NOT selectors (ambiguous). Outside an aterm session the @self
-    forms refuse with an error naming $ATERM_PARENT_SESSION_ID; everything
-    else targets the latest instance, exactly like `aterm ctl`.
+    @<sid>              a session id (`aterm ctl ls`)
+    @<local-id>         the <local> column of `aterm ctl ls` (per instance)
+    Titles are not selectors. Outside an aterm session a subverb that needs
+    @self, named or implied, refuses and names $ATERM_PARENT_SESSION_ID.
+    Without --sock/--pid, conn targets this session's instance, else the
+    latest, as `aterm ctl` does.
 
-DRIVING A CONNECTED PEER (the connection is standing wiring; driving is ctl):
-    aterm ctl @<sid> turn 'message'     one verified human-grade interaction
-    aterm ctl @<sid> text               read what the peer shows
+DRIVING A PEER (aterm ctl):
+    aterm ctl @<sid> turn 'message'     submit it, return the settled screen
+    aterm ctl @<sid> text               read its screen
 
-`aterm conn` is the same act as `aterm ctl connect/disconnect/flows/raise/spawn
-connected=/open connections`.
+Each subverb is an `aterm ctl` verb: connect (add, set), disconnect (rm),
+flows (ls), spawn connected= (spawn), raise (show), open connections (map).
 ";
 
 /// Per-op socket deadline for the conn verbs. Every §6 verb answers synchronously, so a

@@ -135,10 +135,7 @@ pub(crate) struct AgentStep {
     pub(crate) reading_changed: bool,
     /// What the screen said of the turn, for the session log (phase 3B).
     pub(crate) turn: crate::presence::TurnFacts,
-    /// The verdict to publish on the session's timeline (`word`, raw
-    /// `detail`, a prompt's host-side subject, and the agent its reader
-    /// read — by name or by screen), when the zone was classified this
-    /// observation.
+    /// The verdict to publish on the session's timeline, when the zone was classified.
     pub(crate) publish: Option<AgentPublish>,
     /// What the same screen counts, published with the verdict for the
     /// survey (`SessionTimeline::set_gauges`).
@@ -756,19 +753,10 @@ pub(crate) fn prompt_yields_to_job(
 /// block once complete (133;D read, next 133;A not yet), or, at a prompt, the block that prompt
 /// closed if it completed.
 ///
-/// The second form is the one a sweep meets. Every aterm integration writes the
-/// finished command's `133;D` and the next prompt's `133;A` back to back from
-/// one hook (the zsh and bash precmd, fish's prompt event, the pwsh prompt
-/// function), so the reader processes both in one batch, and the A archives
-/// the completed block (`shell_prompt_start`) before any sweep can read it as
-/// current. Reading the current block alone therefore never saw a
-/// result: a failed command published `outcome=none` while `subscribe … events`
-/// pushed its `block-complete … exit=1` (review finding, 2026-09-27).
-///
-/// Only the block the prompt closed, never an older one: a prompt that closed a
-/// block with no 133;D (an empty Enter, an interrupted or `exec`-replaced
-/// shell) reports nothing, so an older command's result cannot come back over
-/// work that never reported one.
+/// A sweep usually meets the second form: every aterm integration writes `133;D` and the next
+/// `133;A` from one hook, so the reader processes both in one batch and the A archives the
+/// block before any sweep sees it as current. Never an older block: a prompt that closed one
+/// with no 133;D (an empty Enter, an interrupted shell) reports nothing.
 ///
 /// A scrollback erase after the prompt (Cmd-K, or a later ED 3) can take the
 /// closed block with its rows, and the archive with it, before a sweep reads
@@ -782,8 +770,7 @@ pub(crate) fn completed_block(term: &aterm_core::terminal::Terminal) -> Option<C
     let current = term.current_block();
     let block = match current.map(|current| current.state) {
         Some(BlockState::Complete) => current?,
-        // At a prompt (or with no current block, where `shell_evidence` reads
-        // this same archived block): the newest archived block.
+        // At a prompt, or with no current block: the newest archived block.
         Some(BlockState::PromptOnly | BlockState::EnteringCommand) | None => {
             match term.last_completed_block() {
                 Some(archived) if archived.is_complete() => archived,
@@ -976,11 +963,8 @@ fn block_command_line(
     match explicit {
         // OSC 633;E: the shell said the command line itself.
         Some(explicit) => Some(explicit.to_owned()),
-        // The screen scrape reads WHOLE rows, so the command's first row still
-        // carries the prompt in front of it (`$ sleep 30`); cut at the column
-        // the shell marked the command start (OSC 133;B) — by display column,
-        // not char count, so a wide prompt glyph does not eat the program's
-        // first letter.
+        // The scrape reads whole rows, prompt included (`$ sleep 30`): cut at the command-start
+        // column (OSC 133;B) by display column, so a wide prompt glyph eats no letter.
         None => {
             let scraped = term.block_command(block)?;
             let skip = usize::from(block.command_start_col.unwrap_or(0));
@@ -2348,10 +2332,8 @@ impl StatusObserver {
             .is_some_and(|slot| slot.failure.see())
     }
 
-    /// Whether `session`'s published outcome is a failure the person has
-    /// already SEEN ([`FailureMark`]): what an update carries for a held pane
-    /// (`session_store::HeldPaneCarry::failure_seen`), whose successor shows
-    /// the same exit again (round eight of the update audit, U34).
+    /// Whether `session`'s published outcome is a failure the person has already seen
+    /// ([`FailureMark`]), carried for a held pane (`session_store::HeldPaneCarry::failure_seen`).
     #[cfg(unix)]
     pub(crate) fn failure_seen(&self, session: u64) -> bool {
         self.sessions
@@ -2359,12 +2341,9 @@ impl StatusObserver {
             .is_some_and(|slot| slot.failure.failing && !slot.failure.unseen())
     }
 
-    /// The payload of a `status-change` timeline event, when the published
-    /// PHASE or OUTCOME moved since the last one (RFC §7: one timeline event per
-    /// transition that survived dwell). Reason, confidence and detail moves are
-    /// not events: they change without dwell (`content_activity` ↔
-    /// `output_activity` under one `Running`), and carrying them would flood the
-    /// bounded timeline the dwell exists to protect. Consumes the change.
+    /// The payload of a `status-change` timeline event when the published phase or outcome
+    /// moved since the last one; consumes the change. Reason, confidence and detail moves are
+    /// not events: they change without dwell and would flood the bounded timeline.
     #[cfg(test)]
     pub(crate) fn take_status_event(&mut self, session: u64) -> Option<String> {
         self.take_status_transition(session)
@@ -2881,8 +2860,7 @@ impl StatusObserver {
         self.programs.clear_pending();
         self.footer_asked.clear();
         self.rollout_asked.clear();
-        // The agent readings describe the same stopped subsystem: retire them
-        // (presence folds the post-clear sequence as "no reading").
+        // Retire the agent readings too (presence folds the post-clear sequence as none).
         self.agents.clear();
         self.agent_seq += 1;
         self.agent_cleared_at = self.agent_seq;
@@ -2968,15 +2946,13 @@ impl crate::App {
         // The sessions whose agent word moved or whose program began a turn
         // since the last sweep read it: a proven self-claim's landing reopens
         // at a turn anyone begins after it (`App::reopen_self_claim_landing`,
-        // FOREVER LAND §10.4), after the loop.
+        // Autopilot Land), after the loop.
         let mut turns_moved = Vec::new();
         // What a footer read the sweep starts wakes when it moves a session's
         // log (session log Phase 3B, `claude_footer::LogWake`).
         let footer_wake = self.footer_log_wake();
         self.session_status.set_log_wake(&footer_wake);
-        // The sweep never changes pool membership: borrow each due session
-        // directly instead of collecting ids, looking them up again, and
-        // cloning its terminal Arc on every observation interval.
+        // The sweep never changes pool membership, so it borrows each session directly.
         for (session, edged_visit) in sessions {
             #[cfg(test)]
             crate::work_counts::status_probe();
@@ -2996,18 +2972,9 @@ impl crate::App {
             let latest_output_ns = session
                 .latest_output_activity_ns
                 .load(std::sync::atomic::Ordering::Relaxed);
-            // THE REFUSAL COMES FIRST. Contention is a SKIP, and everything
-            // below the lock is evidence this sweep will throw away — so a
-            // contended session must cost one atomic try and nothing else. Read
-            // the other way round, the `tcgetpgrp` syscall and the O(windows)
-            // focus scan were paid per due session on every turn under exactly
-            // the output flood that makes the lock contended, inside the
-            // workload the O(1) gate exists to survive.
-            //
-            // A refusal also CHARGES the observation interval
-            // (`note_skipped`): without it `next_due` never advances on this
-            // path, and `next_wake`'s structural clamp — which floors every
-            // armed instant at `next_due` — has nothing to floor against.
+            // The refusal comes first: a contended session costs one atomic try, not the
+            // `tcgetpgrp` and focus scan below. It still charges the interval (`note_skipped`),
+            // or `next_due` never advances and `next_wake`'s clamp has nothing to floor against.
             //
             // An edged visit refused is owed on the next wake (the inbox) and
             // charges nothing: the pool walk below decides that, as for any
@@ -3095,31 +3062,29 @@ impl crate::App {
                     crate::harness_host::agent_of(timeline.agent()),
                 )
             };
-            // The read is the WHOLE screen, once, through the one construction
-            // `status hash=` hashes ([`crate::control::screen_text`]): its hash
-            // and generation are the verdict's stamp (`agent_gen=`/`agent_fp=`),
-            // and its last rows are the zone classified.
-            // The terminal's cursor, under this SAME guard as the rows: Claude
-            // Code's `idle` is the prompt box that holds it (`presence::Cursor`),
-            // and its moving alone is a reason to read the zone again. Its row
-            // is the grid's, the rows' own (`visible_row` reads the live rows
-            // whatever the scroll position).
+            // The read is the whole screen, once, built as `status hash=` hashes it
+            // ([`crate::control::screen_text`]): its hash and generation stamp the verdict
+            // (`agent_gen=`/`agent_fp=`). The cursor, under the same guard: Claude Code's `idle`
+            // is the prompt box that holds it, and its moving alone warrants another read.
             let cursor = crate::presence::Cursor::At(Some(usize::from(guard.cursor().row)));
             // The text is built under the guard and published to the session's
             // slot once the guard is gone, so the `status`, `text` and `turn`
             // reads of this screen that follow are served it. No look first: a
             // contended session costs one `try_lock` and nothing else.
-            let read = self
-                .session_status
-                .agent_zone_wanted(id, generation, cursor, &program, now)
-                .then(|| std::sync::Arc::new(crate::frame_memo::ScreenText::of(&guard)));
+            // A DEC 2026 frame the program has not finished is no screen to judge: its rows
+            // are a prefix of a redraw, a busy row the split read has not reached missing
+            // (`docs/measured/half-drawn-frame-2026-10-22.md`). Not read, and not counted
+            // as read: the moved generation owes the next look, after the frame's close.
+            let read = (!guard.frame_unfinished_at(now)
+                && self
+                    .session_status
+                    .agent_zone_wanted(id, generation, cursor, &program, now))
+            .then(|| std::sync::Arc::new(crate::frame_memo::ScreenText::of(&guard)));
             drop(guard);
             let (zone, stamp) = match read {
                 Some(text) => {
-                    // The whole screen: the verdict reads its live zone (the
-                    // last CLASSIFY_ROWS of the content, `presence::live_zone`),
-                    // and the whole for a box the zone cuts
-                    // (`presence::agent_verdict`).
+                    // The whole screen: the verdict reads its live zone
+                    // (`presence::live_zone`) and the whole for a box the zone cuts.
                     let (fp, zone) = screen_agent_frame(&text, usize::MAX);
                     session.ctx.frame.publish_text(text);
                     let stamp = crate::session_timeline::AgentStamp { generation, fp };
@@ -3450,8 +3415,7 @@ impl crate::App {
                     self.session_status.slog_wakes.note(id, wake);
                     moved
                 }
-                // Read, and the zone was unchanged: the verdict stands on this
-                // newer screen.
+                // Read, and the zone was unchanged: the verdict stands on this newer screen.
                 (None, Some(stamp)) => {
                     let mut timeline = session
                         .ctx
@@ -3473,13 +3437,10 @@ impl crate::App {
                 self.harness_screen.note_phase(id, &session.ctx, arm, glass);
                 turns_moved.push(id);
             }
-            // THE RESIZE LEDGER, evaluated on this sweep so a `render` verdict
-            // transition lands on the timeline (and wakes the digest) without
-            // waiting for a reader. The SELF-AUDIT: an engine past the ledger
-            // (or another engine) took a resize no path booked, so its journal
-            // is copied under a second `try_lock` taken after the timeline is
-            // released (never nested, never waited on) and backfilled as
-            // `site=-`.
+            // The resize ledger, evaluated here so a `render` verdict move lands on the
+            // timeline without waiting for a reader. An engine past the ledger took a resize no
+            // path booked: its journal is copied under a second `try_lock`, taken after the
+            // timeline is released, and backfilled as `site=-`.
             let now_ms = crate::turn_ledger::now_ms();
             // The session log's owed wake is taken here too, after every
             // append this pass made (its blocks, a failure seen, the verdict):
@@ -3889,10 +3850,9 @@ impl crate::App {
         out
     }
 
-    /// The fields the bridge extracts from `@sid status`. Keep
-    /// their producers and fallback exactly aligned with that record: `hold`
-    /// from the session fabric leaf, `detail` from one non-blocking terminal
-    /// read or the last observed status, and `revision=0` until classified.
+    /// The fields the bridge extracts from `@sid status`, with the same producers and fallbacks
+    /// as that record: `hold` from the fabric leaf, `detail` from one non-blocking terminal read
+    /// or the last status, `revision=0` until classified.
     ///
     /// And one the record does not carry, `hold_origin=` (`person`, `fleet`,
     /// `local`, comma-joined in that order, or `-`), from the same read of the
@@ -4001,10 +3961,8 @@ impl crate::App {
         // start, judged against THIS record's count ([`crate::launch_witness`]).
         // Its leaf lock is taken after the terminal guard, never before it.
         let launch = pooled.ctx.launch.status_fields(human_seq);
-        // The RAW shell-integration cwd, taken from the SAME guard as the
-        // subject rungs: `consent_at_risk` is a lexical test against the
-        // protected roots, and it must not re-take a lock this scope already
-        // holds (nor answer from a display-abbreviated string).
+        // The raw reported cwd, from the same guard: `consent_at_risk` tests it lexically
+        // against the protected roots.
         let reported_cwd = {
             use crate::cwd_native::ReportedCwd as _;
             term.as_deref().and_then(|t| {
@@ -4041,14 +3999,9 @@ impl crate::App {
         // Rung 3: what is running, from the same guard; `-` when nothing runs or the lock was
         // contended. The roster's `detail=` comes from the same producer.
         let detail = term.as_deref().and_then(executing_detail);
-        // THE SETTLED SCREEN'S STAMP, read under the SAME guard as `detail=` so
-        // the two cannot describe different instants. `seq=` is the terminal's
-        // `content_seq` and `hash=` is FNV-1a-64 of the UNTRIMMED visible screen
-        // — byte for byte the pair `turn` returns and `history` keeps for a turn
-        // id, so a report built from this screen can be matched against the
-        // ledger rather than believed (a manager's fold of a report). A session
-        // whose terminal could not be locked answers `-`/`-`: the poll never
-        // waits on the guard for a field it can say it does not have.
+        // `seq=` (`content_seq`) and `hash=` (FNV-1a-64 of the untrimmed visible screen), the
+        // pair `turn` returns and `history` keeps, from the same guard as `detail=`; `-` when
+        // the lock was contended.
         let stamp = term
             .as_deref()
             .map(|t| (t.content_seq(), look.text(t).fnv()));
@@ -4135,10 +4088,8 @@ impl crate::App {
                 proven,
             )
         };
-        // `input= input_bytes= input_wait_ms= fg_rss_mb=` (2026-09-24), after
-        // `integration=`: whether the program is READING its input, probed
-        // live — the fact a frozen program's unmoving screen cannot show
-        // ([`crate::input_stall::status_input`]). `-` off macOS or off a tty.
+        // `input= input_bytes= input_wait_ms= fg_rss_mb=`: whether the program is reading its
+        // input, probed live ([`crate::input_stall::status_input`]); `-` off macOS or off a tty.
         // Unread input with no watch looking wakes one.
         let input = crate::input_stall::status_input(
             &pooled.ctx.sink,
@@ -4167,16 +4118,9 @@ impl crate::App {
             self.status_job_fields(session),
             crate::program_check_watch::status_fields()
         );
-        // THE PROGRAM AND THE AGENT VERDICT (`program= agent= agent_detail=
-        // agent_rev= agent_since_ms=`): the sweep's publication, read from the
-        // session timeline — the same store the `sessions` row, `await agent`
-        // and `EVENT agent` read, so no two surfaces disagree.
-        //
-        // `render=<ok|displaced|desync-risk|unverified|unjudged|-> resizes=<n> flaps=<n>`
-        // (2026-09-28), evaluated in the same leaf lock and printed just before
-        // the `gen=`/`seq=`/`hash=` stamp: whether the app has drawn over
-        // content a resize displaced ([`crate::resize_ledger`]), how many
-        // resizes the session took, and how many net-zero flaps.
+        // `program= agent= agent_detail= agent_rev= agent_since_ms=`: the sweep's publication,
+        // from the session timeline the `sessions` row and `await agent` read. Under the same
+        // lock, `render= resizes= flaps=` ([`crate::resize_ledger`]).
         //
         // `last_act=<act|->` (2026-10-16), from the same leaf lock: the last act
         // an agent that supervises itself recorded (`meta set harness_act`,
@@ -4257,7 +4201,7 @@ impl crate::App {
         // the instant its timed Cruise lands and its task's face as its loop
         // last told this window's host — `task=` only while that host holds
         // the live claim, or beside a proven self-claim whose own acts tell
-        // the face (FOREVER LAND §10.4) — and `-` otherwise.
+        // the face (Autopilot Land) — and `-` otherwise.
         let land_at =
             crate::autopilot::land_at_field(land_at.filter(|_| supervised_agent.is_some()));
         let task = crate::autopilot::task_field(face, claimed_here || proven, supervised_agent);
@@ -4318,7 +4262,7 @@ impl crate::App {
         let opt = |value: Option<&str>| {
             value.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode)
         };
-        // THE ROUND-19 TAIL (design §5): `hand= hand_pid= level= story=`, additive after
+        // THE TAIL (design §5): `hand= hand_pid= level= story=`, additive after
         // the fabric fields. Read from the presence slot the wakes keep current
         // — plain field reads, no lock, no classifier — so the poll pays nothing
         // it did not already pay.
@@ -4369,30 +4313,14 @@ impl crate::App {
             self.typed_by(&pooled.ctx).as_ref(),
             aterm_time::unix_millis().unwrap_or(0),
         );
-        // `path=<frozen|live>` (2026-09-22), after `story=` and BEFORE the
-        // `seq=`/`hash=` stamp, which stays last by contract: whether this
-        // session's shell fronts aterm's managed `agents/` on PATH. `frozen` is
-        // the registry's adoption mark ([`crate::session_store::SessionStore::
-        // has_frozen_path`]): a shell spawned by a build before the self-healing
-        // sessions (2026-09-16) and carried across the update(s) since, so
-        // `claude`/`codex` typed in it run the foreign copies until the hook is
-        // sourced there. An UPPER BOUND — sourcing the hook is not reported back
-        // — the same one the managed-current row's tab count is. One registry
-        // read, no lock the poll did not already take elsewhere.
-        //
-        // `history_lost=<n>` (2026-09-26), from the same registry read, after
-        // the owner columns and before the `gen=`/`seq=`/`hash=` stamp: the
-        // history lines this session's update handoffs could not carry, over
-        // every handoff it crossed (`crate::handoff_history`) — `0` when every
-        // line crossed or it never crossed one. The one place the per-tab count
-        // is answerable; the band says the update's total once.
-        //
-        // `integration_rev=<current|stale:<rev>|frozen|->` (2026-09-26), from the
-        // same registry read and the terminal guard above, after `history_lost=`
-        // and before the stamp: which integration body the shell runs against
-        // the one this build ships (`shell_body::status_word`) — `frozen` for a
-        // shell adopted with an integration from before loaders, which no body
-        // pointer reaches.
+        // One registry read, for fields before the stamp, which stays last by contract:
+        // - `path=` from the adoption mark (`SessionStore::has_frozen_path`): a shell from a
+        //   build before self-healing sessions, so typed `claude`/`codex` run foreign copies
+        //   until the hook is sourced. An upper bound: sourcing the hook is not reported back.
+        // - `history_lost=`: history lines this session's update handoffs could not carry
+        //   (`crate::handoff_history`).
+        // - `integration_rev=<current|stale:<rev>|frozen|->` (`shell_body::status_word`):
+        //   `frozen` is a shell adopted with an integration from before loaders.
         let (mark, history_lost, integration_frozen) = {
             let store = self.store.read().unwrap_or_else(|p| p.into_inner());
             (

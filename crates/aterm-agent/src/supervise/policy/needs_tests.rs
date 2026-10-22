@@ -186,6 +186,51 @@ fn needs_are_one_a_line_each_once_and_the_items_under_a_bare_head() {
     assert_eq!(without_needs(bare), "All else is landed.");
 }
 
+/// ONE NEED A LINE: a head whose words name a need is that one need, and the list under it is
+/// the report's own. The lab stub's tall reply (`aterm-lab`'s `forever::tall_reply`, Land's L6
+/// and r10's land-d: `NEEDS YOU: rotate the deploy key` over 80 `- check <n> passed` rows) was
+/// read as 80 needs (`NEEDS … count=80`, "(+79 more)"); it names one, and the 80 rows stay in
+/// the words every other reader judges. CONTROLS: two NEEDS YOU lines are two needs; words
+/// ending in a colon introduce the list under them, its items the needs; a bare head takes its
+/// list; a none over a list still reads the list (FAIL TOWARD A KEPT NEED).
+#[test]
+fn a_head_that_names_its_need_is_one_need_over_any_list() {
+    let clean = "Nothing left: the parser is committed and pushed to origin/main.";
+    let mut tall = String::from("Here is the landing report.\nNEEDS YOU: rotate the deploy key\n");
+    for i in 1..=80 {
+        tall.push_str(&format!("- check {i} passed\n"));
+    }
+    tall.push_str(clean);
+    assert_eq!(needs_you(&tall), ["rotate the deploy key"]);
+    assert!(!says_no_needs(&tall));
+    let kept = without_needs(&tall);
+    assert_eq!(
+        kept.lines().filter(|l| l.starts_with("- check ")).count(),
+        80
+    );
+    assert!(!kept.contains("NEEDS YOU"), "{kept}");
+    assert_eq!(defense_line(&tall), Some(clean));
+    // CONTROLS.
+    assert_eq!(
+        needs_you(
+            "NEEDS YOU: rotate the deploy key\nNEEDS YOU: approve the release\n- check 1 passed"
+        ),
+        ["rotate the deploy key", "approve the release"]
+    );
+    assert_eq!(
+        needs_you("NEEDS YOU: two things:\n- the deploy key\n- the release approval"),
+        ["the deploy key", "the release approval"]
+    );
+    assert_eq!(
+        needs_you("NEEDS YOU:\n- the deploy key\n- the release approval"),
+        ["the deploy key", "the release approval"]
+    );
+    assert_eq!(
+        needs_you("NEEDS YOU: none\n- the signing key"),
+        ["the signing key"]
+    );
+}
+
 /// A BARE HEAD WITH NO LIST UNDER IT names the paragraph under it, blank rows
 /// between them passed over, its wrapped rows joined; with no words under it
 /// at all (another head, a fence, the report's end) it still names a need

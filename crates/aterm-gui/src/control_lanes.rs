@@ -1417,7 +1417,7 @@ pub(super) struct Lanes {
     wait_spawn: Mutex<Option<WaitSpawnHook>>,
 }
 
-/// What the lanes hold right now (the Tier-1 bind's projection).
+/// What the lanes hold right now (the conformance bind's projection).
 #[cfg(all(test, unix))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Census {
@@ -1539,12 +1539,9 @@ impl Lanes {
                 format!("aterm-control-{index}"),
                 crate::qos::Role::Responsive,
                 move || {
-                    // QoS floor (qos.rs): this lane runs verb dispatch, and a
-                    // read verb holds the terminal mutex while it formats. At the
-                    // default band it would sit below the UI thread that takes
-                    // the same mutex, leaving a descheduled holder in front of the
-                    // next keystroke. Not `Interactive`: a verb storm must never
-                    // outrank the UI thread.
+                    // QoS floor (qos.rs): a read verb holds the terminal mutex the UI
+                    // thread takes. Not `Interactive`: a verb storm must never outrank
+                    // the UI thread.
                     lanes.rpc_lane();
                 },
             ) {
@@ -2052,10 +2049,9 @@ impl Lanes {
                 inline = self.take_inline();
                 if inline.is_none() {
                     refuse_wait(reply);
-                    // A refused frame's body was never read: left in the
-                    // stream, the next turn would serve it as requests under
-                    // this connection's scope. Closed once the busy line is
-                    // out, as a frame refused on its header is.
+                    // A refused frame's body was never read; left in the stream it
+                    // would be served as requests under this scope, so the connection
+                    // closes once the busy line is out.
                     reply.then_close = request.body_len() > 0;
                     may_defer = true;
                     served = true;

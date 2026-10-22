@@ -145,9 +145,7 @@ use aterm_phase::ResetKind;
 
 use super::one_line;
 
-// ---------------------------------------------------------------------------
 // Constants — every number of the design, by name
-// ---------------------------------------------------------------------------
 
 /// The roster's file name, beside `aterm.toml`.
 pub const ACCOUNTS_FILE: &str = "accounts.toml";
@@ -339,7 +337,7 @@ pub const CREDITS_RETELL_S: i64 = 10 * 60;
 /// written around the read, a footer still drawn from the answer before it
 /// carried its figure past a limit reset between the two, and the redraw
 /// that took the warning away said nothing to undo it (the review of S5,
-/// round 5). Stamped with an answer older than its footer, a figure is only
+/// ). Stamped with an answer older than its footer, a figure is only
 /// older than it was: a refill since outranks it, and the next telling
 /// stamps it again.
 pub const NOTICES_DRAWN_S: i64 = 2;
@@ -489,9 +487,7 @@ pub const PROFILE_KEYS: &[&str] = &[
     "ANTHROPIC_CONFIG_DIR",
 ];
 
-// ---------------------------------------------------------------------------
 // 1. The roster (design §4)
-// ---------------------------------------------------------------------------
 
 /// Whose budget an account is. A contention class, not a person class: a
 /// `shared` account is the owner's own, which the owner's OTHER machines
@@ -1514,10 +1510,8 @@ pub fn footer_label<'a>(roster: &'a Roster, who: &ProcessLogin) -> Option<&'a st
     judged_label(roster, who).filter(|_| roster.several())
 }
 
-// ---------------------------------------------------------------------------
 // 1b. Logins (design v2 §4.5, §5): where each row's login is bound on this
 // machine, and what its renewal knows
-// ---------------------------------------------------------------------------
 
 /// The logins' file name, in the store beside `state.json`. Its own file:
 /// an older build saves `state.json` with the keys it knows ([`State::to_json`]),
@@ -2022,7 +2016,7 @@ pub fn note_served_login(logins: &mut Logins, label: &str, at: i64) -> bool {
 }
 
 /// A LOGIN SIGNED BACK IN WHERE IT STANDS, its first turn served at `at`
-/// after its row was recorded signed out (the owner's ruling of 2026-10-19:
+/// after its row was recorded signed out (the owner's
 /// aterm types `/login` into a lost login and the owner signs it in in the
 /// tab; or the tab's carried `/login` after a strike): the row's word is `ok`
 /// again — a candidate for every session, its signed-out or due line gone —
@@ -2111,9 +2105,7 @@ pub fn note_wrong_account(logins: &mut Logins, label: &str, at: i64) -> Vec<Even
     }
 }
 
-// ---------------------------------------------------------------------------
 // 2. The state (design §5), schema 1
-// ---------------------------------------------------------------------------
 
 /// The newest observation or scoped clearing of one raw vendor limit type.
 /// Clearing records share the same bounded map as standing observations.
@@ -3623,9 +3615,7 @@ pub fn mint_machine() -> io::Result<String> {
     aterm_uds::rand::hex_token::<8>()
 }
 
-// ---------------------------------------------------------------------------
 // 3. The condition (design §5's table) — derived, never stored
-// ---------------------------------------------------------------------------
 
 /// The one word for an account, in the table's order: the first row that
 /// applies is the answer.
@@ -3763,9 +3753,7 @@ pub fn sign_in_next(
         .map(|row| (row.label.clone(), row.email.is_some()))
 }
 
-// ---------------------------------------------------------------------------
 // 4. Advice (design §6)
-// ---------------------------------------------------------------------------
 
 /// `[harness] accounts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4681,9 +4669,7 @@ fn login_follow(mine: &Row, me: &Me<'_>, point: &Point, cond: Condition) -> Advi
     })
 }
 
-// ---------------------------------------------------------------------------
 // 5. The ledger event
-// ---------------------------------------------------------------------------
 
 /// What a ledger row records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4932,9 +4918,7 @@ impl Event {
     }
 }
 
-// ---------------------------------------------------------------------------
 // 6. Transactions — pure edits of a `State`, answering the ledger's rows
-// ---------------------------------------------------------------------------
 
 /// The record of `label`, made if absent. `None` for a label no roster
 /// could carry. A state already holding [`MAX_ACCOUNTS`] others forgets the
@@ -6349,9 +6333,7 @@ pub fn unpin(state: &mut State, why: &str, now: i64) -> Option<Event> {
     Some(Event::new(now, Kind::Unpin, &account).because(why))
 }
 
-// ---------------------------------------------------------------------------
 // 7. The store
-// ---------------------------------------------------------------------------
 
 /// The lock's file name.
 const LOCK_FILE: &str = "accounts.lock";
@@ -7084,9 +7066,7 @@ impl Store {
     }
 }
 
-// ---------------------------------------------------------------------------
 // 8. The recorder (design §5, "What counts as an observation")
-// ---------------------------------------------------------------------------
 
 /// What became of one call of the recorder ([`record_wall`]). A host logs it
 /// by [`Recorded::as_str`] alone: the reason a [`Recorded::Refused`] carries

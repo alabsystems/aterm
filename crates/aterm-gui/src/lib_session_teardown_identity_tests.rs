@@ -309,7 +309,7 @@ fn the_final_exit_ends_a_hup_ignoring_shell_as_closing_its_tab_does() {
 }
 
 /// THE COLD UPDATE LANE'S `exec` LEAVES NO HUP-IGNORING SHELL OF A CLOSED TAB
-/// (ATERM-KI-1014-6). The cold lane runs only at zero live tabs, but a tab
+/// . The cold lane runs only at zero live tabs, but a tab
 /// closed just before keeps its shell's reap in grace for ~250 ms, and `exec`
 /// ends the reap's thread with every other: a shell that ignores SIGHUP, not
 /// yet SIGKILLed, would outlive the switch. The steps before the `exec`

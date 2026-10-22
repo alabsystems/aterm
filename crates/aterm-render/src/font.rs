@@ -411,9 +411,8 @@ pub struct Font {
     /// (STHeiti Light: 12 280 entries, 98 kB here against ~150 kB as a map),
     /// and a lookup that misses an empty slice costs nothing.
     unicode_overrides: Box<[(char, u16)]>,
-    /// `hmtx` advance per glyph id, in design units. Indexed by gid; a gid past
-    /// the end of the table repeats the last entry, which is what
-    /// `glyph_hor_advance` already does, so this is a straight copy.
+    /// `hmtx` advance per glyph id, in design units (`glyph_hor_advance`, which repeats the
+    /// last entry past the end of the table).
     advances: Box<[u16]>,
     /// Per-glyph ink box in design units `(x_min, y_min, x_max, y_max)`, for `glyf` faces,
     /// where it is a header read; this keeps [`Font::metrics`] allocation- and parse-free.
@@ -490,12 +489,8 @@ impl Font {
         }
         let glyph_count = face.number_of_glyphs();
 
-        // fontdue's map, built fontdue's way: enumerate every subtable (not just
-        // the Unicode ones), keep only non-zero mappings, let a later subtable
-        // win. `char::from_u32` replaces fontdue's `transmute`, which is the one
-        // place this is strictly safer rather than merely equal: a cmap that
-        // emits a surrogate code point yields `None` here instead of an invalid
-        // `char`, and no `char` a caller can hold is a surrogate anyway.
+        // Every subtable (not only the Unicode ones), non-zero mappings only, a later
+        // subtable winning; `char::from_u32` drops surrogate code points.
         //
         // The same walk notes each code point whose winner may not be the
         // Unicode subtables' answer (`unicode_overrides`): one a legacy

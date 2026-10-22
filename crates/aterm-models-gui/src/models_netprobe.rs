@@ -3,11 +3,10 @@
 
 use aterm_spec::derive::Model;
 
-/// Shutdown crossing a worker's already-checked, mutex-held park boundary.
-/// Condvar parking atomically releases the mutex; a stop that takes that same
-/// mutex must therefore publish after Park. `Buggy=1` is the old atomic-only
-/// publisher, whose notification can precede Park and be lost. Tier-1 drives
-/// the real NetProbe loop at this boundary and replays both orders.
+/// Shutdown crossing a worker's already-checked, mutex-held park boundary. Condvar parking
+/// releases the mutex atomically, so a stop that takes that mutex publishes after Park.
+/// `Buggy=1` publishes through an atomic alone, so its notification can precede Park and be
+/// lost. Tier-1 drives the real NetProbe loop at this boundary and replays both orders.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn netprobe_shutdown_park_model() -> Model {

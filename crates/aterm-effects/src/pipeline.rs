@@ -1016,7 +1016,7 @@ impl EffectsPipeline {
         self.glow_cfg.audible = true;
     }
 
-    /// Configure the legacy opaque comet trail (the `cursor_trail` channel).
+    /// Configure the classic opaque comet trail (the `cursor_trail` channel).
     /// `color` `None` = the colour the glow draws, as a native comet body
     /// wears it (trail, nucleus and crown one hue), resolved each frame by the
     /// native step ([`crate::cursor_fx::follow_live_cursor`]): Laser's violet,
@@ -2143,12 +2143,9 @@ impl EffectsPipeline {
         } else {
             self.decos.free_atlas()
         };
-        // Output streak (`streak_grid`): appended to the nova channel after the
-        // word pass, which owns the channel's clear, so neither engine clears
-        // the other's quads; the fingerprints fold independently. The page
-        // notes keystrokes directly, so no echo rides the frame.
-        // `content_seq` advances on content mutation only. The page has no
-        // audio host, so the cue is dropped.
+        // Output streak (`streak_grid`): appended to the nova channel after the word pass, which
+        // owns the channel's clear; the fingerprints fold independently. The page notes
+        // keystrokes directly (no echo rides the frame) and has no audio host (the cue drops).
         let streak = self.streak.is_some().then(|| {
             let mut cfg = self.streak_cfg;
             cfg.intensity *= cursor_motion.amplitude(MotionEffect::OutputStreak);

@@ -998,7 +998,6 @@ impl LayerSampler {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The encode seam, the verbs under `renderer.rs::run_frame_plan`: open a pass
 // (Clear or Load, optional scissor, shared uniforms bound once), switch pipeline
 // and atlas only on change, bind one instance stream, draw instanced quads, copy
@@ -1213,8 +1212,7 @@ impl<'s> FrameEncoder<'s> {
         Ok(Self::Gl(GlFrame::begin(dev)?))
     }
 
-    /// The live production arm: a wgpu command encoder with the exact
-    /// descriptor the pre-seam `encode_frame` created ("aterm-gpu frame").
+    /// The wgpu arm (production off macOS): one command encoder labelled `label`.
     #[cfg(wgpu_arm)]
     pub(crate) fn wgpu(
         device: &wgpu::Device,

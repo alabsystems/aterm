@@ -114,7 +114,9 @@ fn is_under(exe: &Path, dir: &Path) -> bool {
 /// (a build tree's executable runs where it is).
 ///
 /// Only the holder of the one-mug lock calls this: it removes everything else in `code_dir`
-/// first, and makes `code_dir` (`0700`) when it is missing.
+/// first, and makes `code_dir` (`0700`) when it is missing. A bare `origin` sweeps it as well
+/// ([`discard_copies`]: a copy an earlier mug left, kept while macOS may still be assessing it,
+/// goes once it may), said on stderr when that fails, and makes nothing.
 ///
 /// # Errors
 ///
@@ -123,6 +125,10 @@ fn is_under(exe: &Path, dir: &Path) -> bool {
 /// files, directories and links, or cannot be read.
 pub fn prepare_copy(origin: &Path, code_dir: &Path, label: &str) -> io::Result<Option<PathBuf>> {
     let Some(bundle) = own_bundle(origin) else {
+        #[cfg(unix)]
+        if let Err(e) = discard_copies(code_dir) {
+            eprintln!("aterm caffeine: {}: {e}", code_dir.display());
+        }
         return Ok(None);
     };
     #[cfg(unix)]
@@ -938,6 +944,47 @@ mod tests {
         let code = root.path().join("code");
         assert!(matches!(prepare_copy(&exe, &code, "lbl"), Ok(None)));
         assert!(!code.exists(), "nothing is made for a bare executable");
+    }
+
+    /// A bare executable's start still sweeps what an earlier mug left: a copy that ran goes
+    /// (another build's too), so the next start does remove a copy kept for its first exec once
+    /// it may go. NEGATIVE CONTROL: one no mug said it ran from, inside the first-exec hang,
+    /// stays, and its directory with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_executables_start_sweeps_what_an_earlier_mug_left() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let app = stand_in_bundle(root.path(), "com.example.fake");
+        let origin = app.join("Contents").join("MacOS").join("aterm");
+        let code = root.path().join("code");
+        let ran = home_of(
+            &code,
+            &prepare_copy(&origin, &code, "other.build")
+                .expect("copy")
+                .expect("a bundle"),
+        );
+        let young = home_of(
+            &code,
+            &prepare_copy(&origin, &code, "lbl")
+                .expect("copy")
+                .expect("a bundle"),
+        );
+        aterm_uds::deadline::stamp_exec(&young);
+        assert!(ran.is_dir(), "young when the second copy was made: kept");
+        std::fs::write(ran.join(RAN), "").expect("ran");
+        let exe = root.path().join("target").join("debug").join("aterm");
+        assert!(matches!(prepare_copy(&exe, &code, "lbl"), Ok(None)));
+        assert!(!ran.exists(), "a copy that ran goes");
+        assert!(
+            young.join("Fake (dev).app").is_dir(),
+            "an unproven copy stays"
+        );
+        std::fs::write(young.join(RAN), "").expect("ran");
+        assert!(matches!(prepare_copy(&exe, &code, "lbl"), Ok(None)));
+        assert!(
+            !code.exists(),
+            "once it ran, it goes, and the directory with it"
+        );
     }
 
     #[cfg(unix)]

@@ -31,15 +31,13 @@
 //!   and refuse a toggle (`NotShown`) — no keystroke leaves off an unread
 //!   screen.
 //!
-//! The release profile unwinds (`Cargo.toml` `[profile.release]`), so the
-//! catch holds in the shipped binary. The panic hook (`logging.rs`, and the
-//! wrapper [`guarded`] installs once) hands a panic raised INSIDE the fence
-//! to [`absorb`] instead of filing `crash-<pid>.log` and writing stderr —
-//! a screen that panics the reader is redrawn every frame, and a crash
-//! report per frame would flood the disk and banner a crash that never
-//! happened. [`warn_once`] logs ONE warn per session per distinct panic
-//! location, with the screen's SHAPE (one glyph class per row, no text) —
-//! enough to build the fixture that reproduces it.
+//! The release profile unwinds (`Cargo.toml` `[profile.release]`), so the catch
+//! holds in the shipped binary. The panic hook (`logging.rs`, and the wrapper
+//! [`guarded`] installs once) hands a panic raised inside the fence to [`absorb`]
+//! instead of filing `crash-<pid>.log`: a screen that panics the reader is redrawn
+//! every frame, and a crash report per frame would flood the disk. [`warn_once`] logs
+//! one warn per session per panic location, with the screen's shape (one glyph class
+//! per row, no text), enough to build a reproducing fixture.
 //!
 //! One caller that is no screen reader shares the fence for its hook half: the crash
 //! restore's replay of a dead window's region (`crash_restore::restore_offered`), whose

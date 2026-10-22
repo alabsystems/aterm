@@ -33,9 +33,7 @@ use std::sync::OnceLock;
 
 use crate::win_ffi::{Apartment, Com, Guid, StepError, check, co_create};
 
-// ---------------------------------------------------------------------------
 // GUIDs and constants (wincodec.h)
-// ---------------------------------------------------------------------------
 
 /// `CLSID_WICImagingFactory` {CACAF262-9370-4615-A13B-9F5539DA4C0A}: the
 /// factory every Windows since Vista registers (WICImagingFactory2 adds only
@@ -85,9 +83,7 @@ const EXIF_COLOR_SPACE_SRGB: u32 = 1;
 /// How many colour contexts a frame may carry that the decoder looks at.
 const MOST_COLOR_CONTEXTS: u32 = 8;
 
-// ---------------------------------------------------------------------------
 // Vtables, in COM inheritance order (wincodec.h, objidl.h)
-// ---------------------------------------------------------------------------
 
 type Raw = *mut c_void;
 type Out = *mut *mut c_void;
@@ -291,9 +287,7 @@ fn factory() -> Result<Com, StepError> {
     )
 }
 
-// ---------------------------------------------------------------------------
 // The decoder
-// ---------------------------------------------------------------------------
 
 /// Decode `bytes` (any format an installed WIC decoder reads) to straight
 /// sRGB RGBA8, top-down: `(rgba, width, height)`. Either side past
@@ -531,9 +525,7 @@ fn to_srgb(factory: &Com, frame: &Com) -> Option<Com> {
     (hr >= 0).then_some(transform)
 }
 
-// ---------------------------------------------------------------------------
 // What the decoder reads
-// ---------------------------------------------------------------------------
 
 /// THE FILE EXTENSIONS WIC'S INSTALLED DECODERS CLAIM, lower case and without
 /// their dot (`bmp`, `gif`, `tif`, `heic` where the HEIF codec is installed),

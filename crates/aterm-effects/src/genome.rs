@@ -83,8 +83,7 @@ pub enum SimhashKernel {
     BitSliced,
 }
 
-/// §3.2 context fingerprint — the live entry point. Dispatches on
-/// [`SIMHASH_KERNEL`]; the reference kernel is the default (§7.5 gating rule).
+/// §3.2 context fingerprint, the live entry point: dispatches on [`SIMHASH_KERNEL`].
 #[inline]
 pub fn simhash_ctx(
     chars: &[char],
@@ -160,9 +159,8 @@ fn cast_vote(votes: &mut [i32; 64], h: u64, w: i32) {
     }
 }
 
-/// Fold one candidate token, apply the filter (votes only if alphabetic with
-/// ≥ 2 folded chars, so digits, punctuation, clocks and spinners are silent),
-/// then cast `h_t = mix(fnv(folded chars))` at weight `w`.
+/// Cast one token's vote at weight `w` if it passes the filter: alphabetic with ≥ 2 folded
+/// chars, so digits, punctuation, clocks and spinners are silent.
 #[inline]
 fn vote_token(
     tok_chars: &[char],
@@ -176,8 +174,8 @@ fn vote_token(
     }
 }
 
-/// The fold, filter and FNV/mix shared by both kernels: `Some(h_t)` when the
-/// token votes, `None` when silent. One implementation, so the kernels agree.
+/// The fold, filter and `mix(fnv(folded))` hash shared by both kernels: `Some(h_t)` when the
+/// token votes, `None` when silent.
 #[inline]
 fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) -> Option<u64> {
     tok.clear();
@@ -302,8 +300,7 @@ fn csa(a: u64, b: u64, c: u64) -> (u64, u64) {
 }
 
 /// Bit-sliced majority via the carry-save adder network. Equals
-/// `simhash_majority_reference` on every input (the certificate and the 10k-set
-/// battery below).
+/// `simhash_majority_reference` on every input (the certificate, and the battery below).
 #[inline]
 pub fn simhash_majority_bitsliced(v: &VoterSet) -> u64 {
     // Masked lanes: an absent voter contributes no set bits (and, below, no
@@ -568,8 +565,8 @@ pub enum NovaMagic {
     Singularity,
 }
 
-/// §3.5 cat window. Cats consume the LOW window; a genome is never two magics
-/// at once because novas read the shifted window and the classes are disjoint.
+/// §3.5 cat window. Cats read the low window and novas the shifted one, and the classes are
+/// disjoint, so a genome is never two magics at once.
 #[inline]
 pub const fn cat_magic(magic: u64) -> Option<CatMagic> {
     match magic % 4096 {
@@ -668,29 +665,25 @@ pub const fn cat_variant_v4(gkey: u64) -> CatGlyphId {
 }
 
 /// The `(coat, iris)` ramp indices: `coat = field(6,4)` (0..=15, a `COAT_RAMP`
-/// stop) and `iris = field(10,3)` (0..=7, an `EYE_RAMP` stop). The baker
-/// resolves them via `ResolvedFills::from_indices`.
+/// stop) and `iris = field(10,3)` (0..=7, an `EYE_RAMP` stop), resolved by
+/// `ResolvedFills::from_context`.
 #[inline]
 #[must_use]
 pub const fn cat_fills_v4(gkey: u64) -> (u8, u8) {
     (field(gkey, 6, 4) as u8, field(gkey, 10, 3) as u8)
 }
 
-/// v4 §3: the age band — `AGES[field(13,2)]`, whose `scale()` drives the body
-/// size (0.82 / 0.93 / 1.04 / 1.15). Unchanged role from v2/v3.
+/// v4 §3: the age band, `AGES[field(13,2)]`, whose `scale()` drives the body size.
 #[inline]
 #[must_use]
 pub const fn cat_age_v4(gkey: u64) -> CatAge {
     AGES[field(gkey, 13, 2) as usize]
 }
 
-/// The special window (`magic % 4096`): a special glyph replaces the head (its
-/// `word_top` anchor drives the peek). Maneki-neko, then seven authored specials
-/// (witch / sleeping / yarn / Toastbyte / tuxedo / tabby-bell / fluffy). `None`
-/// is an ordinary head.
-///
-/// Windows over `magic % 4096`: Maneki `0..=7` (1/512), then the seven at
-/// 4/4096 (1/1024) each in `8..=35`.
+/// The special window (`magic % 4096`): a special glyph replaces the head (its `word_top`
+/// anchor drives the peek). Maneki-neko at `0..=7` (1/512), then witch / sleeping / yarn /
+/// stretch / tuxedo / tabby-bell / fluffy at 4/4096 (1/1024) each in `8..=35`. `None` is an
+/// ordinary head.
 #[inline]
 #[must_use]
 pub const fn special_variant_v4(magic: u64) -> Option<CatGlyphId> {

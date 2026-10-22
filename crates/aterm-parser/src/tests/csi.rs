@@ -14,8 +14,7 @@ fn parse_csi_many_params() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // More than MAX_PARAMS parameters (only the first MAX_PARAMS are kept).
-    // 26 params 1..=26; with MAX_PARAMS = 24 the last two (25, 26) are dropped.
+    // 26 parameters: the first MAX_PARAMS (24) are kept.
     parser.advance_fast(
         b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;25;26m",
         &mut sink,
@@ -28,7 +27,6 @@ fn parse_csi_many_params() {
     );
     let params = &sink.csi_dispatches[0].0;
     assert_eq!(params.len(), MAX_PARAMS, "params truncated to MAX_PARAMS");
-    // Verify first params survived truncation in order
     assert_eq!(params[0], 1, "first param preserved");
     assert_eq!(params[23], 24, "last retained param is 24 (25,26 dropped)");
 }
@@ -40,7 +38,6 @@ fn parse_csi_kakoune_sgr() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // 17 params: SGR 4:3 (curly underline) ; 38:2::R:G:B ; 48:2::R:G:B ...
     parser.advance_fast(
         b"\x1b[0;4;38;2;255;128;0;48;2;16;32;48;1;3;9;53;58m",
         &mut sink,
@@ -209,12 +206,8 @@ fn csi_fast_path_falls_back_on_unexpected_byte_after_intermediate() {
 
 #[test]
 fn csi_fast_path_trailing_empty_colon_subparam_matches_per_byte() {
-    // A trailing ':' immediately before the final byte (or an intermediate)
-    // must NOT materialize a phantom empty subparameter on the `D;` fast path.
-    // The reference state machine only finalizes a pending colon value when a
-    // subsequent ';'/' :' separator follows, so a trailing colon is dropped and
-    // CsiDispatch fires plain. Regression for the fast/slow divergence where
-    // `ESC[1;2:m` wrongly produced csi_dispatch_with_subparams([1,2,0],'m').
+    // A trailing ':' before the final byte (or an intermediate) opens no
+    // subparameter on either path.
     let trailing_cases = [
         b"\x1b[1;2:m".as_slice(),
         b"\x1b[1;4:m",

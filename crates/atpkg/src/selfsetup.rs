@@ -197,9 +197,7 @@ impl ShellEnv {
     }
 }
 
-// ---------------------------------------------------------------------------------------
 // shared predicates
-// ---------------------------------------------------------------------------------------
 
 /// The bundle's `CFBundleIdentifier`, read as `CFBundle` reads it, or `None`.
 fn bundle_identifier(app: &Path) -> Option<String> {
@@ -383,9 +381,7 @@ fn present(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
-// ---------------------------------------------------------------------------------------
 // self-uninstall
-// ---------------------------------------------------------------------------------------
 
 /// The sweep's tally and its two channels.
 struct Sweep<'w> {
@@ -409,21 +405,30 @@ impl Sweep<'_> {
     }
 
     /// Remove what is ours, or say what a real run would; an item that cannot be removed
-    /// is SKIPPED and counted, and the sweep goes on.
+    /// is SKIPPED and counted, and the sweep goes on. One gone between the look and the
+    /// removal (a Caffeine bridge removes its own file once `caffeine quit` has saved off) is
+    /// neither: nothing is left to remove.
     fn rm(&mut self, path: &Path, label: &str) {
         if self.dry {
             let act = self.act();
             self.say(&format!("{act} {label}: {}", path.display()));
-        } else if remove(path).is_ok() {
-            self.say(&format!("removed {label}: {}", path.display()));
         } else {
-            let _ = writeln!(
-                self.err,
-                "atpkg: SKIPPED {label} (cannot remove, try sudo): {}",
-                path.display()
-            );
-            self.skipped += 1;
-            return;
+            match remove(path) {
+                Ok(()) => self.say(&format!("removed {label}: {}", path.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.say(&format!("gone already: {label}: {}", path.display()));
+                    return;
+                }
+                Err(_) => {
+                    let _ = writeln!(
+                        self.err,
+                        "atpkg: SKIPPED {label} (cannot remove, try sudo): {}",
+                        path.display()
+                    );
+                    self.skipped += 1;
+                    return;
+                }
+            }
         }
         self.removed += 1;
     }
@@ -499,8 +504,15 @@ fn uninstall_bundle(p: &Places) -> Option<PathBuf> {
 const CAFFEINE_CODE: &str = "caffeine-code.noindex";
 
 /// What `aterm caffeine` keeps in the support dir: the copy of the app the mug runs from,
-/// the session plists, the mode and the one-mug lock.
-const CAFFEINE_FILES: [&str; 4] = [CAFFEINE_CODE, "caffeine", "caffeine.state", "caffeine.lock"];
+/// the session plists, the mode, the one-mug lock, and the pid of the bridge that keeps the Mac
+/// awake while the mug restarts onto an update (it lets go once `quit` has saved off).
+const CAFFEINE_FILES: [&str; 5] = [
+    CAFFEINE_CODE,
+    "caffeine",
+    "caffeine.state",
+    "caffeine.lock",
+    "caffeine.bridge",
+];
 
 /// The line a self-uninstall adds to the toolset decline its own sweep recorded but left for an
 /// aterm it kept: the run that removes that aterm then knows the decline for the sweep's, not
@@ -652,48 +664,136 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<Pa
 /// crashes `syspolicyd`, stranding every exec on the host. Such a copy, and the directories
 /// holding it, stay, SKIPPED with when it may go: no aterm is left to remove it later.
 fn sweep_caffeine_code(s: &mut Sweep<'_>, code: &Path, now: std::time::SystemTime) {
-    let real_dir = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
-    let partial = |path: &Path| path.extension().is_some_and(|e| e == "partial");
-    let labels: Vec<PathBuf> = if real_dir(code) {
-        sorted_entries(code)
-    } else {
-        Vec::new()
+    sweep_caffeine_code_with(
+        s,
+        code,
+        now,
+        &|path| std::fs::symlink_metadata(path),
+        &caffeine_code_entries,
+    );
+}
+
+#[derive(Default)]
+struct CaffeineCodePlan {
+    remove: Vec<(PathBuf, &'static str)>,
+    keep: Vec<(PathBuf, Duration)>,
+}
+
+/// Admit the complete tree before removing any of it. An unreadable directory or entry is
+/// not an empty directory: an unseen copy may still be in its first exec.
+fn caffeine_code_plan_with(
+    code: &Path,
+    now: std::time::SystemTime,
+    metadata: &impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    entries: &impl Fn(&Path) -> std::io::Result<Vec<PathBuf>>,
+) -> std::io::Result<CaffeineCodePlan> {
+    let at = |path: &Path, error: std::io::Error| {
+        std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
     };
-    let young = |copy: &Path| {
-        real_dir(copy) && !partial(copy) && !aterm_uds::deadline::copy_may_go(copy, now)
+    let inspect = |path: &Path| -> std::io::Result<Option<std::fs::Metadata>> {
+        match metadata(path) {
+            Ok(meta) => Ok(Some(meta)),
+            // A name that disappeared is absent, never an unknown kind to remove.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(at(path, error)),
+        }
     };
-    let holds_young = |label: &Path| {
-        real_dir(label) && !partial(label) && sorted_entries(label).iter().any(|c| young(c))
+    let list = |path: &Path| entries(path).map_err(|error| at(path, error));
+    let mut plan = CaffeineCodePlan::default();
+    let Some(root) = inspect(code)? else {
+        return Ok(plan);
     };
-    if !labels.iter().any(|label| holds_young(label)) {
-        s.rm_shared(code, "Caffeine file");
-        return;
+    if !root.is_dir() {
+        plan.remove.push((code.to_path_buf(), "Caffeine file"));
+        return Ok(plan);
     }
-    for label in labels {
-        if !holds_young(&label) {
-            s.rm(&label, "Caffeine file");
+    let partial = |path: &Path| path.extension().is_some_and(|e| e == "partial");
+    for label in list(code)? {
+        let Some(meta) = inspect(&label)? else {
+            continue;
+        };
+        if !meta.is_dir() || partial(&label) {
+            plan.remove.push((label, "Caffeine file"));
             continue;
         }
-        for copy in sorted_entries(&label) {
-            // The keep rule's own reading of what is left: time awake since the exec.
-            let left = real_dir(&copy)
-                .then(|| aterm_uds::deadline::copy_wait_left(&copy, now))
-                .flatten()
-                .filter(|_| !partial(&copy));
-            let Some(left) = left else {
-                s.rm(&copy, "Caffeine copy");
+        let mut copies = Vec::new();
+        let mut kept = Vec::new();
+        for copy in list(&label)? {
+            let Some(meta) = inspect(&copy)? else {
                 continue;
             };
-            s.skip(
-                &copy.display().to_string(),
-                &format!(
-                    "no Caffeine mug said it ran from this copy, so macOS may still be assessing \
-                     its first exec, and removing it now can crash syspolicyd; remove it by hand \
-                     once the Mac has been awake {} more minute(s)",
-                    left.as_secs().div_ceil(60).max(1)
-                ),
-            );
+            let left = (meta.is_dir() && !partial(&copy))
+                .then(|| aterm_uds::deadline::copy_wait_left(&copy, now))
+                .flatten();
+            if let Some(left) = left {
+                kept.push((copy, left));
+            } else {
+                copies.push((copy, "Caffeine copy"));
+            }
         }
+        if kept.is_empty() {
+            plan.remove.push((label, "Caffeine file"));
+        } else {
+            plan.remove.extend(copies);
+            plan.keep.extend(kept);
+        }
+    }
+    if plan.keep.is_empty() {
+        plan.remove.clear();
+        plan.remove.push((code.to_path_buf(), "Caffeine file"));
+    }
+    Ok(plan)
+}
+
+fn caffeine_code_entries(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    collect_caffeine_code_entries(std::fs::read_dir(dir)?.map(|entry| entry.map(|e| e.path())))
+}
+
+fn collect_caffeine_code_entries(
+    entries: impl IntoIterator<Item = std::io::Result<PathBuf>>,
+) -> std::io::Result<Vec<PathBuf>> {
+    let mut paths = entries.into_iter().collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort_by_key(|path| {
+        let name = path.file_name().unwrap_or_default();
+        (name.to_string_lossy().starts_with('.'), name.to_os_string())
+    });
+    Ok(paths)
+}
+
+fn sweep_caffeine_code_with(
+    s: &mut Sweep<'_>,
+    code: &Path,
+    now: std::time::SystemTime,
+    metadata: &impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    entries: &impl Fn(&Path) -> std::io::Result<Vec<PathBuf>>,
+) {
+    let plan = match caffeine_code_plan_with(code, now, metadata, entries) {
+        Ok(plan) => plan,
+        Err(error) => {
+            s.skip(
+                &code.display().to_string(),
+                &format!("cannot inspect every Caffeine copy; all kept: {error}"),
+            );
+            return;
+        }
+    };
+    for (path, label) in plan.remove {
+        if path == code {
+            s.rm_shared(&path, label);
+        } else {
+            s.rm(&path, label);
+        }
+    }
+    for (path, left) in plan.keep {
+        s.skip(
+            &path.display().to_string(),
+            &format!(
+                "no Caffeine mug said it ran from this copy, so macOS may still be assessing \
+                 its first exec, and removing it now can crash syspolicyd; remove it by hand \
+                 once the Mac has been awake {} more minute(s)",
+                left.as_secs().div_ceil(60).max(1)
+            ),
+        );
     }
 }
 
@@ -1283,9 +1383,7 @@ fn without_block(text: &str) -> Option<String> {
     (!dropping).then_some(out)
 }
 
-// ---------------------------------------------------------------------------------------
 // shell-setup
-// ---------------------------------------------------------------------------------------
 
 /// The profile the managed PATH block lands in for `env`'s shell — the ONE election the
 /// plan and the write share, and the one a pass's login rc comes from
@@ -2000,9 +2098,7 @@ fn install_desktop_entry(
     }
 }
 
-// ---------------------------------------------------------------------------------------
 // the verbs
-// ---------------------------------------------------------------------------------------
 
 /// The places of this process: `$HOME`, `$XDG_DATA_HOME`, `$XDG_CONFIG_HOME`, and
 /// install.sh's defaults; `None` when HOME is unset.

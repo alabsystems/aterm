@@ -7,18 +7,15 @@
 
 use aterm_spec::derive::*;
 
-/// Lane-exact admission for the fixed control-socket worker pool. The listener
-/// may admit exactly `LaneCap` queued-or-running jobs and rejects an arrival
-/// when every lane is owned; accepted work remains outstanding until its worker
-/// completes, and completion releases exactly the lane it held. `Buggy=1`
-/// restores over-admission at full capacity, which `LaneBounded` catches, and a
-/// worker that returns without releasing its lane, as a panicking handler would
-/// without `DispatchCompletion`'s drop guard, which `AcceptedWorkAccounted`
-/// catches; `BoundedDispatch::serve_next` holds that guard for every worker.
-/// `arrivals` counts `try_submit` calls, which return either `Ok` or the stream,
-/// so accepted plus rejected arrivals always equal it. A job is a REQUEST, not a
-/// connection: where a connection goes between requests — parked, on a wait
-/// lane — is [`control_lane_tenure_model`]'s.
+/// Lane-exact admission for the fixed control-socket worker pool. The listener admits exactly
+/// `LaneCap` queued-or-running jobs and rejects an arrival when every lane is owned; accepted
+/// work stays outstanding until its worker completes, and completion releases exactly the lane
+/// it held. `Buggy=1` over-admits at full capacity (`LaneBounded`) and has a worker return
+/// without releasing its lane, as a panicking handler would without `DispatchCompletion`'s drop
+/// guard (`AcceptedWorkAccounted`); `BoundedDispatch::serve_next` holds that guard for every
+/// worker. `arrivals` counts `try_submit` calls, which return `Ok` or the stream, so accepted
+/// plus rejected arrivals always equal it. A job is a request, not a connection: where a
+/// connection goes between requests is [`control_lane_tenure_model`]'s.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn control_connection_admission_model() -> Model {
@@ -27,7 +24,7 @@ pub fn control_connection_admission_model() -> Model {
             const Buggy = 0;
             const LaneCap = 2;
             const MaxArrivals = 4;
-            // Admitted work remains outstanding while queued OR running.
+            // Admitted work stays outstanding while queued or running.
             var outstanding = 0;
             var arrivals = 0;
             var accepted = 0;
@@ -47,10 +44,9 @@ pub fn control_connection_admission_model() -> Model {
                 arrivals = arrivals + 1;
                 rejected = rejected + 1;
             }
-            // `completed <= accepted - 1` caps the leak mutant's completions: a
-            // leaked lane keeps `outstanding > 0`, so without the cap Buggy=1
-            // would complete forever. It is inert at Buggy=0, where
-            // AcceptedWorkAccounted implies it.
+            // `completed <= accepted - 1` caps the leak mutant's completions: a leaked lane
+            // keeps `outstanding > 0`, so Buggy=1 would otherwise complete forever. At
+            // Buggy=0 AcceptedWorkAccounted implies it.
             action Complete when (outstanding > 0 && completed <= accepted - 1) {
                 outstanding = if Buggy == 1 { outstanding } else { outstanding - 1 };
                 completed = completed + 1;
@@ -284,14 +280,12 @@ pub fn control_lane_tenure_model() -> Model {
     }
 }
 
-/// Request classification when the focused content may be native rather than a
-/// terminal. Owner App authority is independent of a PTY; a bare Session
-/// request is valid exactly when the front view is terminal; an explicit live
-/// session remains addressable behind native focus; and an Edge can never use an
-/// App route. `Buggy=1` admits the two historical failure classes: retaining a
-/// hidden terminal as the bare target, and bypassing the Owner-only App gate.
-/// It also passes `native_control_decision` its two liveness bools swapped when
-/// the explicit session retires or returns, so the bare route follows the
+/// Request classification when the focused content may be native rather than a terminal. Owner
+/// App authority is independent of a PTY; a bare Session request is valid exactly when the front
+/// view is terminal; an explicit live session stays addressable behind native focus; and an
+/// Edge can never use an App route. `Buggy=1` keeps a hidden terminal as the bare target and
+/// bypasses the Owner-only App gate. It also passes `native_control_decision` its two liveness
+/// bools swapped when the explicit session retires or returns, so the bare route follows the
 /// explicit session and the explicit route follows the front terminal
 /// (`BareSessionIffFrontTerminal`, `ExplicitSessionIffLive`).
 #[must_use]
@@ -359,11 +353,10 @@ pub fn native_control_routing_model() -> Model {
     }
 }
 
-/// Stable tab/view identity and live-reference discipline for the generic native
-/// tab core. IDs are monotone and never reused after close; reorder changes only
-/// order, preserving active identity; close removes exactly one tab/view pair and
-/// keeps active/focus attached to a live survivor. `Buggy=1` leaves active/focus
-/// dangling when their tab closes and also admits explicit retired-ID reuse.
+/// Stable tab/view identity and live-reference discipline for the generic native tab core. IDs
+/// are monotone and never reused after close; reorder changes only order, preserving active
+/// identity; close removes exactly one tab/view pair and keeps active/focus on a live survivor.
+/// `Buggy=1` leaves active/focus dangling when their tab closes and admits retired-ID reuse.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_tab_identity_model() -> Model {
@@ -720,13 +713,12 @@ pub fn native_tab_identity_model() -> Model {
     }
 }
 
-/// Bounded descriptor ledger behind native "Reopen Closed Tab". Closing retains at
-/// most `Cap` descriptors, a failed reopen consumes nothing, and a successful reopen
-/// mints a fresh identity before consuming exactly one descriptor. `Buggy=1` models both
-/// dangerous shortcuts: consuming the record on failed file grant and aliasing the
-/// retired tab identity on success. It also evicts one too few when a close meets
-/// a full ledger (`RecoveryLedger::push` testing `len > capacity`), which
-/// `LedgerBounded` catches.
+/// Bounded descriptor ledger behind native "Reopen Closed Tab". Closing retains at most `Cap`
+/// descriptors, a failed reopen consumes nothing, and a successful reopen mints a fresh identity
+/// before consuming exactly one descriptor. `Buggy=1` consumes the record on a failed file grant
+/// and aliases the retired tab identity on success. It also evicts one too few when a close
+/// meets a full ledger (`RecoveryLedger::push` testing `len > capacity`), which `LedgerBounded`
+/// catches.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_reopen_ledger_model() -> Model {
@@ -787,13 +779,12 @@ pub fn native_reopen_ledger_model() -> Model {
     }
 }
 
-/// Independent bounded recovery ledgers for a non-last split leaf and a whole tab.
-/// Closing the only leaf records exactly one `ClosedTab`; closing a non-last leaf records
-/// exactly one `ClosedView`. Failed reconstruction consumes neither ledger. `Buggy=1`
-/// reproduces the two destructive implementation shortcuts: double-recording one close in
-/// both ledgers and consuming a recovery record before reconstruction succeeds. Every
-/// Buggy push also evicts one too few from a full ledger (`RecoveryLedger::push`
-/// testing `len > capacity`), which the two ledger bounds catch.
+/// Independent bounded recovery ledgers for a non-last split leaf and a whole tab. Closing the
+/// only leaf records exactly one `ClosedTab`; closing a non-last leaf records exactly one
+/// `ClosedView`. Failed reconstruction consumes neither ledger. `Buggy=1` records one close in
+/// both ledgers and consumes a recovery record before reconstruction succeeds; every Buggy push
+/// also evicts one too few from a full ledger (`RecoveryLedger::push` testing
+/// `len > capacity`), which the two ledger bounds catch.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn closed_recovery_ledgers_model() -> Model {
@@ -879,16 +870,13 @@ pub fn closed_recovery_ledgers_model() -> Model {
     }
 }
 
-/// Bounded, per-view Markdown reading history. A new visit truncates any forward
-/// branch, appends the new source anchor, and evicts only the oldest entry when
-/// the capacity is full; back/forward keep the cursor inside the retained
-/// entries. `Buggy=1` reproduces an uncapped append (and, after branching, the
-/// failure to truncate the abandoned future), violating both the capacity and
-/// branch-length contracts. It also reproduces the two off-by-one edges of
-/// `MarkdownHistory`'s cursor: `forward` testing `next > len` steps past the
-/// newest entry (`CursorWithinHistory`), and `back` written as
-/// `cursor.checked_sub(1)` steps off the oldest one, leaving entries with no
-/// cursor (`EmptyIffNoCursor`).
+/// Bounded, per-view Markdown reading history. A new visit truncates any forward branch,
+/// appends the new source anchor, and evicts only the oldest entry when full; back/forward keep
+/// the cursor inside the retained entries. `Buggy=1` appends uncapped (and, after branching,
+/// keeps the abandoned future), violating the capacity and branch-length contracts. It also has
+/// the two off-by-one edges of `MarkdownHistory`'s cursor: `forward` testing `next > len` steps
+/// past the newest entry (`CursorWithinHistory`), and `back` written as `cursor.checked_sub(1)`
+/// steps off the oldest one, leaving entries with no cursor (`EmptyIffNoCursor`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_markdown_history_model() -> Model {
@@ -958,10 +946,9 @@ pub fn native_markdown_history_model() -> Model {
     }
 }
 
-/// Exact intra-block Markdown navigation. A wheel/keyboard row advances the
-/// canonical visual position by one row even when the entire document is one
-/// enormous paragraph or fenced block. `Buggy=1` reproduces the retired
-/// block-only reducer, where one row request skips a whole four-row block.
+/// Exact intra-block Markdown navigation. A wheel/keyboard row advances the canonical visual
+/// position by one row even when the whole document is one enormous paragraph or fenced block.
+/// `Buggy=1` is a block-only reducer, where one row request skips a whole four-row block.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_markdown_viewport_model() -> Model {
@@ -988,15 +975,14 @@ pub fn native_markdown_viewport_model() -> Model {
     }
 }
 
-/// Renderer-sized editor caret reveal and stable scrolling. Compact resize
-/// installs the real eight visible rows and moves the stable line anchor with a
-/// two-row breathing band; a viewport taller than its document clamps the
-/// stable anchor to line zero. Overscroll stores the last *full* viewport
-/// anchor, so the first reverse step moves immediately.
+/// Renderer-sized editor caret reveal and stable scrolling. Compact resize installs the real
+/// eight visible rows and moves the stable line anchor with a two-row breathing band; a viewport
+/// taller than its document clamps the stable anchor to line zero. Overscroll stores the last
+/// *full* viewport anchor, so the first reverse step moves at once.
 ///
-/// `Buggy=1` reproduces the retired failures: the fixed-36-row guess hides line
-/// 20 on a compact body, an EOF anchor strands a short document's content above
-/// the viewport, and a scroll fling retains EOF debt beyond the painted anchor.
+/// `Buggy=1`: a fixed 36-row guess hides line 20 on a compact body, an EOF anchor strands a
+/// short document's content above the viewport, and a scroll fling keeps EOF debt beyond the
+/// painted anchor.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_editor_viewport_model() -> Model {
@@ -1067,10 +1053,10 @@ pub fn native_editor_viewport_model() -> Model {
     }
 }
 
-/// Bounded M-x completion lifecycle. Query edits reset selection into the new
-/// result set, navigation never escapes that set, and submit dispatches exactly
-/// the selected typed command. `Buggy=1` retains the old selection on a narrow
-/// query and records nearest/unknown dispatch instead of the exact candidate.
+/// Bounded M-x completion lifecycle. Query edits reset selection into the new result set,
+/// navigation never escapes that set, and submit dispatches exactly the selected typed command.
+/// `Buggy=1` keeps the prior selection on a narrowed query and records nearest/unknown dispatch
+/// instead of the exact candidate.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_editor_command_palette_model() -> Model {
@@ -1157,13 +1143,11 @@ pub fn native_editor_command_palette_model() -> Model {
     }
 }
 
-/// Bounded Settings ▸ Manual completion lifecycle. Merely presenting LSP-like
-/// assistance never steals ordinary Enter/Down editing, Ctrl-Space explicitly
-/// enters selection, every selected result remains inside the responsive
-/// window, Escape dismisses only the exact context, and acceptance dispatches
-/// the exact selected candidate. `Buggy=1` models the keyboard-hostile/stale
-/// window shortcuts: ordinary Enter is consumed, the visible window stays on
-/// page zero, and acceptance dispatches candidate zero.
+/// Bounded Settings ▸ Manual completion lifecycle. Merely presenting LSP-like assistance never
+/// steals ordinary Enter/Down editing, Ctrl-Space explicitly enters selection, every selected
+/// result stays inside the responsive window, Escape dismisses only the exact context, and
+/// acceptance dispatches the exact selected candidate. `Buggy=1` consumes ordinary Enter, keeps
+/// the visible window on page zero, and dispatches candidate zero.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn manual_config_completion_model() -> Model {
@@ -1292,11 +1276,10 @@ pub fn manual_config_completion_model() -> Model {
     }
 }
 
-/// Bounded Manual problem-navigation lifecycle. F8 and Shift-F8 wrap through
-/// every retained diagnostic (including a one-problem document), move to the
-/// exact selected problem, reveal it, and expose the complete message through
-/// the semantic status lane. `Buggy=1` reproduces the paint-only navigator that
-/// rotates an index without moving/revealing the caret and truncates the only
+/// Bounded Manual problem-navigation lifecycle. F8 and Shift-F8 wrap through every retained
+/// diagnostic (a one-problem document included), move to the exact selected problem, reveal it,
+/// and expose the complete message through the semantic status lane. `Buggy=1` is a paint-only
+/// navigator that rotates an index without moving/revealing the caret and truncates the only
 /// announced message.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1478,19 +1461,16 @@ pub fn manual_config_handoff_model() -> Model {
     }
 }
 
-/// Process-global Settings Packages worker lifecycle. Exactly one refresh or
-/// user verb owns the current sequence; only a matching completion may settle
-/// it. Starting a new verb clears the prior result, while a silent refresh
-/// preserves it. Most importantly, the presented result is the current
-/// process result—not an older successful `status.toml`.
+/// Process-global Settings Packages worker lifecycle. Exactly one refresh or user verb owns the
+/// current sequence; only a matching completion may settle it. Starting a new verb clears the
+/// prior result, while a silent refresh preserves it. The presented result is the current
+/// process result, never an older successful `status.toml`.
 ///
-/// `operation` projects `PackagesService::busy` (a refresh has none) and
-/// `inflight` its separate flag; `expected_result` is the outcome the last verb's
-/// worker reported, which a refresh leaves alone. `Buggy=1` reproduces the
-/// stale-success presentation after a failed command, an `abort` that clears
-/// `inflight` but not `busy` (`SingleFlightHasOneKind`), and a `finish` that
-/// assigns a refresh's absent command over the last verb result
-/// (`RefreshKeepsVerbResult`).
+/// `operation` projects `PackagesService::busy` (a refresh has none) and `inflight` its separate
+/// flag; `expected_result` is the outcome the last verb's worker reported, which a refresh
+/// leaves alone. `Buggy=1` presents stale success after a failed command, has `abort` clear
+/// `inflight` but not `busy` (`SingleFlightHasOneKind`), and has `finish` assign a refresh's
+/// absent command over the last verb result (`RefreshKeepsVerbResult`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_packages_worker_model() -> Model {
@@ -1614,10 +1594,9 @@ pub fn native_packages_worker_model() -> Model {
     }
 }
 
-/// Recovery pagination and capability work are one bounded view lifecycle.
-/// Pages never escape the available range, at most one typed action is in
-/// flight, and a mismatched/stale completion cannot clear its owner. `Buggy=1`
-/// reproduces all three former shortcuts for proof non-vacuity.
+/// Recovery pagination and capability work are one bounded view lifecycle. Pages never escape
+/// the available range, at most one typed action is in flight, and a mismatched/stale
+/// completion cannot clear its owner. `Buggy=1` breaks all three.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_recovery_interaction_model() -> Model {
@@ -1686,19 +1665,16 @@ pub fn native_recovery_interaction_model() -> Model {
     }
 }
 
-/// Bounded editor mark/minibuffer lifecycle. `set-mark-command` pins an anchor
-/// across ordinary motion until a region edit or abort, while Command/Search/
-/// Buffer/Goto minibuffers exclusively consume query input. Search/Goto abort
-/// restores its captured origin and only an explicitly authorized region edit may advance the
-/// abstract document revision. `Cap` is the document's length (the Tier-1 bind
-/// opens a three-character document): the caret and the anchor stay inside it
-/// (`CaretBounded`, `AnchorBounded`), and an incremental search whose match would
-/// run past the end parks the caret at the end, the clamp
-/// `update_incremental_search` makes with `origin.min(len)`. `Buggy=1`
-/// reproduces the acceptance defects this model guards: motion collapses an
-/// active mark, minibuffer typing leaks into the document mutation lane, and the
-/// search clamp is off by one, so the caret lands one past the document end and
-/// a mark set there pins an anchor past it.
+/// Bounded editor mark/minibuffer lifecycle. `set-mark-command` pins an anchor across ordinary
+/// motion until a region edit or abort, while Command/Search/Buffer/Goto minibuffers exclusively
+/// consume query input. Search/Goto abort restores its captured origin, and only an explicitly
+/// authorized region edit may advance the abstract document revision. `Cap` is the document's
+/// length (the Tier-1 bind opens a three-character document): the caret and anchor stay inside
+/// it (`CaretBounded`, `AnchorBounded`), and an incremental search whose match would run past
+/// the end parks the caret at the end, the clamp `update_incremental_search` makes. `Buggy=1`
+/// has motion collapse an active mark, minibuffer typing leak into the document mutation lane,
+/// and the search clamp off by one, so the caret lands one past the end and a mark set there
+/// pins an anchor past it.
 ///
 /// Mode 5 is a command's PROMPT (`kill-buffer`'s buffer name, an
 /// `Invocation`'s next argument): its answer is the command's to use once
@@ -1886,13 +1862,11 @@ pub fn native_editor_modal_model() -> Model {
     }
 }
 
-/// Native Settings activation is process-singleton while its implicit view is
-/// window-local. Ordinary activation may create the singleton instance once and
-/// at most one implicit view in each window; every request focuses the requesting
-/// window. `Buggy=1` models the historical "open means allocate" implementation:
-/// a repeated activation allocates another instance and implicit view. It also
-/// steals focus: activating from window two while window one already shows
-/// Settings raises window one, the singleton's first home, instead of the
+/// Native Settings activation is process-singleton while its implicit view is window-local.
+/// Ordinary activation may create the singleton instance once and at most one implicit view in
+/// each window; every request focuses the requesting window. `Buggy=1` allocates another
+/// instance and implicit view on each activation, and steals focus: activating from window two
+/// while window one shows Settings raises window one, the singleton's first home, instead of the
 /// requester (`RequestingWindowFocused`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1951,11 +1925,10 @@ pub fn native_settings_singleton_model() -> Model {
     }
 }
 
-/// Native Settings retains text drafts across navigation/publication, blocks
-/// every close scope while a draft exists, and keeps explicit recovery visible.
-/// Discard All is destructive only after a separately observable confirmation
-/// step. `Buggy=1` reproduces both unsafe shortcuts: treating a dirty close as
-/// Ready and letting the first discard gesture destroy the draft.
+/// Native Settings keeps text drafts across navigation/publication, blocks every close scope
+/// while a draft exists, and keeps explicit recovery visible. Discard All is destructive only
+/// after a separately observable confirmation step. `Buggy=1` treats a dirty close as Ready and
+/// lets the first discard gesture destroy the draft.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_settings_draft_close_model() -> Model {
@@ -2031,26 +2004,22 @@ pub fn native_settings_draft_close_model() -> Model {
     }
 }
 
-/// Versioned preference patches use touched-key expectations rather than blind
-/// whole-file overwrite. A stale patch may cross an unrelated-key edit, but a
-/// same-key patch or conditional undo conflicts. Reset All is one atomic action.
-/// Every revision is exactly one write: an accepted patch, undo or reset, or one
-/// admitted external edit (`RevisionCountsWrites`).
+/// Versioned preference patches use touched-key expectations rather than blind whole-file
+/// overwrite. A stale patch may cross an unrelated-key edit, but a same-key patch or conditional
+/// undo conflicts. Reset All is one atomic action. Every revision is exactly one write: an
+/// accepted patch, undo or reset, or one admitted external edit (`RevisionCountsWrites`).
 ///
 /// `Buggy = 1` carries one slip per law:
-/// * a patch or undo overwrites a conflicting key (`NoBlindOverwrite`), or Reset
-///   All exposes a half-reset state (`AtomicResetVisibility`);
-/// * the one revision bump every accepted write shares is skipped — the one in
-///   `VersionedConfigService::patch`, which `undo` and Reset All reach through
-///   `patch` — so an accepted write publishes under the revision it found. Every
-///   open Settings view discards that snapshot as one it already holds
-///   (`snapshot.revision == view.snapshot_revision`) and never shows the write
-///   (`RevisionCountsWrites`).
+/// * a patch or undo overwrites a conflicting key (`NoBlindOverwrite`), or Reset All exposes a
+///   half-reset state (`AtomicResetVisibility`);
+/// * the one revision bump every accepted write shares (in `VersionedConfigService::patch`,
+///   which `undo` and Reset All reach) is skipped, so an accepted write publishes under the
+///   revision it found. Every open Settings view discards that snapshot as one it already holds
+///   and never shows the write (`RevisionCountsWrites`).
 ///
-/// No law says a patch's base is never ahead of the service. The controller copies
-/// its base from the snapshot it holds and the revision only grows, so nothing in
-/// the design produces a future base; `VersionedConfigService::patch` refuses one
-/// anyway (`invalid base revision`, pinned by its own unit test).
+/// No law says a patch's base is never ahead of the service: the controller copies its base
+/// from the snapshot it holds and the revision only grows, so nothing produces a future base;
+/// `VersionedConfigService::patch` refuses one anyway (`invalid base revision`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_config_transaction_model() -> Model {
@@ -2095,9 +2064,9 @@ pub fn native_config_transaction_model() -> Model {
                 revision = revision + 1;
                 external_edits = external_edits + 1;
             }
-            // `accepted <= MaxRevision - 1`, here and in `UndoPatchA` and
-            // `ResetAll`, is implied by the revision guard in the healthy
-            // machine; it bounds the mutant, whose writes mint no revision.
+            // `accepted <= MaxRevision - 1`, here and in `UndoPatchA` and `ResetAll`, is
+            // implied by the revision guard in the healthy machine; it bounds the mutant,
+            // whose writes mint no revision.
             action CommitPatchA when (
                 patch_active == 1 && expected_a <= key_a &&
                 key_a <= if Buggy == 1 { 2 } else { expected_a } &&
@@ -2163,16 +2132,13 @@ pub fn native_config_transaction_model() -> Model {
     }
 }
 
-/// Exact config observations cross a serialized worker/event-loop handoff.
-/// Once an external generation is known, queued semantic writes remain fenced
-/// until that exact generation is admitted or a reconciliation sample orders it
-/// against a concurrent publication. Failed reconciliation retains the newest
-/// candidate and ANSWERS the queued writes with the failure (draining them —
-/// retention was abandonment: nothing else ever drained the queue), and a newer
-/// candidate that arrives after sampling must be resampled rather than silently
-/// discarded or admitted as the older sample.
-/// `Buggy=1` exposes all three historical failures: lost deferred bytes, a blind
-/// queued write, and stale-sample admission.
+/// Exact config observations cross a serialized worker/event-loop handoff. Once an external
+/// generation is known, queued semantic writes stay fenced until that exact generation is
+/// admitted or a reconciliation sample orders it against a concurrent publication. Failed
+/// reconciliation keeps the newest candidate and answers the queued writes with the failure,
+/// and a newer candidate that arrives after sampling is resampled rather than silently
+/// discarded or admitted as the older sample. `Buggy=1` loses deferred bytes, makes a blind
+/// queued write, and admits a stale sample.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_config_observation_handoff_model() -> Model {
@@ -2230,12 +2196,12 @@ pub fn native_config_observation_handoff_model() -> Model {
                 pending = if Buggy == 1 { 0 } else { pending };
                 sampled = 0;
                 reconciliation_failed = 1;
-                // The queued writes are ANSWERED-and-drained, not retained: the
-                // sample they were waiting on is the one thing that could have
-                // cleared the fence, so "still queued" meant abandoned (nothing
-                // else drains this queue — a control caller sat on the 30 s wire
-                // timeout). A reply is not a loss; the SILENT losses stay the
-                // Buggy mutant's (`dropped_candidate`, the external bytes).
+                // The queued writes are answered with the failure and drained, not retained:
+                // the sample they waited on was the one thing that could clear the fence, and
+                // nothing else drains this queue (pinned by
+                // `failed_reconciliation_answers_queued_callers_instead_of_leaving_them_pending`).
+                // A reply is not a loss; the silent losses stay the Buggy mutant's
+                // (`dropped_candidate`, the external bytes).
                 queued = 0;
                 dropped_candidate = if Buggy == 1 { 1 } else { dropped_candidate };
                 // A failed reconciliation ANSWERS its queued callers (with the
@@ -2299,16 +2265,14 @@ pub fn native_config_observation_handoff_model() -> Model {
     }
 }
 
-/// Process-global Serious Mode commands retain semantic desired values while
-/// another config write is in flight. The request at the queue head is rebased
-/// against the service's current optimistic revision/value before it reduces;
-/// live policy changes only at durable completion. The mutant captures the
-/// expected value at enqueue time, reproducing the stale third toggle in an
-/// ON→OFF→ON burst. It also recomputes the projection at a completion from the
-/// OLDEST pending intent — `refresh_serious_mode_queued_projection` without its
-/// `.rev()` — so mid-burst the checkmark shows the second click's value while
-/// the third is queued, and the next click composes against it
-/// (`ProjectionTracksLatestIntent`).
+/// Process-global Serious Mode commands keep semantic desired values while another config write
+/// is in flight. The request at the queue head is rebased against the service's current
+/// optimistic revision/value before it reduces; live policy changes only at durable completion.
+/// The mutant captures the expected value at enqueue time, giving a stale third toggle in an
+/// ON→OFF→ON burst. It also recomputes the projection at a completion from the oldest pending
+/// intent (`refresh_serious_mode_queued_projection` without its `.rev`), so mid-burst the
+/// checkmark shows the second click's value while the third is queued, and the next click
+/// composes against it (`ProjectionTracksLatestIntent`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn serious_mode_intent_queue_model() -> Model {
@@ -2330,9 +2294,8 @@ pub fn serious_mode_intent_queue_model() -> Model {
             var completed = 0;
             var conflict = 0;
             var last_desired = 0;
-            // 0 none, 1 native toggle, 2 legacy absolute set. This preserves
-            // source identity when a set happens to have the same value as a
-            // toggle, so Tier-1 conformance cannot pass through ambiguity.
+            // 0 none, 1 native toggle, 2 legacy absolute set: source identity survives a set
+            // whose value equals a toggle's, so Tier-1 cannot pass through ambiguity.
             var intent_kind = 0;
             action StartToggle when (
                 inflight == 0 && issued <= MaxIssued - 1
@@ -2362,9 +2325,8 @@ pub fn serious_mode_intent_queue_model() -> Model {
                 last_desired = if projection == 0 { 1 } else { 0 };
                 intent_kind = 1;
             }
-            // Legacy/control callers express an absolute semantic value rather
-            // than a toggle. They share the same serialized queue and rebase
-            // discipline; these actions make that mixed lane explicit.
+            // Legacy/control callers set an absolute semantic value rather than toggle; they
+            // share the serialized queue and rebase discipline.
             action StartSetOn when (
                 inflight == 0 && issued <= MaxIssued - 1 && projection == 0
             ) {
@@ -2435,9 +2397,9 @@ pub fn serious_mode_intent_queue_model() -> Model {
                 q1_expected = if queue_count <= 1 { 0 } else { q2_expected };
                 q2_expected = 0;
                 queue_count = if queue_count == 0 { 0 } else { queue_count - 1 };
-                // The completion re-reads the pending queue (`q1` is its oldest
-                // entry, still queued when the refresh runs). The newest intent
-                // wins; the mutant reads the queue front-first.
+                // The completion re-reads the pending queue (`q1` is its oldest entry, still
+                // queued when the refresh runs). The newest intent wins; the mutant reads the
+                // queue front-first.
                 projection = if queue_count == 0 {
                     current_desired
                 } else {
@@ -2454,10 +2416,9 @@ pub fn serious_mode_intent_queue_model() -> Model {
                 if inflight == 0 { live == service && live == projection } else { live <= 1 };
             invariant ProjectionTracksLatestIntent: projection == last_desired;
             bound QueueBounded: queue_count <= 2;
-            // No accounting law `completed <= issued`: `Complete` needs an
-            // in-flight write, and the shipping origin moves into its worker job
-            // and back, so one request cannot complete twice — the type rules it
-            // out. `IssuedBounded` and that guard bound `completed` too.
+            // No accounting law `completed <= issued`: `Complete` needs an in-flight write, and
+            // the shipping origin moves into its worker job and back, so the type rules out a
+            // double completion. `IssuedBounded` and that guard bound `completed` too.
             bound IssuedBounded: issued <= MaxIssued;
             bound ValuesBoolean:
                 live <= 1 && service <= 1 && projection <= 1 && current_desired <= 1 &&
@@ -2467,20 +2428,18 @@ pub fn serious_mode_intent_queue_model() -> Model {
     }
 }
 
-/// Filesystem commit authority shared by Manual and structured Settings. Both
-/// writers capture a file generation, canonical target generation, and logical
-/// link-chain generation before they contend for one lock. Under the lock, an
-/// unchanged triple may publish, including through a stable identity-bound
-/// dotfiles symlink; a stale file, retargeted chain, or recreated link must
-/// conflict. A durable Manual publication synchronizes the process config service
-/// in that same completion transition. A publication whose post-rename proof
-/// fails enters an explicit reconcile-required phase and may not retry against its
-/// old baseline. `Buggy=1` admits blind second winners, split-target/changed-link
-/// writes, delayed Manual synchronization, and blind retry after indeterminate
-/// publication. It also books Manual's published-but-unverified save as
-/// committed — `SaveReducer` folding `PublishedUnverified { observed: Some(_) }`
-/// into its success arm, adopting the visible bytes as a durable baseline the
-/// failed directory sync never proved (`IndeterminateDoesNotClaimDurability`).
+/// Filesystem commit authority shared by Manual and structured Settings. Both writers capture a
+/// file generation, canonical target generation, and logical link-chain generation before they
+/// contend for one lock. Under the lock an unchanged triple may publish, including through a
+/// stable identity-bound dotfiles symlink; a stale file, retargeted chain, or recreated link
+/// conflicts. A durable Manual publication synchronizes the process config service in that same
+/// completion transition. A publication whose post-rename proof fails enters an explicit
+/// reconcile-required phase and may not retry against its old baseline. `Buggy=1` admits blind
+/// second winners, split-target/changed-link writes, delayed Manual synchronization, and blind
+/// retry after indeterminate publication. It also books Manual's published-but-unverified save
+/// as committed (`SaveReducer` folding `PublishedUnverified { observed: Some(_) }` into its
+/// success arm), adopting visible bytes the failed directory sync never proved durable
+/// (`IndeterminateDoesNotClaimDurability`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn config_file_commit_cas_model() -> Model {
@@ -2661,11 +2620,9 @@ pub fn config_file_commit_cas_model() -> Model {
                 settings_phase = 4;
                 settings_indeterminate = 0;
             }
-            // A retry attempt is a real, reachable input, but the healthy
-            // machine rejects it without changing authority or publication
-            // state. The mutant turns that same attempt into a blind retry.
-            // Keeping rejection explicit avoids encoding a promised response
-            // as a vacuous/dead action.
+            // A retry attempt is a real, reachable input; the healthy machine rejects it
+            // without changing authority or publication state, and the mutant turns it into a
+            // blind retry. Keeping rejection explicit avoids a vacuous dead action.
             action RetryIndeterminate when (
                 manual_phase == 5 || settings_phase == 5
             ) {
@@ -2706,12 +2663,11 @@ pub fn config_file_commit_cas_model() -> Model {
     }
 }
 
-/// A composite accessibility tree publishes independent route ownership for
-/// two visible native views. A platform request may dispatch only to the view
-/// named by that route and only while the route's published generation still
-/// equals the live generation. The mutant reproduces both historical failure
-/// classes: routing through the focused view instead of the node owner, and
-/// accepting a delayed route after one owner advances.
+/// A composite accessibility tree publishes independent route ownership for two visible native
+/// views. A platform request may dispatch only to the view named by that route, and only while
+/// the route's published generation still equals the live generation. The mutant routes through
+/// the focused view instead of the node owner, and accepts a delayed route after one owner
+/// advances.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn composite_accessibility_route_model() -> Model {
@@ -2797,15 +2753,14 @@ pub fn composite_accessibility_route_model() -> Model {
     }
 }
 
-/// Two controllers share one document sequence. A clean transaction advances
-/// canonical text, immutable snapshot, both view observations, and the selection
-/// anchor version in one transition. Concurrent publication makes an older base
-/// stale; rejecting it is a no-op. The mutants accept the stale base, or publish a
-/// commit only to its author: the shared snapshot — the immutable projection
-/// cache `DocumentStore::transact` republishes beside the Surface commit — stays
-/// at the old text, and the other controller
-/// misses it: Markdown its observed sequence, the Editor its observed sequence and
-/// the rebase of its selection anchor through the commit's deltas.
+/// Two controllers share one document sequence. A clean transaction advances canonical text,
+/// immutable snapshot, both view observations, and the selection anchor version in one
+/// transition. Concurrent publication makes an older base stale; rejecting it is a no-op. The
+/// mutants accept the stale base, or publish a commit only to its author: the shared snapshot
+/// (the immutable projection cache `DocumentStore::transact` republishes beside the Surface
+/// commit) stays at the old text, and the other controller misses it: Markdown its observed
+/// sequence, the Editor its observed sequence and the rebase of its selection anchor through
+/// the commit's deltas.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_document_publication_model() -> Model {
@@ -2826,8 +2781,8 @@ pub fn native_document_publication_model() -> Model {
                 txn_active = 1;
                 txn_base = edit_seq;
             }
-            // The other controller's commit. Buggy publishes it only to its
-            // author, as `CommitClean` does in the other direction.
+            // The other controller's commit. Buggy publishes it only to its author, as
+            // `CommitClean` does in the other direction.
             action OtherCommit when (edit_seq <= MaxSeq - 1) {
                 edit_seq = edit_seq + 1;
                 snapshot_seq = if Buggy == 1 { snapshot_seq } else { snapshot_seq + 1 };
@@ -2878,11 +2833,11 @@ pub fn native_document_publication_model() -> Model {
     }
 }
 
-/// File-watch observations are a five-way decision with strict precedence: an
-/// in-flight save defers every changed observation; otherwise byte-equivalent
-/// generations rebind only the baseline; otherwise dirty local bytes surface a
-/// conflict and clean bytes reload atomically. An equal observation is always
-/// a no-op. The mutant checks dirty before both higher-priority decisions.
+/// File-watch observations are a five-way decision with strict precedence: an in-flight save
+/// defers every changed observation; otherwise byte-equivalent generations rebind only the
+/// baseline; otherwise dirty local bytes surface a conflict and clean bytes reload atomically.
+/// An equal observation is always a no-op. The mutant checks dirty before both higher-priority
+/// decisions.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_file_watch_model() -> Model {
@@ -2945,14 +2900,12 @@ pub fn native_file_watch_model() -> Model {
     }
 }
 
-/// Failure/recovery protocol shared by the live config and theme watchers. A
-/// healthy→failed edge publishes exactly one warning and latches the previous
-/// catalog; repeated identical failures are presentation-inert. The first
-/// successful theme observation, or exact admission of the newest config
-/// candidate, publishes exactly one recovery and clears the warning. A stale
-/// config completion is inert. The mutant repeats a failure wake, clears the
-/// warning, changes the retained catalog during a failed epoch, and admits an
-/// older config candidate, so the obligations are demonstrably non-vacuous.
+/// Failure/recovery protocol shared by the live config and theme watchers. A healthy→failed
+/// edge publishes exactly one warning and latches the previous catalog; repeated identical
+/// failures are presentation-inert. The first successful theme observation, or exact admission
+/// of the newest config candidate, publishes exactly one recovery and clears the warning. A
+/// stale config completion is inert. The mutant repeats a failure wake, clears the warning,
+/// changes the retained catalog during a failed epoch, and admits an older config candidate.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn watcher_failure_recovery_model() -> Model {
@@ -3064,13 +3017,13 @@ pub fn watcher_failure_recovery_model() -> Model {
     }
 }
 
-/// Crash-journal serialization has one in-flight generation, coalesces edits to
-/// the latest desired head, accepts durability only for the exact fsync proof,
-/// and rebases/prunes only after an atomic file-save proof. A checkpoint may
-/// retain a newer draft beyond the saved baseline. The filesystem image has an
-/// independent generation captured under the process-shared lock; append and
-/// rewrite reject if another process wins. Mutants accept a stale completion,
-/// publish over a different journal image, or prune against an unproven file baseline.
+/// Crash-journal serialization has one in-flight generation, coalesces edits to the latest
+/// desired head, accepts durability only for the exact fsync proof, and rebases/prunes only
+/// after an atomic file-save proof. A checkpoint may keep a newer draft beyond the saved
+/// baseline. The filesystem image has an independent generation captured under the
+/// process-shared lock; append and rewrite reject if another process wins. Mutants accept a
+/// stale completion, publish over a different journal image, or prune against an unproven file
+/// baseline.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_draft_journal_model() -> Model {
@@ -3209,20 +3162,17 @@ pub fn native_draft_journal_model() -> Model {
     }
 }
 
-/// Durable restore-manifest publication and single-use consumption. Writers
-/// serialize a unique temporary publication under the same process-shared lock
-/// used by takers. A taker atomically claims the visible name, synchronizes that
-/// removal, and only then may return a manifest.
+/// Durable restore-manifest publication and single-use consumption. Writers serialize a unique
+/// temporary publication under the same process-shared lock takers use. A taker atomically
+/// claims the visible name, synchronizes that removal, and only then may return a manifest.
 ///
-/// Every mutant is its own action, dead at `Buggy = 0`, so the strict-vacuity
-/// audit credits each as an independently caught negative control: a taker
-/// returns before its claim is durable (`ReturnUnsynced`); a writer reuses the
-/// fixed temporary alias (`ReuseFixedTemporary`); and a taker takes with no
-/// lock (`HistoricalTakeA`, `HistoricalTakeB`): read the manifest, then remove
-/// it and return what it read.
-/// Between a taker's read and its remove the name is still visible
-/// (`ClaimRemovesVisibleName`), and a second taker that reads in that window
-/// returns the same manifest (`AtMostOneConsumer`).
+/// Every mutant is its own action, dead at `Buggy = 0`, so the strict-vacuity audit credits each
+/// as an independently caught negative control: a taker returns before its claim is durable
+/// (`ReturnUnsynced`); a writer reuses the fixed temporary alias (`ReuseFixedTemporary`); and a
+/// taker takes with no lock (`HistoricalTakeA`, `HistoricalTakeB`): read the manifest, then
+/// remove it and return what it read. Between a taker's read and its remove the name is still
+/// visible (`ClaimRemovesVisibleName`), and a second taker that reads in that window returns the
+/// same manifest (`AtMostOneConsumer`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn restore_manifest_single_use_model() -> Model {
@@ -3239,8 +3189,8 @@ pub fn restore_manifest_single_use_model() -> Model {
             var unique_temporary = 0;
             var unsafe_return = 0;
             var fixed_alias_corrupted = 0;
-            // Each historical taker's progress: 0 idle, 1 read with the name
-            // still visible, 2 removed and returned. Always 0 when healthy.
+            // Each unlocked taker's progress: 0 idle, 1 read with the name still visible,
+            // 2 removed and returned. Always 0 when healthy.
             var historical_a = 0;
             var historical_b = 0;
 
@@ -3318,9 +3268,9 @@ pub fn restore_manifest_single_use_model() -> Model {
             action ReuseFixedTemporary when (Buggy == 1 && lock_owner == 3) {
                 fixed_alias_corrupted = 1;
             }
-            // Mutant: the unlocked take, one action per taker, each firing
-            // its next step — `read_to_string(path)` with no lock held, then
-            // `remove_file(path)` (its failure ignored) and return what was read.
+            // Mutant: the unlocked take, one action per taker, each firing its next step:
+            // `read_to_string(path)` with no lock held, then `remove_file(path)` (its failure
+            // ignored) and return what was read.
             action HistoricalTakeA when (
                 Buggy == 1 &&
                 ((historical_a == 0 && visible == 1) || historical_a == 1)
@@ -3356,21 +3306,20 @@ pub fn restore_manifest_single_use_model() -> Model {
     }
 }
 
-/// Atomic close planning freezes the final document sequence, waits for a
-/// durable acknowledgement and every leaf's readiness, and only then detaches
-/// the tree. Failure leaves every leaf attached and Retry requires a later real
-/// acknowledgement. `Buggy = 1` carries one slip per law: a leaf detaches before
-/// the plan is ready (`AtomicTreeClose`); `transact` admits an edit while the
-/// document is Closing, moving the head past the frozen request
-/// (`FrozenFinalSequence`); and the acknowledgement of an OLDER save — a
-/// generation already in flight when the close froze its sequence — is read as
-/// covering the request, so the plan closes below it (`NoSilentLoss`).
+/// Atomic close planning freezes the final document sequence, waits for a durable
+/// acknowledgement and every leaf's readiness, and only then detaches the tree. Failure leaves
+/// every leaf attached, and Retry requires a later real acknowledgement. `Buggy = 1` carries one
+/// slip per law: a leaf detaches before the plan is ready (`AtomicTreeClose`); `transact` admits
+/// an edit while the document is Closing, moving the head past the frozen request
+/// (`FrozenFinalSequence`); and the acknowledgement of an older save (a generation already in
+/// flight when the close froze its sequence) is read as covering the request, so the plan
+/// closes below it (`NoSilentLoss`).
 ///
-/// `FrozenFinalSequence` follows from `Edit`'s `phase == 0` guard, and stays: that
-/// guard is a check the shipping code makes (`transact` refuses a Closing
-/// document with `DocumentError::Closing`), its mutant drops the check, and a
-/// real-store control drives the refusal. A law that restates a captured copy or
-/// a variable only the law reads has no such check behind it and is not kept.
+/// `FrozenFinalSequence` follows from `Edit`'s `phase == 0` guard and stays: that guard is a
+/// check the shipping code makes (`transact` refuses a Closing document with
+/// `DocumentError::Closing`), its mutant drops the check, and a real-store control drives the
+/// refusal. A law that restates a captured copy, or a variable only the law reads, has no such
+/// check behind it and is not kept.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_close_plan_model() -> Model {
@@ -3451,31 +3400,27 @@ pub fn native_close_plan_model() -> Model {
                 };
             invariant FrozenFinalSequence:
                 if phase == 0 { edit_seq <= MaxSeq } else { requested_seq == edit_seq };
-            // Closed has no views by construction: the store derives `Suspended`
-            // from an empty view map (`commit_detach`), and `CommitClose` empties
-            // both counts in the transition that closes.
+            // Closed has no views by construction: the store derives `Suspended` from an
+            // empty view map (`commit_detach`), and `CommitClose` empties both counts in the
+            // transition that closes.
             bound SequenceBounded: edit_seq <= MaxSeq;
         }
     }
 }
 
-/// A document owns the latest explicit Save/close durability intent while an
-/// older atomic file generation is in flight. Completion either hands off to
-/// that newer target (remaining visibly in-flight) or settles once the latest
-/// requested sequence is durable. A close may commit only after its frozen
-/// sequence is covered. The mutant drops the latch at the first completion,
-/// reproducing both a false "Saved" publication and a wedged close/Quit plan.
-/// It also commits a close the moment it is armed, without waiting for the
-/// checkpoint to cover the frozen sequence — the check
-/// `document_close_plan_ready` makes through `DocumentStore::prepare_close` — so
-/// a window close detaches a document no checkpoint covered
-/// (`ClosedSequenceIsDurable`).
+/// A document owns the latest explicit Save/close durability intent while an older atomic file
+/// generation is in flight. Completion either hands off to that newer target (staying visibly
+/// in flight) or settles once the latest requested sequence is durable. A close may commit only
+/// after its frozen sequence is covered. The mutant drops the latch at the first completion,
+/// giving both a false "Saved" publication and a wedged close/Quit plan. It also commits a close
+/// the moment it is armed, without waiting for the checkpoint to cover the frozen sequence (the
+/// check `document_close_plan_ready` makes through `DocumentStore::prepare_close`), so a window
+/// close detaches a document no checkpoint covered (`ClosedSequenceIsDurable`).
 ///
-/// No law says `durable`, `target` or `requested` is never ahead of `head`: each
-/// is a captured past head (an acknowledged plan, a plan's snapshot seq,
-/// `PendingDocumentSaveIntent::seq`), so nothing in the design produces a future
-/// one, and `DocumentStore::checkpoint_ack` refuses an ack past head anyway
-/// (pinned by its own unit test).
+/// No law says `durable`, `target` or `requested` is never ahead of `head`: each is a captured
+/// past head (an acknowledged plan, a plan's snapshot seq, `PendingDocumentSaveIntent::seq`), so
+/// nothing produces a future one, and `DocumentStore::checkpoint_ack` refuses an ack past head
+/// anyway.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_save_intent_latch_model() -> Model {
@@ -3574,22 +3519,19 @@ pub fn native_save_intent_latch_model() -> Model {
     }
 }
 
-/// Async work is routed by owner identity and generation, not current focus or
-/// operation number. Replacing the owning view makes its token stale; a service
-/// result survives requester-view navigation, and a reply is reduced at most once
-/// (`ReducedAtMostOnce`). Each mutant is its own action, dead at `Buggy = 0`, so
-/// the strict-vacuity audit credits each as an independently caught negative
-/// control: a stale view reply is delivered to whatever view now holds focus
-/// (`DeliverStaleView`); navigating away cancels service-owned work with its
-/// initiating view (`NavigateCancelsService`); and a reply its first delivery
-/// consumed is reduced again (`RedeliverView`) — `SettingsApp::finish_external`
-/// without its `pending.remove` guard, which lets a second `ExternalOpenFinished`
-/// for the same operation overwrite the feedback the first one set.
+/// Async work is routed by owner identity and generation, not current focus or operation
+/// number. Replacing the owning view makes its token stale; a service result survives
+/// requester-view navigation, and a reply is reduced at most once (`ReducedAtMostOnce`). Each
+/// mutant is its own action, dead at `Buggy = 0`, so the strict-vacuity audit credits each as an
+/// independently caught negative control: a stale view reply is delivered to whatever view now
+/// holds focus (`DeliverStaleView`); navigating away cancels service-owned work with its
+/// initiating view (`NavigateCancelsService`); and a consumed reply is reduced again
+/// (`RedeliverView`: `SettingsApp::finish_external` without its `pending.remove` guard, letting a
+/// second `ExternalOpenFinished` for the same operation overwrite the first one's feedback).
 ///
-/// The two owners here are the two the shipping runtime mints: a view's
-/// external-open reply and the config service's patch. The instance- and
-/// document-owned kinds (and a service restart) have no shipping producer, so
-/// the model does not carry them.
+/// The two owners are the two the shipping runtime mints: a view's external-open reply and the
+/// config service's patch. Instance- and document-owned kinds (and a service restart) have no
+/// shipping producer, so the model does not carry them.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_async_delivery_model() -> Model {
@@ -3597,9 +3539,9 @@ pub fn native_async_delivery_model() -> Model {
         NativeAsyncDelivery {
             const Buggy = 0;
             const MaxGeneration = 3;
-            // owner/sink: 0 None, 1 View, 4 Service (2 and 3 were the retired
-            // Instance and Document kinds). The service generation never moves
-            // in a shipping process, so a service token carries generation 1.
+            // owner/sink: 0 None, 1 View, 4 Service (2 and 3 are unused). The service
+            // generation never moves in a shipping process, so a service token carries
+            // generation 1.
             var owner = 0;
             var sink = 0;
             var token_generation = 0;
@@ -3662,9 +3604,9 @@ pub fn native_async_delivery_model() -> Model {
                 reduced = reduced + 1;
                 wrong_delivery = 1;
             }
-            // A second delivery of a view reply its first delivery consumed. The
-            // healthy reducer finds no pending operation and changes nothing, so
-            // the healthy model has no such step; the mutant reduces it again.
+            // A second delivery of a view reply its first delivery consumed. The healthy
+            // reducer finds no pending operation and changes nothing, so only the mutant has
+            // this step.
             action RedeliverView when (
                 Buggy == 1 && pending == 0 && owner == 1 && reduced == 1
             ) {

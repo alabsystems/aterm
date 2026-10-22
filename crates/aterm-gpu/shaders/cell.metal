@@ -439,8 +439,6 @@ static inline uint2 fire_shade_over_px(FireCoreOut c, int py, int temp, int cov_
     return uint2(ink, uint(clamp(a, 0, 255)));
 }
 
-// FireMode::Over — straight ink + field alpha through the deco source-over
-// blend state on the same Unorm view.
 fragment float4 fs_fire_over(FireVsOut in [[stage_in]]) {
     int px = int(floor(in.pos.x));
     int py = int(floor(in.pos.y));

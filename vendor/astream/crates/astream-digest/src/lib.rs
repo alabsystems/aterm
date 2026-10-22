@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
-//! `astream-digest` — SHA-256, transcribed from FIPS 180-4 section 6.2: the
-//! reference algorithm, checkable line by line against the standard; and the one
+//! `astream-digest` — SHA-256 after FIPS 180-4 section 6.2: the reference
+//! algorithm, each compression round checkable against the standard, and held by
+//! the tests to the form it replaced; and the one
 //! HMAC-SHA256 (RFC 2104), HKDF-SHA256 (RFC 5869) and constant-time compare built
 //! on it.
 //!
@@ -22,8 +23,11 @@
 //! RFC 5869 and the answers each copy recorded.
 //!
 //! Zero dependencies and no `unsafe`, SIMD or assembly: astream hashes grants,
-//! nonces and test output, not bulk traffic. The const slice updater copies bytes
-//! into one 64-byte buffer and compresses it whenever it fills.
+//! nonces and test output, not bulk traffic. aterm's Aos observation chain is the
+//! one bulk user (about 8 KB hashed per hosted event), so the const slice updater
+//! compresses whole blocks straight from its input, copying only a partial head and
+//! tail into its 64-byte buffer, and the compression function keeps its message
+//! schedule as a sixteen-word ring and runs its rounds two to a pass.
 //!
 //! Ported from aterm's `aterm-digest` (the same author), with its tests: the
 //! SHA-256 first, then its HMAC, its `ct_eq` and its length sweeps
@@ -240,6 +244,13 @@ impl Sha256 {
     }
 
     /// Feeds a byte slice into the hash without generic `AsRef` dispatch.
+    ///
+    /// Bytes go into the buffer one at a time, and a full buffer is compressed at once.
+    /// Whenever the buffer is empty, the whole 64-byte blocks at the front of `data` are
+    /// compressed straight from it instead: copied in one at a time they would fill the empty
+    /// buffer with exactly those 64 bytes and compress it, so both paths absorb the same
+    /// block. Only a head that tops up a partial block, and a tail shorter than a block, go
+    /// through the buffer.
     pub const fn update_slice(&mut self, mut data: &[u8]) {
         let data_len = data.len() as u64;
         self.len = self.len.wrapping_add(data_len);
@@ -248,7 +259,16 @@ impl Sha256 {
         } else {
             0
         };
-        while let &[b, ref rest @ ..] = data {
+        loop {
+            if cur == 0 {
+                while let Some((block, rest)) = data.split_first_chunk::<BLOCK_LEN>() {
+                    compress(&mut self.state, block);
+                    data = rest;
+                }
+            }
+            let &[b, ref rest @ ..] = data else {
+                break;
+            };
             self.buf[cur & MAX_PARTIAL_LEN] = b;
             cur = (cur & MAX_PARTIAL_LEN) + 1;
             if cur == BLOCK_LEN {
@@ -433,10 +453,106 @@ const fn load_be_u32(bytes: &[u8; 4]) -> u32 {
         | (bytes[3] as u32)
 }
 
+/// One round of FIPS 180-4 sec. 6.2.2 step 3 on the working variables `[a, b, c, d, e, f, g, h]`,
+/// with the round's constant `kt` (`K[t]`) and schedule word `wt` (`W[t]`).
+const fn sha256_round(v: [u32; 8], kt: u32, wt: u32) -> [u32; 8] {
+    let [a, b, c, d, e, f, g, h] = v;
+    // Sigma_1(e), Ch(e, f, g) -- eqs. (4.7), (4.2)
+    let big_s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+    let ch = sha256_ch(e, f, g);
+    let t1 = h
+        .wrapping_add(big_s1)
+        .wrapping_add(ch)
+        .wrapping_add(kt)
+        .wrapping_add(wt);
+
+    // Sigma_0(a), Maj(a, b, c) -- eqs. (4.6), (4.3)
+    let big_s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+    let maj = sha256_maj(a, b, c);
+    let t2 = big_s0.wrapping_add(maj);
+
+    // h = g, g = f, f = e, e = d + T1, d = c, c = b, b = a, a = T1 + T2.
+    [t1.wrapping_add(t2), a, b, c, d.wrapping_add(t1), e, f, g]
+}
+
+/// `W[t]` for `16 <= t < 64` (FIPS 180-4 sec. 6.2.2 step 1), from `w`, the ring of the
+/// schedule's last sixteen words, and written into the slot `W[t-16]` held.
+///
+/// `W[t]` reads `W[t-2]`, `W[t-7]`, `W[t-15]` and `W[t-16]`, all among the sixteen words before
+/// it. With `s = t & 15`, `W[t-16]` is in slot `s`, `W[t-15]` in `(s + 1) & 15`, `W[t-7]` in
+/// `(s + 9) & 15` and `W[t-2]` in `(s + 14) & 15`.
+const fn sha256_ring_word(w: &mut [u32; 16], t: usize) -> u32 {
+    let s = t & 15;
+    let next = sha256_schedule_word(w[s], w[(s + 1) & 15], w[(s + 9) & 15], w[(s + 14) & 15]);
+    w[s] = next;
+    next
+}
+
 /// The SHA-256 compression function -- FIPS 180-4 sec. 6.2.2.
 ///
-/// Absorbs one 512-bit block into the eight-word state.
+/// Absorbs one 512-bit block into the eight-word state. It computes sec. 6.2.2 with two
+/// changes of form, neither of which changes a word:
+///
+/// * The message schedule W is a ring of its last sixteen words ([`sha256_ring_word`]): round
+///   `t` computes `W[t]` just before using it, instead of a 64-word array filled first.
+/// * Each pass of the round loop runs two rounds ([`sha256_round`]).
+///
+/// Two, not more: in this form Trust's advisory gate reports every row of this function
+/// proved, as it does for the form it replaced, in a run that reports the whole crate, and in
+/// none of the larger forms tried. With the 64 rounds written out, its one row ran past the
+/// per-function budget; with eight rounds inline in the loop body, none of its rows was
+/// proved; and with four or eight [`sha256_round`] calls per pass, trustc died partway
+/// through the crate, so its report is incomplete.
+///
+/// The tests hold it to the form it replaced, kept beside them as
+/// `compress_reference`, over random states and blocks, and through every digest the crate's
+/// vectors and length sweeps pin.
 const fn compress(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
+    // 1. The first sixteen words of the message schedule W: the block, big-endian.
+    let mut w = [0u32; 16];
+    w[0] = load_be_u32(&[block[0], block[1], block[2], block[3]]);
+    w[1] = load_be_u32(&[block[4], block[5], block[6], block[7]]);
+    w[2] = load_be_u32(&[block[8], block[9], block[10], block[11]]);
+    w[3] = load_be_u32(&[block[12], block[13], block[14], block[15]]);
+    w[4] = load_be_u32(&[block[16], block[17], block[18], block[19]]);
+    w[5] = load_be_u32(&[block[20], block[21], block[22], block[23]]);
+    w[6] = load_be_u32(&[block[24], block[25], block[26], block[27]]);
+    w[7] = load_be_u32(&[block[28], block[29], block[30], block[31]]);
+    w[8] = load_be_u32(&[block[32], block[33], block[34], block[35]]);
+    w[9] = load_be_u32(&[block[36], block[37], block[38], block[39]]);
+    w[10] = load_be_u32(&[block[40], block[41], block[42], block[43]]);
+    w[11] = load_be_u32(&[block[44], block[45], block[46], block[47]]);
+    w[12] = load_be_u32(&[block[48], block[49], block[50], block[51]]);
+    w[13] = load_be_u32(&[block[52], block[53], block[54], block[55]]);
+    w[14] = load_be_u32(&[block[56], block[57], block[58], block[59]]);
+    w[15] = load_be_u32(&[block[60], block[61], block[62], block[63]]);
+
+    // 2. Initialise the working variables with the current hash value.
+    let mut v = *state;
+
+    // 3. Sixty-four rounds, two per pass: rounds 0 to 15 take the words loaded above, and
+    //    rounds 16 to 63 the words they schedule.
+    let mut t = 0usize;
+    while t < 16 {
+        v = sha256_round(v, K[t & 63], w[t & 15]);
+        v = sha256_round(v, K[(t + 1) & 63], w[(t + 1) & 15]);
+        t += 2;
+    }
+    while t < 64 {
+        v = sha256_round(v, K[t & 63], sha256_ring_word(&mut w, t));
+        v = sha256_round(v, K[(t + 1) & 63], sha256_ring_word(&mut w, t + 1));
+        t += 2;
+    }
+
+    // 4. Compute the next hash value.
+    add_state_words(state, &v);
+}
+
+/// The SHA-256 compression function as it stood at astream 1148dfc, after FIPS 180-4
+/// sec. 6.2.2: the 64-word message schedule filled first, then the rounds in a loop.
+/// [`compress`] replaced it; the tests hold the two to the same state.
+#[cfg(test)]
+const fn compress_reference(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
     // 1. Prepare the message schedule W.
     let mut w = [0u32; 64];
     w[0] = load_be_u32(&[block[0], block[1], block[2], block[3]]);
@@ -608,6 +724,150 @@ mod tests {
             want[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
         }
         assert_eq!(got, want);
+    }
+
+    // -----------------------------------------------------------------------
+    // The ring-schedule compression and the block-wise updater against the
+    // forms they replaced
+    // -----------------------------------------------------------------------
+
+    /// SplitMix64: a fixed, seedable stream of test inputs.
+    struct SplitMix(u64);
+
+    impl SplitMix {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+
+        fn bytes(&mut self, len: usize) -> Vec<u8> {
+            (0..len).map(|_| self.next_u64() as u8).collect()
+        }
+    }
+
+    /// The byte-at-a-time updater this crate had from 8603b58 to 1148dfc, over
+    /// [`compress_reference`]: every byte through the buffer, a full buffer compressed at
+    /// once, then the sec. 5.1.1 padding written out here rather than by `finalize`.
+    fn byte_at_a_time_digest(pieces: &[&[u8]]) -> [u8; OUTPUT_LEN] {
+        let mut state = H_INIT;
+        let mut buf = [0u8; BLOCK_LEN];
+        let mut n = 0usize;
+        let mut len = 0u64;
+        for piece in pieces {
+            for &b in *piece {
+                buf[n] = b;
+                n += 1;
+                len += 1;
+                if n == BLOCK_LEN {
+                    compress_reference(&mut state, &buf);
+                    n = 0;
+                }
+            }
+        }
+        buf[n] = 0x80;
+        n += 1;
+        if n > PAD_LEN_OFFSET {
+            buf[n..].fill(0);
+            compress_reference(&mut state, &buf);
+            n = 0;
+        }
+        buf[n..PAD_LEN_OFFSET].fill(0);
+        buf[PAD_LEN_OFFSET..].copy_from_slice(&(len * 8).to_be_bytes());
+        compress_reference(&mut state, &buf);
+        encode_state_be(&state)
+    }
+
+    #[test]
+    fn the_ring_schedule_compression_gives_the_transcriptions_state_on_random_blocks() {
+        let mut rng = SplitMix(0x5eed_c0de_2026_1022);
+        // Each pair starts from a random state, and from the state the last pair reached,
+        // so a difference anywhere in the 64 rounds would also carry forward.
+        let mut carried = H_INIT;
+        for i in 0..20_000 {
+            let mut start = [0u32; 8];
+            for word in &mut start {
+                *word = rng.next_u64() as u32;
+            }
+            if i % 2 == 1 {
+                start = carried;
+            }
+            let block: [u8; BLOCK_LEN] = rng.bytes(BLOCK_LEN).try_into().unwrap();
+            let (mut ring, mut transcribed) = (start, start);
+            compress(&mut ring, &block);
+            compress_reference(&mut transcribed, &block);
+            assert_eq!(ring, transcribed, "pair {i}");
+            carried = ring;
+        }
+        // Not vacuous: one flipped message bit moves the state.
+        let block = [0u8; BLOCK_LEN];
+        let mut flipped = block;
+        flipped[63] ^= 1;
+        let (mut a, mut b) = (H_INIT, H_INIT);
+        compress(&mut a, &block);
+        compress(&mut b, &flipped);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn whole_blocks_from_the_input_digest_as_every_byte_through_the_buffer_does() {
+        let mut rng = SplitMix(0x0b10_c4ed_0000_0001);
+        // Every length to 600, then lengths with many whole blocks after a partial head:
+        // the mean and the largest observation-chain link of aterm's Aos story among them.
+        let mut lengths: Vec<usize> = (0..=600).collect();
+        lengths.extend([
+            1023,
+            1024,
+            1025,
+            4096 + 17,
+            7_990,
+            9_379,
+            26_852,
+            65_536 + 13,
+        ]);
+        for len in lengths {
+            let msg = rng.bytes(len);
+            let want = byte_at_a_time_digest(&[&msg]);
+            assert_eq!(Sha256::digest(&msg), want, "length {len}, whole");
+            // Random splits, empty pieces and pieces longer than a block among them, so a
+            // partial head, whole blocks and a tail meet in one update.
+            for split in 0..4 {
+                let mut pieces = Vec::new();
+                let mut at = 0;
+                while at < len {
+                    let cap = if split % 2 == 0 { 9 } else { 300 };
+                    let take = rng.below(cap).min(len - at);
+                    pieces.push(&msg[at..at + take]);
+                    at += take;
+                }
+                let mut h = Sha256::new();
+                for piece in &pieces {
+                    h.update(piece);
+                }
+                assert_eq!(h.finalize(), want, "length {len}, split {split}");
+                assert_eq!(byte_at_a_time_digest(&pieces), want, "the oracle, split");
+            }
+        }
+    }
+
+    #[test]
+    fn the_digest_still_evaluates_at_compile_time() {
+        // `update_slice`, `compress` and `finalize` are `const fn`: a const item runs them in
+        // the compiler's evaluator, and it must give the FIPS 180-4 B.1 answer.
+        const ABC: [u8; OUTPUT_LEN] = Sha256::digest_slice(b"abc");
+        const TWO_BLOCKS: [u8; OUTPUT_LEN] = Sha256::digest_slice(&[0x61; 130]);
+        assert_eq!(
+            hex(&ABC),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(TWO_BLOCKS, Sha256::digest([0x61; 130]));
+        assert_eq!(TWO_BLOCKS, byte_at_a_time_digest(&[&[0x61; 130]]));
     }
 
     #[test]

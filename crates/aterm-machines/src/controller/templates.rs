@@ -21,7 +21,8 @@ schema = 1
 parallel = 8
 
 # The GitHub machine user the hosts' keys are registered with (design §7). Create the
-# account, `gh auth login` as it on this Mac, then uncomment.
+# account, uncomment this, then `aterm machines github login` keeps its token (one with
+# the admin:public_key scope) in this Mac's login keychain.
 # [github]
 # account = "your-lab-bot"
 "#;
@@ -122,19 +123,6 @@ team_id = "YD6LEYT6WZ"
 bundle = "Caffeine.app"
 version = "1.1.4"
 
-# gh's installer package carries no installer signature; its binary is checked against
-# GitHub's Team ID instead (design §8).
-[[app]]
-name = "gh"
-kind = "pkg"
-url = "https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_macOS_universal.pkg"
-sha256 = "1787e65f36626245a6b3cee353a458f6ea4372008548ceb8fb5d5dfb55b006d0"
-team_id = "VEKTX9H2N7"
-unsigned = true
-pkg_id = "com.github.cli"
-binary = "/usr/local/bin/gh"
-version = "2.102.0"
-
 # A per-host GitHub key for each user, registered with the [github] machine user.
 [github]
 key = true
@@ -162,4 +150,6 @@ pub const EARLIER_DEFAULT_BASELINES: &[&str] = &[
     "74dcb0817721f664b3a2b1d4c349e07cd110b6b76e5963f75a0fddc5586323e8",
     // 6045a51374: [names] names each Mac for what it is, HostName left alone.
     "e38407721722b11a0faac79954f4906f57eb92d4760bae3f092a00737380a11a",
+    // 326cdca677: host_name = "" unsets a HostName set by hand, and the gh package.
+    "80dbe78ab51b8dcf737a52074e4c1122c16bcdfa1310077001f2ca6a470ecb52",
 ];

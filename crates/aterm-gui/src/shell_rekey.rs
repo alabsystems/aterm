@@ -237,9 +237,8 @@ impl Deferred {
         }
     }
 
-    /// Whether [`Self::release`] has run: the incoming handoff COMMITTED, and
-    /// its adopted shells are this process's. A test's view: a session's drop
-    /// asks [`Self::withdraw`], which answers the same under one lock.
+    /// Whether [`Self::release`] has run (the incoming handoff committed). A test's view: a
+    /// session's drop asks [`Self::withdraw`], which answers the same under one lock.
     #[cfg(all(test, unix))]
     pub(crate) fn released(&self) -> bool {
         self.held
@@ -264,7 +263,7 @@ impl Deferred {
         true
     }
 
-    /// THE COMMIT: write every held key; later ones are written at once.
+    /// The Commit: write every held file; later ones are written at once.
     #[cfg(unix)]
     pub(crate) fn release(&self) {
         let queue = self

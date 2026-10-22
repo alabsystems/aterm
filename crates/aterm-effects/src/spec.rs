@@ -328,10 +328,8 @@ impl SpecTable {
     }
 }
 
-// ---------------------------------------------------------------------------
 // `[[sparkle_words.custom]]` parsing, shared by the native config resolver and
 // the web `set_sparkle_custom_specs(toml)` surface.
-// ---------------------------------------------------------------------------
 
 /// One raw `[[sparkle_words.custom]]` entry, serde-shaped so the native
 /// `Config` deserializer embeds it directly:
@@ -567,9 +565,7 @@ pub fn parse_custom_toml(fragment: &str) -> Result<Vec<RawCustomEntry>, String> 
     Ok(root.sparkle_words.custom)
 }
 
-// ---------------------------------------------------------------------------
 // Toy Pack v1: strict, versioned, bounded cold-path compilation.
-// ---------------------------------------------------------------------------
 
 const MAX_PACK_ID_BYTES: usize = 96;
 const MAX_TOY_ID_BYTES: usize = 64;

@@ -428,8 +428,8 @@ pub(crate) struct SessionGlass {
     hold: Option<HeldGlass>,
 }
 
-/// THE KIND OF A TASK'S END (§11.2.3, item 1): under FOREVER CRUISE /
-/// FOREVER LAND only Land's landing, the face moved to `landed`. Cruise never
+/// THE KIND OF A TASK'S END (§11.2.3, item 1): under Autopilot Cruise /
+/// Autopilot Land only Land's landing, the face moved to `landed`. Cruise never
 /// ends, so it has no end to tell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum EndFace {

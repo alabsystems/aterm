@@ -48,9 +48,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::aliases;
 
-// ---------------------------------------------------------------------------
 // Function kind
-// ---------------------------------------------------------------------------
 
 /// Top-level function classifier used by [`SequenceSelector`] and
 /// [`DispatchedSequence`].
@@ -88,9 +86,7 @@ impl fmt::Display for FunctionKind {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Param
-// ---------------------------------------------------------------------------
 
 /// One parameter position in a [`SequenceSelector`].
 ///
@@ -126,9 +122,7 @@ impl SelectorParam {
     }
 }
 
-// ---------------------------------------------------------------------------
 // SequenceSelector
-// ---------------------------------------------------------------------------
 
 /// A compiled pattern matched against a [`DispatchedSequence`].
 ///
@@ -246,9 +240,7 @@ impl SequenceSelector {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Dispatched sequence
-// ---------------------------------------------------------------------------
 
 /// A concrete escape sequence ready for policy evaluation.
 ///
@@ -320,9 +312,7 @@ impl DispatchedSequence {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Bucket key for precompiled decision tree
-// ---------------------------------------------------------------------------
 
 /// Decision-tree bucket key used by the precompiled engine table.
 ///
@@ -337,9 +327,7 @@ pub struct BucketKey {
     pub major: Option<u32>,
 }
 
-// ---------------------------------------------------------------------------
 // Parsing
-// ---------------------------------------------------------------------------
 
 /// Selector parser error. A rule whose selector fails to parse never matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -557,9 +545,7 @@ fn non_empty_string(s: &str) -> Option<String> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

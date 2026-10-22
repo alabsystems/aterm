@@ -639,8 +639,8 @@ mod tests {
     ///    scanline measured 0.097 and up, so 0.06·perimeter separates them.
     #[test]
     fn ppem_sweep_no_glyph_rasterizes_as_a_filled_block() {
-        // Both bundled faces: the text default the bug bit, and the Nerd icon
-        // face, whose outlines are shaped nothing like Latin text.
+        // Both bundled faces: the text default, and the Nerd icon face, whose outlines are
+        // shaped nothing like Latin text.
         let faces: [(&str, &[u8]); 2] = [
             ("DejaVuSansMono (embedded)", dejavu()),
             (
@@ -713,9 +713,8 @@ mod tests {
         );
     }
 
-    /// At a VARIABLE instance the hinted path's advance is the instantiated
-    /// unhinted raster's, to the bit: both read `hmtx` + `HVAR` at the same
-    /// coords through the same reader.
+    /// At a variable instance the hinted path's advance is the instantiated unhinted raster's,
+    /// to the bit: both read `hmtx` + `HVAR` at the same coords through the same reader.
     ///
     /// The fixture is the bundled `engraved` face (Cinzel, `wght` 400..=900 with an `HVAR`), so
     /// the test runs wherever this module compiles, and its advances move with the instance (a

@@ -3,10 +3,9 @@
 
 //! The `rustc` group publish over fakes of its parts (the packers, the indexer, the seal's
 //! `-Vv`, the receipt switch) and real git checkouts in scratch: the
-//! preflight collects every refusal before anything runs (the seal, the exposes, a live
-//! tree, the store, the trust build and every sibling judged against the floor per target,
-//! the force rules), and step 2 re-checks each sibling before any packs and before its
-//! own.
+//! preflight collects every refusal before anything runs (the seal, the exposes, a live tree,
+//! the store, the trust build and each sibling judged against the floor per target, the force
+//! rules), and step 2 re-checks each sibling before any packs and before its own.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

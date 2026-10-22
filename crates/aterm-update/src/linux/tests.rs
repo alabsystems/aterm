@@ -391,19 +391,39 @@ fn elf(marker: u8, target: LinuxTarget) -> Vec<u8> {
     bytes
 }
 
+/// Where every fixture's root goes: a private (`0700`) directory that the real
+/// [`ancestry::refusal`] admits. First beside this test binary's build
+/// (`<target>/<profile>/`), so a run writes nothing into the person's home and does not
+/// care where `HOME` points (a scratch `HOME` under `/tmp` is refused); then `HOME`,
+/// for a build whose target sits under a directory other accounts can write.
+fn fixture_parent() -> PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    let beside_build = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent()?.parent().map(Path::to_path_buf));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut refused = Vec::new();
+    for base in beside_build.into_iter().chain(home) {
+        let parent = base.join(".aterm-linux-update-tests");
+        let made = fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&parent)
+            .map_err(|e| e.to_string())
+            .and_then(|()| ancestry::refusal(&parent));
+        match made {
+            Ok(()) => return parent,
+            Err(why) => refused.push(format!("{}: {why}", parent.display())),
+        }
+    }
+    panic!("no private fixture parent: {}", refused.join("; "));
+}
+
 impl Fixture {
     fn new() -> Self {
         // Tests deliberately share the real ownership/ancestor checks: no /tmp
         // escape, and no injected production trust pin or network endpoint.
-        use std::os::unix::fs::DirBuilderExt;
-        let parent = PathBuf::from(std::env::var_os("HOME").expect("private fixture parent HOME"))
-            .join(".aterm-linux-update-tests");
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&parent)
-            .unwrap();
-        let root = parent.join(aterm_uds::rand::hex_token::<16>().unwrap());
+        let root = fixture_parent().join(aterm_uds::rand::hex_token::<16>().unwrap());
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let target = root.join("aterm");
@@ -3252,7 +3272,7 @@ fn a_crash_loop_rollback_the_loop_sees_is_said() {
     );
 }
 
-/// THE START-WAIT IS NO INSTALL FAILURE (the review of ATERM-KI-1015-2, U21). Linux never
+/// THE START-WAIT IS NO INSTALL FAILURE (the review of , U21). Linux never
 /// starts an installed executable in a running aterm, so an automatic install (`auto_apply`
 /// and automatic checks, both on by default) waits for the next aterm a person starts as
 /// a matter of course. Told to the window under the install half's failing title, it put
@@ -3373,7 +3393,7 @@ fn a_wait_over_a_start_that_never_finished_does_not_say_none_began() {
 }
 
 /// A ROLLBACK IS SAID IN ITS OWN WORDS, NEVER IN THE CHECK'S (the second review of
-/// ATERM-KI-1015-2, U21). The pass that first sees a crash loop's rollback may also be a
+/// , U21). The pass that first sees a crash loop's rollback may also be a
 /// due check, which replaces the record's "didn't start properly … is back" sentence with
 /// its own outcome before the pass is read; when the channel's head is at or below the
 /// restored build (a pulled release), the window got "Couldn't install updates" over "Up
@@ -3411,7 +3431,7 @@ fn a_rollback_seen_on_a_checks_pass_is_said_in_its_own_words() {
     );
 }
 
-/// A CRASH LOOP NO ROLLBACK COULD ANSWER IS SAID (the second review of ATERM-KI-1015-2,
+/// A CRASH LOOP NO ROLLBACK COULD ANSWER IS SAID (the second review of ,
 /// U21). The new build's starts spent their budget, but the build before it could not come
 /// back (below the signed floor, or its kept copy gone), so the trial ended and the build
 /// stays. The window was told only that the wait was over, when it had been said, and
@@ -3454,7 +3474,7 @@ fn a_crash_loop_no_rollback_could_answer_is_said() {
     }
 }
 
-/// A CRASH LOOP'S END FOUND AT LAUNCH IS SAID, ONCE FOR THE COPY (ATERM-KI-1015-2, U21).
+/// A CRASH LOOP'S END FOUND AT LAUNCH IS SAID, ONCE FOR THE COPY.
 /// The rollback is taken at a start (the start past the budget restores the build before
 /// it), so the aterm that comes up after it is a process started after the record moved.
 /// Its loop took the record as its first pass, which only starts the looking, and the
@@ -3482,7 +3502,7 @@ fn a_crash_loops_end_found_at_launch_is_said_once() {
     );
 }
 
-/// A CRASH LOOP'S END WAITS FOR A LOOP WITH A WINDOW TO TELL (ATERM-KI-1015-2, U21's
+/// A CRASH LOOP'S END WAITS FOR A LOOP WITH A WINDOW TO TELL (U21's
 /// review). The start that rolls the build back may be a terminal session's, whose loop
 /// starts at once with no window (`notify` is `None`): it took the end off the record and
 /// said it to nobody, so the window already open, and every window after it, said
@@ -3557,7 +3577,7 @@ fn a_crash_loops_end_waits_for_a_loop_with_a_window_to_tell() {
     assert_eq!(state.unsaid_trial_ends.len(), UNSAID_TRIAL_ENDS_KEPT);
 }
 
-/// A SECOND CRASH LOOP BEFORE THE FIRST WAS ANSWERED IS SAID AS ITS OWN (ATERM-KI-1015-2,
+/// A SECOND CRASH LOOP BEFORE THE FIRST WAS ANSWERED IS SAID AS ITS OWN (
 /// U21). Build 11 crash-looped and was rolled back; build 12 was installed over the
 /// rollback and crash-looped too before any start of it finished. The second rollback
 /// reached the window as a restatement, a log line, and the words said for the first

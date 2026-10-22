@@ -113,9 +113,7 @@ pub use tmux::TmuxPassthrough;
 
 use aterm_alloc::ArrayVec;
 
-// ----------------------------------------------------------------------------
 // Test instrumentation: Deterministic operation counters
-// ----------------------------------------------------------------------------
 // These counters replace wall-clock timing for complexity assertions in tests.
 // See #1572 for the rationale behind deterministic counters.
 //

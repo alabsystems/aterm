@@ -10207,7 +10207,7 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// ATERM-KI-1015-12: a document whose last view closed stays in memory
+    /// a document whose last view closed stays in memory
     /// while a reopen could bring it back — the reopen finds the very document,
     /// its undo history with it — and leaves with every trace once nothing
     /// can: the store's entry, its saver and grant, its journal entry and the

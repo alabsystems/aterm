@@ -454,13 +454,11 @@ fn stdout_is_capped_and_the_exit_code_reported() {
     assert_eq!(got.stdout, b"hello");
     assert!(got.success());
 
-    // The cap is a CUT, not an error: a child that prints more than the
-    // caller asked for loses the tail rather than the whole answer.
+    // The cap truncates; it is not an error.
     let got = capture_bounded(print("aaaaaaaaaaaaaaaaaaaa"), HANG_DETECTOR, 4).expect("it runs");
     assert_eq!(got.stdout, b"aaaa");
 
-    // The exit code is REPORTED, never swallowed: the caller decides what a
-    // non-zero means.
+    // The exit code is reported; the caller decides what non-zero means.
     let got = capture_bounded(shell("exit 7"), HANG_DETECTOR, 16).expect("it runs");
     assert_eq!(got.code, Some(7));
     assert!(!got.success());

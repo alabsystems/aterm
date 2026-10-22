@@ -265,7 +265,7 @@ mod tests {
         assert!(kept.power.is_none() && kept.keyboard.is_none() && kept.apps.is_empty());
         assert!(kept.homebrew.is_none() && kept.developer.is_none() && kept.aterm.is_none());
         let both = parse(&keep_only(starter, &["names".into(), "app".into()]).unwrap()).unwrap();
-        assert!(both.names.is_some() && both.apps.len() == 3 && both.power.is_none());
+        assert!(both.names.is_some() && both.apps.len() == 2 && both.power.is_none());
         let text = "schema = 1\nusers = [\"admin\"]\n[names]\ncomputer_name = \"x\"\n\
                     [power.ac]\nsleep = 0\n";
         let kept = parse(&keep_only(text, &["power".into()]).unwrap()).unwrap();

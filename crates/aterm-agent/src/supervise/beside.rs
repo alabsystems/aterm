@@ -38,7 +38,7 @@
 //! counted, and the warning's row names the person's restart from then on.
 //!
 //! THE WORKER'S NEEDS YOU IS THE SELF-CLAIM'S OWN beside it (the contract's
-//! §5 NEEDS YOU row, FOREVER CRUISE / FOREVER LAND): codex-alab raises and
+//! §5 NEEDS YOU row, Autopilot Cruise / Land): codex-alab raises and
 //! takes down `meta set attention owner=needs` itself, so this loop never
 //! writes or unsets that owner's entry — not at a point, not at the loop's
 //! start (a standing entry is codex-alab's, never one a loop before this one

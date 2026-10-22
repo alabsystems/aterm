@@ -141,7 +141,7 @@
 //! since 2026-09-28 — the owner: "I don't know what these OSX alerts are from
 //! aterm but they are annoying, disable them"; on macOS without
 //! `terminal-notifier` they arrive as Script Editor banners — and kept off by
-//! the lead's ruling of 2026-10-18). Once on they are needs only
+//! the lead's ). Once on they are needs only
 //! (owner-surfaces §3): the herald posts one notice per need and none for a
 //! wait or a record, and the consent path's and update health's notices are
 //! for what only the person can act on too. The owner opts in with the status
@@ -180,9 +180,7 @@ use std::sync::mpsc::SyncSender;
 
 /// One pending notification handed from a tab's engine callback to the delivery thread.
 pub(crate) struct NotifyMsg {
-    /// Originating session/tab id (matched against the active tab to suppress
-    /// self-notifications the user is already watching). Only a host with real
-    /// delivery reads it.
+    /// Originating session, for focus suppression. Only a host with real delivery reads it.
     #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
     pub session: u64,
     /// Notification title (OSC 99 carries one; OSC 9/777 do not — `None`).
@@ -190,9 +188,8 @@ pub(crate) struct NotifyMsg {
     pub title: Option<String>,
     /// Notification body.
     pub body: String,
-    /// `true` for a notice aterm wrote itself ([`Self::own`]), which the
-    /// `desktop_alerts` switch governs; `false` for a program's (OSC 9/99/777,
-    /// [`Self::program`]), which `allow_notifications` already admitted.
+    /// `true` for a notice aterm wrote itself ([`Self::own`]), governed by `desktop_alerts`;
+    /// `false` for a program's ([`Self::program`]), which `allow_notifications` admitted.
     #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
     pub own: bool,
 }
@@ -250,10 +247,9 @@ impl NotifyMsg {
     }
 }
 
-/// The delivery thread's one decision for a dequeued message: an OWN notice
-/// while `desktop_alerts` is off (`own_alerts == false`) is dropped, and so is
-/// any notice whose session the person is already looking at (`suppressed`, the
-/// focus set). Pure, so the gate is tested without running a notifier.
+/// The delivery thread's one decision for a dequeued message: an own notice while
+/// `desktop_alerts` is off is dropped, and so is any notice whose session is in the focus set
+/// `suppressed`. Pure, so the gate is tested without a notifier.
 #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
 fn delivers(msg: &NotifyMsg, suppressed: &HashSet<u64>, own_alerts: bool) -> bool {
     if msg.own && !own_alerts {
@@ -299,11 +295,6 @@ pub(crate) fn spawn_delivery(
     let (tx, rx) = std::sync::mpsc::sync_channel::<NotifyMsg>(NOTIFY_QUEUE_CAP);
     std::thread::spawn(move || {
         while let Ok(msg) = rx.recv() {
-            // Suppress when the firing session is the active tab of SOME
-            // focused window — the user is already looking at it. App unfocused
-            // (empty set) OR a background tab fired it → deliver (a background
-            // tab's activity still surfaces, mirroring `App::on_bell`) — unless
-            // it is aterm's own notice and `desktop_alerts` is off.
             let alerts = own_alerts.load(Ordering::Acquire);
             let admitted = delivers(
                 &msg,
@@ -1008,22 +999,27 @@ fn post(poster: &freedesktop::Poster, title: Option<&str>, body: &str, silent: b
 }
 
 /// Deliver one notification on the calling thread, at once (blocking up to
-/// [`freedesktop::CALL_TIMEOUT`]): the Linux arm of `menu::notify`, whose
-/// callers (a launch that cannot start, a file that cannot open) may end the
-/// process right after it, before the delivery thread would run. A desktop
-/// launch has no terminal, so its stderr reaches only the journal and this is
-/// what the person sees. It is about no tab, so it carries no action and the
-/// server's own activation of aterm answers a click. The same guards as
-/// [`deliver`].
+/// twice [`freedesktop::CALL_TIMEOUT`]: the bus's handshake, then the call,
+/// each bounded by it): the Linux arm of `menu::notify`, whose callers (a
+/// launch that cannot start, a file that cannot open) may end the process right
+/// after it, before the delivery thread would run. A file that cannot open
+/// calls it on the event loop, which a bus that stopped answering would
+/// otherwise hold for aterm-dbus's 25 s handshake bound. A desktop launch has
+/// no terminal, so its stderr reaches only the journal and this is what the
+/// person sees. It is about no tab, so it carries no action and the server's
+/// own activation of aterm answers a click. The same guards as [`deliver`].
 #[cfg(target_os = "linux")]
 pub(crate) fn deliver_now(title: &str, body: &str) {
     if cfg!(test) || crate::menu::process_is_headless() {
         return;
     }
-    let Ok(call) = freedesktop::notify_call(title, body, false, false) else {
+    let (Ok(addresses), Ok(call)) = (
+        aterm_dbus::address::session_bus(),
+        freedesktop::notify_call(title, body, false, false),
+    ) else {
         return;
     };
-    freedesktop::Bus { conn: None }.notify(&call, &aterm_dbus::Connection::session, &mut |_| {});
+    freedesktop::notify_now(&call, &addresses, freedesktop::CALL_TIMEOUT);
 }
 
 /// `org.freedesktop.Notifications` over the first-party D-Bus client: the
@@ -1047,6 +1043,7 @@ mod freedesktop {
     use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
     use std::time::Duration;
 
+    use aterm_dbus::address::Address;
     use aterm_dbus::{Connection, Kind, Message, Type, Value};
 
     /// The notification server's well-known name, object and interface.
@@ -1069,10 +1066,12 @@ mod freedesktop {
     /// nobody clears) holds no more than this.
     pub(super) const POSTED_CAP: usize = 64;
 
-    /// How long the bus thread waits for the server's answer. A server
-    /// answers `Notify` at once; the bound only keeps a wedged bus from holding
-    /// the thread (and the delivery thread waiting on it: the bounded queue
-    /// drops what arrives meanwhile).
+    /// How long the bus thread waits for the server's answer to a notice
+    /// ([`Poster::post`]), and [`super::deliver_now`] for the bus's handshake
+    /// and then the answer ([`notify_now`]). A running server
+    /// answers `Notify` at once; the bound only keeps a wedged bus or a slow
+    /// server from holding the thread (and the delivery thread waiting on it:
+    /// the bounded queue drops what arrives meanwhile).
     pub(super) const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
     thread_local! {
@@ -1151,19 +1150,29 @@ mod freedesktop {
     }
 
     impl Bus {
-        /// Send `call` and wait for its answer, best-effort. `open` dials the bus
-        /// (`Connection::session` in the product; a test hands its private
+        /// Send `call` and wait up to `bound` for its answer, best-effort. `open`
+        /// dials the bus (`Connection::session` on the bus thread, a dial
+        /// bounded as the call is for [`notify_now`]; a test hands its private
         /// daemon). A connection that fails — closed by the bus, a socket error,
-        /// a deadline — is dropped; when it was a cached one, a fresh one is
-        /// dialled and the call sent once more, since a long-lived connection
-        /// the bus restarted under is the expected way to find it dead. An error
-        /// the SERVER answered (no notification server on this bus) leaves the
-        /// connection as it is: the bus is fine. Returns where the server put
-        /// the notification, `None` when it took none. What the bus sent the
-        /// connection before the answer goes to `heard`, in order.
+        /// a call the bus did not take whole by the deadline — is dropped; when
+        /// it was a cached one, a fresh one is dialled and the call sent once
+        /// more, since a long-lived connection the bus restarted under is the
+        /// expected way to find it dead. An error the SERVER answered (no
+        /// notification server on this bus) leaves the connection as it is: the
+        /// bus is fine. So does a call that went out whole and was not answered
+        /// by the deadline ([`aterm_dbus::Error::NoReply`]): a slow server (a
+        /// stalled shell, one the bus is still starting) is no dead connection.
+        /// Dropping it would forget where each notice still showing goes, and
+        /// sending again would show this one twice; this one is left unmapped
+        /// instead, so a click on it goes nowhere, and its late answer reaches
+        /// `heard` as any other message. Returns where the server put the
+        /// notification, `None` when it took none or did not say in time. What
+        /// the bus sent the connection before the answer goes to `heard`, in
+        /// order.
         pub(super) fn notify(
             &mut self,
             call: &Message,
+            bound: Duration,
             open: &dyn Fn() -> aterm_dbus::Result<Connection>,
             heard: &mut dyn FnMut(Observation<'_>),
         ) -> Option<Posted> {
@@ -1183,7 +1192,7 @@ mod freedesktop {
                     }
                 }
                 let conn = self.conn.as_mut()?;
-                match conn.call(call.clone(), CALL_TIMEOUT) {
+                match conn.call(call.clone(), bound) {
                     Ok(answer) => {
                         let id = answer.body.first().and_then(Value::as_u32)?;
                         return Some(Posted {
@@ -1191,7 +1200,9 @@ mod freedesktop {
                             id,
                         });
                     }
-                    Err(aterm_dbus::Error::Remote { .. }) => return None,
+                    Err(aterm_dbus::Error::Remote { .. } | aterm_dbus::Error::NoReply) => {
+                        return None;
+                    }
                     Err(_) => {
                         self.end_connection(heard);
                         if dialled {
@@ -1227,6 +1238,20 @@ mod freedesktop {
                 heard(Observation::ConnectionReset);
             }
         }
+    }
+
+    /// Post `call` on a connection of its own to `addresses`, the dial and the
+    /// call each bounded by `bound`: [`super::deliver_now`]'s delivery
+    /// ([`CALL_TIMEOUT`]), which must not wait out aterm-dbus's 25 s handshake
+    /// bound on the event loop. Where the server put the notice, as
+    /// [`Bus::notify`] says.
+    pub(super) fn notify_now(
+        call: &Message,
+        addresses: &[Address],
+        bound: Duration,
+    ) -> Option<Posted> {
+        let open = || Connection::open_within(addresses, bound);
+        Bus { conn: None }.notify(call, bound, &open, &mut |_| {})
     }
 
     /// One notice about a session, as the bus thread remembers it.
@@ -1315,10 +1340,12 @@ mod freedesktop {
         }
     }
 
-    /// One notice for the bus thread, and the session a click on it goes to.
+    /// One notice for the bus thread, the session a click on it goes to, and
+    /// how long the thread waits for the server's answer.
     struct Post {
         call: Message,
         session: Option<u64>,
+        bound: Duration,
     }
 
     /// The delivery thread's end of the bus thread: dropped, it ends the thread.
@@ -1370,9 +1397,23 @@ mod freedesktop {
         }
 
         /// Hand the bus thread one `Notify` call, a click on which goes to
-        /// `session`, and ring it.
+        /// `session`, and ring it. The thread waits [`CALL_TIMEOUT`] for the
+        /// server's answer.
         pub(super) fn post(&self, call: Message, session: Option<u64>) {
-            if self.posts.send(Post { call, session }).is_ok() {
+            self.post_within(call, session, CALL_TIMEOUT);
+        }
+
+        /// [`Poster::post`], the server's answer awaited for `bound`.
+        pub(super) fn post_within(&self, call: Message, session: Option<u64>, bound: Duration) {
+            if self
+                .posts
+                .send(Post {
+                    call,
+                    session,
+                    bound,
+                })
+                .is_ok()
+            {
                 // Non-blocking: a full socket already holds a ring.
                 let _ = (&self.wake).write(&[1]);
             }
@@ -1410,7 +1451,7 @@ mod freedesktop {
             loop {
                 match posts.try_recv() {
                     Ok(post) => {
-                        let posted = bus.notify(&post.call, &subscribed, &mut |msg| {
+                        let posted = bus.notify(&post.call, post.bound, &subscribed, &mut |msg| {
                             hear(&mut clicks, msg, clicked);
                         });
                         if let Some(at) = posted {
@@ -1897,7 +1938,7 @@ mod tests {
     use std::collections::HashSet;
 
     /// aterm's own notices are opt-in (the owner, 2026-09-28, kept by the
-    /// lead's ruling of 2026-10-18): an unset `desktop_alerts` reads off, and
+    /// lead's ): an unset `desktop_alerts` reads off, and
     /// a set one wins. Whose banner they would arrive as is the facts
     /// `deliver` acts on — what macOS has said about aterm posting as itself,
     /// whether aterm runs from a bundle, terminal-notifier found, and the
@@ -2538,7 +2579,7 @@ mod tests {
         let mut bus = super::freedesktop::Bus { conn: None };
         let open = || Connection::open(&private.addresses);
         let loud = super::freedesktop::notify_call("build", "done <b>&</b>", false, true).unwrap();
-        let posted = bus.notify(&loud, &open, &mut |_| {});
+        let posted = bus.notify(&loud, HANG, &open, &mut |_| {});
         assert_eq!(
             posted,
             Some(super::freedesktop::Posted {
@@ -2549,7 +2590,7 @@ mod tests {
         );
         let quiet = super::freedesktop::notify_call("aterm", "serious", true, false).unwrap();
         assert!(
-            bus.notify(&quiet, &open, &mut |_| {}).is_some(),
+            bus.notify(&quiet, HANG, &open, &mut |_| {}).is_some(),
             "and the second, on the cached connection"
         );
         let seen = served.join().unwrap();
@@ -2894,5 +2935,155 @@ mod tests {
             "and raises the window aterm was last used in"
         );
         drop(poster);
+    }
+
+    /// A SLOW LINUX NOTIFICATION SERVER IS NO DEAD CONNECTION, end to end
+    /// through a private `dbus-daemon` (never the session's bus). The stand-in
+    /// server answers tab A's notice at once and holds its answer to tab B's
+    /// until tab C's reaches it, past the bus thread's deadline for tab B's
+    /// (the product's [`super::freedesktop::CALL_TIMEOUT`]), as a stalled
+    /// GNOME Shell or a notification daemon the bus is still starting does;
+    /// then it answers both and reports a click on tab A's notice. Tab A's and
+    /// tab C's answers must come, so their deadlines are hang detectors. The
+    /// server saw each notice once, and the click goes to tab A: the late
+    /// answer kept the connection, and with it where each notice still showing
+    /// goes. Before, the deadline dropped the connection, so the bus thread
+    /// sent tab B's notice again on a new one (the server showed it twice) and
+    /// forgot tab A's, whose click went nowhere. COULD NOT RUN where no
+    /// `dbus-daemon` is on PATH.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_slow_linux_server_shows_a_notice_once_and_keeps_its_clicks() {
+        use aterm_dbus::{Connection, Kind, Value};
+
+        let private = PrivateBus::start();
+        let mut server = private.server();
+        let served = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut held = Vec::new();
+            let mut next = 41;
+            loop {
+                let msg = server.recv(Some(HANG)).unwrap().expect("a Notify call");
+                if msg.kind != Kind::MethodCall || msg.member.as_deref() != Some("Notify") {
+                    continue;
+                }
+                let summary = msg.body[3].as_str().unwrap().to_owned();
+                held.push((next, msg));
+                next += 1;
+                let last = summary == "tab C";
+                seen.push(summary);
+                // Tab A's is answered at once; every other waits for tab C's,
+                // which the bus thread sends only once it gave up on tab B's.
+                if seen.len() == 1 || last {
+                    for (id, notify) in held.drain(..) {
+                        server.reply(&notify, vec![Value::U32(id)]).unwrap();
+                    }
+                }
+                if last {
+                    server
+                        .emit(
+                            OBJECT,
+                            SERVER,
+                            "ActionInvoked",
+                            vec![Value::U32(41), Value::from("default")],
+                        )
+                        .unwrap();
+                    return (server, seen);
+                }
+            }
+        });
+
+        let (woke, wakes) = std::sync::mpsc::channel();
+        let addresses = private.addresses.clone();
+        let poster = super::freedesktop::Poster::start(
+            move || Connection::open(&addresses),
+            move |wake| {
+                let _ = woke.send(wake);
+            },
+        )
+        .expect("the bus thread starts");
+        let (tab_a, tab_b, tab_c) = (3, 5, 7);
+        for (tab, summary, bound) in [
+            (tab_a, "tab A", HANG),
+            (tab_b, "tab B", super::freedesktop::CALL_TIMEOUT),
+            (tab_c, "tab C", HANG),
+        ] {
+            let call = super::freedesktop::notify_call(summary, "done", false, true).unwrap();
+            poster.post_within(call, Some(tab), bound);
+        }
+
+        let (_server, seen) = served.join().unwrap();
+        assert_eq!(
+            seen,
+            ["tab A", "tab B", "tab C"],
+            "the server saw each notice once: an answer past the deadline sent none again"
+        );
+        let wake = wakes
+            .recv_timeout(HANG)
+            .expect("the click on tab A's notice reaches aterm");
+        let crate::Wake::NoticeClicked {
+            session,
+            activation,
+        } = wake
+        else {
+            panic!("not a click: {wake:?}");
+        };
+        assert_eq!(
+            (session, activation),
+            (tab_a, None),
+            "tab A's notice still goes to tab A: the connection and its clicks were kept"
+        );
+        drop(poster);
+    }
+
+    /// A NOTICE POSTED AT ONCE GIVES UP ON A SILENT BUS WITHIN ITS OWN BOUND:
+    /// [`super::deliver_now`] runs on the event loop for a file that cannot
+    /// open, so its dial is bounded by [`super::freedesktop::CALL_TIMEOUT`],
+    /// never aterm-dbus's 25 s handshake default, which froze every window.
+    /// The bus is a listener that never accepts: the kernel completes the
+    /// connection into its backlog, and nothing answers the handshake. The
+    /// control: a private `dbus-daemon` (never the session's bus) whose
+    /// stand-in server takes the same notice, its dial and answer awaited as
+    /// what must happen (a hang detector). COULD NOT RUN where no
+    /// `dbus-daemon` is on PATH.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_notice_posted_at_once_gives_up_on_a_silent_bus_within_its_bound() {
+        use aterm_dbus::{Kind, Value};
+
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let path = scratch.path().join("silent");
+        let _silent = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let silent = aterm_dbus::address::parse(&format!("unix:path={}", path.display())).unwrap();
+        let call = super::freedesktop::notify_call("aterm", "cannot open", false, false).unwrap();
+        let asked = std::time::Instant::now();
+        let posted =
+            super::freedesktop::notify_now(&call, &silent, super::freedesktop::CALL_TIMEOUT);
+        let waited = asked.elapsed();
+        assert_eq!(posted, None, "a bus that never answered took nothing");
+        // The two bounds compared, not the machine's speed.
+        assert!(
+            waited < aterm_dbus::conn::HANDSHAKE_TIMEOUT,
+            "the notice gave up after {waited:?}, the handshake default's, not its own bound"
+        );
+
+        let private = PrivateBus::start();
+        let mut server = private.server();
+        let served = std::thread::spawn(move || {
+            loop {
+                let msg = server.recv(Some(HANG)).unwrap().expect("a Notify call");
+                if msg.kind == Kind::MethodCall && msg.member.as_deref() == Some("Notify") {
+                    server.reply(&msg, vec![Value::U32(7)]).unwrap();
+                    return server;
+                }
+            }
+        });
+        let posted = super::freedesktop::notify_now(&call, &private.addresses, HANG);
+        let _server = served.join().unwrap();
+        assert_eq!(
+            posted.map(|at| at.id),
+            Some(7),
+            "a bus that answers takes the notice"
+        );
     }
 }

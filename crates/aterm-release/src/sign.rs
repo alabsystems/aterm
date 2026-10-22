@@ -23,9 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-// ---------------------------------------------------------------------------
 // Tool paths — absolute, never PATH-resolved
-// ---------------------------------------------------------------------------
 
 // Whoever controls `$PATH` would otherwise decide what "signed" and "Gatekeeper approved"
 // mean. Every verdict-deciding spawn goes through `RealAppleTools`.
@@ -46,9 +44,7 @@ pub const NOTARY_SUBMIT_TIMEOUT: Duration = Duration::from_secs(40 * 60);
 /// Bound for `stapler staple` / `stapler validate`: a ticket fetch and a local check.
 const STAPLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-// ---------------------------------------------------------------------------
 // Release credentials: one profile file, named by one explicit flag
-// ---------------------------------------------------------------------------
 
 /// The owner's signing material, from the profile named by `targo --unverified ship cut
 /// --release-credentials <path>` or this machine's key (see [`Self::resolve`]).
@@ -400,9 +396,7 @@ fn current_uid() -> Result<u32, String> {
         .map_err(|e| format!("id -u parse: {e}"))
 }
 
-// ---------------------------------------------------------------------------
 // Tier APPLE — resolving the anchor into a usable identity
-// ---------------------------------------------------------------------------
 
 /// The Developer-ID certificate this cut signs with, resolved from the anchor.
 ///
@@ -614,9 +608,7 @@ pub fn resolve_apple_tier(
     })
 }
 
-// ---------------------------------------------------------------------------
 // codesign
-// ---------------------------------------------------------------------------
 
 /// Sign the assembled bundle and return the `signed_by` provenance string for
 /// `bundle::write_provenance` ("ad-hoc", or the Developer-ID identity).
@@ -690,9 +682,7 @@ pub fn sign_dmg(dmg: &Path, sign_id: &DevIdIdentity) -> Result<(), String> {
     )
 }
 
-// ---------------------------------------------------------------------------
 // Notarization
-// ---------------------------------------------------------------------------
 
 /// notarytool credentials, built by [`credentials_notary_auth`] from the
 /// release-credentials profile. `KeychainProfile` is the default: `AppleId` puts the
@@ -829,9 +819,7 @@ pub fn devid_preflight(codesign_info: &str, is_app: bool) -> Result<(), String> 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Designated-requirement class (macOS privacy consent, design §3.1)
-// ---------------------------------------------------------------------------
 
 /// What a designated requirement is keyed on, and so whether a macOS privacy (TCC) grant
 /// recorded against it survives a rebuild.
@@ -1034,9 +1022,7 @@ pub fn notarize(artifact: &Path, auth: &NotaryAuth) -> Result<(), String> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // The two Tier APPLE hooks, and the seam that makes them testable
-// ---------------------------------------------------------------------------
 
 /// Every Apple tool spawn whose outcome decides whether a release ships: the irreversible
 /// operations and the self-check's verdict queries. Tests drive the real decision code
@@ -1184,9 +1170,7 @@ pub fn sign_and_notarize_dmg(
     Ok(true)
 }
 
-// ---------------------------------------------------------------------------
 // The self-check's Apple branch, as a pure verdict over captured tool output
-// ---------------------------------------------------------------------------
 
 /// What the self-check observed about a finished cut's artifacts, gathered by spawning tools
 /// and judged by the pure [`apple_selfcheck_verdict`]. A resumed cut re-proves this after
@@ -1251,8 +1235,6 @@ pub fn apple_selfcheck_verdict(e: &AppleSelfcheck<'_>) -> Result<(), String> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-
 fn run_checked(cmd: &mut Command, what: &str) -> Result<(), String> {
     let out = cmd.output().map_err(|e| format!("spawn {what}: {e}"))?;
     if !out.status.success() {
@@ -1299,9 +1281,7 @@ fn run_streamed(cmd: &mut Command, what: &str, timeout: Duration) -> Result<(), 
     }
 }
 
-// ---------------------------------------------------------------------------
 // Designated-requirement classification over recorded codesign output
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod dr_tests {

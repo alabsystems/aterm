@@ -2024,7 +2024,7 @@ fn footer_rows(state: &SettingsViewState, width: f32, narrow: bool) -> Vec<(UiNo
     let folder_visual = if narrow { "Folder" } else { "Themes folder" };
     // Narrow, the two share one line where their words allow: "Import…" and
     // "Folder" took 3pt more than a 234pt window's 178pt line at 1.5× text in
-    // the round-7 Linux lane's Noto Sans, so they went on two lines, a stop
+    // the Linux lane's Noto Sans, so they went on two lines, a stop
     // 88pt tall in the list's 84pt, whole on no screen. Its ellipsis is the
     // painted words' only cut; the button's name keeps it.
     let import_visual = if narrow { "Import" } else { "Import\u{2026}" };

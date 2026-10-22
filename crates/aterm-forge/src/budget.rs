@@ -559,8 +559,8 @@ fn missing_armed(rows: &[Row], live: &Live) -> Vec<(String, String, u64)> {
         .collect()
 }
 
-/// The RED diagnostic for one row: what it costs, what forge can and cannot
-/// say about why, and the two ways out.
+/// The red diagnostic for one row: what it costs, what forge can and cannot say about why, and
+/// the two ways out.
 fn over_message(row: &Row, over: u64, live: &Live) -> String {
     let mut s = format!(
         "RED  {} {} is {over} over the ceiling of {}.\n",

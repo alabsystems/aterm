@@ -226,9 +226,7 @@ impl Places {
     }
 }
 
-// ---------------------------------------------------------------------------
 // flags
-// ---------------------------------------------------------------------------
 
 /// What `init` and `join` take.
 #[derive(Debug, Default)]
@@ -514,9 +512,7 @@ fn read_unshown(prompt: &str) -> io::Result<String> {
     Ok(line)
 }
 
-// ---------------------------------------------------------------------------
 // the verbs
-// ---------------------------------------------------------------------------
 
 /// A node id's first eight digits, as rows and reports show it.
 fn short(node: &str) -> &str {
@@ -2222,9 +2218,7 @@ fn leave(places: &Places, args: &[String]) -> Result<String, Failure> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
 // the fleet read: `aterm ctl survey --fleet | --host`
-// ---------------------------------------------------------------------------
 
 /// THE FLEET CLIENT of `aterm ctl survey --fleet | --host`
 /// (`aterm_ctl::LocalVerbs::fleet_survey`): every peer this machine knows —
@@ -2606,9 +2600,7 @@ fn raise_open_files() {
     let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
 }
 
-// ---------------------------------------------------------------------------
 // aterm.toml's [fleet] table
-// ---------------------------------------------------------------------------
 
 /// `[fleet]` as aterm.toml says it now.
 #[derive(Debug, Default, PartialEq, Eq)]

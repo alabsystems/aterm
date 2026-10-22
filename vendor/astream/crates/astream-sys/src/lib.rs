@@ -45,16 +45,28 @@
 //!   `SIGHUP` reloads the file (`Broker::load_revocation_file`, `asb serve
 //!   --revocation-file`); a broker that loads none never changes the process's
 //!   `SIGHUP` disposition.
+//! - The owner-only file rule: [`open_nonblocking`] opens a path read-only and
+//!   without waiting (`O_NONBLOCK`, so a FIFO opens at once), following or refusing a
+//!   link at its last component (`O_NOFOLLOW`); [`owner_private`] and
+//!   [`owner_private_dir`] judge the open descriptor: the kind asked for (a regular
+//!   file, a directory), owned by [`euid`], no group or other permission bit, and on
+//!   macOS no access-list entry that allows anyone anything (`acl_get_fd_np`), because
+//!   macOS checks an extended ACL before the mode bits. astream-cap's `capfile` reads
+//!   every secret file through it (claim `cap.secret-file-owner-only`).
 //!
 //! ## The cordon
 //!
-//! The crate root is `deny(unsafe_code)`, and exactly one module re-permits it:
-//! `apple` (`cfg(target_vendor = "apple")`), four hand-declared FFI calls with a
-//! `// SAFETY:` note each: `fcntl(F_BARRIERFSYNC)` behind [`barrier_sync`],
+//! The crate root is `deny(unsafe_code)`, and exactly two modules re-permit it, for
+//! hand-declared FFI calls with a `// SAFETY:` note each. `apple`
+//! (`cfg(target_vendor = "apple")`): `fcntl(F_BARRIERFSYNC)` behind [`barrier_sync`],
 //! `sysctlbyname("kern.bootsessionuuid")` behind [`boot_session`], `poll` behind
-//! `socket_hung_up`, and `signal(SIGHUP)` behind [`install_sighup_handler`]. Nothing
-//! else here may use `unsafe` — the compiler refuses it — and no errno or raw pointer
-//! leaves that module: every call returns `io::Result` or an owned value.
+//! `socket_hung_up`, and `signal(SIGHUP)` behind [`install_sighup_handler`]. `owner`
+//! (`cfg(unix)`): `geteuid` behind [`euid`] and [`owner_private`], and on Apple
+//! `acl_get_fd_np`, `acl_get_entry`, `acl_get_tag_type` and `acl_free` behind
+//! [`owner_private`] and [`owner_private_dir`]; the per-OS `O_NONBLOCK` and
+//! `O_NOFOLLOW` numbers [`open_nonblocking`] passes to safe `std` live there too.
+//! Nothing else here may use `unsafe` — the compiler refuses it — and no errno or raw
+//! pointer leaves those modules: every call returns `io::Result` or an owned value.
 //! `astream-broker` stays `forbid(unsafe_code)` and reaches the OS through this
 //! crate's safe functions (and reads a barrier's refusal through
 //! [`barrier_refused`], plain errno numbers that need no `unsafe`).
@@ -73,7 +85,10 @@
 //! a failed flush; elsewhere aterm-durable's ordered write is a full flush of its
 //! own, not this crate's. aterm reaches `fcntl`, `sysctlbyname` and `poll` (the last
 //! through astream-broker's client, whose `Closer` it bounds both ways on every
-//! dial), and never installs the `SIGHUP` handler.
+//! dial), and never installs the `SIGHUP` handler. Its private files are held to
+//! the owner rule: aterm-uds's `private_file` judges each file it reads with
+//! [`owner_private`] and each private directory with [`owner_private_dir`], and
+//! aterm-link reads the fabric's mint secret through capfile's `read_secret_in`.
 
 #![deny(unsafe_code)]
 
@@ -106,6 +121,10 @@ macro_rules! apple_ffi {
 #[cfg(target_vendor = "apple")]
 #[allow(unsafe_code)]
 mod apple;
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+mod owner;
 
 #[macro_use]
 #[path = "../../astream-wire/contract_fn.rs"]
@@ -459,6 +478,183 @@ pub fn parse_boot_id(raw: &[u8]) -> Option<[u8; 16]> {
     }
 }
 
+/// This process's effective user id: the owner [`owner_private`] holds a file to.
+#[cfg(unix)]
+#[must_use]
+pub fn euid() -> u32 {
+    owner::euid()
+}
+
+/// Whether [`open_nonblocking`] may follow a symbolic link at the path's last
+/// component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Links {
+    /// Follow it, as `open(2)` does by default.
+    Follow,
+    /// Refuse it (`O_NOFOLLOW`): a link there fails the open (`ELOOP`) and nothing
+    /// is opened through it. Only the last component is judged.
+    Refuse,
+}
+
+/// Open `path` read-only and NON-BLOCKING (`O_NONBLOCK`), following or refusing a
+/// link at its last component as `links` says.
+///
+/// Non-blocking so that whatever sits at the path is opened at once, a FIFO
+/// included: a plain open of a FIFO waits until something opens its other end, so a
+/// reader that opened before it judged would hang on one anyone could make with
+/// `mkfifo`. Reads of a regular file are not changed by the flag. The caller judges
+/// what it opened ([`owner_private`], [`owner_private_dir`]) before it reads a byte.
+///
+/// # Errors
+///
+/// The open's own error (`NotFound`, `PermissionDenied`, and under
+/// [`Links::Refuse`] the OS's `ELOOP` for a link). On a target whose flags this
+/// crate does not declare (Unix other than Apple, the BSDs, and Linux/Android on
+/// x86, x86-64, RISC-V, s390x, LoongArch, ARM and PowerPC), `Unsupported`: nothing is
+/// opened without them. Off Unix, a plain read-only open: there is no FIFO to wait
+/// on, and `links` is not judged.
+pub fn open_nonblocking(path: &std::path::Path, links: Links) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let Some((nonblock, nofollow)) = owner::OPEN_FLAGS else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "astream-sys declares no O_NONBLOCK/O_NOFOLLOW for this target",
+            ));
+        };
+        let flags = match links {
+            Links::Follow => nonblock,
+            Links::Refuse => nonblock | nofollow,
+        };
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = links;
+        File::open(path)
+    }
+}
+
+/// Why an open file is not its owner's alone ([`owner_private`],
+/// [`owner_private_dir`]). Its `Display` names the clause without a path; a caller
+/// leads with the path it opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotPrivate {
+    /// It is not the kind of file asked for: what it is instead (`"a FIFO"`, `"a
+    /// directory"`, `"a regular file"`, `"a socket"`, `"a device"`).
+    Kind(&'static str),
+    /// It is another user's: its owner's uid (the reader's is [`euid`]).
+    Owner(u32),
+    /// A group or other permission bit is set: its permission bits (`& 0o777`).
+    Mode(u32),
+    /// An access-list entry allows someone something (macOS, `ACL_EXTENDED_ALLOW`).
+    /// macOS checks an extended list before the mode bits, so a 0600 file carrying
+    /// an `everyone allow read` entry (one a parent's `file_inherit` entry passed
+    /// on, say) is open to every user.
+    Acl,
+}
+
+impl core::fmt::Display for NotPrivate {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            NotPrivate::Kind(what) => write!(f, "is {what}"),
+            NotPrivate::Owner(uid) => write!(f, "is owned by uid {uid}, not this user"),
+            NotPrivate::Mode(mode) => write!(f, "is mode {mode:04o}"),
+            NotPrivate::Acl => f.write_str("carries an access list (ACL) that lets other users in"),
+        }
+    }
+}
+
+/// The word [`NotPrivate::Kind`] names a file type by.
+fn kind_of(file_type: std::fs::FileType) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        if file_type.is_fifo() {
+            return "a FIFO";
+        }
+        if file_type.is_socket() {
+            return "a socket";
+        }
+        if file_type.is_char_device() || file_type.is_block_device() {
+            return "a device";
+        }
+    }
+    if file_type.is_dir() {
+        "a directory"
+    } else if file_type.is_file() {
+        "a regular file"
+    } else if file_type.is_symlink() {
+        "a symlink"
+    } else {
+        "not a regular file"
+    }
+}
+
+/// `file` held to the owner-only rule, read off the descriptor (`fstat`, and on
+/// macOS `acl_get_fd_np`), never by path: a REGULAR file, owned by this process's
+/// effective uid ([`euid`]), carrying no access-list entry that allows anyone anything
+/// (macOS; a deny entry takes nothing away and passes), and with no group or other
+/// permission bit. The clauses are judged in that order, and the first one broken is
+/// the answer: [`NotPrivate::Mode`], the one clause a `chmod` of the mode closes, comes
+/// last, so a caller that narrows a mode it was given knows every other clause held.
+/// Off Unix only the kind is judged: there are no mode bits.
+///
+/// The outer `Err` is an OS error that left the file unjudged (the `fstat`, or an
+/// access list that could not be read); `Ok(Err(..))` is the clause it breaks;
+/// `Ok(Ok(meta))` passes, with the descriptor's metadata, so a caller adds its own
+/// clauses (a link count, a length) without a second `fstat`.
+///
+/// # Errors
+///
+/// As above.
+pub fn owner_private(file: &File) -> io::Result<Result<std::fs::Metadata, NotPrivate>> {
+    owner_only(file, false)
+}
+
+/// [`owner_private`] for a DIRECTORY (opened as [`open_nonblocking`] opens one): the
+/// same clauses, with a directory the kind asked for. A directory that holds a
+/// secret bounds who may replace it, or put another name for it beside it.
+///
+/// # Errors
+///
+/// As [`owner_private`].
+pub fn owner_private_dir(dir: &File) -> io::Result<Result<std::fs::Metadata, NotPrivate>> {
+    owner_only(dir, true)
+}
+
+fn owner_only(file: &File, dir: bool) -> io::Result<Result<std::fs::Metadata, NotPrivate>> {
+    let meta = file.metadata()?;
+    let file_type = meta.file_type();
+    let kind_ok = if dir {
+        file_type.is_dir()
+    } else {
+        file_type.is_file()
+    };
+    if !kind_ok {
+        return Ok(Err(NotPrivate::Kind(kind_of(file_type))));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() != owner::euid() {
+            return Ok(Err(NotPrivate::Owner(meta.uid())));
+        }
+        if owner::acl_allows(file)? {
+            return Ok(Err(NotPrivate::Acl));
+        }
+        let mode = meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Ok(Err(NotPrivate::Mode(mode)));
+        }
+    }
+    Ok(Ok(meta))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,3 +795,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod owner_tests;

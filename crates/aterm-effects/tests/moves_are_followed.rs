@@ -35,13 +35,11 @@ use aterm_effects::kitty_pet::PetBrain;
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::time::{Duration, Instant};
 
-// ===========================================================================
 // b2m: Claude Code's bottom-anchored composer (alt screen, 53 rows, 15×28 cells),
 // the frame hold only (every named row read), framed `fr16`, `paced` or `pet`.
 // Census: one frame after each wrap or composer newline, a completed line lit ≥90%
 // before and <90% after is dark. Host option `stale@k`: the far-row read dropped on
 // the k-th newline's echo frame.
-// ===========================================================================
 mod b2m {
     use super::*;
 
@@ -503,10 +501,8 @@ mod b2m {
     }
 }
 
-// ===========================================================================
 // b2s: a band carried by one follow, then moved again with no key between. Host:
 // the scroll seam (no alt re-baseline), the frame hold with the caret row re-read.
-// ===========================================================================
 mod b2s {
     use super::*;
 
@@ -664,11 +660,9 @@ mod b2s {
     }
 }
 
-// ===========================================================================
 // b3: boxes, composers and tears (`h1`…`h10`, `h8b`, the paste-then-wrap `diag`).
 // Host: SYNC-1 (no frame while a `?2026` bracket is open), the scroll seam (no alt
 // re-baseline), the frame hold (caret row not re-read), on a 16 or 8 ms train.
-// ===========================================================================
 mod b3 {
     use super::*;
 
@@ -1708,11 +1702,9 @@ mod b3 {
     }
 }
 
-// ===========================================================================
 // d4: relocations, torn repaints and push-downs on `trail_host::PacedHost` (scroll
 // seam, alt re-baseline, frame hold with the caret row not re-read, SYNC-1 off),
 // framed `fr16`, `fr8`, `paced` or `pet`.
-// ===========================================================================
 mod d4 {
     use super::*;
 

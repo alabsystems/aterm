@@ -3,46 +3,47 @@
 
 //! Registering and revoking each host's GitHub key with the fleet's machine user (design §7).
 //!
-//! The machine user's token stays in `gh`'s keychain entry on the controller. Each command
-//! reads it with `gh auth token --hostname github.com --user <account>` and hands it to each
-//! `gh api` child as `GH_TOKEN` through [`Cmd::secret_env`], whose display masks it, so it is never
-//! printed, logged or put in an error. `gh auth switch` is never run: it would change the
-//! account of every other program on the controller that uses gh.
+//! No gh (docs/DESIGN-init-system-2026-10-20.md S14, §6.1 row 22). The machine user's token is
+//! a login-keychain entry on the controller that `aterm machines github login` files ([`login`])
+//! through CLT git's osxkeychain helper (`git credential approve`, the token on standard input
+//! alone; [`crate::git_credential`]) under the host [`TOKEN_HOST`], not `github.com`, so git's
+//! own github.com lookups (a clone, a fetch) never hand it out. Each command reads it back with
+//! `git credential fill`, checks with `GET /user` that it signs in as the account, and talks to
+//! GitHub's REST API through [`System::github_rest`] (aterm-http): the token is an
+//! `Authorization` header this process builds, never an argument, a variable, a log line or
+//! an error.
 //!
-//! What gh prints was measured with gh 2.92.0 on 2026-10-16, run as [`crate::port::Live`] runs
-//! a child (cleared environment, fixed `PATH`, `HOME`, `/dev/null` on standard input), and the
-//! tests' fixtures follow it, with made-up ids, keys and tokens:
+//! What GitHub answers (REST version 2022-11-28), which the tests' fixtures follow with
+//! made-up ids, keys and tokens:
 //!
-//! * `gh auth token --hostname github.com --user <login>`: exit 0, the token and a newline
-//!   (`gho_` and 36 of `[A-Za-z0-9_]`; a fine-grained token is `github_pat_…`), nothing on
-//!   standard error. gh prints a token GitHub no longer accepts just the same, so only
-//!   `GET /user` catches that. For a login gh does not hold (`--user` matches exactly, case
-//!   included): exit 1, nothing on standard output, and `no oauth token found for github.com
-//!   account <login>` on standard error.
-//! * `gh api user --jq .login`: exit 0, the login and a newline.
-//! * `gh api user/keys --paginate --jq '.[] | [.id, .key] | @tsv'`: per key, `<id>`, a tab,
-//!   `<type> <base64>` (GitHub keeps no comment) and a newline; the same lines whatever the
-//!   page size; nothing at all for no keys.
-//! * A `gh api` GitHub refuses: exit 1, `gh: <message> (HTTP <status>)` and a newline on
-//!   standard error, and the API's JSON body on standard output as GitHub sent it, `--jq` not
-//!   applied (compact for a 404 or a 422, indented with CRLF line ends for a 401).
+//! * `GET /user`: 200 and the account's `login`; 401 `Bad credentials` for a token it no longer
+//!   accepts. A classic token's answers carry `X-OAuth-Scopes`, the scopes it holds; a
+//!   fine-grained token's carry none.
+//! * `GET /user/keys?per_page=100`: 200 and a JSON array of `{id, key, …}`, `key` being
+//!   `<type> <base64>` (GitHub keeps no comment), paged by `Link`.
+//! * `POST /user/keys` with `{"title", "key"}`: 201 and the new key's `id`; 422 `Validation
+//!   Failed` with `errors[].message` for a key it refuses.
+//! * `DELETE /user/keys/{id}`: 204.
+//! * A token without [`KEY_SCOPE`]: 404 `Not Found` on each of those, with
+//!   `X-Accepted-OAuth-Scopes` naming the scopes the endpoint takes.
 
-use crate::port::{Cmd, System};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use crate::git_credential::Git;
+use crate::github_pages;
+use crate::port::{GithubResponse, RestMethod, Secret, System};
+use serde::Serialize;
 
-/// Where gh lives: Homebrew on Apple silicon, then Homebrew on Intel and gh's own pkg.
-pub const GH_PATHS: [&str; 2] = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"];
+/// The host the machine user's token is filed under in the login keychain: the API's, which
+/// no git remote names.
+pub const TOKEN_HOST: &str = "api.github.com";
 
-/// The one GitHub host.
-pub const GITHUB_HOST: &str = "github.com";
-
-/// The bound on one gh call: a hung network is what it catches.
-const GH_BUDGET: Duration = Duration::from_secs(60);
-
-/// The OAuth scope listing, adding and deleting the account's SSH keys needs. `gh auth login`
-/// does not ask for it by default, and GitHub answers a token without it `Not Found`.
+/// The OAuth scope listing, adding and deleting the account's SSH keys needs (a classic
+/// token's; a fine-grained token needs read and write of "Git SSH keys"). GitHub answers a
+/// token without it `Not Found`.
 pub const KEY_SCOPE: &str = "admin:public_key";
+
+/// The key listing, at GitHub's largest page.
+const KEYS: &str = "/user/keys?per_page=100";
+const KEYS_PER_PAGE: usize = 100;
 
 /// One key `POST /user/keys` registered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,34 +52,6 @@ pub struct Registered {
     pub user: String,
     /// GitHub's key id.
     pub id: u64,
-}
-
-/// The first gh of [`GH_PATHS`] that exists.
-///
-/// # Errors
-/// One line when neither does.
-pub fn gh_path(sys: &dyn System) -> Result<PathBuf, String> {
-    GH_PATHS
-        .iter()
-        .map(Path::new)
-        .find(|p| sys.stat(p).is_ok())
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            format!(
-                "gh is not installed ({} or {}), and aterm does not install it: with one \
-                 there, gh auth login as the machine user",
-                GH_PATHS[0], GH_PATHS[1]
-            )
-        })
-}
-
-/// A `gh api` run carrying `token`.
-#[must_use]
-pub fn api_cmd(gh: &Path, token: &str) -> Cmd {
-    Cmd::new(gh)
-        .secret_env("GH_TOKEN", token)
-        .arg("api")
-        .budget(GH_BUDGET)
 }
 
 /// A GitHub login: letters, digits and single hyphens, at most 39 characters.
@@ -91,106 +64,105 @@ fn valid_login(account: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
+/// The git `account`'s token is stored and read through, once `account` is a login and that
+/// git is installed.
+fn keychain(sys: &dyn System, account: &str) -> Result<Git, String> {
+    if !valid_login(account) {
+        return Err(format!("{account:?} is not a GitHub login"));
+    }
+    let git = Git::keychain();
+    if !git.installed(sys) {
+        return Err(
+            "the machine user's GitHub token is kept through Apple's Command Line Tools git, \
+             which is not installed (aterm init --only base.clt installs them)"
+                .into(),
+        );
+    }
+    Ok(git)
+}
+
 /// An authenticated session as the machine user. Holds the token, so it has no `Debug`.
 struct Session {
-    gh: PathBuf,
-    token: String,
+    token: Secret,
 }
 
 impl Session {
-    /// Read `account`'s token from gh and check that it signs in as `account`.
+    /// Read `account`'s token from the login keychain and check that it signs in as
+    /// `account`.
     fn open(sys: &dyn System, account: &str) -> Result<Self, String> {
-        if !valid_login(account) {
-            return Err(format!("{account:?} is not a GitHub login"));
-        }
-        let gh = gh_path(sys)?;
-        let cmd = Cmd::new(&gh)
-            .args([
-                "auth",
-                "token",
-                "--hostname",
-                GITHUB_HOST,
-                "--user",
-                account,
-            ])
-            .budget(GH_BUDGET);
-        // Only standard error is ever quoted: standard output is the token.
-        let ran = sys.run(&cmd).map_err(|e| format!("gh auth token: {e}"))?;
-        if !ran.success() {
-            // gh matches `--user` exactly: a login it holds as `fleetbot` is not found as
-            // `FleetBot`, though GitHub reads both as one account.
+        let git = keychain(sys, account)?;
+        let Some(token) = git.fill(sys, None, TOKEN_HOST, account)? else {
             return Err(format!(
-                "gh holds no token for {account} on {GITHUB_HOST} (gh matches the login \
-                 exactly, case included, as gh auth status lists it; or run gh auth login \
-                 --hostname {GITHUB_HOST} --scopes {KEY_SCOPE} and sign in as {account}): {}",
-                ran.describe()
+                "the login keychain holds no GitHub token for {account} (aterm machines github \
+                 login stores one: a token of {account}'s with the {KEY_SCOPE} scope)"
             ));
-        }
-        let token = ran.out().trim().to_owned();
-        if token.is_empty() || token.contains(char::is_whitespace) {
-            return Err(format!("gh auth token printed no token for {account}"));
-        }
-        let session = Self { gh, token };
-        let login = session.call(sys, &["user", "--jq", ".login"])?;
-        let login = login.trim();
+        };
+        let session = Self { token };
+        let (login, _) = session.login(sys)?;
         if !login.eq_ignore_ascii_case(account) {
             return Err(format!(
-                "gh's token for {account} signs in as {login:?}; nothing was sent (gh auth \
-                 switch is never run)"
+                "the login keychain's GitHub token for {account} signs in as {login:?}; nothing \
+                 was sent (aterm machines github login replaces it)"
             ));
         }
         Ok(session)
     }
 
-    /// `gh api <args>`: standard output on success, else one line from gh's standard error
-    /// and the API's message.
-    fn call(&self, sys: &dyn System, args: &[&str]) -> Result<String, String> {
-        let cmd = api_cmd(&self.gh, &self.token).args(args);
-        let what = format!("gh api {}", endpoint(args));
-        match sys.run(&cmd) {
-            Ok(ran) if ran.success() => Ok(ran.out()),
-            Ok(ran) => Err(format!("{what}: {}", failure(&ran))),
-            Err(e) => Err(format!("{what}: {e}")),
+    fn send(
+        &self,
+        sys: &dyn System,
+        method: RestMethod,
+        endpoint: &str,
+        body: Option<&[u8]>,
+    ) -> Result<GithubResponse, String> {
+        sys.github_rest(&self.token, method, endpoint, body)
+    }
+
+    /// `GET /user`: the login the token signs in as, and the answer's headers.
+    fn login(&self, sys: &dyn System) -> Result<(String, Vec<(String, String)>), String> {
+        let answer = self.send(sys, RestMethod::Get, "/user", None)?;
+        if answer.status != 200 {
+            return Err(failure(RestMethod::Get, "/user", &answer));
         }
+        let headers = answer.headers.clone();
+        let (value, _) = github_pages::page(answer.status, answer.headers, &answer.body)?;
+        let login = value["login"]
+            .as_str()
+            .filter(|login| valid_login(login))
+            .ok_or("GitHub GET /user answered no login")?
+            .to_owned();
+        Ok((login, headers))
     }
 }
 
-/// The endpoint among `gh api`'s arguments: the first word that is neither a flag nor the
-/// method `--method` takes.
-fn endpoint<'a>(args: &[&'a str]) -> &'a str {
-    let mut words = args.iter().copied();
-    while let Some(word) = words.next() {
-        if word == "--method" || word == "-X" {
-            words.next();
-        } else if !word.starts_with('-') {
-            return word;
-        }
-    }
-    ""
+/// The value of the header `name` (any case) in `headers`.
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
-/// One line for a failed `gh api`: how it ended, the API's message when gh's status line does
-/// not already carry it, and any line gh printed about the token's scopes. gh's status line is
-/// the body's `message` (`gh: Not Found (HTTP 404)`), so only a message it leaves out (a 422's
-/// `errors[].message`) is added. gh writes its scope suggestion (`gh auth refresh … -s
-/// <scope>`) after the status line, which [`Ran::describe`] alone would drop.
-fn failure(ran: &crate::port::Ran) -> String {
-    let mut line = ran.describe();
-    if let Some(message) = api_message(&ran.out()).filter(|m| !line.contains(m.as_str())) {
-        line.push_str(&format!(" ({message})"));
-    }
-    let err = ran.err();
-    for hint in err.lines().skip(1).filter(|l| l.contains("scope")) {
-        line.push_str("; ");
-        line.push_str(hint.trim().trim_start_matches("gh: "));
-    }
-    line
+/// A scope list header (`admin:public_key, read:public_key`).
+fn scopes(value: &str) -> impl Iterator<Item = &str> {
+    value.split(',').map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// The API's own explanation in an error body gh printed: the first `errors[].message`, else
-/// `message`.
-fn api_message(body: &str) -> Option<String> {
-    let value: aterm_json::Value = aterm_json::from_str(body.trim()).ok()?;
+/// The scope the token lacks for an endpoint, when GitHub's answer says: the first of the
+/// endpoint's `X-Accepted-OAuth-Scopes` when the token's `X-OAuth-Scopes` holds none of them.
+fn missing_scope(headers: &[(String, String)]) -> Option<&str> {
+    let accepted = header(headers, "x-accepted-oauth-scopes")?;
+    let held: Vec<&str> = header(headers, "x-oauth-scopes")
+        .map(|held| scopes(held).collect())
+        .unwrap_or_default();
+    let mut accepted = scopes(accepted).peekable();
+    let first = *accepted.peek()?;
+    (!accepted.any(|scope| held.contains(&scope))).then_some(first)
+}
+
+/// The API's own explanation in an error body: the first `errors[].message`, else `message`.
+fn api_message(body: &[u8]) -> Option<String> {
+    let value: aterm_json::Value = aterm_json::from_slice(body).ok()?;
     value
         .pointer("/errors/0/message")
         .or_else(|| value.pointer("/message"))
@@ -198,27 +170,52 @@ fn api_message(body: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The keys the machine user holds: `(id, key type, base64 body)`. One `<id>\t<type> <base64>`
-/// line per key from `--jq`, which applies to each page `--paginate` fetches.
-fn listed(sys: &dyn System, session: &Session) -> Result<Vec<(u64, String, String)>, String> {
-    let out = session.call(
-        sys,
-        &[
-            "user/keys",
-            "--paginate",
-            "--jq",
-            ".[] | [.id, .key] | @tsv",
-        ],
-    )?;
-    let mut keys = Vec::new();
-    for line in out.lines().filter(|l| !l.trim().is_empty()) {
-        let parsed = line.split_once('\t').and_then(|(id, key)| {
-            let (kind, body) = crate::items::github::key_material(key)?;
-            Some((id.trim().parse::<u64>().ok()?, kind, body))
-        });
-        keys.push(parsed.ok_or_else(|| format!("gh api user/keys printed {line:?}"))?);
+/// One line for an answer that is not the one wanted: the status, the API's message, and the
+/// scope the token lacks when GitHub names it.
+fn failure(method: RestMethod, endpoint: &str, answer: &GithubResponse) -> String {
+    let mut line = format!("GitHub {method} {endpoint}: HTTP {}", answer.status);
+    if let Some(message) = api_message(&answer.body) {
+        line.push_str(&format!(" ({message})"));
     }
-    Ok(keys)
+    if let Some(scope) = missing_scope(&answer.headers) {
+        line.push_str(&format!(
+            "; the token lacks the {scope} scope (aterm machines github login stores one \
+             that holds it)"
+        ));
+    }
+    line
+}
+
+/// The keys the machine user holds: `(id, key type, base64 body)`, every page read.
+fn listed(sys: &dyn System, session: &Session) -> Result<Vec<(u64, String, String)>, String> {
+    let values = github_pages::all(KEYS, KEYS_PER_PAGE, |endpoint| {
+        let answer = session.send(sys, RestMethod::Get, endpoint, None)?;
+        if answer.status != 200 {
+            return Err(failure(RestMethod::Get, "/user/keys", &answer));
+        }
+        github_pages::page(answer.status, answer.headers, &answer.body)
+    })?;
+    values
+        .iter()
+        .map(|value| {
+            let id = value["id"].as_u64().filter(|id| *id != 0);
+            let key = value["key"]
+                .as_str()
+                .and_then(crate::items::github::key_material);
+            id.zip(key)
+                .map(|(id, (kind, body))| (id, kind, body))
+                .ok_or_else(|| {
+                    "GitHub GET /user/keys listed an entry that is not an id and an SSH key".into()
+                })
+        })
+        .collect()
+}
+
+/// The body of `POST /user/keys`.
+#[derive(Serialize)]
+struct NewKey<'a> {
+    title: &'a str,
+    key: &'a str,
 }
 
 /// Register every `github.key@<user>` public key in `report` that the machine user
@@ -259,26 +256,30 @@ pub fn register(
             continue;
         }
         let title = crate::items::github::key_title(host_name, user);
-        let posted = session.call(
-            sys,
-            &[
-                "--method",
-                "POST",
-                "user/keys",
-                "-f",
-                &format!("title={title}"),
-                "-f",
-                &format!("key={kind} {body}"),
-                "--jq",
-                ".id",
-            ],
-        );
-        match posted.map(|out| out.trim().parse::<u64>()) {
-            Ok(Ok(id)) => done.push(Registered {
-                user: user.clone(),
-                id,
-            }),
-            Ok(Err(_)) => failed.push(format!("{user}: GitHub returned no key id")),
+        let key = format!("{kind} {body}");
+        let new = aterm_json::to_vec(&NewKey {
+            title: &title,
+            key: &key,
+        })
+        .map_err(|e| format!("{user}: {e}"))?;
+        let posted = session.send(sys, RestMethod::Post, "/user/keys", Some(&new));
+        match posted {
+            Ok(answer) if answer.status == 201 => {
+                let id = aterm_json::from_slice::<aterm_json::Value>(&answer.body)
+                    .ok()
+                    .and_then(|value| value["id"].as_u64());
+                match id {
+                    Some(id) => done.push(Registered {
+                        user: user.clone(),
+                        id,
+                    }),
+                    None => failed.push(format!("{user}: GitHub returned no key id")),
+                }
+            }
+            Ok(answer) => failed.push(format!(
+                "{user}: {}",
+                failure(RestMethod::Post, "/user/keys", &answer)
+            )),
             Err(why) => failed.push(format!("{user}: {why}")),
         }
     }
@@ -305,12 +306,6 @@ pub fn revoke(sys: &dyn System, account: &str, ids: &[u64]) -> Result<Vec<String
         return Ok(Vec::new());
     }
     let session = Session::open(sys, account)?;
-    let held = |sys: &dyn System| -> Result<Vec<u64>, String> {
-        Ok(listed(sys, &session)?
-            .into_iter()
-            .map(|(id, ..)| id)
-            .collect())
-    };
     let listing = listed(sys, &session)?;
     let before: Vec<u64> = listing.iter().map(|(id, ..)| *id).collect();
     let deleted: Vec<String> = listing
@@ -320,16 +315,18 @@ pub fn revoke(sys: &dyn System, account: &str, ids: &[u64]) -> Result<Vec<String
         .collect();
     let mut answers: Vec<(u64, String)> = Vec::new();
     for id in ids.iter().copied().filter(|id| before.contains(id)) {
-        let path = format!("user/keys/{id}");
-        let cmd = api_cmd(&session.gh, &session.token).args(["--method", "DELETE", &path]);
-        let answer = match sys.run(&cmd) {
-            Ok(ran) if ran.success() => continue,
-            Ok(ran) => failure(&ran),
-            Err(e) => e.to_string(),
+        let path = format!("/user/keys/{id}");
+        let answer = match session.send(sys, RestMethod::Delete, &path, None) {
+            Ok(answer) if answer.status == 204 => continue,
+            Ok(answer) => failure(RestMethod::Delete, &path, &answer),
+            Err(e) => e,
         };
         answers.push((id, answer));
     }
-    let after = held(sys)?;
+    let after: Vec<u64> = listed(sys, &session)?
+        .into_iter()
+        .map(|(id, ..)| id)
+        .collect();
     let failed: Vec<String> = ids
         .iter()
         .filter(|id| after.contains(id))
@@ -348,15 +345,44 @@ pub fn revoke(sys: &dyn System, account: &str, ids: &[u64]) -> Result<Vec<String
     }
 }
 
+/// Store `token` as the machine user `account`'s (`aterm machines github login`), once
+/// GitHub confirms it signs in as `account` and, for a classic token (whose answers list its
+/// scopes), that it holds [`KEY_SCOPE`]; then read it back from the login keychain.
+///
+/// # Errors
+/// One line (not a login, no CLT git, GitHub refused the token, it is another account's or
+/// lacks the scope, or the keychain did not hand it back). Nothing is stored on an error
+/// before the store, and no error carries the token.
+pub fn login(sys: &dyn System, account: &str, token: Secret) -> Result<(), String> {
+    let git = keychain(sys, account)?;
+    let session = Session { token };
+    let (login, headers) = session
+        .login(sys)
+        .map_err(|why| format!("{why}; nothing was stored"))?;
+    if !login.eq_ignore_ascii_case(account) {
+        return Err(format!(
+            "the token signs in as {login:?}, not {account}; nothing was stored"
+        ));
+    }
+    if let Some(held) = header(&headers, "x-oauth-scopes")
+        && !scopes(held).any(|scope| scope == KEY_SCOPE)
+    {
+        return Err(format!(
+            "the token lacks the {KEY_SCOPE} scope that adding and deleting {account}'s SSH \
+             keys needs; nothing was stored"
+        ));
+    }
+    git.store(sys, None, TOKEN_HOST, account, &session.token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::port::{Fake, Ran, Stat};
+    use crate::git_credential::script;
+    use crate::port::{Fake, Stat};
 
-    /// Made up, in the measured shape: `gho_` and 36 of `[A-Za-z0-9_]`.
-    const TOKEN: &str = "gho_ThisIsNotARealToken0123456789abcdefg"; // gitleaks:allow
-
-    const GH: &str = "/opt/homebrew/bin/gh";
+    /// Made up; never a real token.
+    const TOKEN: &str = "fixture_machine_user_token_only";
 
     /// The key the VM's admin made (see items::github's fixtures).
     const ALICE_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJpFPtSPTOuLIj6oqQTj8ndNDVNHFp4renP47+wxFYao aterm-machines:lab-07:alice";
@@ -379,75 +405,100 @@ mod tests {
     /// indented, CRLF line ends.
     const BAD_CREDENTIALS_BODY: &str = "{\r\n  \"message\": \"Bad credentials\",\r\n  \"documentation_url\": \"https://docs.github.com/rest\",\r\n  \"status\": \"401\"\r\n}";
 
-    /// A `gh api` GitHub refused, laid out as gh prints one: exit 1, the API's body on
-    /// standard output, gh's own lines on standard error.
-    fn refused(body: &str, stderr: &str) -> Ran {
-        Ran {
-            status: Some(1),
-            stdout: body.as_bytes().to_vec(),
-            stderr: stderr.as_bytes().to_vec(),
-        }
+    /// What GitHub names for the key endpoints in `X-Accepted-OAuth-Scopes`.
+    const ACCEPTED: (&str, &str) = (
+        "X-Accepted-OAuth-Scopes",
+        "admin:public_key, read:public_key, write:public_key",
+    );
+
+    const FIRST_PAGE: &str = "/user/keys?per_page=100&page=1";
+
+    fn answer(status: u16, headers: &[(&str, &str)], body: &str) -> Result<GithubResponse, String> {
+        Ok(GithubResponse {
+            status,
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            body: body.as_bytes().to_vec(),
+        })
     }
 
-    fn link() -> Stat {
-        Stat {
-            uid: 501,
-            gid: 80,
-            mode: 0o755,
-            dir: false,
-            symlink: true,
-            len: 26,
-        }
+    fn keys(held: &[(u64, &str)]) -> String {
+        let keys: Vec<_> = held
+            .iter()
+            .map(|(id, body)| aterm_json::json!({"id": id, "key": format!("ssh-ed25519 {body}")}))
+            .collect();
+        aterm_json::to_string(&keys).unwrap()
     }
 
-    /// A controller with gh at Homebrew's path, a token for `fleetbot`, signing in as
+    /// The listing's next answer: the account holds `held`, on one page.
+    fn lists(sys: &Fake, held: &[(u64, &str)]) {
+        sys.on_github_rest(RestMethod::Get, FIRST_PAGE, answer(200, &[], &keys(held)));
+    }
+
+    /// CLT git, for the keychain reads.
+    fn git(sys: &Fake) {
+        sys.stat_of(
+            crate::items::github::CLT_GIT,
+            Stat {
+                uid: 0,
+                gid: 0,
+                mode: 0o755,
+                dir: false,
+                symlink: false,
+                len: 1,
+            },
+        );
+    }
+
+    /// A controller whose login keychain holds a token for `fleetbot` that signs in as
     /// `login`.
     fn controller(login: &str) -> Fake {
         let sys = Fake::default();
-        sys.stat_of(GH, link());
-        sys.on(
-            &format!("{GH} auth token --hostname github.com --user fleetbot"),
-            Ran::ok(&format!("{TOKEN}\n")),
-        );
-        sys.on(
-            &format!("GH_TOKEN=\u{2026} {GH} api user --jq .login"),
-            Ran::ok(&format!("{login}\n")),
+        git(&sys);
+        script::holds(&sys, None, TOKEN_HOST, "fleetbot", TOKEN);
+        sys.on_github_rest(
+            RestMethod::Get,
+            "/user",
+            answer(200, &[], &format!(r#"{{"login":"{login}"}}"#)),
         );
         sys
     }
 
-    fn list_key() -> String {
-        format!("GH_TOKEN=\u{2026} {GH} api user/keys --paginate --jq '.[] | [.id, .key] | @tsv'")
-    }
-
-    fn post_key(user: &str, body: &str) -> String {
+    fn posted(user: &str, body: &str) -> String {
         format!(
-            "GH_TOKEN=\u{2026} {GH} api --method POST user/keys -f title=aterm-machines:lab-07:{user} \
-             -f 'key=ssh-ed25519 {body}' --jq .id"
+            r#"github POST /user/keys {{"title":"aterm-machines:lab-07:{user}","key":"ssh-ed25519 {body}"}}"#
         )
     }
 
-    #[test]
-    fn every_api_call_carries_the_token_in_its_environment_only() {
-        let cmd = api_cmd(Path::new(GH), TOKEN).args(["user"]);
-        assert_eq!(cmd.env, [("GH_TOKEN".to_owned(), TOKEN.to_owned())]);
-        assert!(cmd.args.iter().all(|a| a.to_string_lossy() != TOKEN));
-        assert!(!cmd.display().contains(TOKEN));
+    /// No call carries the token, and none is gh.
+    fn clean(sys: &Fake) {
+        let calls = sys.calls();
+        assert!(
+            calls
+                .iter()
+                .all(|c| !c.contains(TOKEN) && !c.contains("/gh ") && !c.contains("GH_TOKEN")),
+            "{calls:?}"
+        );
     }
 
     #[test]
     fn a_new_key_is_posted_and_one_already_held_is_only_recorded() {
         let sys = controller("fleetbot");
-        sys.on(
-            &list_key(),
-            Ran::ok(&format!(
-                "100000101\tssh-ed25519 {}\n100000102\tssh-ed25519 {BOB_BODY}\n\
-                 100000103\tssh-ed25519 {}\n",
-                OTHER_BODIES[0], OTHER_BODIES[1]
-            )),
+        lists(
+            &sys,
+            &[
+                (100_000_101, OTHER_BODIES[0]),
+                (100_000_102, BOB_BODY),
+                (100_000_103, OTHER_BODIES[1]),
+            ],
         );
-        let alice_body = ALICE_KEY.split(' ').nth(1).unwrap();
-        sys.on(&post_key("alice", alice_body), Ran::ok("100000104\n"));
+        sys.on_github_rest(
+            RestMethod::Post,
+            "/user/keys",
+            answer(201, &[], r#"{"id":100000104,"key":"ssh-ed25519 x"}"#),
+        );
         let keys = [
             ("alice".to_owned(), ALICE_KEY.to_owned()),
             (
@@ -470,12 +521,58 @@ mod tests {
             ]
         );
         let calls = sys.calls();
+        let alice_body = ALICE_KEY.split(' ').nth(1).unwrap();
+        assert!(calls.contains(&posted("alice", alice_body)), "{calls:?}");
         assert_eq!(
-            calls.iter().filter(|c| c.contains("--method POST")).count(),
+            calls
+                .iter()
+                .filter(|c| c.starts_with("github POST"))
+                .count(),
             1
         );
-        assert!(calls.iter().all(|c| !c.contains(TOKEN)), "{calls:?}");
-        assert!(calls.iter().all(|c| !c.contains("auth switch")));
+        // The token came from the keychain, through the one pinned helper.
+        assert_eq!(calls[0], script::credential(None, "fill"));
+        clean(&sys);
+    }
+
+    #[test]
+    fn a_key_held_on_a_later_page_is_found_and_a_page_cut_short_sends_nothing() {
+        let next = format!("<https://api.github.com{KEYS}&page=2>; rel=\"next\"");
+        let first: Vec<(u64, &str)> = (1..=100).map(|id| (id, OTHER_BODIES[0])).collect();
+        for cut in [false, true] {
+            let sys = controller("fleetbot");
+            sys.on_github_rest(
+                RestMethod::Get,
+                FIRST_PAGE,
+                answer(200, &[("Link", &next)], &keys(&first)),
+            );
+            sys.on_github_rest(
+                RestMethod::Get,
+                "/user/keys?per_page=100&page=2",
+                if cut {
+                    Err("GitHub GET /user/keys?per_page=100&page=2: the body was cut short".into())
+                } else {
+                    answer(200, &[], &keys(&[(101, BOB_BODY)]))
+                },
+            );
+            let bob = [(
+                "bob".to_owned(),
+                format!("ssh-ed25519 {BOB_BODY} aterm-machines:lab-07:bob"),
+            )];
+            let done = register(&sys, "fleetbot", "lab-07", &bob);
+            if cut {
+                assert!(done.unwrap_err().contains("cut short"));
+            } else {
+                assert_eq!(
+                    done.unwrap(),
+                    [Registered {
+                        user: "bob".into(),
+                        id: 101
+                    }]
+                );
+            }
+            assert!(!sys.calls().iter().any(|c| c.starts_with("github POST")));
+        }
     }
 
     #[test]
@@ -489,47 +586,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("signs in as \"someone-else\""), "{err}");
-        assert!(!err.contains(TOKEN));
-        assert!(sys.calls().iter().all(|c| !c.contains("user/keys")));
+        assert!(sys.calls().iter().all(|c| !c.contains("/user/keys")));
+        clean(&sys);
     }
 
     #[test]
-    fn no_token_for_the_account_is_one_line_that_never_quotes_standard_output() {
+    fn no_token_in_the_keychain_names_the_verb_that_stores_one_and_sends_nothing() {
         let sys = Fake::default();
-        sys.stat_of(GH, link());
-        // gh's measured answer (exit 1, this standard error), plus standard output it never
-        // printed, to show that standard output is never quoted.
-        sys.on(
-            &format!("{GH} auth token --hostname github.com --user fleetbot"),
-            Ran {
-                status: Some(1),
-                stdout: b"partial-secret".to_vec(),
-                stderr: b"no oauth token found for github.com account fleetbot\n".to_vec(),
-            },
-        );
+        git(&sys);
+        script::holds_nothing(&sys, None);
         let err = revoke(&sys, "fleetbot", &[1]).unwrap_err();
-        assert!(err.contains("gh holds no token for fleetbot"), "{err}");
-        assert!(
-            err.ends_with("exit 1: no oauth token found for github.com account fleetbot"),
-            "{err}"
-        );
-        assert!(!err.contains("partial-secret"), "{err}");
-        assert_eq!(sys.calls().len(), 1);
+        assert!(err.contains("holds no GitHub token for fleetbot"), "{err}");
+        assert!(err.contains("aterm machines github login"), "{err}");
+        assert_eq!(sys.calls(), [script::credential(None, "fill")]);
+        // Without CLT git the keychain is not read at all, and the remedy is init's item.
+        let sys = Fake::default();
+        let err = revoke(&sys, "fleetbot", &[1]).unwrap_err();
+        assert!(err.contains("aterm init --only base.clt"), "{err}");
+        assert!(sys.calls().is_empty());
     }
 
     #[test]
     fn a_token_github_no_longer_accepts_stops_at_the_login_check() {
-        // gh prints a stored token GitHub refuses as it prints any other (exit 0); `GET /user`
-        // is what answers 401.
+        // The keychain still holds it; only `GET /user` says GitHub refuses it.
         let sys = Fake::default();
-        sys.stat_of(GH, link());
-        sys.on(
-            &format!("{GH} auth token --hostname github.com --user fleetbot"),
-            Ran::ok(&format!("{TOKEN}\n")),
-        );
-        sys.on(
-            &format!("GH_TOKEN=\u{2026} {GH} api user --jq .login"),
-            refused(BAD_CREDENTIALS_BODY, "gh: Bad credentials (HTTP 401)\n"),
+        git(&sys);
+        script::holds(&sys, None, TOKEN_HOST, "fleetbot", TOKEN);
+        sys.on_github_rest(
+            RestMethod::Get,
+            "/user",
+            answer(401, &[], BAD_CREDENTIALS_BODY),
         );
         let err = register(
             &sys,
@@ -538,27 +624,24 @@ mod tests {
             &[("alice".into(), ALICE_KEY.into())],
         )
         .unwrap_err();
-        assert!(err.starts_with("gh api user: exit 1"), "{err}");
-        assert!(err.contains("HTTP 401"), "{err}");
-        assert_eq!(err.matches("Bad credentials").count(), 1, "{err}");
-        assert!(!err.contains(TOKEN), "{err}");
-        assert!(sys.calls().iter().all(|c| !c.contains("user/keys")));
+        assert_eq!(err, "GitHub GET /user: HTTP 401 (Bad credentials)");
+        assert!(sys.calls().iter().all(|c| !c.contains("/user/keys")));
+        clean(&sys);
     }
 
     #[test]
     fn a_refused_post_names_the_apis_reason() {
         let sys = controller("fleetbot");
-        sys.on(&list_key(), Ran::ok(""));
-        let alice_body = ALICE_KEY.split(' ').nth(1).unwrap();
-        // No POST was sent to capture this, and GitHub's reference shows no body for this 422:
-        // the `errors[]` entry is made up, in the layout of the measured 422 of `GET
-        // search/repositories?q=` (compact body on standard output with `--jq` not applied,
-        // `gh: Validation Failed (HTTP 422)` on standard error).
-        sys.on(
-            &post_key("alice", alice_body),
-            refused(
+        lists(&sys, &[]);
+        // GitHub's reference shows no body for this 422: the `errors[]` entry is made up, in
+        // the layout of the measured 422 of `GET search/repositories?q=`.
+        sys.on_github_rest(
+            RestMethod::Post,
+            "/user/keys",
+            answer(
+                422,
+                &[],
                 r#"{"message":"Validation Failed","errors":[{"resource":"PublicKey","code":"custom","field":"key","message":"key is already in use"}],"documentation_url":"https://docs.github.com/rest/users/keys#create-a-public-ssh-key-for-the-authenticated-user","status":"422"}"#,
-                "gh: Validation Failed (HTTP 422)\n",
             ),
         );
         let err = register(
@@ -568,94 +651,101 @@ mod tests {
             &[("alice".into(), ALICE_KEY.into())],
         )
         .unwrap_err();
-        assert!(err.contains("HTTP 422"), "{err}");
-        assert!(err.contains("key is already in use"), "{err}");
+        assert_eq!(
+            err,
+            "alice: GitHub POST /user/keys: HTTP 422 (key is already in use)"
+        );
     }
-
-    fn delete_key(id: u64) -> String {
-        format!("GH_TOKEN=\u{2026} {GH} api --method DELETE user/keys/{id}")
-    }
-
-    /// What gh prints to standard error for a 404 from a token that lacks the scope: the
-    /// measured status line, then its scope suggestion. The suggestion is gh 2.92.0's format
-    /// string (`This API operation needs the %[1]q scope. To request it, run:  gh auth refresh
-    /// -h %[2]s -s %[1]s`, after `gh: `), read from its binary, not a capture: every token on
-    /// the controller it was measured on holds the scope. gh fills in the first scope of the
-    /// answer's `X-Accepted-OAuth-Scopes` the token lacks, measured for `GET user/keys` and
-    /// `GET user/keys/1` as `admin:public_key, read:public_key, write:public_key`.
-    const NO_SCOPE: &str = "gh: Not Found (HTTP 404)\ngh: This API operation needs the \"admin:public_key\" scope. To request it, run:  gh auth refresh -h github.com -s admin:public_key\n";
 
     #[test]
     fn a_key_is_revoked_when_the_listing_no_longer_holds_it() {
         let sys = controller("fleetbot");
         // Before: …105 is held and …106 is already gone. After the delete: neither.
-        sys.on(
-            &list_key(),
-            Ran::ok(&format!(
-                "100000101\tssh-ed25519 {}\n100000105\tssh-ed25519 {BOB_BODY}\n",
-                OTHER_BODIES[0]
-            )),
+        lists(
+            &sys,
+            &[(100_000_101, OTHER_BODIES[0]), (100_000_105, BOB_BODY)],
         );
-        sys.on(
-            &list_key(),
-            Ran::ok(&format!("100000101\tssh-ed25519 {}\n", OTHER_BODIES[0])),
+        lists(&sys, &[(100_000_101, OTHER_BODIES[0])]);
+        sys.on_github_rest(
+            RestMethod::Delete,
+            "/user/keys/100000105",
+            answer(204, &[], ""),
         );
-        sys.on(&delete_key(100_000_105), Ran::ok(""));
         assert_eq!(
             revoke(&sys, "fleetbot", &[100_000_105, 100_000_106]),
             Ok(vec![format!("ssh-ed25519 {BOB_BODY}")])
         );
         let calls = sys.calls();
-        assert!(calls.contains(&delete_key(100_000_105)), "{calls:?}");
+        assert!(calls.contains(&"github DELETE /user/keys/100000105".to_owned()));
         assert!(
-            !calls.contains(&delete_key(100_000_106)),
+            !calls.contains(&"github DELETE /user/keys/100000106".to_owned()),
             "a key not held is not deleted"
         );
+        clean(&sys);
     }
 
     #[test]
     fn a_404_from_a_token_without_the_scope_is_not_a_key_already_gone() {
-        let sys = controller("fleetbot");
-        sys.on(
-            &list_key(),
-            Ran::ok(&format!("100000107\tssh-ed25519 {BOB_BODY}\n")),
-        );
-        sys.on(&delete_key(100_000_107), refused(NOT_FOUND_BODY, NO_SCOPE));
-        let err = revoke(&sys, "fleetbot", &[100_000_107]).unwrap_err();
-        assert!(err.starts_with("key 100000107: still registered"), "{err}");
-        assert!(err.contains("HTTP 404"), "{err}");
-        assert_eq!(err.matches("Not Found").count(), 1, "{err}");
-        assert!(err.contains("-s admin:public_key"), "{err}");
+        for (held, hint) in [("repo, read:org", true), ("admin:public_key", false)] {
+            let sys = controller("fleetbot");
+            lists(&sys, &[(100_000_107, BOB_BODY)]);
+            sys.on_github_rest(
+                RestMethod::Delete,
+                "/user/keys/100000107",
+                answer(404, &[ACCEPTED, ("X-OAuth-Scopes", held)], NOT_FOUND_BODY),
+            );
+            let err = revoke(&sys, "fleetbot", &[100_000_107]).unwrap_err();
+            assert!(
+                err.starts_with(
+                    "key 100000107: still registered (GitHub DELETE /user/keys/100000107: HTTP \
+                     404 (Not Found)"
+                ),
+                "{err}"
+            );
+            // Negative control: a token that holds the scope gets no scope hint.
+            assert_eq!(
+                err.contains("the token lacks the admin:public_key scope"),
+                hint,
+                "{err}"
+            );
+        }
     }
 
     #[test]
-    fn a_listing_the_token_may_not_read_names_the_endpoint_and_the_missing_scope() {
+    fn a_listing_the_token_may_not_read_names_the_missing_scope() {
         let sys = controller("fleetbot");
-        sys.on(&list_key(), refused(NOT_FOUND_BODY, NO_SCOPE));
+        sys.on_github_rest(
+            RestMethod::Get,
+            FIRST_PAGE,
+            answer(404, &[ACCEPTED, ("X-OAuth-Scopes", "repo")], NOT_FOUND_BODY),
+        );
         let err = revoke(&sys, "fleetbot", &[7]).unwrap_err();
-        assert!(err.starts_with("gh api user/keys: exit 1"), "{err}");
-        assert!(err.contains("admin:public_key"), "{err}");
-        assert!(sys.calls().iter().all(|c| !c.contains("DELETE")));
-        assert_eq!(
-            endpoint(&["--method", "POST", "user/keys", "-f", "title=x"]),
-            "user/keys"
+        assert!(
+            err.starts_with("GitHub GET /user/keys: HTTP 404 (Not Found); the token lacks the admin:public_key scope"),
+            "{err}"
         );
+        assert!(sys.calls().iter().all(|c| !c.contains("DELETE")));
     }
 
     #[test]
-    fn a_listing_line_out_of_the_measured_shape_stops_the_revocation() {
-        // A line the listing cannot read could hide a key still held, which a revocation
+    fn a_listing_entry_out_of_shape_stops_the_revocation() {
+        // An entry the listing cannot read could hide a key still held, which a revocation
         // would then report gone.
         let sys = controller("fleetbot");
-        sys.on(
-            &list_key(),
-            Ran::ok(&format!(
-                "100000107\tssh-ed25519 {BOB_BODY}\nssh-ed25519 {}\n",
-                OTHER_BODIES[1]
-            )),
+        sys.on_github_rest(
+            RestMethod::Get,
+            FIRST_PAGE,
+            answer(
+                200,
+                &[],
+                &format!(
+                    r#"[{{"id":100000107,"key":"ssh-ed25519 {BOB_BODY}"}},{{"key":"ssh-ed25519 {}"}}]"#,
+                    OTHER_BODIES[1]
+                ),
+            ),
         );
         let err = revoke(&sys, "fleetbot", &[100_000_107]).unwrap_err();
-        assert!(err.starts_with("gh api user/keys printed"), "{err}");
+        assert!(err.contains("not an id and an SSH key"), "{err}");
         assert!(sys.calls().iter().all(|c| !c.contains("DELETE")));
     }
 
@@ -668,21 +758,106 @@ mod tests {
     }
 
     #[test]
-    fn gh_is_found_at_either_path_or_named_missing() {
+    fn an_account_that_is_not_a_login_is_refused_before_git_runs() {
         let sys = Fake::default();
-        assert!(gh_path(&sys).unwrap_err().contains("gh is not installed"));
-        sys.stat_of("/usr/local/bin/gh", link());
-        assert_eq!(gh_path(&sys).unwrap(), PathBuf::from("/usr/local/bin/gh"));
-        sys.stat_of(GH, link());
-        assert_eq!(gh_path(&sys).unwrap(), PathBuf::from(GH));
+        git(&sys);
+        let err = revoke(&sys, "--user=x", &[1]).unwrap_err();
+        assert!(err.contains("not a GitHub login"), "{err}");
+        let err = login(&sys, "a\nb", Secret::new(TOKEN.as_bytes()).unwrap()).unwrap_err();
+        assert!(err.contains("not a GitHub login"), "{err}");
+        assert!(sys.calls().is_empty());
+    }
+
+    /// `aterm machines github login` stores the token only once GitHub signs it in as the
+    /// account with the key scope, and reads it back. Negative controls: another account's
+    /// token, a classic token without the scope, and one GitHub refuses each store nothing.
+    #[test]
+    fn login_stores_a_token_only_after_github_vouches_for_it() {
+        let user = |login: &str| format!(r#"{{"login":"{login}"}}"#);
+        let cases: [(Result<GithubResponse, String>, Option<&str>); 5] = [
+            (
+                answer(
+                    200,
+                    &[("X-OAuth-Scopes", "repo, admin:public_key")],
+                    &user("FleetBot"),
+                ),
+                None,
+            ),
+            // A fine-grained token lists no scopes: GitHub's answers on use are the check.
+            (answer(200, &[], &user("fleetbot")), None),
+            (
+                answer(
+                    200,
+                    &[("X-OAuth-Scopes", "admin:public_key")],
+                    &user("someone-else"),
+                ),
+                Some("signs in as \"someone-else\", not fleetbot; nothing was stored"),
+            ),
+            (
+                answer(
+                    200,
+                    &[("X-OAuth-Scopes", "repo, read:public_key")],
+                    &user("fleetbot"),
+                ),
+                Some("lacks the admin:public_key scope"),
+            ),
+            (
+                answer(401, &[], BAD_CREDENTIALS_BODY),
+                Some("GitHub GET /user: HTTP 401 (Bad credentials); nothing was stored"),
+            ),
+        ];
+        for (reply, refused) in cases {
+            let sys = Fake::default();
+            git(&sys);
+            sys.on_github_rest(RestMethod::Get, "/user", reply);
+            let approve = script::approves(&sys, None);
+            script::holds(&sys, None, TOKEN_HOST, "fleetbot", TOKEN);
+            let stored = login(&sys, "fleetbot", Secret::new(TOKEN.as_bytes()).unwrap());
+            let calls = sys.calls();
+            match refused {
+                None => {
+                    stored.unwrap();
+                    assert_eq!(
+                        calls,
+                        [
+                            "github GET /user".to_owned(),
+                            approve,
+                            script::credential(None, "fill")
+                        ]
+                    );
+                }
+                Some(why) => {
+                    let err = stored.unwrap_err();
+                    assert!(err.contains(why), "{err}");
+                    assert_eq!(calls, ["github GET /user"], "nothing was stored");
+                }
+            }
+            clean(&sys);
+        }
     }
 
     #[test]
-    fn an_account_that_is_not_a_login_is_refused_before_gh_runs() {
+    fn a_store_the_keychain_does_not_hand_back_fails() {
         let sys = Fake::default();
-        sys.stat_of(GH, link());
-        let err = revoke(&sys, "--user=x", &[1]).unwrap_err();
-        assert!(err.contains("not a GitHub login"), "{err}");
-        assert!(sys.calls().is_empty());
+        git(&sys);
+        sys.on_github_rest(
+            RestMethod::Get,
+            "/user",
+            answer(200, &[], r#"{"login":"fleetbot"}"#),
+        );
+        script::approves(&sys, None);
+        script::holds(
+            &sys,
+            None,
+            TOKEN_HOST,
+            "fleetbot",
+            "fixture_some_other_value",
+        );
+        let err = login(&sys, "fleetbot", Secret::new(TOKEN.as_bytes()).unwrap()).unwrap_err();
+        assert!(err.contains("did not hand back"), "{err}");
+        assert!(
+            !err.contains(TOKEN) && !err.contains("fixture_some_other_value"),
+            "{err}"
+        );
     }
 }

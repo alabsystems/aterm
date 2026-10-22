@@ -235,7 +235,7 @@ pub const WHY_BUDGET: &str = "it already typed here as often as an hour allows";
 /// …a tab with no task: nothing is typed into it.
 pub const WHY_NO_TASK: &str = "this tab has no task for aterm to carry on";
 
-/// …a task Land landed (FOREVER LAND: the one end a task has): nothing
+/// …a task Land landed (Autopilot Land: the one end a task has): nothing
 /// more is typed into it until someone's turn.
 pub const WHY_TASK_LANDED: &str = "the task in this tab is landed";
 

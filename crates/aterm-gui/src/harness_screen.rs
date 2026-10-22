@@ -53,15 +53,11 @@ use crate::claude_lights::{ChipFace, ChipGlass, LandAtGlass};
 /// The 7-day window's length.
 const WEEK_MS: i64 = 7 * 86_400_000;
 
-// ---------------------------------------------------------------------------
 // The A/B book (`harness_ab`)
-// ---------------------------------------------------------------------------
 
 pub(crate) use crate::harness_ab::{AbArm, AbBook, AbCause, AbPhase, AbWeek, ab_rows};
 
-// ---------------------------------------------------------------------------
 // What the harness did
-// ---------------------------------------------------------------------------
 
 /// One reading of the ledgers: today and the last 7 days, and when it was
 /// taken.
@@ -344,9 +340,7 @@ impl HarnessStatsSlot {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The App's own part
-// ---------------------------------------------------------------------------
 
 /// What the App keeps for Settings ▸ Harness: the projection's revision, the
 /// A/B book and the ledgers' reading.
@@ -527,9 +521,7 @@ impl HarnessScreen {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The published state
-// ---------------------------------------------------------------------------
 
 /// One live supervisable agent session as the page lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1552,7 +1544,7 @@ pub(crate) const DONE_CHECKED_OF_KEPT_GOING: &str = "of them";
 /// The ledger's rules a done claim was checked under: Cruise's done check
 /// (`continue-done-check@v1`), and the two challenges older builds typed at
 /// a done report instead (`continue-open-items@v1`,
-/// `continue-uncommitted@v1`; retired with Forever Cruise, whose done check
+/// `continue-uncommitted@v1`; retired with Autopilot Cruise, whose done check
 /// carries their words), which a 7-day window still reads. Each is one of
 /// the turns kept going (`acts::sort`).
 const DONE_CLAIM_RULES: [&str; 3] = {
@@ -1617,7 +1609,7 @@ pub(crate) const NEEDED_YOU: CountWords = CountWords {
 };
 
 /// Times a worker's `NEEDS YOU:` line went on the person's screen as an
-/// `owner=needs` ask while the work went on (FOREVER CRUISE / FOREVER LAND):
+/// `owner=needs` ask while the work went on (Autopilot Cruise / Land):
 /// never a stop, so never one of [`NEEDED_YOU`]'s.
 pub(crate) const NEEDS_TOLD: CountWords = CountWords {
     label: "Needs told",
@@ -2551,9 +2543,7 @@ fn names_program(title: &str, program: &str) -> bool {
         .eq_ignore_ascii_case(program)
 }
 
-// ---------------------------------------------------------------------------
 // The App
-// ---------------------------------------------------------------------------
 
 impl App {
     /// THE A/B BOOK'S WEEK (§10.5.3 B, C.4): today and the six days before,

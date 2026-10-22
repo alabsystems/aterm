@@ -1839,10 +1839,10 @@ pub(crate) enum AppEvent {
         lines: i32,
         key: UiKey,
     },
-    /// Up (`-1`) / Down (`1`) in Settings: the keyboard moves to the control
-    /// before or after the focused one in the page's list and the list
-    /// follows; with no control of the list focused, the list scrolls a row.
-    /// Only Settings is sent this; the wheel stays `ScrollLines`.
+    /// Up (`-1`) / Down (`1`) in Settings: focus moves to the previous or next
+    /// control in the page's list and the list follows; with no list control
+    /// focused, the list scrolls a row. Only Settings is sent this; the wheel
+    /// stays `ScrollLines`.
     StepFocus(i32),
     /// Page Up (`-1`) / Page Down (`1`) in Settings: the reducer moves by the page its
     /// last render showed. Only Settings is sent this; Markdown gets `MarkdownPage` and
@@ -2478,9 +2478,9 @@ pub(crate) enum AppEffect {
     /// Settings ▸ Harness's timer press ([`HarnessTimerRequest`]): performed
     /// by the host, answered by the republished projection.
     HarnessTimer(HarnessTimerRequest),
-    /// Settings' theme picker footer and Needs-attention rows: open the
-    /// themes folder or one theme file, or import a theme. Identity only, no
-    /// path (the `OpenConfigEditor` rule); answers `ThemesFinished`.
+    /// Settings' theme picker asks the host for a [`ThemesRequest`]: a theme
+    /// by catalog id, never a path (the `OpenConfigEditor` rule); answers
+    /// `ThemesFinished`.
     Themes {
         request: ThemesRequest,
         reply: ReplyToken<ThemesOutcome>,

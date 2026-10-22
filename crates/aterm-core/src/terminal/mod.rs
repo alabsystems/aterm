@@ -174,8 +174,8 @@ pub use holder_fence::{
 };
 pub use mode_mirror::ModeMirror;
 pub use observe::{
-    RowMatch, RowRange, RowVerdict, Satisfaction, SurfaceSource, WatchId, WatcherSet, WatcherSpec,
-    first_matching_row,
+    FRAME_HANG, Frame, GONE_SETTLE, RowMatch, RowRange, RowVerdict, Satisfaction, SurfaceSource,
+    WatchId, WatcherSet, WatcherSpec, first_matching_row,
 };
 // `ClockReading`: the injected-clock seam, so an out-of-crate replay harness can
 // feed a fixed clock and get bit-deterministic state.

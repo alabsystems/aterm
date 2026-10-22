@@ -729,9 +729,8 @@ impl<C: Ctl> Session<'_, C> {
                 Shows::Unread => {
                     let bound = if entered { waits.claim } else { waits.open };
                     if self.fx.since(since) >= bound {
-                        // Whatever stands there is no screen of the step's
-                        // that this build reads: said once, never keyed —
-                        // and not said of a step that ends untold.
+                        // No screen of the step's that this build reads: said once, never
+                        // keyed, and not said of a step that ends untold.
                         if self.reset_untold(opts).is_none()
                             && let Some(host) = opts.idle_host.as_ref()
                         {
@@ -760,7 +759,7 @@ impl<C: Ctl> Session<'_, C> {
                         && reader.background_wait(&screen.rows).is_none();
                     self.reset_end(seq, false, opts, review)?;
                     if live && self.reset == ResetStep::Idle {
-                        self.took(seq);
+                        self.took(seq, Some(&opts.policy), review);
                     }
                     return Ok(true);
                 }
@@ -1243,7 +1242,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         self.reset_end(screen.seq, false, opts, review)?;
         if live && self.reset == ResetStep::Idle {
-            self.took(screen.seq);
+            self.took(screen.seq, Some(&opts.policy), review);
         }
         Ok(())
     }

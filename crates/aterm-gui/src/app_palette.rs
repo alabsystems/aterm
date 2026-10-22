@@ -439,10 +439,9 @@ impl App {
         // static carries too.
         let front_person_hold = wid.is_some_and(|wid| self.front_person_hold(wid));
         let front_remote_hold = wid.is_some_and(|wid| self.front_remote_hold(wid));
-        // Accelerator hints for menu rows (keyboard audit #6): the resolved
-        // chord for every menu action bound in the EFFECTIVE keybinding table,
-        // deduped by action (a command listed in two menus shows one truth).
-        // macOS supplies none — its rows keep their native ⌘ key-equivalents.
+        // Accelerator hints for menu rows: the chord for every menu action bound in the
+        // effective keybinding table, deduped by action. macOS supplies none: its rows keep
+        // their native ⌘ key-equivalents.
         #[cfg(target_os = "macos")]
         let menu_accels = Vec::new();
         #[cfg(not(target_os = "macos"))]
@@ -2478,9 +2477,8 @@ mod tests {
         );
     }
 
-    /// A palette closed some other way (another overlay took the slot) reverts
-    /// at the next turn's sync; a highlight that leaves the Theme section
-    /// reverts at once.
+    /// A highlight that leaves the Theme section, or a palette closed some other way (another
+    /// overlay took the slot), reverts at the next turn's sync.
     #[test]
     fn palette_theme_preview_ends_when_the_highlight_or_the_palette_goes() {
         let mut app = themed_app("theme = \"Dracula\"\n");

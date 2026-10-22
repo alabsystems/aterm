@@ -261,6 +261,8 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// Take `LOCK_EX` on `path` (created `0600` if absent), blocking until it is free. Not for
+    /// the launch path: see [`acquire_within`](Self::acquire_within).
     #[cfg(unix)]
     #[test]
     fn file_lock_is_close_on_exec() {

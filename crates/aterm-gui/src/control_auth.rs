@@ -56,8 +56,8 @@ pub(crate) use imp::{ensure_private_dir, lock_socket_file, peer_check, provision
 pub(crate) use imp::ensure_control_dir;
 #[cfg(not(windows))]
 pub(crate) use imp::ensure_private_dir as ensure_control_dir;
-// Whether a pid is alive: the stale sweeps' one test, shared with the handoff's
-// sweep of a dead sender's `seamless-<pid>-…` leftovers (`crate::seamless`).
+// The stale sweeps' liveness test, shared with `crate::seamless`'s sweep of a dead sender's
+// leftovers.
 pub(crate) use imp::pid_alive;
 // `peer_uid`: `peer_check` inside the unix `imp`, the macOS handoff rendezvous dialer
 // (`handoff_rendezvous::dial_and_claim` proves the listener is same-uid before it writes the

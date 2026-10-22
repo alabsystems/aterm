@@ -488,7 +488,7 @@ fn cmd_verb_help(verb: &str) -> ExitCode {
     match verb_usage(verb) {
         Some(usage) => {
             println!("usage: {usage}");
-            println!("atpkg: full manual for this verb: aterm help pkg");
+            println!("atpkg: full manual: aterm help pkg");
             ExitCode::SUCCESS
         }
         // Not a verb: the roster at exit 0 would read as help for `<verb>`, so name the
@@ -1052,6 +1052,7 @@ fn cmd_help() -> ExitCode {
     println!("usage: aterm pkg <command> [args\u{2026}]");
     print_verb_tiers(&mut std::io::stdout());
     println!("new machine: aterm pkg install --default-set");
+    println!("one command: aterm pkg help <command>");
     println!("full manual: aterm help pkg");
     ExitCode::SUCCESS
 }
@@ -3689,7 +3690,7 @@ fn bare_lines(counts: Option<(usize, usize)>) -> Vec<String> {
         // Empty store: the one next act is the install, and it says what it does.
         Some((0, _)) => lines.push(
             "atpkg: next: aterm pkg install --default-set — the whole ALab toolset · \
-             manual: aterm help pkg"
+             full manual: aterm help pkg"
                 .to_string(),
         ),
         Some(_) => lines.push(
@@ -13239,8 +13240,7 @@ fn install_toolset(
         }
         println!(
             "atpkg: nothing was installed — the signed index pins no program with a build \
-             for this machine ({}). This is not a failure to retry; nothing lands here \
-             until an artifact for this architecture is published.",
+             for this machine ({}); retrying will not help until one is published.",
             current_triple()
         );
         // Exit 2, not 0 and not 1: the GUI maps 0 to "Succeeded" (which would be the

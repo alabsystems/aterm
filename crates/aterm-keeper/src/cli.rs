@@ -28,39 +28,35 @@ USAGE:
     aterm keeper serve  [--sock <path>] [--identity designated|uid] [--no-relaunch]
 
     start    Submit this build's keeper as a transient launchd job
-             (`launchctl submit`: no plist, gone at logout). It runs
-             `serve --no-relaunch`: the next launch you make recovers.
-    stop     Remove the job (launchd ends the keeper; the shells it alone
-             held are hung up, as a quit would), then remove the copies of
-             code left by keepers that have ended.
-    status   Ask the keeper what it holds: masters by state, the relaunch
-             brake, and which identity it requires. `keeper=absent` when none
-             answers.
-    serve    Run a keeper in the foreground on its socket (what the job
-             runs). It never reads a terminal or signals anything, and
-             relaunches only its own app bundle (never with --no-relaunch or
-             from a build tree's bare binary). Under `designated` it runs
-             from a copy of this build's code (~/Library/Application
-             Support/aterm/keeper-code), so windows can still check it after
-             an update removes this build. `stop` removes the copy; so does
-             the next keeper start, once its keeper has ended.
+             (`launchctl submit`: no plist, gone at logout) unless a job is
+             loaded or a keeper answers. It runs `serve --no-relaunch`.
+    stop     Remove the job, wait for its keeper to end (shells only it held
+             hang up, as on a quit) and remove ended keepers' code copies.
+    status   What the keeper holds (masters by state, the relaunch brake, its
+             identity), then this build's `label=` and `job=`. `keeper=absent`
+             when none answers, `keeper=refused` when it is not this build's.
+    serve    Run a keeper in the foreground (what the job runs). From an app
+             bundle without --no-relaunch, it reopens that app after a crash.
+             Under `designated` it runs from a copy of its code in
+             ~/Library/Application Support/aterm/keeper-code, so windows can
+             still check it after an update removes this build.
 
 OPTIONS:
-    --sock <path>        The socket (default: this build's own, in the per-user
-                         private directory; the installed app and every dev
-                         tree have different ones).
-    --identity <which>   `designated` (the default): a peer must run code that
-                         satisfies this build's designated requirement.
-                         `uid`: the same-uid floor only, for tests and by-hand
+    --sock <path>        The socket (default: this build's own, as `status`
+                         prints it; each dev tree and the app have their own).
+    --identity <which>   `designated` (the default): the peer must run code
+                         that satisfies this build's designated requirement.
+                         `uid`: the same user only, for tests and by-hand
                          runs; a window registers nothing with such a keeper.
-    --label <label>      The launchd label (default: this build's own). Only
-                         this build's label or a test label
+    --label <label>      The launchd label start and stop act on (default:
+                         this build's own). Only that or a test label
                          (`com.aterm.aterm.keeper.test.*`) is accepted.
-    --no-relaunch        Never bring a window back; orphans wait for the next
-                         launch.
+    --no-relaunch        Never reopen a window; a crashed window's shells wait
+                         for the next launch.
 
-macOS only: a window uses the keeper only with `[keeper] enabled = true` in
-aterm.toml (read at launch).
+macOS only. A window uses the keeper only with `[keeper] enabled = true` in
+aterm.toml (read at launch) and never starts one. Exit: 0 when this build's
+keeper answers (start, status) or has ended (stop), 1 if not, 2 on bad usage.
 ";
 
 struct Args {

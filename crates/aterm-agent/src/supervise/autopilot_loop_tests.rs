@@ -1299,7 +1299,7 @@ fn a_managers_one_look_ignores_the_autopilot_word() {
 /// ends on `ATERM-TASK-DONE` beside work left is no clean defense, so Land
 /// nudges it (`land-nudge@v1`) and journals no `DONE`. Under Cruise the same
 /// reply, and a token under a report that leaves nothing, are done claims
-/// that get the done check (FOREVER CRUISE), never an end.
+/// that get the done check (Autopilot Cruise), never an end.
 #[test]
 fn a_token_reply_to_the_land_instruction_is_nudged_never_landed() {
     let done_lines = |word: &'static str, tag: &str, reply: &str| {

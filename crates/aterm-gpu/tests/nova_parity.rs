@@ -206,9 +206,7 @@ fn damaged_path_multi_row_nova_parity_cpu_matches_gpu() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Super nova cases, driven from the pure emitters.
-// ---------------------------------------------------------------------------
 
 /// The super nova word: row 2, cells 4..=7. Dark theme, so the detonation is
 /// the full-viewport additive wash and star crown (pure `nova_add`).

@@ -323,13 +323,11 @@ pub const ANCHORS: &[Anchor] = &[
     // ([`crate::prompt::fixtures::SETTINGS_ERROR`]), its Esc read in the
     // bundle.
     lit("settings.error", "Settings Error", "2.1.301"),
-    // The question dialog (AskUserQuestion): its free-text option's
-    // placeholder (`Type something.`; `Type something` when several answers
-    // may be picked), its `Chat about this` row, and its footer's `Enter to
-    // select` (its `… to navigate` item is read by its verb: the key words
-    // are the bindings', `↑/↓` or `Tab/Arrow keys`). The free-text and chat
-    // rows are read by their POSITION in a dialog read whole
-    // (`crate::question`); these texts name the kind of a dialog that is not.
+    // The question dialog (AskUserQuestion): its free-text placeholder (`Type something.`;
+    // `Type something` when several answers may be picked), its `Chat about this` row, and its
+    // footer's `Enter to select` (the `… to navigate` item is read by its verb: the keys are the
+    // bindings', `↑/↓` or `Tab/Arrow keys`). The free-text and chat rows are read by position in
+    // a dialog read whole (`crate::question`); these texts name the kind of one that is not.
     lit("question.other", "Type something", "2.1.280"),
     lit("question.chat", "Chat about this", "2.1.280"),
     hint("question.select", "Enter to select", "2.1.280"),
@@ -554,9 +552,8 @@ pub const ANCHORS: &[Anchor] = &[
     lit("panel.queued", " queued", "2.1.304"),
     lit("panel.large_workflow", "Large workflow", "2.1.304"),
     lit("panel.workflows_stop", "/workflows to stop", "2.1.304"),
-    // A turn a person stopped with Esc: the vendor's row under the last
-    // message or tool row (`  ⎿  Interrupted · What should Claude do
-    // instead?`, measured 2026-09-23 on the lane probe's worker).
+    // A turn a person stopped with Esc: the vendor's row under the last message or tool row
+    // (`  ⎿  Interrupted · What should Claude do instead?`).
     lit(
         "turn.interrupted",
         "Interrupted · What should Claude do instead?",
@@ -1013,12 +1010,10 @@ pub const ANCHORS: &[Anchor] = &[
     // demand for Opus 4.` (its renderer's own case); `Switched to Sonnet due to
     // high demand for Opus` is its model fallback, which goes on.
     lit("wall.high_demand", "high demand", "2.1.300"),
-    // Claude Code's critical-memory banner, right-aligned on its own row
-    // between the spinner and the composer's top rule (`<anchor> (140.4GB) —
-    // restart and resume with claude --continue`, measured 2026-09-24 on the
-    // incident tab whose worker sat at 38.8 GiB resident and read no input
-    // for 2h41m). Placed by `wall::memory_wall`, never by `PHRASES`: a
-    // composer draft quoting it carries the same words.
+    // Claude Code's critical-memory banner, right-aligned on its own row between the spinner
+    // and the composer's top rule (`<anchor> (140.4GB) — restart and resume with claude
+    // --continue`). Placed by `wall::memory_wall`, never by `PHRASES`: a composer draft quoting
+    // it carries the same words.
     lit("wall.memory", "Critical memory usage", "2.1.280"),
     // The disk is full (2.1.302's bundle, read 2026-10-16 after two incidents
     // in one day): the pinned `transcript-writer-degraded` notification, a
@@ -1040,7 +1035,7 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.302",
     ),
     // The rows of Claude Code's own that a HOOK'S WORDS stand under (2.1.302,
-    // measured in the lab, ATERM-KI-1015-14; `phase::block_is_vendors`): the
+    // measured in the lab; `phase::block_is_vendors`): the
     // stop-hook summary, `⏺ Ran 1 stop hook (ctrl+o to expand)` (`Ran `, the
     // count, then `stop hook` or `stop hooks`, joined at draw time), whose
     // first rows are the hooks' commands and `stopReason`; and the row a hook's
@@ -1885,6 +1880,11 @@ pub const TRANSCRIPT_KEYS: &[Anchor] = &[
     lit("transcript.durationMs", "durationMs", "2.1.294"),
     lit("transcript.compact_boundary", "compact_boundary", "2.1.294"),
     lit("transcript.isCompactSummary", "isCompactSummary", "2.1.294"),
+    lit(
+        "transcript.queueTranscriptOnly",
+        "queueTranscriptOnly",
+        "2.1.294",
+    ),
     lit(
         "transcript.isApiErrorMessage",
         "isApiErrorMessage",

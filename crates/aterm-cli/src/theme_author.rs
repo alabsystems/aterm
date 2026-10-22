@@ -652,7 +652,7 @@ fn check_text(report: &CheckReport) -> String {
         if defects.is_empty() {
             out.push_str("signature bar: every bar cleared\n");
         } else {
-            out.push_str("signature bar (aterm's own themes clear all of these):\n");
+            out.push_str("signature bars missed (aterm's signature themes clear them all):\n");
             for d in defects {
                 out.push_str(&format!("  missed[{}]: {}\n", d.code, d.message));
             }
@@ -1020,7 +1020,8 @@ pub(crate) fn schema_json() -> Value {
 /// `aterm theme schema --format text`.
 fn schema_text() -> String {
     let mut out = String::from(
-        "aterm theme file: one `key = value` per line; `#` or `;` starts a comment.\n\
+        "aterm theme file: one `key = value` per line. A line starting with `#` or `;`\n\
+         is a comment, as is whitespace then `#` or `;` after a value.\n\
          Keys are case-insensitive; an unknown or repeated key is an error.\n\n",
     );
     let mut group = None;
@@ -1534,7 +1535,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `check --signature` reports the bar aterm's own themes clear: none
+    /// `check --signature` reports the bar aterm's signature themes clear: none
     /// missed for a signature theme's export, some for a ported one, which
     /// then fail the check only under --strict. Without the switch the field
     /// is null.

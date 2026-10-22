@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! GATE (a) OF THE ONE END (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-//! §11.2.5; §11.2.3 item 3, the review's R2), under FOREVER CRUISE / FOREVER
+//! §11.2.5; §11.2.3 item 3, the review's R2), under Autopilot Cruise / FOREVER
 //! LAND, where the one end is Land's landing: a relaunch over a LANDED task —
 //! the host's REAL worker running aterm-agent's REAL hosted loop over the
 //! App's own session terminal ([`super::watched`]), its supervision restarted

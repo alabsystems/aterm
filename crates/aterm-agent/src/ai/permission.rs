@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! A REVIEWER INHERITS THE ASKING AGENT'S PERMISSIONS (docs/DESIGN-ai-connections-2026-10-16.md
-//! §9.1, owner ruling 2026-10-16: "inherit the current parent agent's permissions (which is
+//! §9.1, "inherit the current parent agent's permissions (which is
 //! usually YOLO)").
 //!
 //! A complete readable process walk identifies a person or the nearest supported AI CLI.

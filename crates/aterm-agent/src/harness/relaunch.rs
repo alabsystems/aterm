@@ -104,69 +104,12 @@
 //! flight is filed under `<state>/upgrade/<conversation>.json` like an
 //! upgrade, so whichever caller comes next finishes it.
 //!
-//! THE LINE CARRIES THE LOGIN ITS AGENT RUNS UNDER
-//! (`docs/DESIGN-claude-accounts-2026-10-01.md` §6): Claude Code chooses its
-//! login by `CLAUDE_SECURESTORAGE_CONFIG_DIR`, and the tab's shell keeps the
-//! environment it was started with — so a session relaunched under another
-//! of the owner's accounts would fall back to the shell's login at its next
-//! relaunch unless every relaunch types the variable again. Each planner
-//! does: the restart in place, the relaunch on exit and after aterm itself
-//! ended, and the upgrade's own all re-apply exactly what the process's own
-//! exec environment held ([`Snapshot::login`]: unset, set and empty, or a
-//! directory — three lines), and an account move ([`restart_under`]) types
-//! its target's instead. It is REQUIRED environment ([`line_for`]): a line
-//! that cannot hold it is refused, never typed without it. A machine with no
-//! roster has no such variable, and every line is what it was.
-//!
-//! AND THE CLAUDE HOME IT RUNS UNDER, the same way ([`Snapshot::home`]):
-//! `CLAUDE_CONFIG_DIR` names the directory Claude Code keeps its global
-//! config in (`<dir>/.claude.json`: onboarding, folder trust, the profile)
-//! and, with the login variable unset, the keychain item it signs in by
-//! ([`accounts::HOME_ENV`]). A process started with it on its own command
-//! line or by a wrapper (the tab's shell never had it) and relaunched
-//! without it is a different Claude Code: MEASURED 2026-10-09 (2.1.295, the
-//! real-claude lab, which launches `CLAUDE_CONFIG_DIR=<home>/.claude claude`):
-//! the explicit restart's relaunch line carried no home, the new process
-//! read `<home>/.claude.json`, which did not exist, and sat in the
-//! first-run theme picker, never holding its conversation, the continuation
-//! never typed (`step=wait:resume`). So every planner re-applies the value
-//! the process's own exec environment held, verbatim, as REQUIRED
-//! environment beside the login ([`required_env`]); unset adds nothing.
-//!
-//! AND READS THE AGENT'S OWN RECORDS UNDER IT ([`Records`]): Claude Code
-//! started with `CLAUDE_CONFIG_DIR=<dir>` files `sessions/<pid>.json` and
-//! `projects/` in `<dir>`, never in `~/.claude`. Every read of a relaunch's
-//! agent — the snapshot's, the host's looks ([`follow`], [`look_at_exit`]),
-//! the relaunch's plan (its conversation, whether its transcript exists, its
-//! model and mode) and every step after the line (finding the new process,
-//! its first idle, its continuation, its model: the home its record keeps,
-//! [`St::home`]) — is made there (review of `fix/cold-restore-login-home`,
-//! 2026-10-09: read under the user's home alone, an agent under another home
-//! was never relaunched at all, `ended:no-conversation`, or started afresh).
-//! A RELATIVE home — set and EMPTY included, which Claude Code's `??` keeps
-//! — names a directory under the one the process runs in: the snapshot
-//! resolves it there by the one resolver the live upgrade's sweep uses
-//! ([`Records::of_process`]: under the directory that holds its record, the
-//! one it started in where a worktree has moved it since) and keeps where
-//! it read the record ([`Snapshot::claude_dir`]); a line whose `cd` would
-//! resolve it elsewhere is refused (`refused:home`), as the sweep's is.
-//! Before 2026-10-14 none of these read anything for such an agent: its
-//! crash read as a graceful exit, its restart in place waited
-//! `wait:no-session-record` for good.
-//!
-//! The one line also HEALS THE SHELL it is typed at: a tab whose
-//! shell lost its integration key before the re-key channel existed reads
-//! `status integration=degraded`, and nothing but a line typed while the
-//! SHELL holds the terminal can reach it. The relaunch line is that line, for
-//! every caller above: the window is asked for a one-use key file (`rekey
-//! shell=<pid>`) and the shell takes it in front of the relaunch
-//! ([`type_relaunch_line_with`], [`upgrade::with_rekey`]). The same line
-//! reaches a shell whose integration predates LOADERS (`status
-//! integration_rev=frozen`), and a loader whose prompt hook never runs
-//! (a fish from before the prompt event under its own prompt),
-//! which no body pointer ever will: the window names its own loader in the
-//! file for a shell that does not sign the window's revision, and the line
-//! sources it.
+//! The line also heals the shell it is typed at: a tab whose integration is degraded (`status
+//! integration=degraded`) or predates loaders (`integration_rev=frozen`) can be reached only by a
+//! line typed while the shell holds the terminal. The window is asked for a one-use key file
+//! (`rekey shell=<pid>`), naming its own loader for a shell that does not sign the window's
+//! revision, and the shell takes it in front of the relaunch ([`type_relaunch_line_with`],
+//! [`upgrade::with_rekey`]).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -404,9 +347,7 @@ pub(super) fn plan(
             detail: "the target model's profile context is unknown or differs from the captured billing context".to_string(),
         });
     }
-    // The usage tap, where `[harness] usage_tap` names this aterm
-    // ([`Opts::usage_tap`]) and its gate holds for the relaunched process in
-    // the directory it starts in ([`tap_of`]).
+    // The usage tap, where `[harness] usage_tap` names this aterm and its gate holds ([`tap_of`]).
     let tap = opts
         .usage_tap
         .as_ref()
@@ -678,7 +619,7 @@ pub fn caller_claude(pid: u32, home: &Path) -> Option<CallerClaude> {
 /// under the worker's directory. With no `CLAUDE_CONFIG_DIR`, Claude Code
 /// keeps its records in `<HOME>/.claude`, the process's own `HOME`: a
 /// manager under another `HOME` than the user's has that `HOME` carried
-/// ([`home_carried`]'s rule, ATERM-KI-1015-1 LC-4), as the worker's shell
+/// ([`home_carried`]'s rule), as the worker's shell
 /// is the server's, under the user's.
 pub(super) fn worker_homes(
     user_home: &Path,
@@ -1186,11 +1127,9 @@ fn relaunch_held(
     // Read again rather than recorded: a relaunch a later step resumes finds
     // the same shell, and one whose name cannot be read now types no re-key.
     let dialect = shell_dialect(shell, &table());
-    // A MODEL IS ASKED BY THE LINE THAT ASKS IT: the model this line carries
-    // is recorded as asked right before it is typed, and taken back when it
-    // is not, whichever restart ended the agent. Recorded at the signal
-    // instead, a restart whose signal was refused or whose line never came
-    // would keep it, and it would settle FAILED though no relaunch asked it.
+    // The model this line carries is recorded as asked right before it is typed, and taken back
+    // when it is not: recorded at the signal, a restart whose line never came would settle it
+    // failed though no relaunch asked it.
     let asked = record_asked(opts, session, &st.model_list);
     // The command block the line is typed into, read before it is
     // ([`line_block`]): whether the line's command has run and ended is that
@@ -1245,7 +1184,7 @@ fn relaunch_held(
 }
 
 /// A RELAUNCH LINE TYPED IS RECORDED BEFORE ANYTHING ELSE IS DONE
-/// (ATERM-KI-1016-1 host-5): `st` relaunched now, its command block `block`
+/// (host-5): `st` relaunched now, its command block `block`
 /// and no process of the new line adopted yet ([`St::relaunched_pid`]),
 /// saved for `session` — and only then `after` (the ledger's line). The
 /// ledger's line came first: a step that panicked between the two left the
@@ -1613,7 +1552,7 @@ fn type_at_prompt(
 /// seamless successor's adopted shell nothing was carried for begins at its
 /// Commit), or a host that does not say, it cannot. A seamless update's
 /// successor carries the outgoing instance's stamp and serving age (LC-4 of
-/// ATERM-KI-1016-1). Counted, so the restart's stale bound ends it and its
+/// ). Counted, so the restart's stale bound ends it and its
 /// row asks the person, as it did before a hand was waited out.
 ///
 /// `Ok(None)`: a read with no cursor, typed at with no mark.
@@ -2006,7 +1945,7 @@ fn await_held(
         // relaunch's word and stop — what it printed is on the tab.
         //
         // A MOVE ONTO ANOTHER BUILD IS TAKEN BACK first (LC-5 of
-        // ATERM-KI-1016-1, [`St::roll_back`]): its failure kept against the
+        // , [`St::roll_back`]): its failure kept against the
         // build, the line back — the same resume on the program the agent ran
         // ([`St::back_line`]) — is typed at the prompt the shell has back,
         // saved first as every relaunch line is, and the agent is carried on
@@ -2341,11 +2280,10 @@ impl ShellBack {
     }
 }
 
-/// THE COMMAND BLOCK A RELAUNCH LINE IS TYPED INTO ([`St::line_block`]): the
-/// tab's newest block while it is the prompt the shell waits at (`prompt` or
-/// `entering`, `blocks 1 --json`), read right before the line is typed.
-/// `None` where the tab's shell marks no blocks, or its newest is not a
-/// prompt (a command still runs, or its marks are behind).
+/// The command block a relaunch line is typed into ([`St::line_block`]): the tab's newest block
+/// while it is the prompt the shell waits at (`prompt` or `entering`, `blocks 1 --json`), read
+/// right before the line is typed. `None` where the tab's shell marks no blocks, or its newest is
+/// not a prompt (a command still runs, or its marks are behind).
 pub(super) fn line_block(c: &mut Client, tab: &str) -> Option<u64> {
     let newest = newest_block(c, tab)?;
     let state = newest.get("state").and_then(Value::as_str)?;
@@ -2590,7 +2528,7 @@ fn carry_on_once(
     // look at what did not come back stays. A pass that carries no Autopilot
     // of its own (the CLI's hand-run sweep, `Opts::land` false) reads the
     // tab's own `status`, as an adopting pass does ([`tab_under_land`];
-    // ATERM-KI-1016-1: it typed Cruise's carry-on into a Land tab).
+    // it typed Cruise's carry-on into a Land tab).
     if opts.land || tab_under_land(c, tab) {
         st.phase = upgrade::Phase::Done;
         r.from.clone_from(&st.from);
@@ -2646,9 +2584,8 @@ fn carry_on_once(
                 if super::upgrade_drive::held(c, tab, opts.human_grace_s) {
                     return said(r, "wait:held");
                 }
-                // UNDER THE HARNESS'S HAND: the caller's, else one for the
-                // typing alone; a tab another driver holds is a wait, the
-                // continuation still owed.
+                // Under the harness's hand: the caller's, else one for the typing alone; a tab
+                // another driver holds is a wait, the continuation still owed.
                 let Some(typed) = under_hand(c, tab, hand, |c| {
                     type_continuation(c, tab, &text, opts.timings.fence_every)
                 }) else {
@@ -2761,7 +2698,7 @@ fn nothing_owed(
     // defense answering a land act, and nobody has asked anything since — is
     // carried on with nothing, whatever brought it back (a crash, aterm's own
     // end, the memory restart, a stall, an asked restart, a model or account
-    // move): a carry-on would reopen a landed task (FOREVER LAND: nothing is
+    // move): a carry-on would reopen a landed task (Autopilot Land: nothing is
     // typed until a person's or an orchestrator's turn). The tab's loop reads the same record at its point
     // ([`upgrade::FinishedScan`]); this one read starts
     // `upgrade_drive::FINISHED_ONCE_BYTES` back, and further back where that
@@ -4206,7 +4143,7 @@ pub struct CodexRun {
 /// Never a tab's own program's ([`NO_SHELL`]): nothing relaunches it in its
 /// tab.
 ///
-/// ONE PREDICATE WITH THE RELAUNCH (LC-3 of ATERM-KI-1015-1): a Claude
+/// ONE PREDICATE WITH THE RELAUNCH (LC-3 of ): a Claude
 /// Code's is [`exit_line`]'s, which asks everything the relaunch refuses on
 /// before it types — the home its line carries included
 /// ([`super::upgrade_drive::home_carried`], for a user whose home is
@@ -4296,7 +4233,7 @@ pub fn resumes_on_exit(user_home: &Path, snap: &Snapshot) -> bool {
 /// IN ([`super::upgrade_drive::home_carried`], for a user whose home is
 /// `user_home`): the relaunch refuses (`refused:home`) a relative home its
 /// line would move, and records no `HOME` names, so nothing is promised for
-/// either (LC-3 of ATERM-KI-1015-1). An agent under another `HOME` with no
+/// either (LC-3 of ). An agent under another `HOME` with no
 /// `CLAUDE_CONFIG_DIR` is promised: its line carries that `HOME` (LC-4).
 #[must_use]
 pub fn exit_line(user_home: &Path, snap: &Snapshot) -> Option<String> {
@@ -4354,7 +4291,7 @@ pub fn exit_line(user_home: &Path, snap: &Snapshot) -> Option<String> {
 /// root `state`: a `--model` the conversation's record marks failed is not
 /// printed), CARRYING THE CLAUDE HOME its agent ran under as its relaunch
 /// line carries it ([`super::upgrade_drive::home_carried`],
-/// [`super::resume::with_env`]; ATERM-KI-1015-1 LC-4: told bare, in a tab
+/// [`super::resume::with_env`] LC-4: told bare, in a tab
 /// whose shell has another home, `claude --resume <id>` found no transcript
 /// or met the first-run screen). Never the login
 /// ([`super::resume::SHELL_LOGIN_CLAUSE`]). `None` for a Codex (no such
@@ -4709,9 +4646,8 @@ pub(super) fn snapshot_with(opts: &Opts, k: &dyn Kernel) -> Result<Snapshot, &'s
         dialect: (shell != NO_SHELL)
             .then(|| shell_dialect(shell, &[]))
             .flatten(),
-        // READ off the process's own exec environment, the same read that
-        // gave its argv: what the vendor's runtime was started with, which
-        // is what chose its keychain item (the accounts design, §1).
+        // Off the process's own exec environment, the read that gave its argv: what chose its
+        // keychain item.
         login: args.env_var(accounts::LOGIN_ENV).map(str::to_owned),
         // The same read: the home it was started under, and where it keeps
         // its records under it.
@@ -4813,7 +4749,7 @@ pub fn follow_record(snap: &mut Snapshot, sf: &SessionFile) -> bool {
 /// is ("until a NEWER build is the target") — and a build that failed to
 /// start for the conversation, while its stop's rest stands. The caller's
 /// `held` also holds off a build not PROVED to start (LC-5 of
-/// ATERM-KI-1015-1: `upgrade_build_start::proved`, the upgrade's probe).
+/// `upgrade_build_start::proved`, the upgrade's probe).
 pub(super) fn relaunch_target(
     upgrade: bool,
     running: Option<&Version>,
@@ -5444,7 +5380,7 @@ fn after_exit_as(
     }
     // WHERE THE GONE AGENT WENT ON WRITING ITS CONVERSATION (a worktree's
     // home under a relative one), noted before anything reads its finish
-    // ([`super::upgrade_drive::note_moved_writes`], ATERM-KI-1016-1): the
+    // ([`super::upgrade_drive::note_moved_writes`]): the
     // host's own note may never have been written, its finished read
     // overtaken by the crash.
     if !opts.dry_run {
@@ -5472,7 +5408,7 @@ fn after_exit_as(
     let now = now_s();
     // And a build not PROVED to start — whether or not one failed, for any
     // conversation ([`super::upgrade_drive::build_proved`], LC-5 of
-    // ATERM-KI-1015-1): the agent comes back on the program it ran, never
+    // ): the agent comes back on the program it ran, never
     // staked on a build nothing has started.
     let held = |t: &upgrade::Candidate| {
         prior
@@ -5855,7 +5791,7 @@ pub fn account_restart(opts: &Opts, pid: u32) -> Option<String> {
 /// `through_hand`: the host CARRIED this exit through a hand that held its
 /// tab — a hold, a lease, a turn: [`hand_on_tab`] — attempting nothing while
 /// it stood ([`WAIT_HAND_LIFTS`], ruling 20's mechanism, LC-7 of
-/// ATERM-KI-1015-1), and this is the first carry since it lifted. The
+/// ), and this is the first carry since it lifted. The
 /// relaunch's stale bound ([`STALE_S`], [`expired`]) is there so a line is
 /// never typed at a prompt a person may have taken meanwhile; a tab held is
 /// a prompt nobody types at, so the bound counts from now, as from a fresh
@@ -6158,7 +6094,7 @@ pub fn moved_off(opts: &Opts, session: &str, at: Option<u64>, live: &Snapshot) -
         own || kept(&st)
     });
     // …or the move kept beside a record removed since
-    // ([`super::upgrade_drive::kept_move`], ATERM-KI-1016-1).
+    // ([`super::upgrade_drive::kept_move`]).
     record || kept_move(opts, session).is_some_and(|st| kept(&st))
 }
 
@@ -6172,7 +6108,7 @@ pub fn moved_off(opts: &Opts, session: &str, at: Option<u64>, live: &Snapshot) -
 /// default account), else [`accounts::HOME_ENV`] verbatim, else — or that
 /// empty — the default. So an unset variable under the default home is the
 /// default login (the review's RR3-R4-1), and unset under another home is
-/// the login that home's own string names (ATERM-KI-1016-1): a move to that
+/// the login that home's own string names: a move to that
 /// login is met by it, never by a move to the default one.
 fn runs_moved(live: &Snapshot, login: Option<&str>, left: Option<&str>) -> bool {
     let runs = live.login.as_deref().or(live.home.as_deref()).unwrap_or("");
@@ -6941,7 +6877,7 @@ pub enum Say {
 /// `HarnessRelaunchOnExit` in `aterm-spec`; the Tier-1 test drives this type
 /// through every action.
 ///
-/// THE BACK-OFF IS A CRASH'S (LC-6 of ATERM-KI-1015-1): only the attempts at
+/// THE BACK-OFF IS A CRASH'S (LC-6 of ): only the attempts at
 /// an exit nobody asked for climb it ([`Self::exited_as`]'s `crash`). An exit
 /// the explicit restart made ([`OnExit::Asked`]: a person's `aterm ctl
 /// restart`, the stall's remedy) or the harness's own restart

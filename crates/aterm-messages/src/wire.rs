@@ -376,9 +376,7 @@ pub fn activity_rows_compat(
     rows
 }
 
-// ---------------------------------------------------------------------------
 // `notice`: the outside world's voice on the band.
-// ---------------------------------------------------------------------------
 
 /// The `notice` verb's usage line: a missing or unknown sub-form.
 pub(crate) const NOTICE_USAGE: &str =

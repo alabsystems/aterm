@@ -166,9 +166,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     })
 }
 
-// ---------------------------------------------------------------------------
 // What one check measured, read from its log
-// ---------------------------------------------------------------------------
 
 /// A proof check its caller cancelled: ay's words when the
 /// caller's stop signal ends a strict proof check ("interrupt, deadline, or
@@ -1107,9 +1105,7 @@ impl Measured {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Memory: what a host can verify
-// ---------------------------------------------------------------------------
 //
 // `targo trust` gives each verified library a memory ceiling of one eighth of
 // the host's RAM and takes no other value, so a floor recorded under a larger
@@ -1871,9 +1867,7 @@ pub fn memory_rewritten(text: &str, rows: &[(String, MemRow)]) -> String {
     s
 }
 
-// ---------------------------------------------------------------------------
 // The facts of one run
-// ---------------------------------------------------------------------------
 
 /// What the lane decided about one selected library before anything ran —
 /// from the graph, the scope list and the fork roster, all in the tree — and,
@@ -2192,9 +2186,7 @@ impl Facts {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The judge: facts and a ratchet make a verdict
-// ---------------------------------------------------------------------------
 
 /// One ratchet row, as the lane reads it: `<crate>\t<proved>\t<total>\t<prover>[\t<why>]`.
 struct Floor {
@@ -3250,9 +3242,7 @@ pub fn judge(
     }
 }
 
-// ---------------------------------------------------------------------------
 // The up-only floor, for facts reused on another commit
-// ---------------------------------------------------------------------------
 
 /// The up-only floor on reuse. Facts measured on commit A judge commit B when B differs
 /// from A only in [`RATCHET`], so B's floors are held here to the ratchet's up-only rule:
@@ -3383,9 +3373,7 @@ pub fn floors_lowered(
     out
 }
 
-// ---------------------------------------------------------------------------
 // THE KEY
-// ---------------------------------------------------------------------------
 
 /// SHA-256 over the tree of `rev` with the files `--update-ratchet` rewrites
 /// removed: every `git ls-tree -r -z --full-tree` record (`<mode> <type>
@@ -3455,9 +3443,7 @@ pub fn facts_key(tree_sans_floors: &str, prover: &str, lane: &str) -> String {
     hex(&Sha256::digest(material.as_bytes()))
 }
 
-// ---------------------------------------------------------------------------
 // The lane's end: [`conclude`]
-// ---------------------------------------------------------------------------
 
 /// What a lane run wrote in its log directory (`.plan`, read by [`conclude`]): the
 /// run's decisions and where its logs are, and — when the run is one that files — what
@@ -4371,9 +4357,7 @@ pub fn trustc_commit(bin: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-// ---------------------------------------------------------------------------
 // ASSEMBLY: the verdict for a commit, from its facts and its own ratchet
-// ---------------------------------------------------------------------------
 
 /// The toolchain requested for a stored-facts verdict.
 #[derive(Clone, Debug)]
@@ -4557,9 +4541,7 @@ fn short_name(name: &str) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
 // `targo --unverified ship trust <verb>`
-// ---------------------------------------------------------------------------
 
 /// A `trust` verb ([`parse_cmd`], run by [`run_cmd`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -4858,9 +4840,7 @@ pub(crate) mod testing {
     }
 }
 
-// ---------------------------------------------------------------------------
 // tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

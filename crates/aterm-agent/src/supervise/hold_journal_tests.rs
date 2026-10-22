@@ -136,7 +136,7 @@ fn a_held_break_names_its_guard_once() {
     assert_eq!(host.backgrounds.load(Ordering::SeqCst), 0);
     // Negative control: the live turn the wait loop reads takes the act.
     s.host_steps_in_background(&screen_at(5, busy_screen()), &mut since, None, &mut heard);
-    s.took(5);
+    s.took(5, None, &mut heard);
     for seq in 6..8 {
         s.host_steps_in_background(
             &screen_at(seq, break_screen()),
@@ -405,3 +405,6 @@ fn a_break_no_host_wants_is_said_only_once_it_stood_the_settle() {
         heard.noted
     );
 }
+
+#[path = "occupancy_loop_tests.rs"]
+mod occupancy;

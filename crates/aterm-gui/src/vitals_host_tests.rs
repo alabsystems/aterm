@@ -1952,7 +1952,7 @@ fn held_wait(app: &crate::App) -> (Option<aterm_vitals::jobs::WaitName>, Demand)
 }
 
 /// A PROGRAM WAITING FOR THE PERSON AT ITS PROMPT ARMS NOTHING WITH NO
-/// WINDOW (design §6.1, "What arms nothing"; forever land's END, which saw 9
+/// WINDOW (design §6.1, "What arms nothing"; Autopilot Land's END, which saw 9
 /// to 10 timer wakes in its 20 s at rest on main, each a `system_vitals`
 /// fire, for Claude Code 2.1.306 and 2.1.307 and Gemini CLI): a raw program
 /// at rest on a real terminal, read through the probe thread's own step by

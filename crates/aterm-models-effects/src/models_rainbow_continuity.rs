@@ -3,19 +3,16 @@
 
 use aterm_spec::derive::*;
 
-/// A retired typed run can rejoin an adjacent key only when the current row
-/// still spells its exact cached glyphs, the hand stayed on that row, and the
-/// echo is typed and inside the five-second chain window. The cache is
-/// dormant: idle ticks neither scan it nor schedule a frame. `Buggy=1` loses
-/// the owner's `and ` prefix by treating a licence clear as content erasure;
-/// `Buggy=2` revives it on keyless
-/// program paint; `Buggy=3` wakes the idle renderer for dormant metadata.
+/// A retired typed run rejoins an adjacent key only when the current row still spells its exact
+/// cached glyphs, the hand stayed on that row, and the echo is typed and inside the five-second
+/// chain window. The cache is dormant: idle ticks neither scan it nor schedule a frame.
+/// `Buggy=1` treats a licence clear as content erasure, losing a typed prefix; `Buggy=2` revives
+/// the run on keyless program paint; `Buggy=3` wakes the idle renderer for dormant metadata.
 ///
-/// Tier-1 in `aterm-effects/tests/codex_particle_replay.rs` replays Codex
-/// 0.155.1's captured wrapped composer at the measured five-hertz cadence,
-/// projecting the separate-turn licence clear, exact-content resume, and its
-/// changed, keyless, navigation, and stale controls onto the real ribbon's
-/// newly born prefix cells.
+/// Tier-1 (`aterm-effects/tests/codex_particle_replay.rs`) replays a captured Codex wrapped
+/// composer at its five-hertz cadence, projecting the separate-turn licence clear, exact-content
+/// resume, and its changed, keyless, navigation and stale controls onto the real ribbon's newly
+/// born prefix cells.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn rainbow_typed_continuity_model() -> Model {

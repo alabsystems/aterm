@@ -196,9 +196,7 @@ use aterm_json::{Map, Value};
 use super::truncate_bytes;
 use super::usage::rfc3339_utc;
 
-// ---------------------------------------------------------------------------
 // Constants
-// ---------------------------------------------------------------------------
 
 /// `disk.warn_free_gib` (design §5.5).
 pub const DEFAULT_WARN_FREE_GIB: u64 = 40;
@@ -346,9 +344,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// Seconds in a day.
 const DAY_S: i64 = 86_400;
 
-// ---------------------------------------------------------------------------
 // The safelist
-// ---------------------------------------------------------------------------
 
 /// The safelist. A class not named here has no spelling that reaches
 /// [`apply`]: the list is a closed enum, not a configurable string set.
@@ -439,9 +435,7 @@ impl Delegate {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Knobs
-// ---------------------------------------------------------------------------
 
 /// The `[disk]` knobs of design §5.5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -804,9 +798,7 @@ impl Thresholds {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The survey — every fact the decision needs, injected
-// ---------------------------------------------------------------------------
 
 /// One vendor version under `versions/`: a directory, or (every native
 /// install, and Windows') a single executable FILE.
@@ -947,9 +939,7 @@ impl Survey {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The witness
-// ---------------------------------------------------------------------------
 
 /// Why a row is safe to remove. There is no `Witness::None`: a row with no
 /// witness is not a candidate.
@@ -1179,9 +1169,7 @@ impl Tier {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The report
-// ---------------------------------------------------------------------------
 
 /// One reported target.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1602,9 +1590,7 @@ fn path_text(p: &Path) -> String {
     truncate_bytes(&p.display().to_string(), ROW_TEXT_CAP).to_owned()
 }
 
-// ---------------------------------------------------------------------------
 // The report, as a pure function
-// ---------------------------------------------------------------------------
 
 /// Build the §5.5 report from `survey`. Pure: no clock, no filesystem, no
 /// environment.
@@ -2528,9 +2514,7 @@ pub fn human_bytes(b: u64) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Apply — the plan, the guard, the denial
-// ---------------------------------------------------------------------------
 
 /// Why an apply, or one path inside it, was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3570,18 +3554,12 @@ fn remove_rows(
     }
 }
 
-/// The real remover, one primitive per class: [`Class::CargoTargets`] goes
-/// through [`target::reclaim_leaving`] under `judge` (each idle profile's
-/// `incremental/`, under cargo's locks — never the directory, and never a
-/// profile of a build directory named inside it, which its own row takes)
-/// or, for a pressure row, [`target::reclaim_lru`] (that one profile's, on
-/// the device its row was measured on) — or, for a gone owner's build
-/// directory, no process using it ([`discover::unused`], every process of
-/// this uid) and then [`target::reclaim_whole`], the owner checked again
-/// under its locks ([`discover::recheck`], a session's by the running
-/// processes read again) — and [`Class::ClaudeStaleVersions`] through
-/// [`remove_tree`]. A delegated class never reaches a remover ([`plan`]
-/// refuses it).
+/// The real remover. [`Class::CargoTargets`]: an idle row through
+/// [`target::reclaim_leaving`] (never a profile of a build directory named
+/// inside it), a pressure row through [`target::reclaim_lru`] on the device
+/// it was measured on, a gone owner's directory through [`discover::unused`]
+/// and then [`target::reclaim_whole`]. [`Class::ClaudeStaleVersions`]:
+/// [`remove_tree`]. A delegated class never reaches a remover ([`plan`]).
 ///
 /// `sessions` reads this instance's sessions AS THEY STAND NOW (tier 3's
 /// clause 4a, [`idle::Sessions`]): the window's re-reads its tabs, the
@@ -3759,9 +3737,7 @@ pub(crate) fn remover_among(
     }
 }
 
-// ---------------------------------------------------------------------------
 // The resume — a session the full disk stopped is told once space is back
-// ---------------------------------------------------------------------------
 
 /// The ledger's name for the resume typed into a session whose screen said
 /// the disk was full ([`resume_text`]), once space is back.
@@ -3815,9 +3791,7 @@ pub fn type_resume(sock: &str, sid: &str, text: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The scan — the one impure half
-// ---------------------------------------------------------------------------
 
 /// Where to look. Every path is injected; this module reads no environment
 /// variable and derives no path from a name.

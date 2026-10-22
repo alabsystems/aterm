@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance of the SHIPPING authorization gate to
+//! Tier-1 conformance of the shipping authorization gate to
 //! `aterm_models_session::authorize_soundness_model` (`AuthorizeSoundness`).
 //!
 //! The model's predicate is a four-guard conjunction: the token is in the table

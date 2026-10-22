@@ -77,6 +77,28 @@ pub enum Kind {
     Restore,
     /// RIS.
     Reset,
+    /// `CSI ? 6 h` (`set`) or `l`: origin mode.
+    Origin { set: bool },
+    /// DECSTBM, valid or not.
+    Region,
+}
+
+/// What [`Track`] knows of one DECSC slot: it was written with origin mode
+/// on, and a DECSTBM has come since.
+#[derive(Clone, Copy, Debug, Default)]
+struct OriginSlot {
+    origin: bool,
+    region_moved: bool,
+}
+
+impl OriginSlot {
+    /// [subset] A restore of this slot would put origin mode back on over a
+    /// region that may no longer hold the saved row, where xterm and aterm
+    /// clamp differently (the `decrc_under_origin_mode_above_the_region`
+    /// exclusion).
+    fn blocks_restore(self) -> bool {
+        self.origin && self.region_moved
+    }
 }
 
 /// One token: its kind, and the chunks it is fed as, in order.
@@ -134,6 +156,12 @@ struct Track {
     /// aterm emptied it there, which xterm (and a fold with `ris_keeps_alt`)
     /// keeps.
     ris_dropped_slot: bool,
+    /// Origin mode is on.
+    origin: bool,
+    /// The main screen's DECSC slot, as origin mode sees it.
+    main_slot: OriginSlot,
+    /// The alternate screen's.
+    alt_slot: OriginSlot,
 }
 
 impl Track {
@@ -168,11 +196,12 @@ impl Track {
             }
             // [subset] No `?1049l` on the main screen: xterm (and the fold)
             // restore the cursor there, aterm moves nothing (the
-            // `stray_1049l_*` exclusions).
+            // `stray_1049l_*` exclusions). Its restore reads the main slot,
+            // which [`OriginSlot::blocks_restore`] may rule out.
             Kind::Alt {
                 mode: 1049,
                 set: false,
-            } => self.in_alt,
+            } => self.in_alt && !self.main_slot.blocks_restore(),
             // [subset] While the pinned fold drops the alternate screen's
             // DECSC slot on every switch (xterm keeps `sc[1]` with its one
             // persistent buffer), a restore on the alternate screen follows a
@@ -180,11 +209,40 @@ impl Track {
             // Nor after a RIS while the fold keeps the slot aterm emptied, until a
             // save on the alternate screen writes it again.
             Kind::Restore => {
-                !self.in_alt
+                let slot_known = !self.in_alt
                     || self.alt_saved
-                    || (caps.alt_persists && !(self.ris_dropped_slot && caps.ris_keeps_alt))
+                    || (caps.alt_persists && !(self.ris_dropped_slot && caps.ris_keeps_alt));
+                slot_known && !self.slot().blocks_restore()
             }
-            Kind::Alt { .. } | Kind::Plain | Kind::Save | Kind::Reset => true,
+            Kind::Alt { .. }
+            | Kind::Plain
+            | Kind::Save
+            | Kind::Reset
+            | Kind::Origin { .. }
+            | Kind::Region => true,
+        }
+    }
+
+    /// The DECSC slot of the buffer that is up.
+    fn slot(&self) -> OriginSlot {
+        if self.in_alt {
+            self.alt_slot
+        } else {
+            self.main_slot
+        }
+    }
+
+    /// A DECSC (or the save `?1049h` makes) into the slot of the buffer
+    /// that is up.
+    fn save(&mut self) {
+        let slot = OriginSlot {
+            origin: self.origin,
+            region_moved: false,
+        };
+        if self.in_alt {
+            self.alt_slot = slot;
+        } else {
+            self.main_slot = slot;
         }
     }
 
@@ -195,6 +253,11 @@ impl Track {
                     self.alt_saved = false;
                 }
                 if mode == 1049 {
+                    if set {
+                        // `?1049h` saves into the slot of the buffer it
+                        // leaves (or of the alternate one, already up).
+                        self.save();
+                    }
                     if set && self.in_alt {
                         // A second `?1049h` saves into the alternate slot.
                         self.alt_saved = true;
@@ -205,14 +268,18 @@ impl Track {
                         self.ris_dropped_buffer = false;
                     } else if self.in_alt {
                         self.alt_dropped = true;
+                        // `?1049l` restores the main slot.
+                        self.origin = self.main_slot.origin;
                     }
                 }
                 self.in_alt = set;
             }
             Kind::Save => {
+                self.save();
                 self.alt_saved |= self.in_alt;
                 self.ris_dropped_slot &= !self.in_alt;
             }
+            Kind::Restore => self.origin = self.slot().origin,
             Kind::Reset => {
                 *self = Track {
                     ris_dropped_buffer: true,
@@ -220,7 +287,12 @@ impl Track {
                     ..Track::default()
                 }
             }
-            Kind::Plain | Kind::Restore => {}
+            Kind::Origin { set } => self.origin = set,
+            Kind::Region => {
+                self.main_slot.region_moved = true;
+                self.alt_slot.region_moved = true;
+            }
+            Kind::Plain => {}
         }
     }
 }
@@ -232,13 +304,14 @@ const COLS: [u16; 11] = [1, 2, 3, 4, 5, 8, 10, 13, 16, 20, 33];
 const ROWS: [u16; 8] = [1, 2, 3, 4, 5, 6, 8, 10];
 
 /// Printable glyphs. All one cell wide in both engines: ASCII, and narrow
-/// non-ASCII (Latin-1 letters, a box-drawing rule). [subset] No East Asian
-/// wide glyph or combining mark: astream-term gives every codepoint one cell
-/// (screen.rs "One codepoint per cell"), aterm gives a wide glyph two and
-/// folds a mark into its base.
+/// non-ASCII (Latin-1 letters, a box-drawing rule). The ASCII ones straddle
+/// DEC Special Graphics' range (`^` just below it, `_` and `~` at its ends).
+/// [subset] No East Asian wide glyph or combining mark: astream-term gives
+/// every codepoint one cell (screen.rs "One codepoint per cell"), aterm
+/// gives a wide glyph two and folds a mark into its base.
 const GLYPHS: &[char] = &[
-    'a', 'b', 'c', 'x', 'y', 'z', 'A', 'M', 'Z', '0', '7', '9', ' ', '-', '#', '~', '[', ';',
-    '\u{e9}', '\u{df}', '\u{f1}', '\u{2500}',
+    'a', 'b', 'c', 'x', 'y', 'z', 'A', 'M', 'Z', '0', '7', '9', ' ', '-', '#', '~', '[', ';', 'q',
+    'l', '_', '^', '`', '{', '}', '\u{e9}', '\u{df}', '\u{f1}', '\u{2500}',
 ];
 
 fn csi(params: &str, final_byte: char) -> Vec<u8> {
@@ -434,7 +507,7 @@ impl Gen {
         let (cols, rows, caps) = (self.cols, self.rows, self.caps);
         let lim = cols.max(rows);
         let r = &mut self.r;
-        let plain = match r.below(32) {
+        let plain = match r.below(36) {
             // Text: the bulk of any real stream.
             0..=8 => {
                 let n = run_len(r, cols);
@@ -505,10 +578,13 @@ impl Gen {
             }
             // DECSTBM: valid regions, empty and inverted ones (ignored), a
             // bottom past the screen (clamped), and the bare reset.
-            25 => match r.below(4) {
-                0 => csi("", 'r'),
-                _ => csi(&format!("{};{}", num(r, rows), num(r, rows)), 'r'),
-            },
+            25 => {
+                let t = match r.below(4) {
+                    0 => csi("", 'r'),
+                    _ => csi(&format!("{};{}", num(r, rows), num(r, rows)), 'r'),
+                };
+                return (Kind::Region, t);
+            }
             // Save and restore the cursor: a restore only where [`Track`]
             // admits one, a save otherwise.
             26 => {
@@ -529,7 +605,8 @@ impl Gen {
             }
             // Sequences both consume without touching the grid, cursor or
             // pen: an OSC title (BEL- and ST-terminated), OSC 133 marks, the
-            // ASCII charset designation, keypad modes, XTMODKEYS, DECSCUSR, a
+            // ASCII charset designation (which undoes a DEC Special Graphics
+            // one, where the fold models both), keypad modes, XTMODKEYS, DECSCUSR, a
             // DECRQSS query (aterm answers it; the answer is not on the
             // screen), PM, SOS. [subset] Not OSC 133 `A`: on the alternate
             // screen aterm reads a prompt mark as the app having died and
@@ -553,6 +630,41 @@ impl Gen {
                 .to_vec(),
             // RIS, rarely: it resets everything both engines model.
             31 if r.chance(1, 4) => return (Kind::Reset, b"\x1bc".to_vec()),
+            // Origin mode (DECOM): set more often than reset, so the
+            // addressing that follows runs under it.
+            32 if caps.origin_mode => {
+                let set = r.chance(2, 3);
+                return (Kind::Origin { set }, csi("?6", if set { 'h' } else { 'l' }));
+            }
+            // Insert mode (IRM) and newline mode (LNM), alone and together.
+            33 if caps.insert_mode => {
+                let modes: &[&str] = if caps.newline_mode {
+                    &["4", "4", "20", "4;20", "20;4"]
+                } else {
+                    &["4"]
+                };
+                csi(r.pick(modes), if r.chance(1, 2) { 'h' } else { 'l' })
+            }
+            // SU and SD.
+            34 if caps.scroll_up_down => csi(&num(r, rows), r.pick(&['S', 'T'])),
+            // Character sets: ASCII or DEC Special Graphics into G0 or G1, SO
+            // and SI, and now and then a designation and a glyph run in one
+            // token. [subset] Never G2/G3, a single shift or a national set:
+            // the fold models none of them.
+            35 if caps.charsets => {
+                let mut t = match r.below(4) {
+                    0 | 1 => {
+                        format!("\x1b{}{}", r.pick(&['(', ')']), r.pick(&['B', '0'])).into_bytes()
+                    }
+                    2 => r.pick(&[b"\x0e".as_slice(), b"\x0f"]).to_vec(),
+                    _ => b"\x1b(0".to_vec(),
+                };
+                if r.chance(1, 3) {
+                    let n = run_len(r, cols);
+                    t.extend(text(r, n));
+                }
+                t
+            }
             _ => {
                 let n = run_len(r, cols);
                 text(r, n)

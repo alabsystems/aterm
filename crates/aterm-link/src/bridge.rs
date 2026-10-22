@@ -3058,9 +3058,7 @@ impl Bridge {
         })
     }
 
-    // -----------------------------------------------------------------------
     // the aterm verb lane — EVERY call goes through here
-    // -----------------------------------------------------------------------
 
     /// One verb on aterm's VERB lane (fd 3), with the one thing every caller
     /// must do on an I/O failure: say so where the loop can see it.
@@ -3114,9 +3112,7 @@ impl Bridge {
         self.ctl.lost() || self.mailbox.aterm_closed()
     }
 
-    // -----------------------------------------------------------------------
     // broker plumbing
-    // -----------------------------------------------------------------------
 
     /// One authenticated connection to the broker over the configured transport,
     /// with every cap attached — and the closer that can end it from another
@@ -3276,9 +3272,7 @@ impl Bridge {
         }
     }
 
-    // -----------------------------------------------------------------------
     // the broker link, as told to the endpoint
-    // -----------------------------------------------------------------------
 
     /// EVERY REQUEST/REPLY ON THE PUBLISHER CONNECTION PASSES ITS OUTCOME
     /// THROUGH HERE. `started` is when the request was written; `r` is what came
@@ -4186,9 +4180,7 @@ impl Bridge {
         }
     }
 
-    // -----------------------------------------------------------------------
     // presence and the incarnation
-    // -----------------------------------------------------------------------
 
     /// Bring the node's presence up: read the bus's own opinion of our last
     /// incarnation, take `max(local, bus) + 1`, register the will at that
@@ -4501,9 +4493,7 @@ impl Bridge {
         true
     }
 
-    // -----------------------------------------------------------------------
     // the aterm side
-    // -----------------------------------------------------------------------
 
     /// Refresh `local -> sid` and `sid -> epoch` from aterm's own roster.
     ///
@@ -4787,9 +4777,7 @@ impl Bridge {
         }
     }
 
-    // -----------------------------------------------------------------------
     // the inbox plane
-    // -----------------------------------------------------------------------
 
     /// One record off the durable inbox group: validate, classify, deliver,
     /// COMMIT — and the commit happens ONLY when the record was accounted for.
@@ -6144,9 +6132,7 @@ impl Bridge {
         }
     }
 
-    // -----------------------------------------------------------------------
     // receipts (R8): `inbox seen … handled|refused|deferred` acks the sender
-    // -----------------------------------------------------------------------
 
     /// Put one OWED receipt on the bus and retire it at the endpoint — a
     /// `receipt sid= rid= off= verdict= kind= from=` line off the `outbox` peek,
@@ -6389,9 +6375,7 @@ impl Bridge {
         Ok(Ok(subject::person_lane(&fleet, from, &self.node)))
     }
 
-    // -----------------------------------------------------------------------
     // nothing lost (E3): `inbox get @<off>` reads the log through the bridge
-    // -----------------------------------------------------------------------
 
     /// Answer one `fetch sid=<sid> off=<n>` line off the `outbox` peek: the
     /// endpoint has a session parked in `inbox get @<off>` for a record its
@@ -6949,9 +6933,7 @@ impl Bridge {
         true
     }
 
-    // -----------------------------------------------------------------------
     // deadlines (R8): the asker's own bridge records `expired`
-    // -----------------------------------------------------------------------
 
     /// Move the deadline arm toward the earliest ask. A new ask may be due
     /// sooner than the old one, including now; a periodic roster round replaces
@@ -7608,9 +7590,7 @@ impl Bridge {
             .min()
     }
 
-    // -----------------------------------------------------------------------
     // the fleet halt
-    // -----------------------------------------------------------------------
 
     /// One `/f/<F>/fleet/<h>/<kind>` record — whole: a halt that arrives while
     /// this one is being applied waits for it ([`Bridge::unyielding`]).
@@ -9529,9 +9509,7 @@ impl Bridge {
         gen_of_frame(reply.rows().first()?)
     }
 
-    // -----------------------------------------------------------------------
     // the outbound plane
-    // -----------------------------------------------------------------------
 
     /// [`Fault::FailPostPublishWhileMarked`]'s refusal for a record `sid`
     /// sends, while its marker names that session (or `*`): the broker's
@@ -11033,9 +11011,7 @@ impl Bridge {
         Ok(seen)
     }
 
-    // -----------------------------------------------------------------------
     // aterm's events digest
-    // -----------------------------------------------------------------------
 
     /// One `EVENT …`, `GAP …` or `sub …` (a watch's ack) line off the push lane.
     fn on_event(&mut self, line: &str) {
@@ -11443,9 +11419,7 @@ impl Bridge {
         }
     }
 
-    // -----------------------------------------------------------------------
     // the loop
-    // -----------------------------------------------------------------------
 
     /// Connect to the broker, bring presence up, open every subscription, and
     /// start the reader threads. Answers `false` when the broker is unreachable —
@@ -12498,14 +12472,16 @@ impl Bridge {
     /// anything but this open's admitted run — an earlier boot's unclean
     /// stop, a clean stop's record, none — every attach first writes it
     /// again, and none goes on until it holds ([`Bridge::run_names_this_boot`]).
-    /// A record written is said with what it cost. A fresh StateDir open
+    /// A record written is said with what it cost: its barriers and its full
+    /// flushes, and how long the start took. A fresh StateDir open
     /// establishes its own required publication fence, even after a handoff.
     fn begin_run(&self) {
         let began = self.fx.now();
         match self.state.begin_run() {
-            Ok(flushed) if flushed.full > 0 => eprintln!(
-                "aterm-link: the run record says a bridge runs in this boot: {} full flushes in \
-                 {} us",
+            Ok(flushed) if flushed.full + flushed.ordered > 0 => eprintln!(
+                "aterm-link: the run record says a bridge runs in this boot: {} barriers and {} \
+                 full flushes in {} us",
+                flushed.ordered,
                 flushed.full,
                 self.fx.now().saturating_duration_since(began).as_micros()
             ),
@@ -12584,8 +12560,8 @@ impl Bridge {
             Err(e) => {
                 if self.link.down_wants_report("error") {
                     eprintln!(
-                        "aterm-link: the state dir's OPEN run record could not be durably \
-                         admitted: {e}; not attaching until its required publication succeeds"
+                        "aterm-link: the state dir's OPEN run record could not be admitted: \
+                         {e}; not attaching until its required publication succeeds"
                     );
                 }
                 self.link_down("error");
@@ -12608,11 +12584,13 @@ impl Bridge {
     /// handoff's gap is the fabric's whole outage: so nothing is flushed here
     /// and `run` stays open, as after a kill. The successor's start then finds
     /// `run` open in this boot, re-establishes its durable OPEN publication
-    /// fence and inherits every file a power cut could tear, unflushed
+    /// fence (visible OPEN alone cannot exclude a prior failed publication), and
+    /// inherits every file a power cut could tear, unflushed
     /// ([`StateDir::begin_run`]), and its own
     /// clean stop flushes them. A power cut once the successor's run has begun
-    /// finds the run open in an earlier boot and the next boot's sweep runs,
-    /// as it would have with this stop clean.
+    /// finds the run open in an earlier boot — the successor's OPEN, or, where
+    /// the cut took that and everything after it, this run's — and the next
+    /// boot's sweep runs, as it would have with this stop clean.
     ///
     /// THE PRICE IS THE GAP BEFORE THAT START. A power cut after this exit and
     /// before the successor's [`StateDir::begin_run`] finds this run open too,
@@ -12628,8 +12606,8 @@ impl Bridge {
     /// removed, or a bridge that keeps failing to start), it is the rest of
     /// the boot. Nothing claims a clean stop it did not make, so damage after
     /// a clean stop stays a bug's. The old bridge's handoff flushes nothing;
-    /// its successor pays one durable OPEN write. Historical full-flush
-    /// measurements in `handoff_cost` predate this required admission fence.
+    /// its successor pays one OPEN write and two full flushes
+    /// (`handoff_cost`, which prints what each start and stop cost).
     fn end_run(&self) {
         if self.bye == Some(Bye::Handoff) {
             eprintln!(
@@ -18100,11 +18078,13 @@ mod tests {
     /// STOPS IT CLEANLY** (sim item S6, [`Bridge::end_run`]). A bridge of boot
     /// 1 wrote a reservation, unflushed, and aterm's last word was `bye
     /// handoff`: its stop flushes nothing and `run` stays open in boot 1. The
-    /// successor's start in the same boot re-establishes OPEN and inherits the
+    /// successor's start in the same boot re-establishes OPEN by two full
+    /// flushes ([`StateDir::begin_run`]), and inherits the
     /// reservation unflushed, and its own clean stop flushes it where it is
     /// (nothing rewritten, [`StateDir::end_run_clean`]). NEGATIVE
     /// CONTROL: after `bye quit` the stop is clean, the successor's start
-    /// writes the record again (two full flushes) and inherits nothing.
+    /// writes the record again over a clean stop of this boot (two full
+    /// flushes, no barrier) and inherits nothing.
     #[test]
     fn a_handoff_leaves_the_run_to_its_successor_and_a_quit_stops_it_cleanly() {
         for bye in [Bye::Handoff, Bye::Quit] {
@@ -18133,11 +18113,19 @@ mod tests {
             let stopped = successor.end_run_clean().unwrap();
             match bye {
                 Bye::Handoff => {
-                    assert_eq!(began.full, 2, "the successor admits OPEN independently");
+                    assert_eq!(
+                        (began.ordered, began.full),
+                        (0, 2),
+                        "the successor admits OPEN independently, in full"
+                    );
                     assert_eq!(stopped.files, 1, "the reservation, inherited and flushed");
                 }
                 Bye::Quit => {
-                    assert_eq!(began.full, 2, "CONTROL: the record written again");
+                    assert_eq!(
+                        (began.ordered, began.full),
+                        (0, 2),
+                        "CONTROL: the record written again, in full over a clean stop"
+                    );
                     assert_eq!(stopped.files, 0, "CONTROL: nothing inherited");
                 }
             }
@@ -18259,8 +18247,10 @@ mod tests {
             if reopen {
                 bridge.state = StateDir::open(&root).unwrap();
                 bridge.simulate_boot(crate::durability::test_boot(1), 0);
-                bridge.state.refuse_directory_flush(Some(refusal));
             }
+            // A failed publication's visible OPEN can still hide CLEAN on
+            // media. The full root flush remains required after a reopen too.
+            bridge.state.refuse_directory_flush(Some(refusal));
             assert!(!bridge.attach_broker(), "unadmitted OPEN, reopen={reopen}");
             assert!(bridge.conn.is_none());
             assert_eq!(bridge.state.incarnation(), 0);

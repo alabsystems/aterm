@@ -67,9 +67,7 @@ fn words(s: &str) -> Vec<String> {
     s.split(' ').map(str::to_string).collect()
 }
 
-// ---------------------------------------------------------------------------
 // The grammar
-// ---------------------------------------------------------------------------
 
 /// Every form the help text advertises parses to the command it names.
 #[test]
@@ -433,7 +431,7 @@ fn the_grammar_refuses_what_it_does_not_know() {
         let argv = words(line).into_iter().map(OsString::from).collect();
         assert_eq!(format!("{:?}", main_entry(argv)), exit(2), "{line}");
     }
-    // NEGATIVE CONTROL: where the two flags belong they still parse.
+    // Negative control: where the two flags belong they still parse.
     assert!(matches!(
         parse(&words("upgrade s-abc --dry-run"))
             .expect("the sweep")
@@ -443,9 +441,7 @@ fn the_grammar_refuses_what_it_does_not_know() {
     assert!(parse(&words("limits --sock /a.sock")).is_ok());
 }
 
-// ---------------------------------------------------------------------------
 // hook / statusline: retired, silent
-// ---------------------------------------------------------------------------
 
 /// From a pipe, `hook` and `statusline` read the payload to the end, print
 /// nothing and exit 0. At a terminal they read nothing (a panicking reader
@@ -482,9 +478,7 @@ fn the_retired_hook_verbs_drain_a_pipe_and_never_wait_on_a_terminal() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // usage
-// ---------------------------------------------------------------------------
 
 /// A `CLAUDE_CONFIG_DIR` this command cannot resolve (a relative one whose base, Claude Code's
 /// working directory, it cannot read): `usage` folds nothing and says why rather than folding
@@ -1119,9 +1113,7 @@ fn usage_from_codex_tools_with_a_relative_codex_home_folds_nothing_and_says_so()
     assert!(out.contains("has written no rollout under"), "{out}");
 }
 
-// ---------------------------------------------------------------------------
 // limits
-// ---------------------------------------------------------------------------
 
 /// A screen with Claude Code's session-limit notice above its composer.
 fn limited_screen() -> Vec<String> {
@@ -1398,9 +1390,7 @@ fn limits_reads_each_tab_by_its_own_programs_grammar() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // disk
-// ---------------------------------------------------------------------------
 
 /// The report answers, removes nothing by default, and is journalled to the
 /// disk ledger `ledger disk` reads back.
@@ -2040,11 +2030,9 @@ fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
     assert!(target.join("debug/deps").exists());
 }
 
-/// THE OWNER'S VERB USES THE SAME UNIT: `aterm harness disk <dir> --apply
-/// cargo-targets`, with `disk.apply = true`, reclaims the idle profile's
-/// `incremental/` and nothing else, prints what went and what it freed —
-/// "freed about": a count of the blocks it unlinked, not a measurement — and
-/// journals the intent and the outcome.
+/// The owner's verb uses the same unit: with `disk.apply = true`, `--apply cargo-targets`
+/// reclaims only the idle profile's `incremental/`, prints what went and what it freed ("freed
+/// about": a count of unlinked blocks, not a measurement), and journals intent and outcome.
 #[cfg(unix)]
 #[test]
 fn the_verb_applies_cargo_targets_with_the_same_unit() {
@@ -2084,11 +2072,8 @@ fn the_verb_applies_cargo_targets_with_the_same_unit() {
     assert_eq!(kinds, [true, true, true], "{ledger}");
 }
 
-/// NOTHING IS REMOVED WITHOUT ITS INTENT ON RECORD. When the disk journal
-/// cannot take a row — the state directory cannot be made (here a FILE sits
-/// where it should be), or the append fails on a full disk — the tick removes
-/// nothing: each row it would have reclaimed is a denial saying the intent
-/// could not be journalled, and the cache stays.
+/// Nothing is removed without its intent on record: with the state directory unmakeable (a file
+/// sits where it goes), the tick removes nothing and each row is an `unjournalled` denial.
 #[cfg(unix)]
 #[test]
 fn the_tick_removes_nothing_whose_intent_it_cannot_journal() {
@@ -2629,9 +2614,7 @@ fn an_unreadable_aterm_toml_grants_no_removal_and_the_verb_says_so() {
     assert!(!out.contains("disk.auto_free_gib"), "{out}");
 }
 
-// ---------------------------------------------------------------------------
 // The hand-run upgrade
-// ---------------------------------------------------------------------------
 
 /// `harness.enabled = false` appended below another table's header still
 /// switches the harness off, and the verb says where it found it. TOML files
@@ -2821,10 +2804,9 @@ fn a_hand_run_upgrade_that_could_not_sweep_does_not_exit_zero() {
         format!("{:?}", ExitCode::from(atpkg::lock::CONTENDED_EXIT)),
         "{out}"
     );
-    // Positive control: the lock released, the same sweep runs and exits 0.
-    // Released by `LOCK_UN` as the sweep's guard does: the sweep takes one try
-    // (`upgrade_drive::sweep_lock`), and a lock released only by close stays
-    // held while any test thread's child has yet to exec.
+    // Positive control: the lock released, the same sweep runs and exits 0. Released by
+    // `LOCK_UN` as the sweep's guard does: the sweep takes one try (`upgrade_drive::sweep_lock`),
+    // and a lock released only by close stays held while any test thread's child has yet to exec.
     held.unlock().expect("the test releases the sweep lock");
     drop(held);
     let (ok, out, err) = go(&upgrade_cmd(false, false), &env);
@@ -2845,9 +2827,7 @@ fn a_hand_run_upgrade_that_could_not_sweep_does_not_exit_zero() {
     assert_eq!(code, format!("{:?}", ExitCode::from(1)), "{out}");
 }
 
-// ---------------------------------------------------------------------------
 // ledger
-// ---------------------------------------------------------------------------
 
 /// `ledger` reads the engine's approval ledger (written by the supervisor's
 /// approval loop) for one session, newest last. Negative controls: another
@@ -2922,9 +2902,7 @@ fn a_ledger_tail_keeps_only_the_newest_rows() {
     assert!(tail_lines(&path, 0).expect("read").is_empty());
 }
 
-// ---------------------------------------------------------------------------
 // The live upgrade: the owner's view and word
-// ---------------------------------------------------------------------------
 
 #[test]
 fn a_deferral_is_a_span_with_a_unit_within_a_month() {
@@ -3331,11 +3309,10 @@ fn a_conversation_resumed_outside_aterm_is_never_told_unwatched() {
     let _ = inside.wait();
 }
 
-/// The owner's word on a tab whose agent's OWN switch is off is recorded and
-/// waits, as under the master switch: stderr names that agent's switch, for a
-/// Claude Code tab and a Codex tab alike. NEGATIVE CONTROLS: the other
-/// agent's switch off says nothing of the tab; the master switch off is named
-/// as ever, whatever an agent's own switch says.
+/// The owner's word on a tab whose agent's own switch is off is recorded and waits, as under the
+/// master switch: stderr names that agent's switch, for a Claude Code tab and a Codex tab alike.
+/// Negative controls: the other agent's switch off says nothing of the tab; the master switch off
+/// is named whatever an agent's own switch says.
 #[test]
 fn an_owners_word_on_a_tab_whose_agent_is_off_names_its_switch() {
     let tmp = tmp_dir("upgrade-owner-agent-off");
@@ -3548,9 +3525,7 @@ fn the_view_places_a_weekly_walls_bare_clock_after_its_print() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // accounts (docs/DESIGN-claude-accounts-2026-10-01.md §4, §8)
-// ---------------------------------------------------------------------------
 
 /// An exit code as a test compares it.
 fn exit(code: u8) -> String {
@@ -4057,9 +4032,7 @@ fn add_refuses_a_listed_or_inadmissible_label_by_name_and_writes_nothing() {
         assert_eq!(code, exit(1), "{label:?}");
         assert!(out.is_empty(), "{label:?}: {out}");
     }
-    // `help` is in that grammar and is no label: this command's help word.
-    // (Typed, `accounts add help` is the help; the verb itself refuses it by
-    // name, for whoever calls it another way.)
+    // `help` is in the grammar but is the help word, so the verb refuses it by name too.
     let (code, out, _) = acc_quiet(add("help", Class::Dedicated), &env);
     assert_eq!(code, exit(1));
     assert!(out.is_empty(), "{out}");
@@ -4650,7 +4623,7 @@ fn a_login_that_could_not_be_asked_is_said_and_never_recorded() {
         assert!(out.contains("\nwork-2: could not run ("), "{case}: {out}");
         assert!(!store.state_file().exists(), "{case}: nothing recorded");
     }
-    // NEGATIVE CONTROL: answered, it is recorded.
+    // Negative control: answered, it is recorded.
     let signed_in = |_: &str| said(true);
     let mut tty = FakeHost::new(&signed_in);
     tty.tty = true;
@@ -5461,12 +5434,10 @@ fn the_auth_runner_runs_the_program_it_is_given_under_the_login() {
     ));
 }
 
-/// `harness limits` SAYS WHETHER USAGE CREDITS CARRY THE SESSION (accounts v2
-/// S5): `credits=in-use` beside `wall=none` on the measured 2.1.300 credits
-/// screens — credits are no wall — and `"credits":"in-use"` in the JSON; the
-/// watchdog's retry row is a turn in progress, no wall, with `credits=-`.
-/// NEGATIVE CONTROL: an ordinary screen says `credits=-` and
-/// `"credits":null`.
+/// `harness limits` says whether usage credits carry the session: `credits=in-use` beside
+/// `wall=none` on the 2.1.300 credits screens (credits are no wall) and `"credits":"in-use"` in
+/// the JSON; the watchdog's retry row is a turn in progress, no wall, with `credits=-`. Negative
+/// control: an ordinary screen says `credits=-` and `"credits":null`.
 #[test]
 fn harness_limits_says_whether_credits_carry_the_session() {
     use aterm_phase::prompt::fixtures::{
@@ -5628,9 +5599,7 @@ fn the_accounts_report_shows_the_record_of_usage() {
     assert!(!row("work-2").contains("credits:"), "{out}");
 }
 
-// ---------------------------------------------------------------------------
 // The usage tap
-// ---------------------------------------------------------------------------
 
 /// `usage` shows the tap's last reading of its own process: the file this tab and
 /// `CLAUDE_PID` name, written since that process started (the HUD's figures and the reading's
@@ -5832,9 +5801,7 @@ fn a_figure_held_only_in_the_sample_is_shown_by_both_views() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // accounts stats
-// ---------------------------------------------------------------------------
 
 /// The account id the composed profiles carry (invented).
 const STATS_UUID: &str = "0f6c2b8e-1d3a-4c5e-9b7f-2a4d6e8c0b1a";

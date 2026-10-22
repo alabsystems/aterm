@@ -1634,7 +1634,7 @@ fn a_writers_wait_carries_its_words() {
     );
 }
 
-/// A WORKER'S NEEDS YOU ENTRY IS AN ASK (FOREVER CRUISE / FOREVER LAND): the
+/// A WORKER'S NEEDS YOU ENTRY IS AN ASK (Autopilot Cruise / Land): the
 /// loop raises `owner=needs kind=ask "<program> needs you: … — carrying on"`
 /// for a report's `NEEDS YOU:` lines, and the classifier reads it as the ask
 /// it is — the border, the pill, `◇`, `❯N` and the menu bar's "needs you" —

@@ -1332,9 +1332,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Ending a child's whole group: the ceiling and an interrupt.
-    // -----------------------------------------------------------------------
 
     /// How long a grandchild that must be gone gets to go: a hang detector (a
     /// killed grandchild is reaped by launchd, and a loaded machine takes its
@@ -1600,9 +1598,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    // -----------------------------------------------------------------------
     // In-process walks under the ceiling, and the children they launch.
-    // -----------------------------------------------------------------------
 
     /// A walk answers, panics or outlives its ceiling; only the first is an
     /// answer, and a hung one never holds the caller past the ceiling.

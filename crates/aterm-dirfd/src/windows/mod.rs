@@ -186,9 +186,7 @@ pub use std::os::windows::io::{
     AsHandle as AsFd, BorrowedHandle as BorrowedFd, OwnedHandle as OwnedFd,
 };
 
-// ---------------------------------------------------------------------------
 // Errno
-// ---------------------------------------------------------------------------
 
 /// A Win32 error code — the Windows reading of the unix half's `errno` (see
 /// the module docs' "Errors" for the mapping and for why only [`Self::NOENT`]
@@ -360,9 +358,7 @@ impl From<Errno> for std::io::Error {
 /// This crate's result type.
 pub type Result<T> = std::result::Result<T, Errno>;
 
-// ---------------------------------------------------------------------------
 // Names
-// ---------------------------------------------------------------------------
 
 /// A name handed to a handle-relative call: ONE component, as UTF-16.
 ///
@@ -403,9 +399,7 @@ impl<A: AsRef<OsStr>> Arg for A {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Flags
-// ---------------------------------------------------------------------------
 
 flags! {
     /// How [`openat`] opens: the unix flag names, read as Windows rights and
@@ -499,9 +493,7 @@ flags! {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Cloud placeholders
-// ---------------------------------------------------------------------------
 
 /// This thread switched to seeing cloud placeholders as what they are
 /// (`PHCM_EXPOSE_PLACEHOLDERS`) until the guard drops, which puts back the
@@ -560,9 +552,7 @@ impl Drop for ExposedPlaceholders {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Identity and stat
-// ---------------------------------------------------------------------------
 
 /// A file's identity: `FILE_ID_INFO`'s volume serial number and file id.
 ///
@@ -877,9 +867,7 @@ fn guid_of_volume_path(path: &[u16]) -> Option<String> {
     shaped.then(|| guid.to_ascii_lowercase())
 }
 
-// ---------------------------------------------------------------------------
 // Ownership
-// ---------------------------------------------------------------------------
 
 /// A security identifier (`SID`) in its binary form: who owns a file
 /// ([`owner`]), or who this process runs as ([`Sid::current_user`]).
@@ -1048,9 +1036,7 @@ pub fn owner<Fd: AsHandle>(fd: Fd) -> Result<Sid> {
     sid
 }
 
-// ---------------------------------------------------------------------------
 // The opens
-// ---------------------------------------------------------------------------
 
 /// Whether `OBJ_DONT_REPARSE` is still passed: cleared once a kernel refuses
 /// it (module docs).
@@ -1454,9 +1440,7 @@ fn open_root(root: &OsStr) -> Result<OwnedHandle> {
     Ok(handle)
 }
 
-// ---------------------------------------------------------------------------
 // Deletion
-// ---------------------------------------------------------------------------
 
 /// `unlinkat(2)`'s twin, with the identity the name must still carry: open
 /// `name` under `dirfd` for `DELETE` (sharing everything, never following),
@@ -1660,9 +1644,7 @@ fn unsupported(e: Errno) -> bool {
     .contains(&e.0)
 }
 
-// ---------------------------------------------------------------------------
 // Directory reading
-// ---------------------------------------------------------------------------
 
 /// One directory entry, as the directory index lists it: name, identity,
 /// kind and sizes — and no time (module docs, "Freshness").
@@ -1940,9 +1922,7 @@ impl Iterator for Dir {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Test seam
-// ---------------------------------------------------------------------------
 
 #[cfg(any(test, debug_assertions))]
 thread_local! {

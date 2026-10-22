@@ -273,9 +273,7 @@ impl std::fmt::Debug for WireBuffer {
 /// to surface to the agent through `sudo`'s stderr or an `ERR askpass` line.
 pub type AttestError = String;
 
-// ---------------------------------------------------------------------------
 // macOS
-// ---------------------------------------------------------------------------
 
 #[cfg(target_vendor = "apple")]
 mod imp {

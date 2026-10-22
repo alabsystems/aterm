@@ -32,13 +32,13 @@
 //! that we recently included" (Iosevka Term, below), by two judged render
 //! farms drawn through aterm at the owner's 96 DPI:
 //!
-//! * Round 1 judged the bundled Iosevka Term (Regular) at 16 to 18 px against
+//! * judged the bundled Iosevka Term (Regular) at 16 to 18 px against
 //!   Cascadia Mono PL at 16 px, and it lost on three counts: its Regular
 //!   weight is too light there (ink per cell 18.9 at 17 px against Cascadia's
 //!   26.85), on a 1.0 line its accented capitals' marks touched the
 //!   descenders of the row above (42 of their pixels at 17 px), and its
 //!   `calt` ligatures (`=>` drawn as `⇒`, `!=` as `≠`) were a deal-breaker.
-//! * Round 2 answered each: heavier cuts of the same design, a taller line,
+//! * answered each: heavier cuts of the same design, a taller line,
 //!   no ligatures. SemiBold at 17 px on a 1.1 line (the render named J2-lh11:
 //!   cell 9x23, ink per cell 24.12, 49.1% of ink pixels solid and 23% faint,
 //!   NO accent pixel touching a descender) scored a mean of 7.5 with no
@@ -207,9 +207,8 @@
 /// into this build. Iosevka Term has its own switch ([`IOSEVKA_ACTIVE`]).
 pub const ACTIVE: bool = cfg!(all(feature = "embedded-font", not(target_os = "macos")));
 
-/// Whether this build compiles in the Cascadia Mono PL faces: the stack is
-/// active AND the target is Windows. Everywhere else the `CASCADIA_*`
-/// identities below resolve to nothing.
+/// Whether this build compiles in the Cascadia Mono PL faces: the stack is active and the
+/// target is Windows. Everywhere else the `CASCADIA_*` identities resolve to nothing.
 pub const CASCADIA_ACTIVE: bool = cfg!(all(feature = "embedded-font", windows));
 
 /// The virtual identity scheme for bundled faces.
@@ -238,11 +237,8 @@ pub const CASCADIA_ITALIC_ID: &str = "bundled:Cascadia Mono PL Italic";
 /// The bundled Cascadia Mono PL's bold-italic face identity.
 pub const CASCADIA_BOLD_ITALIC_ID: &str = "bundled:Cascadia Mono PL Bold Italic";
 
-/// Whether this build compiles in the Iosevka Term faces: wherever the stack
-/// feature is on, macOS INCLUDED — unlike the rest of the stack it is never a
-/// default and never a chain face, only a family a user names
-/// (`font_family = "Iosevka Term"`), so it means the same face on every
-/// machine ([`IOSEVKA_FAMILY`]).
+/// Whether this build compiles in the Iosevka Term faces: wherever the stack feature is on,
+/// macOS included. Never a default or a chain face, only a family a user names.
 pub const IOSEVKA_ACTIVE: bool = cfg!(feature = "embedded-font");
 
 /// Iosevka Term's family name, as a user types it (name ID 1 of all four
@@ -284,7 +280,7 @@ pub const IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID: &str = "bundled:Iosevka Term Semibold
 /// Semibold on Windows, JetBrains Mono on every other non-macOS target.
 #[cfg(windows)]
 pub const PRIMARY_FAMILY: &str = IOSEVKA_SEMIBOLD_FAMILY;
-/// The bundled PRIMARY's family name, as a user types it.
+/// The bundled primary's family name, as a user types it.
 #[cfg(not(windows))]
 pub const PRIMARY_FAMILY: &str = JETBRAINS_FAMILY;
 /// The bundled primary's virtual identity (regular face).
@@ -296,19 +292,19 @@ pub const PRIMARY_ID: &str = JETBRAINS_ID;
 /// The bundled primary's bold face identity.
 #[cfg(windows)]
 pub const PRIMARY_BOLD_ID: &str = IOSEVKA_SEMIBOLD_BOLD_ID;
-/// The bundled primary's BOLD face identity.
+/// The bundled primary's bold face identity.
 #[cfg(not(windows))]
 pub const PRIMARY_BOLD_ID: &str = JETBRAINS_BOLD_ID;
 /// The bundled primary's italic face identity.
 #[cfg(windows)]
 pub const PRIMARY_ITALIC_ID: &str = IOSEVKA_SEMIBOLD_ITALIC_ID;
-/// The bundled primary's ITALIC face identity.
+/// The bundled primary's italic face identity.
 #[cfg(not(windows))]
 pub const PRIMARY_ITALIC_ID: &str = JETBRAINS_ITALIC_ID;
 /// The bundled primary's bold-italic face identity.
 #[cfg(windows)]
 pub const PRIMARY_BOLD_ITALIC_ID: &str = IOSEVKA_SEMIBOLD_BOLD_ITALIC_ID;
-/// The bundled primary's BOLD-ITALIC face identity.
+/// The bundled primary's bold-italic face identity.
 #[cfg(not(windows))]
 pub const PRIMARY_BOLD_ITALIC_ID: &str = JETBRAINS_BOLD_ITALIC_ID;
 
@@ -405,7 +401,7 @@ mod bytes {
 }
 
 /// The bytes behind one virtual identity, or `None` for anything that is not a
-/// bundled identity in THIS build (on macOS: the Iosevka Term faces alone).
+/// bundled identity in this build (on macOS: the Iosevka Term faces alone).
 #[cfg(feature = "embedded-font")]
 #[must_use]
 pub fn face_for_id(id: &str) -> Option<&'static [u8]> {
@@ -589,24 +585,12 @@ const PRIMARY_FAMILIES: [[&str; 4]; 4] = [
 ///
 /// Measured over U+0041..U+024F in each face's `glyf` boxes:
 ///
-/// * Cascadia Mono PL 2407.24: the comma-below and cedilla letters — Romanian
-///   `ș ț Ș Ț`, Latvian `ķ ļ ņ ŗ Ģ Ķ Ļ Ņ Ŗ` — reach 568 of 2048 units (Regular,
-///   Italic) and 608 (Bold, Bold Italic), past a line descent of 480. On the
-///   vendor's line the 16 px cell (9x19, baseline 15) cut their commas off (a
-///   regular `ș` drew 13 of its 14 rows, a bold one 13 of 15) and a `j`
-///   reached the cell's last row, so it fused with the caron of an `Š` drawn
-///   on the next row: the hinter lifts Cascadia's capitals from 11.09 px to
-///   12 at 16 px, and their accents ink the row above the cell. On this floor
-///   the cell is 9x21 at 16 px, same baseline: every comma whole, at every
-///   size from 8 to 64 px (no row of 1/8 coverage or more past the cell), and
-///   one clear row between a `j` and the accents under it at 16 px. That row
-///   is not there at every size — 0 at 10, 11, 15, 18, 20, 22, 24 and 33 px,
-///   where they touch, and the hinted accents overlap the descenders by a
-///   row at 9 and 14 px — as the hinter's rounding falls.
-/// * JetBrains Mono 2.304: 240 of 1000, inside its 300 descent. No change.
-/// * Iosevka Term 34.9.0 (measured 2026-10-14, all four faces): 256 of 1000,
-///   inside its 285 descent (ascent 965, no lineGap: a 1.25 em line). No
-///   change.
+/// * Cascadia Mono PL 2407.24: the comma-below and cedilla letters (Romanian `ș ț`, Latvian
+///   `ķ ļ ņ ŗ`) reach 568 of 2048 units (608 in the bold faces), past a line descent of 480
+///   that cuts their commas off in the vendor's 9x19 cell at 16 px. On this floor the cell is
+///   9x21, same baseline 15.
+/// * JetBrains Mono 2.304: 240 of 1000, inside its 300 descent.
+/// * Iosevka Term 34.9.0: 256 of 1000, inside its 285 descent.
 /// * Iosevka Term Semibold (measured 2026-10-16, its SemiBold, ExtraBold and
 ///   both italics): 259 of 1000, inside the same 285 descent. No change: the
 ///   clear row between lines it needs is the Windows 1.1 line height's, not
@@ -1029,7 +1013,7 @@ pub fn supersedes_system_face(path: &str) -> bool {
             .is_some_and(|n| SUPERSEDED_SYSTEM_FILES.contains(&n))
 }
 
-/// Families the bundled stack makes selectable by NAME (for `list-fonts`): the
+/// Families the bundled stack makes selectable by name (for `list-fonts`): the
 /// primary first, on Windows Cascadia Mono PL (the default before it) and
 /// JetBrains Mono beside it, and Iosevka Term everywhere (macOS included,
 /// where it is the one).
@@ -1168,8 +1152,7 @@ mod tests {
     fn the_letter_floor_is_the_familys_deepest_latin_letter() {
         let per_em = |id: &str| letter_descent_floor(face_for_id(id).unwrap());
         if IOSEVKA_ACTIVE {
-            // Iosevka Term: 256 of 1000 (the comma-below letters), inside
-            // its 285 descent — the floor exists and changes nothing.
+            // Iosevka Term: 256 of 1000, inside its 285 descent.
             for id in IOSEVKA_FACES {
                 assert_eq!(per_em(id), Some(-0.256), "{id}");
             }
@@ -1185,13 +1168,12 @@ mod tests {
             assert!(letter_descent_floor(crate::embedded_font()).is_none());
             return;
         }
-        // JetBrains Mono: 240 of 1000 (the comma-below letters), inside its
-        // 300 descent — the floor exists and changes nothing.
+        // JetBrains Mono: 240 of 1000, inside its 300 descent.
         for id in JETBRAINS_FACES {
             assert_eq!(per_em(id), Some(-0.24), "{id}");
         }
         if CASCADIA_ACTIVE {
-            // Cascadia Mono PL: the BOLD faces' 608 of 2048 governs all four.
+            // Cascadia Mono PL: the bold faces' 608 of 2048 governs all four.
             for id in CASCADIA_FACES {
                 assert_eq!(per_em(id), Some(-608.0 / 2048.0), "{id}");
             }
@@ -1950,8 +1932,7 @@ mod tests {
             ('↵', &dejavu),
             ('★', &dejavu),
             ('⚙', &dejavu),
-            // Media / technical: Noto Sans Symbols 2 — a REAL glyph now beats
-            // the synthetic tier that drew these before the stack shipped.
+            // Media / technical: Noto Sans Symbols 2.
             ('⏴', &sym2),
             ('⏵', &sym2),
             ('⏶', &sym2),
@@ -2093,11 +2074,8 @@ mod tests {
         }
     }
 
-    /// `ch` resolves to the runtime tier's I/O-free EMBEDDED lane — the
-    /// compiled-in Symbols Nerd Font — in every style: the regular key names
-    /// [`FaceId::RuntimeFallback`], the decision the rasterizer recovers it
-    /// from is the embedded face, and the bold / italic / bold-italic keys are
-    /// that same face's (never a styled sibling of the primary).
+    /// `ch` resolves to the compiled-in Symbols Nerd Font through the runtime tier's embedded
+    /// lane, in every style (never a styled sibling of the primary).
     #[cfg(all(windows, feature = "embedded-font"))]
     fn assert_embedded_nerd_lane(r: &mut Renderer, ch: char) {
         use crate::StyleBits;
@@ -2244,9 +2222,8 @@ mod tests {
             );
             assert_eq!(ink, want, "U+{:04X}: the measured ink box moved", ch as u32);
         }
-        // CONTROL: the runtime tier closed, so the primary keeps its own glyph —
-        // the defect as measured on the renders: rows -3..18, and a column
-        // either side of the 9-px cell too.
+        // Control: with the runtime tier closed the primary keeps its own glyph, which
+        // leaves the cell by three rows above and a column either side.
         let mut closed = cascadia(16.0);
         closed.set_runtime_font_discovery(false);
         closed.seal_admitted_font_sources();

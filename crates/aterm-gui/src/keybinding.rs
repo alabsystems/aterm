@@ -148,11 +148,10 @@ pub(crate) enum Action {
     /// live, Enter keeps it, Esc reverts. Unbound by default; bind it in
     /// `[keybindings]` (e.g. `ctrl+shift+k = "choose_theme"`).
     ChooseTheme,
-    /// Edit the FOCUSED PANE's session pin in place on the tab strip — the
-    /// keyboard face of Window ▸ Rename Session… and of double-clicking a tab.
-    /// It renames the SESSION (`meta set title`), not the tab: a tab can hold
-    /// several split sessions. No chord by default — bind it in `[keybindings]`
-    /// (e.g. `ctrl+shift+r = "rename_session"`).
+    /// Edit the focused pane's session pin in place on the tab strip (Window ▸
+    /// Rename Session…, or double-clicking a tab). It renames the session
+    /// (`meta set title`), not the tab: a tab can hold several split sessions.
+    /// Unbound by default.
     RenameSession,
     /// Select the visible screen as whole lines (Edit ▸ Select All,
     /// `App::select_all`). Default Ctrl+Shift+A off macOS; ⌘A is a menu equivalent
@@ -914,10 +913,9 @@ impl Keybindings {
         ("ctrl+shift+right", "next_tab"),
         #[cfg(not(windows))]
         ("ctrl+shift+left", "prev_tab"),
-        // The document-window reflex every Windows app answers. Ctrl+Tab is
-        // indistinguishable from a bare Tab in the LEGACY encoding, so nothing
-        // that works today loses a keystroke; a kitty-protocol app does lose
-        // its `ESC[9;5u`, which is the same trade Windows Terminal makes.
+        // The document-window reflex every Windows app answers. Ctrl+Tab is a bare
+        // Tab in the legacy encoding, so only a kitty-protocol app loses its
+        // `ESC[9;5u`, the trade Windows Terminal makes.
         #[cfg(windows)]
         ("ctrl+tab", "next_tab"),
         #[cfg(windows)]

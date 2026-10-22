@@ -3102,7 +3102,7 @@ pub struct ReadClock<'a> {
 /// the Claude home the process ran under in front of it where that is not
 /// the shell's of a user whose home is `user_home`
 /// ([`super::resume::home_env`]: its `CLAUDE_CONFIG_DIR`, or the `HOME` that
-/// holds `claude_dir`; ATERM-KI-1015-1 LC-4 — the line every other surface
+/// holds `claude_dir` LC-4 — the line every other surface
 /// tells for it). `launch` is asked once with the registry entry for its
 /// launch facts and argv.
 ///

@@ -205,12 +205,9 @@ impl SemanticPrewarmWorker {
         Self::spawn_serialized_by(&SEMANTIC_PREWARM_GATE, crate::qos::Role::Background)
     }
 
-    /// `gate` is the serialization mutex for heavyweight warmups — the
-    /// process-wide [`SEMANTIC_PREWARM_GATE`] in production. Worker-mechanics
-    /// unit tests pass a private gate so their staged coalescing windows and
-    /// bounded landing waits never queue behind another test's warmup (nor
-    /// stall anyone else's): the worker protocol under test is identical, the
-    /// serialization domain is per-test.
+    /// `gate` serializes heavyweight warmups: [`SEMANTIC_PREWARM_GATE`] in production; worker
+    /// unit tests pass a private gate so their staged windows never queue behind another
+    /// test's warmup.
     ///
     /// `role` is the worker's class: [`crate::qos::Role::Background`] in
     /// production, where nothing waits on a warmup. Those tests wait on it and

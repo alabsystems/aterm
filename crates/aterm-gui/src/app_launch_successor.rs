@@ -869,11 +869,9 @@ fn begin_launch_validated(
         if workspace.is_null() {
             return;
         }
-        // The completion handler is a BLOCK, so the parameter is spelled
-        // `*mut c_void` rather than `Id`: a block is `@?` to the runtime, not
-        // `@`. It does not matter for a SEND — nothing reads an encoding here —
-        // but writing it as an object would be the shape that, in a DECLARED
-        // method, registers the wrong letter.
+        // The completion handler is a block, so the parameter is `*mut c_void`, not `Id`: a block
+        // is `@?` to the runtime, not `@`. A send reads no encoding, but the object spelling in a
+        // declared method would register the wrong letter.
         let open: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, *mut c_void) =
             aterm_objc::checked_msg();
         open(

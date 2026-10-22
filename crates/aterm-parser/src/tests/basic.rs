@@ -101,7 +101,7 @@ fn cancel_aborts_sequence() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // Start CSI sequence, then CAN (0x18) aborts it
+    // CAN (0x18) inside a CSI cancels it and is executed.
     parser.advance_fast(b"\x1b[31\x18Hello", &mut sink);
 
     assert!(sink.executes.contains(&0x18));
@@ -114,7 +114,7 @@ fn esc_interrupts_sequence() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // Start CSI sequence, then ESC starts new sequence
+    // ESC inside a CSI starts a new sequence.
     parser.advance_fast(b"\x1b[31\x1b[32m", &mut sink);
 
     assert_eq!(sink.csi_dispatches.len(), 1);

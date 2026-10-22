@@ -123,7 +123,7 @@ pub(crate) const WHY_LANDED: &str = "landed";
 pub(crate) const TASK_WHY: &[&str] = &[
     // `done`: Autopilot Land landed the work: a clean `Nothing left:`
     // defense at a land act's yield, over a repository holding nothing the
-    // remote main lacks (FOREVER LAND). The one `done` a harness writes.
+    // remote main lacks (Autopilot Land). The one `done` a harness writes.
     WHY_LANDED,
     // `done`, READ ONLY: an older build's retired token rule. A record it
     // carried across a seamless update (or a rollback) still parses; no

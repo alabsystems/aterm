@@ -868,7 +868,7 @@ fn the_proof_digests_do_not_see_the_sidecar() {
     let mut with = outgoing(&term, &turns, Some(7));
     // The foreground holder rides the record, and is in neither digest either.
     with.fg_holders = vec![(0, 4242)];
-    // So does the render debt (R08).
+    // So does the render debt.
     with.render_debts = vec![(0, aterm_core::terminal::RenderDebt::of_rows(-1, 0))];
     let without = StageCarry {
         screens: with.screens.clone(),

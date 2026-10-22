@@ -1262,9 +1262,7 @@ pub(crate) static GRAPHEME_BREAK: [[bool; 15]; 15] = [
     ],
 ];
 
-// ---------------------------------------------------------------------------
 // Indic Conjunct Break (InCB) property -- used only by UAX #29 GB9c.
-// ---------------------------------------------------------------------------
 
 /// InCB property values. `None` (default) is represented by absence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

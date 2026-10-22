@@ -28,9 +28,10 @@
 //!    gone, reaps it at once) — one successor session posts a note to the
 //!    other. aterm queues it: its bridge is standing by.
 //! 4. The successor's bridge takes the dir at its next try, begins its run
-//!    (its durable OPEN fence, `StateDir::begin_run`), publishes the node row
-//!    and both sessions' presence rows under its own pid and incarnation, and
-//!    drains the gap's post, which its recipient's `await inbox` answers.
+//!    (its durable OPEN fence, two full flushes, `StateDir::begin_run`),
+//!    publishes the node row and both sessions' presence rows under its own
+//!    pid and incarnation, and drains the gap's post, which its recipient's
+//!    `await inbox` answers.
 //!
 //! The successor is then the holder, and the next round hands it off in turn:
 //! `rounds=` handoffs, each one sampled window of the broker's heads, read off
@@ -81,7 +82,7 @@ const STANDBY_POLL: Duration = Duration::from_secs(1);
 /// 966 ms, twice). Spread, the rounds sample the poll; in use the phase is
 /// whatever the update's own steps make it. The steps are counted from the
 /// setup, not from the poll, and the setup starts at the standby's report of
-/// a failed try, so round 1 lands just after a try (2026-10-22: 20-36 ms) and
+/// a failed try, so lands just after a try (2026-10-22: 20-36 ms) and
 /// the rounds sit near 0.03, 0.37 and 0.70 of the poll: their mean wait is
 /// about 0.63 of it, above a uniformly placed exit's half. Pure (unit-tested).
 fn phase_of(n: usize, rounds: usize) -> Duration {
@@ -416,7 +417,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
 #[cfg(test)]
 mod tests {
 
-    /// THE ROUNDS SPREAD OVER ONE POLL: round 1 quits at once, and each later
+    /// THE ROUNDS SPREAD OVER ONE POLL: quits at once, and each later
     /// one a further `1/rounds` of the poll in, never a whole poll.
     #[test]
     fn the_rounds_quit_spread_over_one_standby_poll() {

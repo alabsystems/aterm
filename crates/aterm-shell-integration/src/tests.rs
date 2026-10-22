@@ -2080,9 +2080,7 @@ fn test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // WSL and cmd.exe
-// ---------------------------------------------------------------------------
 
 /// The WSL injection crosses into the distro through `WSLENV` (ours first, see
 /// below) and runs as `wsl --exec /bin/sh -c <program>` — `--exec` keeps argv
@@ -2494,7 +2492,6 @@ fn test_fish_fallback_prompt_survives_a_missing_hostname() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The multiplexer boundary (screen / tmux)
 //
 // aterm hosts ONE session per PTY; start `screen` or `tmux` in it and every pane
@@ -2507,7 +2504,6 @@ fn test_fish_fallback_prompt_survives_a_missing_hostname() {
 // the detection trustworthy: aterm's spawn seam forces
 // `$ATERM_SHELL_INTEGRATION_INSTALLED` EMPTY for every session it starts, so a
 // NON-empty value means we did not come straight from aterm.
-// ---------------------------------------------------------------------------
 
 /// Source a script under `shell` in a synthesized environment and report the
 /// boundary variables it left behind, plus whatever it said on stderr.
@@ -2729,10 +2725,8 @@ fn test_each_shell_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Live: a tab that is already open picks up the managed dirs atpkg lays after its shell
 // started (a seamless update adopts the old shell), with no new tab.
-// ---------------------------------------------------------------------------
 
 /// The atpkg hook in `crates/atpkg/src/hooks.rs`'s exact format: a golden of `hook_files()`
 /// for three fixture paths, pinned from atpkg's side
@@ -2941,7 +2935,7 @@ impl LiveShell {
     /// a tab's shell. A test process launched by a non-interactive shell's `&`
     /// inherits both ignored, std keeps an ignored disposition across exec, and
     /// bash keeps a signal ignored at its entry ignored in every job: a ^C into
-    /// a command then ended nothing on a healthy tty (`133;D;0`, the round-4
+    /// a command then ended nothing on a healthy tty (`133;D;0`, the
     /// profile's failure of the bash tty test).
     fn spawn(label: &str, cmd: &mut Command) -> Self {
         use aterm_uds::spawnfd::InheritNothing as _;

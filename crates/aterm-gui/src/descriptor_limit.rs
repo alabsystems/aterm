@@ -6,7 +6,7 @@
 //! launcher's limit every shell is handed back. POSIX alone (`getrlimit`,
 //! `setrlimit`, `fcntl`), so every Unix lane takes it: macOS's launched lane
 //! and both platforms' fork lane and cold lane. Moved out of
-//! `handoff_rendezvous`, which is macOS's (ATERM-KI-1015-2, U9).
+//! `handoff_rendezvous`, which is macOS's.
 
 use crate::handoff_env::HandoffName;
 
@@ -46,7 +46,7 @@ enum SuccessorLane {
 /// [`SUCCESSOR_DESCRIPTOR_FLOOR`] ([`raised_soft_limit`]): room for the grant,
 /// and for the wake pipe and exit witness each adopted session opens.
 ///
-/// THE FORK LANE NEEDS IT TOO (ATERM-KI-1015-2, U9). Only the launched lane's
+/// THE FORK LANE NEEDS IT TOO. Only the launched lane's
 /// claim raised the limit, and a forked successor inherits its predecessor's. A
 /// producer that never raised its own — any build before round eight's park
 /// raise, started from the Dock at launchd's 256 — handed its sessions to a
@@ -60,7 +60,7 @@ enum SuccessorLane {
 /// ([`OlderImageLimit`]). A forked successor that inherited room raises
 /// nothing, and keeps whatever record it adopted.
 ///
-/// Every Unix successor settles here (ATERM-KI-1015-2, U9): the fork lane is
+/// Every Unix successor settles here: the fork lane is
 /// POSIX, and a Linux fork-lane successor once kept whatever limit its producer
 /// held, with no raise and no carried launcher limit. Only macOS has the
 /// launched lane's rendezvous; elsewhere nothing sets it.
@@ -144,7 +144,7 @@ pub(crate) fn launcher_soft_descriptor_limit() -> Option<u64> {
 /// inherited the raise. A park's raise is the one nothing before it made, and
 /// so the one an OLDER successor must not be started at
 /// ([`OlderImageLimit`]): set by the park's raise that moved the limit, by a
-/// forked successor's own raise (ATERM-KI-1015-2, U9 — none was made before
+/// forked successor's own raise (U9 — none was made before
 /// it either), or adopted from a predecessor that held one
 /// ([`ENV_PARK_RAISED_FROM`]), and cleared by a claim's or a recovery's, after
 /// which the raise is one the process would have held anyway.
@@ -196,7 +196,7 @@ const TAKES_PARK_RAISED_FROM_BUILD: u64 = 1_791_501_389;
 /// lane's `exec` alike. Nothing when this process never raised its limit, so
 /// its shells already get what it runs at.
 ///
-/// ONLY TO A TARGET THAT TAKES IT (ATERM-KI-1015-2, U1). A successor built
+/// ONLY TO A TARGET THAT TAKES IT. A successor built
 /// before the name ([`TAKES_LAUNCHER_NOFILE_FROM_BUILD`]) never reads it and
 /// leaves it in its environment: every shell of a rollback to it carried the
 /// launcher's limit, and a newer aterm started from one adopted it as its own
@@ -233,7 +233,7 @@ pub(crate) fn carry_launcher_limit(
 }
 
 /// A CARRIED LIMIT IS AN UPDATE'S WORD TO ITS SUCCESSOR, AND NOTHING ELSE'S
-/// (ATERM-KI-1015-2, U1). Every lane that names [`ENV_LAUNCHER_NOFILE`] or
+/// . Every lane that names [`ENV_LAUNCHER_NOFILE`] or
 /// [`ENV_PARK_RAISED_FROM`] — the fork lane's child, the cold lane's `exec` —
 /// names `ATERM_UPDATED_FROM` beside it (`update_launch`), and every build
 /// takes that one out of its environment before any shell. A copy on any
@@ -999,7 +999,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// EVERY LANE SETTLES ITS DESCRIPTOR LIMIT IN ONE PLACE (ATERM-KI-1015-2,
+    /// EVERY LANE SETTLES ITS DESCRIPTOR LIMIT IN ONE PLACE (
     /// U9). In a child whose soft limit leaves 64 to spare: a cold launch
     /// raises nothing; a launched successor raises and its raise is a claim's
     /// (a park's record is cleared); a second settle with room raises nothing
@@ -1055,7 +1055,7 @@ pub(crate) mod tests {
         assert_eq!(park_raised_from(), None, "and the record stays the claim's");
     }
 
-    /// A STRAY LAUNCHER LIMIT IS NOBODY'S (ATERM-KI-1015-2, U1). A window
+    /// A STRAY LAUNCHER LIMIT IS NOBODY'S. A window
     /// whose limit a park raised updates; its successor is a build that never
     /// reads the names (every release up to v0.99.0, reached by a rollback,
     /// played here by a stand-in that takes neither) and so leaves them in the
@@ -1143,7 +1143,7 @@ pub(crate) mod tests {
         successor.spawn().passed();
     }
 
-    /// ONLY A TARGET THAT TAKES THE NAMES IS TOLD THEM (ATERM-KI-1015-2, U1):
+    /// ONLY A TARGET THAT TAKES THE NAMES IS TOLD THEM:
     /// a successor built before a name leaves it in its shells' environment.
     /// Toward v0.98.0 neither is named, toward v0.100.0 the launcher's limit
     /// alone, and from v0.101.0 on both.

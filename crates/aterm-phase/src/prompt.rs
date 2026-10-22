@@ -261,7 +261,7 @@
 //! composer is gone.
 //!
 //! **A WRAPPED TITLE** (`title_line`; MEASURED on 2.1.300, the harness sweep
-//! of 2026-10-15, ATERM-KI-1015-1 W2 and F3; the fixtures
+//! of 2026-10-15 and F3; the fixtures
 //! `claude-2.1.300-*-NNcol.txt`). A title is one line, which Ink wraps too:
 //! the usage-limit dialog's `What do you want to` over `do?` at 26 columns,
 //! a skill box's `Use skill` over `"<name>"?` under ~48, a held message's
@@ -280,7 +280,7 @@
 //! Claude Code draws a box's body straight under its title at the title's
 //! column (a file box's path, a Bash box's description and its `Tip:` row),
 //! and a long body row reads to the rule as the rest of a full title row
-//! (the review of round 20: at 50 columns `Bash command · from the
+//! (at 50 columns `Bash command · from the
 //! general-purpose agent` took `Show status` and was no Bash header; `Edit
 //! file` took a long path, and the path was read off the dashed rule under
 //! it). So a row that is a whole title alone takes no row under it, and a
@@ -485,7 +485,7 @@ pub enum PromptKind {
     /// ` Run a dynamic workflow?`.
     Workflow,
     /// The folder-trust dialog, ` Accessing workspace:` (2.1.280, measured):
-    /// unnumbered options, the cursor on `No, exit`, and a cancel that EXITS
+    /// unnumbered options, the cursor on `No, exit`, and a cancel that exits
     /// Claude Code — or, when the folder pre-approves grants (the gated-
     /// grants backstop), `No, continue without these permissions`, whose
     /// cancel declines them and goes on.
@@ -2452,7 +2452,7 @@ const HINT_ROWS: usize = 8;
 /// row ends (MEASURED on 2.1.300, the fixtures
 /// `claude-2.1.300-plan-ready-NNcol.txt`): read a row at a time the path
 /// row was no hint and no option, and the dialog was no box — `idle`, never
-/// escalated or answered (ATERM-KI-1015-1 F3).
+/// escalated or answered (F3).
 fn last_hint(rows: &[String]) -> Option<(usize, usize)> {
     let width = crate::question::screen_width(rows);
     let last = rows
@@ -4925,7 +4925,7 @@ pub mod fixtures {
     pub const MCP_TRAILING_BLANK_ROWS_IN_FIRST_BLOCK_THEN_LOGIN_PHRASE_MEASURED: &str = include_str!(
         "fixtures/claude-2.1.294-mcp-trailing-blank-rows-in-first-block-then-login-phrase.txt"
     );
-    /// MEASURED on 2.1.302 (the lab, 2026-10-16, ATERM-KI-1015-14): a
+    /// MEASURED on 2.1.302 (the lab, 2026-10-16): a
     /// program's words behind one of Claude Code's own LABELS, the reply after
     /// them empty, so they are the last thing said. A Monitor's event is ONE
     /// row, `⏺ Monitor event: <the first line the command printed> · <the
@@ -4970,7 +4970,7 @@ pub mod fixtures {
     /// to continue`).
     pub const MONITOR_EVENT_THEN_CONTEXT_WALL_MEASURED: &str =
         include_str!("fixtures/claude-2.1.302-monitor-event-then-context-wall.txt");
-    /// MEASURED on 2.1.302 (the lab, 2026-10-16, ATERM-KI-1015-14, the review
+    /// MEASURED on 2.1.302 (the lab, 2026-10-16, the review
     /// of the first pass): a hook's words on a row of Claude Code's own with
     /// NO label, the reply after them empty. A Stop hook that answers
     /// `{"continue": false, "stopReason": "Not logged in · Please run
@@ -5560,7 +5560,7 @@ pub mod fixtures {
     /// Claude Code 2.1.302, measured in the real-Claude lab: a multi-select
     /// with the long-term policy text typed into its free-text row, then
     /// `down` to `Submit`, at the widths where the text kept every row and
-    /// round 20's rule, which did not know the column the text lands in, gave
+    /// the prior rule, which did not know the column the text lands in, gave
     /// up on it (`[✔]Decide` at column 8 up to 51 columns, column 9 above):
     /// `(columns, the dialog from its top rule to its footer)`.
     pub const QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302: [(u16, &str); 9] = [
@@ -8657,7 +8657,7 @@ mod tests {
     /// and left the session stalled past the reset; the wait row is the one
     /// option with a role. (Which row the supervisor chooses, for every
     /// spelling and order, is `aterm-agent`'s `approval_tests.rs`.) At 26
-    /// columns (ATERM-KI-1015-1 W2, MEASURED on 2.1.300) Ink wraps the title
+    /// columns (W2, MEASURED on 2.1.300) Ink wraps the title
     /// (`What do you want to` over `do?`): the `›` cursor its title allows is
     /// read off the joined title, not its first row. The controls: the same
     /// question over other rows is not it.
@@ -9092,7 +9092,7 @@ mod tests {
         r[top..].join("\n")
     }
 
-    /// ATERM-KI-1016-1, "Dialogs in narrow panes". Each label below Ink wraps
+    /// , "Dialogs in narrow panes". Each label below Ink wraps
     /// in a narrow pane where a row-by-row reading cuts it: at a capital
     /// that is a name, mid-sentence (the held message's `Deliver this
     /// message to` over `Claude` under 34 columns; Computer Use's `Deny, and
@@ -9149,7 +9149,7 @@ mod tests {
         assert_eq!(p.options[2].label, "Upgrade your plan");
     }
 
-    /// ATERM-KI-1015-1 F3 (the harness sweep of 2026-10-15, Claude Code
+    /// F3 (the harness sweep of 2026-10-15, Claude Code
     /// 2.1.300): plan mode's `Ready to code?` draws its `ctrl+g to edit in Vim
     /// · <plan file>` hint under its options, and in a pane narrower than the
     /// hint (about 70 columns, by the plan's slug) Ink wraps it, the path on

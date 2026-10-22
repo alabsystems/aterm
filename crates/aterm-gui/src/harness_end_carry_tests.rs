@@ -9,7 +9,7 @@ use super::*;
 /// AN END AND ITS WORK READ BACK AS WRITTEN, and nothing is no row: an
 /// unseen landing, a seen one, work with no end; a session with neither
 /// writes no key. NEGATIVE CONTROLS: each row that must not read — no `end=`,
-/// no kind, a kind that is no end (`done` among them: FOREVER LAND has no
+/// no kind, a kind that is no end (`done` among them: Autopilot Land has no
 /// other end), no time or one at the epoch, no `seen=`, a `seen` that is not
 /// 0 or 1, a count that is no count, a key twice, a field with no `=` —
 /// carries nothing; a key this build does not know is skipped, so a later

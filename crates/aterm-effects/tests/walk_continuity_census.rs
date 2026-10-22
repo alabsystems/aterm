@@ -98,6 +98,23 @@ fn lagged(mut s: Shell) -> Shell {
     s
 }
 
+/// Three keys arrive across the margin in one frame, then typing continues.
+fn coalesced_fold(echo: u64) -> Shell {
+    let mut s = Shell::new(60, 83, Echo::After(echo)).folding(Fold::Kernel);
+    s.mark("type");
+    let line = prose(60);
+    let (a, b) = line.split_at(57);
+    s.type_str(a);
+    s.mark("burst");
+    s.type_lagged(b, 3, 40);
+    s.idle(40);
+    s.mark("type2");
+    s.type_str(" and on");
+    s.mark("idle");
+    s.idle(400);
+    s
+}
+
 /// Every scenario the census runs. A name starting `zle-` or `kernel-` names
 /// its fold ([`Fold`]) and is read once; every other is read behind each fold.
 #[expect(clippy::type_complexity, reason = "a test's case table")]
@@ -367,6 +384,10 @@ const SCENARIOS: &[(&str, fn() -> Shell)] = &[
     }),
     ("fold-glyph-rest-echo20", || {
         rested(sh20(), &prose(59), 2_500, " and on")
+    }),
+    ("kernel-coalesced-fold-continue-echo2", || coalesced_fold(2)),
+    ("kernel-coalesced-fold-continue-echo20", || {
+        coalesced_fold(20)
     }),
 ];
 

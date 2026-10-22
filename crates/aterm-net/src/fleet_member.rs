@@ -216,9 +216,7 @@ const PEERS_FILE_MAX: usize = 256 * 1024;
 /// How long a writer of the book waits for another one to finish.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 
-// ---------------------------------------------------------------------------
 // private files
-// ---------------------------------------------------------------------------
 
 // The strict private-file rules live in aterm-uds, which agh's token files share; the
 // fleet's state files keep reaching them by these names.
@@ -227,9 +225,7 @@ pub use aterm_uds::private_file::{
     PrivateFileError, ensure_private_dir, read_private, remove_private, write_private,
 };
 
-// ---------------------------------------------------------------------------
 // the secret and the node id
-// ---------------------------------------------------------------------------
 
 /// A new fleet secret, [`SECRET_LEN`] bytes from the OS CSPRNG.
 ///
@@ -406,9 +402,7 @@ fn identity_of(node: &str, seed: &[u8]) -> io::Result<NodeIdentity> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // the join code
-// ---------------------------------------------------------------------------
 
 /// Crockford's base32 alphabet, lowercase: no `i`, `l`, `o` or `u`.
 const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
@@ -771,9 +765,7 @@ fn is_codeword(symbols: &[u8]) -> bool {
     true
 }
 
-// ---------------------------------------------------------------------------
 // hosts and ports
-// ---------------------------------------------------------------------------
 
 /// Whether `host` is a host a fleet names: an IP address, or a name of
 /// letters, digits, `.`, `-` and `_` (at most 253, not starting with `.` or
@@ -847,9 +839,7 @@ pub fn parse_host_port(text: &str, default: Option<u16>) -> Result<(String, u16)
     Ok((host.to_owned(), port))
 }
 
-// ---------------------------------------------------------------------------
 // the book of peers
-// ---------------------------------------------------------------------------
 
 /// How a peer came into the book.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1471,9 +1461,7 @@ pub fn remove(book: &mut Vec<Peer>, copies: &[Peer], what: &str) -> Result<Peer,
     }
 }
 
-// ---------------------------------------------------------------------------
 // node keys: which node a peer is
-// ---------------------------------------------------------------------------
 
 /// The node keys this machine binds, node id to key (the module doc's **Node
 /// keys**): its book's — on the issuer every member that registered since
@@ -1964,9 +1952,7 @@ impl Drop for BookLock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // the join exchange
-// ---------------------------------------------------------------------------
 
 /// What a member tells the issuer it joins (the module doc's wire).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2295,9 +2281,7 @@ pub fn register_by(
     }
 }
 
-// ---------------------------------------------------------------------------
 // the issuer's book, read by a member
-// ---------------------------------------------------------------------------
 
 /// The refusal a machine that holds no join code answers a `book` read with
 /// ([`serve_book`]): it keeps no roster of the fleet.
@@ -2670,9 +2654,7 @@ pub fn merge_book(book: &mut Vec<Peer>, fetched: &Book, own: Option<&str>) {
     with_copies(book, copies_of(fetched, own));
 }
 
-// ---------------------------------------------------------------------------
 // reaching a peer
-// ---------------------------------------------------------------------------
 
 /// The longest one connect may take: a LAN host answers a SYN in
 /// milliseconds, so a recorded address that has gone dark gives the name

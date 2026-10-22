@@ -320,8 +320,8 @@ fn failed_candidate_and_unrelated_live_owner_keep_socket_and_token() {
     let client = CtlStream::connect(&plan.sock_path).unwrap();
     drop((client, parent.accept().unwrap()));
 
-    // Even a released gate and an exited predecessor do not grant permission
-    // to displace a DIFFERENT listener on the fixed path.
+    // Even a released gate and an exited predecessor grant no permission to displace a
+    // different listener on the fixed path.
     step(&model, &mut state, "Exit");
     step(&model, &mut state, "ForeignBind");
     assert!(model.successors("Bind", &state).is_empty());

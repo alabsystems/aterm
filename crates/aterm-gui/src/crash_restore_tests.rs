@@ -1184,9 +1184,7 @@ fn the_recovery_tally_carries_the_losses_to_the_ledger() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The history ring (increment 5): the scrollback below the restored screen
-// ---------------------------------------------------------------------------
 
 impl Rig {
     /// The journal worker's ticks, run here until the ring has caught the history up (or
@@ -2376,9 +2374,7 @@ fn the_ring_is_due_on_a_nudge_a_growth_and_less_often_in_a_flood() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The memory shed (increment 6): history rings taken away under pressure
-// ---------------------------------------------------------------------------
 
 /// The region a custody descriptor names, restored as a recovering window restores it.
 fn restore_custody(
@@ -3692,9 +3688,7 @@ fn a_pressure_level_reported_before_the_worker_starts_is_where_it_begins() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The control slot (the plan's increment 7)
-// ---------------------------------------------------------------------------
 
 /// A turn record as `cmd_turn` records one.
 fn turn(id: u64, text: &str) -> crate::turn_ledger::TurnRecord {

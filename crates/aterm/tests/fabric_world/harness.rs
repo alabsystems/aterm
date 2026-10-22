@@ -2197,9 +2197,7 @@ fn scratch_cli_env(tmp: &Path) -> [(&'static str, PathBuf); 3] {
     ]
 }
 
-// ---------------------------------------------------------------------------
 // A5 — a FLEET: one broker, and two or more nodes on it
-// ---------------------------------------------------------------------------
 
 /// One guarded broker served on a Unix socket in the fleet's scratch dir, and
 /// the nodes the tests boot against it: what needs two NODES, which one

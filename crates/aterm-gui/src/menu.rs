@@ -337,6 +337,13 @@ pub(crate) enum MenuAction {
     /// Open Settings at the Messages route:
     /// everything aterm told the person, newest first; the page the band's `Details ›` opens.
     Messages,
+    /// aterm ▸ System State…: focus or create the System State tab in the front window,
+    /// the tab `aterm ctl open app system-state` opens (`App::open_app`), where first-run
+    /// setup, the secrets vault join and its subscriber are reviewed and applied. The
+    /// in-app way back to it after the first run, and the menu item the setup and vault
+    /// digest lines name. Offered on macOS only, the one platform whose setup it runs
+    /// ([`Self::offered_on_this_platform`]).
+    SystemState,
     /// Toggle the command palette overlay (`App::toggle_palette`).
     OpenPalette,
     /// View ▸ Choose Theme… — open the command palette scoped to its Theme
@@ -536,6 +543,7 @@ impl MenuAction {
             MenuAction::DeckSizeFull => 89,
             MenuAction::DeckSizeFolded => 90,
             MenuAction::Save => 91,
+            MenuAction::SystemState => 92,
             // Per-session themes (palette-256-session).
             MenuAction::ChooseTabTheme => 77,
             MenuAction::ClearTabTheme => 78,
@@ -625,6 +633,7 @@ impl MenuAction {
             89 => MenuAction::DeckSizeFull,
             90 => MenuAction::DeckSizeFolded,
             91 => MenuAction::Save,
+            92 => MenuAction::SystemState,
             _ => return None,
         })
     }
@@ -1302,6 +1311,10 @@ impl MenuAction {
             | MenuAction::BrowseThemes
             | MenuAction::Messages
             | MenuAction::ToggleSeriousMode => ConfigWrite,
+            // System State is the setup surface `open app system-state` raises, which
+            // the control gate classifies with `open prefs` (`ConfigWrite`): the same
+            // fence for its menu twin.
+            MenuAction::SystemState => ConfigWrite,
             // Gateway to every action + the staged-update re-exec twins.
             MenuAction::OpenPalette | MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => {
                 OwnerOnly
@@ -1469,6 +1482,7 @@ impl MenuAction {
             | MenuAction::Packages
             | MenuAction::HarnessSettings
             | MenuAction::Messages
+            | MenuAction::SystemState
             | MenuAction::OpenPalette
             | MenuAction::ChooseTheme
             | MenuAction::BrowseThemes
@@ -1555,6 +1569,9 @@ impl MenuAction {
             MenuAction::ToggleSettings => "Open Settings.",
             MenuAction::Packages => "Open Settings at Packages: the ALab toolchain.",
             MenuAction::Messages => "Open Settings at Messages: everything aterm told you.",
+            MenuAction::SystemState => {
+                "Open System State: this Mac's setup and secrets vault, and what each step needs."
+            }
             MenuAction::HarnessSettings => {
                 "Open Settings at Harness: the coding agent harness and its Autopilot."
             }
@@ -1653,12 +1670,14 @@ impl MenuAction {
     }
 
     /// Whether this platform can do what the row offers: the update rows only where the in-app
-    /// updater exists ([`aterm_update::enabled`]). The palette, the native bar and the `chrome`
-    /// lines all ask this.
+    /// updater exists ([`aterm_update::enabled`]), System State only on macOS. The palette, the
+    /// native bar and the `chrome` lines all ask this.
     #[must_use]
     pub(crate) fn offered_on_this_platform(self) -> bool {
         match self {
             MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => aterm_update::enabled(),
+            // System State runs macOS setup: only a macOS launch installs its handlers.
+            MenuAction::SystemState => cfg!(target_os = "macos"),
             _ => true,
         }
     }
@@ -1707,6 +1726,7 @@ impl MenuAction {
             "ToggleSettings" => Some(MenuAction::ToggleSettings),
             "Packages" => Some(MenuAction::Packages),
             "Messages" => Some(MenuAction::Messages),
+            "SystemState" => Some(MenuAction::SystemState),
             "HarnessSettings" => Some(MenuAction::HarnessSettings),
             "RenameSession" => Some(MenuAction::RenameSession),
             "OpenPalette" => Some(MenuAction::OpenPalette),
@@ -1872,6 +1892,14 @@ const APP_MENU: &[MenuEntry] = &[
     Item {
         label: "Messages…",
         action: MenuAction::Messages,
+        key: "",
+        mods: MenuMods::None,
+    },
+    // The way back to first-run setup and the secrets vault, named by their digest
+    // lines (`message_reporters::workstation_setup_failure_entry`, `secrets_join`).
+    Item {
+        label: "System State…",
+        action: MenuAction::SystemState,
         key: "",
         mods: MenuMods::None,
     },
@@ -2892,9 +2920,7 @@ fn help_url() -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
 // System Settings deep links — the macOS privacy panes
-// ---------------------------------------------------------------------------
 
 /// Which section of Privacy & Security a deep link aims at. Only registered anchors in the
 /// Settings extension's `searchTerms` index are spellable; the per-folder strings in its Mach-O
@@ -4896,14 +4922,64 @@ mod tests {
         assert_eq!(offered("Check for Updates…"), updater);
         // Nothing staged: no install row, and never the model's placeholder.
         assert!(!offered("Install"), "{:?}", menu_chrome_lines(None, false));
-        // Nothing else is platform-gated.
+        // Nothing else is platform-gated but System State
+        // (`system_state_is_an_app_menu_row_where_its_setup_runs`).
         for section in MENU_MODEL {
             for (_, action, _, _) in section.entries.iter().flat_map(MenuEntry::items) {
-                if !matches!(action, MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate) {
+                if !matches!(
+                    action,
+                    MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate | MenuAction::SystemState
+                ) {
                     assert!(action.offered_on_this_platform(), "{action:?}");
                 }
             }
         }
+    }
+
+    /// SYSTEM STATE HAS AN IN-APP WAY IN: aterm ▸ System State…, a row of the app menu
+    /// beside Settings' with no chord, offered (in the bar, the palette and the `chrome`
+    /// lines) where its macOS setup runs and nowhere else, fenced as `open app
+    /// system-state` is (`ConfigWrite`, the Settings rows' class), firing no input, and
+    /// reachable by `invoke SystemState`.
+    #[test]
+    fn system_state_is_an_app_menu_row_where_its_setup_runs() {
+        let app = MENU_MODEL.iter().find(|s| s.title == "aterm").unwrap();
+        let rows: Vec<_> = app
+            .entries
+            .iter()
+            .flat_map(MenuEntry::items)
+            .filter(|(_, action, _, _)| *action == MenuAction::SystemState)
+            .collect();
+        assert_eq!(
+            rows,
+            [(
+                "System State…",
+                MenuAction::SystemState,
+                "",
+                super::MenuMods::None
+            )]
+        );
+        let macos = cfg!(target_os = "macos");
+        assert_eq!(MenuAction::SystemState.offered_on_this_platform(), macos);
+        let chrome = menu_chrome_lines(None, false);
+        assert_eq!(
+            chrome.iter().any(|l| l.contains("System State…")),
+            macos,
+            "{chrome:?}"
+        );
+        let mut palette = crate::palette::PaletteState::new();
+        palette.resolve(&crate::palette::PaletteLive::default());
+        assert_eq!(palette.action_by_name("SystemState").is_ok(), macos);
+        assert_eq!(
+            MenuAction::from_invoke_name("SystemState"),
+            Some(MenuAction::SystemState)
+        );
+        assert_eq!(
+            MenuAction::SystemState.invoke_authority(),
+            MenuAction::ToggleSettings.invoke_authority()
+        );
+        assert!(!MenuAction::SystemState.writes_pty_input());
+        assert!(!super::requires_terminal_tab(MenuAction::SystemState));
     }
 
     /// The load-bearing key equivalents are transcribed correctly: a wrong chord silently

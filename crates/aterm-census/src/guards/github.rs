@@ -81,9 +81,10 @@ const GITHUB_API_HOSTS: &[&str] = &["api.github.com", "uploads.github.com"];
 const AUTH_HEADER_CAPS: &[(&str, usize)] = &[
     // The curl upload lane's header file; M3 deletes it.
     ("crates/aterm-release/src/publish.rs", 1),
-    // `aterm init`'s curl preflight of a GitHub token (`/user`) before `gh` stores it; the
-    // machines migration to agh lowers it.
-    ("crates/aterm-machines/src/init_github.rs", 1),
+    // The machines controller's REST door for its machine user's SSH-key writes, which agh
+    // M1's GET-only transport refuses (init-system S14); agh design §16.4 step 5a
+    // (`users().keys()`) moves them into agh and deletes it.
+    ("crates/aterm-machines/src/port/github_rest.rs", 1),
 ];
 
 /// The files that still spawn `gh`, each with its cap (design §16.8's table, derived again
@@ -93,8 +94,6 @@ const GH_SPAWN_CAPS: &[(&str, usize)] = &[
     ("crates/agh/src/fx/mod.rs", 1),
     // `GhCli`; M2's swap deletes it.
     ("crates/atpkg-publish/src/host/gh.rs", 1),
-    // `GH_PATHS`; machines 5b deletes it.
-    ("crates/aterm-machines/src/controller/github.rs", 1),
     // The channel reads; M3.
     ("crates/aterm-release/src/gates.rs", 2),
     // M3.
@@ -202,9 +201,7 @@ fn contains_ignore_case(hay: &str, needle: &str) -> bool {
     hay.to_ascii_lowercase().contains(needle)
 }
 
-// ---------------------------------------------------------------------------
 // github-auth-door
-// ---------------------------------------------------------------------------
 
 fn github_auth_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(PRODUCT) {
@@ -287,9 +284,7 @@ fn bearer_clause(file: &SourceFile, out: &mut Vec<Finding>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // gh-spawn
-// ---------------------------------------------------------------------------
 
 fn gh_spawn(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(PRODUCT) {
@@ -350,9 +345,7 @@ fn spawns_gh(line: &Line<'_>) -> bool {
     })
 }
 
-// ---------------------------------------------------------------------------
 // agh-fx
-// ---------------------------------------------------------------------------
 
 fn agh_fx(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(&[AGH_SRC]) {

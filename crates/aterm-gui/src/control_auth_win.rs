@@ -45,14 +45,9 @@ use std::path::{Path, PathBuf};
 
 use aterm_uds::CtlStream;
 
-/// Create `dir` (and parents) if absent, then FAIL CLOSED unless the current
-/// user owns it, tightening its DACL to an owner-only (user + SYSTEM +
-/// Administrators), non-inheriting grant. This is the Windows twin of the Unix
-/// `ensure_private_dir` owner check + `0700` chmod: a directory owned by another
-/// user (a planted `%LOCALAPPDATA%\aterm`, or an explicit `--control-sock`
-/// under someone else's tree) is REFUSED, and a same-owned but loosely-ACL'd
-/// directory is re-protected so the socket + token it will hold are not
-/// world-accessible.
+/// Create `dir` (and parents) if absent, refuse it unless the current user owns it, and
+/// tighten its DACL to a non-inheriting user + SYSTEM + Administrators grant: the Windows
+/// twin of the Unix owner check and `0700`.
 ///
 /// In an elevated process, the control directory and every directory under it
 /// get the elevated posture instead (the module docs): a grant to this user

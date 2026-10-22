@@ -43,8 +43,6 @@ use aterm_render::{
 };
 
 use crate::GpuContext;
-// Every pipeline's entry points, target role, blend, write mask, vertex layout and
-// topology come from the pipeline table, which the Metal backend also reads.
 #[cfg(any(wgpu_arm, target_os = "macos"))]
 use crate::pipeline_table::ShaderLibrary;
 #[cfg(wgpu_arm)]
@@ -1968,7 +1966,7 @@ pub(crate) struct TrayScrimLayer {
     rgba: [u8; 4],
 }
 
-/// Inset border thickness in device px for a `w`×`h` framebuffer. MUST stay in
+/// Inset border thickness in device px for a `w`×`h` framebuffer. Must stay in
 /// sync with `app_render::drop_border_px` so GPU and CPU/headless agree.
 #[inline]
 fn drop_border_px_gpu(w: u32, h: u32) -> u32 {
@@ -3450,8 +3448,8 @@ struct MetalArmLive {
     /// before its Submit B is encoded and keeps it however it ends
     /// ([`Self::take_present_seq`]).
     present_seq: u64,
-    /// Diagnostic: how many times `await_frame_slot` actually consumed a
-    /// prior in-flight Submit A (the pipelining differential's probe).
+    /// Diagnostic: prior in-flight Submit As consumed, by `await_frame_slot`
+    /// or an atlas append's settle (the pipelining differential's probe).
     awaited_frames: u64,
     /// Time parked in `await_frame_slot`, atlas-append settles and
     /// `drain_pending`, which call the timeout-less `waitUntilCompleted`. These
@@ -4085,13 +4083,12 @@ impl MetalArmLive {
         Ok(())
     }
 
-    /// Ensure the armed texture for `atlas` holds `bytes` under structural `key`
-    /// `(width, tex_h, salt)` and shelf write state `(write_gen, cur_py)`.
-    /// Re-mints the `MTLTexture` only when `key` changes (first frame, resize,
-    /// or full repack); when `key` matches and `write_gen` advanced (`grow_atlas`),
-    /// uploads only the dirty row band `[uploaded_py, occupied_rows)` in place.
-    /// Such an upload first settles `frame_slots`, returning the consumed frame
-    /// count and park duration. Fresh immutable atlases have no prior readers.
+    /// Ensure the armed texture for `atlas` holds `bytes` (the occupied rows)
+    /// under `key` and shelf write state `(write_gen, cur_py)`. Re-mints only
+    /// when `key` moves; when only `write_gen` moved (`grow_atlas`), uploads the
+    /// dirty row band `[uploaded_py, occupied_rows)` in place after settling
+    /// every reader in `frame_slots`, and returns that settle's
+    /// `(consumed_frames, parked_ns)`. A fresh mint has no prior readers.
     #[allow(clippy::too_many_arguments)]
     fn ensure_atlas(
         layer: crate::device_layer::DeviceHandle<'_>,
@@ -4829,6 +4826,8 @@ fn wgpu_scoped<T>(device: &wgpu::Device, f: impl FnOnce() -> T) -> Result<T, Str
     }
 }
 
+/// An on-screen presentation target. Opaque: the frontend holds it and passes
+/// it back to [`GpuRenderer::present_input`] / `resize_surface`.
 pub struct GpuSurface {
     acquire_id: u64,
     #[cfg(not(wgpu_arm))]
@@ -7830,7 +7829,7 @@ fn build_cell_layouts(
     }
 }
 
-/// The THREE cell pipelines [`build_cell_pipelines`] returns, in declaration
+/// The three cell pipelines [`build_cell_pipelines`] returns, in declaration
 /// order: bg, glyph, color_glyph.
 #[cfg(wgpu_arm)]
 type CellPipelines = (
@@ -9184,7 +9183,7 @@ impl GpuRenderer {
         self.cpu.drawn_faces()
     }
 
-    /// The wrapped CPU face's real BOLD sibling of the primary family for the
+    /// The wrapped CPU face's real bold sibling of the primary family for the
     /// GUI chrome. See [`Renderer::chrome_bold_face`].
     #[must_use]
     #[inline]
@@ -9851,8 +9850,8 @@ impl GpuRenderer {
         self.atlas_tex_creations
     }
 
-    /// The `(width, height)` of the resident mono + colour atlas textures (for
-    /// the persistence test: identity check that the SAME textures are reused).
+    /// The `(width, height)` of the resident mono + colour atlas textures, so the
+    /// persistence test can check the same textures are reused.
     #[cfg(all(test, wgpu_arm))]
     fn atlas_tex_dims(&self) -> Option<((u32, u32), (u32, u32))> {
         let m = self.mono_res.as_ref()?;
@@ -10173,8 +10172,8 @@ impl GpuRenderer {
         let cap_h = self.ctx.device_layer().max_texture_dim();
         #[cfg(not(wgpu_arm))]
         let cap_h = self.first_party_max_texture_dim();
-        // Every full repack moves the armed atlas keys, even when
-        // `(w, tex_h, map.len())` are identical (a font-feature change).
+        // Every full repack moves the armed atlas keys, even when `(w, tex_h)`
+        // is unchanged (a font-feature change).
         #[cfg(any(target_os = "macos", gl_arm))]
         {
             self.atlas_epoch += 1;
@@ -14194,13 +14193,12 @@ impl GpuRenderer {
     ///   adds no latency while the pool is not exhausted. The present itself is
     ///   `Immediate` (`pick_present_mode`); compositor-to-glass time is measured
     ///   by `aterm_gpu::present_glass` (`present_glass_*`).
-    /// * Vulkan: with two images, a second present inside one refresh has nothing
-    ///   to acquire until vblank, parking the main thread in
-    ///   `get_current_texture` with keystrokes queued. aterm's frames are bursty,
-    ///   so this is common. A third image removes the park without delaying
-    ///   glass (the clustered frame waits for the same vblank either way); on a
-    ///   Mailbox surface three images cost nothing. The content pace floor and
-    ///   the effect lane's panel-rate cap keep the queue from deepening.
+    /// * Vulkan: with two images, a second present inside one refresh parks the
+    ///   main thread in `get_current_texture` until vblank, with keystrokes
+    ///   queued; aterm's bursty frames make this common. A third image removes
+    ///   the park without delaying glass and costs nothing on Mailbox. The
+    ///   content pace floor and the effect lane's panel-rate cap keep the queue
+    ///   from deepening.
     #[cfg(wgpu_arm)]
     #[inline]
     pub(crate) const fn default_frame_latency(is_metal: bool, is_vulkan: bool) -> u32 {
@@ -14587,14 +14585,11 @@ impl GpuRenderer {
     /// 8-bit drawable under that tag is misread.
     ///
     /// A refused flip (arm not live, no swapchain, `reconcile` error, or the
-    /// layer not moving because an acquisition is in flight) reverts the
-    /// retained format, promotes nothing and returns `false`. The revert is sound
-    /// because a refused reconfigure never half-writes the layer.
-    ///
-    /// One direction only: an f16 window moved to an SDR screen keeps f16.
-    /// Returns whether the layer moved. `false` without an AppKit read for an
-    /// already-f16 surface or when the gate refuses; also `false` on an SDR
-    /// screen, a refused flip, off macOS, and on the wgpu-oracle arm.
+    /// layer held by an in-flight acquisition) reverts the retained format and
+    /// promotes nothing; a refused reconfigure never half-writes the layer. One
+    /// direction only: an f16 window moved to an SDR screen keeps f16. Returns
+    /// whether the layer moved: `false` before any AppKit read for an f16
+    /// surface or a refusing gate, and always `false` on the wgpu arm.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn upgrade_surface_for_screen<W: WindowTarget>(
         &mut self,
@@ -16270,7 +16265,7 @@ impl GpuRenderer {
                 // Reusable: scissor the dirty band. The bloom halo does not widen
                 // the dirty set, since it composites at present time over a copy,
                 // never into the scissor base. Zero dirty rows means Load preserves
-                // the frame and nothing draws. Upward overshoot (ATERM-KI-1020-1):
+                // the frame and nothing draws. Upward overshoot:
                 // the row above a marked row whose ink there may have changed is
                 // rebuilt too (the scroll plan marks its own apron rows).
                 DirtyDecision::Rows(_) => {
@@ -21944,7 +21939,7 @@ const fn with_over_cap(mut inst: RainGlowInstance, color: u32) -> RainGlowInstan
 
 /// Which rows of `input` draw glyphs under `scope`, and the device-pixel rows
 /// `[y0, y1)` each one's glyph quads keep on top of the row's own clip
-/// (ATERM-KI-1020-1), written to `out` for rows `0..rows`: `None` for a row that
+/// , written to `out` for rows `0..rows`: `None` for a row that
 /// draws none. The CPU damaged path's aprons (`Renderer::composite_free`,
 /// `Renderer::draw_lower_apron`), for glyphs that ink above their own band.
 ///
@@ -22751,7 +22746,7 @@ impl GpuRenderer {
         let linear = mint.sampler(SamplerDesc::LINEAR_CLAMP)?;
         let nearest = mint.sampler(SamplerDesc::NEAREST_CLAMP)?;
 
-        // --- bloom (rows 4 + 12), rederived exactly as the wgpu arm --------
+        // --- bloom (`GlowAdd` extract, `Bloom` composite), as the wgpu arm -
         let bloom_state = if self.enable_bloom && fx_gpu::bloom_source_live(input) {
             let (count, bbox, extract_first) = self.build_bloom_glow(input);
             (count > 0).then_some((count, bbox, extract_first))
@@ -23374,11 +23369,9 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
     // The demand set (`frame_effect_pipelines`) of the lazy effect-pipeline
     // build. A slot missing from the set panics in `EffectPipelines::get` on
     // the frame that binds it.
-    // ---------------------------------------------------------------------
 
     #[cfg(wgpu_arm)]
     fn resident_names(want: [bool; EFFECT_PIPELINE_COUNT]) -> Vec<&'static str> {

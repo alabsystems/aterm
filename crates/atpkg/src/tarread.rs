@@ -1018,9 +1018,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // Golden evidence.
-    // -----------------------------------------------------------------------
 
     /// The shapes a real bundle is made of, decoded to exact expected values.
     #[test]
@@ -1296,9 +1294,7 @@ mod tests {
         assert_eq!(seen[0].content, b"data");
     }
 
-    // -----------------------------------------------------------------------
     // Deliberate deviations from the `tar` crate.
-    // -----------------------------------------------------------------------
 
     /// The [`MAX_EXTENSION_BODY`] ceiling.
     #[test]
@@ -1351,9 +1347,7 @@ mod tests {
         assert!(err.contains("checksum"), "unexpected error: {err}");
     }
 
-    // -----------------------------------------------------------------------
     // Streaming, truncation and the short-read paths
-    // -----------------------------------------------------------------------
 
     /// Every loop honours the `Read` contract rather than assuming a full
     /// buffer: the same archive through a one-byte-at-a-time reader must decode

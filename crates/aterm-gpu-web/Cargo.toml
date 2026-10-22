@@ -36,9 +36,8 @@ aterm-types = { workspace = true }
 # types are aterm-wasm-abi JS objects. No wasm-bindgen, web-sys, js-sys or
 # wgpu in this module's graph.
 aterm-wasm-abi = { workspace = true, features = ["export"] }
-# No getrandom row: nothing here needs entropy, and aterm's own manifests were
-# its only parents on this cell, so a defensive row alone shipped it
-# (deny.toml bans it outside ring; `forge check` [OB-18]).
+# No getrandom row: nothing here needs entropy, and a defensive row alone shipped
+# it. deny.toml bans it outside ring (`forge check` [OB-18]).
 
 # No [profile.release]: profiles take effect only at the workspace root. A size
 # build (opt-level = "z") comes from the build tool's --profile.

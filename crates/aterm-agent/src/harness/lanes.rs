@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHICH HARNESS LANES ARE WRITTEN FOR AN AGENT: one [`Lanes`] per
-//! [`Program`], whether the relaunch on exit, the live upgrade and the
-//! restart in place exist for it. A lane is written for a program when its
-//! code knows that program's launch line, its exit and its conversation; the
-//! owner's `[harness]` switches (`relaunch`, `upgrade`), read live beside it,
-//! say whether a written lane runs. A program the supervisor does not host
-//! (`Program::Generic`) has none.
+//! Which harness lanes exist for each [`Program`]: relaunch on exit, live
+//! upgrade, restart in place. The owner's `[harness]` switches (`relaunch`,
+//! `upgrade`), read live, say whether an existing lane runs.
+//! `Program::Generic` has none.
 //!
 //! MUSE CODE HAS THE RELAUNCH ON EXIT (and so the restore after aterm's own
 //! end), measured on 1.4.10-R6427.1 ([`super::upgrade_muse`]): its launch

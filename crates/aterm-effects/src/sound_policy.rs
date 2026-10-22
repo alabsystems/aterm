@@ -96,16 +96,10 @@ pub fn trail_sound_gain(raw_focused: bool, configured: bool, volume: f32) -> Opt
     (raw_focused && configured && volume > 0.0).then_some(volume)
 }
 
-/// Resolve sing-along riff audio policy: the trail-sound law
-/// ([`trail_sound_gain`]) and the riff's own switch.
-///
-/// `trail_sound_riff` (default on) quiets the held-key riff, the loudest
-/// voice the engine emits, without muting the keystroke palette. It gates
-/// sound only: the celebration's ribbon saturation, star shower, dancing cat
-/// and singing face are a motion contract and keep running, so this resolves
-/// a gain rather than suppressing the celebration. Both riff seams (the
-/// single-pane present and the split-pane compose) use it, so a split pane
-/// never sings a song a single pane suppresses.
+/// Resolve sing-along riff audio: [`trail_sound_gain`] plus the riff's own
+/// switch, `trail_sound_riff` (default on), which quiets the held-key riff
+/// without muting the keystroke palette. It gates sound only; the celebration's
+/// visuals keep running. The single-pane and split-pane riff seams both use it.
 #[inline]
 pub fn sing_riff_gain(
     raw_focused: bool,
@@ -323,7 +317,7 @@ pub fn bonk_sound_gain(
     reduced_motion: bool,
     volume: f32,
 ) -> Option<f32> {
-    // The bonk's ONE extra term over the shared law: a Reduced-motion window
+    // The bonk's one term beyond the shared law: a Reduced-motion window
     // renders no wince, so it must not clash either (its motion twin).
     voice_gain(
         Voice::Bonk,

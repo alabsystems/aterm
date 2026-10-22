@@ -167,8 +167,8 @@ fn resolved_bands_always_inside_the_cell() {
     }
 }
 
-/// The table path actually consumes the tables (non-vacuity for the resolver:
-/// a synthetic post/OS2 entry moves the band off the heuristic position).
+/// Non-vacuity for the resolver: a synthetic post/OS2 entry moves the band off the
+/// heuristic position.
 #[test]
 fn font_tables_actually_drive_the_bands() {
     let tables = Some(DecoTables {
@@ -288,9 +288,7 @@ fn resolved_bands_conform_to_the_deco_band_containment_model() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // (1) phase continuity — pattern emission is partition-invariant.
-// ---------------------------------------------------------------------------
 
 /// Paint the rects of one underline emission into a coverage grid.
 fn paint(grid: &mut [Vec<bool>], rects: &[[usize; 4]]) {
@@ -500,9 +498,7 @@ fn undercurl_waves_however_low_the_font_puts_its_underline() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// (3) ink-skip — coverage-monotone, no-ink identity, dilation exactness.
-// ---------------------------------------------------------------------------
+// Ink-skip: coverage-monotone, identity without ink, exact dilation.
 
 /// Exhaustive over every ink mask up to 12 columns: the kept spans are exactly
 /// the columns with no ink within 1px — a pure erase (never adds), identity
@@ -903,9 +899,7 @@ fn assert_contained(
     );
 }
 
-// ---------------------------------------------------------------------------
-// (5) the CJK composition underline — a wide glyph's rule is never carved.
-// ---------------------------------------------------------------------------
+// The CJK composition underline: a wide glyph's rule is never carved.
 
 /// Render `text` as an IME preedit at column 2 of row 0, as
 /// `RenderInput::overlay_ime_preedit` paints a live composition. The `$ ` prompt matters:

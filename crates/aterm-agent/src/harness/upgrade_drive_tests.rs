@@ -2770,7 +2770,7 @@ fn newer() -> Targets {
 ///
 /// THE BUILDS THESE TESTS MOVE ONTO ARE NAMES, NOT PROGRAMS ([`newer`]'s
 /// `/nonexistent/claude`): the start probe a crash's relaunch runs before it
-/// is moved onto a build no probe has proved (ATERM-KI-1015-1 LC-5,
+/// is moved onto a build no probe has proved (LC-5,
 /// [`build_start::proved`]), and the one a move onto a build with a failure
 /// noted runs ([`build_start::starts`]), are named on this thread to pass,
 /// unless the test named another first ([`probe_finds`]).
@@ -5994,7 +5994,7 @@ fn a_build_that_failed_to_start_is_moved_onto_only_once_proved_to_start() {
     let never = |_: &Path| -> Probe { panic!("no probe is run") };
     let now = now_s();
     // No failure noted: the upgrade's move probes the build once before it
-    // is taken (ATERM-KI-1016-1's LC-5; a crash's relaunch needs the proof,
+    // is taken ('s LC-5; a crash's relaunch needs the proof,
     // `build_start::proved`) — a probe of no finding lets it go and is not
     // run again inside its gap — and a dry read runs nothing.
     let dry = Opts {
@@ -6097,7 +6097,7 @@ fn a_build_that_failed_to_start_is_moved_onto_only_once_proved_to_start() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A CRASH IS NO TIME TO TRY A BUILD NOTHING HAS RUN (ATERM-KI-1015-1
+/// A CRASH IS NO TIME TO TRY A BUILD NOTHING HAS RUN (
 /// LC-5): the relaunch on exit took the newest build whenever no failure was
 /// noted against it — one presented seconds earlier, never run here — so an
 /// agent that crashed came back on a build that did not start, and stayed
@@ -6217,7 +6217,7 @@ fn a_crashs_relaunch_moves_only_onto_a_build_proved_to_start() {
 }
 
 /// THE UPGRADE'S OWN FIRST MOVE ONTO A BUILD NEVER RUN HERE IS PROBED FIRST
-/// (ATERM-KI-1016-1's LC-5): the quiet restart of an idle agent onto a build
+/// ('s LC-5): the quiet restart of an idle agent onto a build
 /// no probe has run on runs the probe once, before the agent is ended. A
 /// build the probe sees exit with a failure is moved onto by no agent: a
 /// recorded wait (`wait:build-fails`), nothing typed or signalled, the build's
@@ -10103,7 +10103,7 @@ fn a_stopped_restart_a_hand_held_is_its_exits_counted_from_the_hand() {
     );
 }
 
-/// LC-7 OF ATERM-KI-1015-1, THE STALE BOUND COUNTED FROM A HAND'S LIFT (the
+/// LC-7 OF , THE STALE BOUND COUNTED FROM A HAND'S LIFT (the
 /// review of the r20 relaunch lane: no test told the renewal from a plain
 /// carry, and the lab could not either — a hold landing before any carry
 /// leaves no stamp to renew): a restart's exit whose agent was seen gone
@@ -12033,7 +12033,7 @@ fn register_running_in(claude_dir: &Path, pid: u32, start: &str, cwd: &Path) {
 fn a_relative_claude_home_is_followed_by_the_relaunch_and_the_restart_in_place() {
     const RELATIVE: &str = "work home/.claude";
     let record = register_running_in;
-    // THE LOOK AT A CRASH, and the relaunch after aterm itself ended.
+    // The look at a crash, and the relaunch after aterm itself ended.
     let mut a = DeadAgent::new("relative-home-relaunch");
     let (sock, _asked) = instance_with(&a.dir, Answers::default());
     a.opts = Opts {
@@ -12366,7 +12366,7 @@ fn the_relaunch_on_exit_refuses_a_line_that_would_move_a_relative_home() {
     );
 }
 
-/// THE RELAUNCH ON EXIT CARRIES AN AGENT'S OWN `HOME` (ATERM-KI-1015-1
+/// THE RELAUNCH ON EXIT CARRIES AN AGENT'S OWN `HOME` (
 /// LC-4): an agent started with `HOME=<dir>/other home` and no
 /// `CLAUDE_CONFIG_DIR` keeps its records under `<dir>/other home/.claude`,
 /// where its snapshot read them; its crash is relaunched, driven, on a line
@@ -12746,7 +12746,7 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
 }
 
 /// A RELAUNCH IS PROMISED ONLY WHERE ITS LINE WOULD CARRY THE AGENT'S CLAUDE
-/// HOME (ATERM-KI-1015-1 LC-3): `restart` answered `OK` and sent SIGTERM to
+/// HOME (LC-3): `restart` answered `OK` and sent SIGTERM to
 /// an agent under another `HOME`, whose relaunch then refused its line
 /// (`refused:home`, [`home_carried`]), leaving it at its shell — the promise
 /// ([`super::super::relaunch::exit_line`], which `carries_restart` and the
@@ -13346,7 +13346,7 @@ fn a_relative_claude_home_the_line_would_move_is_refused() {
         &records
     )));
     // An unset home under another `HOME`: its records are `<HOME>/.claude`, and the line carries
-    // that `HOME` (ATERM-KI-1015-1 LC-4: refused before, its remedy a resume the tab's shell
+    // that `HOME` (LC-4: refused before, its remedy a resume the tab's shell
     // could not run).
     let other = Records::at(
         user,
@@ -13931,7 +13931,7 @@ fn land_row() -> String {
 }
 
 /// A clean defense, escaped for [`turn_by`]: what lands a task answering
-/// Land's instruction ([`land_row`]; FOREVER LAND).
+/// Land's instruction ([`land_row`]; Autopilot Land).
 #[cfg(unix)]
 const LANDED_JSON: &str =
     "Landed and verified.\\nNothing left: it is merged into the remote main branch.";
@@ -14676,7 +14676,7 @@ impl Kernel for EachLineEnds {
 }
 
 /// A MOVE ONTO A BUILD THAT FAILS ONLY AT A REAL START IS TAKEN BACK ONTO THE BUILD ITS
-/// AGENT RAN (LC-5 of ATERM-KI-1016-1, [`St::roll_back`]). The build answered its probe; the
+/// AGENT RAN (LC-5 of , [`St::roll_back`]). The build answered its probe; the
 /// move ended the working agent at its READY, and the relaunch line ran and ended with
 /// nothing registering the conversation, its shell holding the tab again. Stopped there,
 /// the one working agent stayed down until a person resumed it. Now the line back — the
@@ -19232,7 +19232,7 @@ fn a_line_a_hand_held_is_never_typed_into_a_shell_used_meanwhile() {
 }
 
 /// WHAT A DRIVER LEFT ON THE LINE UNDER ITS LEASE HOLDS THE RELAUNCH LINE
-/// (ATERM-KI-1016-1 LC-7, lifecycle-2; decided by ruling 20 (ii) of
+/// (LC-7, lifecycle-2; decided by ruling 20 (ii) of
 /// `docs/HANDOFF-robustness-rounds-2026-10-08.md`). Another driver's lease is
 /// a hand the restart's line waits out uncounted, and the driver's own
 /// writes in the shell under it are no person's keys (a control verb never
@@ -21255,7 +21255,7 @@ fn the_relaunch_line_moves_the_model_within_its_family_first_and_keeps_the_rest(
     }
 }
 
-/// A MOVE OUTLIVES ITS RECORD'S REMOVAL (ATERM-KI-1016-1, limits: [`St::moved_at`] lived in
+/// A MOVE OUTLIVES ITS RECORD'S REMOVAL (limits: [`St::moved_at`] lived in
 /// the conversation's record alone). An account move left the measured weekly row; an
 /// upgrade round's pending record written over the move keeps it (the one writer's carry),
 /// and then the session reaches that build by hand, so [`forget_settled_pending`] closes the
@@ -24353,7 +24353,7 @@ fn a_cold_restores_note_of_its_earlier_tab_is_read_with_no_record() {
 }
 
 /// A TAB AN OLDER COLD RESTORE MINTED IS LINKED TO ITS EARLIER TAB BY THE
-/// UPGRADE LEDGER (relaunch-7 of ATERM-KI-1016-1, the review's KR-4): no
+/// UPGRADE LEDGER (relaunch-7 of , the review's KR-4): no
 /// release before v0.106.0 carried a leaf's sid, so a tab such a restore
 /// reopened has no note of the tab it stood in for, and no record names it
 /// — but every upgrade step the conversation took in the old tab is a row
@@ -24644,7 +24644,7 @@ fn a_moved_agents_finish_is_read_where_it_wrote_it_after_its_process_is_gone() {
 }
 
 /// A MOVED AGENT'S FINISH IS FOUND BY ITS RELAUNCH WHEN THE HOST NEVER NOTED
-/// IT (ATERM-KI-1016-1's relative home wrong action): under a relative home a
+/// IT ('s relative home wrong action): under a relative home a
 /// worker entered a worktree (`<proj>/.claude/worktrees/wt1`, registered in
 /// the repository's `.git/worktrees`) and wrote its token in that
 /// worktree's home; aterm then ended before the host's finished read wrote
@@ -25038,7 +25038,7 @@ fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
         assert!(typed[0].contains(DONE_CHECK), "{what}: {typed:?}");
         assert!(!typed[0].contains(upgrade::CARRY_ON), "{what}: {typed:?}");
     }
-    // THE CRUISE PROMPT ANSWERED WITH A DONE CLAIM (FOREVER CRUISE: done is
+    // THE CRUISE PROMPT ANSWERED WITH A DONE CLAIM (Autopilot Cruise: done is
     // never the end) — an idle report, the defense itself — is asked it
     // again.
     for (what, answer) in [
@@ -25216,7 +25216,7 @@ fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
 /// before — never the continuation.
 #[cfg(unix)]
 /// A RELAUNCH INTO A TASK LAND'S ACT LANDED TYPES NOTHING (the merge
-/// review's M5-R1 and XM-LAND-RECORD; FOREVER LAND): the turn-end policy
+/// review's M5-R1 and XM-LAND-RECORD; Autopilot Land): the turn-end policy
 /// lands the task on the clean defense answering [`LAND`], and on the one
 /// answering the retry of a wall that cut its turn; the record
 /// (`FinishedScan`) reads both the same, so the carry-on is
@@ -26077,7 +26077,7 @@ fn a_relaunch_into_a_persons_own_exchange_types_nothing() {
 }
 
 /// A RELAUNCH INTO A PERSON'S EXCHANGE RETRIED AT A WALL TYPES NOTHING
-/// (ATERM-KI-1016-1): the person's prompt met a 529, the tab's loop left the
+/// : the person's prompt met a 529, the tab's loop left the
 /// exchange to them at the wall (`wall:` row, the work before it carried)
 /// and typed the retry, and the agent was relaunched once the retry's short
 /// answer ended. The retry's row closed the wall's, so the relaunch typed its
@@ -26447,7 +26447,7 @@ fn a_new_loops_first_read_reaches_a_token_behind_long_wakes() {
 }
 
 /// A TOKEN BEHIND MORE WAKES THAN A RESTART'S ONE READ STILL ENDS THE TASK
-/// (ATERM-KI-1016-1): a first read whose window settles nothing
+/// : a first read whose window settles nothing
 /// ([`upgrade::FinishedScan::settled`]: Claude Code's own wakes and their
 /// answers, no prompt of someone's, no answer that finishes) reads from
 /// further back, so a relaunch types no carry-on into a task its worker
@@ -26593,7 +26593,7 @@ fn a_finished_conversation_is_moved_quietly_under_upgrade_ask() {
 }
 
 /// UNDER `upgrade_ask = true` A PERSON'S OWN EXCHANGE LEFT TO THEM MOVES AS
-/// A QUIET MOVE (ATERM-KI-1016-1, [`left_to_person`]): the tab's loop left
+/// A QUIET MOVE ([`left_to_person`]): the tab's loop left
 /// the person's exchange to them (`left-to-person@v1`, keyed by their prompt,
 /// or by the reply as an earlier build keyed it), and the harness types
 /// nothing there until someone else's turn ends — the upgrade's notice
@@ -26743,7 +26743,7 @@ fn a_token_behind_long_wakes_is_moved_quietly_under_upgrade_ask() {
 }
 
 /// THE LOOK'S MEMO READS ON FROM WHERE ITS LAST READ ENDED, AND ONE
-/// CARRY-ON'S READERS SHARE ONE READ (the review of ATERM-KI-1016-1's done-6,
+/// CARRY-ON'S READERS SHARE ONE READ (the review of 's done-6,
 /// KR-DONE-3). A first read reaches back past a window that settles nothing,
 /// so on a conversation the harness's own `keep going` drives it reads back
 /// to the last person's prompt (measured: 2.1 s for 109 MiB, a debug build).
@@ -27866,7 +27866,6 @@ fn the_transcript_that_confirms_a_wall_is_found_from_the_process() {
     std::fs::remove_file(alt.join("projects/-moved").join(format!("{alt_id}.jsonl")))
         .expect("moved");
     assert_eq!(tail(Some(&alt), start), None, "no transcript");
-    // No record of the process: none.
     std::fs::remove_file(alt.join(format!("sessions/{pid}.json"))).expect("record");
     assert_eq!(tail(Some(&alt), start), None, "no record");
 }
@@ -28761,7 +28760,7 @@ fn the_clis_sweep_reads_the_tabs_of_every_instance_it_is_given() {
 /// build did not bring back stays open, as for every carry-on that typed
 /// nothing. So too where the pass carries no Autopilot of its own — the
 /// CLI's hand-run sweep (`Opts::land` false) — and the tab's own `status`
-/// says Land (ATERM-KI-1016-1: it typed Cruise's carry-on there). NEGATIVE
+/// says Land (it typed Cruise's carry-on there). NEGATIVE
 /// CONTROLS: under Cruise the same conversations get the continuation and
 /// the done check, as before.
 #[cfg(unix)]
@@ -28842,7 +28841,7 @@ fn a_relaunch_under_land_types_no_carry_on_and_leaves_its_point_to_the_loop() {
     }
 }
 
-/// LC-3 OF ATERM-KI-1015-1 — THE EXPLICIT RESTART OFFERS EXACTLY WHAT ITS
+/// LC-3 OF — THE EXPLICIT RESTART OFFERS EXACTLY WHAT ITS
 /// RELAUNCH CARRIES: an agent whose records no relaunch line can name (no
 /// `CLAUDE_CONFIG_DIR`, its records under another `HOME` in no `.claude`) is
 /// refused by its relaunch on exit (`refused:home`) — the crash's and the
@@ -28915,7 +28914,7 @@ fn the_restart_offers_no_relaunch_its_exit_refuses_under_another_home() {
     assert!(carries_restart(&c.opts.home, &c.snap) && resumes_on_exit(&c.opts.home, &c.snap));
 }
 
-/// LC-5 OF ATERM-KI-1015-1 — A CRASH IS NEVER MOVED ONTO A NEWER BUILD NOT
+/// LC-5 OF — A CRASH IS NEVER MOVED ONTO A NEWER BUILD NOT
 /// PROVED TO START: the relaunch on exit chose the newest build the session
 /// may move to ([`super::super::relaunch::relaunch_target`]) whether or not
 /// anything had ever started on it, and round eighteen's build-start probe
@@ -29020,7 +29019,7 @@ fn a_crash_is_never_moved_onto_a_newer_build_not_proved_to_start() {
 }
 
 /// THE GATE OF A CRASH'S RELAUNCH ([`build_start::proved`], LC-5 of
-/// ATERM-KI-1015-1): a build with no failure noted is probed before a
+/// ): a build with no failure noted is probed before a
 /// crashed agent is moved onto it — the upgrade's own first move is held by
 /// its probe only where that probe sees the build exit with a failure
 /// ([`build_start::starts`]) — and the probe's answer is the build's note for

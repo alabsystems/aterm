@@ -40,7 +40,7 @@
 //! program's words behind one of Claude Code's own labels — a Monitor's event
 //! row, a Stop hook's `Stop hook error: [<command>]: …` row, a hook's
 //! `systemMessage` row (`<hook> says: …`) — are no wall on the screen at
-//! all ([`aterm_phase::classify_wall`], ATERM-KI-1015-14): read as one
+//! all ([`aterm_phase::classify_wall`]): read as one
 //! (2.1.302, measured), the since-removed `aterm drive watch` typed `/login` on a Monitor's
 //! event and on a Stop hook's stderr. Nor are a hook's words with no label
 //! under a row of Claude Code's own: a Stop hook's `stopReason` under the
@@ -57,14 +57,14 @@
 //! a hook's reason that is the wall's words is: with the transcript it is
 //! found there ([`Session::transcript_found`], the row showing the class of
 //! the notice the transcript ends on), with none it is not acted on, a
-//! knowing loss of recall (ATERM-KI-1015-14). The walk
+//! knowing loss of recall. The walk
 //! is given EVERY ROW THE SCREEN SHOWS for it: the loop reads the screen's
 //! tail (`tail=40`, the server's own agent-verdict cut, which every other
 //! read keeps), and a tail can hold the wall without the call above it, so
 //! a gutter wall read on a tail with no call over it is read again from the
 //! whole grid before it is acted on ([`Session::under_call_on_screen`]).
 //!
-//! RULING 2026-10-08 (H6-HARNESS-1, pass 5): with no transcript, a wall
+//! (H6-HARNESS-1, pass 5): with no transcript, a wall
 //! under a recognised tool call — an MCP call's and a `!` command's
 //! included — is not acted on. Main DID act on walls under MCP and `!`
 //! calls: its walk did not know them as calls, and read every `⎿` row under
@@ -99,7 +99,7 @@
 //! Bash output's, measured) is read under the call too, and with no
 //! transcript gets no `/compact`, where main and pass 5 typed one. A tool's
 //! output whose call row has scrolled off the screen, read with no owner and
-//! acted on until ATERM-KI-1015-14, is judged with the main screen's history
+//! acted on until , is judged with the main screen's history
 //! right above the screen, read up to the owner
 //! ([`Session::under_call_on_screen`]).
 //!
@@ -115,7 +115,7 @@
 //! off, the person's next turn is. The footer's placement is NOT exempted. A
 //! custom statusline's own rows are not read as a notice at all
 //! (`phase::footer_notice` reads only where Claude Code draws its own,
-//! ATERM-KI-1015-14), but one that prints a status glyph first, or
+//! ), but one that prints a status glyph first, or
 //! right-aligns its words, reads as the vendor's. (2) With no transcript, a
 //! wall whose owner is above the screen is refused where the history cannot
 //! be read up to it: the alternate screen (the fullscreen renderer keeps no
@@ -259,7 +259,7 @@
 //! after the newest entry is marked on the end (`TranscriptEnd::prompted`):
 //! its prompt asks the model, so where that entry is an older notice the
 //! screen's `⏺` row does not show, the row is the answer not written yet, and
-//! is read again once, as a turn's input is (ATERM-KI-1016-1).
+//! is read again once, as a turn's input is.
 //!
 //! THE ONE LOCAL COMMAND THAT IS A NOTICE: a `/compact` that FAILED (the
 //! context wall the policy meets again after its own `/compact`) writes no
@@ -441,14 +441,11 @@ pub(crate) struct TranscriptEnd {
     pub(crate) last: Entry,
     /// Claude Code closed the turn after it: a `system` row `turn_duration`.
     pub(crate) closed: bool,
-    /// The id (`uuid`) of the row the newest entry was read from (`None`: no
-    /// entry, or a row that carries none): a usage limit's notice confirmed
-    /// is remembered by it ([`served_since_notice`]).
+    /// The id (`uuid`) of the row the newest entry was read from: a usage limit's notice
+    /// confirmed is remembered by it ([`served_since_notice`]).
     pub(crate) row: Option<String>,
-    /// When that row says it was written (its own `timestamp`, unix
-    /// seconds; `None`: none, or none the parser reads): what tells a limit
-    /// a cancel left in answer to the loop's act from an older one
-    /// ([`Session::judge_wall`]).
+    /// That row's own `timestamp` (unix seconds): what tells a limit a cancel left in answer to
+    /// the loop's act from an older one ([`Session::judge_wall`]).
     pub(crate) at: Option<i64>,
     /// A PROMPT COMMAND's row (`<command-message>…`, [`prompt_command`]) was
     /// passed over after the newest entry: its prompt is the model's to
@@ -478,11 +475,8 @@ impl TranscriptEnd {
             .filter(|_| matches!(self.last, Entry::Notice { .. }))
     }
 
-    /// The transcript has not caught up with the turn the screen ended: no
-    /// `turn_duration` row closed it, and its newest entry is no notice —
-    /// the turn's input (a prompt, a tool's result), the model's call or
-    /// words the rest of the turn follows, or nothing. A notice settles it,
-    /// and so does a closed turn.
+    /// The transcript has not caught up with the turn the screen ended: no `turn_duration` closed
+    /// it and its newest entry is no notice.
     #[must_use]
     pub(crate) fn lagging(&self) -> bool {
         !self.closed && !matches!(self.last, Entry::Notice { .. })
@@ -497,25 +491,13 @@ pub(crate) enum Row {
     Closed,
 }
 
-/// What the main chain of `jsonl` (a transcript's tail; a torn first line is
-/// passed over) ends on: its newest entry — an `assistant` row (a notice
-/// when `isApiErrorMessage`, else the model's reply), a `user` row (a tool's
-/// result, or a turn: a prompt, a shell-mode command and its output) — and
-/// whether a `turn_duration` row closed the turn after it. Not entries: a
-/// subagent's rows (`isSidechain`), Claude Code's meta rows (`isMeta`: a
-/// local command's caveat, its nudge after an empty reply), a compaction's
-/// summary (`isCompactSummary`), a local command's own rows, `user` or
-/// `system` (its invocation, its output: [`local_command`]) — except a
-/// `system` row's output that reads as a full context, which is the context
-/// wall's notice (module docs) — and every other row (attachments, a
-/// `system` row of another kind, the mode and snapshot rows).
-///
-/// NEWEST BY ITS PLACE IN THE FILE, but for the ONE measured exception
-/// (module docs): a prompt row with no parent (`parentUuid: null`) opens the
-/// conversation, and written after rows of the conversation's — 2.1.294
-/// wrote a relaunched Claude Code's first prompt after the session limit's
-/// notice, auto-continue and `turn_duration` that answered it (the lab,
-/// 2026-10-08) — it is older than they are, and ends nothing.
+/// What the main chain of `jsonl` (a transcript's tail; a torn first line is passed over) ends
+/// on: its newest entry (an `assistant` row, a notice when `isApiErrorMessage`; a `user` row, a
+/// tool's result or a turn's input) and whether a `turn_duration` row closed the turn after it.
+/// Not entries: a subagent's rows (`isSidechain`), meta rows (`isMeta`), a compaction's summary
+/// (`isCompactSummary`), a local command's own rows ([`local_command`]) except a `system` output
+/// that reads as a full context, and every other row. Newest by place in the file, except that a
+/// prompt row with no parent opens the conversation and ends nothing (module docs).
 pub(crate) fn transcript_ends_on(jsonl: &str) -> TranscriptEnd {
     let mut end = TranscriptEnd {
         last: Entry::Nothing,
@@ -803,7 +785,8 @@ fn turn_closed(jsonl: &str, launched: i64) -> Option<bool> {
                 person |= close.is_some()
                     && v.get("type").and_then(Value::as_str) == Some("user")
                     && !flag("isMeta")
-                    && !flag("isCompactSummary");
+                    && !flag("isCompactSummary")
+                    && !flag("queueTranscriptOnly");
             }
         }
     }
@@ -856,7 +839,7 @@ fn opens_the_conversation(v: &Value) -> bool {
 /// a local command's rows, [`local_command`]); any other is a turn's input or a tool's result.
 fn user_entry(v: &Value) -> Option<Entry> {
     let flag = |key: &str| v.get(key).and_then(Value::as_bool) == Some(true);
-    if flag("isMeta") || flag("isCompactSummary") {
+    if flag("isMeta") || flag("isCompactSummary") || flag("queueTranscriptOnly") {
         return None;
     }
     match v.get("message").and_then(|m| m.get("content")) {
@@ -1146,7 +1129,7 @@ fn notice_wall(entry: &Entry) -> Option<WallKind> {
     // The vendor's typed word that the LOGIN failed decides over the status
     // it answered: a 403 `authentication_failed` (a token revoked, in words
     // no table names) is the lost login's, whose remedy is `/login`, never a
-    // refused request retried slowly (ATERM-KI-1016-1). The refusals a 403
+    // refused request retried slowly. The refusals a 403
     // also carries that no login fixes are typed otherwise
     // ([`TERMINAL_API_ERRORS`]: `org_disabled_credential`,
     // `api_key_auth_disabled`, …) and are read above.
@@ -1181,9 +1164,8 @@ fn shows(said: &str, text: &str) -> bool {
             .eq(want.iter().copied())
 }
 
-/// Whether the transcript's end CONFIRMS a screen wall of kind `screen`: its
-/// newest entry is Claude Code's own notice ([`Entry::Notice`]) of the same
-/// class ([`Class`]) — by its words, through the same table the screen is
+/// Whether the transcript's end confirms a screen wall of kind `screen`: its newest entry is
+/// Claude Code's own notice of the same [`Class`], by its words through the table the screen is
 /// read by ([`aterm_phase::classify_wall`]), else by its `error` word; words
 /// naming nothing but their status confirm the lost login too where the
 /// typed fields say the login failed ([`lost_login`]).
@@ -1728,13 +1710,9 @@ impl<C: Ctl> Session<'_, C> {
                 }
                 self.turn_end.notice_typed_was(end.typed());
                 self.turn_end.notice_written_at(end.notice_at());
-                // A LIMIT A CANCEL LEFT, read as the answer to a turn
-                // ([`Session::left_read`]), is that turn's only where its
-                // notice row was written since the turn was asked: a
-                // conversation `/resume`d meanwhile ends on its own older
-                // cancelled limit, whose row confirms its class all the same.
-                // Where the screen cannot tell it from the notice already
-                // seen, a row that names no time says nothing either.
+                // A limit a cancel left, read as a turn's answer, is that turn's only where its
+                // notice row was written since the turn was asked (module docs); where the screen
+                // cannot tell it from the notice already seen, a row naming no time says nothing.
                 let older = left.is_some_and(|(since, tells)| {
                     end.at
                         .map_or(!tells, |at| at < since.saturating_sub(LEFT_ANSWER_SLACK_S))
@@ -1824,7 +1802,7 @@ impl<C: Ctl> Session<'_, C> {
         // command's invocation passed over after it ([`TranscriptEnd::prompted`]).
         // A prompt command's rows are no entry, so a request it sent right
         // after an error notice leaves that notice the newest entry until the
-        // one its request met is written (ATERM-KI-1016-1: read once, the new
+        // one its request met is written (read once, the new
         // notice drawn like prose was an ordinary turn end, and one
         // continuation was typed into it). Whatever the row is — that notice,
         // or the model's reply — the file has not written it yet.
@@ -2017,7 +1995,7 @@ impl<C: Ctl> Session<'_, C> {
         // decision on the snapshot the host kept from before it named the
         // process already asked about, asked nothing, and decided the
         // standing weekly limit away while the step, asked after it, held
-        // its carry-on behind the same row (ATERM-KI-1016-1). And A POINT
+        // its carry-on behind the same row. And A POINT
         // AFTER A TURN SEEN RUNNING: the turn drops what is held, and is no
         // proof the model answered — a relaunched process's start-up reads
         // busy, and a host that wants no step there (the carry-on settled or
@@ -2274,21 +2252,15 @@ impl<C: Ctl> Session<'_, C> {
         over
     }
 
-    /// Whether wall `w`, read from `screen`, stands UNDER A TOOL'S CALL on
-    /// the WHOLE SCREEN ([`aterm_phase::Wall::under_call`]). The loop's reads
-    /// are the screen's tail (`tail=`, [`Screen::first`] past 0), which can
-    /// hold the wall and not the call above it: the owner walk then reaches
-    /// the top of the rows read and finds no owner (the review of pass 4: an
-    /// MCP call's row at row 9 of 50, the weekly limit's words under it read
-    /// from rows 10-49 — acted on). So a gutter wall read on a tail with no
-    /// call over it is read again from the whole grid ([`Self::grid`], read
-    /// once more here and nowhere else: the tail stays every other read's,
-    /// the server's own agent-verdict cut), and stands only where that read
-    /// finds the same wall and no call over it. A whole read that fails, or
-    /// a screen that no longer reads the same wall, counts as under a call:
-    /// nothing is acted on that the screen's rows above were not read for.
+    /// Whether wall `w`, read from `screen`, stands under a tool's call on the whole screen
+    /// ([`aterm_phase::Wall::under_call`]). The loop reads the screen's tail, which can hold the
+    /// wall and not the call above it, so a gutter wall read on a tail with no call over it is read
+    /// again from the whole grid ([`Self::grid`], here alone: every other read keeps the tail) and
+    /// stands only where that read finds the same wall and no call over it. A whole read that
+    /// fails, or one that no longer reads the same wall, counts as under a call: nothing is acted
+    /// on that the rows above were not read for.
     ///
-    /// THE OWNER ABOVE THE SCREEN (ATERM-KI-1015-14): where the walk reaches
+    /// THE OWNER ABOVE THE SCREEN: where the walk reaches
     /// the whole grid's first row with no owner found
     /// ([`aterm_phase::phase::owner_above_rows`]) — a call row scrolled off
     /// over its long output — the rows right above the screen are read up
@@ -2531,7 +2503,8 @@ impl<C: Ctl> Session<'_, C> {
                 message: l.answer.wall.message.clone(),
                 reset: l.answer.wall.reset.clone(),
             };
-        } else if matches!(turn.phase, Phase::Idle | Phase::Question)
+        }
+        if matches!(turn.phase, Phase::Idle | Phase::Question)
             && self.standing_read.placed == Some(turn.screen.seq)
             && let Some(found) = self.standing_read.found.as_ref()
         {

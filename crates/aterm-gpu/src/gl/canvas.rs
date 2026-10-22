@@ -97,9 +97,12 @@ impl GlCanvasSurface {
     }
 
     /// Post the stand-in: size the canvas if it moved, then copy the
-    /// stand-in into the drawing buffer with its rows flipped. `Err` names
-    /// the GL failure; a lost context is latched on the device.
-    pub(crate) fn present(&mut self, dev: &GlDevice) -> Result<(), GlPresentError> {
+    /// stand-in into the drawing buffer with its rows flipped. The drawing
+    /// buffer is the size this sets, so nothing lies past the frame for the
+    /// frame's background (`_fill`, which a window surface clears there) to
+    /// cover. `Err` names the GL failure; a lost context is latched on the
+    /// device.
+    pub(crate) fn present(&mut self, dev: &GlDevice, _fill: u32) -> Result<(), GlPresentError> {
         let standin = self
             .standin
             .as_ref()

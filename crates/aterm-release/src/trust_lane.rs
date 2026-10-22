@@ -78,9 +78,7 @@ const LANE_PASSED: [&str; 9] = [
     "CARGO_TARGET_DIR",
 ];
 
-// ---------------------------------------------------------------------------
 // What a run is asked, and what it answers
-// ---------------------------------------------------------------------------
 
 /// Which libraries a run verifies.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,9 +258,7 @@ pub fn parse<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<Config, Strin
     Ok(cfg)
 }
 
-// ---------------------------------------------------------------------------
 // The prover
-// ---------------------------------------------------------------------------
 
 /// The toolchain every compile of a run uses, resolved once.
 #[derive(Clone, Debug)]
@@ -374,9 +370,7 @@ pub fn lane_env(bin: &Path, host: &dyn Fn(&str) -> Option<String>) -> Vec<(Strin
     env
 }
 
-// ---------------------------------------------------------------------------
 // The gate list, from the resolved graph
-// ---------------------------------------------------------------------------
 
 /// What a package of the graph is to the lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -798,9 +792,7 @@ pub fn select(libs: &[Lib], names: Option<&[String]>) -> Result<Vec<Selected>, S
         .collect())
 }
 
-// ---------------------------------------------------------------------------
 // Slots, order and the budget
-// ---------------------------------------------------------------------------
 
 /// `--jobs auto`: one slot per six cores and per 16 GiB, at least one; memory that
 /// cannot be read allows one.
@@ -1134,9 +1126,7 @@ pub fn record(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // A run
-// ---------------------------------------------------------------------------
 
 /// What a run needs of the machine: its prover, the graph that prover resolves, and
 /// checks run beside that prover's trustd. [`run`] uses the machine's ([`Machine`]); a
@@ -2018,9 +2008,7 @@ fn push_kv(plan: &mut String, k: &str, v: &str) {
     plan.push('\n');
 }
 
-// ---------------------------------------------------------------------------
 // Where a run's slots go, and the toolchain they are checked with
-// ---------------------------------------------------------------------------
 
 /// The checkout's own target root, `<repo>/target-trust.noindex`: a folder named
 /// `*.noindex` is skipped by Spotlight with all it holds, so no check's intermediates
@@ -2742,9 +2730,7 @@ impl Drop for RunLock {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The real checks
-// ---------------------------------------------------------------------------
 
 struct RealChecks<'a> {
     driver: &'a Driver,
@@ -2890,9 +2876,7 @@ impl Check for RealCheck {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Process trees
-// ---------------------------------------------------------------------------
 
 pub mod proc_tree {
     //! A check's process tree: listed by parent pid (targo-trust starts its build in a
@@ -3057,9 +3041,7 @@ pub mod proc_tree {
     }
 }
 
-// ---------------------------------------------------------------------------
 // trustd, Trust's per-user memory jobserver
-// ---------------------------------------------------------------------------
 
 pub mod trustd {
     //! targo starts a check only beside the trustd packaged with it: it asks the daemon

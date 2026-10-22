@@ -26,9 +26,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use aterm_json::{Map, Value};
 
-// ---------------------------------------------------------------------------
 // Bounds
-// ---------------------------------------------------------------------------
 
 /// The longest transcript line that is parsed; a longer one is counted in
 /// [`TranscriptUsage::rows_skipped_long`] and its bytes are discarded as they
@@ -58,9 +56,7 @@ pub const UNKNOWN_MODEL: &str = "unknown";
 /// The model key spend is filed under past [`MAX_MODELS`] distinct ids.
 pub const OTHER_MODEL: &str = "(other)";
 
-// ---------------------------------------------------------------------------
 // Numbers: integer or float, never a panic
-// ---------------------------------------------------------------------------
 
 fn num_f64(v: Option<&Value>) -> Option<f64> {
     v.and_then(Value::as_f64).filter(|f| f.is_finite())
@@ -76,9 +72,7 @@ fn num_u64(v: Option<&Value>) -> Option<u64> {
     Some(f as u64)
 }
 
-// ---------------------------------------------------------------------------
 // One request's tokens
-// ---------------------------------------------------------------------------
 
 /// One request's token counts — the vendor's `usage` object on every
 /// assistant transcript row.
@@ -179,9 +173,7 @@ impl TokenUsage {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The transcript: spend per model, deduped by message.id
-// ---------------------------------------------------------------------------
 
 /// Token totals for one model over the rows folded so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1107,9 +1099,7 @@ pub(crate) fn cannot_be_assistant(line: &str) -> bool {
 /// [`TranscriptUsage::busy_ms`].
 const TURN_DURATION: &str = "turn_duration";
 
-// ---------------------------------------------------------------------------
 // The view
-// ---------------------------------------------------------------------------
 
 /// Spend on one model, as the view shows it.
 #[derive(Debug, Clone, PartialEq)]
@@ -1238,9 +1228,7 @@ impl UsageView {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The `/usage` panel, read off aterm's own grid
-// ---------------------------------------------------------------------------
 
 /// One rate-limit window Claude Code painted on its `/usage` panel, before
 /// its reset text is placed on a clock; the producer of
@@ -1445,9 +1433,7 @@ pub fn usage_panel_windows(rows: &[String]) -> Vec<PanelWindow> {
     out
 }
 
-// ---------------------------------------------------------------------------
 // The accounts probe's read of the panel (P10, P22)
-// ---------------------------------------------------------------------------
 
 /// The command the accounts probe types to open the panel. `usage` is an
 /// `immediate` `local-jsx` command sharing its prefix with `usage-credits`; on
@@ -1610,9 +1596,7 @@ pub fn spend_from_transcript(usage: &TranscriptUsage) -> BTreeMap<String, SpendV
         .collect()
 }
 
-// ---------------------------------------------------------------------------
 // The HUD line
-// ---------------------------------------------------------------------------
 
 /// The family word of a model id: `claude-fable-5-1` → `fable`,
 /// `claude-3-5-haiku-20241022` → `haiku`. The first `-`-separated segment
@@ -1696,9 +1680,7 @@ pub fn hud_line(view: &UsageView) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
 // `harness usage --json`, schema 1
-// ---------------------------------------------------------------------------
 
 /// `YYYY-MM-DDTHH:MM:SSZ` of an epoch instant, before the epoch too (the
 /// calendar is `aterm_types::rfc3339`'s, the workspace's one copy).
@@ -1790,9 +1772,7 @@ pub fn usage_json(view: &UsageView) -> String {
         .unwrap_or_else(|_| r#"{"schema":1,"accounts":[],"error":"serialize"}"#.to_owned())
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! A PROVEN SELF-CLAIM'S LANDING REOPENS AT A TURN BEGUN AFTER IT
-//! (FOREVER LAND §10.4, `App::reopen_self_claim_landing`), however short the
+//! (Autopilot Land, `App::reopen_self_claim_landing`), however short the
 //! turn and whenever the status sweep runs, and never at a report that begins
 //! no turn after it (the landing turn's own, one written again after a
 //! handoff, work running on through the landing). What the program's reports
@@ -817,6 +817,264 @@ fn a_point_left_to_a_person_reopens_at_their_next_turn() {
             Some(TaskFace::Open),
             "later counted input reopens the earlier mark"
         );
+        tab.done();
+    }
+}
+
+/// THE RELAND FACE RACE (codex-alab parity-4, `harness_task::landing_turns`):
+/// codex-alab records its land act once the land turn has started and
+/// `landed@v1` at that turn's yield, both on the control socket, while its
+/// TUI writes the turn's OSC 7501 reports to the PTY. When both acts reach
+/// aterm before the turn's begin is parsed, that begin — read after the
+/// landing — is the landing's own turn, and must not reopen it; the person's
+/// turn after it does. As it is when the begin is parsed between the two
+/// acts (the program's order and aterm's agree). NEGATIVE CONTROLS: a land
+/// act that came in a turn (its begin counted already) owes nothing, so the
+/// next turn's begin reopens; and neither does one recorded under a claim
+/// since released, whose holder's acts are no landing's for the next.
+#[test]
+fn a_landing_whose_acts_outran_its_own_turns_begin_stays_landed() {
+    let mut wrong = Vec::new();
+    for case in ["outran", "begun between", "act in a turn", "claim since"] {
+        let mut tab = Tab::new();
+        // The turn before, every report swept: one turn begun, at rest.
+        for bytes in [IDLE, WORKING, DONE] {
+            tab.says(bytes);
+            tab.sweep();
+        }
+        if case == "act in a turn" {
+            tab.says(IDLE);
+            tab.says(WORKING);
+        }
+        let wakes = tab.act("land@v1");
+        tab.apply(wakes);
+        assert_eq!(tab.face(), Some(TaskFace::Open), "{case}: the land act");
+        match case {
+            "begun between" => tab.says(WORKING),
+            "act in a turn" => tab.says(DONE),
+            "claim since" => {
+                let now = crate::metrics::now_us();
+                assert!(crate::session_timeline::release_supervisor(
+                    &tab.ctx,
+                    None,
+                    now,
+                    aterm_slog::Actor::Ctl
+                ));
+                crate::session_timeline::claim_supervisor_as(
+                    &tab.ctx,
+                    &format!("codex-alab@{}", std::process::id()),
+                    Some(1),
+                    None,
+                    Some(crate::self_claim::stand_in::running()),
+                    now,
+                    aterm_slog::Actor::Ctl,
+                )
+                .expect("the holder takes the free session again");
+            }
+            _ => {}
+        }
+        tab.sweep();
+        tab.lands();
+        let owes = matches!(case, "outran" | "begun between");
+        if case != "act in a turn" {
+            // The land turn's reports, parsed after its landing.
+            if case != "begun between" {
+                tab.says(IDLE);
+                tab.says(WORKING);
+            }
+            tab.sweep();
+            tab.says(DONE);
+            tab.sweep();
+            let want = if owes {
+                TaskFace::Landed
+            } else {
+                TaskFace::Open
+            };
+            if tab.face() != Some(want) {
+                wrong.push(format!(
+                    "{case}: the land turn's begin, read after the landing: {:?}",
+                    tab.face()
+                ));
+            }
+        }
+        if owes || case == "act in a turn" {
+            // The next turn: a person's.
+            tab.says(WORKING);
+            tab.sweep();
+            if tab.face() != Some(TaskFace::Open) {
+                wrong.push(format!(
+                    "{case}: a turn begun after the landing: {:?}",
+                    tab.face()
+                ));
+            }
+        }
+        tab.done();
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// AN ACT THAT STARTS NO TURN NAMES NO LANDING'S TURN (review of codex-alab
+/// parity-4, R1): after the land turn's reports were all parsed, codex-alab
+/// records an act that types nothing at rest — a report mailed, an approval,
+/// a box's answer — and then its landing. That act is no turn still to come,
+/// so the landing is marked at the engine's count, and a person's turn begun
+/// after it reopens the task. NEGATIVE CONTROL: a continuation in the same
+/// place does start a turn whose begin is still unparsed when the landing
+/// arrives, so that begin stays the landing's own, and the person's turn after
+/// it reopens.
+#[test]
+fn an_act_that_starts_no_turn_leaves_the_landings_turn_as_it_was() {
+    let mut wrong = Vec::new();
+    for act in [
+        "mail-report@v1",
+        "approve-all@v1",
+        "answer-recommended@v1",
+        "continue@v1",
+    ] {
+        let starts_one = act == "continue@v1";
+        let mut tab = Tab::new();
+        // The turn before, every report swept: one turn begun, at rest.
+        for bytes in [IDLE, WORKING, DONE] {
+            tab.says(bytes);
+            tab.sweep();
+        }
+        let wakes = tab.act("land@v1");
+        tab.apply(wakes);
+        // The land turn, every report swept before its landing.
+        tab.says(IDLE);
+        tab.says(WORKING);
+        tab.sweep();
+        tab.says(DONE);
+        tab.sweep();
+        let wakes = tab.act(act);
+        tab.apply(wakes);
+        tab.lands();
+        if starts_one {
+            // The continuation's own turn, parsed after the landing.
+            tab.says(IDLE);
+            tab.says(WORKING);
+            tab.sweep();
+            tab.says(DONE);
+            tab.sweep();
+            if tab.face() != Some(TaskFace::Landed) {
+                wrong.push(format!(
+                    "{act}: its own turn's begin, read after the landing: {:?}",
+                    tab.face()
+                ));
+            }
+        }
+        // A person's turn.
+        tab.says(WORKING);
+        tab.sweep();
+        if tab.face() != Some(TaskFace::Open) {
+            wrong.push(format!(
+                "{act}: a turn begun after the landing: {:?}",
+                tab.face()
+            ));
+        }
+        tab.done();
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A SELF-CLAIM'S FACE STANDS ACROSS ITS OWN RE-EXEC (Autopilot Land:
+/// `upgrade@v1` moves no face, the landing carried across; seen live in
+/// aterm-lab's codex-alab proof, 2026-10-22, where the exchange left to the
+/// person and every landed Land leg read `task=open` past the upgrade):
+/// codex-alab records `upgrade@v1`, gives its claim back as its image execs,
+/// and its next image claims again. In that gap the watching loop's run is
+/// cut and its next run starts, telling "unknown" and then its own start
+/// face, and the new claim cuts it again: none of those is the session's.
+/// The face the self-claim told (`theirs`, `landed`) stands through the gap
+/// and past the new claim, until a turn begun past it. NEGATIVE CONTROLS: a
+/// claim given back with no upgrade before it (codex-alab gone passive)
+/// leaves the session to the watching loop, whose face is told; so does one
+/// given back after the new image's claim (the upgrade is spent).
+#[test]
+fn a_self_claims_face_stands_across_its_own_reexec() {
+    for case in ["theirs", "landed", "passive", "passive after the re-exec"] {
+        let upgrade = case != "passive";
+        let mut tab = Tab::new();
+        let sid = tab.ctx.self_id.to_string();
+        for bytes in [IDLE, WORKING, DONE] {
+            tab.says(bytes);
+            tab.sweep();
+        }
+        let want = if case == "landed" {
+            tab.lands();
+            TaskFace::Landed
+        } else {
+            let wakes = tab.act("left-to-person@v1");
+            tab.apply(wakes);
+            TaskFace::Theirs
+        };
+        assert_eq!(tab.face(), Some(want), "{case}");
+        if upgrade {
+            let wakes = tab.act("upgrade@v1");
+            tab.apply(wakes);
+        }
+        // The image execs: its claim is given back while it runs.
+        let release = |tab: &Tab| {
+            assert!(crate::session_timeline::release_supervisor(
+                &tab.ctx,
+                Some(1),
+                crate::metrics::now_us(),
+                aterm_slog::Actor::Ctl,
+            ));
+        };
+        // The watching loop's run, cut, tells "unknown"; its next run tells
+        // its start face.
+        let watching = |tab: &mut Tab| {
+            tab.app
+                .apply_harness_fact(&sid, crate::HarnessFact::Task(None));
+            tab.app
+                .apply_harness_fact(&sid, crate::HarnessFact::TaskNoted(TaskFace::Open, 1));
+            tab.app
+                .apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Open)));
+            tab.sweep();
+        };
+        release(&tab);
+        watching(&mut tab);
+        if !upgrade {
+            assert_eq!(
+                tab.face(),
+                Some(TaskFace::Open),
+                "NEGATIVE CONTROL: given back with no upgrade, the watching loop's face"
+            );
+            tab.done();
+            continue;
+        }
+        assert_eq!(tab.face(), Some(want), "{case}: through the re-exec's gap");
+        // The new image claims again, which cuts the watching loop's run.
+        crate::session_timeline::claim_supervisor_as(
+            &tab.ctx,
+            &format!("codex-alab@{}", std::process::id()),
+            Some(1),
+            None,
+            Some(crate::self_claim::stand_in::running()),
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the new image claims again");
+        tab.app
+            .apply_harness_fact(&sid, crate::HarnessFact::Task(None));
+        tab.sweep();
+        assert_eq!(tab.face(), Some(want), "{case}: past the new claim");
+        if case == "passive after the re-exec" {
+            release(&tab);
+            watching(&mut tab);
+            assert_eq!(
+                tab.face(),
+                Some(TaskFace::Open),
+                "NEGATIVE CONTROL: given back again, the upgrade spent"
+            );
+            tab.done();
+            continue;
+        }
+        // CONTROL: a turn begun past it still opens the task.
+        tab.says(WORKING);
+        tab.sweep();
+        assert_eq!(tab.face(), Some(TaskFace::Open), "{case}: the next turn");
         tab.done();
     }
 }

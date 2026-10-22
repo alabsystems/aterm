@@ -83,7 +83,8 @@ fn quit(w: &mut World) {
 /// THE RUN WROTE.** Eight sessions in use leave sixteen torn-kind files
 /// written with no flush; the instance hands off: its bridge flushes nothing
 /// and leaves the run open, and its successor, on the same dir in the same
-/// boot, establishes its own durable OPEN fence. The successor then quits,
+/// boot, establishes its own durable OPEN fence by two full flushes. The
+/// successor then quits,
 /// and its clean stop flushes every one of the sixteen it inherited where it is (nothing
 /// rewritten), each by the barrier, and ends with one full flush.
 #[test]
@@ -141,24 +142,46 @@ fn a_handoff_flushes_nothing_and_the_quit_after_it_flushes_the_run() {
     assert_eq!(handed.len(), 1, "it says so once");
 
     // THE SUCCESSOR, on the same state dir in the same boot.
-    let before = log_len(&w);
+    let successor = log_len(&w);
     let gui = w.gui.insert(World::relaunch_gui(&w));
     w.token = World::wait_for_owned_token_of(&w.ctl_sock, gui, &w.gui_log);
     w.wait_ready();
-    let began = said(&w, before, "aterm-link: the run record says a bridge runs");
+    let began = said(
+        &w,
+        successor,
+        "aterm-link: the run record says a bridge runs",
+    );
     eprintln!("MEASURED handoff, the successor's start: {began:?}");
     assert_eq!(
         began.len(),
         1,
         "the successor establishes its own OPEN fence"
     );
-    assert_eq!(number(&began[0], "full flushes"), 2);
+    assert_eq!(
+        (
+            number(&began[0], "barriers"),
+            number(&began[0], "full flushes")
+        ),
+        (0, 2),
+        "over the open run it inherits, in full: {}",
+        began[0]
+    );
 
     // ITS QUIT: a real one, and a clean stop of the run it inherited.
     let before = log_len(&w);
     quit(&mut w);
     let stopped = said(&w, before, "aterm-link: the run stopped cleanly:");
     eprintln!("MEASURED quit after the handoff, its clean stop: {stopped:?}");
+    // The mirror's floor, durable at the successor's first raise in its
+    // open (if its mirror sent a batch), is the other flush its run paid
+    // for its start (raise_logfloor's tier is not this item's): printed,
+    // never judged.
+    let floor = said(
+        &w,
+        successor,
+        "aterm-link: mirror: the floor of the node's total",
+    );
+    eprintln!("MEASURED handoff, the successor's first floor raise: {floor:?}");
     let [line] = stopped.as_slice() else {
         panic!("one stop line, not {stopped:?}");
     };

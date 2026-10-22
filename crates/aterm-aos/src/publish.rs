@@ -89,7 +89,7 @@ use crate::effects::{EffectDivergence, EffectRecord, NoEffects, ShadowPort};
 use crate::evidence::{Witness, WitnessParts};
 use crate::ident::{ArtifactKind, BranchId, Digest, Revision, TaskIdentity};
 use crate::log::{EventLog, IdentityMismatch, LogHeader, RangeFault};
-use crate::replay::{Divergence, replay};
+use crate::replay::{Divergence, Run, replay};
 use crate::task::{Code, PausedClass, Schema, StepRefusal, state_digest};
 
 /// The live head: everything a publication must find unchanged.
@@ -966,31 +966,43 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         // The live code, from the ancestor, over the complete range, must land exactly on the
         // paused head: otherwise the log is not the history that produced it.
         let none: &[EffectRecord] = &[];
-        let mut live_port = ShadowPort::new(none);
-        let live_run = replay(
-            schema,
-            live_code,
-            ancestor.clone(),
-            inputs,
-            from,
-            &mut live_port,
-        );
-        bump(replays);
-        if let Some(d) = live_port.frontier() {
-            return Err(PublishRefusal::LiveEffects(*d));
-        }
-        if let Some((cursor, _)) = &live_run.refused {
-            return Err(PublishRefusal::LiveNotReproduced(Divergence::Refused {
-                cursor: *cursor,
-            }));
-        }
-        if live_run.state_digest != expected.state_digest {
-            return Err(PublishRefusal::LiveNotReproduced(Divergence::State {
-                a: live_run.state_digest,
-                b: expected.state_digest,
-            }));
-        }
-        live_port.finish().map_err(PublishRefusal::LiveEffects)?;
+        // The live run is judged as soon as it is checked, and only its verdict and chain
+        // outlive this block: its observations are not held through the candidate's replay,
+        // so a repair holds one run's observations at a time. A contract is a pure judgement
+        // of (inputs, run), so the verdict is the one a later judgement would give.
+        let (live_verdict, live_observation_chain) = {
+            let mut live_port = ShadowPort::new(none);
+            let live_run = replay(
+                schema,
+                live_code,
+                ancestor.clone(),
+                inputs,
+                from,
+                &mut live_port,
+            );
+            bump(replays);
+            if let Some(d) = live_port.frontier() {
+                return Err(PublishRefusal::LiveEffects(*d));
+            }
+            if let Some((cursor, _)) = &live_run.refused {
+                return Err(PublishRefusal::LiveNotReproduced(Divergence::Refused {
+                    cursor: *cursor,
+                }));
+            }
+            if live_run.state_digest != expected.state_digest {
+                return Err(PublishRefusal::LiveNotReproduced(Divergence::State {
+                    a: live_run.state_digest,
+                    b: expected.state_digest,
+                }));
+            }
+            live_port.finish().map_err(PublishRefusal::LiveEffects)?;
+            // Repair is judged by the corrected contract, never by equivalence to the live
+            // code: the live verdict is recorded, not required.
+            (
+                contract.judge(schema, inputs, &live_run),
+                live_run.observation_chain,
+            )
+        };
 
         // The candidate continues from the same ancestor over the same inputs.
         candidate
@@ -1010,11 +1022,21 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
             .map_err(PublishRefusal::CandidateEffects)?;
 
         // Repair is judged by the corrected contract, never by equivalence to the live code.
-        let live_verdict = contract.judge(schema, inputs, &live_run);
         let candidate_verdict = contract.judge(schema, inputs, &cand_run);
         if !candidate_verdict.passed() {
             return Err(PublishRefusal::CandidateFailed(candidate_verdict));
         }
+        // Judged: the candidate's observations go here too, before the trace digest. They are
+        // moved out and dropped by name, since a field a pattern leaves behind would stay
+        // allocated in `cand_run` until `prepare` returns. `refused` is `None` here.
+        let Run {
+            state: candidate_state,
+            state_digest: candidate_state_digest,
+            observation_chain: candidate_observation_chain,
+            observations: candidate_observations,
+            refused: _,
+        } = cand_run;
+        drop(candidate_observations);
         let trace_digest = rec
             .log
             .trace_digest(schema, from, to)
@@ -1029,15 +1051,15 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
             contract: contract.id().clone(),
             live_code: live_code.id().clone(),
             live_verdict,
-            live_observation_chain: live_run.observation_chain,
+            live_observation_chain,
             candidate_code: candidate.id().clone(),
             candidate_verdict,
-            candidate_observation_chain: cand_run.observation_chain,
-            candidate_state_digest: cand_run.state_digest,
+            candidate_observation_chain,
+            candidate_state_digest,
         });
         Ok(Prepared {
             candidate,
-            state: cand_run.state,
+            state: candidate_state,
             witness,
         })
     }
@@ -1405,19 +1427,21 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
     }
 
     /// Before an input is recorded: a broken or full log is replaced by a fresh checkpoint
-    /// of the current state (a true boundary) and an empty log of the next epoch.
+    /// of the current state (a true boundary) and an empty log of the next epoch, whose
+    /// parent is the checkpoint it replaces. That parent's digest is taken only then: it is
+    /// read by nothing else here, and an admit that needs no re-anchor (nearly every one)
+    /// would hash the checkpoint for nothing.
     fn ensure_room(&mut self) {
-        let (needs, parent, epoch) = match &self.live.recording {
-            Some(rec) => (
-                rec.log.broken().is_some() || rec.log.len() >= rec.log.max_events(),
-                rec.checkpoint.digest(),
-                rec.log.header().log_epoch.checked_add(1),
-            ),
-            None => return,
+        let Some(rec) = &self.live.recording else {
+            return;
         };
-        if !needs {
+        if rec.log.broken().is_none() && rec.log.len() < rec.log.max_events() {
             return;
         }
+        let (parent, epoch) = (
+            rec.checkpoint.digest(),
+            rec.log.header().log_epoch.checked_add(1),
+        );
         let Some(epoch) = epoch else {
             self.break_log("the log epochs are exhausted");
             return;

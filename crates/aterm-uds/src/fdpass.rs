@@ -258,7 +258,6 @@ mod scm {
             cmsg_type: i32,
         }
 
-        /// Byte offsets of `cmsg_level` / `cmsg_type` inside [`CmsgHdr`].
         pub const LEVEL_OFFSET: usize = 4;
         /// See [`LEVEL_OFFSET`].
         pub const TYPE_OFFSET: usize = 8;
@@ -295,8 +294,6 @@ mod scm {
                 msg_namelen: 0,
                 msg_iov: iov,
                 msg_iovlen: iov_len as i32,
-                // A NULL control pointer is the documented "no ancillary
-                // data" spelling; a non-null pointer with length 0 is not.
                 msg_control: if control_len == 0 {
                     core::ptr::null_mut()
                 } else {

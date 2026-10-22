@@ -17,17 +17,22 @@
 //! `None`, [`ConfirmRead::Inexact`] and [`ResetLine::Other`] are the answers
 //! to anything reworded, and none of them spends a reset.
 //!
-//! ONE BUILD'S WORDING: Claude Code 2.1.304's, the store's build, which the
-//! drift canaries grep (`crate::anchors`). The wording of 2.1.287 to 2.1.303
-//! — `Use your reset now (…)`, `Use your reset?`, `Yes, use my reset`, one
-//! `Limits reset · …` for every grant, `Reset kept · …` — drawn by an older
-//! build still running, or by a flag payload that carries the old strings,
-//! reads as no grant row, a confirmation not read exactly and an `Other`
-//! line: refused, nothing spent.
+//! ONE WORDING: Claude Code 2.1.304's, which every build since draws
+//! unchanged through 2.1.308, the store's build, and which the drift canaries
+//! grep (`crate::anchors`). 2.1.305 to 2.1.308 were read again on 2026-10-22,
+//! the reset program's bundle chunks diffed against 2.1.304's with the
+//! minifier's names set aside: the same texts, rows, confirmation and
+//! answers, and one change of the reset's code, 2.1.307's suffix helper for
+//! `Yn`'s strip (the drift canary takes either spelling), which draws the
+//! same names. The wording of 2.1.287 to 2.1.303 — `Use your reset now (…)`,
+//! `Use your reset?`, `Yes, use my reset`, one `Limits reset · …` for every
+//! grant, `Reset kept · …` — drawn by an older build still running, or by a
+//! flag payload that carries the old strings, reads as no grant row, a
+//! confirmation not read exactly and an `Other` line: refused, nothing spent.
 //!
 //! NOTHING HERE IS MEASURED. No wall with a reset on offer has been seen on a
 //! screen or in a transcript: every text below is READ in the 2.1.304
-//! bundle — `@` a byte offset into the store's binary, its JavaScript
+//! bundle — `@` a byte offset into that build's binary, its JavaScript
 //! source — and every fixture ([`fixtures`]) is COMPOSED and says so on its
 //! first line. What is read, and where:
 //!
@@ -2430,7 +2435,7 @@ mod tests {
                 ConfirmRead::Inexact("title"),
                 "cut {cut}"
             );
-            // NEGATIVE CONTROL: no part of the confirmation left.
+            // Negative control: no part of the confirmation left.
             let other = boxed_as(QUESTION, &[PLAIN], "Yes", "No", cut);
             assert_eq!(confirm_read(&other), ConfirmRead::Not, "cut {cut}");
         }
@@ -2658,10 +2663,11 @@ mod tests {
         assert_eq!(reset_pending(&[]), None);
     }
 
-    /// The vendor's answers at a wall, each as its templates draw it (READ,
-    /// the module header; the dates and counts invented): the lines of a
-    /// claim, then the row's own answers.
-    const FAILURES: [&str; 23] = [
+    /// The vendor's other answers at a wall, as its templates draw them (dates and counts
+    /// invented): the lines of a claim, then the row's own answers, then the rest of what the
+    /// answers' templates compose (2.1.308's are 2.1.304's), then the answers away from a
+    /// wall, which a person's own `/limit-reset` draws.
+    const FAILURES: [&str; 43] = [
         "That reset was already used · nothing changed just now · 1 weekly reset left",
         "That reset was already used · nothing changed just now · 1 five-hour reset left · run \
          /limit-reset again to use one",
@@ -2694,6 +2700,48 @@ mod tests {
         "Resets can't be used while you continue at lower priority · run /limit-reset after that \
          ends",
         "Resets kept · run /limit-reset when you want one · first expires Oct 5 at 3pm",
+        // Nothing to take at the wall, each reason the answer composes after
+        // its ` · this limit resets {when}` or ` · you're not at a usage
+        // limit right now`.
+        "No reset to use · this limit resets Oct 9 at 5am",
+        "Your Fable reset can't be used right now · no Fable usage this week to give back · this \
+         limit resets Oct 9 at 5am",
+        "Your reset can't be used for this limit right now · it is paused · this limit resets \
+         Oct 9 at 5am",
+        "Your reset can't be used for this limit right now · try again in a minute · this limit \
+         resets 3pm",
+        "This reset isn't available any more · nothing was used · you're not at a usage limit \
+         right now",
+        // The row's kind not on offer, by each reason it is not: the reason
+        // whole where it opens `can't be used`, after `can't be used right
+        // now · ` where it does not; then the kinds that are.
+        "Your weekly reset can't be used while you're at your session limit · you can use a \
+         5-hour reset",
+        "Your full reset can't be used while you're at your Opus limit · you can use a weekly \
+         reset",
+        "Your 5-hour reset can't be used while you're at another limit it doesn't refill · you \
+         can use a weekly reset or a full reset",
+        "Your weekly reset can't be used right now · you can use a 5-hour reset",
+        "Your weekly reset can't be used right now · doesn't refill the limit you've reached · \
+         you can use a 5-hour reset, a full reset or a Fable reset",
+        "Your weekly reset can't be used right now · doesn't refill your session limit · you can \
+         use a 5-hour reset",
+        "Your full reset can't be used right now · usable once you reach a limit it refills · you \
+         can use a 5-hour reset",
+        "Your Fable reset can't be used right now · no Fable usage this week to give back · you \
+         can use a weekly reset",
+        "Your weekly reset can't be used right now · try again in a minute · you can use a 5-hour \
+         reset",
+        // Away from a wall.
+        "You have a reset saved for when you reach a usage limit · run /limit-reset when you do · \
+         1 reset left · use by Oct 5",
+        "Your reset can't be used right now · it is paused · 2 resets left · use by Oct 5",
+        "Your reset can't be used right now · try again later · 1 reset left · use by Oct 5",
+        "Your reset only works at a usage limit, and you're not at one now · nothing was used",
+        "Another reset was just started on your account · this one wasn't used · try again in a \
+         minute",
+        "Couldn't confirm the reset went through · check /usage in a moment · if your limits \
+         weren't refilled, run /limit-reset again",
     ];
     const SPENT: &str =
         "Weekly limits reset · your weekly reset day stays Oct 9 at 5am · 1 weekly reset left";
@@ -3007,18 +3055,44 @@ mod tests {
             "/limit-reset to use your weekly reset · 1 left · use by Oct 9",
             "/limit-reset · 2 five-hour, 1 Fable resets · first expires Oct 5",
             "Reset used · 1 reset left",
-            // The chooser (`Fnt` @257468497): its title and a disabled row.
+            // The chooser (`Fnt` @257468497): its title; its disabled rows
+            // are `chooser` below.
             "Which reset do you want to use?",
-            "Weekly reset · can't be used while you're at your session limit",
-            "Fable reset · no Fable usage this week to give back",
             // The weekly session reset (`yJ` @225880305): its row, its
             // footer notice, its answers and its pending line.
             WEEKLY,
             "/limit-reset to reset your session limit now · uses weekly limit · 1/week",
             "Resetting your session limit… this usually takes a few seconds",
         ];
-        for line in fixed.iter().chain(&FAILURES).chain(&JUNIPER) {
-            for line in [(*line).to_string(), format!("{line}{ASKS}")] {
+        // The chooser's disabled rows (`Ht` @244631702): `{Kind} · {reason}`,
+        // every kind with every reason `zn` draws (@244632695; `ln` for a
+        // Fable reset at the weekly limit, the limit names `R1e`'s and
+        // `d0t`'s), and `doesn't refill your {limit}` with each name `Se`
+        // draws (@244634234) — a superset of the rows a build composes.
+        let reasons = [
+            "try again in a minute",
+            "can't be used while you're at your session limit",
+            "can't be used while you're at your weekly limit",
+            "can't be used while you're at your Opus limit",
+            "can't be used while you're at your Sonnet limit",
+            "no Fable usage this week to give back",
+            "can't be used while you're at another limit it doesn't refill",
+            "doesn't refill the limit you've reached",
+            "usable once you reach a limit it refills",
+            "can't be used right now",
+            "doesn't refill your session limit",
+            "doesn't refill your weekly limit",
+            "doesn't refill your Opus limit",
+            "doesn't refill your Sonnet limit",
+            "doesn't refill your Fable limit",
+            "doesn't refill your usage credit limit",
+        ];
+        let chooser = ["5-hour reset", "Weekly reset", "Full reset", "Fable reset"]
+            .into_iter()
+            .flat_map(|kind| reasons.map(|reason| format!("{kind}{SEP}{reason}")));
+        let lines = fixed.iter().chain(&FAILURES).chain(&JUNIPER);
+        for line in lines.map(|line| (*line).to_string()).chain(chooser) {
+            for line in [format!("{line}{ASKS}"), line] {
                 assert_eq!(classify_wall(&line), None, "{line}");
             }
         }

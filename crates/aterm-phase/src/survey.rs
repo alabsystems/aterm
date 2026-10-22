@@ -18,7 +18,7 @@
 //! options row up, never from a question text.
 //!
 //! **IN A NARROW PANE** (MEASURED on 2.1.300, the harness sweep of 2026-10-15,
-//! ATERM-KI-1015-1 S2R-F2; the fixtures `claude-2.1.300-survey-session-NNcol.txt`): below
+//! S2R-F2; the fixtures `claude-2.1.300-survey-session-NNcol.txt`): below
 //! 41 columns Ink wraps the question onto a row at column 2 (`● How is Claude doing this`
 //! over `session? (optional)`), and draws the options as four boxes side by side, each
 //! key at its box's column and each box's text wrapped inside it (`  1: Bad  2: Fine 3:
@@ -1302,7 +1302,7 @@ mod tests {
         }
     }
 
-    /// ATERM-KI-1016-1, "Dialogs in narrow panes": where Ink shrinks the card's FIRST box
+    /// , "Dialogs in narrow panes": where Ink shrinks the card's FIRST box
     /// under its label (`1:` over `Bad`: the session card under 24 columns, the plugin
     /// and memory cards' five boxes under 30), the options' first row opens `  1:` and
     /// spaces, and the row under it opens at column two (`  Bad  Fine  Good smiss`) —

@@ -180,9 +180,7 @@ pub(crate) fn wall_answer(
     }
 }
 
-// ---------------------------------------------------------------------------
 // ATERM'S OWN COPY of codex-alab's session record (the contract, §4).
-// ---------------------------------------------------------------------------
 
 /// The copy each session's proven claim was last read into, by tab
 /// ([`refresh`]): the record read ONLY while the claim's identity was live —

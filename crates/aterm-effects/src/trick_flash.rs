@@ -1951,7 +1951,7 @@ mod tests {
         }
     }
 
-    /// A rescan of the flash's pane with NO cursor is a scrollback view: the
+    /// A rescan of the flash's pane with no cursor is a scrollback view: the
     /// viewport's rows are not live rows, so the flash ends — live or pending.
     #[test]
     fn a_rescan_without_a_cursor_ends_the_flash() {

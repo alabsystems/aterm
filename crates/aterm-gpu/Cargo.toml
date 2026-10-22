@@ -127,8 +127,7 @@ aterm-spec = { workspace = true }
 aterm-models-core = { workspace = true }
 aterm-models-misc = { workspace = true }
 aterm-models-render = { workspace = true }
-# The pure, clockless supernova emitters feed `nova_parity`'s RenderInput
-# channels directly, with no engine.
+# `nova_parity` feeds the clockless supernova emitters into RenderInput directly.
 aterm-effects = { workspace = true }
 
 # The GL arm's windowed X11 test (`gl::glx`) runs its work in a child, this test

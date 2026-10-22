@@ -227,7 +227,6 @@ fn step_bar(bar: Bar, forward: bool) -> Bar {
     }]
 }
 
-// ---------------------------------------------------------------------
 // The frame's measures (§11.3), pt from the shell's top-left corner.
 
 /// The shell's side margin: the explainer wraps to the shell width − 24.
@@ -458,7 +457,6 @@ fn stack(
     Some(out)
 }
 
-// ---------------------------------------------------------------------
 // The pen: text, rules, bars and marks in pt from the shell's corner, each
 // edge on a whole device pixel.
 
@@ -817,7 +815,6 @@ fn line_section<'d>(name: &str, label: &str, forms: Vec<String>, right: bool) ->
     }
 }
 
-// ---------------------------------------------------------------------
 // Lists: a chip, a name, a scope, a bar and a figure a row.
 
 /// One row of a list.
@@ -1013,7 +1010,6 @@ fn list_section<'d>(
     }
 }
 
-// ---------------------------------------------------------------------
 // Step traces (§7.7): a line per bucket, because the axis does not start at
 // zero.
 
@@ -1298,7 +1294,6 @@ fn trace_section<'d>(
     }
 }
 
-// ---------------------------------------------------------------------
 // Words the lens prints.
 
 /// Bytes printed alone, as the deck and its Details print them
@@ -1457,7 +1452,6 @@ fn gib(bytes: u64) -> f64 {
     bytes as f64 / 1_073_741_824.0
 }
 
-// ---------------------------------------------------------------------
 // The lenses.
 
 /// What every lens's builder reads.
@@ -3246,7 +3240,6 @@ fn lines_section<'d>(
     }
 }
 
-// ---------------------------------------------------------------------
 // Line 1, the explainer and the answer.
 
 /// A key hint's pieces: words, or a pair of drawn arrows.
@@ -3413,7 +3406,6 @@ fn draw_lines(
     shown
 }
 
-// ---------------------------------------------------------------------
 // Laying the lens.
 
 /// A laid lens: its prims, what a reader hears, and how its body went.

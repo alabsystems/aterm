@@ -2307,8 +2307,7 @@ mod tests {
         let Attestation { ok, log, .. } = report(fixture.0.path());
         assert!(!ok && log.contains("FAIL [OB-7]"), "{log}");
 
-        // Without its NOTICE line the crate is no longer a recorded absorption:
-        // it reads as a half-recorded redistribution, refused outright.
+        // Without its NOTICE line the crate is a half-recorded redistribution, refused outright.
         let fixture = absorbed_fixture("absorbed-no-notice-line", false);
         let notice = fixture.0.path().join("NOTICE");
         let text = std::fs::read_to_string(&notice).unwrap().replace(

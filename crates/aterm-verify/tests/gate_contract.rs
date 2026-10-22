@@ -366,6 +366,85 @@ fn a_scoped_run_narrows_the_driver_where_the_check_reads_the_selection() {
     );
 }
 
+/// THE DOCTESTS THROUGH THE REAL STAND-IN: the doctests stage hands cargo the
+/// test compile's own selection (`--workspace` here) and this binary as its
+/// doc driver, which skips the pass of the library whose docs hold no doctest,
+/// saying so, and becomes the stage2's trustdoc for the one whose docs hold
+/// one, with `RUSTDOC` back on trustdoc and its own variables gone. A failing
+/// pass fails the row. The stand-in targo plays cargo's doc loop: a
+/// `Doc-tests` header and a `$RUSTDOC --test` pass per library, each with its
+/// `CARGO_PKG_NAME`.
+#[test]
+fn the_doctests_run_rustdoc_only_where_a_doctest_lives_over_the_test_compiles_selection() {
+    let repo = FakeRepo::new();
+    for (name, lib) in [
+        (
+            "documented",
+            "/// ```\n/// assert!(true);\n/// ```\npub fn f() {}\n",
+        ),
+        ("plain", "//! ```text\n//! not rust\n//! ```\n"),
+    ] {
+        let dir = repo.root.join("crates").join(name);
+        fs::create_dir_all(dir.join("src")).expect("mkdir");
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\n"),
+        )
+        .expect("manifest");
+        fs::write(dir.join("src/lib.rs"), lib).expect("lib");
+    }
+    repo.with_stage2_body(
+        "echo \"argv: $*\"\n\
+         st=0\n\
+         for p in documented plain; do\n\
+         echo \"   Doc-tests $p\"\n\
+         CARGO_PKG_NAME=$p \"$RUSTDOC\" --crate-name $p --test crates/$p/src/lib.rs || st=101\n\
+         done\n\
+         exit $st",
+    );
+    let trustdoc = repo.stage2.join("trustdoc");
+    let ran = |code: i32| {
+        format!(
+            "echo \"trustdoc ran $CARGO_PKG_NAME with $*: RUSTDOC=$RUSTDOC \
+             driver=${{ATERM_VERIFY_DOC_DRIVER-unset}} skip=${{ATERM_VERIFY_DOC_SKIP-unset}}\"\n\
+             printf '\\nrunning 1 test\\ntest src/lib.rs - f (line 1) ... ok\\n\\ntest result: ok. 1 \
+             passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\\n\\n'\n\
+             exit {code}"
+        )
+    };
+    let doc_run = || {
+        let mut ctx = repo.ctx(&[Check::Doc], Scope::workspace());
+        ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+        run_ctx(&ctx)
+    };
+
+    common::standin_body(&trustdoc, &ran(0));
+    let (ladder, code) = doc_run();
+    assert_eq!(code, exit::PASS, "{ladder}");
+    assert!(
+        ladder.contains("--unverified test --doc --workspace --no-fail-fast"),
+        "{ladder}"
+    );
+    let want = format!(
+        "trustdoc ran documented with --crate-name documented --test crates/documented/src/lib.rs: \
+         RUSTDOC={} driver=unset skip=unset",
+        fs::canonicalize(&trustdoc).expect("canonical").display()
+    );
+    assert!(ladder.contains(&want), "missing {want:?} in:\n{ladder}");
+    assert!(!ladder.contains("trustdoc ran plain"), "{ladder}");
+    assert!(
+        ladder
+            .lines()
+            .any(|l| l.starts_with("aterm-verify: ") && l.contains("plain's docs")),
+        "the skip says why:\n{ladder}"
+    );
+
+    common::standin_body(&trustdoc, &ran(101));
+    let (ladder, code) = doc_run();
+    assert_eq!(code, exit::FAILED, "{ladder}");
+    assert!(ladder.contains("trustdoc ran documented"), "{ladder}");
+}
+
 /// Every driven stage looks at its driver's exit code — the regressions these
 /// drivers exist for (a dropped `EventLoopProxy`, a retyped objc argument)
 /// leave `cargo build` at 0 — and nothing that decided nothing is green: the

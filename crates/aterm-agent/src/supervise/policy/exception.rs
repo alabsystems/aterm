@@ -153,7 +153,7 @@ impl Exception {
         }
     }
 
-    /// THE STALL NO READER NAMES (the canary's third rung,
+    /// A stall no reader names (the canary's third rung,
     /// `wall_memory::Session::stuck_busy_note`): the screen has read busy on
     /// background work alone for hours while Claude's title says idle. Built
     /// by the canary, not [`exception_for`]: such a stall reaches no decided
@@ -271,7 +271,7 @@ impl Exception {
     /// attachments: its own remedy, done in the tab. A context an IMAGE or
     /// ATTACHMENTS fill ([`ContextFill`], by `message` or `fill`) is cleared by
     /// going back to before them, as the vendor's own notice says
-    /// (ATERM-KI-1016-1: told `go back a few messages`, which need not reach
+    /// (told `go back a few messages`, which need not reach
     /// them). Any other full context is [`Self::context`].
     #[must_use]
     pub fn context_of(message: &str, fill: Option<ContextFill>) -> Self {
@@ -906,7 +906,7 @@ fn limit_roster_step<'a>(
 }
 
 /// CLAUDE CODE'S LOST LOGIN, CARRIED BY THE HARNESS UP TO THE SIGN-IN
-/// ([`super::login`], the owner's ruling of 2026-10-19): `Some` at a point of
+/// ([`super::login`], the owner's ): `Some` at a point of
 /// such an episode — the wall's row, `/login`'s dialog over the lost login
 /// this loop tracks, `Login interrupted` under it, or the row off the screen
 /// while its track stands with `/login` typed — with the notice that stands
@@ -1138,7 +1138,7 @@ fn claude_login(
         }
         // Nothing typed into a tab with no task, a landed one, or a
         // person's own exchange left to them (the task's two ends under
-        // FOREVER CRUISE / FOREVER LAND).
+        // Autopilot Cruise / Land).
         TurnEndAction::Nothing if reading.taskless => {
             told(&notice::LOGIN_NOT_RUN, roster, Some(notice::WHY_NO_TASK))
         }

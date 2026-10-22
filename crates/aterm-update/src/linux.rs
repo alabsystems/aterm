@@ -263,7 +263,7 @@ struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kept_unproven: Option<u64>,
     /// What each crash loop's end says — a rollback or a build kept — until a check loop
-    /// with a window to tell takes them ([`take_unsaid_trial_ends`]; ATERM-KI-1015-2,
+    /// with a window to tell takes them ([`take_unsaid_trial_ends`],
     /// U21). The trial ends at a start, so the aterm that comes up after it is a process
     /// started after the record moved, which no change between two of its own passes could
     /// show, and a terminal session's loop has no window to tell: the ends wait here until

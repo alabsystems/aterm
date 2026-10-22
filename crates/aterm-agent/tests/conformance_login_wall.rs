@@ -24,7 +24,7 @@
 //! the new login in its staging home alone, never the idle one it replaces, as the
 //! model's `Renew` does.
 //!
-//! The lost login carried (the owner's ruling of 2026-10-19): the real exception
+//! The lost login carried (the owner's ): the real exception
 //! tells the owner now, not escalated, exactly where `TellNow` is enabled, and the
 //! real supervisor never rests at a wall with nothing typed and nobody told
 //! (`Rest`); a `done` state's wall answered the owner's own prompt to a finished

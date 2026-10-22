@@ -156,10 +156,8 @@ fn walk<'a>(links: &BTreeMap<&'a str, Option<&'a str>>, start: &'a str) -> Vec<&
     path
 }
 
-// ---------------------------------------------------------------------------
 // test-appkit-door: the AppKit calls measured opening a WindowServer
 // connection from a test binary.
-// ---------------------------------------------------------------------------
 
 pub(super) const TEST_APPKIT_DOOR: Rule = Rule {
     id: "test-appkit-door",
@@ -253,10 +251,8 @@ fn appkit_door_findings(file: &SourceFile) -> Vec<Finding> {
     out
 }
 
-// ---------------------------------------------------------------------------
 // shared-application: +[NSApplication sharedApplication] creates the
 // application object, and with it a WindowServer connection.
-// ---------------------------------------------------------------------------
 
 /// The proof only a windowed launch mints (`platform::Windowed`). A send is
 /// held by it when its function takes the proof (a `Windowed` parameter, or

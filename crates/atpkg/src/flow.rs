@@ -62,13 +62,18 @@ fn verify_and_stage(
 /// The pre-swap gate an index-lane stage of `program` runs: for an ALab-built agent program
 /// ([`crate::alab::agent`], which reaches the index lane only where the source rule hands it
 /// there) the ALab pack gate ([`crate::install::alab_pack_gate`]: the package marker, and
-/// `codesign --verify --strict` on every Mach-O); for every other program none, as before.
+/// `codesign --verify --strict` on every Mach-O), then the minimum-aterm pairing; for every
+/// other program none, as before.
 fn alab_pack_gate(program: &str, exposes: &[String]) -> Option<Box<StageGate>> {
     crate::alab::agent(program).map(|_| -> Box<StageGate> {
-        Box::new(crate::install::alab_pack_gate(
-            exposes,
-            crate::install::codesign_strict_check,
-        ))
+        let pack = crate::install::alab_pack_gate(exposes, crate::install::codesign_strict_check);
+        // THE MINIMUM-ATERM PAIRING ([`crate::alab::pairs_with`]): a pack this aterm is too
+        // old to host (its record's `aterm.min`) is never laid. The version is the client's
+        // alone: the producer pins for every aterm, and holds the record only to its shape.
+        Box::new(move |tree: &Path| {
+            pack(tree)?;
+            crate::alab::pairs_with(tree, crate::alab::this_aterm()).map_err(StageError::Payload)
+        })
     })
 }
 
@@ -1183,12 +1188,8 @@ pub(crate) fn land_artifact(
     } else {
         let inline = ahead.is_none();
         if let Err(e) = ahead.unwrap_or_else(|| fetch(&dl)) {
-            // An aborted transfer leaves bytes in `<dl>.part`, not at `<dl>`: the production
-            // fetcher promotes the part onto `dl` only on curl success, so `dl` is either
-            // absent or complete. The part is deliberately LEFT for the next attempt to
-            // continue from (`aterm_update_core::download_to_resumable`); `dl` itself is
-            // reclaimed on this exit exactly as on the stage exit below, because a `dir:`
-            // registry's copy lane writes there directly.
+            // The `.part` is left for the next attempt to resume; `dl` is reclaimed, since a
+            // `dir:` registry's copy lane writes there directly.
             let _ = std::fs::remove_file(&dl);
             note_fetch_fault();
             return Err(FlowError::Download(e));
@@ -2363,27 +2364,14 @@ fn apply_group_txn_inner(
     // A check no flip took (a stage-phase abort, a held flip) is waited out here, before
     // any tree it runs from is discarded: none outlives the transaction.
     drop(ahead);
-    // On abort, DISCARD the builds this transaction staged. They were never left active (a
-    // stage-phase abort flipped nothing; a flip-phase abort re-pointed every shim back to the
-    // prior build via rollback), so leaving a complete-but-inactive build on disk would make
-    // list_installed/`decide` mis-read it as the active build next run — silently splitting
-    // the coherence tuple and wedging the update while reporting success. Within THIS
-    // process the staged `build_dir` is USUALLY the NEW pinned build — but not always, and
-    // the earlier claim that it always is ("decide only stages Install members, so new !=
-    // the prior active build") was WRONG: `decide` reads the SHIM-derived `installed` view
-    // ([`crate::ops::active_builds`]), which goes SILENT when a program's tools are all
-    // tombstoned or `atpkg unlink` removed its dev shims, so it legitimately returns Install
-    // for the build `store/<program>/current` already names. `Staged::was_live` catches
-    // exactly that member below. Across processes the discard rests on the
-    // SINGLE-WRITER-PER-STORE contract ([`crate::lock`]): every mutating verb try-acquires
-    // the store-wide `store.lock` at the CLI edge, so no OTHER atpkg process can be staging
-    // or activating builds in this store while this transaction runs — without that lock, a
-    // concurrent process could have just activated one of these very builds, and this
-    // discard would leave its shims dangling on a deleted tree.
-    // A HELD FLIP ([`TxnOutcome::Deferred`] from the last look) discards the same way: its
-    // trees were never flipped, and a complete inactive build above the live one is what
-    // this discard exists to prevent. The archives stay (below), so the flip that follows
-    // re-stages without a download.
+    // On abort, discard the builds this transaction staged. None was left active (a
+    // flip-phase abort rolled every shim back), and a complete-but-inactive build would make
+    // `list_installed`/`decide` read it as active next run, splitting the tuple. The staged
+    // build can be the one `current` already names, because `decide` reads the shim view
+    // ([`crate::ops::active_builds`]), which is silent when a program's tools are
+    // tombstoned or unlinked; `Staged::was_live` skips it. Across processes this rests on
+    // the single-writer store lock ([`crate::lock`]) taken at the CLI edge. A held flip
+    // ([`TxnOutcome::Deferred`]) discards the same way; its archives stay (below).
     if matches!(
         outcome,
         TxnOutcome::Aborted { .. } | TxnOutcome::Deferred { .. }
@@ -3784,14 +3772,11 @@ fn fetch_member(
     }
     // Live-progress hooks, mirroring the singleton path (no-ops without a live pass).
     crate::progress::note_build(program, pinned);
-    // THE CARRIED ARCHIVE ([`carried_archive`]). An earlier pass of this tuple can have
-    // aborted on some OTHER member after this one downloaded, verified and staged: that
-    // abort discarded this member's extracted TREE (it must — see `apply_group_txn`), but
-    // the archive the tree came out of is the signed artifact's own bytes, and re-using it
-    // is what bounds the retry to the members that actually failed. The same archive is
-    // what THIS member's own failed stage leaves behind when the failure was not the
-    // bytes' ([`reclaim_after_failed_stage`]) — otherwise a non-digest refusal
-    // re-downloads the whole archive (743 MB for `trust`) at every launch and tick.
+    // The carried archive ([`carried_archive`]): an earlier pass can have aborted on another
+    // member after this one staged, discarding its tree but not its signed archive, and a
+    // failed stage whose fault was not the bytes leaves it too
+    // ([`reclaim_after_failed_stage`]). Reusing it bounds a retry to the members that
+    // failed.
     //
     // THE ARCHIVE FETCHED AHEAD ([`ahead`]): the set completion's download-ahead lane may
     // already hold this member's download, or be moving it. Its answer stands in for the
@@ -3829,10 +3814,8 @@ fn fetch_member(
             ahead::fetched_inline(program, &dl);
         }
         if let Err(e) = fetched {
-            // SAY WHY (see `stage_failure_note`). The transfer is the failure
-            // this exit meets most often and `e` carries the fetcher's own words — HTTP
-            // status, curl exit, the signed byte cap — which no later surface can
-            // reconstruct, because the abort report only ever learns the member's NAME.
+            // Say why: `e` carries the fetcher's words (HTTP status, curl exit, the signed
+            // byte cap), which the abort report never learns.
             eprintln!("{}", stage_failure_note(program, pinned, &e));
             // The `.part` is left for the next attempt to resume; `dl` is reclaimed, since a
             // `dir:` registry's copy lane writes there directly.
@@ -3933,11 +3916,10 @@ fn stage_fetched(
     })
 }
 
-/// Flip a staged member live: point its `store/<program>/current` at the new build and (re)install
-/// its shims. `true` on success. A partial flip (shims IO error after `current` was already
-/// re-pointed) is self-undone via [`rollback_member`] so a `false` return leaves NO live
-/// pointer into the new build — the abort cleanup then discards it. (Shim refusals for
-/// sensitive names are not a flip failure; they are honestly dropped, matching `install`.)
+/// Flip a staged member live: point `store/<program>/current` at the new build and
+/// (re)install its shims. A partial flip is undone via [`rollback_member`], so `false`
+/// leaves no live pointer into the new build. A shim refused for a sensitive name is
+/// dropped, not a failure.
 ///
 /// A bundle's resolve check is `ahead`'s verdict when it was started at the stage
 /// ([`ResolveAhead`]), else run here.
@@ -4245,8 +4227,7 @@ fn rollback_member(layout: &Layout, program: &str, s: &Staged) {
                         );
                     }
                 } else {
-                    // A binary the new build added but the prior build lacks — drop the shim
-                    // rather than leave it dangling at a nonexistent prior-build path.
+                    // A binary the new build added and the prior lacks: drop the shim.
                     let _ = crate::lay::remove_in_process(&layout.shim(tool));
                     if let Some(alias) = &alias {
                         let _ = crate::lay::remove_in_process(&layout.shim(alias));

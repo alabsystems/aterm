@@ -2054,7 +2054,7 @@ impl crate::App {
     /// wake. Left to the next turn it would be the loop's deadline, armed at
     /// now and fired at once: a `system_vitals` timer wake for every write a
     /// program makes at rest (Muse Code's SGR reset every 10 s), which
-    /// forever land's END counts against the instance. Within the floor the
+    /// Autopilot Land's END counts against the instance. Within the floor the
     /// edge waits for its deadline as before.
     pub(crate) fn vitals_output_edge(&mut self, now: Instant) {
         self.vitals.note_edge();

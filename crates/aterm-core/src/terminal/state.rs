@@ -615,6 +615,80 @@ impl Terminal {
         self.transient.app_sync_open && self.transient.app_sync_dirty
     }
 
+    /// Whether a reader that judges only WHOLE frames must not read the screen at
+    /// `now`: the program's frame is unfinished ([`Self::sync_frame_unfinished`]) and
+    /// every batch since less than [`FRAME_HANG`](super::FRAME_HANG) before `now` ended
+    /// with one unfinished. A redraw that the PTY's reads split leaves the grid holding
+    /// a prefix of it: rows the frame has not reached yet still show the frame before,
+    /// or nothing (measured on Claude Code 2.1.308 and agy 1.4.0,
+    /// `docs/measured/half-drawn-frame-2026-10-22.md`). Past the hang detector the frame
+    /// is read as it stands: a program that opened a frame and never closed it, or whose
+    /// every read ends inside its next frame, cannot freeze every reader. The row
+    /// predicates of the observation kernel, `await frame`, `text --json`'s `"frame"`
+    /// and the server's agent verdict read this.
+    #[inline]
+    #[must_use]
+    pub fn frame_unfinished_at(&self, now: aterm_time::Instant) -> bool {
+        self.frame_hang_deadline().is_some_and(|hang| now < hang)
+    }
+
+    /// When the unfinished frame's hang detector fires ([`Self::frame_unfinished_at`]):
+    /// the first batch end of the run of batches that ended with a frame unfinished,
+    /// plus [`FRAME_HANG`](super::FRAME_HANG). Per run, not per frame: a batch that
+    /// closes one frame and opens the next does not restart it. `None` while no frame
+    /// is unfinished; an unrepresentable instant reads as already fired (fail open).
+    #[inline]
+    #[must_use]
+    pub fn frame_hang_deadline(&self) -> Option<aterm_time::Instant> {
+        if !self.sync_frame_unfinished() {
+            return None;
+        }
+        let since = self.transient.frame_unfinished_since?;
+        Some(since.checked_add(super::FRAME_HANG).unwrap_or(since))
+    }
+
+    /// Whether the screen is a frame the program finished and nothing has been drawn
+    /// since: its last DEC 2026 frame, one it wrote into, was closed by its own `?2026l`
+    /// on this screen at this size, and the content has not moved after. Such a screen
+    /// is whole by the program's own word; any other may be a redraw the PTY's reads
+    /// split, which only time tells apart ([`super::GONE_SETTLE`]).
+    #[inline]
+    #[must_use]
+    pub fn screen_is_closed_frame(&self) -> bool {
+        !self.sync_frame_unfinished()
+            && self.transient.app_sync_closed
+                == Some(super::transient_state::ClosedFrame {
+                    content_gen: self.grid.content_gen(),
+                    screen: self.transient.screen_replaced,
+                    grid: (self.grid.rows(), self.grid.cols()),
+                })
+    }
+
+    /// The batch's end, before the observation kernel reads it: the run of unfinished
+    /// frames ([`Self::frame_hang_deadline`]) starts at the first batch that ends inside
+    /// one and ends at the first that ends whole, and the screen's last change
+    /// ([`super::Frame::drawn_at`]) is stamped when the content generation or the
+    /// screen moved.
+    pub(super) fn note_batch_end(&mut self) {
+        let now = self.transient.process_now;
+        if self.sync_frame_unfinished() {
+            self.transient.frame_unfinished_since.get_or_insert(now);
+        } else {
+            self.transient.frame_unfinished_since = None;
+        }
+        let mark = (self.grid.content_gen(), self.transient.screen_replaced);
+        if self.transient.drawn.is_none_or(|(_, seen)| seen != mark) {
+            self.transient.drawn = Some((now, mark));
+        }
+    }
+
+    /// When the screen last changed ([`Self::note_batch_end`]); `None` before any batch.
+    #[inline]
+    #[must_use]
+    pub fn drawn_at(&self) -> Option<aterm_time::Instant> {
+        self.transient.drawn.map(|(at, _)| at)
+    }
+
     /// Whether the VT parser is in Ground state (no pending escape sequence),
     /// outside a tmux passthrough wrapper (whose payload the parser reads
     /// unwrapped until the wrapper's `ESC \\`). The I/O-queue fast path uses it

@@ -219,10 +219,8 @@ pub(crate) fn ns_error_string(err: Id) -> String {
     unsafe { aterm_objc::ns_error_string(err) }
 }
 
-// ---------------------------------------------------------------------------
 // Enumerations, with values from the Metal headers. Every one used here is
 // exercised by a `super` test.
-// ---------------------------------------------------------------------------
 
 /// `MTLPixelFormat`. Only the formats aterm actually asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -444,9 +442,7 @@ pub(crate) const TEXTURE_USAGE_RENDER_TARGET: usize = 4;
 #[cfg(test)]
 pub(crate) const TEXTURE_USAGE_PIXEL_FORMAT_VIEW: usize = 16;
 
-// ---------------------------------------------------------------------------
 // The object wrappers.
-// ---------------------------------------------------------------------------
 
 /// An `MTLCompileOptions`: how MSL source becomes an `MTLLibrary`. Both
 /// options are set, as wgpu-hal does:
@@ -1073,11 +1069,9 @@ impl VertexDescriptor {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Compute. The renderer issues no compute work; these entry points exist so
 // the parity tests can evaluate the shipped MSL field functions and diff them
 // against the CPU (`super::tests::fire_field_matches_the_cpu_bit_for_bit`).
-// ---------------------------------------------------------------------------
 
 /// `MTLSize`, passed by value to the dispatch selectors.
 #[repr(C)]
@@ -1231,12 +1225,10 @@ fn wait_for_command_buffer(command_buffer: Id) -> Result<(), String> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Render encoding: a colour attachment, a draw, and a texture -> buffer copy
 // for CPU readback. The default draw is a vertex-bufferless fullscreen
 // triangle (`vs_blit` synthesises positions from `[[vertex_id]]`); a
 // [`DrawCall`] override draws a table row instanced from a bound stream.
-// ---------------------------------------------------------------------------
 
 /// `MTLLoadAction::Load`.
 pub(crate) const LOAD_ACTION_LOAD: usize = 1;
@@ -1565,7 +1557,7 @@ pub(crate) struct DrawCall<'a> {
 ///
 /// One command buffer holds the render pass and the texture -> buffer blit, so
 /// encoder order sequences them; `waitUntilCompleted` makes the bytes visible.
-/// `readback` must be Shared storage (no `synchronizeResource:` here).
+/// Binding indices are caller-spelled (a table row's `BindSpec`).
 ///
 /// Binding indices are caller-spelled, from the table's `BindSpec` for a table
 /// row.

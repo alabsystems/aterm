@@ -68,7 +68,7 @@ pub(crate) struct WordAsk {
     /// ([`App::send_upgrade_word`]; empty: none). Its record takes the word
     /// (`upgrade_drive::ask_for`): the harness's own read has no roster, and
     /// can rank another conversation of the tab first (the review of
-    /// ATERM-KI-1015-1 LC-9).
+    /// LC-9).
     pub(crate) session: String,
 }
 
@@ -344,7 +344,7 @@ pub(crate) struct UpgradeView {
     /// conversation's, as handed over — what a pressed word's answer is laid
     /// over ([`laid_in`]) and the window applies again.
     rows: Vec<Row>,
-    /// Each tab's one row of [`Self::rows`] (`upgrade_drive::tab_rows`, ATERM-KI-1015-1
+    /// Each tab's one row of [`Self::rows`] (`upgrade_drive::tab_rows`
     /// LC-9): what the tab says, its menu, the words its records offer, the counts
     /// ([`Self::row_for`], [`Self::offers`], [`App::tabs_behind`]).
     shown: Vec<Row>,
@@ -528,7 +528,7 @@ impl App {
     /// with the owner's words they were read too soon to carry
     /// ([`UpgradeView::words_landed`]).
     ///
-    /// THE TABS LEFT AS THEY STAND (`kept`, ATERM-KI-1016-1): tabs whose upgrade
+    /// THE TABS LEFT AS THEY STAND (`kept`): tabs whose upgrade
     /// record the host could not read (`upgrade_drive::View::refresh_keeping`).
     /// What the window shows of them is kept: the rows it holds for them stay
     /// beside the host's ([`UpgradeView::kept`]), and a stall row an earlier
@@ -558,7 +558,7 @@ impl App {
     /// ([`Self::apply_host_upgrades`]), or the window's own with a word that
     /// landed laid in.
     ///
-    /// THE TAB'S ROW (ATERM-KI-1015-1 LC-9): the host hands over every
+    /// THE TAB'S ROW (LC-9): the host hands over every
     /// conversation's row, and a tab can hold several at once — a move that
     /// finished or failed after its exit beside the tab's newer one. What the
     /// tab says is its one row (`upgrade_drive::tab_rows`); what a
@@ -579,7 +579,7 @@ impl App {
             .snapshot();
         let mut noted: Vec<u64> = Vec::new();
         for h in &snapshot {
-            // The tab's one row (LC-9 of ATERM-KI-1015-1, `upgrade_drive::tab_row`):
+            // The tab's one row (LC-9 of , `upgrade_drive::tab_row`):
             // a finished move of an earlier conversation never stands in for a newer one.
             let row = shown.iter().find(|r| r.tab == h.sid.as_str()).cloned();
             // A tab left as it stands, with no row: its column and note as they are.
@@ -980,7 +980,7 @@ impl App {
     fn post_upgrade_stalls(&mut self, shown: &[Row], rows: &[Row], now: u64) {
         let stalled: BTreeMap<String, (&Row, String)> = shown
             .iter()
-            // A TAB LEFT AS IT STANDS ([`UpgradeView::kept`], ATERM-KI-1016-1
+            // A TAB LEFT AS IT STANDS ([`UpgradeView::kept`]
             // host-8) is no stall of this pass: what its record says now is
             // not known, so its entry stays as it is (the `gone` read below
             // keeps it) and no entry is posted or restated off the row the
@@ -1328,7 +1328,7 @@ impl App {
     /// `App` has no event loop, and writes it here. `false` only when no thread could be
     /// started (said on the row).
     ///
-    /// The word is for the row the owner was shown (ATERM-KI-1015-1 LC-9): the tab's row for
+    /// The word is for the row the owner was shown (LC-9): the tab's row for
     /// the build pressed names its conversation ([`WordAsk::session`]), whose record takes
     /// the word.
     pub(crate) fn send_upgrade_word(&mut self, mut ask: WordAsk) -> bool {
@@ -1885,7 +1885,7 @@ mod tests {
             .collect()
     }
 
-    /// LC-9 OF ATERM-KI-1015-1 — `status upgrade=` NAMES THE TAB'S NEWEST
+    /// LC-9 OF — `status upgrade=` NAMES THE TAB'S NEWEST
     /// MOVE: a tab whose earlier move finished (a fresh restart onto a new
     /// conversation, shown for ten minutes) and whose newer move — the new
     /// conversation's — failed has two rows, handed in session-id order; the
@@ -2238,7 +2238,7 @@ mod tests {
     }
 
     /// A TAB'S `upgrade=` IS ITS NEWEST MOVE, NOT ITS FIRST CONVERSATION
-    /// (ATERM-KI-1015-1 LC-9): the host hands over every conversation's row,
+    /// (LC-9): the host hands over every conversation's row,
     /// by session id, and a tab can hold a conversation's finished move
     /// (shown ten minutes) beside the newer one the tab runs now, whose own
     /// move failed after its exit. The column, the tab's row and its band row
@@ -4178,7 +4178,7 @@ mod tests {
     /// `upgrade_drive::View::refresh_keeping`) keeps what the window shows of
     /// it: the row an earlier process left up for it is not withdrawn, and this
     /// process's own row for it stands; every other tab is renewed
-    /// (ATERM-KI-1016-1 host-8).
+    /// (host-8).
     #[test]
     fn a_tab_left_as_it_stands_keeps_its_rows_and_the_rest_are_renewed() {
         let (carried, other, mine) = ("s-carried", "s-other", "s-mine");
@@ -4218,7 +4218,7 @@ mod tests {
     }
 
     /// A TAB LEFT AS IT STANDS RAISES NO STALL OFF THE ROW THE WINDOW HOLDS FOR
-    /// IT (ATERM-KI-1016-1 host-8, the review of its first cut): its record
+    /// IT (host-8, the review of its first cut): its record
     /// cannot be read, so the window keeps its last row for it — and that row,
     /// read at the window's `now`, ages. Here the row the window holds reads a
     /// stall now (its agent the upgrade ended, ten minutes ago): no entry is

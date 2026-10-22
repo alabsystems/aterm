@@ -1153,17 +1153,10 @@ impl PetBrain {
         true
     }
 
-    /// THE RE-SIGHTING GHOST'S ADMISSION ON ITS OWN GLASS, judged at the
-    /// boundary ([`PetBrain::resight_coordinate_space`]) — before the retire
-    /// drops the old surface's map, so the map is the observation the body
-    /// was drawn against on the frame the user saw. The ghost is the body
-    /// standing still at its seat in the stance that frame drew it at
-    /// (`PetBrain::last_stance`: a ghost is drawn at it), at the last tick's
-    /// cell metrics and grid; it is admitted only where that map certifies
-    /// nothing protected under it — no selection, image, overlay or unseen
-    /// cell — exactly the live body's own verdict
-    /// (`under_text_clearance_past_caret`). An incoherent map, or none,
-    /// admits nothing.
+    /// Whether the re-sighting ghost may stay on its own glass, judged at the boundary
+    /// ([`PetBrain::resight_coordinate_space`]) before the old map is retired: the body
+    /// standing still at its seat in `last_stance` is admitted only where the map certifies
+    /// nothing protected under it. An incoherent map, or none, admits nothing.
     #[inline]
     pub(super) fn console_still_body_clear(&self) -> bool {
         self.console_still_rect_verdict(self.col, self.row, self.last_stance) == Some(true)
@@ -2734,9 +2727,8 @@ impl PetBrain {
                 return Some(seat);
             }
         }
-        // No perch in reach is `None`, not "stay where you are": both callers
-        // fall back to the baseline station, so the pet keeps following the
-        // caret.
+        // No perch in reach is `None`, not "stay where you are": both callers fall back to
+        // the baseline station, so the pet keeps following the caret.
         if !walled && {
             let (feet, margin) = Self::stand_rect(world, body);
             world.ground_under_text_clearance_past_caret(feet, margin) != Some(false)
@@ -6737,8 +6729,8 @@ mod tests {
             );
         }
 
-        // Place a right-hand box border ahead on the same row and type toward it;
-        // the station must never step leftward onto the caret or sawtooth as lead decays.
+        // A box border ahead on the caret's row: typing toward it must never park the
+        // cat on the caret.
         s.term.process(b"\x1b[s\x1b[6;32H|\x1b[u");
         for ch in "abcd".chars() {
             s.type_text(&ch.to_string());

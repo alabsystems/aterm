@@ -1010,7 +1010,7 @@ fn a_full_disk_is_one_standing_alert_and_what_was_freed_is_a_fact() {
     );
 }
 
-/// THE DEVELOPER TOOLS LIST (owner ruling 2026-10-14) is one line however often a
+/// THE DEVELOPER TOOLS LIST is one line however often a
 /// reading says `not_granted`, whose one press opens the Developer Tools pane and whose
 /// second capsule opens aterm's own Settings ▸ Security, in `atpkg::devtools`' words (owner
 /// ask 2026-10-15: one spelling on every surface); a reading that finds aterm on the list
@@ -1322,7 +1322,7 @@ fn an_upgrade_that_cannot_run_is_one_line_until_the_last_tab_runs_again() {
     assert!(app.messages.digest().is_empty());
 }
 
-/// THE RECORDS' FOLDER THE UPGRADES' VIEW CANNOT LIST (ATERM-KI-1016-1) is
+/// THE RECORDS' FOLDER THE UPGRADES' VIEW CANNOT LIST is
 /// the host's fact, `harness.upgrade-host.records-unlisted`, in the
 /// classifier's words with the folder under Details: until it, the upgrades
 /// shown stood at the last whole look with nothing said. Said again, it is
@@ -1364,7 +1364,7 @@ fn a_records_folder_the_view_cannot_list_is_one_line_until_it_is_listed() {
     );
 }
 
-/// THE RECORDS THE UPGRADES' VIEW CANNOT READ (ATERM-KI-1016-1 host-8) are
+/// THE RECORDS THE UPGRADES' VIEW CANNOT READ (host-8) are
 /// the host's fact, `harness.upgrade-host.records-unreadable`, in the
 /// classifier's words with each file under Details: until it, a record that
 /// could not be read froze its tab's upgrade row and mark with nothing
@@ -2239,7 +2239,7 @@ fn a_resume_that_would_lose_turns_is_never_told_to_be_resumed() {
     }
 }
 
-/// A `lost` LINE ENDS WITH ITS TAB TOO (the review of ATERM-KI-1015-1 LC-4):
+/// A `lost` LINE ENDS WITH ITS TAB TOO (the review of LC-4):
 /// it says "run the command below in that tab" and shows that tab, and its
 /// host forgets the tab's word with it, so nothing would end it once the
 /// tab is gone — a Warn that resurfaces for the rest of the process, its
@@ -2494,7 +2494,7 @@ fn a_now_no_escalation_carries_is_a_standing_ask_until_its_point_moves_on() {
             .collect()
     };
     let sign_in = |sid: &str| mr::notice_ask_key(sid, Some(notice::LOGIN_SIGN_IN.code));
-    // NEGATIVE CONTROLS: the loop's own escalation; a `Later` one.
+    // Negative controls: the loop's own escalation; a `Later` one.
     told(
         &mut app,
         "s-1",
@@ -3163,9 +3163,8 @@ fn a_kind_in_two_tabs_is_one_entry_that_names_them() {
     // dismissal of a tab's stall does not silence a later dialog in it.
     let dialog = mr::resume_exceptions(&[fact("s-2", 2, ExceptionKind::Dialog)]);
     assert_eq!(dialog[0].key(), "harness.resume.s-2.dialog");
-    // A context no `/compact` lowers is each tab's own, since the way back is
-    // done IN the tab: two tabs, two entries, and a tab at the usage limit
-    // beside them keeps the kind-wide line of its own.
+    // A context no `/compact` lowers is each tab's own (the way back is in the tab): two tabs,
+    // two entries, beside a third tab's kind-wide usage-limit line.
     let both = mr::resume_exceptions(&[
         fact("s-1", 1, ExceptionKind::Context),
         fact("s-3", 3, ExceptionKind::Context),
@@ -3872,7 +3871,7 @@ fn a_broken_c_toolchain_is_its_own_entry_and_each_verdict_ends_the_other() {
 
 /// A RELAUNCH THAT KEEPS FAILING WITH NO COMMAND THE TAB'S MARK COULD NAME
 /// (a Codex, a launch no resume repeats) is the digest's line AT ONCE (LC-5 of
-/// ATERM-KI-1015-1: at attention, where it was a record only): the agent is
+/// at attention, where it was a record only): the agent is
 /// down and only the owner can start it sooner; an agent running again ends
 /// it. NEGATIVE CONTROL: with a command the tab's mark says it, and the digest
 /// stays empty.

@@ -63,8 +63,8 @@ use aterm_types::control_verbs::{framing_of, Framing};
 
 /// The largest request line this client will write, newline excluded.
 ///
-/// One byte under aterm's `MAX_REQUEST_LINE` (64 KiB, newline excluded): an
-/// off-by-one in either implementation must cost an error, not a fleet halt.
+/// One byte under aterm's `MAX_REQUEST_LINE` (64 KiB, newline excluded): an off-by-one in
+/// either implementation must cost an error, not a lost bridge.
 pub const REQUEST_LINE_MAX: usize = aterm_types::control_verbs::MAX_REQUEST_LINE - 1;
 
 /// The largest framed body this client will read, and the ceiling on the byte

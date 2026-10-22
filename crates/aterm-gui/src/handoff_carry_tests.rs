@@ -388,7 +388,7 @@ fn a_sidecar_that_does_not_fit_sheds_rows_then_state_then_history() {
 }
 
 /// A ROOM SHORT OF THE WHOLE TAIL STILL CARRIES ITS NEWEST ROWS
-/// (ATERM-KI-1015-2, U30). The rows were all or nothing: one byte short of
+/// . The rows were all or nothing: one byte short of
 /// the whole tail, a session crossed with its counters alone, and `drive
 /// report` read the rows after its newest turn's mark as lost although they
 /// would have fit many times over. Now the oldest rows go first, no more of
@@ -450,7 +450,7 @@ fn a_room_short_of_the_whole_tail_carries_its_newest_rows() {
 }
 
 /// A CROWDED DESK SHARES ITS ROWS ALIKE, EVERY SESSION'S NEWEST FIRST
-/// (ATERM-KI-1015-2, U30): every session carries the rows after its newest
+/// : every session carries the rows after its newest
 /// turn's mark (what `drive report` reads back), then as many of its older
 /// rows as every other session, and keeps the differ's state, which is shed
 /// only after the rows. Spent in pool order, the first sessions carried their
@@ -743,9 +743,8 @@ fn a_record_the_receiver_cannot_read_is_not_vouched_for() {
         (21, true, "timeout")
     );
     assert_eq!(&*last.text, "turn 21");
-    // (c) v0.100.0, every build after it, this build and a newer successor
-    // read `hangup` and get it as it is: a rollback from this build to v0.100.0
-    // carries the record exactly, as it did before.
+    // (c) v0.100.0, every build after it, this build and a newer successor read `hangup` and
+    // get it as it is.
     let running = crate::running_build_number();
     for target in [v0_100, v0_100 + 1, running, running + 1] {
         assert_eq!(

@@ -757,11 +757,10 @@ pub(crate) fn not_asked_again_note(request_parts: &[String]) -> String {
                 .to_owned()
         }
         (Some("post"), _) => {
-            "the `post` may already be queued or sent — an update carries a queued post under \
-             its id and the successor sends it, a crash does not (a session the PTY keeper \
-             recovers retires each post it lost `reason=not-carried`) — so never post it again \
-             blind: re-post it with the same `key=` (the broker keeps one), or look for it \
-             first (`outbox`, and the `post`/`post-landed` rows of `timeline`)"
+            "the `post` may already be queued or sent (an update hands a queued post to the \
+             successor; a crash loses it, and a session the PTY keeper recovers retires it \
+             `reason=not-carried`) — never post it again blind: re-post it with the same \
+             `key=`, or look for it first (the `post`/`post-landed` rows of `timeline`)"
                 .to_owned()
         }
         (_, Some("await seq")) => {

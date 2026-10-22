@@ -315,7 +315,6 @@ aterm_objc::declare_class! {
             }
         }
 
-        // ------------------------------------------------------------------
         // NSTextInputClient. Eleven rows, and the reason this file is the risk
         // in the port: Foundation reads the frame layout for every one of them
         // out of the string `class_addMethod` was handed, so an encoding that
@@ -324,7 +323,6 @@ aterm_objc::declare_class! {
         // `protocol_getMethodDescription(NSTextInputClient, …)` by the live
         // auditor, and the composition path is driven for real by
         // `objc_ime_drive.rs`.
-        // ------------------------------------------------------------------
 
         @sel(hasMarkedText)
         fn has_marked_text(&self) -> Bool {
@@ -620,12 +618,10 @@ aterm_objc::declare_class! {
             }
         }
 
-        // ------------------------------------------------------------------
         // NSResponder. Every row below takes the `NSEvent` AppKit is
         // delivering; the declared argument is a bare `id` (`@`, which is what
         // `NSResponder` itself registers) and each body borrows it as objc2's
         // `&NSEvent` at the top.
-        // ------------------------------------------------------------------
 
         @sel(keyDown:)
         fn key_down(&self, event: Id) {
@@ -1069,7 +1065,6 @@ impl WinitView {
         this
     }
 
-    // ---------------------------------------------------------------------
     // LOCAL PATCH (aterm): THE FIVE CROSSINGS W8 WROTE HERE ARE GONE.
     // `ns_view`, `as_responder`, `as_any`, `as_event` and `retained` each
     // existed to hand an objc2 BINDING TYPE to an objc2 binding METHOD; with
@@ -1078,7 +1073,6 @@ impl WinitView {
     // narrowed the declared `@` back to `&NSEvent`, and the trampoline had the
     // right thing in hand the whole time. `mtm` survives because it is a CHECK,
     // not a crossing.
-    // ---------------------------------------------------------------------
 
     /// The main-thread witness objc2's `mutability::MainThreadOnly` used to
     /// derive from the receiver's type.
@@ -1477,14 +1471,12 @@ impl WinitView {
     }
 }
 
-// ---------------------------------------------------------------------------
 // LOCAL PATCH (aterm): the file-level helpers the port needed, and only these.
 // Each replaces an objc2 method that READ AS A PROPERTY and was a message send
 // with a convention. The two length helpers are the pair that matters: objc2's
 // `len()` and `len_utf16()` differ by six characters in Rust and by an entire
 // encoding at the runtime, and this file calls both on one string three lines
 // apart.
-// ---------------------------------------------------------------------------
 
 /// An `NSString`'s length in UTF-8 BYTES — objc2's `NSString::len()`, i.e.
 /// `-lengthOfBytesUsingEncoding:NSUTF8StringEncoding`, which is the unit
@@ -1555,7 +1547,7 @@ fn mouse_button(event: Id) -> MouseButton {
 /// `+keyEventWithType:…` with the dead key's `´` as its characters composed nothing, even in the
 /// active app's key window, while the same key built from a CGEvent composed.
 ///
-/// LOCAL PATCH (aterm), 2026-10-16 (ATERM-KI-1015-9): upstream's `replace_event`, which winit-core
+/// LOCAL PATCH (aterm), 2026-10-16: upstream's `replace_event`, which winit-core
 /// step 5 (2026-10-15) had cut with `OptionAsAlt`, restored. Upstream rebuilt any event; this one
 /// rebuilds only a key-down or key-up (the getters below raise on anything else, and a raise
 /// inside a trampoline aborts) with a non-empty `-charactersIgnoringModifiers`.

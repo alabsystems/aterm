@@ -52,10 +52,8 @@ fn a_process_with_no_replaceable_bundle_refuses_before_anything_parks() {
     );
 }
 
-/// The post-swap re-exec image carries both the single-use re-exec nonce and the
-/// caller's restored handoff authority pairs; without them the successor's
-/// prearm cannot validate the inherited handoff. Asserted on the constructed
-/// Command (program, `--window` pin first, envs), so it is testable without exec.
+/// The post-swap re-exec command pins `--window` first and carries the re-exec nonce,
+/// the from-build and the restored handoff authority the successor's prearm needs.
 /// The mode pin's table is `rollback_reexec_command_pins_mode_and_restores_handoff_env`'s.
 #[test]
 fn boot_reexec_command_pins_mode_and_restores_handoff_env() {
@@ -627,7 +625,7 @@ fn a_cold_launch_waits_for_a_check_to_confirm_a_stale_roster_authorization() {
             "nothing is memoized against the build"
         );
     }
-    // A revocation a check HAS seen still retires, stale or not (gate 4c first).
+    // A revocation a check has seen still retires, stale or not (gate 4c first).
     let stale = publish_confirmed_stage(&s, 20, "m11", Some(now - 2 * day));
     let revoked = vec!["m11".to_string()];
     crate::manifest::Floor::observe_and_write(
@@ -1508,7 +1506,7 @@ fn a_full_disk_at_the_install_location_is_a_passing_refusal_not_the_person_s() {
     assert!(crate::is_passing_refusal(&refusal), "{refusal}");
     assert!(!crate::is_install_location_refusal(&refusal), "{refusal}");
     assert!(!crate::refusal_needs_person(&refusal), "{refusal}");
-    // CONTROL: a refused write is still the person's.
+    // Control: a refused write is still the person's.
     let denied = install_location_verdict(
         app,
         bundle::classify_probe_error(
@@ -3815,12 +3813,10 @@ fn native_update_disk_transaction_model_conforms_to_real_swap_recovery_and_healt
     let _ = std::fs::remove_dir_all(rollback_root);
 }
 
-// -----------------------------------------------------------------------
 // The zip extraction bound. These build central directories by hand, since the
 // shapes that matter are ones a real archiver will not produce: a saturated
 // ZIP64 sentinel with nothing behind it, a directory cut mid-header, a size
 // field no filesystem could satisfy.
-// -----------------------------------------------------------------------
 
 /// One central directory file header for `name`, declaring `uncompressed`
 /// bytes and carrying `extra` as its extra field.
@@ -4124,9 +4120,7 @@ fn tree_bytes_sums_regular_files_and_never_follows_links() {
     assert_eq!(tree_bytes(&root.join("absent")), 0);
 }
 
-// -----------------------------------------------------------------------
 // Stage-verify tests.
-// -----------------------------------------------------------------------
 
 /// Both lanes sweep both kinds of scratch: a `mnt-<pid>` a DMG stage left behind
 /// (possibly with its image still attached) is reclaimed by the zip lane too, and

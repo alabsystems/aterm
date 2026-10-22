@@ -124,7 +124,7 @@ use super::transcript;
 /// (ruling T8's rule), the whole build string matched: 0.164.0-dev.12521,
 /// built from its source for the run, 0.164.0-dev.12479, the owner's
 /// managed codex-alab, read from its store, and 0.164.0-dev.12672, the
-/// forever-port build (codex-alab `089291d37`) the FOREVER CRUISE / LAND
+/// forever-port build (codex-alab `089291d37`) the Autopilot Cruise / LAND
 /// proof runs (B5c). `lab codex-alab-proof`'s legs
 /// on each (session log 6D-3a: a turn, a continued turn, an approved
 /// `exec_command`, a `request_user_input` answered, the usage wall waited

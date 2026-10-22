@@ -301,7 +301,7 @@ fn a_control_paste_begun_after_the_drain_gate_stands_the_commit_down() {
     assert_whole(&parked.read_frame(writer));
 }
 
-/// AN INPUT REPLY OWED HOLDS THE COMMIT (ATERM-KI-1014-6): a background paste delivered whole
+/// AN INPUT REPLY OWED HOLDS THE COMMIT: a background paste delivered whole
 /// whose `OK n bytes` is still on its way to the client is not settled, since the Commit's
 /// `_exit` would leave the client an EOF for input that landed, and a retry would type it twice.
 /// The drain gate re-posts while the reply is owed (`control::InputReplies`), and once it is
@@ -449,7 +449,7 @@ fn a_reset_at_the_write_is_never_answered_ok() {
 }
 
 /// THE OUTGOING COMMIT WRITES THE PERSON'S STAMPS AT ITS WRITE (LC-4 of
-/// ATERM-KI-1016-1; the review's KR-1): run through the Commit's own path
+/// ; the review's KR-1): run through the Commit's own path
 /// (`App::finish_proven_handoff`), the attempt's person-stamps sidecar
 /// (`seamless::person_stamps_path` of its manifest) stands at the write and
 /// names the handed session a person keyed, with its age; a Commit that

@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Content-agnostic tab, view, and split-tree foundations.
-//!
-//! The terminal UI historically identified both a tab and its focused pane by a
-//! session id and laid splits out in terminal cells.  Native tab apps need three
-//! identities instead: a stable tab, a stable view, and (for native content) a
-//! stable app instance.  This module owns those identities and the generic
-//! logical-pixel split geometry.  PTY ownership deliberately remains in
+//! Content-agnostic tab, view and split-tree foundations: stable tab, view and native
+//! app-instance identities and the logical-pixel split geometry. PTY ownership stays in
 //! `aterm_gui::SessionPool`; [`View::Terminal`] is only the typed link to it.
 
 use std::collections::HashMap;
@@ -35,7 +30,7 @@ macro_rules! stable_id {
 
         impl $name {
             /// The stable integer representation used by restore and control
-            /// serialization.  It is never a vector index.
+            /// serialization. It is never a vector index.
             #[must_use]
             #[inline]
             pub const fn get(self) -> u64 {
@@ -55,7 +50,7 @@ stable_id!(TabId);
 stable_id!(ViewId);
 stable_id!(AppInstanceId);
 
-/// Reconstitute an identity at a validated restore boundary.  Live allocation
+/// Reconstitute an identity at a validated restore boundary. Live allocation
 /// goes through [`IdAllocator`] or [`ViewStore`]. Only the macOS tab strip
 /// reconstitutes a [`TabId`], and no shipping code an [`AppInstanceId`]; the
 /// tests mint both directly — aterm-gui's on every platform, so both are in
@@ -78,12 +73,12 @@ from_stored!(TabId);
 #[cfg(any(test, debug_assertions))]
 from_stored!(AppInstanceId);
 
-/// The stable-id space has been exhausted.  This is explicit even though a
+/// The stable-id space has been exhausted. This is explicit even though a
 /// process cannot realistically create `u64::MAX` tabs or views.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct IdExhausted;
 
-/// Monotonic, never-reusing identity source.  Removing an object never rewinds
+/// Monotonic, never-reusing identity source. Removing an object never rewinds
 /// this counter, so a delayed event cannot address a later object by accident.
 #[derive(Clone, Debug)]
 pub struct IdAllocator<I> {
@@ -94,8 +89,7 @@ pub struct IdAllocator<I> {
 impl<I> Default for IdAllocator<I> {
     fn default() -> Self {
         Self {
-            // Zero remains available to decode old manifests while all newly
-            // allocated identities are visibly distinct from legacy indices.
+            // Zero is never allocated, so it can stand for "no object".
             next: 1,
             _id: PhantomData,
         }
@@ -122,7 +116,7 @@ stable_id_impl!(ViewId);
 stable_id_impl!(AppInstanceId);
 
 impl<I: StableId> IdAllocator<I> {
-    /// Mint the next identity.  An exhausted allocator stays exhausted.
+    /// Mint the next identity. An exhausted allocator stays exhausted.
     #[inline]
     pub fn allocate(&mut self) -> Result<I, IdExhausted> {
         let raw = self.next;
@@ -137,14 +131,14 @@ pub struct TerminalView {
     pub session: u64,
 }
 
-/// The core-owned link for a native view.  Its reducer/view-local state lives in
+/// The core-owned link for a native view. Its reducer/view-local state lives in
 /// the native app runtime and is keyed by the enclosing [`ViewId`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct NativeViewRef {
     pub instance: AppInstanceId,
 }
 
-/// Content of one split leaf.  The closed enum makes PTY-only operations
+/// Content of one split leaf. The closed enum makes PTY-only operations
 /// explicit and gives later native apps a first-class, non-PTY representation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -203,7 +197,7 @@ impl ViewStore {
         self.views.contains_key(&id)
     }
 
-    /// Remove a view.  Its identity remains burned and is never allocated again.
+    /// Remove a view. Its identity remains burned and is never allocated again.
     #[inline]
     pub fn remove(&mut self, id: ViewId) -> Option<View> {
         self.views.remove(&id)
@@ -281,13 +275,10 @@ impl<T> SplitTree<T> {
         }
     }
 
-    /// Allocation-free, short-circuiting twin of `leaves().into_iter().any(..)`: same
-    /// left-to-right leaf order as [`Self::visit`], stops at the first match.
-    ///
-    /// PERF: `leaves()` costs a `len()` recursion plus a heap `Vec` — even for a lone leaf —
-    /// which is pure waste when the caller only wants a bool. The predicates on the wake and
-    /// present paths (`active_tab_displays_session`, `active_tab_contains_native`) run at the PTY
-    /// reader's batch rate, i.e. thousands of times a second under a flood, so they use this.
+    /// Allocation-free, short-circuiting `leaves.into_iter.any(..)`, in
+    /// [`Self::visit`]'s leaf order. The wake and present predicates
+    /// (`active_tab_displays_session`, `active_tab_contains_native`) run at the PTY
+    /// reader's batch rate, thousands of times a second under a flood, so they use this.
     pub fn any_leaf(&self, pred: &mut impl FnMut(&T) -> bool) -> bool {
         match self {
             Self::Leaf(value) => pred(value),
@@ -333,7 +324,7 @@ impl<T: Copy + Eq> SplitTree<T> {
     }
 
     /// Replace `target` with a split whose first leaf is the original and whose
-    /// second leaf is `new`.  Returns false without mutation if `target` is stale.
+    /// second leaf is `new`. Returns false without mutation if `target` is stale.
     pub fn split_leaf(&mut self, target: T, axis: SplitAxis, new: T) -> bool {
         match self {
             Self::Leaf(value) if *value == target => {
@@ -416,7 +407,7 @@ impl<T: Copy + Eq> SplitTree<T> {
         true
     }
 
-    /// Remove `target` and collapse its parent.  The only leaf is reported but
+    /// Remove `target` and collapse its parent. The only leaf is reported but
     /// left in place so the tab owner can atomically remove the whole tab.
     pub fn remove_leaf(&mut self, target: T) -> RemoveLeaf {
         if !self.contains(target) {
@@ -462,9 +453,8 @@ impl<T: Copy + Eq> SplitTree<T> {
         }
     }
 
-    /// The LAST leaf in tree order — the bottom/right-most one, the mirror of
-    /// [`Self::first_leaf`]. Used to find the leaf that touches a divider from
-    /// the side above/left of it ([`Self::absorbing_neighbor`]).
+    /// The last leaf in tree order (bottom/right-most), the mirror of
+    /// [`Self::first_leaf`]: the leaf touching a divider from above/left of it.
     #[must_use]
     #[inline]
     pub fn last_leaf(&self) -> T {
@@ -474,24 +464,12 @@ impl<T: Copy + Eq> SplitTree<T> {
         }
     }
 
-    /// The leaf that INHERITS `target`'s space when [`Self::remove_leaf`] collapses
-    /// `target`'s parent onto its sibling — and, of that sub-tree, the leaf pressed
-    /// right up against the divider `target` shared with it. That is the "nearest
-    /// surviving leaf" focus must re-seat on: the pane that visibly grows into the
-    /// hole is the pane the person's eyes (and next keystrokes) follow.
-    ///
-    /// The near edge is the mirror of `target`'s own side of the divider: when
-    /// `target` is the FIRST child the sibling lies below/right of it, so its
-    /// `first_leaf` touches the seam; when `target` is the SECOND child the sibling
-    /// lies above/left, so its `last_leaf` does. `None` when `target` is not a leaf
-    /// of this tree, or is the whole tree (nothing survives to inherit).
-    ///
-    /// THE DEFECT THIS REPLACES: both close paths used to re-point focus at
-    /// `root.first_leaf()` — the tree's GLOBAL top-left leaf, which for anything
-    /// closed outside the first sub-tree is the opposite corner of the window.
-    /// Closing the bottom-right pane of `a | (b / c)` threw the keyboard across to
-    /// `a` while `b` silently took the freed space, so the next command ran in a
-    /// different live shell than the one the freed space pointed at.
+    /// The leaf that inherits `target`'s space when [`Self::remove_leaf`] collapses
+    /// its parent: of the sibling sub-tree, the leaf against the divider `target`
+    /// shared with it (`first_leaf` when `target` is the first child, `last_leaf`
+    /// when it is the second). Focus re-seats there, on the pane that visibly grows
+    /// into the hole, never on the tree's global first leaf. `None` when `target` is
+    /// not a leaf of this tree or is the whole tree.
     #[must_use]
     pub fn absorbing_neighbor(&self, target: T) -> Option<T> {
         let Self::Split { first, second, .. } = self else {
@@ -574,9 +552,9 @@ pub struct LayoutLeaf<T> {
 
 /// One leaf's sizing contract in the tab's logical coordinate space.
 ///
-/// `minimum` is a hard ergonomic request when the host has enough room.  If the
+/// `minimum` is a hard ergonomic request when the host has enough room. If the
 /// whole tree cannot fit, every leaf remains present and the shortage is shared
-/// deterministically instead of dropping a sibling.  `preferred` is used to
+/// deterministically instead of dropping a sibling. `preferred` is used to
 /// distribute that shortage and is otherwise advisory; the user's divider ratio
 /// remains the primary placement choice.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -616,7 +594,7 @@ impl LeafSizing {
     }
 }
 
-/// A stable root-to-node branch.  Paths remain valid across focus, resize and
+/// A stable root-to-node branch. Paths remain valid across focus, resize and
 /// divider-ratio changes; a structural split/close intentionally invalidates
 /// paths below the changed node, where mutation then fails closed.
 #[derive(
@@ -718,7 +696,7 @@ pub struct VisibleDivider {
     span_extent: f32,
 }
 
-/// A frame-stable, content-agnostic plan.  Paint, pointer hit testing, terminal
+/// A frame-stable, content-agnostic plan. Paint, pointer hit testing, terminal
 /// sizing and accessibility all consume this same artifact.
 #[derive(Clone, PartialEq, Debug)]
 pub struct VisibleLeafPlan {
@@ -814,7 +792,7 @@ pub enum FocusDirection {
 }
 
 impl<T: Copy + Eq> SplitTree<T> {
-    /// Resolve every leaf in logical pixels.  `divider` is a pixel-width gap;
+    /// Resolve every leaf in logical pixels. `divider` is a pixel-width gap;
     /// `min_leaf` is the nonzero ergonomic floor along the divided axis.
     #[must_use]
     pub fn layout(&self, bounds: LogicalRect, divider: f32, min_leaf: f32) -> Vec<LayoutLeaf<T>> {
@@ -924,7 +902,7 @@ impl<T: Copy + Eq> SplitTree<T> {
         Some(((pointer - hit.span_origin) / splittable).clamp(0.0, 1.0))
     }
 
-    /// Apply a ratio through a still-live divider path.  Stale paths fail closed.
+    /// Apply a ratio through a still-live divider path. Stale paths fail closed.
     pub fn set_divider_ratio(&mut self, hit: &LogicalDividerHit, ratio: f32) -> bool {
         let mut node = self;
         for branch in hit.path.branches() {
@@ -1175,7 +1153,7 @@ fn constrained_extent(
         return (first, available - first);
     }
 
-    // Impossible fit: keep both subtrees represented.  Preferred extents are a
+    // Impossible fit: keep both subtrees represented. Preferred extents are a
     // deterministic tie-breaker when minimums are zero; otherwise shortage is
     // shared in proportion to the requested minimums.
     let first_weight = if first_minimum + second_minimum > f32::EPSILON {
@@ -1352,32 +1330,27 @@ fn node_at_path_mut<'a, T>(
 
 /// Independent tab-state flags; no state hides another state.
 ///
-/// The two attention bits are SEPARATE FIELDS, one per owner, because a single
-/// shared bool cannot be recomputed. The status classifier refolds its bit from
-/// the tab's leaves on every publication, while a failed document shutdown or a
-/// settings/update announcement writes its own bit out of band and is not
-/// derivable from anything the classifier can see. Merged into one bool, the
-/// recomputing owner had to OR the stored value back in to avoid erasing the
-/// other — and so ORed back its OWN previous contribution, latching a failure
-/// onto the tab for the life of the process. Ask [`Self::wants_attention`] at
-/// every render seam; never read one field alone.
+/// Each attention bit has one owner. The status classifier recomputes
+/// `status_attention` from the tab's leaves on every publication; `attention` is
+/// written out of band and cannot be derived from anything the classifier sees. A
+/// shared bool could not be recomputed without latching the recomputer's own past
+/// value. Ask [`Self::wants_attention`] at every render seam; never read one field.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct TabIndicators {
     pub dirty: bool,
     pub busy: bool,
-    /// Raised OUT OF BAND by a native leaf's owner (a failed document shutdown,
-    /// an update announcement). Never written by the status path.
+    /// Raised out of band by a native leaf's owner (a failed document shutdown, an
+    /// update announcement). Never written by the status path.
     pub attention: bool,
-    /// Raised by the session STATUS classifier — today, a failed last outcome.
-    /// Fully recomputed from the tab's terminal leaves on every pass, so it
-    /// clears itself when the failure is superseded.
+    /// Raised by the session status classifier (a failed last outcome). Recomputed
+    /// from the tab's terminal leaves on every pass, so it clears itself when the
+    /// failure is superseded.
     pub status_attention: bool,
 }
 
 impl TabIndicators {
-    /// Whether anything at all wants the user's eye. The chrome shows ONE mark,
-    /// so every renderer and the introspection serializer fold here rather than
-    /// picking a field.
+    /// Whether anything at all wants the user's eye. The chrome shows one mark, so
+    /// every renderer and the introspection serializer fold here.
     #[must_use]
     #[inline]
     pub const fn wants_attention(self) -> bool {
@@ -1385,12 +1358,9 @@ impl TabIndicators {
     }
 }
 
-/// Closed icon identity for first-party, non-terminal tab applications.
-///
-/// A terminal is deliberately absent from this enum: terminal presentation is
-/// title-only and expresses that invariant as `TabPresentation::icon == None`.
-/// Keeping the distinction typed prevents an unknown app metadata string from
-/// accidentally receiving the same chrome policy as a terminal session.
+/// Closed icon identity for first-party, non-terminal tab applications. A terminal
+/// has no variant (its presentation is title-only, `TabPresentation::icon == None`),
+/// so unknown app metadata can never get a terminal's chrome policy.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TabIconKind {
     Settings,
@@ -1426,16 +1396,12 @@ impl TabIconKind {
 }
 
 /// Which side(s) of a live session connection (design §4) a tab's sessions sit
-/// on: `Outbound` = some session here holds authority INTO a peer, `Inbound` =
-/// a peer holds authority over a session here, `Both` = both at once.
+/// on: `Outbound` = a session here holds authority into a peer, `Inbound` = a peer
+/// holds authority over a session here, `Both` = both.
 ///
-/// Deliberately NOT a [`TabIndicators`] field: the indicator bits have exactly
-/// two recomputing owners (the status classifier and the native leaves), and
-/// several seams ASSIGN whole `TabIndicators` values over a presentation —
-/// a third owner's bit stored there would be erased by every such write (the
-/// latching bug that struct's doc comment exists to prevent). The role is
-/// instead stamped per TAB by `App::stamp_tab_connection_roles` inside the one
-/// strip-refresh funnel, so it can never fight the indicator owners.
+/// Not a [`TabIndicators`] field: several seams assign whole `TabIndicators` values
+/// over a presentation, which would erase a third owner's bit. The role is stamped
+/// per tab by `App::stamp_tab_connection_roles` inside the one strip-refresh funnel.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TabConnRole {
     Outbound,
@@ -1484,10 +1450,9 @@ impl TabConnRole {
         Self::from_flags(ao || bo, ai || bi)
     }
 
-    /// Stable state tokens for the `chrome` introspection line (`format_tab_
-    /// chrome`). `Both` reports BOTH directional tokens rather than a third
-    /// spelling, so a script greps `conn-out`/`conn-in` and never misses a
-    /// direction (§6: marks are never visual-only).
+    /// Stable state tokens for the `chrome` introspection line
+    /// (`toolbar::format_tab_chrome`). `Both` reports both directional tokens, so a
+    /// script greps `conn-out`/`conn-in` and never misses a direction.
     #[must_use]
     #[inline]
     pub const fn chrome_states(self) -> &'static [&'static str] {
@@ -1505,10 +1470,9 @@ pub struct TabPresentation {
     pub title: String,
     pub icon: Option<TabIconKind>,
     pub indicators: TabIndicators,
-    /// The tab's connection-mark role (design §4), stamped from the live edge
-    /// tables by the strip-refresh funnel — see [`TabConnRole`] for why this is
-    /// not an indicator bit. `None` = no live connection touches this tab's
-    /// sessions (or the `tab_connection_badge` opt-out quieted the mark).
+    /// The tab's connection-mark role (design §4), stamped by the strip-refresh funnel
+    /// ([`TabConnRole`] says why it is not an indicator bit). `None` = no live
+    /// connection touches this tab's sessions, or `tab_connection_badge` is off.
     pub conn: Option<TabConnRole>,
     pub closable: bool,
     pub tooltip: Option<String>,
@@ -1689,16 +1653,10 @@ impl Tab {
         true
     }
 
-    /// Remove one leaf and repair focus to the nearest deterministic survivor.
-    /// The final leaf is left in place so the tab owner can run its close
-    /// transaction before removing the whole tab.
-    ///
-    /// "Nearest" is [`SplitTree::absorbing_neighbor`] — the leaf on the far side of
-    /// the divider the removed leaf shared, i.e. inside the sub-tree that takes its
-    /// space. Read BEFORE the removal, because the collapse is what erases the
-    /// parent that names the sibling. `first_leaf` is only the last-resort answer
-    /// for a tree that has no such neighbour (a stale focus repaired on a tree the
-    /// removed view was never in).
+    /// Remove one leaf and re-seat focus on [`SplitTree::absorbing_neighbor`], read
+    /// before the removal because the collapse erases the parent that names the
+    /// sibling; `first_leaf` only when there is no such neighbour. The final leaf is
+    /// left in place so the tab owner can run its close transaction first.
     pub fn remove_view(&mut self, view: ViewId) -> RemoveLeaf {
         let heir = self.root.absorbing_neighbor(view);
         let removed = self.root.remove_leaf(view);
@@ -1805,7 +1763,7 @@ impl Tab {
     }
 }
 
-/// Ordered stable tabs with active identity.  Vector positions remain a chrome
+/// Ordered stable tabs with active identity. Vector positions remain a chrome
 /// concern and never escape as durable identity.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct TabSet {
@@ -1929,7 +1887,7 @@ impl TabSet {
         Some(id)
     }
 
-    /// Remove a tab and keep the same logical active tab when possible.  When
+    /// Remove a tab and keep the same logical active tab when possible. When
     /// removing the active tab, select the tab now at that position, else the
     /// preceding final tab.
     pub fn remove(&mut self, id: TabId) -> Option<Tab> {
@@ -2240,20 +2198,9 @@ mod tests {
         );
     }
 
-    /// THE SHRINK RULE, canonical half. `pane::PaneTree` and this planner are the
-    /// two engines that place panes, and the 2026-08-25 splits audit found the
-    /// first one emitting rects OFF the window grid when a layout was squeezed
-    /// under what it needs. That rule — *shrinking clamps; it never restructures,
-    /// never drops a pane, and never leaves the grid* — has to hold here too or
-    /// "consistent" is only prose.
-    ///
-    /// This planner reaches it a different way: `constrained_extent` returns
-    /// `(first, available - first)`, so the two children plus the divider gap TILE
-    /// the parent exactly and no rect can escape by construction. The difference
-    /// worth stating out loud is the floor: `PaneTree` keeps one cell per pane and
-    /// lets panes COINCIDE on the last row/column, while this planner keeps them
-    /// disjoint and lets an extent reach ZERO. Both keep every leaf, both leave the
-    /// tree untouched, and both round-trip when the window grows back.
+    /// The shrink rule (`pane.rs` module doc) holds for the canonical planner too:
+    /// `constrained_extent` makes children plus divider tile the parent, so no rect
+    /// leaves the bounds, no leaf drops, and growing back restores the geometry.
     #[test]
     fn shrinking_a_canonical_plan_stays_inside_the_bounds_and_drops_no_leaf() {
         let (_, views) = view_store_with(4);
@@ -2296,7 +2243,7 @@ mod tests {
             }
         }
 
-        // Reversible: the tree was only ever READ.
+        // Reversible: the tree was only ever read.
         let regrown = tab.visible_plan(LogicalRect::new(0.0, 0.0, 200.0, 48.0), 1.0, sizing);
         assert_eq!(
             regrown.leaves, roomy.leaves,
@@ -2355,9 +2302,6 @@ mod tests {
                             dirty: true,
                             busy: false,
                             attention: true,
-                            // The classifier's own bit folds independently, so a
-                            // sibling's terminal failure cannot be hidden by, or
-                            // hide, this leaf's out-of-band mark.
                             status_attention: true,
                         },
                         // Unions with the focused pane's Inbound to Both below.
@@ -2383,11 +2327,8 @@ mod tests {
         assert!(!aggregate.closable);
     }
 
-    /// The mixed native/terminal close path repairs focus by the SAME rule as
-    /// `pane::PaneTree` — onto the leaf that inherits the removed leaf's space,
-    /// across the divider the two shared. Both engines used to answer
-    /// `root.first_leaf()`, the tab's top-left leaf, so a fix to only one of them
-    /// would leave the heterogeneous tab throwing the keyboard across the window.
+    /// The mixed native/terminal close path re-seats focus by the same rule as
+    /// `pane::PaneTree`: onto the leaf that inherits the removed leaf's space.
     #[test]
     fn remove_view_repairs_focus_onto_the_leaf_that_inherits_the_space() {
         let (_, views) = view_store_with(4);
@@ -2406,8 +2347,7 @@ mod tests {
             "focus follows the space to view 1, not back to the first leaf 0"
         );
 
-        // 0 | (1 / 2) again, but closing the leaf that is NOT focused must still
-        // leave the typist alone — the repair only fires for the focused leaf.
+        // 0 | (1 / 2) again: closing a leaf that is not focused leaves focus alone.
         let (_, views) = view_store_with(3);
         let mut tab = Tab::new(
             TabId::from_stored(2),
@@ -2470,13 +2410,8 @@ mod tests {
         assert!(!model.check_invariant("FocusInRange", &dangling));
     }
 
-    /// `any_leaf` replaces `leaves().into_iter().any(..)` on the wake/present paths, so it
-    /// has to agree with it on EVERY leaf of a nested tree — including the short-circuit
-    /// point, which is what makes the two orderings observationally the same.
-    ///
-    /// The reference side is spelled `leaves.contains(&probe)`: for a slice that IS
-    /// `iter().any(|leaf| leaf == &probe)` by definition, so it is the same oracle written
-    /// the way the standard library wants an equality search written.
+    /// `any_leaf` agrees with `leaves.contains` on every leaf of a nested tree and
+    /// stops at the first match.
     #[test]
     fn any_leaf_agrees_with_leaves_any_and_stops_at_the_first_match() {
         let (_, views) = view_store_with(3);
@@ -2498,7 +2433,7 @@ mod tests {
             );
         }
 
-        // Short-circuit: a predicate true for the FIRST visited leaf must not visit a second.
+        // Short-circuit: a predicate true for the first visited leaf visits no second.
         let mut seen = Vec::new();
         assert!(tab.root.any_leaf(&mut |view| {
             seen.push(*view);

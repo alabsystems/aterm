@@ -74,11 +74,9 @@ pub(crate) fn push_grid_quad(
     }
 }
 
-/// Push a pixel rect of premultiplied light in window px, clamped to the
-/// effects box (grid + head band, identity at `head == 0`) and split into
-/// per-cell-row [`GlowQuad`]s with origin-anchored row damage tags. Callers
-/// pass window px (`geom.origin_*` applied); grid-relative emitters use
-/// [`push_grid_quad`].
+/// Push additive premultiplied light in window px (`geom.origin_*` applied), clamped to the
+/// effects box (grid + head band) and split into per-cell-row [`GlowQuad`]s with
+/// origin-anchored row tags.
 #[inline]
 pub(crate) fn push_fx_rect(
     out: &mut Vec<GlowQuad>,

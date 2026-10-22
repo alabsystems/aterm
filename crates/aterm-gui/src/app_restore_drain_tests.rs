@@ -629,7 +629,7 @@ fn a_persons_own_quit_inside_the_drain_keeps_no_agent_and_no_hold() {
 ///
 /// PUT BACK AND THEN LIFTED BY THE OWNER, the hold stays lifted (theirs to
 /// lift) and the agent stays down (ruling 23 (ii): a held tab's agent is not
-/// relaunched when the hold lifts; ATERM-KI-1016-1 LC-8): the leaf names no
+/// relaunched when the hold lifts LC-8): the leaf names no
 /// agent, and the next launch neither holds the tab nor relaunches into it,
 /// as after the drain's last slice. It named the agent with no hold, and the
 /// next launch relaunched it and typed its carry-on into the tab. AND THE

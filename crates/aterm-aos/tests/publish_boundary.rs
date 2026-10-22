@@ -4,13 +4,16 @@
 //! Boundary publication: the repair protocol end to end, the queue during a pause, and every
 //! refusal `pause`, `prepare` and `commit` can return, each leaving the boundary untouched.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use aterm_aos::contract::{Contract, Verdict};
 use aterm_aos::effects::{EffectDivergence, EffectRequest, NoEffects, RecordingPort};
 use aterm_aos::evidence::EvidenceGrade;
 use aterm_aos::publish::{Admit, PublishRefusal};
 use aterm_aos::replay::{Divergence, Run};
 use aterm_aos::task::{Code, Schema, StepRefusal, state_digest};
-use aterm_aos::{ArtifactId, ArtifactKind, Revision};
+use aterm_aos::{ArtifactId, ArtifactKind, Digest, Revision};
 
 use crate::toy::{
     TICK_CLEARS, ToyInput, ToyObs, ToySchema, ToyState, Variant, adds, apply, attached,
@@ -383,6 +386,96 @@ fn a_boundary_constructed_with_another_contract_than_the_identity_names_refuses_
     assert!(b.is_paused());
 }
 
+/// What a judge was shown of one run: its observation count, first and last cursors,
+/// observation chain and state digest.
+type Shown = (usize, Option<u64>, Option<u64>, Digest, Digest);
+
+/// The corrected contract, keeping what it was shown of every run it judged.
+#[derive(Clone, Debug)]
+struct Watching {
+    judge: crate::toy::TickClears,
+    shown: Rc<RefCell<Vec<Shown>>>,
+}
+
+impl Contract<ToySchema> for Watching {
+    fn id(&self) -> &ArtifactId {
+        self.judge.id()
+    }
+
+    fn judge(&self, schema: &ToySchema, inputs: &[ToyInput], run: &Run<ToySchema>) -> Verdict {
+        self.shown.borrow_mut().push(shown(run));
+        self.judge.judge(schema, inputs, run)
+    }
+}
+
+fn shown(run: &Run<ToySchema>) -> Shown {
+    (
+        run.observations.len(),
+        run.observations.first().map(|(c, _)| *c),
+        run.observations.last().map(|(c, _)| *c),
+        run.observation_chain,
+        run.state_digest,
+    )
+}
+
+/// Prepare judges the live run as soon as it is checked and lets its observations go before
+/// the candidate replays: the contract still sees each complete run exactly once, live first,
+/// and the witness carries the verdicts and chains the straight folds give, for a failing
+/// live run (stranded) and a passing one (good, republished).
+#[test]
+fn prepare_judges_the_complete_live_run_then_the_complete_candidate_run_once_each() {
+    let schema = ToySchema::new();
+    let trace = [Add(3), Tick, Add(4), Tick, Add(5), Tick];
+    let corrected = contract();
+    for live_variant in [Variant::Stranded, Variant::Good] {
+        let shown_runs = Rc::new(RefCell::new(Vec::new()));
+        let watching = Watching {
+            judge: contract(),
+            shown: Rc::clone(&shown_runs),
+        };
+        let mut b = judged_by(live_variant, ToyState::default(), 4, watching);
+        b.attach(1, 64).unwrap();
+        for i in &trace {
+            let schema = b.schema().clone();
+            assert_eq!(b.admit(i), Admit::Run);
+            let (code, state) = b.pair_mut();
+            code.step(&schema, state, i, &mut NoEffects).unwrap();
+            b.advance();
+        }
+        b.pause().unwrap();
+        let p = b.prepare(code(Variant::Good)).unwrap();
+        let w = p.witness();
+        let live_run = fold(live_variant, ToyState::default(), &trace);
+        let candidate_run = fold(Variant::Good, ToyState::default(), &trace);
+        assert_eq!(live_run.observations.len(), trace.len());
+        assert_eq!(
+            *shown_runs.borrow(),
+            vec![shown(&live_run), shown(&candidate_run)],
+            "{live_variant:?}: one judgement of each complete run, live first"
+        );
+        assert_eq!(
+            w.live_verdict(),
+            &corrected.judge(&schema, &trace, &live_run)
+        );
+        assert_eq!(
+            w.candidate_verdict(),
+            &corrected.judge(&schema, &trace, &candidate_run)
+        );
+        assert_eq!(w.live_observation_chain(), live_run.observation_chain);
+        assert_eq!(
+            w.candidate_observation_chain(),
+            candidate_run.observation_chain
+        );
+        assert_eq!(w.candidate_state_digest(), candidate_run.state_digest);
+        assert_eq!(p.state(), &candidate_run.state);
+        assert_eq!(
+            w.live_verdict().passed(),
+            live_variant == Variant::Good,
+            "non-vacuity: the stranded live run fails and the good one passes"
+        );
+    }
+}
+
 /// A judge that passes every run, declaring whatever contract artifact it is given.
 #[derive(Clone, Debug)]
 struct Lenient(ArtifactId);
@@ -655,6 +748,44 @@ fn a_full_log_reanchors_at_a_fresh_checkpoint_and_repair_replays_from_the_newest
     b.pause().unwrap();
     let p = b.prepare(code(Variant::Good)).unwrap();
     assert_eq!((p.witness().range(), p.witness().log_epoch()), ((4, 5), 9));
+}
+
+/// Every admit asks whether the log needs a re-anchor, and only a re-anchor takes the parent
+/// checkpoint's digest. Over successive full logs, each fresh checkpoint still names the one
+/// it replaced as its parent, each fresh log names the fresh checkpoint as its ancestor, and
+/// an admit into a log with room re-anchors nothing.
+#[test]
+fn each_full_log_reanchor_names_the_checkpoint_it_replaced_and_an_admit_with_room_names_none() {
+    let mut b = boundary_over(Variant::Good, ToyState::default(), 4);
+    b.attach(3, 2).unwrap();
+    let mut seen = vec![b.checkpoint().unwrap().clone()];
+    for (i, n) in (1..=7).enumerate() {
+        feed(&mut b, &adds(&[n]));
+        let c = b.checkpoint().unwrap();
+        if c != seen.last().unwrap() {
+            seen.push(c.clone());
+        }
+        // Two inputs per log: the log after input i + 1 holds the inputs past the last
+        // re-anchor, never more than its bound.
+        assert_eq!(b.log().unwrap().len(), i % 2 + 1, "after input {n}");
+        assert_eq!(b.stats().reanchors, i as u64 / 2, "after input {n}");
+    }
+    assert_eq!(seen.len(), 4, "three re-anchors over seven inputs");
+    for pair in seen.windows(2) {
+        assert_eq!(pair[1].provenance().parent, Some(pair[0].digest()));
+        assert_eq!(
+            pair[1].provenance().log_epoch,
+            pair[0].provenance().log_epoch + 1
+        );
+    }
+    let newest = seen.last().unwrap();
+    assert_eq!(b.log().unwrap().header().ancestor, newest.digest());
+    assert_eq!(newest.provenance().input_cursor, 6);
+    assert_eq!(b.stats().breaks, 0);
+    b.pause().unwrap();
+    let p = b.prepare(code(Variant::Good)).unwrap();
+    assert_eq!(p.witness().ancestor(), newest.digest());
+    assert_eq!(p.witness().range(), (6, 7));
 }
 
 #[test]

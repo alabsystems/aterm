@@ -8,18 +8,47 @@
 //!
 //! ## What it serves
 //!
-//! The requests the bridge makes, with astream's semantics: `Hello` (the log's
-//! identity, the tier served, the LINEAGE), `Publish` (deduped by
-//! `(producer, seq)`, a reserved `/a/...` subject refused, `/a/retire` the
-//! subject retire), a pipelined publish's acks in order, `Will` (a hidden
-//! registration record; it fires when its connection ends and again at every
-//! open while the log holds it, deduped like a publish and fenced by any later
-//! sequence of its producer below [`astream_broker::ACK_SEQ_BASE`]), `Last`,
-//! `Fetch`, `Commit` (a hidden record; a group resumes at `upto + 1`, max-
-//! folded), `Subscribe` and `SubscribeGroup` (every matching record from the
-//! start, in order, then live), `IdleMarks`, `Keepalive`, `Budget`. Every
-//! `Mark` carries the durable head. No capability is checked: the simulated
-//! broker is an unguarded one, as a test's broker is.
+//! The requests the bridge makes, with astream's semantics:
+//!
+//! * `Hello`: the log's identity, the tier served and the table's rule count,
+//!   the LINEAGE (empty until the log's first move), the request set;
+//! * `Publish`: deduped by `(producer, seq)`; a malformed subject, or one of
+//!   the broker's own four (`/a/commit`, `/a/will`, `/a/bind`, `/a/retire`),
+//!   refused; a subject new to the index refused past its producer's budget
+//!   (`ERR_SUBJECT_BOUND`: the subjects it is charged for and its wills'
+//!   reservations); and a pipelined publish's acks in order;
+//! * `/a/retire` (a publish, any sequence): the subject retire — moot for an
+//!   absent target, refused for one charged to another producer
+//!   (`charged: `) or one a will can still append to (`will: `), and for a
+//!   target that is malformed or the broker's own;
+//! * `Will`: refused for a subject a publish could not take, a second
+//!   producer on a connection that holds one, a sequence in the ack half,
+//!   and a new subject past the budget; otherwise a hidden registration
+//!   record, which RESERVES its subject against its producer's budget until a
+//!   record of its lands there. It fires when its connection ends, and at
+//!   every open each producer's latest will on the log fires again; deduped
+//!   like a publish, fenced by any later sequence of its producer below
+//!   [`astream_broker::ACK_SEQ_BASE`], and exempt from the budget;
+//! * `Last` (a page in subject order that resumes after its last row once it
+//!   reached its max), `Fetch` (a page from a scan of at most
+//!   `FETCH_SCAN_MAX` records, its `Mark` naming the oldest offset: 0, for a
+//!   log nothing compacts), `Commit` (a hidden record; a group resumes at
+//!   `upto + 1`, max-folded), `Subscribe` and `SubscribeGroup` (every
+//!   matching record from the start, in order, then live; a refused one ends
+//!   its connection), `IdleMarks`, `Keepalive`, `Budget`;
+//! * a name past `MAX_NAME_LEN` refused before anything reads it.
+//!
+//! Every `Mark` carries the durable head. No capability is checked: the
+//! simulated broker is an unguarded one, as a test's broker is.
+//!
+//! ## Held to astream's broker
+//!
+//! A DIFFERENTIAL TEST plays scripts on this model and on a real
+//! `astream_broker::Broker` opened as aterm opens its own, and compares the
+//! answers request by request (`super::conform_broker`, sim item B01): one
+//! script per verb and edge, and the door's journal of seeded worlds
+//! ([`Event`], [`State::journal`]) — what real bridges sent. Each pin bump of
+//! `vendor/astream` re-runs it. What it leaves out is listed there.
 //!
 //! ## What a restart may lose: astream's power-loss law, P2-P7
 //!
@@ -49,7 +78,13 @@
 //! refusal nor its cut with a move is drawn. Nor is a move after a process
 //! crash: astream moves a weak tier's generation after an unclean stop of a
 //! log off the boot volume, whose page cache it cannot vouch for, and here a
-//! crash never moves.
+//! crash never moves. A will live at a stop fires at the next open (its
+//! producer's latest on the log), where astream's connection thread may fire
+//! it at the stop instead, racing the shutdown: one of the two outcomes the
+//! race allows. The table's principal rule (`h-`) escalates by the world's
+//! producer names ([`Broker::name_producer`]); astream applies it only to a
+//! producer a bound grant attached (`/a/bind`), which an unguarded broker
+//! never has.
 //!
 //! ## Held acks: the answer behind the record (aterm-0)
 //!
@@ -280,6 +315,10 @@ pub(crate) struct State {
     index: BTreeMap<String, (u64, u64)>,
     /// producer -> its highest sequence below the ack half.
     max_seq: BTreeMap<u64, u64>,
+    /// producer -> the subjects its registered wills hold against its subject
+    /// budget until a record of its lands on them ([`State::reserve`]):
+    /// astream's `will_reserved`.
+    reserved: BTreeMap<u64, std::collections::BTreeSet<String>>,
     wills: Vec<Will>,
     conns: BTreeMap<u64, ConnState>,
     next_conn: u64,
@@ -306,6 +345,10 @@ pub(crate) struct State {
     pub(crate) mutant: ArmMutant,
     /// A SIBLING RACING AN ATTACH ([`Race`]), in the worlds that have one.
     pub(crate) race: Option<Race>,
+    /// THE DOOR'S JOURNAL ([`Event`]), in a world that keeps one: every
+    /// connection, served request, delivery, connection end, world write and
+    /// restart, in order.
+    pub(crate) journal: Option<Vec<Event>>,
     notes: Vec<String>,
 }
 
@@ -356,11 +399,48 @@ pub(crate) enum ArmMutant {
     LoseWithoutMove,
     /// A move whose lineage claims the whole old log (breaks P7).
     LineageAtHead,
+    /// A resent `(producer, seq)` is appended again under a fresh offset,
+    /// never deduped: the differential test's negative control
+    /// (`super::conform_broker`).
+    FreshDedup,
+    /// A will fires whatever its producer published since: the differential
+    /// test's other negative control.
+    NoWillFence,
+    /// Corrupt each published payload byte: the differential must compare bytes,
+    /// including distinct malformed UTF-8 sequences.
+    AlterPayload,
 }
 
 /// One visible record as the oracle reads it: `(offset, subject, body,
 /// producer key)`.
 pub(crate) type Visible = (u64, String, Vec<u8>, Option<(u64, u64)>);
+
+/// ONE THING THAT HAPPENED AT THE BROKER'S DOOR, as a world's broker that keeps
+/// a journal ([`State::journal`]) records it: what the differential test
+/// (`super::conform_broker`) replays against astream's own broker, so the
+/// requests it holds the model to are the ones a real bridge sent.
+#[derive(Clone, Debug)]
+pub(crate) enum Event {
+    /// A connection opened ([`dial_stream`]).
+    Dial(u64),
+    /// A request on a connection reached the broker and was served.
+    Request(u64, Request),
+    /// A subscription's next delivery was handed to its reader.
+    Deliver(u64),
+    /// A connection ended while the broker ran (its will fires).
+    End(u64),
+    /// A world producer's write ([`Broker::publish_as`]).
+    Publish {
+        producer: u64,
+        seq: u64,
+        subject: String,
+        body: Vec<u8>,
+    },
+    /// The broker stopped ([`Broker::stop`]).
+    Stop(Stop),
+    /// The broker opened again ([`Broker::start`]).
+    Start,
+}
 
 /// The simulated broker every connection of a world reaches.
 #[derive(Debug)]
@@ -398,6 +478,7 @@ impl Broker {
                 groups: BTreeMap::new(),
                 index: BTreeMap::new(),
                 max_seq: BTreeMap::new(),
+                reserved: BTreeMap::new(),
                 wills: Vec::new(),
                 conns: BTreeMap::new(),
                 next_conn: 1,
@@ -409,9 +490,24 @@ impl Broker {
                 seen_before_ack: 0,
                 mutant: ArmMutant::None,
                 race: None,
+                journal: None,
                 notes: Vec::new(),
             }),
         }
+    }
+
+    /// Keep a journal of the door from now on ([`State::journal`]).
+    pub(crate) fn keep_journal(&self) {
+        lock(&self.state).journal.get_or_insert_with(Vec::new);
+    }
+
+    /// The journal so far, emptied.
+    pub(crate) fn take_journal(&self) -> Vec<Event> {
+        lock(&self.state)
+            .journal
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Tell the model which principal a producer id is (the principal rule).
@@ -440,6 +536,12 @@ impl Broker {
         if !s.up {
             return None;
         }
+        s.note_event(|| Event::Publish {
+            producer,
+            seq,
+            subject: subject.to_string(),
+            body: body.to_vec(),
+        });
         s.publish(producer, seq, subject, body).ok()
     }
 
@@ -540,7 +642,28 @@ impl Broker {
     /// among exactly the cuts the law allows ([`State::allowed_cuts`]). It
     /// stays down until [`Broker::start`].
     pub(crate) fn stop(&self, stop: Stop, rng: &mut Rng) -> Restart {
+        self.stop_choosing(stop, rng, |cuts, rng| {
+            let pick = usize::try_from(rng.below(cuts.len() as u64)).unwrap_or(0);
+            cuts.get(pick).copied()
+        })
+    }
+
+    /// [`Broker::stop`], KEEPING THE WHOLE LOG whatever the law would allow it to
+    /// cut: a power loss after which every record survived, as a reboot after the
+    /// page cache reached the disk leaves it — what the differential test holds
+    /// to astream's reopen in a boot it cannot name.
+    pub(crate) fn stop_keeping_all(&self, stop: Stop) -> Restart {
+        self.stop_choosing(stop, &mut Rng::new(0), |cuts, _| cuts.last().copied())
+    }
+
+    fn stop_choosing(
+        &self,
+        stop: Stop,
+        rng: &mut Rng,
+        choose: impl FnOnce(&[u64], &mut Rng) -> Option<u64>,
+    ) -> Restart {
         let mut s = lock(&self.state);
+        s.note_event(|| Event::Stop(stop));
         let before = s.log.clone();
         let durable_before = s.durable;
         let generation_before = s.generation;
@@ -555,8 +678,7 @@ impl Broker {
             c.held.clear();
         }
         let cuts = s.allowed_cuts(stop);
-        let pick = usize::try_from(rng.below(cuts.len() as u64)).unwrap_or(0);
-        let mut kept = cuts.get(pick).copied().unwrap_or(s.log.len() as u64);
+        let mut kept = choose(&cuts, rng).unwrap_or(s.log.len() as u64);
         if s.mutant == ArmMutant::CutBelowDurable
             && stop == Stop::PowerLoss
             && s.tier != Tier::Strict
@@ -607,21 +729,20 @@ impl Broker {
     }
 
     /// OPEN AGAIN: rebuild every index from the log that survived, call it
-    /// durable (the open's flush), and re-fire every will it still holds.
+    /// durable (the open's flush), and re-fire the wills it still holds as
+    /// astream's open does: each producer's LATEST registration on the log
+    /// (`BrokerLog::pending_wills`), in log order, whatever became of it — one
+    /// that fired dedups, one a later incarnation fenced appends nothing.
     pub(crate) fn start(&self) {
         let mut s = lock(&self.state);
+        s.note_event(|| Event::Start);
         s.rebuild();
         s.durable = s.log.len() as u64;
         s.up = true;
-        let pending: Vec<usize> = s
-            .wills
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| !w.replaced && w.fired_at.is_none() && w.reg_off < s.log.len() as u64)
-            .map(|(i, _)| i)
-            .collect();
-        for i in pending {
-            s.fire(i);
+        let mut latest: Vec<usize> = s.latest_wills().into_values().collect();
+        latest.sort_by_key(|&i| s.wills[i].reg_off);
+        for i in latest {
+            s.fire_will(i);
         }
         let line = format!("broker start head={} gen={}", s.log.len(), s.generation);
         s.notes.push(line);
@@ -643,7 +764,7 @@ impl Broker {
         lock(&self.state)
             .max_seq
             .get(&producer)
-            .is_some_and(|max| *max > seq)
+            .is_some_and(|&high_water| astream_broker::proto::will_is_fenced(high_water, seq))
     }
 
     /// The highest incarnation `producer` ever put anything on the log under,
@@ -716,7 +837,7 @@ impl State {
                 self.dedup.entry(key).or_insert(off);
                 if key.1 < astream_broker::ACK_SEQ_BASE {
                     let m = self.max_seq.entry(key.0).or_insert(0);
-                    *m = (*m).max(key.1);
+                    *m = astream_broker::proto::high_water_monotone(*m, key.1);
                 }
             }
             match &rec.kind {
@@ -729,7 +850,7 @@ impl State {
                 }
                 Kind::Commit { group, upto } => {
                     let e = self.groups.entry(group.clone()).or_insert(*upto);
-                    *e = (*e).max(*upto);
+                    *e = astream_broker::proto::group_commit_monotone(*e, *upto);
                 }
                 Kind::Retire => {
                     let subject = String::from_utf8_lossy(&rec.body).into_owned();
@@ -745,6 +866,115 @@ impl State {
             w.conn = None;
         }
         self.conns.retain(|_, c| c.open);
+        // THE RESERVATIONS an open rebuilds (`reserve_pending_will_subjects`):
+        // each producer's latest will on the log that nothing of its producer
+        // above it fenced or said, on a subject not in the index.
+        self.reserved.clear();
+        for i in self.latest_wills().into_values() {
+            if !self.settled_above(i) {
+                let w = &self.wills[i];
+                let (producer, subject) = (w.producer, w.subject.clone());
+                self.reserve(producer, subject);
+            }
+        }
+    }
+
+    /// Hold `subject` against `producer`'s budget for its will, unless the
+    /// index holds it already (`reserve_will_subject`).
+    fn reserve(&mut self, producer: u64, subject: String) {
+        if !astream_broker::store::is_hidden_subject(&subject) && !self.index.contains_key(&subject)
+        {
+            self.reserved.entry(producer).or_default().insert(subject);
+        }
+    }
+
+    /// Whether the log holds will `i`: its registration record is on it (a
+    /// power loss may have cut it, and a later record taken its offset).
+    fn holds_will(&self, i: usize) -> bool {
+        self.wills.get(i).is_some_and(|w| {
+            usize::try_from(w.reg_off)
+                .ok()
+                .and_then(|at| self.log.get(at))
+                .is_some_and(|r| r.kind == Kind::WillReg(i))
+        })
+    }
+
+    /// Each producer's LATEST will on the log, by its registration
+    /// (`BrokerLog::latest_wills`): producer -> will.
+    fn latest_wills(&self) -> BTreeMap<u64, usize> {
+        let mut latest: BTreeMap<u64, usize> = BTreeMap::new();
+        for i in (0..self.wills.len()).filter(|&i| self.holds_will(i)) {
+            let w = &self.wills[i];
+            let newer = latest
+                .get(&w.producer)
+                .is_none_or(|&j| self.wills[j].reg_off < w.reg_off);
+            if newer {
+                latest.insert(w.producer, i);
+            }
+        }
+        latest
+    }
+
+    /// Whether a record of will `i`'s producer ABOVE its registration says
+    /// its key or outranks it (astream's `settled_above`).
+    fn settled_above(&self, i: usize) -> bool {
+        let w = &self.wills[i];
+        self.log
+            .iter()
+            .skip(
+                usize::try_from(w.reg_off)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1),
+            )
+            .filter_map(|r| r.key.filter(|_| matches!(r.kind, Kind::Plain)))
+            .any(|(p, seq)| {
+                p == w.producer
+                    && (seq == w.seq
+                        || (seq < astream_broker::ACK_SEQ_BASE
+                            && astream_broker::proto::will_is_fenced(seq, w.seq)))
+            })
+    }
+
+    /// Whether will `w` could still append: no record of its producer
+    /// outranks it, and its own key is not on the log
+    /// (`will_can_still_append`).
+    fn can_still_append(&self, w: &Will) -> bool {
+        !self
+            .max_seq
+            .get(&w.producer)
+            .is_some_and(|&high_water| astream_broker::proto::will_is_fenced(high_water, w.seq))
+            && !self.dedup.contains_key(&(w.producer, w.seq))
+    }
+
+    /// Whether a will that can still append targets `subject`: one a live
+    /// connection holds, or a producer's latest on the log
+    /// (`will_targets_subject`) — what refuses a retire of it.
+    fn will_targets(&self, subject: &str) -> bool {
+        let latest = self.latest_wills();
+        self.wills.iter().enumerate().any(|(i, w)| {
+            w.subject == subject
+                && ((w.conn.is_some() && !w.replaced) || latest.get(&w.producer) == Some(&i))
+                && self.can_still_append(w)
+        })
+    }
+
+    /// How many index entries `producer` is charged for.
+    fn charged_to(&self, producer: u64) -> usize {
+        self.index.values().filter(|(_, c)| *c == producer).count()
+    }
+
+    /// Whether `producer`'s record on `subject` would open a subject past its
+    /// budget: the index entries charged to it and its wills' reservations
+    /// but this subject's (`subject_bound_exceeded`).
+    fn past_the_budget(&self, producer: u64, subject: &str) -> bool {
+        if self.index.contains_key(subject) {
+            return false;
+        }
+        let held = self
+            .reserved
+            .get(&producer)
+            .map_or(0, |held| held.len() - usize::from(held.contains(subject)));
+        self.charged_to(producer) + held >= astream_broker::store::MAX_SUBJECTS_PER_PRODUCER
     }
 
     fn append(&mut self, rec: Rec) -> u64 {
@@ -753,7 +983,7 @@ impl State {
             self.dedup.insert(key, off);
             if key.1 < astream_broker::ACK_SEQ_BASE {
                 let m = self.max_seq.entry(key.0).or_insert(0);
-                *m = (*m).max(key.1);
+                *m = astream_broker::proto::high_water_monotone(*m, key.1);
             }
         }
         if let Kind::Plain = rec.kind {
@@ -762,6 +992,14 @@ impl State {
                 .get(&rec.subject)
                 .map_or_else(|| rec.key.map_or(0, |k| k.0), |(_, c)| *c);
             self.index.insert(rec.subject.clone(), (off, charged));
+            // The subject landed: its producer's reservation of it is spent.
+            if let Some((producer, _)) = rec.key {
+                if let Some(held) = self.reserved.get_mut(&producer) {
+                    if held.remove(&rec.subject) && held.is_empty() {
+                        self.reserved.remove(&producer);
+                    }
+                }
+            }
         }
         let escalated = rec.escalated;
         self.log.push(rec);
@@ -954,7 +1192,11 @@ impl State {
         }
     }
 
-    /// One publish: dedup, the reserved subjects, the retire, the append.
+    /// One publish, as astream's `serve_publish` and the writer's
+    /// `stage_publish` take it: `/a/retire` is a retire ([`State::retire`]);
+    /// a malformed subject or one of the broker's own is refused; a resent
+    /// key dedups; a new subject past the producer's budget is refused; the
+    /// append.
     fn publish(
         &mut self,
         producer: u64,
@@ -962,43 +1204,30 @@ impl State {
         subject: &str,
         body: &[u8],
     ) -> Result<(u64, bool), Box<Response>> {
-        if subject == astream_broker::RETIRE_SUBJECT && seq == 0 {
-            let target = String::from_utf8_lossy(body).into_owned();
-            return Ok(match self.index.get(&target) {
-                Some((_, charged)) if *charged == producer => {
-                    self.index.remove(&target);
-                    let off = self.append(Rec {
-                        subject: subject.to_string(),
-                        body: body.to_vec(),
-                        key: None,
-                        kind: Kind::Retire,
-                        escalated: false,
-                        principal: self.principal(producer).map(str::to_string),
-                    });
-                    (off, false)
-                }
-                Some((at, _)) => {
-                    return Err(refused(
-                        astream_broker::proto::ERR_RETIRE_REFUSED,
-                        format!("charged: {target} at {at} is another producer's"),
-                    ))
-                }
-                None => (self.log.len() as u64, true),
-            });
+        self.publish_bounded(producer, seq, subject, body, true)
+    }
+
+    /// [`State::publish`], held to the subject budget or not: a will's
+    /// firing is exempt (its registration was held to it, and reserved it).
+    fn publish_bounded(
+        &mut self,
+        producer: u64,
+        seq: u64,
+        subject: &str,
+        body: &[u8],
+        bounded: bool,
+    ) -> Result<(u64, bool), Box<Response>> {
+        if subject == astream_broker::RETIRE_SUBJECT {
+            return self.retire(producer, body);
         }
-        if astream_wire::Subject::new(subject).is_err() {
-            return Err(refused(
-                astream_broker::proto::ERR_BAD_SUBJECT,
-                format!("bad subject {subject:?}"),
-            ));
+        if let Some(refusal) = subject_error(subject) {
+            return Err(refusal);
         }
-        if subject.starts_with("/a/") {
-            return Err(refused(
-                astream_broker::proto::ERR_RECORD_REFUSED,
-                format!("reserved subject {subject:?}"),
-            ));
-        }
-        if let Some(&off) = self.dedup.get(&(producer, seq)) {
+        if let Some(&off) = self
+            .dedup
+            .get(&(producer, seq))
+            .filter(|_| self.mutant != ArmMutant::FreshDedup)
+        {
             if let Some(race) = self.race.as_mut().filter(|race| race.alias) {
                 if race
                     .raced
@@ -1024,13 +1253,23 @@ impl State {
                 "commit failed: the batch was rolled back (simulated)".to_string(),
             ));
         }
+        if bounded && self.past_the_budget(producer, subject) {
+            return Err(refused(
+                astream_broker::proto::ERR_SUBJECT_BOUND,
+                format!("producer {producer} holds its whole subject budget"),
+            ));
+        }
         let principal = self.principal(producer).map(str::to_string);
         let escalated = self
             .table
             .escalates(subject, &Kind::Plain, principal.as_deref());
         let off = self.append(Rec {
             subject: subject.to_string(),
-            body: body.to_vec(),
+            body: if self.mutant == ArmMutant::AlterPayload {
+                body.iter().map(|&byte| byte ^ 1).collect()
+            } else {
+                body.to_vec()
+            },
             key: Some((producer, seq)),
             kind: Kind::Plain,
             escalated,
@@ -1039,21 +1278,97 @@ impl State {
         Ok((off, false))
     }
 
-    /// Fire will `i`: an ordinary publish under its key, fenced by any later
-    /// sequence of its producer.
+    /// A SUBJECT RETIRE (`/a/retire`, its body the target), as astream's
+    /// `serve_publish` and `stage_retire` take one: a target that is not a
+    /// subject, or is the broker's own (`/a/...`), is refused; an absent one
+    /// is moot (the head, deduped); one charged to another producer is
+    /// refused `charged: `, one a will can still append to `will: `;
+    /// otherwise the index forgets it and a hidden record says so.
+    fn retire(&mut self, producer: u64, body: &[u8]) -> Result<(u64, bool), Box<Response>> {
+        use astream_broker::proto::{
+            ERR_BAD_SUBJECT, ERR_RECORD_REFUSED, ERR_RETIRE_REFUSED, RETIRE_CHARGED_PREFIX,
+            RETIRE_WILL_PREFIX,
+        };
+        let Ok(target) = std::str::from_utf8(body) else {
+            return Err(refused(
+                ERR_RECORD_REFUSED,
+                "retire body must be a valid UTF-8 subject".to_string(),
+            ));
+        };
+        if target.len() > astream_broker::broker::MAX_NAME_LEN {
+            return Err(refused(
+                ERR_RECORD_REFUSED,
+                format!("subject too long: {} bytes", target.len()),
+            ));
+        }
+        if astream_broker::store::is_hidden_subject(target)
+            || target.starts_with("/a/")
+            || target == "/a"
+        {
+            return Err(refused(
+                ERR_RECORD_REFUSED,
+                format!("reserved subject {target}"),
+            ));
+        }
+        if astream_wire::Subject::new(target).is_err() {
+            return Err(refused(ERR_BAD_SUBJECT, format!("bad subject {target:?}")));
+        }
+        let Some(&(_, charged)) = self.index.get(target) else {
+            return Ok((self.log.len() as u64, true));
+        };
+        if charged != producer {
+            return Err(refused(
+                ERR_RETIRE_REFUSED,
+                format!("{RETIRE_CHARGED_PREFIX}{target} is charged to producer {charged}"),
+            ));
+        }
+        if self.will_targets(target) {
+            return Err(refused(
+                ERR_RETIRE_REFUSED,
+                format!("{RETIRE_WILL_PREFIX}{target} is targeted by a will that can still append"),
+            ));
+        }
+        self.index.remove(target);
+        let off = self.append(Rec {
+            subject: astream_broker::RETIRE_SUBJECT.to_string(),
+            body: body.to_vec(),
+            key: None,
+            kind: Kind::Retire,
+            escalated: false,
+            principal: self.principal(producer).map(str::to_string),
+        });
+        Ok((off, false))
+    }
+
+    /// Will `i`'s connection ended: it fires, unless a later will on that
+    /// connection replaced it or it fired already.
     fn fire(&mut self, i: usize) {
+        if self
+            .wills
+            .get(i)
+            .is_some_and(|w| !w.replaced && w.fired_at.is_none())
+        {
+            self.fire_will(i);
+        }
+    }
+
+    /// FIRE will `i` (astream's `stage_will_fire`): FENCED — nothing appended —
+    /// when a record of its producer outranks it; otherwise an ordinary
+    /// publish under its key, so one already said dedups, exempt from the
+    /// subject budget.
+    fn fire_will(&mut self, i: usize) {
         let Some(w) = self.wills.get(i).cloned() else {
             return;
         };
-        if w.replaced || w.fired_at.is_some() {
-            return;
-        }
-        let fenced = self.max_seq.get(&w.producer).is_some_and(|m| *m > w.seq);
+        let fenced =
+            self.max_seq.get(&w.producer).is_some_and(|&high_water| {
+                astream_broker::proto::will_is_fenced(high_water, w.seq)
+            }) && self.mutant != ArmMutant::NoWillFence;
         let at = if fenced {
             self.notes.push(format!("will seq={} fenced", w.seq));
             self.log.len() as u64
         } else {
-            match self.publish(w.producer, w.seq, &w.subject, &w.body) {
+            match self.publish_bounded(w.producer, w.seq, &w.subject, &w.body, false) {
                 Ok((off, deduped)) => {
                     self.notes.push(format!(
                         "will seq={} fired @{off}{}",
@@ -1071,13 +1386,24 @@ impl State {
         }
     }
 
+    /// Record `event` in the journal, in a world that keeps one.
+    fn note_event(&mut self, event: impl FnOnce() -> Event) {
+        if let Some(journal) = self.journal.as_mut() {
+            journal.push(event());
+        }
+    }
+
     /// Connection `conn` ended: its will fires (while the broker is up).
     fn end(&mut self, conn: u64) {
+        let was_open = self.conns.get(&conn).is_some_and(|c| c.open);
         if let Some(c) = self.conns.get_mut(&conn) {
             c.open = false;
         }
         if !self.up {
             return;
+        }
+        if was_open {
+            self.note_event(|| Event::End(conn));
         }
         let mine: Vec<usize> = self
             .wills
@@ -1135,11 +1461,8 @@ impl State {
                     }),
                     rules: self.table.rules(),
                 }),
-                lineage: if self.lineage.is_empty() {
-                    None
-                } else {
-                    astream_broker::Lineage::from_steps(&self.lineage)
-                },
+                // Every open log has a lineage, empty until its first move.
+                lineage: astream_broker::Lineage::from_steps(&self.lineage),
                 requests: Some(astream_broker::REQUEST_RETIRE),
                 health: None,
                 retention: None,
@@ -1150,6 +1473,14 @@ impl State {
     /// Answer one request on `conn`: the frames it writes back.
     fn handle(&mut self, conn: u64, req: Request) -> Vec<Response> {
         let head = self.log.len() as u64;
+        // A NAME PAST astream's BOUND is refused before anything parses it
+        // (`oversized_name`).
+        if let Some(msg) = oversized_name(&req) {
+            return vec![Response::Error {
+                code: astream_broker::proto::ERR_RECORD_REFUSED,
+                msg,
+            }];
+        }
         match req {
             Request::Hello => vec![self.hello()],
             Request::Attach { .. } | Request::IdleMarks | Request::Keepalive => {
@@ -1175,44 +1506,7 @@ impl State {
                 producer_seq,
                 subject,
                 body,
-            } => {
-                if producer_seq >= astream_broker::ACK_SEQ_BASE {
-                    return vec![Response::Error {
-                        code: astream_broker::proto::ERR_REFUSED,
-                        msg: "a will's sequence in the ack half".to_string(),
-                    }];
-                }
-                if let Some(refusal) = self.race_at_will(producer_id, producer_seq) {
-                    return refusal;
-                }
-                for w in &mut self.wills {
-                    if w.conn == Some(conn) {
-                        w.replaced = true;
-                    }
-                }
-                let i = self.wills.len();
-                let reg_off = self.append(Rec {
-                    subject: astream_broker::store::WILL_SUBJECT.to_string(),
-                    body: Vec::new(),
-                    key: None,
-                    kind: Kind::WillReg(i),
-                    escalated: false,
-                    principal: None,
-                });
-                self.wills.push(Will {
-                    producer: producer_id,
-                    seq: producer_seq,
-                    subject,
-                    body,
-                    reg_off,
-                    conn: Some(conn),
-                    fired_at: None,
-                    replaced: false,
-                });
-                self.notes
-                    .push(format!("will c{conn} seq={producer_seq} @{reg_off}"));
-                vec![self.mark(self.log.len() as u64, String::new())]
-            }
+            } => self.register(conn, producer_id, producer_seq, subject, body),
             Request::Commit { group, upto } => {
                 // A BATCH ROLLED BACK refuses the group commit in it too: the
                 // bridge's commit rides the pipeline beside its publishes
@@ -1241,7 +1535,7 @@ impl State {
                     principal: None,
                 });
                 let e = self.groups.entry(group.clone()).or_insert(upto);
-                *e = (*e).max(upto);
+                *e = astream_broker::proto::group_commit_monotone(*e, upto);
                 self.notes
                     .push(format!("commit {group} upto={upto} @{off}"));
                 vec![Response::PublishAck {
@@ -1256,34 +1550,40 @@ impl State {
                         msg: format!("bad filter {filter:?}"),
                     }];
                 };
+                // astream's page (`last_matching`): at most `max` rows after
+                // `after`, in subject order; a page that reached its max
+                // resumes after its last row, whether or not more follow; a
+                // head query (`max` 0) is a page of none with nothing to
+                // resume. Its per-round scan bound is invisible below
+                // `LAST_RESUME_ROUNDS` x `LAST_SCAN_MAX` index entries
+                // (module doc).
                 let max = max.min(astream_broker::broker::LAST_PAGE_MAX) as usize;
-                let rows: Vec<(String, u64)> = self
-                    .index
-                    .iter()
-                    .filter(|(subject, _)| subject.as_str() > after.as_str())
-                    .filter(|(subject, _)| filt.matches_str(subject))
-                    .map(|(subject, (off, _))| (subject.clone(), *off))
-                    .collect();
-                let more = rows.len() > max;
+                let mut out = Vec::new();
+                let mut resume = String::new();
+                if max > 0 {
+                    let rows = self
+                        .index
+                        .range::<str, _>((
+                            std::ops::Bound::Excluded(after.as_str()),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .filter(|(subject, _)| filt.matches_str(subject));
+                    for (subject, (off, _)) in rows {
+                        out.push(Response::Delivery {
+                            offset: *off,
+                            subject: subject.clone(),
+                            body: self.log[usize::try_from(*off).unwrap_or(0)].body.clone(),
+                        });
+                        if out.len() >= max {
+                            resume.clone_from(subject);
+                            break;
+                        }
+                    }
+                }
                 self.notes.push(format!(
                     "last c{conn} {filter} after={after:?}: {} rows",
-                    rows.len()
+                    out.len()
                 ));
-                let mut out: Vec<Response> = rows
-                    .iter()
-                    .take(max)
-                    .map(|(subject, off)| Response::Delivery {
-                        offset: *off,
-                        subject: subject.clone(),
-                        body: self.log[usize::try_from(*off).unwrap_or(0)].body.clone(),
-                    })
-                    .collect();
-                let resume = if more {
-                    rows.get(max.saturating_sub(1))
-                        .map_or_else(String::new, |(s, _)| s.clone())
-                } else {
-                    String::new()
-                };
                 out.push(self.mark(head, resume));
                 out
             }
@@ -1298,11 +1598,18 @@ impl State {
                         msg: format!("bad filter {filter:?}"),
                     }];
                 };
+                // astream's page (`fetch_from`): at most `max` records, from a
+                // scan of at most `FETCH_SCAN_MAX` records — a sparse filter's
+                // page may end with none, its cursor moved on — and a `Mark`
+                // that names the oldest offset the filter reaches: 0, on a log
+                // nothing ever compacted.
                 let mut out = Vec::new();
                 let mut next = from_offset;
                 if max > 0 {
+                    let scan = astream_broker::broker::FETCH_SCAN_MAX as u64;
+                    let limit = from_offset.saturating_add(scan).min(head);
                     let mut off = from_offset;
-                    while off < head {
+                    while off < limit {
                         next = off + 1;
                         let rec = &self.log[usize::try_from(off).unwrap_or(0)];
                         if !rec.hidden() && filt.matches_str(&rec.subject) {
@@ -1318,7 +1625,11 @@ impl State {
                         off = next;
                     }
                 }
-                out.push(self.mark(next, String::new()));
+                let mut mark = self.mark(next, String::new());
+                if let Response::Mark { oldest, .. } = &mut mark {
+                    *oldest = Some(0);
+                }
+                out.push(mark);
                 out
             }
             Request::Subscribe {
@@ -1329,23 +1640,96 @@ impl State {
                 let from = self.groups.get(&group).map_or(0, |upto| upto + 1);
                 self.subscribe(conn, from, &filter)
             }
-            Request::Budget { producer_id } => {
-                let subjects = self
-                    .index
-                    .values()
-                    .filter(|(_, charged)| *charged == producer_id)
-                    .count() as u64;
-                vec![Response::Budget {
-                    subjects,
-                    reserved: 0,
-                    max: astream_broker::store::MAX_SUBJECTS_PER_PRODUCER as u64,
-                }]
-            }
+            Request::Budget { producer_id } => vec![Response::Budget {
+                subjects: self.charged_to(producer_id) as u64,
+                reserved: self.reserved.get(&producer_id).map_or(0, |held| held.len()) as u64,
+                max: astream_broker::store::MAX_SUBJECTS_PER_PRODUCER as u64,
+            }],
             other => vec![Response::Error {
                 code: astream_broker::proto::ERR_REFUSED,
                 msg: format!("malformed request (not simulated): {other:?}"),
             }],
         }
+    }
+
+    /// REGISTER A WILL on `conn`, as astream's `serve_will` and the writer's
+    /// `stage_will_register` take one: a subject a publish could not take is
+    /// refused; so is a second producer's on a connection that holds one; so
+    /// is a sequence in the ack half, which no later record could fence; and
+    /// a subject new to the index past its producer's budget. Otherwise a
+    /// hidden record holds it, it replaces the connection's earlier will,
+    /// and its subject is reserved against the budget until it lands.
+    fn register(
+        &mut self,
+        conn: u64,
+        producer_id: u64,
+        producer_seq: u64,
+        subject: String,
+        body: Vec<u8>,
+    ) -> Vec<Response> {
+        use astream_broker::proto::{ERR_RECORD_REFUSED, ERR_SUBJECT_BOUND};
+        if let Some(refusal) = subject_error(&subject) {
+            return vec![*refusal];
+        }
+        let held = self
+            .wills
+            .iter()
+            .find(|w| w.conn == Some(conn) && !w.replaced)
+            .map(|w| w.producer);
+        if let Some(held) = held.filter(|&held| held != producer_id) {
+            return vec![Response::Error {
+                code: ERR_RECORD_REFUSED,
+                msg: format!(
+                    "this connection already holds a will for producer {held} (use another \
+                     connection for producer {producer_id})"
+                ),
+            }];
+        }
+        if producer_seq >= astream_broker::ACK_SEQ_BASE {
+            return vec![Response::Error {
+                code: ERR_RECORD_REFUSED,
+                msg: "will was not persisted: a will's sequence in the ack half".to_string(),
+            }];
+        }
+        if let Some(refusal) = self.race_at_will(producer_id, producer_seq) {
+            return refusal;
+        }
+        if self.past_the_budget(producer_id, &subject) {
+            return vec![Response::Error {
+                code: ERR_SUBJECT_BOUND,
+                msg: format!(
+                    "will was not persisted: producer {producer_id} holds its whole subject budget"
+                ),
+            }];
+        }
+        for w in &mut self.wills {
+            if w.conn == Some(conn) {
+                w.replaced = true;
+            }
+        }
+        let i = self.wills.len();
+        let reg_off = self.append(Rec {
+            subject: astream_broker::store::WILL_SUBJECT.to_string(),
+            body: Vec::new(),
+            key: None,
+            kind: Kind::WillReg(i),
+            escalated: false,
+            principal: None,
+        });
+        self.reserve(producer_id, subject.clone());
+        self.wills.push(Will {
+            producer: producer_id,
+            seq: producer_seq,
+            subject,
+            body,
+            reg_off,
+            conn: Some(conn),
+            fired_at: None,
+            replaced: false,
+        });
+        self.notes
+            .push(format!("will c{conn} seq={producer_seq} @{reg_off}"));
+        vec![self.mark(self.log.len() as u64, String::new())]
     }
 
     fn subscribe(&mut self, conn: u64, from: u64, filter: &str) -> Vec<Response> {
@@ -1362,6 +1746,46 @@ impl State {
         }
         Vec::new()
     }
+}
+
+/// Why a publish (or a will) may not name `subject`, as astream's
+/// `publish_subject_error` says: not a subject, or one of the broker's own.
+fn subject_error(subject: &str) -> Option<Box<Response>> {
+    if astream_wire::Subject::new(subject).is_err() {
+        Some(refused(
+            astream_broker::proto::ERR_BAD_SUBJECT,
+            format!("bad subject {subject:?}"),
+        ))
+    } else if astream_broker::store::is_hidden_subject(subject) {
+        Some(refused(
+            astream_broker::proto::ERR_RECORD_REFUSED,
+            format!("reserved subject {subject}"),
+        ))
+    } else {
+        None
+    }
+}
+
+/// A name in `req` past astream's bound (`MAX_NAME_LEN`), as its
+/// `oversized_name` refuses one before anything parses it.
+fn oversized_name(req: &Request) -> Option<String> {
+    let names: Vec<(&str, &str)> = match req {
+        Request::Publish { subject, .. } | Request::Will { subject, .. } => {
+            vec![("subject", subject)]
+        }
+        Request::Subscribe { filter, .. } | Request::Fetch { filter, .. } => {
+            vec![("filter", filter)]
+        }
+        Request::Commit { group, .. } => vec![("group", group)],
+        Request::SubscribeGroup { group, filter } => vec![("group", group), ("filter", filter)],
+        Request::Attach { grant, .. } => vec![("grant", grant)],
+        Request::Last { filter, after, .. } => vec![("filter", filter), ("cursor", after)],
+        _ => Vec::new(),
+    };
+    names
+        .into_iter()
+        .find(|(_, name)| name.len() > astream_broker::broker::MAX_NAME_LEN)
+        .map(|(what, name)| format!("{what} too long: {} bytes", name.len()))
 }
 
 /// A refusal, as the broker answers one.
@@ -1381,6 +1805,20 @@ fn put(out: &mut VecDeque<u8>, resp: &Response) {
 /// the model, and its closer. Refused while the broker is down, as a socket
 /// nobody listens on is.
 pub(crate) fn dial(p: &Arc<Process>) -> io::Result<(Conn, BusCloser)> {
+    let stream = dial_stream(p)?;
+    let conn = stream.conn;
+    Ok((
+        Conn::from_stream(Box::new(stream)),
+        BusCloser::Sim(SimCloser {
+            conn,
+            process: Arc::clone(p),
+        }),
+    ))
+}
+
+/// [`dial`]'s connection as the raw byte stream astream's client would wrap:
+/// what the differential test (`super::conform_broker`) writes frames to.
+pub(crate) fn dial_stream(p: &Arc<Process>) -> io::Result<SimStream> {
     let conn = {
         let mut s = lock(&p.core.broker.state);
         if !s.up {
@@ -1402,20 +1840,14 @@ pub(crate) fn dial(p: &Arc<Process>) -> io::Result<(Conn, BusCloser)> {
                 sub: None,
             },
         );
+        s.note_event(|| Event::Dial(id));
         id
     };
     p.core.note(format!("dial pid={} conn={conn}", p.pid));
-    let stream = SimStream {
+    Ok(SimStream {
         conn,
         process: Arc::clone(p),
-    };
-    Ok((
-        Conn::from_stream(Box::new(stream)),
-        BusCloser::Sim(SimCloser {
-            conn,
-            process: Arc::clone(p),
-        }),
-    ))
+    })
 }
 
 /// One connection's stream, as astream's client reads and writes it.
@@ -1446,6 +1878,7 @@ impl Read for SimStream {
                         s.seen_before_ack += 1;
                     }
                     let rec = s.log[usize::try_from(off).unwrap_or(0)].clone();
+                    s.note_event(|| Event::Deliver(self.conn));
                     if let Some(c) = s.conns.get_mut(&self.conn) {
                         c.sub = Some((off + 1, filter));
                         put(
@@ -1561,14 +1994,27 @@ impl std::io::Write for SimStream {
             let req = decode_request(&payload);
             {
                 let mut s = lock(&self.process.core.broker.state);
+                let subscribing = matches!(
+                    req,
+                    Some(Request::Subscribe { .. } | Request::SubscribeGroup { .. })
+                );
                 let responses = match req {
-                    Some(req) => s.handle(self.conn, req),
+                    Some(req) => {
+                        s.note_event(|| Event::Request(self.conn, req.clone()));
+                        s.handle(self.conn, req)
+                    }
                     None => vec![Response::Error {
                         code: astream_broker::proto::ERR_REFUSED,
                         msg: "malformed request".to_string(),
                     }],
                 };
                 s.answer(self.conn, &responses);
+                // A REFUSED SUBSCRIBE ENDS ITS CONNECTION, as astream's does
+                // once the refusal is written: the answer is still read, then
+                // the end; its will fires.
+                if subscribing && !responses.is_empty() {
+                    s.end(self.conn);
+                }
             }
             // A kill AFTER: served and answered, the answer never read.
             self.process.step("bus-after");

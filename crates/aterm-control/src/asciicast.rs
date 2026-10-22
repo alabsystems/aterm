@@ -148,9 +148,7 @@ impl Asciicast {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The writer
-// ---------------------------------------------------------------------------
 
 /// `aterm_truncated`'s note.
 const TRUNCATED_NOTE: &str = "drop-oldest evicted the head; leading ANSI state incomplete; \
@@ -261,9 +259,7 @@ fn escape_bytes_into(out: &mut String, bytes: &[u8]) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The reader
-// ---------------------------------------------------------------------------
 
 /// Parse the text `cast` answers (and `asciinema rec` writes): a JSON header
 /// object on the first non-blank line, then one `[t, "<kind>", "<data>"]` array

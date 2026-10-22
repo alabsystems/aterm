@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The index PLAN over typed data: numbering, downgrades, omissions, yanks, `min_build`,
+//! The index plan over typed data: numbering, downgrades, omissions, yanks, `min_build`,
 //! per-target overlays carried / retired / duplicated, vendor-direct programs and metadata.
 
 use std::collections::BTreeMap;

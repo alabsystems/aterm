@@ -175,10 +175,10 @@
 //!   dialog's: it goes with the dialog, at the worker's next busy read or at
 //!   a look that reads the worker at its composer with no dialog up, so the
 //!   same question asked again in a new dialog is written afresh
-//!   (ATERM-KI-1015-1 F4); a frame that reads neither keeps it. One read
+//!   (F4); a frame that reads neither keeps it. One read
 //!   tells a new dialog with no read between: the question the loop's own
 //!   Enter answered by its text, its field pristine again with no person's
-//!   key since the text ([`Session::asked_again`], ATERM-KI-1016-1).
+//!   key since the text ([`Session::asked_again`]).
 //! * **The exact read-back.** After the one `send` the field must read the
 //!   text back byte for byte on the reader's one-space join (ticked, on a
 //!   multi-select) before the press returns [`Press::Typed`]; the Enter is a
@@ -358,10 +358,9 @@ pub(super) struct QuestionMemory {
     /// policy text: on the text itself, or on the multi-select's button
     /// after it ([`Session::asked_again`]).
     pub(super) entered: std::collections::BTreeSet<String>,
-    /// The latch: the answering word ([`Self::deciding`]) at the loop's first
-    /// key or text on this dialog. A dialog whose effective word differs
-    /// later is handed over; before the first key a new word simply applies.
-    /// This loop's memory only: a restarted supervisor begins with none.
+    /// The latch: the answering word ([`Self::deciding`]) at the loop's first key or text on
+    /// this dialog. A dialog whose word differs later is handed over; before the first key a
+    /// new word simply applies. A restarted supervisor begins with none.
     pub(super) mode: Option<QuestionPriority>,
     /// The answering word of the decision in hand (`decide_box`): what the
     /// press latches ([`Self::mode`]) at its first write.
@@ -1053,12 +1052,9 @@ impl<C: Ctl> Session<'_, C> {
         self.person = field("human_ms")
             .and_then(|ms| ms.parse::<u64>().ok())
             .and_then(|ms| self.fx.mono().checked_sub(Duration::from_millis(ms)));
-        // Another driver's hand on the session (a drive lease or a turn a
-        // named driver typed: `hand=lease:<holder>`, `hand=turn:<id>:<holder>`)
-        // holds the loop as a person's keystroke does, so the loop never
-        // fights a manager driving the worker. An owner-class turn names
-        // nobody: this loop's own continuations are typed so.
-        // (A halt is the server's to refuse: `ERR halted` parks the loop.)
+        // Another driver's hand (`hand=lease:<holder>`, `hand=turn:<id>:<holder>`) holds the
+        // loop as a person's keystroke does. An owner-class turn names nobody: this loop's own
+        // continuations are typed so.
         self.driver = crate::harness::relaunch::driver_hand(&r.stdout);
         if self.driver {
             self.person = Some(self.fx.mono());
@@ -1245,8 +1241,9 @@ impl<C: Ctl> Session<'_, C> {
     /// `breaker-read-only` waits for that, and a box that stays goes to a
     /// person: [`Self::box_left`]) or a new mount begins, so it answers no
     /// later box drawn alike. `None`: no host reads a transcript. The policy
-    /// judges the command only where it draws as the box's rows
-    /// ([`box_command::drawn_as`]), so nothing here is a proof by itself.
+    /// adds the command to the screen's readings only where it draws as the
+    /// box's rows and its call's row ([`box_command::drawn_as`]) and removes
+    /// none, so nothing here is a proof by itself.
     fn box_command(&mut self, opts: &SuperviseOpts) -> Option<Result<BoxCommand, String>> {
         let host = opts.idle_host.as_deref()?;
         let Some(tail) = host.transcript_tail() else {
@@ -1549,8 +1546,7 @@ impl<C: Ctl> Session<'_, C> {
             };
             said_by_session = policy.session_reason();
             if let Some(word) = policy.answer {
-                // How it is answered: the word, and what the loop remembers
-                // writing into this question's free-text row.
+                // The word, and what the loop remembers writing into this question's field.
                 question.priority = word;
                 self.question.deciding = Some(word);
                 let this = prompt
@@ -1579,9 +1575,8 @@ impl<C: Ctl> Session<'_, C> {
                 question.fell_back = key
                     .as_ref()
                     .is_some_and(|k| self.question.fell_back.contains(k));
-                // The latch: the word at the loop's first key on this dialog
-                // is the dialog's; a word changed since is a person's call
-                // (decision 13).
+                // The latch: the word at the loop's first key is the dialog's; a word changed
+                // since is a person's call.
                 if let Some(latched) = self.question.mode.filter(|m| *m != word) {
                     return Ok(Decision::Escalate {
                         reason: format!(
@@ -1639,7 +1634,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         // The rm breaker's too-many box over barred rows, which the screen's
         // readings alone do not prove a read: its command as the transcript
-        // holds it ([`Self::box_command`]), for the policy to judge where it
+        // holds it ([`Self::box_command`]), for the policy to add where it
         // draws as the box ([`box_command::drawn_as`]), read only where
         // [`box_command::wanted`] says so.
         if let Some(p) = reading.prompt.as_ref()
@@ -1664,11 +1659,9 @@ impl<C: Ctl> Session<'_, C> {
         // ([`Self::auto_read`]): the context is these facts' alone, so a
         // diagnostic reader can decide again from the recorded facts.
         self.decided_on = Some(facts);
-        // The grant row's rule: the decision this read gets without it, kept
-        // for a reset passed over before its first key. Under `none` a
-        // dialog read for its grant row alone, and not decided by the row's
-        // rule (its head off the screen, no option focused), is the owner's
-        // by the words of a loop with the key off.
+        // The decision this read gets without the grant row's rule, kept for a reset passed
+        // over before its first key. Under `none` a dialog read only for its grant row and not
+        // decided by that rule is the owner's.
         let owners_box = opts.policy.approve == Approve::None && !own_rule(false);
         if matches!(&decision, Decision::Approve { rule_id, .. } if *rule_id == RULE_LIMIT_RESET) {
             self.reset_fallback = Some(if owners_box {
@@ -1795,7 +1788,7 @@ impl<C: Ctl> Session<'_, C> {
 
     /// Whether `p` is a question the loop answered by its own policy text,
     /// asked again in a new dialog that no read told apart from the first
-    /// (ATERM-KI-1016-1): no busy read and no composer came between them, so
+    /// : no busy read and no composer came between them, so
     /// the first dialog's memory still stands ([`Self::question_done`] was
     /// not called). It is when the loop's own Enter answered that question
     /// ([`QuestionMemory::entered`]), its free-text row reads pristine again,
@@ -1940,7 +1933,7 @@ impl<C: Ctl> Session<'_, C> {
         // closes them in the ledger (`approvals::open_left`): the accounts
         // probe's `/usage` asks the model nothing, and a wall's retry under
         // a person's exchange at the wall delivers it again
-        // ([`approvals::left_after_typed`], ATERM-KI-1016-1).
+        // ([`approvals::left_after_typed`]).
         if outcome == approvals::Outcome::Typed {
             self.left_keys = std::mem::take(&mut self.left_keys)
                 .iter()
@@ -2341,8 +2334,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(Step::Review(turn));
         };
         let seq = turn.screen.seq;
-        // Too young to judge: waited on, bounded by what is left of the
-        // settle, and read again.
+        // Too young to judge: wait out the rest of the settle and read again.
         if let Some(wait) = self.box_young(&turn, p.kind) {
             self.wait(&["seq", &seq.to_string()], wait)?;
             return Ok(Step::Again { settle: false });
@@ -2380,9 +2372,7 @@ impl<C: Ctl> Session<'_, C> {
             |_| format!("{decision:?}"),
             self.decided_on.as_ref(),
         );
-        // The `status` that named the program says the worker is not reading
-        // its input: this box is neither pressed nor escalated; the next look
-        // holds (`stall.rs`).
+        // The worker is not reading its input (`stall.rs`): neither pressed nor escalated.
         if self.stall_in_hand(review) {
             return Ok(Step::Again { settle: false });
         }
@@ -2447,13 +2437,10 @@ impl<C: Ctl> Session<'_, C> {
         self.auto_act(turn, p, decision, opts, approved, deadline, review)
     }
 
-    /// What [`Self::auto_read`] does with the box `p` on `turn` once it is
-    /// decided, the stall check and the person's hold behind it: escalate
-    /// it, or press its answer and see the press through. Its own function
-    /// so that the usage-limit dialog's reset, passed over before its first
-    /// key ([`Self::reset_take`]), is answered by the decision made without
-    /// the reset's rule ([`Session::reset_fallback`]) through this same
-    /// path, on the same read.
+    /// What [`Self::auto_read`] does with the decided box `p`: escalate it, or press its answer
+    /// and see the press through. Separate so a reset passed over before its first key
+    /// ([`Self::reset_take`]) is answered by [`Session::reset_fallback`] through the same path,
+    /// on the same read.
     #[allow(clippy::too_many_arguments)]
     fn auto_act(
         &mut self,
@@ -2471,9 +2458,8 @@ impl<C: Ctl> Session<'_, C> {
                 self.ledger_row("-", approvals::Outcome::Escalated, &p.command, &reason, seq);
                 if p.kind == PromptKind::Question {
                     note_dialog(review, seq, "-", &turn.screen.rows);
-                    // Handed to a person for a reason of its own, not the
-                    // policy holding it (`question_held`), which a hand-back
-                    // lifts: answered then, the answer is still the policy's.
+                    // Handed over for its own reason, not held by the policy
+                    // (`question_held`): a hand-back would still answer the latter as the policy's.
                     if !self.question_held {
                         self.question.theirs = true;
                     }
@@ -2497,9 +2483,8 @@ impl<C: Ctl> Session<'_, C> {
         };
         // What the lines name (module header): the decision's subject.
         let what = shown_subject(&subject, &p.command);
-        // A question's answer: its dialog read again from the same rows (the
-        // key's bookkeeping needs it), and the waits the pure decision cannot
-        // know (module docs, "A question dialog").
+        // A question's answer: its dialog read again from the same rows, and the waits the
+        // pure decision cannot know (module docs, "A question dialog").
         let (question, toggle) = match &act {
             Act::Approve {
                 choice: Choice::Answer(answer),
@@ -2740,11 +2725,9 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(Step::Again { settle: false });
             }
             Pressing::Lost { why } => {
-                // The grant row's Enter with no answer: it may have taken
-                // the row, so what it opens is owed its end — and never
-                // entered ([`Self::reset_row_lost`]). Lost at an arrow, no
-                // row was taken: the claim stays in hand, and the dialog is
-                // decided again after the reconnect.
+                // The grant row's Enter with no answer may have taken the row: what it opens is
+                // owed its end ([`Self::reset_row_lost`]). Lost at an arrow, no row was taken
+                // and the dialog is decided again after the reconnect.
                 if reset && self.focus_key_tried {
                     self.reset_row_lost(&what, seq);
                 }
@@ -3371,8 +3354,8 @@ impl<C: Ctl> Session<'_, C> {
     /// ([`Self::limit_retry_until`]) — so the turn-end policy waits it out as
     /// it waits out any limit whose notice left the screen and types its
     /// resume there, a try of the episode — never into the quota, and
-    /// never handed over for good: a Stop is no Off (FOREVER LAND, the
-    /// owner's ruling of 2026-10-19), as Esc on Claude Code's countdown is
+    /// never handed over for good: a Stop is no Off (Autopilot Land, the
+    /// owner's ), as Esc on Claude Code's countdown is
     /// none. Measured before (`lab forever --harness gemini --mode
     /// wall-hid`, 2026-10-21): the error escalated as `not retried … after its
     /// usage limit's Stop`, the badge up, nothing typed past the reset, the
@@ -4054,7 +4037,7 @@ mod act_tests {
         ),
         ("decline@v1", Outcome::Declined, "rm -rf /"),
         (RULE_LOGIN, Outcome::Typed, "/login"),
-        ("read-only@classify-v4", Outcome::Skipped, "ls"),
+        ("read-only@classify-v5", Outcome::Skipped, "ls"),
         ("-", Outcome::Escalated, ""),
         ("wall-wait@v1", Outcome::Waiting, ""),
     ];

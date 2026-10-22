@@ -5,15 +5,11 @@
 //! command line against a real broker, a real headless `aterm` and the real
 //! bridge it launches, every one of them in a scratch world of its own.
 //!
-//! SEALED OFF FROM THE MACHINE: its own `$HOME` (so the default root, the
-//! LaunchAgents dir and the config path all land in scratch), its own
-//! `$XDG_CONFIG_HOME` and `$XDG_RUNTIME_DIR` (so no live instance is dialed and
-//! the rendezvous file is scratch), its own `$ATERM_FABRIC_HOME` (so the derived
-//! launchd label can never be the live one — `enable::Paths::label`), and
-//! `--service none` everywhere except the one test that drives a FAKE
-//! `launchctl` on `$PATH`. No test here can reach the real launchd, the real
-//! broker, or a real session. Full-App fixtures explicitly opt out of reroute,
-//! automatic primer installation, updates, and machine-setting writes; scratch
+//! Sealed off from the machine: its own `$HOME` (default root, LaunchAgents dir and config
+//! path land in scratch), `$XDG_CONFIG_HOME` and `$XDG_RUNTIME_DIR` (no live instance is
+//! dialed), `$ATERM_FABRIC_HOME` (the derived launchd label, `enable::Paths::label`, is
+//! never the live one), and `--service none` everywhere except the test that drives a fake
+//! `launchctl` on `$PATH`. Instances run the harness's fixture config, since a scratch
 //! HOME alone does not isolate macOS preferences.
 #![allow(
     clippy::disallowed_types,
@@ -29,7 +25,7 @@ use std::process::{Child, Command, Output, Stdio};
 use aterm_link::ctl::Ctl;
 use aterm_link::fabric::kv;
 
-/// The scratch world. Short, under `/tmp`: the broker's socket path has to fit
+/// The scratch world, short and under `/tmp`: the broker's socket path has to fit
 /// `sun_path`, and a per-user `$TMPDIR` does not.
 struct Scratch {
     dir: PathBuf,
@@ -140,7 +136,8 @@ fn write_secret(s: &Scratch, bytes: &[u8], mode: u32) {
 /// GUARDED bus `on` deploys under launchd, started here instead; killed on
 /// drop. A root with no secret yet gets one first (32 bytes, 0600), which
 /// `on` then keeps: the broker cannot be guarded by a secret that does not
-/// exist.
+/// exist. The root is made 0700 first, as `on` leaves it: a mint secret is read
+/// only from a directory nobody else can reach.
 struct Broker {
     child: Child,
 }
@@ -154,12 +151,13 @@ impl Broker {
     /// `--durability`, as the manual's by-hand step 1 adds it).
     fn spawn_with(s: &Scratch, extra: &[&str]) -> Self {
         use aterm_uds::spawnfd::InheritNothing as _;
+        chmod(&s.root(), 0o700);
         let secret = s.root().join("mint.secret");
         if !secret.exists() {
             write_secret(s, &[0x6b; 32], 0o600);
         }
-        // std's, for `harness::first_line_within`, with the strip: the broker
-        // holds its stdio and nothing else of this process while it serves.
+        // std's `Command` for `harness::first_line_within`, stripped: the broker holds its
+        // stdio and nothing else of this process.
         let mut child = Command::new(harness::aterm_to_launch())
             .inherit_nothing()
             .args([
@@ -189,12 +187,10 @@ impl Drop for Broker {
     }
 }
 
-/// The caps `on` minted, checked by the broker `on` DEPLOYS — the one on the
-/// root's socket, guarded by the root's secret: every grant attaches (the tags
-/// are real HMACs over that secret) and a `Last` walk under the ring answers,
-/// while a cap minted under another secret AND a halt published with no cap
-/// at all are refused — so the check tells a guarded broker from one that
-/// checks nothing (revert the guard in `broker_argv` and the halt lands).
+/// The caps `on` minted, checked against the broker it deploys (the root's socket, guarded
+/// by the root's secret): every grant attaches and a `Last` walk under the ring answers,
+/// while a cap minted under another secret and a halt published with no cap are refused,
+/// which tells a guarded broker from one that checks nothing.
 fn deployed_broker_checks_the_minted_caps(s: &Scratch, node: &str) {
     let caps = aterm_link::bridge::read_cap_file(&s.path("root/node.cap")).expect("cap file");
     assert_eq!(caps.len(), 8);
@@ -229,7 +225,7 @@ fn deployed_broker_checks_the_minted_caps(s: &Scratch, node: &str) {
     );
 }
 
-/// A headless aterm with NO fabric command — the instance `on` has to arm.
+/// A headless aterm with no fabric command: the instance `on` has to arm.
 struct Gui {
     child: Child,
     ctl_sock: String,
@@ -293,8 +289,7 @@ impl Drop for Gui {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // The bridge aterm launched: its supervisor is gone with the gui, but
-        // the child sees its fds close a moment later — kill it so no test
+        // The bridge sees its fds close a moment after the gui dies: kill it so no test
         // leaves a `serve` behind.
         if let Some(pid) = std::fs::read_to_string(self.state.join("pid"))
             .ok()
@@ -305,9 +300,8 @@ impl Drop for Gui {
     }
 }
 
-/// The step lines named `<name>`, e.g. `node       already   n-…` — from the
-/// STEPS block only: the `aterm fabric` status that follows a real run has a
-/// `node` row of its own.
+/// The step lines named `<name>` (e.g. `node already n-…`), from the STEPS block
+/// only: the status report that follows a real run has a `node` row of its own.
 fn step<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
     let steps = out
         .find("\naterm fabric — fleet")
@@ -446,13 +440,12 @@ fn on_with_an_aterm_path_holding_a_space_runs_it_through_a_link() {
     }
 }
 
-/// **THE WHOLE THING, END TO END, TWICE.** A headless aterm with no fabric
-/// command and no broker: the first `on` provisions the root, the node id, the
-/// secret and the cap, then FAILS at the broker — `--service none` starts none
-/// — naming the GUARDED broker to run. With that broker up, `on` writes the
-/// config and the rendezvous file, ARMS the instance, and PROVES the round
-/// trip; a second `on` changes nothing and says so; the read-side verbs then
-/// need no flags; `off` removes what changes behaviour and keeps the identity.
+/// End to end, twice. With no fabric command and no broker, the first `on` provisions the
+/// root, node id, secret and cap, then fails at the broker (`--service none` starts none),
+/// naming the guarded broker to run. With that broker up, `on` writes the config and the
+/// rendezvous file, arms the instance and proves the round trip; a second `on` changes
+/// nothing and says so; the read-side verbs then need no flags; `off` removes what changes
+/// behaviour and keeps the identity.
 #[test]
 fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     let bin = harness::aterm();
@@ -466,7 +459,7 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         status.header()
     );
 
-    // ---- `on` with no broker: identity provisioned, the broker named
+    // `on` with no broker: identity provisioned, the broker named.
     let (code, out, err) = s.fabric(&["on", "--service", "none"]);
     assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
     for (name, verdict) in [
@@ -505,7 +498,7 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         "the broker is guarded by the secret `on` minted"
     );
 
-    // ---- `on` with the broker up
+    // `on` with the broker up.
     let (code, out, err) = s.fabric(&["on", "--service", "none"]);
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     assert!(err.is_empty(), "nothing on stderr: {err}");
@@ -533,9 +526,8 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         step(&out, "broker").iter().all(|l| !l.contains("WARNING")),
         "a guarded broker is no warning:\n{out}"
     );
-    // The node id was provisioned into the state dir, and the cap minted FOR IT
-    // with the root's secret — which the deployed broker verified when the
-    // bridge attached (the proof could not have landed otherwise).
+    // The node id is in the state dir and the cap was minted for it with the root's secret,
+    // which the deployed broker verified when the bridge attached.
     let node = std::fs::read_to_string(s.root().join("link-state/node")).expect("node");
     let node = node.trim().to_string();
     assert!(node.starts_with("n-") && node.len() == 18, "{node}");
@@ -551,8 +543,7 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     assert_eq!(mode_of(&s.root().join("node.cap")), 0o600);
     assert_eq!(mode_of(&s.root()), 0o700);
     deployed_broker_checks_the_minted_caps(&s, &node);
-    // The config carries the bridge command, in the shim's spelling, with
-    // --accept-from.
+    // The config carries the bridge command in the shim's spelling, with --accept-from.
     let config = std::fs::read_to_string(s.config()).expect("config");
     let command = aterm_link::fabric::command_in_toml(&config)
         .expect("valid TOML")
@@ -579,7 +570,7 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     assert_eq!(r.cap_file, s.path("root/node.cap"));
     assert_eq!(r.state, s.path("root/link-state"));
     assert_eq!(r.command, command);
-    // The instance is ARMED with exactly that command, and connected.
+    // The instance is armed with exactly that command, and connected.
     let status = gui.verb("fabric status");
     let h = status.header();
     assert_eq!(kv(h, "supervised"), Some("1"), "{h}");
@@ -600,7 +591,7 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     assert_eq!(notes.len(), 1, "{:#?}", inbox.rows());
     assert!(kv(notes[0], "off").is_some_and(|o| o.parse::<u64>().is_ok()));
 
-    // ---- the second `on`: idempotent, says so, proves again
+    // The second `on`: idempotent, says so, proves again.
     let before = std::fs::read(s.config()).expect("config bytes");
     let rendezvous_before = std::fs::read(s.rendezvous()).expect("fabric.toml bytes");
     let (code, out2, err) = s.fabric(&["on", "--service", "none"]);
@@ -643,7 +634,7 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         "the cap was re-minted"
     );
 
-    // ---- the read-side verbs need no flags now
+    // The read-side verbs need no flags now.
     let (code, ls, err) = s.link(&["ls"]);
     assert_eq!(code, 0, "{ls}\n{err}");
     assert!(
@@ -655,8 +646,7 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         ls.lines().any(|l| l.contains(&format!(" {sid} "))),
         "and the session's presence row:\n{ls}"
     );
-    // The rendezvous file supplying flags is carried by the `ls` assertions above.
-    // A flag on the command line still wins: a wrong broker is a wrong broker.
+    // A flag on the command line still beats the rendezvous file.
     let (code, _, err) = s.link(&["ls", "--broker", "/tmp/atfo-nowhere.sock"]);
     assert_ne!(code, 0, "{err}");
     // `aterm fabric` (status) without [fabric] reads the rendezvous file.
@@ -671,7 +661,7 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         "exit {code}:\n{status}"
     );
 
-    // ---- off
+    // `off`, dry then real.
     let (code, out, err) = s.fabric(&["off", "--service", "none", "--dry-run"]);
     assert_eq!(code, 0, "{out}\n{err}");
     assert!(s.rendezvous().exists(), "a dry run removes nothing");
@@ -681,8 +671,8 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     for kept in ["link-state/node", "mint.secret", "node.cap"] {
         assert!(s.root().join(kept).exists(), "off keeps {kept}");
     }
-    // `off` on a config that HAS the table: the table goes, the rest stays, a
-    // .bak holds the previous file.
+    // `off` on a config with the table: the table goes, the rest stays, a .bak holds the
+    // previous file.
     std::fs::write(
         s.config(),
         format!(
@@ -712,9 +702,8 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     drop(broker);
 }
 
-/// **`--dry-run` PRINTS EVERY STEP AND TOUCHES NOTHING**: on a bare world with
-/// no broker, every step is `would`, and afterwards there is no root, no
-/// config, no rendezvous file.
+/// `--dry-run` on a bare world with no broker prints every step as `would` and leaves no
+/// root, config or rendezvous file.
 #[test]
 fn dry_run_names_every_step_and_creates_nothing() {
     let s = Scratch::new("dry");
@@ -744,18 +733,15 @@ fn dry_run_names_every_step_and_creates_nothing() {
     );
 }
 
-/// **A REJECTED MINT PUBLISHES NOTHING AND SUPERVISES NOTHING** — the shell
-/// fixture's containment check, on the Rust command, with its effect trace run
-/// through `aterm-spec`'s capability-publication model (Tier-1 of
-/// `fabric_capability_publication_model`, eight grants).
+/// A rejected mint publishes nothing and supervises nothing; the effect trace runs through
+/// `fabric_capability_publication_model` with eight grants.
 ///
-/// A refusal at grant 1, 3 and 8, over an absent cap, a STALE one (a cap for
-/// another node id) and a FOREIGN one (this node's ring under another secret,
-/// which the guarded broker refuses): the previous cap is byte-identical or still
-/// absent, no staging file is left, the config and the rendezvous file are not
-/// written, exit 1. A short secret is refused before any mint and never
-/// replaced. A cap already minted for this node is reused without a mint. And
-/// the good case: eight `Mint`s, one `Publish`, then `Supervise`.
+/// A refusal at grant 1, 3 and 8, over an absent cap, a stale one (another node id's) and a
+/// foreign one (this node's ring under another secret): the previous cap is byte-identical
+/// or still absent, no staging file is left, neither config nor rendezvous file is written,
+/// exit 1. A short or world-readable secret is refused before any mint and never replaced.
+/// The good case is eight `Mint`s, one `Publish`, then `Supervise`, and a cap already
+/// minted for this node is reused without a mint.
 #[test]
 fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
     let mut model = aterm_models_session::fabric_capability_publication_model();
@@ -772,9 +758,8 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         )
         .expect("stale cap");
     };
-    // THIS node's whole ring, minted under ANOTHER secret than the root's — a
-    // secret moved aside and minted afresh, or a ring another host minted:
-    // the guarded broker would refuse every grant, so `on` re-mints it.
+    // This node's whole ring minted under another secret (a secret moved aside, or a ring
+    // another host minted): the guarded broker would refuse every grant, so `on` re-mints.
     let foreign = |s: &Scratch, node: &str| {
         let lines: String = aterm_link::enable::node_grants("local", node)
             .iter()
@@ -817,7 +802,7 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
             .map(str::to_string)
             .collect()
     };
-    // Run the trace through the model; answers (rejected by the model, state).
+    // Run the trace through the model, answering the final state.
     let check = |trace: &[String]| {
         let mut state = model.init_state();
         for event in trace {
@@ -875,10 +860,9 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         }
     }
 
-    // A short secret, and a full-length one other users can read: each
-    // refused at the secret step, before the first mint, and never replaced
-    // or chmodded behind the operator's back (a secret that sat readable may
-    // have been read).
+    // A short secret, and a full-length one other users can read: each refused at the
+    // secret step, before the first mint, and never replaced or chmodded (a secret that sat
+    // readable may have been read).
     for (tag, bytes, mode) in [
         ("short", b"short\n".to_vec(), 0o600),
         ("wide", vec![9u8; 32], 0o644),
@@ -909,17 +893,13 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         assert!(trace_of(&s).is_empty(), "{:?}", trace_of(&s));
     }
 
-    // The good case, over an absent cap, a stale one and this node's ring
-    // minted under another secret: eight mints, one publish, then supervision
-    // — with a real broker answering, and no instance to arm, exit 0 and the
+    // The good case over an absent, a stale and a foreign cap: eight mints, one publish,
+    // then supervision; with a broker answering and no instance to arm, exit 0 and the
     // proof skipped by name.
     for existing in ["absent", "stale", "foreign"] {
         let s = Scratch::new(&format!("mint-good-{existing}"));
         let node = node_of(&s);
         seed_secret(&s);
-        for d in [s.root(), s.root().join("link-state")] {
-            chmod(&d, 0o755);
-        }
         if existing == "stale" {
             stale(&s, "n-previous");
         }
@@ -928,6 +908,11 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         }
         let secret_before = secret_bytes(&s);
         let broker = Broker::spawn(&s);
+        // Widened once the broker holds its secret (a restore, a `cp -r`): `on`
+        // narrows both before it reads the secret again.
+        for d in [s.root(), s.root().join("link-state")] {
+            chmod(&d, 0o755);
+        }
         let (code, out, err) = run(s
             .fabric_cmd(&["on", "--service", "none"])
             .env("ATERM_FABRIC_TRACE", s.path("effects.trace")));
@@ -999,10 +984,9 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     let s = Scratch::new("launchd");
     let calls = s.path("launchctl.calls");
     let pidfile = s.path("launchd.pid");
-    // Every path is the scratch dir's, read off `$0` (`<dir>/bin/launchctl`), so
-    // the body is the same on every run and `stand_in` hands back an inode the
-    // system has already assessed: a fresh script's first exec can stall for
-    // over a minute on a loaded Mac.
+    // Every path is read off `$0` (`<dir>/bin/launchctl`), so the body is the same on every
+    // run and `stand_in` hands back an inode the system has already assessed: a fresh
+    // script's first exec can stall for over a minute on a loaded Mac.
     aterm_tempfile::stand_in(
         &s.dir.join("bin/launchctl"),
         &format!(
@@ -1034,8 +1018,7 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     )
     .expect("fake launchctl");
     let path = format!("{}:/usr/bin:/bin", s.path("bin"));
-    // Whatever happens below, the broker the fake launchd started dies with
-    // the test.
+    // Whatever happens below, the broker the fake launchd started dies with the test.
     struct Reap(String);
     impl Drop for Reap {
         fn drop(&mut self) {
@@ -1059,7 +1042,7 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         .trim()
         .to_string();
 
-    // ---- an UNMANAGED broker answers on the socket: refused, not bootstrapped over
+    // An unmanaged broker answers on the socket: refused, not bootstrapped over.
     let unmanaged = Broker::spawn(&s);
     let unmanaged_pid = unmanaged.child.id();
     let (code, out, err) = run(s
@@ -1236,7 +1219,7 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     std::fs::remove_file(&no_gui).expect("no-gui");
     let _ = std::fs::remove_file(&calls);
 
-    // ---- the install: bootstrap starts the broker, and `on` reads its pid
+    // The install: bootstrap starts the broker, and `on` reads its pid.
     let (code, out, err) = run(s
         .fabric_cmd(&["on", "--service", "launchd"])
         .env("PATH", &path));
@@ -1251,8 +1234,8 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         text.contains(&format!("<key>Label</key><string>{label}</string>")),
         "{text}"
     );
-    // The broker's words, one <string> each — no shell, no quoting — and
-    // GUARDED by the root's secret.
+    // The broker's argv, one <string> each (no shell, no quoting), guarded by the root's
+    // secret.
     assert!(
         text.contains(&format!(
             "<string>{bin}</string>\n    <string>link</string>\n    <string>broker</string>\n    <string>{sock}</string>\n    \
@@ -1289,7 +1272,7 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         "the pid printed is launchd's own, never 0:\n{out}"
     );
 
-    // ---- a second `on`: the plist is `already`, and so is the job, by its pid
+    // A second `on`: the plist is `already`, and so is the job, by its pid.
     std::fs::remove_file(&calls).expect("reset");
     let (code, out, _) = run(s
         .fabric_cmd(&["on", "--service", "launchd"])
@@ -1311,7 +1294,7 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         "a job that answers is left alone: {recorded}"
     );
 
-    // ---- `off`: bootout and remove the plist; the broker is gone
+    // `off`: bootout and remove the plist; the broker is gone.
     std::fs::remove_file(&calls).expect("reset");
     let (code, out, _) = run(s
         .fabric_cmd(&["off", "--service", "launchd"])
@@ -1974,13 +1957,10 @@ fn a_person_reads_an_ask_and_answers_it_as_a_human() {
     drop(broker);
 }
 
-/// **`off` ACTS ON THE ROOT THE FABRIC IS ON.** `on` under root A writes
-/// `[fabric] command` dialing A's socket; `off` under a different
-/// `$ATERM_FABRIC_HOME` (or none) must not resolve root B from the environment
-/// and leave A's `KeepAlive` broker running. `off` follows the config's
-/// `--broker` to A, says so in its header,
-/// and every line names A; with the config gone, the rendezvous file; with
-/// both gone, the environment.
+/// `off` acts on the root the fabric is on. After `on` under root A, `off` under another
+/// `$ATERM_FABRIC_HOME` (or none) must not resolve root B and leave A's `KeepAlive` broker
+/// running: it follows the config's `--broker` to A and says so in its header, then the
+/// rendezvous file once the config is gone, then the environment once both are.
 #[test]
 fn review_off_acts_on_the_root_the_config_names() {
     let s = Scratch::new("offroot");

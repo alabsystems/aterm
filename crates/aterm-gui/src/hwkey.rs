@@ -276,10 +276,9 @@ fn take_inline_mods(body: &str) -> (u64, &str) {
     (m, rest)
 }
 
-/// Parse `mods=<list>` / `count=<n>` / `interval=<ms>` trailing tokens, returning
-/// them plus the residual body. Any unparsable token value is an error rather than
-/// a silent default: a typo'd `count=1oo` that silently injected one key would
-/// invalidate a whole measurement run without saying so.
+/// Parse `mods=<list>` / `count=<n>` / `interval=<ms>` trailing tokens, returning them plus the
+/// residual body. Any unparsable token value is an error rather than a silent default: a typo'd
+/// `count=1oo` that injected one key would quietly invalidate a measurement run.
 fn take_tokens(rest: &str) -> Result<(u64, u32, u64, bool, String), String> {
     let mut mods = 0u64;
     let mut count = 1u32;
@@ -461,10 +460,8 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
         let _posting = crate::askpass::PROMPT_INPUT
             .posting_permit()
             .map_err(|()| "ERR hwkey: a sudo password sheet is up\n".to_string())?;
-        // One pool PER KEY, not one around the loop: `count=5000` would otherwise
-        // hold five thousand autoreleased NSEvents alive for the whole run, and a
-        // control thread with no pool at all makes Cocoa log-and-leak every one of
-        // them. Draining per key keeps a long paced burst flat.
+        // One pool per key: one around the loop would hold every autoreleased NSEvent of a
+        // `count=5000` run alive, and with no pool Cocoa logs and leaks each one.
         autoreleasepool(|_| {
             // Read immediately before the post, on the seconds-since-boot clock
             // `current_event_queue_age_ns` subtracts it from, so the age is the real time the

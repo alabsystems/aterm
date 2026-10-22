@@ -70,14 +70,14 @@
 //! answered; the Land episode ([`crate::supervise::approvals::land_episode`]);
 //! and the short streak ([`crate::supervise::approvals::short_streak`]): an
 //! act's mark, its yield still to come, or the record of the last point a
-//! loop judged ([`crate::supervise::approvals::RULE_POINT`], round 8: every
-//! act's answer and every move of the streak; round 9: every move of the
+//! loop judged ([`crate::supervise::approvals::RULE_POINT`]: every
+//! act's answer and every move of the streak; every move of the
 //! point's time), that point's streak and time, and the answer of the check
 //! or a land act judged there — unless a turn was read running after it
-//! ([`crate::supervise::approvals::RULE_TURN_RAN`], round 9): the next idle
+//! ([`crate::supervise::approvals::RULE_TURN_RAN`]): the next idle
 //! point is that turn's end, a later turn's. A person's exchange left to them
 //! is in the ledger whenever it is left, the task's end said before it or not
-//! (round 9). The gap cells ([`gap_cells`]: [`run_follower`] on books cut at
+//! . The gap cells ([`gap_cells`]: [`run_follower`] on books cut at
 //! a point the loop before never read, whose end it reads as a turn that ran:
 //! [`TurnEndState::take_gap`]) are their own tests, every scenario's among
 //! them, and so is the cut a loop's start makes of a ledger past its bound
@@ -694,7 +694,7 @@ impl Loop<'_> {
         self.rows.clone_from(&rows);
         let reader = self.s.reader(&rows);
         self.s.end_memory_on_live_turn(reader, &rows, self.seq);
-        self.s.took(self.seq);
+        self.s.took(self.seq, None, &mut Alone);
         self.awaiting = false;
         self.unseen = None;
         self.busy_since.get_or_insert(self.now());
@@ -3406,7 +3406,7 @@ fn land_policy() -> SupervisorConfig {
     }
 }
 
-/// THE SHAPES GROWN IN ROUND 7 (the seed's real inputs the matrix lacked):
+/// THE SHAPES GROWN IN (the seed's real inputs the matrix lacked):
 /// a handoff in the read latency past a try's take window; acts in a
 /// limit's place other than the done check; a cancelled notice under the
 /// screen a try was typed at; a loop started as Off lifts; a done check
@@ -3492,7 +3492,7 @@ fn grown_scenarios() -> Vec<Scenario> {
         } else {
             // A handoff past twice the window, the try unread still: the
             // seed once read such a try as met at the screen it was typed at
-            // (ATERM-KI-1016-1, follow-2).
+            // (follow-2).
             let late = beat(At::Act(0, first_read - 5), "(a handoff instant)", Ev::Mark);
             beats.extend([mark, late, read]);
         }
@@ -3854,7 +3854,7 @@ fn grown_scenarios() -> Vec<Scenario> {
         ));
     }
     // (e) A task's end, then Off stood and lifted: the landing — the clean
-    // defense in words that answers Land's instruction (FOREVER LAND; the
+    // defense in words that answers Land's instruction (Autopilot Land; the
     // retired token lands nothing, and Cruise never ends, so main's token
     // and done-check cells have no end to hand over). A loop stopped in the
     // end's window ([`window_cells`]) leaves books a loop started as Off
@@ -4016,7 +4016,7 @@ fn grown_scenarios() -> Vec<Scenario> {
     // ---- R7b: the five-hour window's try TAKEN, its own 20-minute turn
     // ending on a bucket that names no reset: the bucket's appearance is that
     // turn's end, judged at once (work read), take window or not — not the
-    // window's end after it (ATERM-KI-1016-1, "a loop that follows another").
+    // window's end after it ("a loop that follows another").
     for take in [false, true] {
         let mut beats = b_head();
         beats.push(taken(0, &h_c, "keep going"));
@@ -4374,7 +4374,7 @@ fn grown_scenarios() -> Vec<Scenario> {
     out
 }
 
-/// THE SHAPES GROWN IN ROUND 8 (the verifier of 97daeeace, RS8): Off
+/// THE SHAPES GROWN IN (the verifier of 97daeeace, RS8): Off
 /// standing between a try and its late first read (a record of the loop's
 /// is no read); the short streak moved at points no act follows — a
 /// person's short turn, a wake's, a done check's answer judged not done —
@@ -4689,9 +4689,9 @@ fn round8_scenarios() -> Vec<Scenario> {
     out
 }
 
-/// Round 9's shapes (the verifier of 75b03ac6d): the land act answered not
+/// the prior shapes (the verifier of 75b03ac6d): the land act answered not
 /// done (RS9-F4). (Its RS9-F2 and RS9-F3 began at a task the worker's own
-/// token ended, which FOREVER CRUISE retired.)
+/// token ended, which Autopilot Cruise retired.)
 fn round9_scenarios() -> Vec<Scenario> {
     let mut out = Vec::new();
     let w0 = work0();
@@ -4782,7 +4782,7 @@ fn round9_scenarios() -> Vec<Scenario> {
 }
 
 /// AN API ERROR'S RETRY LADDER (a 529, overloaded: [`TurnEndTiming::retry_backoff`],
-/// 1, 5, 15, 30, then 60 minutes from each appearance; ATERM-KI-1016-1's "a
+/// 1, 5, 15, 30, then 60 minutes from each appearance's "a
 /// loop that follows another"). Taken up from nothing, a loop that follows
 /// retried on the ladder's first rung from its own read, whatever rung the
 /// loop before was on: up to an hour sooner. The ladder met again at every
@@ -5224,7 +5224,7 @@ fn api_retry_scenarios() -> Vec<Scenario> {
     out
 }
 
-/// The scenarios of ATERM-KI-1016-1's person lane, after its review
+/// The scenarios of 's person lane, after its review
 /// (KR-P6-ESC): the first loop's `keep going`, its answer stopped by an Esc
 /// that is no act of the harness's — a person's key, and the Esc with no
 /// keystroke the window stamps — then, inside the Esc's hold, a person's own
@@ -5625,7 +5625,7 @@ fn a_land_holds_since_its_instruction_row_for_this_loop_and_the_next() {
 }
 
 /// OFF STANDS AT EVERY PARK THE JOURNAL SAYS, IN THE BOOKS A LOOP THAT
-/// FOLLOWS READS (ATERM-KI-1016-1, done-6): a build through 0.105.0 notes
+/// FOLLOWS READS (done-6): a build through 0.105.0 notes
 /// `PARKED seq=<n> autopilot=off` as it parks and records no
 /// `autopilot-off@v1`; read where that note stands, the Land episode the
 /// park ended is over (`approvals::land_episode_in`), and a newer build's
@@ -5829,7 +5829,7 @@ fn a_try_a_seed_found_aged_out_is_over_and_ends_no_wall() {
 /// standing limit 30 minutes sooner. So does a successor attached before
 /// that read, 66 s after the try, which no read has seen yet: its own first
 /// read is the try's first, however late after the try it comes, as the
-/// first loop's was (ATERM-KI-1016-1, follow-2: capped at twice the window,
+/// first loop's was (follow-2: capped at twice the window,
 /// it judged the try met at the screen it was typed at and typed 30 minutes
 /// sooner). NEGATIVE CONTROL: a successor that takes nothing up types
 /// sooner.
@@ -5899,7 +5899,7 @@ fn a_try_s_late_first_read_opens_the_window_a_successor_awaits() {
 }
 
 /// A TRY'S TURN NO LOOP WATCHED IS READ AS THE LOOP THAT WATCHED IT READS IT
-/// (ATERM-KI-1016-1, "a long unwatched gap"): the loop that typed a spend
+/// ("a long unwatched gap"): the loop that typed a spend
 /// limit's try stopped before any read after it, the try's own turn worked
 /// 40 minutes and ended on the limit again, and a loop attached a second
 /// after that end — its books holding the try and nothing since — reads the
@@ -6969,7 +6969,7 @@ fn answered_tries(done: bool, transcript: bool, held: bool) -> Scenario {
 }
 
 /// A TRY'S ANSWER NO LOOP READ IS DATED BY THE SCREEN OR THE TRANSCRIPT
-/// (ATERM-KI-1016-1, "a loop that follows another"; limits-1): the loop that
+/// ("a loop that follows another"; limits-1): the loop that
 /// typed a spend limit's second try stopped before any read after it, and a
 /// loop attached later — its books holding that try and nothing since —
 /// reads the limit's answer to it where the screen's done row (`Worked for
@@ -7311,7 +7311,7 @@ fn a_persons_exchange_read_running_by_the_loop_before_is_dated_from_that_read() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE GAP CELLS OF ONE SCENARIO (round 9, [`run_follower`] on books cut
+/// THE GAP CELLS OF ONE SCENARIO ([`run_follower`] on books cut
 /// at a point the loop before never read): at every point of the first
 /// loop's timeline, a loop that stopped just before it (the first loop, and
 /// a loop that followed it from the point before: a chain) and a successor
@@ -7428,7 +7428,7 @@ fn gap_matrix(scenarios: &[Scenario], unrecorded: bool) -> (usize, Vec<String>) 
 }
 
 /// THE END OF A TURN THE LOOP BEFORE READ RUNNING IS JUDGED AS THE FIRST
-/// LOOP JUDGES IT, AT EVERY GAP OF EVERY SCENARIO (ATERM-KI-1016-1's "a loop
+/// LOOP JUDGES IT, AT EVERY GAP OF EVERY SCENARIO ('s "a loop
 /// that follows another": 17 of the matrix's 590 gap cells, in six shapes;
 /// and the verifier of 75b03ac6d, RS9-F1). A GAP HANDOFF: the loop before
 /// read a turn running and stopped before the turn ended (an update, a
@@ -7502,7 +7502,7 @@ fn the_end_of_a_turn_the_loop_before_read_running_is_judged_as_the_first_loop_ju
 }
 
 /// A LIMIT NO RESET ENDS COUNTS ITS FIRST RUNG FROM THE WALL FOR A LOOP THAT
-/// FOLLOWS (ATERM-KI-1016-1's "a loop that follows another"): at a spend
+/// FOLLOWS ('s "a loop that follows another"): at a spend
 /// limit and at a bucket that names no reset, a loop attached between the
 /// wall and the first try tries when the first loop does, 30 minutes after
 /// the wall the loop before waited on (the open `wall-wait@v1` row, the
@@ -7599,7 +7599,7 @@ fn a_limit_no_reset_ends_counts_its_first_rung_from_the_wall_for_a_loop_that_fol
 }
 
 /// A LOOP THAT FOLLOWS LEAVES A PERSON'S OWN EXCHANGE TO THEM AS THE FIRST
-/// LOOP DOES, EVERY READ STAMPED WITH THE PERSON (ATERM-KI-1016-1), as
+/// LOOP DOES, EVERY READ STAMPED WITH THE PERSON, as
 /// production's reads carry `human_ms`. At every handoff of every scenario
 /// a person's keystroke reaches ([`Ev::Key`]; in one with none, or one whose
 /// reads carry it already, a stamped read is the read the base matrix makes:
@@ -7940,7 +7940,7 @@ fn older_cells(sc: &Scenario, i: usize, journal: bool, restored: bool) -> (usize
 }
 
 /// A LOOP THAT FOLLOWS ONE OF A BUILD THROUGH 0.106.0 — the update's first
-/// loop — TYPES AS THE FIRST LOOP AT EVERY HANDOFF (ATERM-KI-1016-1,
+/// loop — TYPES AS THE FIRST LOOP AT EVERY HANDOFF (
 /// follow-5). That build's books hold no record of a point and no mark on
 /// an act ([`books_of_0_106`]): read alone, the follower backed off its
 /// first point from its own attach on the short ladder's first rung (up to
@@ -8152,7 +8152,7 @@ fn restored_cells(sc: &Scenario, i: usize, noted: bool, owed: bool) -> (usize, V
     (cells, broken)
 }
 
-/// A LOOP IN A TAB A COLD RESTORE REOPENED (ATERM-KI-1016-1, follow-7): the
+/// A LOOP IN A TAB A COLD RESTORE REOPENED (follow-7): the
 /// restore reopens each tab under a new session id, so the loop's ledger is
 /// the new tab's and holds nothing; the books of the conversation's loop are
 /// the tab's it was reopened from, which the restore notes beside the new

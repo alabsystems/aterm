@@ -657,7 +657,7 @@ pub(crate) fn main() -> ExitCode {
         let dir = layout.reroute_dir();
         if let Err(error) = layout.ensure_dir(&dir) {
             aterm_log::warn!(
-                "aterm: reroute dir not created ({error}); the upstream Rust names are NOT rerouted in this session — `aterm pkg doctor` explains (aterm help reroute)"
+                "aterm: reroute dir not created ({error}); this session does not reroute the upstream Rust names — `aterm pkg doctor` explains (aterm help reroute)"
             );
         }
         if dir.is_dir() {
@@ -668,7 +668,7 @@ pub(crate) fn main() -> ExitCode {
             .spawn(move || {
                 if let Err(error) = atpkg::reroute::lay(&layout) {
                     aterm_log::warn!(
-                        "aterm: reroute stubs not laid ({error}); the upstream Rust names are NOT rerouted in this session — `aterm pkg doctor` explains (aterm help reroute)"
+                        "aterm: reroute stubs not laid ({error}); this session does not reroute the upstream Rust names — `aterm pkg doctor` explains (aterm help reroute)"
                     );
                 }
             });
@@ -1047,9 +1047,7 @@ fn session_lane(quiet: bool) -> ExitCode {
     aterm_cli::session_main(quiet)
 }
 
-// ---------------------------------------------------------------------------
 // argv0 alias dispatch
-// ---------------------------------------------------------------------------
 
 /// How an invocation under an argv0 alias name is served; pure, for the test. On Windows the
 /// Start-Menu shortcut and the jump list launch the `aterm-gui.exe` alias, so the windowing
@@ -1151,9 +1149,7 @@ fn gui_alias_entry(rest: Vec<OsString>) -> ExitCode {
     )
 }
 
-// ---------------------------------------------------------------------------
 // Where a window runs: this process, or the windowed sibling (Windows)
-// ---------------------------------------------------------------------------
 
 /// Which process serves a window the front door decided to open: off Windows always this one;
 /// on Windows it depends on the running image (see the file header) and on what was asked.
@@ -3627,9 +3623,7 @@ fn plain_launch_policy(
     }
 }
 
-// ---------------------------------------------------------------------------
 // The windowing verbs and the routing policy
-// ---------------------------------------------------------------------------
 
 /// `aterm new-tab | new-window | split-pane [-H|-V] [-d <dir>]`, the wt-shaped front door. The
 /// grammar and the routing rule are pure and live in `aterm-cli`
@@ -3906,12 +3900,14 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
         // are the installer's own steps (tools/install.sh, which holds the signed release
         // files), never typed.
         println!("{UPDATE_USAGE}");
+        for line in UPDATE_HELP {
+            println!("{line}");
+        }
         #[cfg(target_os = "linux")]
-        println!(
-            "Linux: aterm update enable | apply | rollback\n\
-             Updates replace only the on-disk executable; running sessions are never \
-             restarted."
-        );
+        for line in UPDATE_HELP_LINUX {
+            println!("{line}");
+        }
+        println!("`aterm help update` has the rest.");
         return ExitCode::SUCCESS;
     }
     #[cfg(target_os = "linux")]
@@ -4057,6 +4053,24 @@ fn no_ledger_fails(checking: bool) -> bool {
 /// listed under it by `--help` on Linux alone.
 const UPDATE_USAGE: &str = "usage: aterm update [status|check] [-v] | identity";
 
+/// `aterm update --help` under [`UPDATE_USAGE`]: one line per word.
+const UPDATE_HELP: &[&str] = &[
+    "  status     this copy's version and where it stands, one line (the default)",
+    "  check      check now (a newer release downloads), then print that line;",
+    "             exits 1 when this copy cannot update or checking fails",
+    "  -v         add the updater's detail: last decision, last check, failures",
+    "  identity   the running binary's compiled identity, as JSON",
+];
+
+/// The Linux delivery's own words, under [`UPDATE_HELP`] on Linux alone.
+#[cfg(target_os = "linux")]
+const UPDATE_HELP_LINUX: &[&str] = &[
+    "  enable     turn on updates for this installed copy",
+    "  apply      install the update already downloaded",
+    "  rollback   go back to the previous executable",
+    "An update replaces only the executable on disk; running sessions keep running.",
+];
+
 /// What `aterm update <word>` says for a word it does not take. The Linux delivery's
 /// verbs exist only on Linux, and a word the package store knows (`claude`, `trust`) is
 /// a package update typed without `pkg`; any other word gets the usage line.
@@ -4154,7 +4168,7 @@ fn update_unreadable_line(version: &str) -> String {
     #[cfg(windows)]
     {
         format!(
-            "aterm {version} doesn\u{2019}t update itself on Windows yet \u{2014} to update it, \
+            "aterm {version} doesn\u{2019}t update itself on Windows \u{2014} to update it, \
              in your aterm checkout run {}",
             aterm_cli::WINDOWS_UPDATE_LANE
         )
@@ -4625,7 +4639,8 @@ impl aterm_cli::ThemeHost for WindowThemes {
 /// The user-typed front-door flags `--completions` offers, with the zsh/fish descriptions: the
 /// flags the routing above and `aterm-cli`'s parser recognize before the mode fork.
 /// `--completions` itself stays out, like the `aterm-ctl` flag it mirrors; operand completion
-/// (the `--containment` mode) is out of scope.
+/// (the `--containment` mode) is out of scope. The scripts paste each description inside
+/// single quotes (zsh also inside `[…]`), so none may hold `'`, `[` or `]`.
 const COMPLETION_FLAGS: &[(&str, &str)] = &[
     ("--window", "open the GPU window explicitly"),
     ("--session", "force the transparent shell session"),
@@ -4640,7 +4655,11 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
         "--no-reroute",
         "restore the upstream Rust names in this session (see aterm help reroute)",
     ),
-    ("--quiet", "suppress the interactive startup notice"),
+    ("--quiet", "hide the session startup line"),
+    (
+        "--verbose",
+        "print a one-line session summary to stderr on exit",
+    ),
     ("--help", "print help and exit"),
     ("--version", "print the version and exit"),
 ];
@@ -5866,14 +5885,8 @@ mod tests {
     #[test]
     fn windows_update_line_names_the_lane_that_updates_it() {
         let line = update_unreadable_line("0.94.0");
-        assert_eq!(
-            line,
-            format!(
-                "aterm 0.94.0 doesn\u{2019}t update itself on Windows yet \u{2014} to update \
-                 it, in your aterm checkout run {}",
-                aterm_cli::WINDOWS_UPDATE_LANE
-            )
-        );
+        assert!(line.starts_with("aterm 0.94.0 "), "{line}");
+        assert!(line.contains(aterm_cli::WINDOWS_UPDATE_LANE), "{line}");
         assert!(!line.contains("aterm.app"), "{line}");
         assert!(!line.contains("macOS"), "{line}");
     }

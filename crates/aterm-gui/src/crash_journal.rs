@@ -2028,7 +2028,7 @@ pub(crate) const WORD_DURABLE_WAIT: Duration = Duration::from_secs(5);
 pub(crate) const WORD_DURABLE_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// WHAT THE JOURNAL HOLDS ON DISK OF THE WORDS ABOUT TYPING
-/// ([`OwnerWords`]; ATERM-KI-1016-1): one state the lane (the main thread),
+/// ([`OwnerWords`]): one state the lane (the main thread),
 /// its writer thread and the control verbs that move a word share, so a
 /// verb's `OK` is a durability ack. The `OK` of `hold` and of `meta set
 /// autopilot` came as the word was stored, before the image that carries it
@@ -2265,7 +2265,7 @@ pub(crate) struct Lane {
     /// ([`Self::note_activity`]): the capture it prompts owes a trailing
     /// settle ([`Self::settle_owed`]).
     activity: bool,
-    /// THE TRAILING SETTLE (ATERM-KI-1016-1 LC-1): the last capture was
+    /// THE TRAILING SETTLE (LC-1): the last capture was
     /// prompted by activity, so ONE more is due at the write interval's end
     /// whatever marks the desk meanwhile — what a tab's program writes after
     /// its last output, which wakes nothing: Claude Code rewrites its record
@@ -2294,7 +2294,7 @@ pub(crate) struct Lane {
     /// covers ([`Self::offer`]).
     capturing: Option<u64>,
     /// THE LAST IMAGE HANDED TO THE WRITER DID NOT REACH THE DISK (a full
-    /// disk; ATERM-KI-1016-1): the next capture hands its image again even
+    /// disk): the next capture hands its image again even
     /// where nothing moved, at the write interval ([`Self::poll_writer`]). A
     /// failed image was owed nothing until the desk changed, so a word it
     /// carried could stay off the disk for the rest of the run.
@@ -2437,7 +2437,7 @@ pub(crate) const END_SESSION_SNAPSHOT_TTL: Duration = Duration::from_secs(2);
 /// (`platform_win::set_end_session_snapshot`). At most every
 /// [`END_SESSION_SNAPSHOT_TTL`] — and AT ONCE where a tab's standing words
 /// about typing ([`OwnerWords`]: its Autopilot word and timer, its holds)
-/// moved from what the last snapshot carries (ATERM-KI-1016-1): held to the
+/// moved from what the last snapshot carries: held to the
 /// TTL, a Land, Off or hold set within 2 s of a logoff was lost there, and
 /// the reopened tab was typed into. Words the snapshot carries owe nothing,
 /// and neither does a session it has no leaf for (a tab newer than it is the
@@ -2795,7 +2795,7 @@ impl Lane {
         self.durable.set_live(self.dir.is_some() && restore_session);
     }
 
-    /// THE WRITER'S WORD SINCE THE LAST LOOK (ATERM-KI-1016-1): an image that
+    /// THE WRITER'S WORD SINCE THE LAST LOOK: an image that
     /// did not reach the disk is owed again — the next capture hands its image
     /// whatever it finds, at the write interval, and a word that image
     /// carried is retried with it. A failed image used to stay the lane's
@@ -2877,7 +2877,7 @@ impl Lane {
     /// about typing ([`Self::note_owner_words`]). The conversation a leaf
     /// names is the one the next launch resumes and types its carry-on into;
     /// held to the write interval, a crash of aterm within it after a
-    /// `/clear` resumed the conversation the agent had left (ATERM-KI-1016-1
+    /// `/clear` resumed the conversation the agent had left (
     /// LC-1). Rare as the move: the host says it only when its publication
     /// moved. An inert lane owes nothing.
     pub(crate) fn owe_agent_capture(&mut self) {
@@ -4486,7 +4486,7 @@ pub(crate) mod tests {
         );
         // Nor a hard link: its other name is another of the person's files,
         // never read — a decode error quotes the line it stopped on, and the
-        // row would carry that line of their file (ATERM-KI-1015-12).
+        // row would carry that line of their file.
         let theirs = secret.path().join("notes.txt");
         std::fs::write(&theirs, b"token = \"their-private-line\n").unwrap();
         std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -6270,7 +6270,7 @@ pub(crate) mod tests {
         assert!(names(dir.path()).is_empty(), "{:?}", names(dir.path()));
     }
 
-    /// THE TRAILING SETTLE (ATERM-KI-1016-1 LC-1): Claude Code rewrites its
+    /// THE TRAILING SETTLE (LC-1): Claude Code rewrites its
     /// record of the agent — the conversation an in-app `/clear` moved it to
     /// — a moment after its last output, and that write wakes nothing. A
     /// capture taken at the output read the record before it, and with
@@ -6482,7 +6482,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
     }
 
-    /// AN IMAGE THE WRITER COULD NOT PUBLISH IS OWED AGAIN (ATERM-KI-1016-1:
+    /// AN IMAGE THE WRITER COULD NOT PUBLISH IS OWED AGAIN (
     /// a full disk). The lane kept the failed image as its `last`, so a
     /// capture that found the same desk handed nothing, and a word that image
     /// carried stayed off the disk until the desk changed. Now the writer's
@@ -6531,7 +6531,7 @@ pub(crate) mod tests {
     }
 
     /// A WORD'S TICKET IS COVERED ONLY ONCE AN IMAGE ON DISK CARRIES IT
-    /// (ATERM-KI-1016-1, the durability ack of `hold` and `meta set
+    /// (the durability ack of `hold` and `meta set
     /// autopilot`): a ticket owes a capture now, inside the write interval;
     /// the capture that found the desk unchanged confirms it on the image
     /// handed before, which is on disk; one whose image the disk refused is

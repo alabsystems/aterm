@@ -808,6 +808,7 @@ pub(crate) fn prelex(src: &str) -> Result<String, String> {
         heredocs: Vec::new(),
         depth: 0,
         backticks: 0,
+        escaped_to: 0,
     };
     lx.run(None)?;
     if !lx.heredocs.is_empty() {
@@ -836,6 +837,9 @@ struct Prelex {
     depth: usize,
     /// How many of those are backtick substitutions.
     backticks: usize,
+    /// The position right after the last character a backslash escaped
+    /// (`0`: none yet), where no word starts ([`Self::at_word_start`]).
+    escaped_to: usize,
 }
 
 impl Prelex {
@@ -844,11 +848,15 @@ impl Prelex {
     }
 
     /// Whether position `i` starts a word: the shell's rule for where `#`
-    /// opens a comment.
+    /// opens a comment. A character a backslash escapes is its word's, a
+    /// blank or a newline too (`echo a\ #; tee x` and `echo a\⏎#; tee x`
+    /// run `tee`, MEASURED 2026-10-22 under `/bin/bash` 3.2 and `/bin/zsh`
+    /// 5.9), so the position right after one starts no word.
     fn at_word_start(&self) -> bool {
         self.i == 0
-            || self.chars[self.i - 1].is_whitespace()
-            || matches!(self.chars[self.i - 1], ';' | '&' | '|' | '(' | ')')
+            || (self.escaped_to != self.i
+                && (self.chars[self.i - 1].is_whitespace()
+                    || matches!(self.chars[self.i - 1], ';' | '&' | '|' | '(' | ')')))
     }
 
     /// Whether the unquoted `(` at the cursor is part of a word (after a letter,
@@ -908,6 +916,7 @@ impl Prelex {
                     if let Some(n) = self.peek(0) {
                         self.out.push(n);
                         self.i += 1;
+                        self.escaped_to = self.i;
                     }
                 }
                 '\'' => self.single_quoted()?,

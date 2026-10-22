@@ -1729,12 +1729,10 @@ fn manual_reset_hands_back_what_the_shell_armed_and_the_handback_never_will() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // THE TEMPORAL SPINE through the real reader (`crate::temporal::SpineMark`):
 // each hold's `RawIn` is a range of the one copy the reader makes of its batch,
 // which the cast and `bytes` taps carry too; the bytes a handback or a manual
 // reset synthesizes are an allocation of their own, recorded at their offset.
-// ---------------------------------------------------------------------------
 
 /// What a replay must reproduce of `t`: every visible row, the screen in
 /// front, and the modes the handback and the reset move.

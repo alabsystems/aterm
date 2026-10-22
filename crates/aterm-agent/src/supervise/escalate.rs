@@ -548,8 +548,8 @@ pub(super) fn needs_attention_text(program: &str, needs: &[String]) -> String {
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// THE WORKER'S NEEDS YOU, ON THE PERSON'S SCREEN (FOREVER CRUISE /
-    /// FOREVER LAND: loud, never blocking): where the needs the policy holds
+    /// THE WORKER'S NEEDS YOU, ON THE PERSON'S SCREEN (Autopilot Cruise /
+    /// Autopilot Land: loud, never blocking): where the needs the policy holds
     /// standing ([`TurnEndState::standing_needs`], its set's
     /// [`TurnEndState::needs_key`]) differ from the set this loop last put
     /// up ([`Session::needs_told`]), the `needs` owner's entry is set —

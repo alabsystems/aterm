@@ -69,9 +69,7 @@ impl BitWriter {
     }
 }
 
-// ---------------------------------------------------------------------------
 // RFC 1951 §3.2.5 code tables, transcribed as (base, extra-bits) pairs.
-// ---------------------------------------------------------------------------
 
 /// Smallest match length code 257..285 stands for.
 const LENGTH_BASE: [u16; 29] = [
@@ -135,9 +133,7 @@ const fn distance_code(dist: u16) -> (u16, u32, u32) {
     (i as u16, (dist - DIST_BASE[i]) as u32, DIST_EXTRA[i])
 }
 
-// ---------------------------------------------------------------------------
 // LZ77
-// ---------------------------------------------------------------------------
 
 /// DEFLATE's window: a match may reach at most this far back.
 const WINDOW: usize = 32768;

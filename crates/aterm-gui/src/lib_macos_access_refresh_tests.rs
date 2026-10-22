@@ -249,9 +249,7 @@ fn settings_gesture_restarts_a_settled_watch_with_fresh_evidence() {
     assert_eq!(app.next_macos_access_card_deadline(now), None);
 }
 
-// ---------------------------------------------------------------------------
 // FILE ACCESS ON A NEW MAC (owner ask 2026-10-16; `consent_launch`)
-// ---------------------------------------------------------------------------
 
 /// A window standing in for a new Mac: the probe reads `denied`, the hand-over lane
 /// opens pages and shows panels through counted stand-ins, and the launch state knows a
@@ -852,9 +850,7 @@ fn a_dismissed_full_disk_access_question_holds_the_launch_page_back() {
     assert_eq!(app.consent_launch.fda(), FdaLaunch::NotAsked);
 }
 
-// ---------------------------------------------------------------------------
 // AN UPDATE FROM 0.105.0 ON THE OWNER'S MAC (2026-10-17)
-// ---------------------------------------------------------------------------
 
 /// The owner's config directory (`~/.config/aterm`) on the Mac where 0.105.0 drew "aterm
 /// would like to access files in your Downloads folder" for an agent in a tab at 08:33
@@ -1177,9 +1173,7 @@ fn a_fork_lane_successor_gets_the_page_once_its_reading_is_its_own() {
     assert!(app.fda_panel_up());
 }
 
-// ---------------------------------------------------------------------------
 // DEBUGGER ACCESS ON A NEW MAC (owner ruling O29, 2026-10-19; `debugger_access`)
-// ---------------------------------------------------------------------------
 
 /// One alert as the stand-in was asked it: title, body and proceed button.
 type Alert = (String, String, String);
@@ -2009,6 +2003,120 @@ fn a_decline_quiet_while_the_offer_records_defers_its_alert() {
     );
 }
 
+/// The launch rule's stand-in reading, Admin.
+fn rule_reads(
+    mode: aterm_containment::consent::DebuggerMode,
+) -> aterm_containment::consent::DebuggerProbe {
+    use aterm_containment::consent::{DebuggerMember, DebuggerProbe, DebuggerProbeLabel};
+    DebuggerProbe {
+        mode,
+        member: DebuggerMember::Admin,
+        label: DebuggerProbeLabel::StatusOk,
+    }
+}
+
+fn rule_reads_on(
+    _: aterm_containment::consent::ProbeGate,
+) -> aterm_containment::consent::DebuggerProbe {
+    rule_reads(aterm_containment::consent::DebuggerMode::Enabled)
+}
+
+fn rule_reads_off(
+    _: aterm_containment::consent::ProbeGate,
+) -> aterm_containment::consent::DebuggerProbe {
+    rule_reads(aterm_containment::consent::DebuggerMode::Disabled)
+}
+
+/// A `DevToolsSecurity -status` that read no rule, for `label`'s reason.
+fn rule_read_fails(
+    label: aterm_containment::consent::DebuggerProbeLabel,
+) -> aterm_containment::consent::DebuggerProbe {
+    use aterm_containment::consent::{DebuggerMember, DebuggerMode, DebuggerProbe};
+    DebuggerProbe {
+        mode: DebuggerMode::Unknown,
+        member: DebuggerMember::Admin,
+        label,
+    }
+}
+
+fn rule_read_times_out(
+    _: aterm_containment::consent::ProbeGate,
+) -> aterm_containment::consent::DebuggerProbe {
+    rule_read_fails(aterm_containment::consent::DebuggerProbeLabel::TimedOut)
+}
+
+fn rule_read_does_not_start(
+    _: aterm_containment::consent::ProbeGate,
+) -> aterm_containment::consent::DebuggerProbe {
+    rule_read_fails(aterm_containment::consent::DebuggerProbeLabel::SpawnFailed)
+}
+
+/// A `-status` whose answer the classifier does not claim.
+fn rule_read_unclaimed(
+    _: aterm_containment::consent::ProbeGate,
+) -> aterm_containment::consent::DebuggerProbe {
+    rule_read_fails(aterm_containment::consent::DebuggerProbeLabel::StatusUnrecognized)
+}
+
+/// `-status` says the rights are in an unknown state: a reading, not a failed read.
+fn rule_reads_unrecognized(
+    _: aterm_containment::consent::ProbeGate,
+) -> aterm_containment::consent::DebuggerProbe {
+    rule_reads(aterm_containment::consent::DebuggerMode::Unrecognized)
+}
+
+/// An app whose recorded answer waited out a decline's quiet, its reading now
+/// older than [`crate::debugger_access::ASK_PROBE_FRESH`] — as a kept answer's
+/// is, past `OWNER_QUIET_FIRST` — but younger than the slot's own refresh age,
+/// so only the spend's retirement reads the rule again; the rule is read again
+/// by `read_again`. Returns the next look's time.
+fn kept_on_an_aging_reading(
+    app: &mut App,
+    t: &mut Instant,
+    read_again: fn(
+        aterm_containment::consent::ProbeGate,
+    ) -> aterm_containment::consent::DebuggerProbe,
+) -> Instant {
+    use crate::debugger_access::ASK_PROBE_FRESH;
+    use aterm_containment::consent::{DebuggerMode, SelfHardening};
+    let at = recorded_mid_offer(app, t);
+    app.owner_quiet.lock().unwrap().note_decline();
+    app.look_for_debugger_moment(at, quiet);
+    assert!(app.debugger_launch.offering(), "PRECONDITION: kept");
+    *app.owner_quiet.lock().unwrap() = crate::native_settings::OwnerQuiet::default();
+    app.consent.publish_debugger_aged_for_test(
+        rule_reads(DebuggerMode::Disabled),
+        SelfHardening::Hardened,
+        ASK_PROBE_FRESH + Duration::from_secs(10),
+    );
+    app.consent.probes_for_test().debugger = read_again;
+    app.debugger_launch.next_deadline().expect("a later look")
+}
+
+/// Look as the park does until a reading of the rule has landed, then give the
+/// next look's time. A look dispatches the read, or, inside the slot's retry floor,
+/// leaves it to a later look; no look is made while a read is out, so none races
+/// the reading it waits for.
+fn read_again_lands(app: &mut App) -> Instant {
+    use crate::debugger_access::ASK_PROBE_FRESH;
+    let gate = app.config.privacy_probe_gate();
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the rule read again", || {
+        if app.consent.debugger_in_flight_for_test() {
+            return None;
+        }
+        let landed = app.consent.debugger_cached(gate).is_some_and(|row| {
+            !row.pending() && row.probe_age().is_some_and(|age| age < ASK_PROBE_FRESH)
+        });
+        if landed {
+            return Some(());
+        }
+        let next = app.debugger_launch.next_deadline()?;
+        app.look_for_debugger_moment(next, quiet);
+        None
+    });
+    app.debugger_launch.next_deadline().expect("a later look")
+}
+
 /// A KEPT ANSWER'S ALERT STATES A FRESH READING OF THE RULE: once the decline quiet has
 /// passed, a reading older than [`crate::debugger_access::ASK_PROBE_FRESH`] is retired
 /// and the rule read again before any alert, as admission does, so a rule switched on
@@ -2018,41 +2126,14 @@ fn a_decline_quiet_while_the_offer_records_defers_its_alert() {
 #[test]
 fn a_kept_answer_is_spent_on_a_fresh_reading_of_the_rule() {
     use crate::debugger_access::ASK_PROBE_FRESH;
-    use aterm_containment::consent::{
-        DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel, ProbeGate, SelfHardening,
-    };
-    fn rule(mode: DebuggerMode) -> DebuggerProbe {
-        DebuggerProbe {
-            mode,
-            member: DebuggerMember::Admin,
-            label: DebuggerProbeLabel::StatusOk,
-        }
-    }
-    fn reads_on(_: ProbeGate) -> DebuggerProbe {
-        rule(DebuggerMode::Enabled)
-    }
-    fn reads_off(_: ProbeGate) -> DebuggerProbe {
-        rule(DebuggerMode::Disabled)
-    }
-    type ReadAgain = fn(ProbeGate) -> DebuggerProbe;
-    for (read_again, asked) in [(reads_on as ReadAgain, 0), (reads_off, 1)] {
+    type ReadAgain =
+        fn(aterm_containment::consent::ProbeGate) -> aterm_containment::consent::DebuggerProbe;
+    for (read_again, asked) in [(rule_reads_on as ReadAgain, 0), (rule_reads_off, 1)] {
         let mut t = Instant::now();
         let root = crate::test_scratch::outlived_dir("aterm-access-");
         let mut app = ready_to_ask(root.path(), owner_says_no);
-        let at = recorded_mid_offer(&mut app, &mut t);
-        app.owner_quiet.lock().unwrap().note_decline();
-        app.look_for_debugger_moment(at, quiet);
-        assert!(app.debugger_launch.offering(), "PRECONDITION: kept");
-        *app.owner_quiet.lock().unwrap() = crate::native_settings::OwnerQuiet::default();
-        // The quiet outlasted the reading, and the rule may have changed meanwhile.
-        app.consent.publish_debugger_aged_for_test(
-            rule(DebuggerMode::Disabled),
-            SelfHardening::Hardened,
-            Duration::from_secs(120),
-        );
-        app.consent.probes_for_test().debugger = read_again;
+        let next = kept_on_an_aging_reading(&mut app, &mut t, read_again);
         let before = debugger_alerts().len();
-        let next = app.debugger_launch.next_deadline().expect("a later look");
         app.look_for_debugger_moment(next, quiet);
         assert_eq!(
             debugger_alerts().len(),
@@ -2061,19 +2142,13 @@ fn a_kept_answer_is_spent_on_a_fresh_reading_of_the_rule() {
         );
         assert!(app.debugger_launch.offering(), "kept for the fresh reading");
         let gate = app.config.privacy_probe_gate();
-        aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the rule read again",
-            || {
-                app.consent
-                    .debugger_cached(gate)
-                    .filter(|row| {
-                        !row.pending() && row.probe_age().is_some_and(|age| age < ASK_PROBE_FRESH)
-                    })
-                    .map(|_| ())
-            },
+        assert!(
+            app.consent
+                .debugger_cached(gate)
+                .is_none_or(|row| row.probe_age().is_none_or(|age| age < ASK_PROBE_FRESH)),
+            "the old reading is retired"
         );
-        let next = app.debugger_launch.next_deadline().expect("a later look");
+        let next = read_again_lands(&mut app);
         app.look_for_debugger_moment(next, quiet);
         assert_eq!(
             debugger_alerts().len(),
@@ -2085,6 +2160,125 @@ fn a_kept_answer_is_spent_on_a_fresh_reading_of_the_rule() {
             "over for this process either way"
         );
     }
+}
+
+/// A FAILED READ OF THE RULE AT THE SPEND IS NO ANSWER: a `-status` that timed out, did
+/// not start or answered what the classifier does not claim reads nothing, and admission
+/// drops such a reading with nothing written; this Mac is recorded already, so the failed
+/// read is retired and the rule read again `RECHECK_EVERY` later, and a read that comes
+/// back off raises the alert. Failed reads held for
+/// [`crate::debugger_access::REFUSED_FOR`] from the first end the ask with no alert once
+/// they number [`crate::debugger_access::UNREAD_READS`], not before: one met after an
+/// absence keeps it. A rule `-status` calls unknown is a reading the lane refuses, and a
+/// `[privacy]` gate closed meanwhile is no read at all (the owner has said not to read
+/// the rule): each ends the ask at once.
+/// NEGATIVE CONTROL: the alert is raised only once the rule reads off.
+#[test]
+fn a_failed_read_of_the_rule_at_the_spend_is_read_again() {
+    use crate::debugger_access::{REFUSED_FOR, UNREAD_READS};
+    use crate::devtools_helper::RECHECK_EVERY;
+    type ReadAgain =
+        fn(aterm_containment::consent::ProbeGate) -> aterm_containment::consent::DebuggerProbe;
+    let mut t = Instant::now();
+    let before = debugger_alerts().len();
+    let mut asked = before;
+    for fails in [
+        rule_read_times_out as ReadAgain,
+        rule_read_does_not_start,
+        rule_read_unclaimed,
+    ] {
+        let root = crate::test_scratch::outlived_dir("aterm-access-");
+        let mut app = ready_to_ask(root.path(), owner_says_no);
+        let next = kept_on_an_aging_reading(&mut app, &mut t, fails);
+        app.look_for_debugger_moment(next, quiet);
+        let failed_at = read_again_lands(&mut app);
+        app.look_for_debugger_moment(failed_at, quiet);
+        let label = fails(app.config.privacy_probe_gate()).label;
+        assert_eq!(debugger_alerts().len(), asked, "{label:?}: no alert");
+        assert!(
+            app.debugger_launch.queued() && app.debugger_launch.offering(),
+            "{label:?}: the answer is kept"
+        );
+        assert_eq!(
+            app.debugger_launch.next_deadline(),
+            Some(failed_at + RECHECK_EVERY),
+            "{label:?}: read again RECHECK_EVERY later"
+        );
+        let gate = app.config.privacy_probe_gate();
+        assert!(
+            app.consent.debugger_cached(gate).is_none(),
+            "{label:?}: the failed read is retired"
+        );
+        app.consent.probes_for_test().debugger = rule_reads_off;
+        let next = app.debugger_launch.next_deadline().expect("a later look");
+        app.look_for_debugger_moment(next, quiet);
+        assert_eq!(
+            debugger_alerts().len(),
+            asked,
+            "{label:?}: no alert before the rule is read"
+        );
+        let next = read_again_lands(&mut app);
+        app.look_for_debugger_moment(next, quiet);
+        asked += 1;
+        assert_eq!(debugger_alerts().len(), asked, "{label:?}: read off, asked");
+        assert!(
+            !app.debugger_launch.queued(),
+            "{label:?}: asked, over for this process"
+        );
+    }
+
+    // The bound: a failure met after an absence is read again; the span and
+    // UNREAD_READS failures end it.
+    assert_eq!(UNREAD_READS, 3, "the case below fails three reads");
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let next = kept_on_an_aging_reading(&mut app, &mut t, rule_read_times_out);
+    app.look_for_debugger_moment(next, quiet);
+    let first = read_again_lands(&mut app);
+    app.look_for_debugger_moment(first, quiet);
+    assert!(app.debugger_launch.queued(), "the first failure: kept");
+    app.look_for_debugger_moment(first + REFUSED_FOR, quiet);
+    let next = read_again_lands(&mut app);
+    app.look_for_debugger_moment(next, quiet);
+    assert!(
+        app.debugger_launch.queued() && app.debugger_launch.offering(),
+        "two failures, the second after an absence: kept"
+    );
+    let next = app.debugger_launch.next_deadline().expect("a later look");
+    app.look_for_debugger_moment(next, quiet);
+    let next = read_again_lands(&mut app);
+    app.look_for_debugger_moment(next, quiet);
+    assert_eq!(debugger_alerts().len(), asked, "failures held: no alert");
+    assert!(
+        !app.debugger_launch.queued(),
+        "failures held for the span: over for this process"
+    );
+
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let next = kept_on_an_aging_reading(&mut app, &mut t, rule_reads_unrecognized);
+    app.look_for_debugger_moment(next, quiet);
+    let next = read_again_lands(&mut app);
+    app.look_for_debugger_moment(next, quiet);
+    assert_eq!(debugger_alerts().len(), asked, "unknown state: no alert");
+    assert!(
+        !app.debugger_launch.queued(),
+        "unknown state: the lane refuses, over for this process"
+    );
+
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut app = ready_to_ask(root.path(), owner_says_no);
+    let next = kept_on_an_aging_reading(&mut app, &mut t, rule_reads_off);
+    app.config.privacy = Some(super::app_config::PrivacyConfig {
+        check: Some(false),
+        ..Default::default()
+    });
+    app.look_for_debugger_moment(next, quiet);
+    assert_eq!(debugger_alerts().len(), asked, "the gate closed: no alert");
+    assert!(
+        !app.debugger_launch.queued(),
+        "the gate closed: over for this process"
+    );
 }
 
 /// FIRST-LAUNCH SETUP'S HOLD DOES NOT STRAND AN OFFER ADMITTED BEFORE IT ARMED: the

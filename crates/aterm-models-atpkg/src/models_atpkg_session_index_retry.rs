@@ -6,9 +6,9 @@
 
 use aterm_spec::derive::*;
 
-/// One build's first, second and later passes. `Buggy=1` records the old
-/// repeated-pass behavior when a same-build HEAD arrives before its retry
-/// deadline. Tier-1 checks `IndexAttempt::holds` at each real boundary.
+/// One build's first, second and later passes. `Buggy = 1` repeats the pass when a same-build
+/// HEAD arrives before its retry deadline. Tier 1 checks `IndexAttempt::holds` at each real
+/// boundary.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_session_index_retry_model() -> Model {

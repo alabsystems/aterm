@@ -38,10 +38,9 @@ const LAYOUT_PROOF_DOMAIN: &[u8] = b"aterm-seamless-layout-v1\0";
 const SCREEN_PROOF_DOMAIN: &[u8] = b"aterm-seamless-screen-v1\0";
 pub(crate) const MAX_HANDOFF_SESSIONS: usize = 256;
 const MAX_HANDOFF_FDS_WIRE_BYTES: usize = 32 * 1024;
-/// The largest manifest this build WRITES: the cap every shipped successor
-/// reads with (v0.100.0 and older, a rollback's target included), so FROZEN —
-/// a manifest past it is one an older successor refuses whole. This build's
-/// own read is [`MAX_INCOMING_MANIFEST_BYTES`].
+/// The largest manifest this build writes: the cap every shipped successor (v0.100.0 and older,
+/// a rollback's target included) reads with, so frozen. This build reads up to
+/// [`MAX_INCOMING_MANIFEST_BYTES`].
 #[cfg(unix)]
 const MAX_HANDOFF_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 /// The largest manifest this build reads: eight times what it writes (L3: the consumer is only
@@ -937,13 +936,10 @@ fn screen_wire_digest(entries: &mut [ScreenWireEntry<'_>]) -> Option<[u8; 32]> {
     Some(hasher.finalize())
 }
 
-/// 16 CSPRNG bytes as 32 lowercase-hex chars, for the single-use handoff nonce — minted
-/// via the workspace's ONE audited entropy surface ([`aterm_uds::rand::hex_token`]:
-/// `getentropy(2)` with a BOUNDED `/dev/urandom` fallback, never a hand-rolled device
-/// read). Entropy failure (never in practice) degrades to the all-zero token: guessable,
-/// but a guessed nonce only ever COSTS the adoption — everything downstream fails closed —
-/// it can never fabricate a session or adopt a stranger's fd, so fail-open is the right
-/// posture here.
+/// 16 CSPRNG bytes as 32 lowercase-hex chars, for the single-use handoff nonce, from the
+/// workspace's audited entropy surface ([`aterm_uds::rand::hex_token`]). Entropy failure degrades
+/// to the all-zero token: a guessed nonce only costs the adoption (everything downstream fails
+/// closed), never fabricates a session or adopts a stranger's fd.
 #[cfg(unix)]
 fn random_nonce() -> String {
     aterm_uds::rand::hex_token::<16>().unwrap_or_else(|_| "0".repeat(32))
@@ -1048,7 +1044,7 @@ fn write_private_new(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
     Some(())
 }
 
-/// THE PERSON'S STAMPS AT THE COMMIT'S WRITE (LC-4 of ATERM-KI-1016-1): the
+/// THE PERSON'S STAMPS AT THE COMMIT'S WRITE (LC-4 of ): the
 /// sidecar beside an attempt's manifest (`seamless-<pid>-<nonce>.person`, swept
 /// with the attempt's other files once its writer is gone) in which the
 /// outgoing process names, right before its Commit's one write, how long ago a
@@ -3367,10 +3363,8 @@ const MAX_HELD_META_BYTES: usize = 64 * 1024;
 /// aggregate caps, and always after them.
 pub(crate) const MAX_HELD_AGGREGATE_GRID_BYTES: u64 = 16 * 1024 * 1024;
 
-/// One held pane as the park captured it (round five, item 19): the pool id
-/// its layout leaf names, its session id (round eight, finding 21), its
-/// visible screen, and how its command ended (round six of the update audit,
-/// finding 49) when the outgoing process had collected that.
+/// One held pane as the park captured it: the pool id its layout leaf names, its session id,
+/// its visible screen, and how its command ended when the outgoing process had collected that.
 #[cfg(unix)]
 #[derive(Clone, Debug)]
 pub(crate) struct HeldScreen {
@@ -4354,9 +4348,8 @@ pub(crate) struct IncomingHandoff {
     /// boot offered no handoff.
     pub roster_seq: Option<u64>,
     /// The argv the outgoing process's bridge was attached to at runtime
-    /// ([`crate::session_store::SessionHandoff::fabric_attached`]), empty when
-    /// none — armed by this process's supervisor when it has no command
-    /// configured (round seven of the update audit, finding 7).
+    /// ([`crate::session_store::SessionHandoff::fabric_attached`]), empty when none; this
+    /// process's supervisor arms it when it has no command configured.
     #[cfg_attr(not(unix), expect(dead_code, reason = "read only by the unix boot"))]
     pub fabric_attached: Vec<String>,
     /// What the outgoing status item knew of each session, by sid
@@ -6415,29 +6408,15 @@ fn with_fabric(mut json: Vec<u8>, fabric: Option<&[u8]>) -> Option<Vec<u8>> {
 /// so at a crash it may be hours old: a link open then would link everything printed after the
 /// recovery, and a link's URI (up to 8 KiB) alone could push the META past its cap.
 ///
-/// At most [`aterm_keeper::wire::MAX_META`] bytes, for every live session
-/// (round seventeen, R17-HANDOFF-1, ruled 2026-10-11). The whole carry goes as
-/// every window before that round wrote it when it fits whole, which an older
-/// reader reads exactly as before ([`PackedTabStops`]' VERSION SKEW, which also
-/// records what that reader trades where it does not); else the tab stops travel
-/// packed, so the size no longer grows with the width, and what still does
-/// not fit is shed one rung at a time, least important first: the tab stops
-/// past the width (custom stops only a later widen would find); the directory
-/// and colours; the title and the mark state; and last the custom tab stops
-/// themselves, the every-8 defaults standing in. What is left — the modes,
-/// keyboard protocols, charsets, pen and both cursors with their regions — is
-/// a fixed set of scalars. Measured 2026-10-11 on a 50-row session: packed,
-/// a META is about 2,205 bytes on the main screen and 2,781 on the alternate
-/// one at any width (the old form: 2,642 and 3,656 at 80 columns, 26,240 and
-/// 50,850 at 4,096). The fullest session `a_meta_is_built_for_every_session`
-/// builds (4,096 columns, a stop at every one on both screens, a long
-/// directory and title, a pushed colour table, marks, full kitty stacks, both
-/// DECSC slots and counters at their maximum) sheds to 3,268 bytes. With every
-/// other scalar at its widest as well (each mode `false`, each number the
-/// widest its field takes, each enum its longest name, the longest character
-/// sets in every slot) it sheds to 3,675, 421 under the cap; that test builds
-/// both and holds each under the cap. So `None` means only that those scalars
-/// outgrew the cap.
+/// At most [`aterm_keeper::wire::MAX_META`] bytes. The old (bool-list) form goes when the whole
+/// carry fits it ([`PackedTabStops`] has the version skew); else the tab stops travel packed,
+/// so the size no longer grows with the width, and what still does not fit is shed one rung at
+/// a time, least important first: the stops past the width; the directory and colours; the
+/// title and mark state; and last the custom stops, the every-8 defaults standing in. What is
+/// left is a fixed set of scalars: on a 50-row session a packed META is about 2.2 KB on the
+/// main screen and 2.8 KB on the alternate one at any width (the old form reaches 50 KB at
+/// 4,096 columns), and the widest session `a_meta_is_built_for_every_session` builds sheds to
+/// 3,675 bytes, 421 under the cap. So `None` means only that those scalars outgrew the cap.
 ///
 /// THE SESSION'S FABRIC rides beside them, under [`KEEPER_FABRIC_KEY`]
 /// ([`crate::fabric::KeeperCarry`]: the holds, the id lease, the topics, the
@@ -6549,16 +6528,13 @@ fn keeper_meta_json(mut meta: CheckpointMeta) -> Option<Vec<u8>> {
     aterm_json::to_vec(&value).ok()
 }
 
-/// THE KEEPER'S REPAINT RUNG (PTY keeper P3, design §5.3 step 7): the
-/// checkpoint a keeper-recovered session is adopted onto — a blank canonical
-/// screen carrying the META the dead window last sent ([`keeper_meta_of`]), built
-/// by the same degrade a refused handoff screen takes
-/// ([`repaint_checkpoint`]), priced against `used_cells` across the recovery.
-/// `None` for a META that is empty or does not read as the handoff's meta (the
-/// session then lands on a blank engine and is re-keyed, as a handoff without
-/// a readable meta does). A nonce is never taken from it, nor a partial
-/// sequence or in-flight output state, whatever window sent it: the META is a
-/// sample from some time before the crash, never the moment of it.
+/// The keeper's Repaint rung: the checkpoint a keeper-recovered session is adopted onto, a
+/// blank canonical screen carrying the META the dead window last sent ([`keeper_meta_of`]),
+/// built by the degrade a refused handoff screen takes ([`repaint_checkpoint`]) and priced
+/// against `used_cells` across the recovery. `None` for a META that is empty or does not read
+/// as the handoff's meta (the session then lands on a blank engine and is re-keyed). Never a
+/// nonce, partial sequence or in-flight output state from it, whatever window sent it: the
+/// META is a sample from before the crash, not the moment of it.
 #[cfg(unix)]
 pub(crate) fn recovered_checkpoint(
     meta: &[u8],
@@ -7202,8 +7178,8 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                     frozen_path: crate::session_store::predates_path_self_heal(
                         manifest.outgoing_build,
                     ) || rec.frozen_path,
-                    // BROADCAST OPT-INS (round 23): the topic set rides the record,
-                    // validated on the way onto the fabric (`fabric::parse_topics`).
+                    // Broadcast opt-ins: the topic set rides the record, validated onto the
+                    // fabric (`fabric::parse_topics`).
                     topics: rec.topics.clone(),
                     // The foreground holder, off the record, so it arrives whatever rung the
                     // screen crossed at and whether or not the control carry did. A value that
@@ -7221,10 +7197,9 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                     // the screen crossed at, and whether or not the proof
                     // covers it, because a halt is not the screen's to lose.
                     holds: rec.hold_rows(),
-                    // THE RECORD'S TITLE (round four, item 8a), the fallback for
-                    // a checkpoint that carried none (`spawn::seed_adopted_title`)
-                    // — unless the layout names the session with a title its
-                    // park read, which replaces it below (round eight, U47).
+                    // The record's title, the fallback for a checkpoint that carried none
+                    // (`spawn::seed_adopted_title`), unless the layout names the session with
+                    // a title its park read, which replaces it below.
                     title: rec.title.clone(),
                     // Another supervisor's lease and the keyed escalations as the record
                     // carried them (read row by row at the seed, `seed_carried_claims`), and
@@ -7260,9 +7235,8 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                         keeper_ep: None,
                         mirror: None,
                     },
-                    // THE PAIR THE CRASH JOURNAL KEYS THE SHELL BY, when the
-                    // outgoing process held an image not its own (round
-                    // seven's leftover I2b); one that does not read is none.
+                    // The pair the crash journal keys the shell by, when the outgoing process
+                    // held an image not its own; one that does not read is none.
                     journal_key: rec
                         .journal_key
                         .as_deref()

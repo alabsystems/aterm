@@ -22,14 +22,11 @@
 //! descender; a cell too short to keep its words off a rail falls back to the face's
 //! underline ([`FindSeam::BottomUnderline`]).
 //!
-//! The middle row carries a real INPUT WELL — a recessed run of cells in the
-//! terminal's own background with the live query, a REVERSE-VIDEO block caret at the
-//! edit position (the terminal's own cursor idiom, so the caret costs no cell and the
-//! text never shifts as it moves), and a dim placeholder while empty. It reads — and
-//! behaves — like a text field: never narrower than [`MIN_FIELD`] cells, never wider
-//! than [`MAX_FIELD`], horizontally scrolled (with `‹`/`›` edge markers) to keep the
-//! caret in view, and — the invariant that matters while typing — of a width that
-//! depends on the WINDOW only, never on how wide the status text happens to be.
+//! The field row holds an input well with a block caret, between [`MIN_FIELD`] and
+//! [`MAX_FIELD`] cells wide, scrolled to keep the caret in view, and sized by the window
+//! alone. The `[Aa]` / `[.*]` toggles are clickable through [`FindBarPaint`]; on a narrow
+//! window they are dropped before the status readout, which goes below 49 columns. A failed
+//! search tints the query.
 //!
 //! A count is painted bare only when it is an exact census of the present screen. Two
 //! qualifiers survive at every width (the ladder drops the `i/` position, never the mark):
@@ -54,9 +51,13 @@
 //! controls, an on toggle in the accent. The cells keep every character for the
 //! text grid and stand in wherever no UI face is installed.
 //!
-//! A count is only ever painted bare when it is an exact census of the present
-//! screen. Two qualifiers say otherwise and survive at EVERY width — the ladder
-//! shortens by dropping the `i/` position, never the marker:
+//! * `+`: the total is a floor. Where there is room the bar names why: the depth cap
+//!   (`none in newest 100,000 lines`, `3/7+ (newest 100,000 lines)`; the limit is
+//!   `search_history_lines`), the match limit (`1/100000+ (match limit)`), a long line a
+//!   regex could not finish (`line cut short`) or a rewrap; otherwise `(partial history)`.
+//! * `…`: the terminal changed since the count was taken. The search is not re-run per PTY
+//!   batch (a full scan per burst on the UI thread), so the number can be wrong in either
+//!   direction until the next edit or ⌘S/⌘R. Spelled out as `(stale)`.
 //!
 //! While a width change's rewrap holds the history away, a zero-match is not a miss (the
 //! search reruns at the re-attach): no width says `no matches`, and the ladder runs from
@@ -81,9 +82,8 @@ use crate::tray_raster;
 use crate::type_scale::{StepPx, TypeStep};
 use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
 
-/// Rows the find panel occupies: a blank pad, the field row, the hints row. The
-/// splice shrinks the band on a terminal too short to hold it (see
-/// [`find_bar_paint`]).
+/// Rows the find panel occupies: a blank pad, the field row, the hints row (fewer on a
+/// terminal too short; see [`find_bar_paint`]).
 ///
 /// Windows drops the pad: there the panel is the compact two-line find box a
 /// Windows Terminal or VS Code user knows, and the pad read as an empty row
@@ -439,18 +439,11 @@ fn caret_ink(c: &BandColors) -> [u8; 3] {
 
 /// The keymap taught on the hints row, widest variant that fits first.
 ///
-/// `esc` is spelled out: U+238B (⎋) is a font-fallback lottery — it renders as blank in
-/// one monospace face and as a reload-looking circular arrow in another, which is worse
-/// than useless for the one key that gets you out.
-///
-/// PER PLATFORM, because a hint that names keys the keyboard does not have is
-/// worse than no hint — aterm's own ratified rule (`palette.rs` blanks its
-/// accelerator column off macOS because a ⌘ glyph "would MISLEAD", and `cli.rs`
-/// splits its KEYS help the same way). Off macOS the same commands answer to
-/// Ctrl+S / Ctrl+R (the emacs arms in `on_key_search_mode`, which always worked
-/// but were never taught) and the toggles to Alt+C / Alt+R (the VS Code find
-/// widget's chords; the seeded ⌥⌘ spelling is Win+Alt on Windows, where
-/// Win+Alt+R belongs to the Xbox Game Bar).
+/// `esc` is spelled out: U+238B (⎋) renders blank or as a reload arrow depending on the
+/// font. Per platform, because a hint naming keys the keyboard lacks is worse than none: off
+/// macOS the commands are Ctrl+S / Ctrl+R (the emacs arms in `on_key_search_mode`) and the
+/// toggles Alt+C / Alt+R (the VS Code chords; ⌥⌘ would be Win+Alt, and Win+Alt+R belongs to
+/// the Xbox Game Bar).
 ///
 /// Windows teaches F3 / Shift+F3, the find-next reflex of every Windows app (the
 /// find field answers them, `App::search_repeat_action`; Ctrl+S / Ctrl+R still
@@ -503,8 +496,7 @@ pub(crate) fn find_bar_paint(
 ) -> FindBarPaint {
     let c = chrome_band::band_colors(palette);
     let height = height.max(1);
-    // 3 rows: pad / field / hints. 2: field / hints. 1: field only — the pad is the
-    // first thing to go, the hints the second, the field never.
+    // 3 rows: pad / field / hints. 2: field / hints. 1: field only.
     let field_row = usize::from(height >= 3);
     let hint_row = (height >= 2).then_some(height - 1);
     let mut rows: Vec<Vec<RenderCell>> = (0..height)
@@ -589,17 +581,9 @@ pub(crate) fn find_bar_paint(
         );
     }
 
-    // ---- seam LAST: one unbroken rule on the content-facing edge, over text and all.
-    // ONE TONE as well as one run. The two branches used to be asymmetric — the
-    // underline named its colour, the overline did not — and an uncoloured rule falls
-    // back to each cell's own ink. At the full height that was invisible, because the
-    // top row is the blank pad and every cell of it is already `label`. It stops being
-    // invisible on the DEGRADED panel this builder deliberately supports: at 1 or 2
-    // rows the pad is the first thing dropped, so `seam_row` IS the field row, whose
-    // inks vary by construction (the bold `Find:` prompt, the well's query, `warn`
-    // across a failing one, and the reverse-video caret whose fg is the well's
-    // background). The rule would brighten under the prompt, turn red across a bad
-    // query, and go missing at the caret.
+    // ---- seam last: one unbroken rule on the content-facing edge, over the text, in one
+    // explicit tone. Uncoloured, a rule falls back to each cell's ink, which on a degraded
+    // 1-2 row panel (seam row = field row) varies under the prompt, the query and the caret.
     //
     // A rail is the splice's to draw: a pixel row is not a cell attribute, and the
     // underline it replaces ran through the hints' descenders five pixels above the
@@ -780,8 +764,7 @@ fn paint_well(
     let chars: Vec<char> = v.query.chars().collect();
     let cursor = v.cursor_chars().min(chars.len());
     let ink = query_ink(v, c);
-    // The caret can sit one past the last character, so the scrollable extent is
-    // `len + 1` even though only `len` cells carry a glyph.
+    // The caret can sit one past the last character, so the scrollable extent is `len + 1`.
     let max_start = (chars.len() + 1).saturating_sub(width);
     let scroll = cursor.saturating_sub(width - 1).min(max_start);
     let caret = caret_ink(c);
@@ -2256,8 +2239,7 @@ mod tests {
         assert_eq!(row[bad.field_cols.start].fg, c.warn, "bad regex ⇒ warn ink");
     }
 
-    /// The seam rides the content-facing edge of the BAND and runs EDGE TO EDGE —
-    /// applied after the text, so it is one rule rather than stubs around the glyphs.
+    /// The seam rides the content-facing edge and runs edge to edge.
     /// At the top it is the splice's rail by default: the builder then leaves every
     /// cell bare, so no underline crosses the hints' descenders.
     #[test]
@@ -2678,7 +2660,7 @@ mod tests {
                 }
             }
         }
-        // A degraded 1-row band keeps the FIELD (the pad and hints go first).
+        // A degraded 1-row band keeps the field (the pad and hints go first).
         let one = find_bar_paint(&view("kept"), 90, 1, Theme::default(), FindSeam::Top);
         assert_eq!(one.field_row, 0);
         assert!(text(&one.rows[0]).contains("kept"));

@@ -6367,9 +6367,7 @@ fn every_chain_and_scenario_of_the_pass_has_its_window_wants() {
     assert!(!wanted(Chain::LandQ, Scenario::L12));
 }
 
-// ---------------------------------------------------------------------------
 // THE RESIDUALS, LIVE (`--mode resid`, `--mode ladder`)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn the_residual_modes_pick_their_chains_and_script_them() {

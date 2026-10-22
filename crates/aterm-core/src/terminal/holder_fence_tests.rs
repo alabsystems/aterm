@@ -525,7 +525,7 @@ impl Sim {
             }
             1 => {
                 let mut b = self.pen();
-                b.extend_from_slice(self.rng.pick(&corpora().lines));
+                b.extend_from_slice(self.rng.pick::<Vec<u8>>(&corpora().lines));
                 b
             }
             _ => self.glyphs(n),

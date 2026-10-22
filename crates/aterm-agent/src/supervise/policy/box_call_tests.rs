@@ -4,7 +4,9 @@
 //! [`drew`] over what Claude Code 2.1.300 really wrote while its box stood
 //! (MEASURED 2026-10-15 against the real-Claude lab's stub, scratch paths
 //! replaced by `/private/tmp/at.F1`): the Edit tool's call waiting on its
-//! `Edit file` box, and a Bash `sed -i` drawn as that same box.
+//! `Edit file` box, and a Bash `sed -i` drawn as that same box. And
+//! [`pending_calls`] over 2.1.308's first turns (MEASURED 2026-10-22), whose
+//! call row the file holds before its prompt row.
 
 use std::path::Path;
 
@@ -81,7 +83,7 @@ fn with(jsonl: &str, rows: &[String]) -> String {
 }
 
 /// The transcripts read as the calls waiting: the Edit alone (its Read was
-/// answered), and the sed, which names no file.
+/// answered), and the sed, which names no file but its command.
 #[test]
 fn the_captured_transcripts_name_the_call_each_box_waits_on() {
     assert_eq!(
@@ -90,15 +92,22 @@ fn the_captured_transcripts_name_the_call_each_box_waits_on() {
             id: EDIT_ID.to_string(),
             tool: "Edit".to_string(),
             file: Some("/private/tmp/at.F1/proj/notes.txt".to_string()),
+            command: None,
         }]
     );
+    let sed = pending_calls(SED_PENDING);
     assert_eq!(
-        pending_calls(SED_PENDING),
-        [PendingCall {
-            id: SED_ID.to_string(),
-            tool: "Bash".to_string(),
-            file: None,
-        }]
+        sed.iter()
+            .map(|c| (c.id.as_str(), c.tool.as_str(), c.file.as_deref()))
+            .collect::<Vec<_>>(),
+        [(SED_ID, "Bash", None)]
+    );
+    assert!(
+        sed[0]
+            .command
+            .as_deref()
+            .is_some_and(|c| c.starts_with("sed -i") && c.contains("notes.txt")),
+        "{sed:?}"
     );
 }
 
@@ -310,5 +319,160 @@ fn a_box_path_names_the_file_whose_components_it_ends() {
         ("", "/p/notes.txt", None, false),
     ] {
         assert_eq!(names(shown, file, home), named, "{shown} vs {file}");
+    }
+}
+
+/// A fresh session's first turn as 2.1.308 wrote it (the real-Claude lab
+/// `b3p1`, 2026-10-22): the Edit call of notes.txt waiting on its box, its
+/// assistant row written BEFORE the prompt row `toolstart @notes.txt` and
+/// the attachment rows its `parentUuid` chain runs up through.
+const FIRST_EDIT: &str =
+    include_str!("../fixtures/claude-2.1.308-transcript-first-turn-edit-pending.jsonl");
+/// The same for a Write call of a new file, under the prompt `toolstart`.
+const FIRST_WRITE: &str =
+    include_str!("../fixtures/claude-2.1.308-transcript-first-turn-write-pending.jsonl");
+/// [`FIRST_EDIT`]'s box, read while it stood.
+const FIRST_EDIT_BOX: &str = include_str!("fixtures/claude-2.1.308-box-edit-first-turn.txt");
+
+/// The value of `key` on the row of `jsonl` holding `marker`.
+fn field_of(jsonl: &str, marker: &str, key: &str) -> String {
+    let row = jsonl
+        .lines()
+        .find(|l| l.contains(marker))
+        .unwrap_or_else(|| panic!("the row with {marker}"));
+    aterm_json::from_str::<Value>(row)
+        .expect("a row")
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{key}"))
+        .to_string()
+}
+
+/// A FIRST TURN'S CALL WRITTEN BEFORE ITS OWN PROMPT ROW STILL WAITS
+/// (MEASURED 2026-10-22, 2.1.308): in [`FIRST_EDIT`] and [`FIRST_WRITE`]
+/// the prompt row follows the call's row in the file, but it is the call's
+/// own ancestor, so the call is the one waiting, naming its file. Read in
+/// the file's order (the reader before breaker-3, the measured note's
+/// mutant M8) both files name no call. The Edit's box, read while it
+/// stood, takes the call as its candidate ([`drew`]) and the transcript
+/// does not lag ([`lagging`]). No decision reads that candidate today (the
+/// module docs): this pins the reader both lanes share.
+///
+/// NEGATIVE CONTROLS: a later prompt (a constructed row whose parent is the
+/// call's row) ends the call; the call row's chain cut (its `parentUuid` a
+/// uuid the tail does not hold) cannot show the prompt is its own, and the
+/// prompt written after it ends it; the call's result, written anywhere,
+/// answers it.
+#[test]
+fn a_first_turns_call_written_before_its_prompt_row_still_waits() {
+    for (jsonl, tool, marker, file) in [
+        (
+            FIRST_EDIT,
+            "Edit",
+            "\"name\":\"Edit\"",
+            "/private/tmp/at.gRGO/proj/notes.txt",
+        ),
+        (
+            FIRST_WRITE,
+            "Write",
+            "\"name\":\"Write\"",
+            "/private/tmp/at.gRGO/proj/new-4.txt",
+        ),
+    ] {
+        let rows: Vec<&str> = jsonl.lines().collect();
+        let call_at = rows
+            .iter()
+            .position(|l| l.contains(marker))
+            .expect("the call row");
+        let prompt_at = rows
+            .iter()
+            .position(|l| l.contains("\"type\":\"user\""))
+            .expect("the prompt row");
+        assert!(
+            prompt_at > call_at,
+            "{tool}: the prompt row follows the call"
+        );
+        let id = field_of(jsonl, marker, "uuid");
+        let pending = pending_calls(jsonl);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|c| (c.tool.as_str(), c.file.as_deref(), c.command.as_deref()))
+                .collect::<Vec<_>>(),
+            [(tool, Some(file), None)],
+            "{tool}"
+        );
+        let call_id = pending[0].id.clone();
+        // NEGATIVE CONTROLS
+        let later = format!(
+            r#"{{"parentUuid":"{id}","isSidechain":false,"type":"user","message":{{"role":"user","content":"and then"}},"uuid":"00000000-0000-4000-8000-00000000p003"}}"#
+        );
+        assert!(pending_calls(&with(jsonl, &[later])).is_empty(), "{tool}");
+        let parent = field_of(jsonl, marker, "parentUuid");
+        let cut = jsonl.replacen(
+            &format!("\"parentUuid\":\"{parent}\""),
+            "\"parentUuid\":\"00000000-0000-4000-8000-0000000c0002\"",
+            1,
+        );
+        assert_ne!(cut, jsonl);
+        assert!(
+            pending_calls(&cut).is_empty(),
+            "{tool}: {:?}",
+            pending_calls(&cut)
+        );
+        let answered = format!("{}\n{jsonl}", result_row(&call_id));
+        assert!(pending_calls(&answered).is_empty(), "{tool}");
+    }
+    let edit = box_of(FIRST_EDIT_BOX, |_| {});
+    let pending = pending_calls(FIRST_EDIT);
+    assert!(!lagging(&edit, &pending, &[]));
+    assert_eq!(
+        drew(&edit, &pending, &[], None).map(|c| c.tool),
+        Some("Edit".to_string())
+    );
+}
+
+/// A CALL ROW WITH NO `uuid` IS ENDED BY ANY LATER PROMPT ([`pending_calls`]):
+/// no `parentUuid` chain can show a later prompt is its own, so a user row
+/// with no result written after it ends it, the prompt with a `uuid` of its
+/// own or without one; and it ends no call written after it.
+///
+/// NEGATIVE CONTROLS: with no prompt after it, or the prompt written before
+/// it, the call waits.
+#[test]
+fn a_call_row_with_no_uuid_is_ended_by_a_later_prompt() {
+    let call = r#"{"isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_lab00000000nouuid","name":"Edit","input":{"file_path":"/p/notes.txt","old_string":"a","new_string":"b"}}]}}"#.to_string();
+    let prompts = [
+        r#"{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"and then"},"uuid":"00000000-0000-4000-8000-00000000p009"}"#.to_string(),
+        r#"{"isSidechain":false,"type":"user","message":{"role":"user","content":"and then"}}"#.to_string(),
+    ];
+    for prompt in &prompts {
+        assert!(
+            pending_calls(&with("", &[call.clone(), prompt.clone()])).is_empty(),
+            "{prompt}"
+        );
+    }
+    // NEGATIVE CONTROLS
+    let waiting = |jsonl: String| {
+        pending_calls(&jsonl)
+            .into_iter()
+            .map(|c| (c.id, c.tool, c.file))
+            .collect::<Vec<_>>()
+    };
+    let edit = (
+        "toolu_lab00000000nouuid".to_string(),
+        "Edit".to_string(),
+        Some("/p/notes.txt".to_string()),
+    );
+    assert_eq!(
+        waiting(with("", std::slice::from_ref(&call))),
+        std::slice::from_ref(&edit)
+    );
+    for prompt in &prompts {
+        assert_eq!(
+            waiting(with("", &[prompt.clone(), call.clone()])),
+            std::slice::from_ref(&edit),
+            "{prompt}"
+        );
     }
 }

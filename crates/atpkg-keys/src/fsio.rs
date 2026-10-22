@@ -150,9 +150,7 @@ fn stage_sibling_temp_with_mode(path: &str, bytes: &[u8], mode: u32) -> std::io:
         ]);
         #[cfg(test)]
         window::reached("temp name drawn", &tmp);
-        // A pid is reused across reboots, so a name collision with a dead run's litter is
-        // possible; take the next sequence number rather than failing on someone else's
-        // corpse.
+        // A pid is reused, so a dead run's litter can collide: take the next sequence number.
         match std::fs::OpenOptions::new()
             .append(true)
             .create_new(true)

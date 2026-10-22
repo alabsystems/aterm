@@ -101,20 +101,17 @@ pub fn atpkg_index_shared_handoff_model() -> Model {
     }
 }
 
-/// The GUI package lane owns at most one asynchronous index probe across park
-/// slices. A positive HEAD may be offered while the probe's other HEAD is still
-/// out; its final answer cannot offer that same build twice. A
-/// vendor completion may be chosen while the probe is still running; an index
-/// answer already offered at the decision point wins over the vendor.
-/// A vendor answer harvested in that same slice survives the index, bump, or
-/// full-pass priority choice until the next park can deliver or recheck it.
-/// A bump and an expired full-pass deadline win before either hint. `NextPark`
-/// keeps an unfinished worker owned after a targeted pass. A full seed/update
-/// pass invalidates the in-flight final answer without releasing its worker slot.
-/// A higher near HEAD arriving after that pass may wake another signed pass.
-/// Thread pressure cannot turn a failed vendor helper spawn into a blocking GET,
-/// whether or not the index answer is outstanding. Tier-1 drives the real
-/// worker handle, package park, and vendor spawn-failure path.
+/// The GUI package lane owns at most one asynchronous index probe across park slices. A
+/// positive HEAD may be offered while the other HEAD is still out, and the final answer cannot
+/// offer that build twice. A vendor completion may be chosen while the probe runs; an index
+/// answer already offered at the decision point wins over the vendor. A vendor answer harvested
+/// in the same slice survives the index, bump or full-pass choice until the next park can
+/// deliver or recheck it. A bump and an expired full-pass deadline win before either hint.
+/// `NextPark` keeps an unfinished worker owned after a targeted pass. A full seed/update pass
+/// invalidates the in-flight final answer without releasing its worker slot; a higher near HEAD
+/// arriving after that pass may wake another signed pass. Thread pressure cannot turn a failed
+/// vendor helper spawn into a blocking GET. Tier 1 drives the real worker handle, package park
+/// and vendor spawn-failure path.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_index_pending_park_model() -> Model {
@@ -292,20 +289,10 @@ pub fn atpkg_index_pending_park_model() -> Model {
 /// bypasses an old stamp immediately. Tier-1 drives `atpkg::index_probe::probe_next` and
 /// its real lock/stamp file.
 ///
-/// Until 2026-09-23 a second locked range (`floor + 3`, `floor + 4`, every five minutes)
-/// also fetched an anonymous Releases listing when its HEADs missed, and a rate-limited
-/// listing stamped an hour (`ProbeRateLimited`, marker 4). Every cooldown held, so nothing
-/// here was violated, yet in the steady state that listing ran every five minutes on every
-/// machine (audit PK-2): a request budget, not a cooldown. It is gone with its action and
-/// its range (owner ruling R3; the publisher's contiguous index builds left the far range
-/// nothing to find). That the probe spends no metered request is a fact of the code, whose
-/// only transport is the HEAD, not a property of this model; `atpkg::index_probe`'s tests
-/// pin it with a recording transport over a hundred steady-state ticks.
-///
-/// `Buggy=1` admits a second lock owner and a second attempt inside its cooldown,
-/// lengthens the published cooldown to five minutes, and shortens the error cooldown to
-/// one tick. Each invariant has its own counterexample: mutual exclusion alone is
-/// insufficient to prevent duplicate work after the first owner releases the lock.
+/// `Buggy = 1` admits a second lock owner and a second attempt inside its cooldown, lengthens
+/// the published cooldown to five minutes and shortens the error cooldown to one tick. Each
+/// invariant has its own counterexample: mutual exclusion alone does not prevent duplicate work
+/// after the first owner releases the lock.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_index_probe_cooldown_model() -> Model {
@@ -404,11 +391,11 @@ pub fn atpkg_index_probe_cooldown_model() -> Model {
     }
 }
 
-/// The probe's two HEADs — `floor + 1` (Low) and `floor + 2` (High) — are aggregated
-/// after both have had their chance to run. A published higher build wins over an
-/// earlier lower build and over uncertainty; `Missing` is valid only when both HEADs
-/// really answered missing. `Buggy=1` replays the old first-hit and false-missing
-/// behavior. Tier-1 drives `atpkg::index_probe::successor_with` over real HEAD answers.
+/// The probe's two HEADs, `floor + 1` (Low) and `floor + 2` (High), are aggregated after both
+/// have had their chance to run. A published higher build wins over an earlier lower one and
+/// over uncertainty; `Missing` only when both HEADs answered missing. `Buggy = 1` takes the
+/// first hit and answers missing over uncertainty. Tier 1 drives
+/// `atpkg::index_probe::successor_with` over real HEAD answers.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_index_successor_selection_model() -> Model {
@@ -461,11 +448,10 @@ pub fn atpkg_index_successor_selection_model() -> Model {
     }
 }
 
-/// The GUI keeps the highest index a full pass did not land. A lower hint from
-/// an unstamped near range cannot replay an older pass while the farther range
-/// is stamped. The model describes the decisions, with the caller's minute
-/// cadence projected by Tier-1 rather than duplicated here. `Buggy=1` restores
-/// equality-only suppression and lowers the mark on a late failed pass.
+/// The GUI keeps the highest index a full pass did not land. A lower hint from an unstamped
+/// near range cannot replay an older pass while the farther range is stamped. The caller's
+/// minute cadence is projected by Tier 1, not modeled. `Buggy = 1` suppresses on equality only
+/// and lowers the mark on a late failed pass.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_index_wake_highwater_model() -> Model {

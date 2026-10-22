@@ -1762,7 +1762,12 @@ mod imp {
         Ok(file)
     }
 
-    /// Open the retained READ guard for an artifact.
+    /// Open a retained read guard for an artifact. Unlike the write and directory guards it
+    /// shares `FILE_SHARE_DELETE`: Windows checks sharing both ways, and a live write guard holds
+    /// `DELETE_ACCESS` for its whole life (it publishes and rolls back through it), so a mask
+    /// without DELETE fails with ERROR_SHARING_VIOLATION on an artifact this process still holds.
+    /// Dropping DELETE from the write guard after publication is no fix: `remove_exact` rolls back
+    /// through that retained guard.
     ///
     /// This share mask used to omit `FILE_SHARE_DELETE`, so a live read guard
     /// ALSO denied delete/rename of that exact file to every other opener. That
@@ -2589,20 +2594,12 @@ mod imp {
                     // swapped before this open. Delete only what provably
                     // sits inside the retained directory.
                     ensure_direct_child(self.leaf(), &file)?;
-                    // `open_disposable` carries FILE_FLAG_BACKUP_SEMANTICS so a
-                    // reparse point can be unlinked WITHOUT being followed —
-                    // which also lets a real directory open, and
-                    // `FileDispositionInfo` will happily delete an empty one.
-                    // Unix removes with `unlinkat` and NO `AT_REMOVEDIR`, so a
-                    // directory there answers EISDIR and survives. Two backends
-                    // of one abstraction stating different contracts is itself
-                    // the defect: a file-scoped cleanup must never destroy a
-                    // directory a same-uid actor parked on an artifact name, and
-                    // these callers are exactly the best-effort rollback paths
-                    // (`write_snapshot_artifacts`, video/image publication) that
-                    // run on names outside this process's control. A directory
-                    // SYMLINK/junction stays removable — that is a link, and
-                    // `unlinkat` removes it too.
+                    // `open_disposable` carries FILE_FLAG_BACKUP_SEMANTICS so a reparse point is
+                    // unlinked without being followed, which also opens a real directory that
+                    // `FileDispositionInfo` would delete if empty. Refuse it, as Unix `unlinkat`
+                    // without `AT_REMOVEDIR` does: these rollback paths run on names this process
+                    // does not control. A directory symlink or junction is a link and stays
+                    // removable.
                     let metadata = file.metadata()?;
                     if metadata.is_dir()
                         && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0

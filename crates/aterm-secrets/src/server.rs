@@ -227,6 +227,10 @@ pub fn serve(options: Options) -> crate::Result<()> {
         options.store.display(),
         running.addr
     ));
+    let unheld = unheld_note(&running.shared.lock_server_state(), &options.pins);
+    if let Some(line) = unheld {
+        note(&line);
+    }
     let children = Children::default();
     if options.keep_awake {
         children.keep_awake();
@@ -581,6 +585,28 @@ fn now() -> u64 {
 /// A line for the server's log (stderr). Names, seqs and fingerprints only.
 fn note(line: &str) {
     eprintln!("aterm secrets serve: {line}");
+}
+
+/// What [`serve`] logs at start when its store holds no vault yet (a new server, or one moved
+/// to another Mac): a machine that asks to join finds none until an admin Mac puts its copy
+/// here, as any admin command there does (`client::admin_open`), and a first version comes
+/// from another Mac only for a name `pins` covers ([`refuse_unheld`]). `None` once it holds one.
+fn unheld_note(state: &State, pins: &[(String, [u8; 32])]) -> Option<String> {
+    if !state.vaults.is_empty() {
+        return None;
+    }
+    let from = if pins.is_empty() {
+        "only from this Mac, since no --pin names a vault".to_string()
+    } else {
+        let names: Vec<&str> = pins.iter().map(|(name, _)| name.as_str()).collect();
+        format!(
+            "from this Mac, or from another for a vault this server pins ({})",
+            names.join(", ")
+        )
+    };
+    Some(format!(
+        "the store holds no vault yet: an admin Mac puts its copy here (any aterm secrets admin command there does), and until then a machine that asks to join finds none; a first version is taken {from}"
+    ))
 }
 
 /// Read the store: every `<name>.vault` that parses and verifies, every `<name>.joins` line
@@ -2241,6 +2267,35 @@ mod tests {
 
         // The same envelope again is done, not refused.
         put(&running, &first).expect("idempotent");
+        running.stop();
+    }
+
+    /// A server whose store holds no vault yet says so in its log at start: a joining machine
+    /// finds none until an admin Mac puts its copy here, which another Mac can do only for a
+    /// vault the server pins. A store that holds one says nothing.
+    #[test]
+    fn a_store_that_holds_no_vault_says_an_admin_mac_puts_its_copy_here() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&options(
+            &root.path().join("served"),
+            Duration::from_millis(200),
+        ));
+        let pins = [("alab".to_string(), OLD)];
+        let unheld =
+            |pins: &[(String, [u8; 32])]| unheld_note(&running.shared.lock_server_state(), pins);
+        let pinned = unheld(&pins).expect("an empty store says so");
+        assert!(
+            pinned.contains("an admin Mac puts its copy here"),
+            "{pinned}"
+        );
+        assert!(
+            pinned.contains("a vault this server pins (alab)"),
+            "{pinned}"
+        );
+        let unpinned = unheld(&[]).expect("an empty store says so");
+        assert!(unpinned.contains("only from this Mac"), "{unpinned}");
+        put(&running, &envelope(&OLD, 1)).expect("trusted on first use");
+        assert_eq!(unheld(&pins), None);
         running.stop();
     }
 

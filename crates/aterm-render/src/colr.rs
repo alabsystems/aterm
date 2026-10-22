@@ -848,12 +848,9 @@ pub(crate) fn rasterize_colr_run(
         });
         face.paint_color_glyph(gid, 0, fg, &mut canvas)?;
     }
-    // The blend accumulator stored PREMULTIPLIED rgb — each layer composited over a
-    // transparent start yields rgb = color·alpha — but `GlyphImage::Rgba` is blitted
-    // as STRAIGHT alpha (blit_rgba_* do bg·(1−a) + rgb·a, like the PNG color-emoji
-    // path). Un-premultiply so a partially-transparent COLR layer is not darkened
-    // twice (rendered at ~a² instead of a). Fully-opaque/transparent pixels are
-    // already correct (×1 / rgb=0), so skip them — the opaque case stays byte-exact.
+    // The accumulator holds premultiplied rgb, but `GlyphImage::Rgba` blits as straight
+    // alpha (like the PNG emoji path); un-premultiply so a translucent layer is not
+    // darkened twice (a² instead of a).
     let mut buf = canvas.buf;
     unpremultiply_straight(&mut buf);
     Some(buf)

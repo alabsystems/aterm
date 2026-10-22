@@ -249,11 +249,9 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
                     BorrowedFd::borrow_raw(commit_read),
                 )
             };
-            // Handed back and dropped once the claim returned. (The real
-            // outgoing process drops it the instant the grant is sent —
-            // `app_update_handoff`, "From here the successor holds copies of
-            // everything"; that ordering is pinned by handoff_rendezvous's
-            // `a_grant_whose_connection_closes_at_once_is_still_claimed`.)
+            // Handed back and dropped once the claim returned; the real outgoing process drops
+            // it as soon as the grant is sent (pinned by handoff_rendezvous's
+            // `a_grant_whose_connection_closes_at_once_is_still_claimed`).
             let granted = peer.transfer(&staged.nonce, &sessions, ready, commit, deadline, None);
             Ok::<_, crate::handoff_rendezvous::RendezvousError>((peer, granted))
         });
@@ -1021,7 +1019,7 @@ fn the_hint_never_reaches_the_adoption_proof() {
     assert!(!model.check_invariant("HintNotInProof", &to));
 }
 
-/// A FORK-LANE SUCCESSOR MAKES ROOM FOR THE SESSIONS IT ADOPTS (ATERM-KI-1015-2,
+/// A FORK-LANE SUCCESSOR MAKES ROOM FOR THE SESSIONS IT ADOPTS (
 /// U9). A successor forked by a producer that never raised its soft descriptor
 /// limit — any build before round eight's park raise, started from the Dock at
 /// launchd's 256 — inherits that limit, and each session it adopts then costs

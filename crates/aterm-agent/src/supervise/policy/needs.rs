@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TWO REPORT LINES THE TURN-END POLICY READS BY THEIR HEAD (FOREVER CRUISE /
-//! FOREVER LAND, owner direction 2026-10-19): a line starting [`NEEDS_YOU`]
+//! TWO REPORT LINES THE TURN-END POLICY READS BY THEIR HEAD (Autopilot Cruise /
+//! Autopilot Land, owner direction 2026-10-19): a line starting [`NEEDS_YOU`]
 //! names what only a person can give, and a line starting [`NOTHING_LEFT`]
 //! opens the worker's defense that nothing is left to do.
 //!
@@ -10,9 +10,13 @@
 //!   nothing after it takes the list items under it, one need each, or with
 //!   no list the paragraph under it, and with neither it still names a need
 //!   ([`UNREAD_NEED`]): a head the reader cannot turn into `nothing` never
-//!   lets a defense land. A head with words takes the list right under it
-//!   too ([`items_under`]), even where its words say none (`NEEDS YOU: none`
-//!   over `- the signing key`). `NEEDS YOU: nothing` (or `none`) says none
+//!   lets a defense land. A head whose words name a need is that one need:
+//!   the list under it is the report's own (the lab stub's tall reply,
+//!   `NEEDS YOU: rotate the deploy key` over 80 `- check <n> passed` rows,
+//!   was read as 80 needs before). Words ending in a colon introduce the list
+//!   right under them ([`items_under`]), its items the needs, and a head
+//!   whose words say none takes that list too (`NEEDS YOU: none` over `- the
+//!   signing key`, FAIL TOWARD A KEPT NEED). `NEEDS YOU: nothing` (or `none`) says none
 //!   stands ([`says_no_needs`]) only where every word of it is accounted for
 //!   ([`none_said`]: FAIL TOWARD A KEPT NEED): a none, the words it negates
 //!   (`nothing needed from you`, `none at the moment`), and clauses that
@@ -1393,11 +1397,13 @@ fn mid_head<'a>(row: &'a str, above: &str) -> Option<(usize, &'a str)> {
     })
 }
 
-/// THE LIST RIGHT UNDER A HEAD WITH WORDS ON ITS LINE (the head at row
-/// `head`, its list from row `i`): each item one need or none
-/// ([`NeedLines::said`]). The items of a head whose own words say none are
-/// read too: `NEEDS YOU: none` over `- the signing key` names the key (FAIL
-/// TOWARD A KEPT NEED). No blank row comes between, except where the head's
+/// THE LIST RIGHT UNDER A HEAD WITH WORDS ON ITS LINE THAT NAME NO NEED OF
+/// THEIR OWN (the head at row `head`, its list from row `i`): words that end in
+/// a colon (`NEEDS YOU: two things:`), whose items are the needs, or words that
+/// say none, whose items are read too: `NEEDS YOU: none` over `- the signing
+/// key` names the key (FAIL TOWARD A KEPT NEED). A head that names its need is
+/// that one need: the list under it is the report's. Each item one need or
+/// none ([`NeedLines::said`]). No blank row comes between, except where the head's
 /// words end in a colon (`NEEDS YOU: two things:`); a head that is itself a
 /// list item takes only the items indented under it, never its siblings;
 /// another head, a fence or a row that is no list item ends the list. The
@@ -1559,9 +1565,13 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>) -> NeedLines {
             continue;
         }
         // A head with its words on its line: they, its wrapped rows joined,
-        // say none or name a need, and so does each item of the list right
-        // under it ([`items_under`]); words that end in a colon over a list
-        // only introduce it.
+        // say none or name ONE need, the line's own (one need a line, the
+        // contract `aterm help` and the agent brief state); the list under a
+        // need is the report's, never more needs (the lab stub's tall reply:
+        // `NEEDS YOU: rotate the deploy key` over 80 `- check <n> passed`
+        // rows, read before as 80 needs). Words that end in a colon over a
+        // list only introduce it, and its items are the needs; a none over a
+        // list reads the list too, FAIL TOWARD A KEPT NEED ([`items_under`]).
         let mut words = rest.to_string();
         while let Some(&next) = rows.get(i).filter(|next| wraps(&words, next)) {
             words.push(' ');
@@ -1570,14 +1580,18 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>) -> NeedLines {
             i += 1;
         }
         let colon = words.trim_end().ends_with(':');
-        if !colon {
+        if colon {
+            let (next, items) = items_under(&rows, (head, i), true, &mut out, by);
+            if items == 0 {
+                out.said(head, &words, by);
+            }
+            i = next;
+        } else if none_said(&words, by).is_some() {
+            out.said(head, &words, by);
+            i = items_under(&rows, (head, i), false, &mut out, by).0;
+        } else {
             out.said(head, &words, by);
         }
-        let (next, items) = items_under(&rows, (head, i), colon, &mut out, by);
-        if colon && items == 0 {
-            out.said(head, &words, by);
-        }
-        i = next;
     }
     out
 }

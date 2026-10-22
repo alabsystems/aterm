@@ -321,9 +321,7 @@ fn gpu_hdr_off_never_boosts() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The HDR crown's per-fragment white boost
-// ---------------------------------------------------------------------------
 
 /// One rainbow-kitty palette mark as the crown sees it: the premultiplied
 /// colour and its composited coverage.

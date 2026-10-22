@@ -52,8 +52,8 @@ pub(crate) fn serve(
     }
 
     // The off marker (design §3.1): no sheet when it exists or cannot be
-    // checked. Read synchronously on the lane; no control verb writes it, and
-    // the owner's Settings button is still planned.
+    // checked. Read synchronously on the lane; no control verb writes it, only
+    // the owner's switch in Settings ▸ Security.
     if crate::askpass::relay_off() {
         return public_reply("ERR askpass refused off\n");
     }

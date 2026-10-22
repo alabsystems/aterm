@@ -82,9 +82,7 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
     r
 }
 
-// ---------------------------------------------------------------------------
 // The argv builders. Pure, so each is a unit test.
-// ---------------------------------------------------------------------------
 
 /// `targo --unverified test <scope> --no-fail-fast --tests --no-run` — the test
 /// compile row's one child and the test stage's first: compile every test target
@@ -118,7 +116,7 @@ pub fn test_compile_args(scope: &Scope) -> Vec<String> {
     a
 }
 
-/// `targo --unverified test <scope> --no-fail-fast --tests` — the second child,
+/// `targo --unverified test <scope> --no-fail-fast --tests`: the second child,
 /// run only when the first compiled: every lib, bin and integration test target
 /// with `test = true` ([`TEST_TARGETS`], the first child's), no doctests (the
 /// doctests stage runs those) and no examples or benches. The measurement
@@ -190,51 +188,62 @@ fn test_base_args(scope: &Scope) -> Vec<String> {
     a
 }
 
-/// `targo --unverified test --doc <selection> --no-fail-fast` — the only
-/// doctest runner (the test stage runs no doctests), over `selection`
-/// ([`doctest_selection`]): `-p` for each of the selection's crates whose docs
-/// hold a Rust code block, each a rustdoc pass of its own, so a crate with no
-/// doctest is left out rather than walked. `--no-fail-fast` for the reason
-/// [`test_compile_args`] gives.
+/// `targo --unverified test --doc <scope> --no-fail-fast` — the only doctest
+/// runner (the test stage runs no doctests), over the test compile's own
+/// selection ([`Scope::args`]), never a narrower one: cargo resolves features
+/// over what a command selects, so the doctests then link the very units the
+/// test compile built instead of rebuilding their own ([`crate::docdriver`] has
+/// the measurement). Which of those libraries rustdoc reads is
+/// [`doctest_split`]'s, applied by the doc driver's stand-in. `--no-fail-fast`
+/// for the reason [`test_compile_args`] gives.
 #[must_use]
-pub fn doctest_args(selection: &[String]) -> Vec<String> {
+pub fn doctest_args(scope: &Scope) -> Vec<String> {
     let mut a = vec![
         "--unverified".to_string(),
         "test".to_string(),
         "--doc".to_string(),
     ];
-    a.extend(selection.iter().cloned());
+    a.extend(scope.args());
     a.push("--no-fail-fast".to_string());
     a
 }
 
-/// The doctests' selection: `-p <crate>` for each of the selection's crates with
-/// a library whose sources hold a doctest ([`crate::docscan`], which fails wide).
-/// The workspace is every `crates/*` member. FAILS WIDE here too: a crate this
-/// walk cannot find is kept, and a workspace whose members it cannot list is the
-/// plain scope. Empty when no crate has a doctest.
+/// The scope's libraries by whether rustdoc reads them ([`doctest_split`]),
+/// each list by package name, sorted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DocSplit {
+    /// The libraries whose sources hold a doctest, or that the scan could not
+    /// read or find ([`crate::docscan`] fails wide).
+    pub run: Vec<String>,
+    /// The libraries whose sources hold none: cargo still builds each (with
+    /// the features the test compile resolved), and the stand-in skips its pass
+    /// ([`crate::docdriver`]).
+    pub skip: Vec<String>,
+}
+
+/// The doctests' split of the scope's libraries: each member with a lib whose
+/// sources hold a doctest runs, each whose sources the scan proves hold none is
+/// skipped. The workspace is every `crates/*` member. FAILS WIDE here too: a
+/// crate this walk cannot find runs, and a workspace whose members it cannot
+/// list is `None`, every library running. `run` is empty when no crate has a
+/// doctest.
 #[must_use]
-pub fn doctest_selection(ctx: &Ctx) -> Vec<String> {
+pub fn doctest_split(ctx: &Ctx) -> Option<DocSplit> {
     let dirs = workspace_member_dirs(&ctx.root);
-    let names: Vec<String> = match &ctx.scope {
-        Scope::Workspace if dirs.is_empty() => return ctx.scope.args(),
+    let mut names: Vec<String> = match &ctx.scope {
+        Scope::Workspace if dirs.is_empty() => return None,
         Scope::Workspace => dirs.iter().map(|(name, _)| name.clone()).collect(),
         s => s.crates().to_vec(),
     };
-    let mut keep: Vec<String> = names
-        .into_iter()
-        .filter(|name| crate::changed::crate_dir_has_lib(&ctx.root, name))
-        .filter(|name| {
-            dirs.iter()
-                .find(|(n, _)| n == name)
-                .is_none_or(|(_, dir)| crate::docscan::src_holds_a_doctest(&dir.join("src")))
-        })
-        .collect();
-    keep.sort();
-    keep.dedup();
-    keep.into_iter()
-        .flat_map(|c| ["-p".to_string(), c])
-        .collect()
+    names.retain(|name| crate::changed::crate_dir_has_lib(&ctx.root, name));
+    names.sort();
+    names.dedup();
+    let (run, skip) = names.into_iter().partition(|name| {
+        dirs.iter()
+            .find(|(n, _)| n == name)
+            .is_none_or(|(_, dir)| crate::docscan::src_holds_a_doctest(&dir.join("src")))
+    });
+    Some(DocSplit { run, skip })
 }
 
 /// Every workspace member under `<root>/crates`, by package name, with its
@@ -688,9 +697,7 @@ pub fn libc_oracle_not_run_reason(run: &exec::Run) -> Option<String> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // Shared shapes
-// ---------------------------------------------------------------------------
 
 /// Run, print what the child said, and decide. Returns whether the child ran and
 /// passed.
@@ -881,13 +888,11 @@ const fn doc_driver_from(
     }
 }
 
-// ---------------------------------------------------------------------------
 // The test stage: its `--no-run` compile (a fingerprint check after the test
 // compile row, which runs the same child at t0), then the `--tests` run if that
 // compiled ([`crate::testrun`]). No doctests, so no doc-driver diagnosis;
 // trustdoc is still bound when the stage2 has one, so both rows share one
 // environment.
-// ---------------------------------------------------------------------------
 
 /// The doc-driver binding the test children share, and the label suffix that
 /// names it: the stage2's trustdoc when it has one, the caller's own export,
@@ -966,9 +971,8 @@ pub fn not_run_behind(r: &mut Report, what: &str, because: &str) {
 }
 
 /// Build what a stage drives, in the main target: `true` when it built. When it
-/// did not, the build's own row and, behind it, a COULD NOT RUN row for `drive`
-/// ([`not_run_behind`]); only one row when the machine refused the build, which
-/// is COULD NOT RUN already.
+/// did not, the build's own row and, behind it, a could-not-run row for `drive`
+/// ([`not_run_behind`]); only one row when the machine refused the build.
 fn build_to_drive(
     ctx: &Ctx,
     r: &mut Report,
@@ -1028,12 +1032,10 @@ fn test(ctx: &Ctx, r: &mut Report) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The measuring rows ([`measuring_args`]), run exclusively because their
 // verdicts depend on machine load, and never demoted, since the paint and spin
 // rows launch the aterm they judge. The suites are handed the release bundle
 // (`--app <APP>`): the bytes the release signs, never a build of the run's own.
-// ---------------------------------------------------------------------------
 
 /// Why a `measure` stage handed no bundle ran nothing, and the fix.
 pub const NO_APP: &str = "(no release bundle to judge — fix: pass --app <path to aterm.app>)";
@@ -1169,9 +1171,7 @@ fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Doctests
-// ---------------------------------------------------------------------------
 fn doctests(ctx: &Ctx, r: &mut Report) {
     if !ctx.tools.have_targo() {
         r.skip("targo test --doc (no targo)");
@@ -1193,41 +1193,140 @@ fn doctests(ctx: &Ctx, r: &mut Report) {
         ));
         return;
     }
-    let selection = doctest_selection(ctx);
-    if selection.is_empty() {
+    let split = doctest_split(ctx);
+    if split.as_ref().is_some_and(|s| s.run.is_empty()) {
         r.pass(format!(
             "targo test --doc (no crate in {} has a fenced Rust block in its docs)",
             ctx.scope.label()
         ));
         return;
     }
-    let cmd = main_targo(ctx, doctest_args(&selection));
-    match doc_driver(ctx) {
-        DocDriver::Stage2 => {
-            run_tests_labeled(
-                ctx,
-                r,
-                &format!("{label} (trustdoc)"),
-                &with_trustdoc(ctx, cmd),
-            );
-        }
-        DocDriver::Ambient => {
-            run_tests_labeled(ctx, r, &format!("{label} (caller's RUSTDOC)"), &cmd);
-        }
-        DocDriver::BarePath => {
-            run_tests_labeled(ctx, r, &label, &cmd);
-        }
+    let skip = split.map(|s| s.skip).unwrap_or_default();
+    let driver = doc_driver(ctx);
+    let label = match driver {
+        DocDriver::Stage2 => format!("{label} (trustdoc)"),
+        DocDriver::Ambient => format!("{label} (caller's RUSTDOC)"),
+        DocDriver::BarePath => label,
         // The only doctest runner, so the diagnosis lives here: no doc driver
         // means no doctest was decided.
-        DocDriver::Absent => r.cannot_run(ctx.tools.missing_trustdoc_label()),
-    }
+        DocDriver::Absent => {
+            r.cannot_run(ctx.tools.missing_trustdoc_label());
+            return;
+        }
+    };
+    run_tests_labeled(ctx, r, &label, &doctest_cmd(ctx, &driver, &skip));
 }
 
-// ---------------------------------------------------------------------------
+/// The doctests' child: [`doctest_args`] in the main target with its doc driver
+/// bound. When the scan cleared some library in scope (`skip`), cargo's
+/// `RUSTDOC` is this binary's stand-in ([`crate::docdriver`]), told the real
+/// driver ([`cargo_doc_driver`]) and the packages to skip; otherwise, or when
+/// this binary or the real driver cannot be named, cargo runs the driver
+/// itself, on every library (the stage2's trustdoc bound through `RUSTDOC`
+/// either way, overriding anything the caller exported).
+fn doctest_cmd(ctx: &Ctx, driver: &DocDriver, skip: &[String]) -> Cmd {
+    let cmd = main_targo(ctx, doctest_args(&ctx.scope));
+    let stand_in = ctx
+        .test_recorder()
+        .filter(|_| !skip.is_empty())
+        .and_then(|s| Some((s, cargo_doc_driver(ctx, driver)?)));
+    let Some((stand_in, real)) = stand_in else {
+        return match driver {
+            DocDriver::Stage2 => with_trustdoc(ctx, cmd),
+            _ => cmd,
+        };
+    };
+    cmd.env("RUSTDOC", stand_in)
+        .env(crate::docdriver::DRIVER_ENV, real)
+        .env(
+            crate::docdriver::SKIP_ENV,
+            crate::docdriver::skip_list(skip),
+        )
+}
+
+/// The file cargo would run as its doc driver, absolute, so the stand-in runs
+/// that file and no other; `None` when this cannot name it. Trust's targo
+/// (`GlobalContext::get_tool`) takes the caller's override unless it is empty
+/// (a value with a `/` or `\` is relative to targo's cwd, the root, and a bare
+/// name is looked up on PATH); with none, a cargo config's `build.rustdoc`,
+/// which the stand-in's own `RUSTDOC` would hide, so a config that names one
+/// ([`names_rustdoc`]) names nothing here and cargo runs its own driver; with
+/// none, the `trustdoc` beside the targo that runs (the file a link to it
+/// resolves to), and only as a plain file, then the bare name on the
+/// children's PATH. Its rustup step is left out: it finds the file the rustup
+/// proxy on that PATH would exec.
+fn cargo_doc_driver(ctx: &Ctx, driver: &DocDriver) -> Option<std::path::PathBuf> {
+    use aterm_toolchain::build_cache::{Machine, configs_name, read_config};
+    let on_path = |name: &std::ffi::OsStr| crate::find_on_path(name, &ctx.path_env);
+    let beside_targo_or_on_path = || {
+        let name = crate::toolchain::tool_file("trustdoc");
+        std::fs::canonicalize(&ctx.tools.targo)
+            .ok()
+            .and_then(|targo| Some(targo.parent()?.join(&name)))
+            .filter(|f| {
+                std::fs::symlink_metadata(f).is_ok_and(|m| m.file_type().is_file())
+                    && is_executable_file(f)
+            })
+            .or_else(|| on_path(name.as_ref()))
+    };
+    let config_names_one = || {
+        let lookup = |k: &str| {
+            ctx.env
+                .cargo_layout
+                .iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| v.clone())
+        };
+        let machine = Machine {
+            home: Some(&ctx.env.home)
+                .filter(|h| !h.as_os_str().is_empty())
+                .map(std::path::PathBuf::as_path),
+            cwd: Some(&ctx.root),
+            env: &lookup,
+            read: &read_config,
+            writable: &|_| None,
+        };
+        configs_name(&machine, names_rustdoc)
+    };
+    let file = match driver {
+        DocDriver::Stage2 => Some(ctx.tools.trustdoc.clone()),
+        DocDriver::Ambient => match ctx.env.rustdoc_override.as_deref() {
+            Some(value) if !value.is_empty() => {
+                let spelled = value.to_str()?;
+                if spelled.contains(['/', '\\']) {
+                    Some(ctx.root.join(spelled))
+                } else {
+                    on_path(value)
+                }
+            }
+            _ if config_names_one() => None,
+            _ => beside_targo_or_on_path(),
+        },
+        DocDriver::BarePath if config_names_one() => None,
+        DocDriver::BarePath => beside_targo_or_on_path(),
+        DocDriver::Absent => None,
+    };
+    file.filter(|f| f.is_absolute())
+}
+
+/// Whether a cargo config line sets a doc driver: a `rustdoc` key, bare,
+/// dotted (`build.rustdoc`), quoted or in an inline table, never `rustdocflags`
+/// or another key that only holds the word. Pure (unit-tested).
+fn names_rustdoc(line: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    line.match_indices("rustdoc").any(|(at, key)| {
+        let rest = &line[at + key.len()..];
+        !line[..at].ends_with(word)
+            && !rest.starts_with(word)
+            && rest
+                .trim_start_matches([' ', '\t', '"', '\''])
+                .starts_with('=')
+    })
+}
+
 // Tippy: the lint under the Trust toolchain's Clippy fork. Present means
 // `-D warnings` must pass; absent is a named skip. Its own target dir
 // (`<target>/verify/tippy.noindex`) lets it compile beside the test build.
-// ---------------------------------------------------------------------------
 /// The exact command the lint stage spawns, so the test asserts on it rather
 /// than a replica.
 ///
@@ -1309,11 +1408,9 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The in-process walks: the censuses and the source guards
 // (`aterm_census::CENSUSES`), each over the checkout, its finding printed
 // under the row that failed.
-// ---------------------------------------------------------------------------
 
 /// The file every aterm checkout has: the in-process checks read the tree's
 /// own sources and policy files, and nothing elsewhere.
@@ -1368,13 +1465,11 @@ fn walks(ctx: &Ctx, r: &mut Report, check: &str, names: &[&str]) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Export guards: `ship check --export`, the publication engine's own `pub stage
 // --dry-run` over a scratch clone of HEAD, the export step `ship release` runs.
 // It judges only a commit on origin/main and needs the network, the engine's
 // checkout, gitleaks and rustup, so it is in no set: a named check to run
 // before asking for a release.
-// ---------------------------------------------------------------------------
 
 /// The export check's row.
 pub const EXPORT_LABEL: &str = "ship check --export";
@@ -1462,7 +1557,6 @@ fn export(ctx: &Ctx, r: &mut Report) {
     r.record_child(&out, outcome, label);
 }
 
-// ---------------------------------------------------------------------------
 // First-party libc ABI oracle, for this host's native cell
 // (`crates/aterm-libc-oracle`): the cell's const/layout/type assertions compiled
 // and its runtime checks run, the shim's public shape and every extern's linker
@@ -1471,7 +1565,6 @@ fn export(ctx: &Ctx, r: &mut Report) {
 // native; a cell no machine hosts is decided by no check, as the oracle's
 // report says. The oracle's separate workspace keeps `[patch.crates-io]` from
 // rewriting the reference libc edge to the shim under test.
-// ---------------------------------------------------------------------------
 fn libc_oracle(ctx: &Ctx, r: &mut Report) {
     if !ctx.tools.have_targo() {
         r.skip("libc ABI oracle (no targo)");
@@ -1502,21 +1595,17 @@ fn libc_oracle(ctx: &Ctx, r: &mut Report) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The census: every lexical walk aterm-census has ([`CENSUS_WALKS`]) — the
 // source guards (the rules no type, visibility or clippy.toml row can hold)
 // and the five L0 censuses (main-loop reach, lock order, wasm reach, scope
 // cardinality, lazy-init reentrancy) — each failing with the site it found.
-// ---------------------------------------------------------------------------
 fn census(ctx: &Ctx, r: &mut Report) {
     walks(ctx, r, "census", &CENSUS_WALKS);
 }
 
-// ---------------------------------------------------------------------------
 // The Trust checkers over the formal models: `spec-check` holds every registered
 // model to `ty` and every `ay` certificate to its declared verdict. Plain tests
 // are interpreter-only by design, so this is the one place those tools are asked.
-// ---------------------------------------------------------------------------
 
 /// `targo --unverified run --profile test -q -p aterm-models --bin spec-check`, in
 /// the main target once the test compile is done ([`MAIN_PROFILE`]; the bin links
@@ -1578,13 +1667,11 @@ fn spec_check(ctx: &Ctx, r: &mut Report) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The release's feature builds: the workspace's tests with `aterm-spec/checkers`
 // (the tiered tests' per-step `ty` agreement, which plain tests never ask), and
 // aterm-gpu's with `wgpu-oracle` (the renderer against wgpu). Each a lane of its
 // own, so a feature build never touches the main cache; each compiles beside the
 // test run and runs its tests after it.
-// ---------------------------------------------------------------------------
 
 /// `targo --unverified test --workspace --features aterm-spec/checkers
 /// --no-fail-fast --tests`: the `checkers` check's child.
@@ -1762,14 +1849,12 @@ fn gpu_oracle(ctx: &Ctx, r: &mut Report) {
     });
 }
 
-// ---------------------------------------------------------------------------
 // Control redraw conformance: the one check that can see a control-socket
 // `select` repaint a window. `EventLoop` construction panics off the main thread
 // and libtest runs tests on spawned threads, so aterm-gui's unit tests build
 // their host with `proxy: None` and cannot catch a dropped `EventLoopProxy`.
 // `aterm-redraw-conformance` owns `fn main` and holds a real proxy; this stage
 // builds it in the main target and drives it.
-// ---------------------------------------------------------------------------
 
 /// How the ladder reads one harness exit code (`0` pass / `1` fail / `2` not
 /// run, declared in aterm-gui's `control_redraw_conformance.rs`).
@@ -1838,11 +1923,9 @@ fn redraw_conformance(ctx: &Ctx, r: &mut Report) {
     r.record_child(&out, outcome, label);
 }
 
-// ---------------------------------------------------------------------------
 // The objc drives: the ported classes and the tab strip, driven on a real
 // AppKit, one row per [`OBJC_DRIVES`] entry. Each checks what no unit test can
 // reach (libtest cannot host AppKit).
-// ---------------------------------------------------------------------------
 
 fn objc_drives(ctx: &Ctx, r: &mut Report) {
     if !cfg!(target_os = "macos") {
@@ -1893,13 +1976,11 @@ fn objc_drive(ctx: &Ctx, r: &mut Report, drive: &ObjcDrive) {
     r.record_child(&out, outcome, label);
 }
 
-// ---------------------------------------------------------------------------
 // The lab's build for the Codex proof: both binaries (`-p aterm -p aterm-lab`
 // in the main target), built by the stage itself, the proof run only if that
 // build succeeded and handed that `aterm`. (The `codex` check that drove the
 // vendor Codex's live upgrade, `lab codex-upgrade`, was retired with that
 // upgrade on 2026-10-16.)
-// ---------------------------------------------------------------------------
 
 /// `targo --unverified build --profile test -q -p aterm -p aterm-lab --bin aterm
 /// --bin aterm-lab`: the lab and the one binary it drives ([`MAIN_PROFILE`]).
@@ -1935,7 +2016,7 @@ pub const CODEX_ATERM_BUILD_LABEL: &str =
 pub const CODEX_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// The build of both binaries, in the main target. Compile-only, so demoted;
-/// the lane itself RUNS code and keeps the inherited tier.
+/// the lane itself runs code and keeps the inherited tier.
 #[must_use]
 pub fn codex_aterm_build_cmd(ctx: &Ctx) -> Cmd {
     main_build_cmd(ctx, codex_aterm_build_args())
@@ -2019,14 +2100,12 @@ pub fn lab_lane_outcome(
     }
 }
 
-// ---------------------------------------------------------------------------
 // The codex-alab proof: `lab codex-alab-proof` proves the codex-alab native
 // harness end to end (its contract §9.3) on the REAL package in a private
 // headless instance of the `aterm` binary, sandboxed to one loopback port. It
 // is the `codex-alab` check, run alone and by hand. It builds both binaries
 // ([`codex_aterm_build_cmd`]), and a machine with no codex-alab package is a named
 // skip, never a pass ([`codex_alab_proof_outcome`]).
-// ---------------------------------------------------------------------------
 
 /// The codex-alab proof, as the ladder names it.
 pub const CODEX_ALAB_LANE: &str = "lab codex-alab-proof";
@@ -2096,7 +2175,6 @@ fn codex_alab_proof(ctx: &Ctx, r: &mut Report) {
     r.record_child(&out, outcome, label);
 }
 
-// ---------------------------------------------------------------------------
 // The Linux runtime lane: `lab linux proof` runs this checkout's Linux tests on
 // aarch64 and on x86_64 (under Rosetta) in a lima VM on this Mac, and drives a
 // Linux aterm-gui under Xvfb, weston, Mutter and Xwayland over its control
@@ -2105,7 +2183,6 @@ fn codex_alab_proof(ctx: &Ctx, r: &mut Report) {
 // the guest compiles on a stock toolchain (STOCK EXCEPTION: no Linux build of
 // Trust exists). The stage builds the lab in the main target and runs that
 // build; the lane's NOT RUN is never a pass ([`linux_lane_outcome`]).
-// ---------------------------------------------------------------------------
 
 /// `targo --unverified build --profile test -q -p aterm-lab --bin aterm-lab`
 /// ([`MAIN_PROFILE`]).
@@ -2578,6 +2655,297 @@ mod tests {
         assert_eq!(doc_driver_from(false, false, false), DocDriver::Absent);
     }
 
+    /// THE DOCTESTS RESOLVE WHAT THE TEST COMPILE RESOLVED. Cargo unifies
+    /// features over the packages a command selects, so a doctests argv that
+    /// selected fewer would build units of its own (aterm-core without `serde`,
+    /// and all above it); every scope's doctests select exactly its test
+    /// compile's packages, and the doc driver's stand-in drops the passes.
+    #[test]
+    fn the_doctests_select_exactly_what_the_test_compile_selects() {
+        fn selection(argv: &[String]) -> Vec<String> {
+            let mut v = Vec::new();
+            let mut it = argv.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "-p" => v.push(format!("-p {}", it.next().expect("a -p value"))),
+                    "--workspace" => v.push(a.clone()),
+                    _ => {}
+                }
+            }
+            v
+        }
+        for scope in [
+            Scope::workspace(),
+            Scope::crate_only("aterm-grid"),
+            Scope::packages(&["aterm-core".into(), "aterm-types".into()]),
+            Scope::changed("main", vec!["aterm-grid".into(), "aterm-gui".into()], true),
+        ] {
+            let doc = doctest_args(&scope);
+            assert!(!selection(&doc).is_empty(), "{doc:?}");
+            assert_eq!(selection(&doc), selection(&test_compile_args(&scope)));
+            let mut c = ctx(scope);
+            c.tools.trustdoc = PathBuf::from("/stage2/trustdoc");
+            for skip in [&[][..], &["plain".to_string()][..]] {
+                let cmd = doctest_cmd(&c, &DocDriver::Stage2, skip);
+                assert!(
+                    cmd.args
+                        .ends_with(&doc.iter().map(std::ffi::OsString::from).collect::<Vec<_>>())
+                );
+            }
+        }
+    }
+
+    /// The split the stand-in applies: a library whose docs hold a doctest runs,
+    /// one whose docs hold none is skipped, a package with no library is in
+    /// neither (cargo runs no doc pass for it), and what the walk cannot find
+    /// or list runs.
+    #[test]
+    fn the_doctests_split_the_scopes_libraries_by_what_their_docs_hold() {
+        let tmp = crate::mktemp_dir("atv-doc-split").expect("mktemp");
+        for (name, file, text) in [
+            (
+                "documented",
+                "lib.rs",
+                "/// ```\n/// assert!(true);\n/// ```\npub fn f() {}\n",
+            ),
+            ("plain", "lib.rs", "//! ```text\n//! not rust\n//! ```\n"),
+            (
+                "binonly",
+                "main.rs",
+                "/// ```\n/// 1;\n/// ```\nfn main() {}\n",
+            ),
+        ] {
+            let dir = tmp.join("crates").join(name);
+            std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\n"),
+            )
+            .expect("manifest");
+            std::fs::write(dir.join("src").join(file), text).expect("source");
+        }
+        let split = |scope, root: &std::path::Path| {
+            let mut c = ctx(scope);
+            c.root = root.to_path_buf();
+            doctest_split(&c)
+        };
+        let names = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            split(Scope::workspace(), &tmp),
+            Some(DocSplit {
+                run: names(&["documented"]),
+                skip: names(&["plain"]),
+            })
+        );
+        assert_eq!(
+            split(Scope::packages(&names(&["plain", "ghost"])), &tmp),
+            Some(DocSplit {
+                run: names(&["ghost"]),
+                skip: names(&["plain"]),
+            })
+        );
+        assert_eq!(
+            split(Scope::crate_only("plain"), &tmp),
+            Some(DocSplit {
+                run: Vec::new(),
+                skip: names(&["plain"]),
+            })
+        );
+        assert_eq!(split(Scope::workspace(), &tmp.join("no-members")), None);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The value `cmd` gives `k`, the last binding winning as at spawn.
+    fn env_of(cmd: &Cmd, k: &str) -> Option<std::ffi::OsString> {
+        cmd.envs
+            .iter()
+            .rev()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// Cargo's `RUSTDOC` is this binary's stand-in exactly when the scan
+    /// cleared a library in scope, and the stand-in is told the driver cargo
+    /// would otherwise have run; with nothing cleared, cargo runs that driver
+    /// itself, the stage2's bound as it always was.
+    #[test]
+    fn the_stand_in_drives_rustdoc_only_where_the_scan_cleared_a_library() {
+        let (driver, skip_env) = (crate::docdriver::DRIVER_ENV, crate::docdriver::SKIP_ENV);
+        let mut c = ctx(Scope::workspace());
+        c.tools.trustdoc = PathBuf::from("/stage2/trustdoc");
+        c.test_recorder = Some(PathBuf::from("/bin/aterm-verify"));
+        c.env.rustdoc_override = Some("/caller/rustdoc".into());
+        let skip = ["other".to_string(), "plain".to_string()];
+        for (kind, real) in [
+            (DocDriver::Stage2, "/stage2/trustdoc"),
+            (DocDriver::Ambient, "/caller/rustdoc"),
+        ] {
+            let cmd = doctest_cmd(&c, &kind, &skip);
+            assert_eq!(
+                env_of(&cmd, "RUSTDOC"),
+                Some("/bin/aterm-verify".into()),
+                "{kind:?}"
+            );
+            assert_eq!(env_of(&cmd, driver), Some(real.into()), "{kind:?}");
+            assert_eq!(
+                env_of(&cmd, skip_env),
+                Some("other,plain".into()),
+                "{kind:?}"
+            );
+            let cmd = doctest_cmd(&c, &kind, &[]);
+            assert_eq!(env_of(&cmd, driver), None, "{kind:?}");
+            assert_eq!(env_of(&cmd, skip_env), None, "{kind:?}");
+            let bound =
+                (kind == DocDriver::Stage2).then(|| std::ffi::OsString::from("/stage2/trustdoc"));
+            assert_eq!(env_of(&cmd, "RUSTDOC"), bound, "{kind:?}");
+        }
+    }
+
+    /// THE STAND-IN RUNS THE FILE CARGO WOULD HAVE RUN, named absolutely. With
+    /// no override cargo takes the plain `trustdoc` beside the targo it runs,
+    /// the file a link to it resolves to, before PATH; a bare name the stand-in
+    /// looked up on its own PATH could be another file. A link there is passed
+    /// over, as cargo passes it over, an override with a separator is the
+    /// root's, and a driver this cannot name leaves cargo to run its own.
+    #[cfg(unix)]
+    #[test]
+    fn the_stand_in_is_told_the_driver_cargo_resolves() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let tmp = std::fs::canonicalize(crate::mktemp_dir("atv-doc-driver").expect("mktemp"))
+            .expect("real");
+        let file = |p: &std::path::Path| {
+            std::fs::create_dir_all(p.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(p, "").expect("write");
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        };
+        // targo is a link into the build that holds it and its trustdoc; the
+        // link's directory holds no trustdoc, and PATH holds another.
+        let (build, links, path) = (tmp.join("build"), tmp.join("links"), tmp.join("path"));
+        for f in [
+            build.join("targo"),
+            build.join("trustdoc"),
+            path.join("trustdoc"),
+        ] {
+            file(&f);
+        }
+        file(&tmp.join("elsewhere/trustdoc"));
+        std::fs::create_dir_all(&links).expect("mkdir");
+        symlink(build.join("targo"), links.join("targo")).expect("symlink");
+        let mut c = ctx(Scope::workspace());
+        c.tools.targo = links.join("targo");
+        c.tools.trustdoc = links.join("trustdoc");
+        c.path_env = std::env::join_paths([&links, &path]).expect("join");
+        c.test_recorder = Some(PathBuf::from("/bin/aterm-verify"));
+        let resolved = |c: &Ctx, kind| cargo_doc_driver(c, &kind);
+        assert_eq!(
+            resolved(&c, DocDriver::BarePath),
+            Some(build.join("trustdoc"))
+        );
+        let cmd = doctest_cmd(&c, &DocDriver::BarePath, &["plain".to_string()]);
+        assert_eq!(env_of(&cmd, "RUSTDOC"), Some("/bin/aterm-verify".into()));
+        assert_eq!(
+            env_of(&cmd, crate::docdriver::DRIVER_ENV),
+            Some(build.join("trustdoc").into_os_string())
+        );
+        // An empty override is no override.
+        c.env.rustdoc_override = Some("".into());
+        assert_eq!(
+            resolved(&c, DocDriver::Ambient),
+            Some(build.join("trustdoc"))
+        );
+        // An override: absolute as it is, with a separator the root's, bare on
+        // PATH, and nowhere on PATH unnamed.
+        for (value, want) in [
+            ("/caller/rustdoc", Some(PathBuf::from("/caller/rustdoc"))),
+            ("tools/rustdoc", Some(PathBuf::from("/repo/tools/rustdoc"))),
+            ("trustdoc", Some(path.join("trustdoc"))),
+            ("rustdoc", None),
+            // targo takes a backslash for a separator on every platform.
+            (
+                "tools\\rustdoc",
+                Some(PathBuf::from("/repo/tools\\rustdoc")),
+            ),
+        ] {
+            c.env.rustdoc_override = Some(value.into());
+            assert_eq!(resolved(&c, DocDriver::Ambient), want, "{value}");
+        }
+        // A cargo config's `build.rustdoc` is cargo's to run: the stand-in's
+        // `RUSTDOC` would hide it, so nothing is named and nothing is wrapped.
+        // The caller's override still wins over it, as in cargo.
+        let root = tmp.join("repo");
+        std::fs::create_dir_all(root.join(".cargo")).expect("mkdir");
+        let repo = std::mem::replace(&mut c.root, root.clone());
+        for (config, named) in [
+            (
+                "[build]\nrustdocflags = ['--cfg', 'x']\n# rustdoc = 'no'\n",
+                true,
+            ),
+            ("[build]\nrustdoc = '/config/rustdoc'\n", false),
+        ] {
+            std::fs::write(root.join(".cargo/config.toml"), config).expect("config");
+            c.env.rustdoc_override = None;
+            assert_eq!(
+                resolved(&c, DocDriver::BarePath).is_some(),
+                named,
+                "{config}"
+            );
+            c.env.rustdoc_override = Some("".into());
+            assert_eq!(
+                resolved(&c, DocDriver::Ambient).is_some(),
+                named,
+                "{config}"
+            );
+        }
+        c.env.rustdoc_override = Some("/caller/rustdoc".into());
+        assert_eq!(
+            resolved(&c, DocDriver::Ambient),
+            Some(PathBuf::from("/caller/rustdoc"))
+        );
+        let cmd = doctest_cmd(&c, &DocDriver::BarePath, &["plain".to_string()]);
+        assert_eq!(env_of(&cmd, "RUSTDOC"), None);
+        c.root = repo;
+        c.env.rustdoc_override = Some("".into());
+        // A link beside targo is passed over for PATH's.
+        std::fs::remove_file(build.join("trustdoc")).expect("rm");
+        symlink(tmp.join("elsewhere/trustdoc"), build.join("trustdoc")).expect("symlink");
+        assert_eq!(
+            resolved(&c, DocDriver::BarePath),
+            Some(path.join("trustdoc"))
+        );
+        // Nothing to name: cargo runs its own driver, unwrapped.
+        c.path_env = links.into_os_string();
+        assert_eq!(resolved(&c, DocDriver::BarePath), None);
+        let cmd = doctest_cmd(&c, &DocDriver::BarePath, &["plain".to_string()]);
+        assert_eq!(env_of(&cmd, "RUSTDOC"), None);
+        assert_eq!(env_of(&cmd, crate::docdriver::DRIVER_ENV), None);
+        assert_eq!(env_of(&cmd, crate::docdriver::SKIP_ENV), None);
+        assert_eq!(resolved(&c, DocDriver::Absent), None);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A config line names a doc driver only by a `rustdoc` key, in each of
+    /// TOML's spellings of one; the word inside another key or a value does not.
+    #[test]
+    fn a_config_names_a_doc_driver_only_by_its_key() {
+        for line in [
+            "rustdoc = '/x/rustdoc'",
+            "rustdoc=\"trustdoc\"",
+            "build.rustdoc = 'r'",
+            "\"rustdoc\" = 'r'",
+            "build = { jobs = 4, rustdoc = 'r' }",
+        ] {
+            assert!(names_rustdoc(line), "{line}");
+        }
+        for line in [
+            "rustdocflags = ['--cfg', 'docsrs']",
+            "my-rustdoc = 'r'",
+            "rustc = 'rustdoc'",
+            "[build]",
+        ] {
+            assert!(!names_rustdoc(line), "{line}");
+        }
+    }
+
     /// THE COVERAGE FLAGS AND THE SELECTION reach every argv that reads one:
     /// `--no-fail-fast` on each test argv and `--keep-going` before the lint's
     /// separator (without them cargo stops at the first red binary or crate,
@@ -2594,7 +2962,7 @@ mod tests {
             for argv in [
                 test_compile_args(&scope),
                 test_run_args(&scope),
-                doctest_args(&scope.args()),
+                doctest_args(&scope),
             ] {
                 assert!(has(&argv, "--no-fail-fast"), "{argv:?}");
                 for c in scope.crates() {

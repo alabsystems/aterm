@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The worker's NEEDS YOU on the person's screen (FOREVER CRUISE / FOREVER
+// The worker's NEEDS YOU on the person's screen (Autopilot Cruise / FOREVER
 // LAND, `escalate.rs`'s `sync_needs`): the `needs` owner's entry put up once
 // a set of needs, taken down when none stands, at an Off park and at the
 // loop's end, journaled `NEEDS`/`CLEARED … needs` and never as an

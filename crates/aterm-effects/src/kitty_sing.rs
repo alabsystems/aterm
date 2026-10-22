@@ -33,9 +33,7 @@ use aterm_time::Instant;
 
 use aterm_scene::{PathCmd, PathTransform, Tile, fill_path};
 
-// ---------------------------------------------------------------------------
 // The shared tempo
-// ---------------------------------------------------------------------------
 
 /// The celebration tempo. 150 BPM is bouncy enough to read as going wild, slow
 /// enough that the beat-synced squash bounce (≈2.5 Hz) stays a dance.
@@ -52,9 +50,7 @@ pub const SING_BAR_BEATS: f32 = 4.0;
 /// One riff bar in seconds.
 pub const SING_BAR_SECONDS: f32 = SING_BEAT_SECONDS * SING_BAR_BEATS;
 
-// ---------------------------------------------------------------------------
 // Song signature
-// ---------------------------------------------------------------------------
 
 /// A fixed bijective mixer over a character's code point (lowbias32-style: two
 /// xorshift + odd-multiply rounds), so distinct characters never share a song and
@@ -76,9 +72,7 @@ pub const fn song_signature(ch: char) -> u32 {
 /// `neutral_signature_is_the_reference_voicing`.
 pub const NEUTRAL_SIGNATURE: u32 = 12;
 
-// ---------------------------------------------------------------------------
 // The armed celebration (`fx celebrate`)
-// ---------------------------------------------------------------------------
 
 /// The most bars an armed celebration may run: four bars (6.4 s), one phrase of
 /// the riff's build.
@@ -240,9 +234,7 @@ struct ExternalRun {
     outro_taken: bool,
 }
 
-// ---------------------------------------------------------------------------
 // Detector
-// ---------------------------------------------------------------------------
 
 /// Consecutive same-character repeats that arm the sing-along. Sixteen at OS
 /// key-repeat cadence is about half a second of holding: bursty double/triple
@@ -764,9 +756,7 @@ impl KittySing {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Music-note sprite field
-// ---------------------------------------------------------------------------
 
 /// Ring capacity for live note sprites. At the half-beat spawn cadence
 /// (~5 notes/s) and [`NOTE_LIFE`], at most ~8 are alive; the ring
@@ -995,9 +985,7 @@ impl MusicNotes {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Note tile art (procedural, host-baked)
-// ---------------------------------------------------------------------------
 
 /// Salt for the note tiles' `host_tile` id space — its own family, scrambled
 /// away from the user kitty sprite ids by the splitmix finalizer.
@@ -1333,9 +1321,8 @@ mod tests {
         }
     }
 
-    /// The wind-down completes: after a key change fails to repeat, the drive
-    /// eases strictly between 0 and 1, decreasing monotonically, to exactly 0.0
-    /// by [`SING_WIND_DOWN`], and `settle` returns the detector to rest.
+    /// After a key change fails to repeat, the drive falls monotonically to exactly 0 by
+    /// [`SING_WIND_DOWN`], and `settle` returns the detector to rest.
     #[test]
     fn wind_down_crossfades_to_zero() {
         let mut d = KittySing::default();
@@ -1623,11 +1610,9 @@ mod tests {
         }
     }
 
-    /// A miniature of the host's render loop: presses feed the detector, and
-    /// every ~16 ms frame applies `app_render`'s `sing_riff_bar` latch (push one
-    /// `(bar, signature())` per new bar index, signature sampled at push time).
-    /// `min_drive` tracks the lowest drive seen after the first arm, the number
-    /// the host's `sing_face_live` gate (0.33) reads.
+    /// A miniature of the host's render loop: ~16 ms frames apply the
+    /// `Companions::sing_riff_bar` latch (one `(bar, signature())` push per new bar index).
+    /// `min_drive` is the lowest drive since the first arm, which `sing_face_live` (0.33) reads.
     struct HostSim {
         d: KittySing,
         clock: Instant,
@@ -1685,10 +1670,8 @@ mod tests {
         }
     }
 
-    /// Hold `w`, then `a`, then `r`, every gap inside repeat cadence: a key
-    /// switch chain, not typing. The drive stays exactly 1.0 from the first arm
-    /// to the last press, so the host's 0.33 face gate never swaps in the cursor
-    /// kitty mid-song.
+    /// A w → a → r key-switch chain at repeat cadence keeps the drive at 1.0, so the host's
+    /// 0.33 face gate never swaps the singer out mid-song.
     #[test]
     fn the_owner_pattern_w_a_r_never_drops_the_drive() {
         let t0 = Instant::now();

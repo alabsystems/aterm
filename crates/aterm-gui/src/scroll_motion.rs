@@ -588,13 +588,11 @@ mod tests {
         }
     }
 
-    /// DIRECT MANIPULATION (2026-09-22) — a 120 Hz precise stream at constant
-    /// finger speed through the TRACK law moves the band 1:1 (within a pixel of
-    /// the finger at every frame, sub-pixel carry included) and EVENLY (per-frame
-    /// velocity `max <= 2 * min`, no zero-motion frame) at 0.5, 1, 2 and 4 rows
-    /// per 100 ms; after the last delta the band HOLDS for `TRACK_REST_MS` with
-    /// one armed wake, then settles to the nearest whole row and is done at
-    /// `end()`; `release` starts that settle at once.
+    /// A 120 Hz precise stream at constant speed through `Glide::track` moves the band 1:1
+    /// (within a pixel, sub-pixel carry included) and evenly (per-frame `max <= 2 * min`, no
+    /// zero-motion frame) at 0.5 to 4 rows per 100 ms; after the last delta it holds for
+    /// `TRACK_REST_MS` with one wake, then settles to the nearest whole row; `release` starts
+    /// the settle at once.
     #[test]
     fn a_precise_stream_tracks_one_to_one() {
         let t0 = Instant::now();

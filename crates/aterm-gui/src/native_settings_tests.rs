@@ -26,13 +26,9 @@ pub(crate) fn fixture_subject(id: &str) -> aterm_containment::consent::ResetSubj
     aterm_containment::consent::ResetSubject::read(&root, &[]).expect("a subject")
 }
 
-/// Two invariants the fast paths depend on, pinned so a new field turns a
-/// silent regression into a build failure:
-/// * keys are UNIQUE — `SettingsViewState::field_index` maps a key to one row,
-///   and `unsaved_field_draft_count` counts keys rather than rows;
-/// * keys and search keywords are ASCII-LOWERCASE — `field_match_score_in`
-///   compares them against a lowercased query without folding them first, so a
-///   capitalized key would become unsearchable.
+/// Keys are unique (`field_index` maps a key to one row; `unsaved_field_draft_count`
+/// counts keys) and keys and keywords are ASCII-lowercase (`field_match_score_in`
+/// compares them against a lowercased query without folding them).
 #[test]
 fn editable_field_keys_are_unique_and_lowercase() {
     let fields = prefs::editable_fields(&Config::default());
@@ -587,11 +583,8 @@ fn every_visual_field_previews_candidate_semantics_fingerprint_pixels_and_isolat
                 | prefs::EDIT_CURSOR_TRAIL_ACCENT
                 | prefs::EDIT_HDR_GLOW
         )
-        // - font_thicken is CoreText FONT SMOOTHING at raster time;
-        //   `Renderer::set_font_thicken` is a no-op beyond recording the
-        //   flag anywhere fontdue rasterizes (no smoothing exists), and
-        //   the Settings row discloses exactly that inertness. The badge
-        //   pixels, semantics, and fingerprint above stay asserted.
+        // - font_thicken is CoreText font smoothing; fontdue has none, so off macOS
+        //   `Renderer::set_font_thicken` only records the flag.
         || (key == prefs::EDIT_FONT_THICKEN && !cfg!(target_os = "macos"))
         // - the fire shimmer is a GPU refraction (UV-displacement) pass at
         //   present time; no still raster can draw it, and the preview's old
@@ -627,12 +620,9 @@ fn every_visual_field_previews_candidate_semantics_fingerprint_pixels_and_isolat
     }
 }
 
-// The fallback raw projection (`SettingsViewState::new` — the recovery/test
-// path) must treat dotted keys exactly like the snapshot projection, at
-// BOTH registered depths: a configured `[matrix_rain]`/`[packages]` bool
-// and a configured `[sparkle_words.*]` sub-table bool are EXPLICIT
-// (present in the Modified review; OCC expects `Exact(Some(..))`), an
-// absent one is not.
+// The fallback raw projection (`SettingsViewState::new`) treats dotted keys like
+// the snapshot projection at both depths: a configured `[matrix_rain]` or
+// `[sparkle_words.*]` bool is explicit, an absent one is not.
 #[test]
 fn fallback_raw_projection_covers_dotted_keys() {
     let config: Config = aterm_toml::from_str(
@@ -727,8 +717,8 @@ fn snapshot_projection_covers_depth_two_dotted_keys() {
     assert!(!absent.is_explicit("sparkle_words.profanity.enabled"));
 }
 
-/// THE PREVIEW'S COMPANION WEARS THE WINDOW'S CAT: the coat and eyes the
-/// host says the cursor companion wears (`ViewMotionCx::companion_look`: the
+/// The preview's companion wears the window's cat: the coat and eyes the host
+/// says the cursor companion wears (`ViewMotionCx::companion_look`: the
 /// favourite, the tenured program cat or the launch kitty) reach the cursor
 /// preview, and a different cat repaints it rather than serving a stale grey
 /// one from the raster memo.
@@ -1512,9 +1502,9 @@ fn music_suppression_resolver_covers_every_reason_and_priority() {
     let motion = ViewMotionCx::default();
     // The cursor effects switch's absent-key default is platform-split
     // (`app_config::DEFAULT_DECORATIVE_EFFECTS`), so an inherited default
-    // would change which reason a case reaches. Each case therefore ASKS for
-    // the switch unless it authors one itself; the typing-notes rung below
-    // reaches its reason through `cursor_trail_style = "off"`.
+    // would change which reason a case reaches: each case asks for the switch
+    // unless it authors one; the typing-notes rung reaches its reason through
+    // `cursor_trail_style = "off"`.
     let reason = |config: Config, motion: ViewMotionCx, output: bool| {
         top_music_suppression_reason_for_output(
             &SettingsViewState::new(&Config {
@@ -1654,8 +1644,8 @@ fn music_suppression_resolver_covers_every_reason_and_priority() {
         );
     }
 
-    // REDUCE MOTION PAUSES ONLY THE VOICES WHOSE LIGHT IT STOPS, named in
-    // the Motion picker's own words.
+    // Reduce Motion pauses only the voices whose light it stops, named in the
+    // Motion picker's own words.
     let full = MusicStatus::MotionPaused(MotionReduction::Setting).full();
     assert!(
         full.starts_with("On. ")
@@ -2083,9 +2073,7 @@ fn view_cx_at(width: f32, height: f32) -> ViewCx<'static> {
     }
 }
 
-// -----------------------------------------------------------------------
 // The macOS access block
-// -----------------------------------------------------------------------
 
 fn access_fixture(fda: FdaState, dr: DrClass, scope: aterm_containment::FdaScope) -> MacosAccess {
     crate::security_fixtures::access(fda, dr, scope)
@@ -2148,8 +2136,8 @@ fn the_census_is_on_the_panel_and_the_trash_button_takes_only_what_it_lists() {
     assert_eq!(copy.claimants.len(), 3, "{:#?}", copy.claimants);
     assert!(copy.claimants[1].starts_with("/Applications/aterm.app.rollback "));
     assert!(copy.claimants[2].starts_with("/Users//a/Old/aterm.app "));
-    // A copy is listed with the link that leads to it whatever else keeps
-    // it (ruling 2026-10-02), not only when the link is the reason.
+    // A copy is listed with the link that leads to it whatever else keeps it, not
+    // only when the link is the reason.
     let mut linked = census_fixture(true);
     linked.found[2].links = vec![std::path::PathBuf::from("/Applications/aterm-old.app")];
     let row = macos_access_copy(&MacosAccess {
@@ -2850,12 +2838,10 @@ fn a_press_behind_a_confirmed_alert_asks_nothing() {
     }
 }
 
-// -----------------------------------------------------------------------
 // The debugger-access row (docs/DESIGN-macos-debugger-access-2026-09-29.md
 // §3.3, §3.4). Every press goes through the injected `confirm` arm: no test
 // reaches `menu::confirm_owner`'s WindowServer alert (the census guard
 // `test-appkit-door`) or `run_devtools`.
-// -----------------------------------------------------------------------
 
 fn debugger_facts(
     mode: aterm_containment::consent::DebuggerMode,
@@ -3662,10 +3648,9 @@ fn a_debugger_alert_answered_on_the_page_answers_the_launch_ask() {
     assert!(shared.lock().unwrap().debugger_answered(), "never settled");
 }
 
-/// A Cancel in aterm's alert records nothing and quiets every gesture of
-/// the block, the warm-up among them; nobody asked (no window) is not a
-/// decline. An unchanged re-probe, which the host counts as the owner's
-/// decline through `note_decline`, quiets the same way.
+/// A Cancel in aterm's alert records nothing and quiets every gesture of the block,
+/// the warm-up included; no window to ask in is not a decline. An unchanged
+/// re-probe, which the host counts as a decline through `note_decline`, quiets too.
 #[test]
 fn a_declined_debugger_alert_quiets_the_block_and_records_nothing() {
     use aterm_containment::consent::{DebuggerMember, DebuggerMode, SelfHardening};
@@ -3828,9 +3813,9 @@ fn a_warm_up_refusal_is_drawn_and_outlasts_the_switch_that_caused_it() {
     assert_eq!(state.feedback, None, "no line on another page");
 }
 
-/// A confirmed press records the plan for the host and leaves the page-wide
-/// bar empty (the block's status row reports the move); with nothing to
-/// move, or a worker already out, it records nothing and says why.
+/// A confirmed press records the plan for the host and leaves the page-wide bar
+/// empty (the block's status row reports the move); with nothing to move, or a
+/// worker already out, it records nothing and says why.
 #[test]
 fn the_trash_press_records_its_plan_once() {
     use aterm_containment::FdaScope;
@@ -4267,10 +4252,9 @@ fn open_privacy_and_security_is_on_the_first_screen_at_every_size() {
     assert!(cannot.into_inner() > 0);
 }
 
-/// THE BLOCK IS REACHABLE ON THE WINDOW IT WAS MEASURED ABSENT ON
-/// (2026-09-10): at 624x348 logical the DEVELOPER TOOLS card and the block
-/// lead the Security list, and the list scrolls on to the permission rows
-/// under them.
+/// The block is reachable at 624x348 logical: the DEVELOPER TOOLS card and
+/// the block lead the Security list, and the list scrolls on to the permission
+/// rows under them.
 #[test]
 fn the_macos_access_block_is_reachable_on_a_short_landscape_window() {
     use aterm_containment::FdaScope;
@@ -4289,7 +4273,7 @@ fn the_macos_access_block_is_reachable_on_a_short_landscape_window() {
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                 unreachable!();
             };
-            state.page_scroll = page;
+            state.scroll_page_to(page);
         }
         let compiled = compile_settings_view(runtime, instance, view, &cx);
         compiled.validate_parity().unwrap();
@@ -4345,7 +4329,7 @@ fn the_macos_access_block_is_reachable_on_a_short_landscape_window() {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!();
         };
-        state.page_scroll = 0;
+        state.scroll_page_to(0);
     }
     let tall_cx = view_cx_at(1_280.0, 900.0);
     let mut carried = BTreeSet::new();
@@ -4372,7 +4356,7 @@ fn the_macos_access_block_is_reachable_on_a_short_landscape_window() {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!();
         };
-        state.page_scroll = 0;
+        state.scroll_page_to(0);
     }
     let tall = compile_settings_view(&runtime, instance, view, &tall_cx);
     tall.validate_parity().unwrap();
@@ -4778,7 +4762,7 @@ fn every_devtools_facts() -> Vec<DevToolsFacts> {
 /// each line it keeps, and its one button in every form; a granted verdict
 /// keeps the state and the trade, and a short budget keeps the state line and
 /// sheds the rest by priority. The MACOS ACCESS card
-/// carries no Developer Tools line any more.
+/// carries no Developer Tools line.
 #[test]
 fn the_devtools_card_draws_what_it_measures() {
     fn walk(node: &UiNode, out: &mut Vec<String>) {
@@ -4963,7 +4947,7 @@ fn the_devtools_card_draws_what_it_measures() {
                 "{context}"
             );
         }
-        // The MACOS ACCESS card no longer carries the Developer Tools row.
+        // The MACOS ACCESS card carries no Developer Tools row.
         for lead in AccessLead::ALL {
             let mut keys = Vec::new();
             walk(&macos_access_card(&access, lead, f32::INFINITY), &mut keys);
@@ -5248,12 +5232,10 @@ fn an_async_access_check_preserves_the_security_pages_observed_facts() {
     assert_eq!(denied.responsible, pending.responsible);
 }
 
-/// The children the two ceiling tests below need, spelled per host. Unix
-/// has `/usr/bin/true`, `/usr/bin/false` and `/bin/sleep`; Windows has no
-/// `/usr/bin`, so `cmd /c exit <n>` answers the two exit codes and a long
-/// `ping` is the child that never exits on its own — ONE process, because
-/// `Child::kill` is `TerminateProcess` on the handle it holds, and a
-/// `cmd /c` wrapper would die leaving its real sleeper orphaned.
+/// The children the two ceiling tests need, per host. Windows has no `/usr/bin`:
+/// `cmd /c exit <n>` gives the exit codes and a long `ping` never exits, as one
+/// process, because `Child::kill` terminates only its own handle and a `cmd /c`
+/// wrapper would orphan the sleeper.
 fn exiting_child(code: i32) -> aterm_uds::spawnfd::Command {
     if cfg!(windows) {
         let mut cmd = aterm_uds::spawnfd::command("cmd");
@@ -6112,7 +6094,7 @@ fn list_bound_sweep(scale: f32) {
                         };
                         state.navigate(route);
                         state.search = query.to_string();
-                        state.page_scroll = 0;
+                        state.scroll_page_to(0);
                     }
                     let mut page = 0;
                     loop {
@@ -6122,7 +6104,7 @@ fn list_bound_sweep(scale: f32) {
                                 unreachable!()
                             };
                             state.search = query.to_string();
-                            state.page_scroll = page;
+                            state.scroll_page_to(page);
                         }
                         let compiled = compile_settings_view(&runtime, instance, view, &cx);
                         let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
@@ -6154,8 +6136,6 @@ fn list_bound_sweep(scale: f32) {
                         match limit {
                             Some(limit) if page < limit => {
                                 page = if page == 0 && limit >= 2 {
-                                    // One middle page, a different one in
-                                    // each cell.
                                     1 + cell % (limit - 1)
                                 } else {
                                     limit
@@ -7042,7 +7022,7 @@ fn escape_with_nothing_to_cancel_keeps_the_page_its_undo_and_place() {
             };
             state.feedback = Some("Tone-adaptive melody turned off".to_string());
             state.last_undo = Some(UndoOffer::showing(7, "Tone-adaptive melody turned off"));
-            state.page_scroll = 1;
+            state.scroll_page_to(1);
         }
         escape(&mut runtime, instance, view);
         escape(&mut runtime, instance, view);
@@ -10548,7 +10528,7 @@ fn the_packages_rail_entry_wears_the_badge_while_a_failure_is_named() {
             unreachable!();
         };
         state.compact_navigation = false;
-        state.page_scroll = 0;
+        state.scroll_page_to(0);
     }
     for (route, value, badge) in rail(&runtime) {
         assert!(
@@ -10590,7 +10570,7 @@ fn compact_categories_showing(
             unreachable!();
         };
         state.compact_navigation = true;
-        state.page_scroll = page;
+        state.scroll_page_to(page);
         let compiled = compile_settings_view(runtime, instance, view, &cx);
         if compiled.semantic(&key).is_some() {
             return compiled;
@@ -10599,8 +10579,7 @@ fn compact_categories_showing(
     panic!("{} is on no page of the compact categories", route.label());
 }
 
-/// The wall clock now, in Unix seconds — the Packages page says every time relative
-/// to it (Phase 4), so its fixtures stamp their events against it.
+/// The wall clock in Unix seconds: the Packages page states times relative to it.
 fn wall_now() -> i64 {
     aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0))
 }
@@ -11044,7 +11023,7 @@ fn the_activity_card_lists_the_log_as_stops_of_the_page() {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                     unreachable!();
                 };
-                state.page_scroll = 0;
+                state.scroll_page_to(0);
                 state.page_reveal = None;
             }
             compile_settings_view(runtime, instance, view, &cx)
@@ -11179,9 +11158,9 @@ fn release_notes_are_one_card_scrolled_row_by_row() {
     }
 }
 
-/// Settings ▸ Software Update links to its record — Settings ▸ Messages with the
-/// update chip down — and the link is whole on the page that shows it. (Packages'
-/// Activity is that page's own log, ruling 41: it carries no second log link.)
+/// Settings ▸ Software Update links to its record (Settings ▸ Messages with the update
+/// chip down), whole on the page that shows it. Packages' Activity is its own log and
+/// carries no second link.
 #[test]
 fn software_update_links_to_its_messages() {
     let key = "updates/messages";
@@ -11200,7 +11179,7 @@ fn software_update_links_to_its_messages() {
                     unreachable!();
                 };
                 state.navigate(SettingsRoute::SoftwareUpdate);
-                state.page_scroll = page;
+                state.scroll_page_to(page);
             }
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             if let Some(hit) = compiled.hits.iter().find(|hit| hit.key.as_str() == key) {
@@ -11251,7 +11230,7 @@ fn display_face_switches_line_up_with_the_pages_controls() {
                     unreachable!();
                 };
                 state.navigate(SettingsRoute::TextFonts);
-                state.page_scroll = page;
+                state.scroll_page_to(page);
             }
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             let rect = |key: &str| {
@@ -11341,7 +11320,7 @@ fn one_line_compact_rows_share_one_fit_rule() {
                     unreachable!();
                 };
                 state.navigate(SettingsRoute::TextFonts);
-                state.page_scroll = page;
+                state.scroll_page_to(page);
             }
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             let rect = |key: &str| {
@@ -11383,7 +11362,7 @@ fn compact_top_settings_keeps_the_playful_effects_note() {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Home);
-            state.page_scroll = page;
+            state.scroll_page_to(page);
         }
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         let painted = |key: &str| {
@@ -11551,7 +11530,7 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                 unreachable!();
             };
-            state.page_scroll = 0;
+            state.scroll_page_to(0);
         }
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         assert!(
@@ -11961,7 +11940,7 @@ fn a_short_compact_page_pairs_the_status_card_with_the_check_switch() {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!();
         };
-        state.page_scroll = index;
+        state.scroll_page_to(index);
         let compiled = compile_settings_view(runtime, instance, view, cx);
         let overflowing = compiled
             .paint_audit_lines()
@@ -12144,7 +12123,7 @@ fn automatic_updates_reads_and_restores_auto_update() {
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                 unreachable!();
             };
-            state.page_scroll = page;
+            state.scroll_page_to(page);
             runtime
                 .render(instance, view, &cx)
                 .unwrap()
@@ -12283,10 +12262,12 @@ fn a_retired_packages_spelling_is_named_resettable_and_reset_by_reset_all() {
     }
 
     // The row's Reset removes that key alone, CAS on the value shown.
-    state.page_scroll = overrides
-        .iter()
-        .position(|entry| entry.key == prefs::RETIRED_PACKAGES_AUTO_UPDATE)
-        .unwrap();
+    state.scroll_page_to(
+        overrides
+            .iter()
+            .position(|entry| entry.key == prefs::RETIRED_PACKAGES_AUTO_UPDATE)
+            .unwrap(),
+    );
     let cx = view_cx_at(1_080.0, 720.0);
     let compiled = runtime
         .render(instance, view, &cx)
@@ -12443,7 +12424,7 @@ fn the_retired_switch_note_and_the_service_line_paint_whole_at_every_width() {
                     unreachable!();
                 };
                 state.navigate(SettingsRoute::Packages);
-                state.page_scroll = page;
+                state.scroll_page_to(page);
                 let compiled = compile_settings_view(&runtime, instance, view, &cx);
                 if let Some(detail) = compiled.semantic(&UiKey::new("packages/detail")) {
                     assert!(!detail.label.contains(&note), "{context}: {}", detail.label);
@@ -12805,7 +12786,7 @@ fn package_admission_is_drawn_from_the_tool_before_the_status_read() {
     }
 }
 
-/// PACKAGES SAYS A MISSING TOOL ONCE, AND KEEPS ITS VERBS IN ITS CARD: the
+/// Packages says a missing tool once and keeps its verbs in its card: the
 /// status card says the package tool is missing, so no switch row repeats it;
 /// the Background service line is plain text, not a card that reads as a
 /// field; and the three verbs are one row of the hero (side by side wherever
@@ -13048,7 +13029,7 @@ fn one_cause_paints_one_note() {
     }
 }
 
-/// THE "THIS MAC" STATUS LIVES IN ITS ROW'S GROUP. On macOS, once the host has
+/// The "This Mac" status lives in its row's group: on macOS, once the host has
 /// read the Mac, Security's one "This Mac" group holds the Universal Control
 /// row and, under it, the measured state in a sentence; where there is
 /// something to apply, what Apply Now does with the button beside it at its own
@@ -13895,7 +13876,7 @@ fn packages_long_reason_rows_put_the_fix_first_and_keep_short_states_stable() {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Packages);
-            state.page_scroll = page;
+            state.scroll_page_to(page);
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             let painted: Vec<String> = compiled
                 .paint_audit_lines()
@@ -14357,9 +14338,9 @@ fn visual_preview_matrix_covers_four_viewports_at_three_text_scales_at_scale(sca
     }
 }
 
-/// ABOUT'S ONE TAGLINE AND WHOLE FACTS: the hero paints the build
-/// information's `tagline` row — the sentence Copy Build Information copies —
-/// and each build fact is ONE block of the card, its wrapped lines inside it,
+/// About's one tagline and whole facts: the hero paints the build
+/// information's `tagline` row (the sentence Copy Build Information copies),
+/// and each build fact is one block of the card, its wrapped lines inside it,
 /// so a list that lays the card out fact by fact never parts a fact from its
 /// own continuation.
 #[test]
@@ -15547,10 +15528,8 @@ fn maximum_type_landscape_update_sections_are_complete_at_scale(_scale: f32) {
     }
 }
 
-/// 2026-08 settings audit: navigating Home → an ordinary form page moved
-/// the content column ~130pt because each page centered around its OWN
-/// route maximum. Sibling pages of one rail must share a left edge; the
-/// narrower page keeps its deliberate width by yielding on the right.
+/// Sibling pages of one rail share a left edge (centring each page on its own route
+/// maximum moved the column ~130pt); the narrower page yields on the right.
 /// THE MEASURE FOLLOWS THE LAYOUT, NOT THE ROUTE: every single-column page —
 /// a form page, Harness, Packages, Messages, About, Search Results, a Top
 /// Settings that stacks its cards — shares one content width, so a row is as
@@ -17732,7 +17711,9 @@ fn short_landscape_audit_reaches_every_control_with_feedback() {
 }
 
 /// Every screen of the list the view shows now, from its top to the last
-/// one it scrolls to: compiled at each first stop in turn.
+/// one it scrolls to: compiled at each first stop in turn. The first,
+/// which measures the list's bound, is its top screen too, unless it
+/// scrolled to the control the keyboard is on.
 fn each_screen(
     runtime: &mut NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -17740,23 +17721,52 @@ fn each_screen(
     cx: &ViewCx<'_>,
     mut each: impl FnMut(&crate::native_ui::CompiledUi, usize),
 ) -> usize {
-    // Scrolling forgets a control kept in view, as the wheel does.
+    each_screen_of(runtime, instance, view, cx, |_, compiled, top| {
+        each(compiled, top);
+    })
+}
+
+/// [`each_screen`], `each` also given the view as that screen left it: the
+/// list's plan and what the screen showed of it.
+fn each_screen_of(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    cx: &ViewCx<'_>,
+    mut each: impl FnMut(&SettingsViewState, &crate::native_ui::CompiledUi, usize),
+) -> usize {
+    // Scrolling forgets a control kept in view, as the wheel does, from
+    // where the last screen put the list, as every event takes it.
     let set_top = |runtime: &mut NativeRuntime, top: usize| {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!();
         };
-        state.page_scroll = top;
+        state.scroll_page_to(top);
         state.page_reveal = None;
     };
     set_top(runtime, 0);
-    let _ = compile_settings_view(runtime, instance, view, cx);
-    let limit = match runtime.view_state(view) {
-        Some(AppViewState::Settings(state)) => state.result_page_limit.get().unwrap_or(0),
+    let first = compile_settings_view(runtime, instance, view, cx);
+    let (limit, drawn) = match runtime.view_state(view) {
+        Some(AppViewState::Settings(state)) => (
+            state.result_page_limit.get().unwrap_or(0),
+            state
+                .scroll_record
+                .borrow()
+                .as_ref()
+                .map_or(0, scroll::ScrollRecord::top),
+        ),
         _ => unreachable!(),
     };
+    let mut first = (drawn == 0).then_some(first);
     for top in 0..=limit {
-        set_top(runtime, top);
-        each(&compile_settings_view(runtime, instance, view, cx), top);
+        let screen = first.take().unwrap_or_else(|| {
+            set_top(runtime, top);
+            compile_settings_view(runtime, instance, view, cx)
+        });
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        each(state, &screen, top);
     }
     limit + 1
 }
@@ -17781,7 +17791,7 @@ fn screen_showing(
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!();
         };
-        state.page_scroll = top;
+        state.scroll_page_to(top);
         state.page_reveal = None;
         found = Some(compile_settings_view(runtime, instance, view, cx));
     }
@@ -17959,9 +17969,8 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
             );
         }
 
-        // Modified includes both reset-safe known structures and unknown
-        // forward-compatible keys. Every exact authored override receives
-        // its own complete summary/action slice.
+        // Modified includes reset-safe known structures and unknown forward-compatible
+        // keys; each authored override gets its own summary/action slice.
         let mut source = (0..7)
             .map(|index| format!("future_{index} = {index}\n"))
             .collect::<String>();
@@ -20962,7 +20971,7 @@ fn clear_search_is_visible_touchable_and_resets_the_complete_query_state() {
             panic!("Settings view")
         };
         state.search_input.select_all();
-        state.page_scroll = 4;
+        state.scroll_page_to(4);
 
         let cx = view_cx_at(width, height);
         let compiled = runtime
@@ -23242,8 +23251,7 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
         }
     }
 
-    // The longest transient Top transaction status is also part of the
-    // supported responsive state space.
+    // The longest transient Top transaction status, too.
     if scale >= 2.0 {
         let (mut runtime, instance, view) = setup();
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -23359,7 +23367,7 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
         let mut assets = (*state.assets).clone();
         assets.themes = themes;
         state.assets = Arc::new(assets);
-        state.page_scroll = 0;
+        state.scroll_page_to(0);
         // On the screen that shows it whole: the first screen's peek draws it
         // as a fading picture where the room's edge cuts it.
         state.reveal_control(UiKey::new(format!(
@@ -24681,10 +24689,12 @@ exclude = ["nested"]
         "the independently authored nested path retains its exact schema action"
     );
 
-    state.page_scroll = overrides
-        .iter()
-        .position(|entry| entry.key == r#""packages.exclude""#)
-        .unwrap();
+    state.scroll_page_to(
+        overrides
+            .iter()
+            .position(|entry| entry.key == r#""packages.exclude""#)
+            .unwrap(),
+    );
     let cx = view_cx_at(1_080.0, 720.0);
     let compiled = runtime
         .render(instance, view, &cx)
@@ -25115,7 +25125,7 @@ fn modified_pages_every_manual_override_at_normal_and_large_text_at_scale(_scale
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!();
         };
-        state.page_scroll = offset;
+        state.scroll_page_to(offset);
         let compiled = runtime
             .render(instance, view, &cx)
             .unwrap()
@@ -25714,8 +25724,8 @@ fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
         assert!(!music_off.has_live_effect, "{key}");
     }
 
-    // Platform truth: with no audio device the synth voices say so, while
-    // the terminal bell — an OS alert sound, not a synth voice — does not.
+    // With no audio device the synth voices say so; the terminal bell, an OS alert
+    // sound, does not.
     let silent = SettingsAvailability {
         trail_audio: false,
         ..availability
@@ -25938,8 +25948,7 @@ fn serious_mode_is_disclosed_on_the_sound_rows_it_silences() {
         prefs::EDIT_TRAIL_SOUND_BED,
         prefs::EDIT_TRAIL_SOUND_RIFF,
         prefs::EDIT_BELL_SOUND,
-        // The bonks take the same note from the keyword-toy branch; pinning
-        // them here keeps the BOX's promise whole rather than one branch's.
+        // The bonks take the same note from the keyword-toy branch.
         prefs::EDIT_SPARKLE_BONK,
         prefs::EDIT_SPARKLE_BONK_DETONATION,
     ] {
@@ -25976,7 +25985,7 @@ fn serious_mode_is_disclosed_on_the_sound_rows_it_silences() {
     );
 }
 
-/// A STYLE READS AS ITS NAME, through any spelling of it: the name its row
+/// A style reads as its name through any spelling of it: the name its row
 /// on Cursor Styles shows, in the closed control, the preview and the
 /// accessible label alike. The naming is scoped to this key.
 #[test]
@@ -27183,7 +27192,7 @@ fn effect_projection_exhaustively_names_platform_backend_and_admission_gates() {
             }
         }
     }
-    // ONE reason a setting does nothing: without its package tool, Install ALab
+    // One reason a setting does nothing: without its package tool, Install ALab
     // tools says that alone, not also that it waits on Keep ALab tools up to
     // date. Negative control: with the tool there, the wait is the reason.
     for (admission, expected) in [
@@ -29633,17 +29642,11 @@ fn row_notes_are_native_semantic_and_fit_responsive_layouts_at_scale(scale: f32)
     }
 }
 
-/// The byline steps down a fixed ladder — author · company · site, then
-/// author · company, then the author, then the author's short form — to the
-/// longest form its hero column really fits, so no width or text scale ever
-/// paints it elided. The site joined the line on 2026-09-14 and clipped a
-/// 286.5pt phone column at 1× ("…alab.sy…", 223.2pt required against 206.5pt
-/// available). The LAST rung is measured like every other one: `Andrew
-/// Yates` was the floor until 2026-09-17, when a 240pt host at 2× gave it a
-/// 164.0pt column against its 164.6pt measure and the painter clipped the
-/// name itself. Below the last rung the hero authors NO byline — asserted
-/// here in both directions, so the omission can never hide a form that would
-/// have fitted. Every scale runs on a thread of its own ([`at_each_text_scale`]).
+/// The byline steps down a fixed ladder (author · company · site, author · company,
+/// author, the author's short form) to the longest form its hero column fits, so no
+/// width or text scale paints it elided; every rung is measured, and below the last
+/// the hero authors no byline, asserted both ways so the omission never hides a form
+/// that fits. Each scale runs on its own thread ([`at_each_text_scale`]).
 #[test]
 fn native_about_byline_steps_down_to_the_longest_form_its_column_fits() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "About byline fit audit", |scale| {
@@ -30090,8 +30093,8 @@ fn long_settings_copy_wraps_instead_of_one_elided_line() {
         let context = format!("Wallpaper at {width}×{height}");
         assert_zero_top_paint(&compiled, &context);
 
-        // The Wallpaper card's note took over the description's sentence;
-        // dim and text tint are rows of their own now, so the hint is gone.
+        // The Wallpaper card's note carries the explanatory sentence (dim and
+        // text tint are rows of their own).
         let key = "settings/wallpaper/note";
         let label = compiled
             .semantic(&UiKey::new(key))
@@ -30115,9 +30118,7 @@ fn long_settings_copy_wraps_instead_of_one_elided_line() {
     }
 }
 
-// -----------------------------------------------------------------------
 // Settings ▸ Messages
-// -----------------------------------------------------------------------
 
 /// Forty entries as the host would publish them (`App::messages_state`):
 /// a folded crash record with its absolute path and an `Open log`, a
@@ -30588,11 +30589,9 @@ fn one_past_day_is_headed_and_the_titles_hold_their_x_across_filters() {
     );
 }
 
-/// A SCREEN READER SCROLLS THE LOG (ruling 264): with no pager, the log's
-/// card is a `List` carrying accesskit's scroll actions, and a scroll on
-/// it routes to the same `ScrollLines` the wheel sends — the list moves
-/// by those entries, and the rows that come into view are disclosure
-/// buttons named by their titles, as before.
+/// A screen reader scrolls the log: with no pager the card is a `List` carrying
+/// accesskit's scroll actions, a scroll routes to the `ScrollLines` the wheel sends,
+/// and the rows that come into view are disclosure buttons named by their titles.
 #[cfg(a11y_tree)]
 #[test]
 fn a_screen_reader_scrolls_the_log_list() {
@@ -30743,7 +30742,7 @@ fn messages_page_lists_newest_first_and_filters_by_tag() {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!()
         };
-        state.page_scroll = limit;
+        state.scroll_page_to(limit);
     }
     let end = message_rows(&compile_settings_view(&runtime, instance, view, &cx));
     assert_eq!(end.last(), Some(&1), "the oldest entry closes the list");
@@ -30760,7 +30759,7 @@ fn messages_page_lists_newest_first_and_filters_by_tag() {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!()
         };
-        state.page_scroll = 0;
+        state.scroll_page_to(0);
     }
 
     messages_action(
@@ -32308,10 +32307,9 @@ fn a_deep_linked_entry_too_tall_for_the_pinned_header_is_read_whole() {
     );
 }
 
-/// The page names an entry and a button by IDENTITY (design §4.4): the
-/// effect carries an id and an index, never the path the intent holds,
-/// and the host's answer becomes the feedback line; a button the
-/// projection says is spent raises no effect at all.
+/// The page names an entry and a button by identity (design §4.4): the effect carries
+/// an id and an index, never the intent's path, and the host's answer becomes the
+/// feedback line; a spent button raises no effect.
 #[test]
 fn messages_entry_actions_never_carry_a_path() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -32553,11 +32551,8 @@ fn the_software_update_link_opens_messages_on_the_update_chip() {
     assert!(state.messages_filter.is_all());
 }
 
-/// ROUND 16, DAY TWO (ruling 267): Page Down on the compact category list
-/// moved a fixed eight rows through a list that shows six — `1–6`, `9–14`,
-/// `17–17` — so Packages and Messages were never shown. It moves by the
-/// page shown now: every category is seen, no page skips one, and Page Up
-/// comes back the same way.
+/// Page Down on the compact category list moves by the page shown now, so every
+/// category is seen and none skipped, and Page Up comes back the same way.
 #[test]
 fn page_keys_move_the_compact_category_list_by_the_page_it_shows() {
     let (mut runtime, instance, view) = setup();
@@ -32741,12 +32736,9 @@ fn the_keyboard_never_scrolls_away_with_the_compact_header() {
     assert!(reached_a_row, "the keyboard went into the list");
 }
 
-/// RULING 270 (round 17, day three): `Copied` in the page's bottom bar
-/// took the list's room, so an open entry that fitted no longer did and
-/// the list fell from seven rows to four for five seconds. The page's
-/// own confirmation rides its count line: the same rows before and
-/// after, no status bar, and the words still said (the count line is a
-/// Status node). At the day's geometry (100 columns, 774×612 pt).
+/// `Copied` rides the page's count line, not a bottom bar, so the list keeps its rows
+/// before and after and the words are still said (the count line is a Status node).
+/// At 100 columns (774×612 pt).
 #[test]
 fn the_messages_pages_confirmation_takes_no_room_from_the_list() {
     let (mut runtime, instance, view) = setup_with_messages();
@@ -32788,7 +32780,7 @@ fn the_messages_pages_confirmation_takes_no_room_from_the_list() {
             };
             state.feedback = None;
             // The list's top, where a compact page seats its count line.
-            state.page_scroll = 0;
+            state.scroll_page_to(0);
         }
         let quiet = message_rows(&compile_settings_view(&runtime, instance, view, &cx));
         {
@@ -32861,7 +32853,7 @@ fn a_scrolled_compact_messages_page_says_an_entrys_copy_where_it_is_seen() {
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                 unreachable!();
             };
-            state.page_scroll = 1;
+            state.scroll_page_to(1);
             state.page_reveal = None;
             1
         };
@@ -32935,10 +32927,9 @@ fn a_scrolled_compact_messages_page_says_an_entrys_copy_where_it_is_seen() {
     }
 }
 
-/// The count line's height and button placement are the COUNT's alone
-/// (round 17 review, V4): at every width, a note leaves both unchanged.
-/// NEGATIVE CONTROL: a count too wide for the buttons does move them —
-/// the sweep reaches both placements.
+/// The count line's height and button placement are the count's alone: at every width
+/// a note leaves both unchanged. Negative control: a count too wide for the buttons
+/// moves them, so the sweep reaches both placements.
 #[test]
 fn a_count_lines_note_never_moves_its_buttons() {
     let shape = |node: &UiNode| {
@@ -33039,7 +33030,7 @@ fn the_messages_pages_confirmation_is_transient() {
 }
 
 /// THE TAG CHIPS WRAP AS ONE ALIGNED, BALANCED BLOCK (design ruling 312;
-/// round 21's census at 1200 pt: the chips filled the line beside the
+/// the prior census at 1200 pt: the chips filled the line beside the
 /// severity segments, then ran on from the page's left edge under them).
 /// More tags than one line beside the segments holds, at 1200 pt (the
 /// page's form measure): two rows of chips, each row's first chip at the x
@@ -33567,9 +33558,7 @@ fn the_log_at_its_ring_cap_builds_only_the_rows_in_view() {
     }
 }
 
-// -----------------------------------------------------------------------
 // Settings ▸ Messages, captured
-// -----------------------------------------------------------------------
 
 /// A Settings controller holding `messages`, its view on Messages.
 fn setup_with_these_messages(
@@ -33605,10 +33594,8 @@ fn go_to_route(
         .unwrap();
 }
 
-// ---------------------------------------------------------------------------
 // Settings ▸ Messages: the keyboard, the scroll and the status line after an action,
 // a publication or a scroll.
-// ---------------------------------------------------------------------------
 
 /// The Settings view's focused key, compiled at `cx`, and whether the page
 /// shows it.
@@ -34454,11 +34441,9 @@ fn a_row_told_on_at_the_top_of_the_view_keeps_the_readers_place() {
     }
 }
 
-/// Ruling 441 (k) and (o), ruling 262's two lines: a publication never
-/// leaves the keyboard on a Tag control it took off a wider page. New tags
-/// a script names fold the chips into the `Tag: …` pop-up, so a focused
-/// chip goes to the pop-up's button, as a choice in the pop-up puts it; a
-/// ring that lets those tags go lets the chips out again and takes the
+/// A publication never leaves the keyboard on a Tag control it took off the page: new
+/// tags that fold the chips into the `Tag: …` pop-up move a focused chip's focus to
+/// the pop-up's button; a ring that drops those tags lets the chips out and takes the
 /// button away. A publication that keeps the chips keeps the chip focused.
 #[test]
 fn a_publication_that_folds_the_tag_chips_moves_the_keyboard_with_them() {
@@ -34733,19 +34718,7 @@ fn the_pinned_preview_keeps_a_specimen_row_and_yields_for_a_second_stop() {
             state.navigate(route);
         }
         let cx = view_cx_at(width, height);
-        let _ = compile_settings_view(&runtime, instance, view, &cx);
-        let limit = messages_view_state(&runtime, view)
-            .scroll_plan()
-            .expect("a measured list")
-            .limit();
-        for top in 0..=limit {
-            {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                    unreachable!();
-                };
-                state.page_scroll = top;
-            }
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        each_screen_of(&mut runtime, instance, view, &cx, |state, compiled, top| {
             let context = format!("{} {width}×{height} screen {top}", route.label());
             let (floor, preview) = compiled
                 .paint
@@ -34761,9 +34734,7 @@ fn the_pinned_preview_keeps_a_specimen_row_and_yields_for_a_second_stop() {
                 preview + 0.01 >= floor,
                 "{context}: the {preview}pt preview is under its {floor}pt floor"
             );
-            let (plan, shown) = messages_view_state(&runtime, view)
-                .scroll_shown()
-                .expect("a measured list");
+            let (plan, shown) = state.scroll_shown().expect("a measured list");
             assert!(
                 shown.len() >= 2
                     || shown.end == plan.len()
@@ -34771,7 +34742,7 @@ fn the_pinned_preview_keeps_a_specimen_row_and_yields_for_a_second_stop() {
                         > plan.room() + (preview - floor) + 0.01,
                 "{context}: one stop where the preview could yield for two"
             );
-        }
+        });
     }
 }
 
@@ -34873,10 +34844,10 @@ fn a_short_host_scrolls_the_preview_never_drops_it() {
     }
 }
 
-/// UP AND DOWN WALK THE PAGE (ruling 264): from a control in the list the
-/// keyboard moves to the next or the previous one wherever it is, and the
-/// list follows it; past the ends it stays put; with the keyboard outside the
-/// list, Down scrolls a row.
+/// Up and Down walk the page: from a control in the list the keyboard moves
+/// to the next or the previous one wherever it is, and the list follows it;
+/// past the ends it stays put; with the keyboard outside the list, Down
+/// scrolls a row.
 #[test]
 fn up_and_down_walk_the_page_controls_and_the_list_follows() {
     let (mut runtime, instance, view) = setup();
@@ -35048,7 +35019,7 @@ fn a_grown_window_reclamps_the_scroll_to_a_full_last_screen() {
             unreachable!();
         };
         state.navigate(SettingsRoute::TextFonts);
-        state.page_scroll = usize::MAX;
+        state.scroll_page_to(usize::MAX);
     }
     let small = view_cx_at(584.0, 348.0);
     let _ = compile_settings_view(&runtime, instance, view, &small);
@@ -36047,7 +36018,7 @@ fn messages_filters_sit_on_a_card_and_chips_hold_3_to_1() {
     }
 }
 
-/// A COPY THAT CAN'T UPDATE ITSELF OFFERS NOTHING THAT PRETENDS TO. Run from a
+/// A copy that can't update itself offers nothing that pretends to: run from a
 /// plain binary (or a disk image, a translocated download, a dev build), the
 /// page's one action is greyed and says why, a press sends no check and says
 /// the same, the palette's "Updates: Check" is greyed with it; the switches'
@@ -36292,7 +36263,7 @@ fn top_of_page(runtime: &mut NativeRuntime, view: crate::native_app::ViewId) {
     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
         unreachable!();
     };
-    state.page_scroll = 0;
+    state.scroll_page_to(0);
     state.page_reveal = None;
 }
 
@@ -37482,7 +37453,7 @@ fn a_search_finds_the_theme_rows_wherever_their_picker_seeds() {
     assert_eq!(shown, ["Gruvbox Dark", "Gruvbox Light"]);
 }
 
-/// SEL-17: the footer opens the themes folder and imports, through the
+/// The theme picker's footer opens the themes folder and imports, through the
 /// host, by request alone.
 #[test]
 fn the_theme_picker_footer_opens_the_folder_and_imports_through_the_host() {
@@ -40393,13 +40364,12 @@ fn a_newly_highlighted_preview_starts_its_own_loop() {
     );
 }
 
-/// THE LAST SCREEN'S PEEK DRAWS NO HALF A BUTTON: at 102x29 the last screen
-/// of Software Update fills its top with the bottom of the status card, and
-/// that card's buttons, cut in half by the list's top edge, used to be drawn
-/// there legible but dead. A control in a peek over the top is whole and
-/// live, or not drawn. Over a run of window heights, every last screen whose
-/// status card peeks: CONTROL, the first screen draws the buttons whole and
-/// live, and the run holds such a screen at all.
+/// The last screen's peek draws no half a button: at 102x29 the last screen of
+/// Software Update fills its top with the bottom of the status card, whose
+/// buttons the list's top edge cuts in half. A control in a peek over the top
+/// is whole and live, or not drawn. Over a run of window heights, every last
+/// screen whose status card peeks; control: the first screen draws the buttons
+/// whole and live, and the run holds such a screen at all.
 /// THE LAST SCREEN'S PEEK IS LIVE WHERE IT SHOWS (THE LIST'S EDGE RULE): on a
 /// short window the last screen of Software Update fills its top with the bottom
 /// of the status card, and that card's buttons, cut by the list's top edge, are
@@ -40418,7 +40388,7 @@ fn the_update_pages_last_screen_draws_the_status_cards_cut_buttons_live() {
         let Some(limit) = state.result_page_limit.get().filter(|limit| *limit > 0) else {
             continue;
         };
-        state.page_scroll = limit;
+        state.scroll_page_to(limit);
         let last = settings_route_at(&state, &cx);
         let Some(hero) = last
             .paint
@@ -42622,7 +42592,7 @@ fn the_compact_messages_first_screen_seats_the_newest_entry() {
     }
 }
 
-/// THE UPDATE STATUS CARD'S HEADLINE IS MEASURED IN ITS COLUMN (the round-7 review
+/// THE UPDATE STATUS CARD'S HEADLINE IS MEASURED IN ITS COLUMN (the review
 /// of p6): `update_status_card` chose the compact headline by a guess — a compact
 /// window narrower than 220pt × the text size at more than 1.25× — so at 1× a phone
 /// column painted "This copy of aterm can't update itself." past its 246pt column,
@@ -42724,7 +42694,7 @@ fn the_update_status_headline_is_measured_in_its_column() {
     assert_eq!(text, "Can\u{2019}t update", "320x900 at 1x");
 }
 
-/// THE SYSTEM PAGES MEASURE AGAINST THE LAYOUT, NOT FIXED WIDTHS (the round-7
+/// THE SYSTEM PAGES MEASURE AGAINST THE LAYOUT, NOT FIXED WIDTHS (the
 /// page-measure follow-up): About took its short hero below a fixed 270pt list
 /// and set its wordmark in a fixed 88pt slot; Software Update's Messages link was
 /// a fixed 124pt (capped at 1.5×) whatever its label measured; Messages wrapped
@@ -42866,7 +42836,7 @@ fn the_system_pages_measure_against_the_layout() {
     );
 }
 
-/// A HARD EDGE NEVER CUTS THROUGH A CARD'S CAPTION (the round-7 edge-rule
+/// A HARD EDGE NEVER CUTS THROUGH A CARD'S CAPTION (the edge-rule
 /// follow-up): on a window with no strip under its list (80x24, 60x20, 80x20 and
 /// a 2x text window that docks its status) the screen drew the next card's peek down to the room's
 /// edge wherever that fell, so AI CLIs, Harness, Tab Control, Appearance, Text &
@@ -43088,7 +43058,7 @@ fn the_packages_consent_note_wraps_to_its_column() {
     );
 }
 
-/// THE PREVIEW SAYS WHAT IT CANNOT SHOW (lead-known-open #30, round-7 cs-19):
+/// THE PREVIEW SAYS WHAT IT CANNOT SHOW (lead-known-open #30 cs-19):
 /// the Settings preview draws in standard range, so on a screen that shows
 /// EDR, HDR glow's row on the Adjust card under it says the preview cannot
 /// show HDR brightness — the preview's own words, from its one cause

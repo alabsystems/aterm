@@ -3,7 +3,7 @@
 // Author: Andrew Yates
 
 //! A rows-only flap of the primary screen with the program's output between
-//! its halves (aterm-grid `grid/resize_handback.rs`, ATERM-KI-1015-1 S2R-F4),
+//! its halves (aterm-grid `grid/resize_handback.rs`),
 //! fed through the parser as the program wrote it and judged by what a
 //! terminal fed the same bytes shows when it never resized, or when it stayed
 //! at the final height.

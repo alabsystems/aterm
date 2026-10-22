@@ -13,15 +13,13 @@
 //!
 //! # Why the cut is sound
 //!
-//! Every sample is taken AFTER the reads it covers, the tty output queue is
-//! one FIFO, `tcgetpgrp` reports the group at the moment it is called, and a
-//! shell reaps its job and `tcsetpgrp`s itself BEFORE writing its next byte
-//! (measured for zsh 5.9 and bash 3.2; fish re-arms its modes only when it next
-//! reads input). So if `s` is the last sample that still showed the old group,
-//! every byte the NEW holder wrote sits at or after `s`'s offset — the cut. The
-//! handback therefore lands before zsh's own `ESC[?2004h`, never after it: a
-//! UI-side sweep could not promise that, which is why the handback is ordered
-//! in the stream. The derived model is `ForegroundHandback`
+//! Every sample is taken after the reads it covers, the tty output queue is one FIFO,
+//! `tcgetpgrp` reports the group at the moment it is called, and a shell reaps its job and
+//! `tcsetpgrp`s itself before writing its next byte (zsh 5.9, bash 3.2; fish re-arms its modes
+//! only when it next reads input). So if `s` is the last sample that still showed the old
+//! group, every byte the new holder wrote sits at or after `s`'s offset: the cut. The handback
+//! therefore lands before zsh's own `ESC[?2004h`; a UI-side sweep could not promise that, so
+//! the handback is ordered in the stream. The derived model is `ForegroundHandback`
 //! (`aterm-models-gui/src/models_foreground_handback.rs`).
 //!
 //! # What is handed back
@@ -958,7 +956,7 @@ mod tests {
         assert!(c.sample(JOB, 20));
         assert!(c.sample(SHELL, 30), "still delivering: the edge is taken");
         assert_eq!(c.finish(|| SHELL, 30), Some(FgEdge::group(10, SHELL, JOB)));
-        // The later flip back is the NEXT batch's edge, seen from its first sample.
+        // The later flip back is the next batch's edge, seen from its first sample.
         c.begin();
         assert_eq!(c.finish(|| SHELL, 5), Some(FgEdge::group(0, JOB, SHELL)));
     }

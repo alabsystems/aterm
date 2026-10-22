@@ -523,7 +523,7 @@ pub const TESTED: [&str; 3] = ["aterm-uds", "aterm-pty", "libc"];
 /// §6.2) and pwsh, and GNU's bash 3.2 for the spare hold's SIGWINCH control
 /// (`linux_guest::BASH_3_2`). The lane provides every shell the suite names, so
 /// a test that ends COULD NOT RUN fails, as every failed test does, and fails
-/// the row: a fish failure no row ran once landed past every check (round 5,
+/// the row: a fish failure no row ran once landed past every check (
 /// 2026-10-21).
 pub const SHELLS: &str = "aterm-shell-integration";
 

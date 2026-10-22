@@ -49,7 +49,7 @@
 //! command that record names run AS WRITTEN, and the tab's `hold=` after it.
 //! Exit 0 when every one of those is what the ruling says; 1 otherwise.
 //!
-//! `--clear` (LC-1 of ATERM-KI-1015-1): after the turn the run types `/clear`,
+//! `--clear` (LC-1 of ): after the turn the run types `/clear`,
 //! waits until Claude Code's record names the new conversation and the desk
 //! names it too (30 s; said when it does not), then ends aterm: the relaunch
 //! must resume the NEW conversation, never the one the agent left, and its
@@ -1027,7 +1027,7 @@ fn run_restore(
         }
     );
 
-    // ---- `/clear` in the app (LC-1 of ATERM-KI-1015-1): Claude Code's record
+    // ---- `/clear` in the app (LC-1 of ): Claude Code's record
     // names a new conversation within a second, and the desk must name it too
     let conv = if clear {
         let t_c = now_ms();

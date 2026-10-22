@@ -183,7 +183,7 @@ impl WrapFrame {
 /// than counted ([`LineCells::append_wrapped_row`], the join a double-click's
 /// word window takes too): row `k` of the run is drawn from column `k * cols`,
 /// each of its cells at that plus the column the grid drew it in, and the
-/// padding runs from where the row's own cells end. (Ruling 2026-10-11, r15
+/// padding runs from where the row's own cells end. (r15
 /// content-4: counting the columns by re-measuring each row's text broke the
 /// stride wherever the text measured wider than the row is, a VS16 base the
 /// grid left one cell wide in the last column, and moved every later hit on

@@ -521,7 +521,6 @@ impl TerminalHandler<'_> {
                     // Wide char doesn't fit — no-op, matching xterm.
                     return;
                 }
-                // IRM insert must respect horizontal margins like ICH.
                 self.grid
                     .insert_chars_margin(row_u16(width), self.modes.left_right_margin_mode);
             }

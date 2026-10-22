@@ -1498,7 +1498,7 @@ pub fn refusal(hit: &Hit, pin: Option<(&PinSource, &str)>) -> String {
         // A hint may only name a command that runs: say that this one may not.
         out.push_str(
             "targo may not have this verb (`targo nextest` and `targo deny` answer \"no such \
-             command\"); IF it does, the Trust spelling is:\n",
+             command\"); if it does, the Trust spelling is:\n",
         );
     } else if hit.unread {
         out.push_str("The Trust tool for it:\n");

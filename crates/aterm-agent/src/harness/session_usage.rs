@@ -91,9 +91,7 @@ pub const NAMED_MODELS: usize = 3;
 /// paused is raised, not counted again, if it grows.
 pub const FINISHED_IDS_KEPT: usize = 16;
 
-// ---------------------------------------------------------------------------
 // One transcript, folded incrementally
-// ---------------------------------------------------------------------------
 
 /// The file a cursor has been folding, as the kernel names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,9 +549,7 @@ impl TranscriptCursor {
     }
 }
 
-// ---------------------------------------------------------------------------
 // One session: its transcript and its subagents' transcripts
-// ---------------------------------------------------------------------------
 
 /// What one [`SessionUsage::refresh`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1288,9 +1284,7 @@ fn list_subagents(dir: &Path, max_entries: usize) -> Listing {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The limit wall, from the transcript
-// ---------------------------------------------------------------------------
 
 /// The limit wall the footer shows: the window of the newest limit notice
 /// written into this session's transcript, and its reset.
@@ -1377,9 +1371,7 @@ fn local_clock(unix: i64, offset: i64, now: i64) -> String {
     format!("{name} {day} at {clock}")
 }
 
-// ---------------------------------------------------------------------------
 // The usage facts: the footer's merged `Σ`, `aterm harness usage`'s per model
-// ---------------------------------------------------------------------------
 
 /// One model's tokens in this session, as `aterm harness usage` names them.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

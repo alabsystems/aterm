@@ -3,14 +3,20 @@
 
 //! Optional local GitHub bootstrap. Configuration contains source locations only;
 //! credentials travel through private stdin and never enter a report or command line.
+//!
+//! No gh (docs/DESIGN-init-system-2026-10-20.md S14, §6.1 row 22): the token's `GET /user`
+//! check and the repository listing go through agh's read door over aterm-http
+//! ([`System::github_api`]), the token is stored in the login keychain by `git credential
+//! approve` through CLT git's osxkeychain helper and read back, and git's github.com settings
+//! are pointed at that helper and read back ([`crate::git_credential`]).
 
+use crate::git_credential::{GITHUB, Git, Lookups};
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, User};
-use crate::port::{Cmd, Secret, System};
+use crate::port::{Secret, System};
 use serde::Deserialize;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
 
 mod native;
 mod repos;
@@ -31,8 +37,6 @@ pub fn run_initial_repositories(
 }
 
 const INPUT_MAX: usize = 64 * 1024;
-const GIT: &str = crate::items::github::CLT_GIT;
-const HOST: &str = "github.com";
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -139,92 +143,74 @@ fn env_key(value: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-pub(super) fn gh(sys: &dyn System) -> Result<PathBuf, String> {
-    crate::controller::github::GH_PATHS
-        .iter()
-        .map(Path::new)
-        .find(|p| sys.stat(p).is_ok())
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            format!(
-                "GitHub bootstrap needs gh ({} or {}), which aterm does not install",
-                crate::controller::github::GH_PATHS[0],
-                crate::controller::github::GH_PATHS[1]
-            )
-        })
-}
-
 pub(super) fn auth_id(user: &User) -> String {
     format!("init.github.auth@{}", user.name)
 }
 
-fn gh_cmd(path: &Path, user: &User) -> Cmd {
-    Cmd::new(path)
-        .as_user(user)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("GH_HOST", HOST)
-        .env("GH_NO_UPDATE_NOTIFIER", "1")
-        .env("GH_NO_EXTENSION_UPDATE_NOTIFIER", "1")
+/// One GitHub read as `user` with `token`, through agh's read door over aterm-http: a whole
+/// 200 answer or an error.
+pub(super) fn get(
+    sys: &dyn System,
+    user: &User,
+    token: &Secret,
+    endpoint: &str,
+) -> Result<crate::github_pages::Page, String> {
+    let reply = sys.github_api(user, token, endpoint)?;
+    crate::github_pages::page(reply.status, reply.headers, &reply.body)
 }
 
-fn active(sys: &dyn System, user: &User, path: &Path, account: &str) -> Result<bool, String> {
-    let cmd = gh_cmd(path, user).args(["api", "--hostname", HOST, "user", "--jq", ".login"]);
-    let ran = sys.run_complete_stdout(&cmd)
-        .map_err(|_| "cannot completely verify the active gh account (network, timeout or output capture failure)")?;
-    if !ran.success() {
-        return Ok(false);
-    }
-    let value = std::str::from_utf8(&ran.stdout)
-        .map_err(|_| "gh returned an invalid account record")?
-        .trim();
-    if !login(value) {
-        return Err("gh returned an invalid account record".into());
-    }
-    Ok(value.eq_ignore_ascii_case(account))
+/// The account `token` signs in as (`GET /user`).
+pub(super) fn identity(sys: &dyn System, user: &User, token: &Secret) -> Result<String, String> {
+    let (value, _) = get(sys, user, token, "/user")?;
+    value["login"]
+        .as_str()
+        .filter(|account| login(account))
+        .map(str::to_owned)
+        .ok_or_else(|| "GitHub returned an invalid authenticated account".into())
 }
 
-fn helper(sys: &dyn System, user: &User, path: &Path) -> Result<bool, String> {
-    if sys.stat(Path::new(GIT)).is_err() {
+/// The token the login keychain holds for `account` at github.com, when it still signs in as
+/// that account. A token GitHub no longer accepts, or a check the network did not answer, is
+/// not ready: the apply stores the source's token again and fails there if GitHub refuses it.
+fn stored(sys: &dyn System, user: &User, account: &str) -> Result<Option<Secret>, String> {
+    let Some(token) = Git::keychain().fill(sys, Some(user), GITHUB, account)? else {
+        return Ok(None);
+    };
+    Ok(match identity(sys, user, &token) {
+        Ok(signed_in) if signed_in.eq_ignore_ascii_case(account) => Some(token),
+        _ => None,
+    })
+}
+
+/// What git's github.com settings resolve to (the keychain helper alone, as the account, or the
+/// setting that keeps them from it), and the keychain's token for the account, when it signs
+/// in as the account.
+fn readiness(
+    sys: &dyn System,
+    user: &User,
+    config: &Github,
+) -> Result<(Lookups, Option<Secret>), String> {
+    let git = Git::keychain();
+    if !git.installed(sys) {
         return Err(
-            "GitHub bootstrap needs Apple's Command Line Tools (xcode-select --install)".into(),
+            "GitHub bootstrap needs Apple's Command Line Tools git (aterm init --only base.clt \
+             installs them)"
+                .into(),
         );
     }
-    let cmd = Cmd::new(GIT).as_user(user).args([
-        "config",
-        "--global",
-        "--get-all",
-        "credential.https://github.com.helper",
-    ]);
-    let ran = sys
-        .run_complete_stdout(&cmd)
-        .map_err(|_| "cannot completely inspect GitHub's git credential helper")?;
-    if ran.status == Some(1) && ran.stdout.is_empty() {
-        return Ok(false);
-    }
-    if !ran.success() {
-        return Err("cannot inspect GitHub's git credential helper".into());
-    }
-    let text = std::str::from_utf8(&ran.stdout)
-        .map_err(|_| "invalid GitHub git credential helper record")?;
-    let lines: Vec<_> = text.lines().collect();
-    let expected = format!("!{} auth git-credential", path.display());
-    let quoted = format!("!\"{}\" auth git-credential", path.display());
-    // The empty entry resets inherited helpers. A later helper would change the
-    // credential selection, so only the generated terminal pair is accepted.
-    Ok(lines.len() >= 2
-        && lines[lines.len() - 2].is_empty()
-        && matches!(lines.last(), Some(value) if *value == expected || *value == quoted))
+    let helper = git.configured(sys, user, &config.account)?;
+    Ok((helper, stored(sys, user, &config.account)?))
 }
 
-pub(super) fn auth_ready(sys: &dyn System, user: &User, config: &Github) -> Result<bool, String> {
-    let (account, helper) = readiness(sys, user, config)?;
-    Ok(account && helper)
-}
-
-fn readiness(sys: &dyn System, user: &User, config: &Github) -> Result<(bool, bool), String> {
-    let path = gh(sys)?;
-    let helper = helper(sys, user, &path)?;
-    Ok((active(sys, user, &path, &config.account)?, helper))
+/// The keychain's token for the configured account once git's settings name it too: what
+/// the repository listing reads with and the clones authenticate with.
+pub(super) fn auth_ready(
+    sys: &dyn System,
+    user: &User,
+    config: &Github,
+) -> Result<Option<Secret>, String> {
+    let (helper, token) = readiness(sys, user, config)?;
+    Ok(token.filter(|_| helper.ready()))
 }
 
 struct Auth {
@@ -241,20 +227,20 @@ impl Item for Auth {
     }
     fn title(&self) -> String {
         format!(
-            "GitHub authentication as {} and HTTPS git helper",
+            "GitHub credential for {} in the login keychain and HTTPS git helper",
             self.config.account
         )
     }
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
         match readiness(sys, &self.user, &self.config) {
-            Ok((true, true)) => Probe::Ok { now: self.title() },
-            Ok((true, false)) => Probe::Change {
-                from: "GitHub HTTPS helper needs setup".into(),
+            Ok((Lookups::Ready, Some(_))) => Probe::Ok { now: self.title() },
+            Ok((Lookups::Not(why), Some(_))) => Probe::Change {
+                from: format!("GitHub HTTPS helper needs setup: {why}"),
                 to: self.title(),
             },
-            Ok((false, _)) => match read_token(sys, &self.user, &self.config) {
+            Ok((_, None)) => match read_token(sys, &self.user, &self.config) {
                 Ok(_) => Probe::Change {
-                    from: "GitHub account or HTTPS helper needs setup".into(),
+                    from: "GitHub credential or HTTPS helper needs setup".into(),
                     to: self.title(),
                 },
                 Err(why) => Probe::Blocked { why },
@@ -263,49 +249,43 @@ impl Item for Auth {
         }
     }
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
-        let path = gh(sys)?;
         if sys.euid() != self.user.uid {
             return Err("GitHub bootstrap must run as its local user".into());
         }
-        // Check tools before changing authentication. No inherited token/environment
-        // can override this login: System runs with a cleared fixed environment.
-        helper(sys, &self.user, &path)?;
-        if !active(sys, &self.user, &path, &self.config.account)? {
+        let git = Git::keychain();
+        let (helper, held) = readiness(sys, &self.user, &self.config)?;
+        if held.is_none() {
             crate::port::no_core_dumps();
             let token = read_token(sys, &self.user, &self.config)?;
-            preflight(sys, &self.user, &self.config, &token)?;
-            let cmd = gh_cmd(&path, &self.user).args([
-                "auth",
-                "login",
-                "--hostname",
-                HOST,
-                "--git-protocol",
-                "https",
-                "--with-token",
-            ]);
-            let ran = sys.run_complete_stdout_input(&cmd, token.bytes()).map_err(
-                |_| "gh authentication failed (private input or complete output was not verified)",
-            )?;
-            if !ran.success() {
-                return Err("gh authentication failed; check token scopes and system credential storage (output withheld)".into());
-            }
-        }
-        if !active(sys, &self.user, &path, &self.config.account)? {
-            return Err("gh did not verify the configured GitHub account after login".into());
-        }
-        if !helper(sys, &self.user, &path)? {
-            let cmd = gh_cmd(&path, &self.user).args(["auth", "setup-git", "--hostname", HOST]);
-            let ran = sys
-                .run_complete_stdout(&cmd)
-                .map_err(|_| "gh could not configure the GitHub HTTPS helper (output withheld)")?;
-            if !ran.success() {
+            // The identity first: nothing is stored for a token that is not the account's.
+            let account = identity(sys, &self.user, &token).map_err(|_| {
+                "GitHub did not verify the supplied token (output withheld); nothing was stored"
+            })?;
+            if !account.eq_ignore_ascii_case(&self.config.account) {
                 return Err(
-                    "gh could not configure the GitHub HTTPS helper (output withheld)".into(),
+                    "the supplied token belongs to a different GitHub account; nothing was stored"
+                        .into(),
                 );
             }
+            git.store(sys, Some(&self.user), GITHUB, &self.config.account, &token)?;
         }
-        if !auth_ready(sys, &self.user, &self.config)? {
-            return Err("GitHub authentication/helper read-back failed".into());
+        if !helper.ready() {
+            git.configure(sys, &self.user, &self.config.account)?;
+        }
+        // The read-back, each half failing for its own reason: git's settings (a setting
+        // configure does not own can still hand github.com lookups elsewhere), then the
+        // keychain's token, which must still sign in as the account.
+        if let Lookups::Not(why) = git.configured(sys, &self.user, &self.config.account)? {
+            return Err(format!(
+                "git's GitHub HTTPS settings did not read back after setup: {why}"
+            ));
+        }
+        if stored(sys, &self.user, &self.config.account)?.is_none() {
+            return Err(format!(
+                "the login keychain's GitHub credential did not read back as one GitHub signs \
+                 in as {} (output withheld)",
+                self.config.account
+            ));
         }
         Ok(())
     }
@@ -371,59 +351,6 @@ fn token(bytes: &[u8], key: Option<&str>) -> Result<Secret, String> {
     Secret::new(value.as_bytes()).map_err(|_| "GitHub token is too long".into())
 }
 
-fn preflight(sys: &dyn System, user: &User, config: &Github, token: &Secret) -> Result<(), String> {
-    // curl accepts this header from a private config pipe, so identity is verified
-    // before gh persists/switches any account. Neither argv nor environment has it.
-    let prefix = b"header = \"Authorization: Bearer ";
-    let mut input = Vec::with_capacity(prefix.len() + token.bytes().len() + 2);
-    input.extend_from_slice(prefix);
-    input.extend_from_slice(token.bytes());
-    input.extend_from_slice(b"\"\n");
-    let cmd = Cmd::new("/usr/bin/curl")
-        .as_user(user)
-        .args([
-            "--disable",
-            "--config",
-            "-",
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--proto",
-            "=https",
-            "--connect-timeout",
-            "15",
-            "--max-time",
-            "55",
-            "--header",
-            "Accept: application/vnd.github+json",
-            "--header",
-            "User-Agent: aterm-init",
-            "--url",
-            "https://api.github.com/user",
-        ])
-        .budget(Duration::from_secs(60));
-    let result = sys.run_complete_stdout_input(&cmd, &input);
-    scrub(&mut input);
-    let ran = result
-        .map_err(|_| "cannot verify the supplied GitHub token before login (output withheld)")?;
-    if !ran.success() {
-        return Err("GitHub rejected the supplied token before login (output withheld)".into());
-    }
-    #[derive(Deserialize)]
-    struct Identity {
-        login: String,
-    }
-    let identity: Identity = aterm_json::from_slice(&ran.stdout)
-        .map_err(|_| "invalid GitHub identity response; gh login was not changed")?;
-    if !identity.login.eq_ignore_ascii_case(&config.account) {
-        return Err(
-            "the supplied token belongs to a different GitHub account; gh login was not changed"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
 fn scrub(bytes: &mut [u8]) {
     for byte in bytes {
         // SAFETY: the mutable slice owns each live byte. Volatile writes prevent
@@ -436,18 +363,15 @@ fn scrub(bytes: &mut [u8]) {
 mod tests {
     use super::*;
     use crate::engine::{self, NoJournal};
+    use crate::git_credential::script;
     use crate::items::defaults::tests::{ctx, user};
     use crate::model::{Mode, Outcome};
-    use crate::port::{Fake, Ran, Stat};
+    use crate::port::{Fake, GithubResponse, Ran, Stat};
 
-    const GH: &str = "/opt/homebrew/bin/gh";
+    const GIT: &str = crate::items::github::CLT_GIT;
     const SOURCE: &str = "/Users//alice/.secrets/github";
     const VALUE: &str = "fixture_secret_injected_only";
-    const ACTIVE: &str = "alice$ GH_PROMPT_DISABLED=1 GH_HOST=github.com GH_NO_UPDATE_NOTIFIER=1 GH_NO_EXTENSION_UPDATE_NOTIFIER=1 /opt/homebrew/bin/gh api --hostname github.com user --jq .login";
-    const HELPER: &str = "alice$ /Library/Developer/CommandLineTools/usr/bin/git config --global --get-all credential.https://github.com.helper";
-    const LOGIN: &str = "alice$ GH_PROMPT_DISABLED=1 GH_HOST=github.com GH_NO_UPDATE_NOTIFIER=1 GH_NO_EXTENSION_UPDATE_NOTIFIER=1 /opt/homebrew/bin/gh auth login --hostname github.com --git-protocol https --with-token";
-    const SETUP: &str = "alice$ GH_PROMPT_DISABLED=1 GH_HOST=github.com GH_NO_UPDATE_NOTIFIER=1 GH_NO_EXTENSION_UPDATE_NOTIFIER=1 /opt/homebrew/bin/gh auth setup-git --hostname github.com";
-    const CURL: &str = "alice$ /usr/bin/curl --disable --config - --silent --show-error --fail --proto =https --connect-timeout 15 --max-time 55 --header 'Accept: application/vnd.github+json' --header 'User-Agent: aterm-init' --url https://api.github.com/user";
+    const STORED: &str = "fixture_stored_keychain_only";
 
     fn stat(mode: u32, len: usize) -> Stat {
         Stat {
@@ -462,7 +386,7 @@ mod tests {
     fn fixture() -> (Fake, Auth, Ctx) {
         let mut sys = Fake::root();
         sys.euid = 501;
-        sys.stat_of(GH, stat(0o755, 0)).stat_of(GIT, stat(0o755, 0));
+        sys.stat_of(GIT, stat(0o755, 0));
         sys.file(SOURCE, VALUE.as_bytes())
             .stat_of(SOURCE, stat(0o600, VALUE.len()));
         let u = user("alice", 501);
@@ -481,8 +405,32 @@ mod tests {
             ctx(&[u]),
         )
     }
-    fn good_helper() -> Ran {
-        Ran::ok("\n!\"/opt/homebrew/bin/gh\" auth git-credential\n")
+    fn signs_in(sys: &Fake, u: &User, login: &str) {
+        sys.on_github_api(
+            u,
+            "/user",
+            Ok(GithubResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: format!("{{\"login\":\"{login}\"}}").into_bytes(),
+            }),
+        );
+    }
+    fn fill(u: &User) -> String {
+        script::credential(Some(u), "fill")
+    }
+    fn approve(u: &User) -> String {
+        script::credential(Some(u), "approve")
+    }
+    /// No call carries the token source's bytes or the keychain's, and none runs gh.
+    fn clean(sys: &Fake) {
+        let calls = sys.calls();
+        assert!(
+            calls
+                .iter()
+                .all(|c| !c.contains(VALUE) && !c.contains(STORED) && !c.contains("/gh")),
+            "{calls:?}"
+        );
     }
 
     #[test]
@@ -542,8 +490,9 @@ mod tests {
     #[test]
     fn plan_and_check_only_probe_and_never_send_or_persist_the_token() {
         let (sys, auth, context) = fixture();
-        sys.on(HELPER, Ran::exit(1, ""))
-            .on(ACTIVE, Ran::exit(1, "not logged in"));
+        let u = auth.user.clone();
+        script::unconfigured(&sys, &u);
+        script::holds_nothing(&sys, Some(&u));
         let rows = engine::run(
             &[Box::new(auth)],
             Mode::Plan,
@@ -552,23 +501,34 @@ mod tests {
             &mut NoJournal,
         );
         assert_eq!(rows[0].outcome, Outcome::Planned);
-        assert_eq!(sys.calls(), vec![HELPER, ACTIVE]);
+        // Reads only: git's settings, then the keychain, which holds nothing to check.
+        let calls = sys.calls();
+        assert_eq!(calls.first(), Some(&script::helpers(&u)), "{calls:?}");
+        assert_eq!(calls.last(), Some(&fill(&u)), "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .all(|c| !c.contains("approve") && !c.contains("--global") && !c.contains(" agh ")),
+            "{calls:?}"
+        );
         assert!(!aterm_json::to_string(&rows).unwrap().contains(VALUE));
-        assert!(sys.fed().is_empty());
+        clean(&sys);
     }
 
     #[test]
     fn configured_plan_waits_for_auth_before_inventory_and_failed_auth_blocks_clones() {
         for mode in [Mode::Plan, Mode::Apply] {
-            let (sys, _auth, context) = fixture();
+            let (sys, auth, context) = fixture();
+            let u = auth.user.clone();
             let profile =
                 b"[github]\naccount='octocat'\nowner='octocat'\ntoken_file='~/.secrets/github'\n";
             let path = "/Users//alice/.config/aterm/init.toml";
             sys.file(path, profile)
                 .stat_of(path, stat(0o644, profile.len()));
-            sys.on(HELPER, Ran::exit(1, ""))
-                .on(ACTIVE, Ran::exit(1, "not logged in"));
-            sys.on(CURL, Ran::exit(22, VALUE));
+            script::unconfigured(&sys, &u);
+            script::holds_nothing(&sys, Some(&u));
+            // GitHub refuses the source's token: nothing is stored or cloned.
+            sys.on_github_api(&u, "/user", Err("refused (output withheld)".into()));
             let rows = engine::run(
                 &items(&sys, &context).unwrap(),
                 mode,
@@ -596,17 +556,20 @@ mod tests {
             assert!(!aterm_json::to_string(&rows).unwrap().contains(VALUE));
             assert!(!sys.calls().iter().any(|c| c.contains("/repos")
                 || c.contains(" clone ")
-                || c.contains("setup-git")
-                || c.contains("auth login")));
+                || c.contains("approve")
+                || c.contains("--global")));
+            clean(&sys);
         }
     }
 
     #[test]
-    fn ready_login_does_not_need_or_read_the_token_source() {
+    fn ready_credential_does_not_need_or_read_the_token_source() {
         let (sys, mut auth, context) = fixture();
         auth.config.token_file = "/not-present".into();
-        sys.on(HELPER, good_helper())
-            .on(ACTIVE, Ran::ok("octocat\n"));
+        let u = auth.user.clone();
+        script::configured(&sys, &u, "octocat");
+        script::holds(&sys, Some(&u), GITHUB, "octocat", STORED);
+        signs_in(&sys, &u, "Octocat");
         let rows = engine::run(
             &[Box::new(auth)],
             Mode::Apply,
@@ -614,20 +577,22 @@ mod tests {
             &context,
             &mut NoJournal,
         );
-        assert_eq!(rows[0].outcome, Outcome::Ok);
-        assert_eq!(sys.calls(), vec![HELPER, ACTIVE]);
+        assert_eq!(rows[0].outcome, Outcome::Ok, "{rows:?}");
+        assert!(sys.calls().iter().all(|c| !c.contains("approve")));
+        clean(&sys);
     }
 
     #[test]
-    fn existing_correct_login_can_repair_helper_without_source_credentials() {
+    fn a_stored_credential_can_repair_the_helper_without_the_token_source() {
         let (sys, mut auth, context) = fixture();
         auth.config.token_file = "/not-present".into();
-        sys.on(ACTIVE, Ran::ok("octocat\n"));
-        sys.on(HELPER, Ran::exit(1, ""))
-            .on(HELPER, Ran::exit(1, ""))
-            .on(HELPER, Ran::exit(1, ""))
-            .on(HELPER, good_helper());
-        sys.on(SETUP, Ran::ok(""));
+        let u = auth.user.clone();
+        script::unconfigured(&sys, &u);
+        script::unconfigured(&sys, &u);
+        script::configured(&sys, &u, "octocat");
+        let writes = script::configure(&sys, &u, "octocat");
+        script::holds(&sys, Some(&u), GITHUB, "octocat", STORED);
+        signs_in(&sys, &u, "octocat");
         let rows = engine::run(
             &[Box::new(auth)],
             Mode::Apply,
@@ -636,132 +601,172 @@ mod tests {
             &mut NoJournal,
         );
         assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
-        assert!(sys.calls().contains(&SETUP.into()));
-        assert!(
-            !sys.calls()
-                .iter()
-                .any(|c| c.contains("auth login") || c.contains("curl"))
-        );
+        let calls = sys.calls();
+        assert!(writes.iter().all(|w| calls.contains(w)), "{calls:?}");
+        assert!(!calls.contains(&approve(&u)), "nothing new is stored");
+        clean(&sys);
     }
 
     #[test]
-    fn token_identity_is_checked_before_any_login_and_all_failure_output_is_withheld() {
-        for response in [
-            Ran::ok("{\"login\":\"someone-else\"}"),
-            Ran::exit(22, VALUE),
-            Ran::ok(VALUE),
+    fn token_identity_is_checked_before_anything_is_stored_and_all_failure_output_is_withheld() {
+        for answer in [
+            Ok(GithubResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{\"login\":\"someone-else\"}".to_vec(),
+            }),
+            Err(format!("refused {VALUE}")),
+            Ok(GithubResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: VALUE.as_bytes().to_vec(),
+            }),
         ] {
             let (sys, auth, context) = fixture();
-            sys.on(HELPER, Ran::exit(1, ""))
-                .on(ACTIVE, Ran::exit(1, "not logged in"));
-            sys.on(CURL, response);
+            let u = auth.user.clone();
+            script::unconfigured(&sys, &u);
+            script::holds_nothing(&sys, Some(&u));
+            sys.on_github_api(&u, "/user", answer);
             let error = auth.apply(&sys, &context).unwrap_err();
-            assert!(!error.contains(VALUE));
+            assert!(!error.contains(VALUE), "{error}");
             assert!(
                 !sys.calls()
                     .iter()
-                    .any(|c| c.contains("auth login") || c.contains("setup-git"))
+                    .any(|c| c.contains("approve") || c.contains("--global")),
+                "{:?}",
+                sys.calls()
             );
-            assert!(sys.calls().iter().all(|c| !c.contains(VALUE)));
+            clean(&sys);
         }
     }
 
     #[test]
-    fn successful_apply_uses_private_input_then_verifies_login_and_helper() {
+    fn a_successful_apply_stores_through_stdin_then_reads_the_credential_and_helper_back() {
         let (sys, auth, context) = fixture();
-        sys.on(HELPER, Ran::exit(1, ""))
-            .on(HELPER, Ran::exit(1, ""))
-            .on(HELPER, good_helper());
-        sys.on(ACTIVE, Ran::exit(1, "not logged in"))
-            .on(ACTIVE, Ran::ok("octocat\n"));
-        sys.on(CURL, Ran::ok("{\"login\":\"octocat\"}"));
-        sys.on(LOGIN, Ran::ok(""));
-        sys.on(SETUP, Ran::ok(""));
+        let u = auth.user.clone();
+        script::unconfigured(&sys, &u);
+        script::configured(&sys, &u, "octocat");
+        let writes = script::configure(&sys, &u, "octocat");
+        // Nothing stored, then the source's token once approve stored it.
+        script::holds_nothing(&sys, Some(&u));
+        script::holds(&sys, Some(&u), GITHUB, "octocat", VALUE);
+        signs_in(&sys, &u, "octocat");
+        let approve = script::approves(&sys, Some(&u));
         auth.apply(&sys, &context).unwrap();
         let calls = sys.calls();
+        let at = |key: &str| calls.iter().position(|c| c == key).unwrap();
+        let last = |key: &str| calls.iter().rposition(|c| c == key).unwrap();
+        assert!(at("alice$ agh GET /user") < at(&approve), "{calls:?}");
+        assert!(at(&approve) < at(&writes[0]), "{calls:?}");
+        // The read-back: git's settings after the writes, then the keychain's token, which
+        // GitHub checks again.
+        assert!(at(&writes[3]) < last(&script::helpers(&u)), "{calls:?}");
+        assert!(last(&script::helpers(&u)) < last(&fill(&u)), "{calls:?}");
+        assert!(last(&fill(&u)) < last("alice$ agh GET /user"), "{calls:?}");
+        clean(&sys);
+    }
+
+    /// The read-back after setup fails for its own reason, named. A setting configure does not
+    /// own that still hands github.com lookups to another helper is git's; a keychain token
+    /// GitHub does not vouch for on the second check is the credential's, not the helper's.
+    /// Negative control: the successful apply above, whose read-back passes.
+    #[test]
+    fn the_read_back_after_setup_names_what_did_not_read_back() {
+        let (sys, auth, context) = fixture();
+        let u = auth.user.clone();
+        let mut foreign = script::configured_settings(&u, "octocat");
+        foreign.push_str(&script::printed(&[(
+            "/Users//alice/.gitconfig",
+            "credential.https://GitHub.com.helper",
+            "!other-credential-helper",
+        )]));
+        script::unconfigured(&sys, &u);
+        sys.on(&script::helpers(&u), Ran::ok(&foreign));
+        let writes = script::configure(&sys, &u, "octocat");
+        script::holds(&sys, Some(&u), GITHUB, "octocat", STORED);
+        signs_in(&sys, &u, "octocat");
+        let error = auth.apply(&sys, &context).unwrap_err();
         assert!(
-            calls.iter().position(|c| c == CURL).unwrap()
-                < calls.iter().position(|c| c == LOGIN).unwrap()
+            error.contains(
+                "credential.https://GitHub.com.helper in /Users//alice/.gitconfig also runs for \
+                 github.com"
+            ),
+            "{error}"
         );
-        assert!(calls.iter().all(|c| !c.contains(VALUE)));
+        assert!(!error.contains("other-credential-helper"), "{error}");
+        assert!(writes.iter().all(|w| sys.calls().contains(w)));
+        clean(&sys);
+
+        let (sys, auth, context) = fixture();
+        script::unconfigured(&sys, &u);
+        script::configured(&sys, &u, "octocat");
+        script::configure(&sys, &u, "octocat");
+        script::holds(&sys, Some(&u), GITHUB, "octocat", STORED);
+        signs_in(&sys, &u, "octocat");
+        sys.on_github_api(&u, "/user", Err("connection reset".into()));
+        let error = auth.apply(&sys, &context).unwrap_err();
         assert!(
-            sys.fed().is_empty(),
-            "the input lane must not retain a secret copy"
+            error.starts_with("the login keychain's GitHub credential did not read back"),
+            "{error}"
         );
+        assert!(
+            !error.contains("helper") && !error.contains("connection reset"),
+            "{error}"
+        );
+        clean(&sys);
     }
 
     #[test]
-    fn incomplete_identity_or_login_capture_stops_before_later_mutations() {
-        for failing in [CURL, LOGIN] {
-            let (sys, auth, context) = fixture();
-            sys.on(HELPER, Ran::exit(1, ""))
-                .on(ACTIVE, Ran::exit(1, "not logged in"));
-            sys.on(CURL, Ran::ok("{\"login\":\"octocat\"}"));
-            sys.on(LOGIN, Ran::ok(""));
-            sys.refuse_complete_stdout(failing, VALUE);
-            let error = auth.apply(&sys, &context).unwrap_err();
-            assert!(!error.contains(VALUE));
-            assert!(!sys.calls().iter().any(|c| c == SETUP));
-            if failing == CURL {
-                assert!(!sys.calls().iter().any(|c| c == LOGIN));
-            }
-        }
+    fn a_store_the_keychain_does_not_read_back_fails_before_the_helper_is_configured() {
+        let (sys, auth, context) = fixture();
+        let u = auth.user.clone();
+        script::unconfigured(&sys, &u);
+        script::configure(&sys, &u, "octocat");
+        script::holds_nothing(&sys, Some(&u));
+        signs_in(&sys, &u, "octocat");
+        script::approves(&sys, Some(&u));
+        let error = auth.apply(&sys, &context).unwrap_err();
+        assert!(error.contains("did not hand back"), "{error}");
+        assert!(!sys.calls().iter().any(|c| c.contains("--global")));
+        clean(&sys);
     }
 
     #[test]
     fn unsafe_token_file_and_unproven_helper_are_never_ready() {
         let (sys, auth, context) = fixture();
-        sys.on(HELPER, Ran::exit(1, ""))
-            .on(ACTIVE, Ran::exit(1, "not logged in"));
+        let u = auth.user.clone();
+        script::unconfigured(&sys, &u);
+        script::holds_nothing(&sys, Some(&u));
         sys.stat_of(SOURCE, stat(0o644, VALUE.len()));
         assert!(matches!(auth.probe(&sys, &context), Probe::Blocked { .. }));
         let (sys, auth, context) = fixture();
-        sys.on(HELPER, good_helper())
-            .on(ACTIVE, Ran::ok("octocat\n"));
-        sys.refuse_complete_stdout(HELPER, "rejected partial tail");
+        script::configured(&sys, &u, "octocat");
+        sys.refuse_complete_stdout(&script::helpers(&u), "rejected partial tail");
         assert!(matches!(auth.probe(&sys, &context), Probe::Unusable { .. }));
-        assert!(
-            !sys.calls()
-                .iter()
-                .any(|c| c.contains("auth login") || c.contains("setup-git"))
-        );
+        // A stored token that signs in as another account is not this one's.
+        let (sys, auth, context) = fixture();
+        script::configured(&sys, &u, "octocat");
+        script::holds(&sys, Some(&u), GITHUB, "octocat", STORED);
+        signs_in(&sys, &u, "someone-else");
+        assert!(matches!(auth.probe(&sys, &context), Probe::Change { .. }));
+        assert!(sys.calls().iter().all(|c| !c.contains("approve")));
     }
 
     #[test]
-    fn real_git_helper_read_distinguishes_global_profile_from_a_local_override() {
-        crate::items::github::need_clt_git();
-        let sys = crate::port::Live::new();
-        let mut scratch = crate::port::Scratch::new(&sys, "github-helper-test").unwrap();
-        let mut u = user("fixture", sys.euid());
-        u.home = scratch.path().to_str().unwrap().into();
-        let repo = scratch.path().join("repository");
-        let command = Cmd::new(GIT)
-            .as_user(&u)
-            .args(["init", "--quiet", "--template=", "--"])
-            .arg(&repo);
-        assert!(sys.run_complete_stdout(&command).unwrap().success());
-        let command = Cmd::new(GIT).as_user(&u).arg("-C").arg(&repo).args([
-            "config",
-            "credential.https://github.com.helper",
-            "local-only",
-        ]);
-        assert!(sys.run_complete_stdout(&command).unwrap().success());
-        let command = Cmd::new(GIT).as_user(&u).arg("-C").arg(&repo).args([
-            "config",
-            "--get-all",
-            "credential.https://github.com.helper",
-        ]);
-        assert_eq!(
-            sys.run_complete_stdout(&command).unwrap().out().trim(),
-            "local-only"
+    fn without_clt_git_the_bootstrap_names_the_item_that_installs_it() {
+        let (sys, auth, context) = fixture();
+        let sys = {
+            let mut bare = Fake::root();
+            bare.euid = sys.euid;
+            bare
+        };
+        let Probe::Unusable { why } = auth.probe(&sys, &context) else {
+            panic!("no git is not ready");
+        };
+        assert!(why.contains("aterm init --only base.clt"), "{why}");
+        assert!(
+            !why.contains("xcode-select") && !why.contains("brew"),
+            "{why}"
         );
-        assert!(!helper(&sys, &u, Path::new(GH)).unwrap());
-        let global = b"[credential \"https://github.com\"]\n helper =\n helper = !\\\"/opt/homebrew/bin/gh\\\" auth git-credential\n";
-        sys.write_file(&scratch.path().join(".gitconfig"), global, 0o600)
-            .unwrap();
-        assert!(helper(&sys, &u, Path::new(GH)).unwrap());
-        let text = sys.run_complete_stdout(&command).unwrap().out();
-        assert_eq!(text.lines().last(), Some("local-only"));
-        scratch.close().unwrap();
     }
 }

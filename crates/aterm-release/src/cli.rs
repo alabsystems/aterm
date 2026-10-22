@@ -36,25 +36,24 @@ USAGE
                   [--linux-worker ARCH=HOST:REPO]...)
                  [--release-credentials <profile.toml>] [--engine DIRECTORY]
                  [--dry-run] [--verbose] [--prepare] [--forget | --abandon vX.Y.Z]
-      THE way to release aterm, from a clean clone of its own on main: checks,
-      sync, commit, the stage (R's commit-only gates, then pub stage), the
-      ONE build (both slices at once, kept in the release cache), `verify
-      release` on those bytes (every check a release requires, MEASURE among
-      them), READY, pub publish, the cut (it claims, then signs the verified
-      bytes), the published release's shape and the site, and the channel's
-      latest — each step skipped when its work is already done for
-      the release commit (the built bundle, the verified
-      record, the attestation, the engine's ledger, the cut journal). Ends in
-      one line: RELEASED …, or REFUSED at <step>: <why> — <what is public>.
-      <remedy>. Run it again to resume; a gap only the owner can close is asked
-      once on the owner's aterm and waited on, while the long steps run.
+      The way to release aterm, from a clean clone of its own on main. Steps:
+      checks, sync, commit, stage, build (the one build of the bundle), verify
+      (`verify release` on those bytes), ready, publish (pub publish), cut (claim,
+      then sign the verified bytes), after-cut (the published release's shape, the
+      site, the handoff fixtures on main) and check (the channel's latest). A step
+      whose work is already done for the release commit is skipped, so running it
+      again resumes. A gap only the owner can close is asked once on the owner's
+      aterm while the long steps run, and waited on at the publish. Ends in one
+      line: RELEASED …, or REFUSED at <step>: <why> — <what is public>. <remedy>.
+      Exit 0 released, prepared, or a dry run with nothing refused · 1 refused ·
+      2 usage · 3 a resumable stop (run it again) · 130 interrupted.
         --bump             commit the next MINOR on origin/main's tip, push it,
                            release it
-        --commit REV       release this commit of origin/main; replaces a
-                           candidate this clone has not published yet (said)
+        --commit REV       release this commit of origin/main; replaces, out
+                           loud, a candidate this clone has not published
         --mac-only / --linux-artifacts …
-                           the Linux declaration the cut requires (journaled:
-                           a bare re-run resumes with it)
+                           the Linux declaration the cut requires (see `cut`);
+                           journaled, so a bare re-run keeps it
         --release-credentials <profile.toml>
                            the cut's signing profile (default
                            ~/.aterm/release-credentials.toml)
@@ -63,117 +62,103 @@ USAGE
         --dry-run          the plan, the ETA, and every refusal a real run would
                            meet; nothing changes
         --verbose          stream every step's output, not only into its log
-        --prepare          run the heavy half — the build, `verify release`
-                           and the stage — and stop
-                           PREPARED before the publish: nothing public, the
-                           prover journaled, this clone's run let go. A bare
-                           `ship release` then finishes it, first asking the
-                           live world again (the same prover, the
-                           provisioning, the tag, the ledger tail, the engine)
-                           and refusing on a mismatch before the claim (and
-                           before anything is public, unless it published
-                           already); a stale prepare is made again by
-                           --prepare. With --dry-run: the plan of both halves
-        --forget           drop this clone's release journal (nothing public
-                           changes), withdraw its open asks, and exit — on its
-                           own (no --dry-run, no flag of a run)
+        --prepare          run through stage, build, verify and ready, then stop
+                           PREPARED, nothing public. A bare `ship release`
+                           finishes it after re-checking the prover, the
+                           provisioning, the tag, the ledger tail and the engine
+                           (a mismatch refuses before the claim); --prepare again
+                           redoes a stale prepare. With --dry-run: both halves
+        --forget           drop this clone's release journal, withdraw its open
+                           asks, and exit; nothing public changes. Takes no flag
+                           of a run
         --abandon vX.Y.Z   withdraw this clone's claimed, unpublished cut of
                            vX.Y.Z (its draft or uploads, its origin tag, its
-                           journal; the claim commit stays) — the claim's own
-                           cutter does it, so run it from the release's clone
+                           journal; the claim commit stays). Run it from the
+                           release's clone: only the claim's own cutter can
 
   targo --unverified ship build
-      THE ONE BUILD of a release bundle: both slices at once from a snapshot of
-      its commit's git objects, the x86_64 slice driven under Rosetta, the
-      unsigned bundle laid out — into the release cache, kept by what it was
-      built as; or found built there, its bytes re-proved. The BUILD step of `ship
-      release`, which runs it for the release this clone's journal reserved
-      (build n, the release commit). With no release in progress it builds
-      HEAD under a provisional number (max(HEAD's ledger tail + 1, now),
-      claimed nowhere) and prints the .app: what `verify measure --app <app>`
-      judges between releases.
+      The one build of a release bundle: both slices at once from a snapshot of
+      the commit's git objects (the x86_64 slice run under Rosetta), laid out
+      unsigned in the release cache — or found there, its bytes re-proved. `ship
+      release` runs it for the build its journal reserved. With no release in
+      progress it builds HEAD under a provisional number (max(HEAD's ledger tail
+      + 1, now), claimed nowhere) and prints the .app for `verify measure --app`.
 
   targo --unverified ship linux-build --version X.Y.Z --build-number N
                  --commit FULL-CLAIM-SHA --out EXISTING-PRIVATE-DIRECTORY
-      Local native Linux worker: sealed Trust build + provenance handoff.
-      No signing or publication. Run on both x86_64 and aarch64 Linux,
-      then give the complete handoff directory to the canonical cutter.
+      On native x86_64 or aarch64 Linux, in a clean checkout at the claim commit:
+      build aterm with the sealed Trust toolchain and write it with its provenance
+      receipt into --out. Nothing is signed or published. Run it on both
+      architectures and hand the directory to the cutter (--linux-artifacts), or
+      let the cutter drive the hosts (--linux-worker).
 
   targo --unverified ship cut [--dry-run] [--resume] [--abandon vX.Y.Z]
-                 [--min-build N] [--release-credentials <profile.toml>]
+                 [--min-build N] [--rehearse OWNER/REPO]
+                 [--release-credentials <profile.toml>]
                  [--linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
                   [--linux-worker ARCH=HOST:REPO]... | --mac-only]
-      The CUT step of `ship release`, which runs it (a release is `ship release` and
-      nothing else): gates → the claim of the release's reserved build → a
-      byte copy of the VERIFIED bundle signed, notarized and packaged (the cut
-      never builds) → tag → ONE publication onto the release channel, made the
-      head last — the binary of the commit `pub publish` published, by that
-      commit's own cutter (the release re-runs as it). A real cut must name
+      The cut step of `ship release`, which runs it; release with `ship release`.
+      Gates, the claim of the release's reserved build, a byte copy of the
+      verified bundle signed, notarized and packaged (the cut never builds), the
+      tag, and one publication onto the release channel, made the head last. Only
+      the release commit's own cutter cuts it. A real or rehearsal cut must name
       --linux-artifacts or --mac-only.
-        --dry-run          gates + a byte copy of the VERIFIED bundle this
-                           clone's release built of the checkout's commit,
-                           under its reserved number (claimed nowhere), signed
-                           into dist/ and notarized by Apple; nothing committed,
-                           published or built
+        --dry-run          the gates, then the verified bundle copied, signed into
+                           dist/ and notarized under its reserved number; nothing
+                           claimed, committed, published or built
         --resume           re-enter the journaled cut (dist/cut-state.toml) at
                            its first incomplete step
         --abandon vX.Y.Z   withdraw an unpublished cut: its own draft deleted, or
                            exactly its uploads taken back off the engine's source
-                           release; its origin tag and the local journal deleted
-                           (the claim commit stays; a later cut recuts)
-        --min-build N      emit an operator apply floor into the manifest
+                           release; its origin tag and the local journal deleted.
+                           The claim commit stays; a later cut recuts
+        --min-build N      raise the manifest's apply floor to at least N
+        --rehearse O/R     a full real cut of the verified bundle, published to
+                           the scratch channel O/R (which must be public) under
+                           its reserved number; no ledger push, no tag on origin
         --linux-artifacts DIRECTORY
-                           require declared Linux handoffs before signing;
-                           missing workers pause the journaled cut for resume
+                           the Linux handoff directory, required complete before
+                           signing; a missing handoff pauses the journaled cut
+                           for --resume
         --linux-target ARCH
-                           explicit native subset (repeatable); defaults to both
+                           ship only these architectures (repeatable); default
+                           both
         --linux-worker ARCH=HOST:REPO
                            after the claim, build ARCH on HOST over ssh (a
                            throwaway worktree of REPO at the claim commit) and
-                           copy its pair into --linux-artifacts; the pair is
-                           checked exactly like a hand-carried one
-        --mac-only         ship no Linux build, on purpose; a real cut must say
-                           this or --linux-artifacts
+                           copy its pair into --linux-artifacts, checked like a
+                           hand-carried one
+        --mac-only         ship no Linux build, on purpose
         --release-credentials <profile.toml>
-                           the signing profile: a rostered, unrevoked machine
-                           key and its notary credential (this machine's is
-                           ~/.aterm/release-credentials.toml). A cut without one
-                           refuses before it claims
+                           the signing profile: a rostered, unrevoked machine key
+                           and its notary credential (`provision` writes
+                           ~/.aterm/release-credentials.toml). Without one the
+                           cut refuses before it claims
 
   targo --unverified ship provision --id <machine-id> [--check] [--cert-dir <folder>]
-                           ON A BARE MACHINE (no Trust toolchain) run
-                           `aterm pkg install trust` first. A full run acquires
-                           rustup, stable's slices, the wasm32 pin and the
-                           wasm-glue oracle's wasm-bindgen itself.
-                           Makes THIS machine a publisher. Seeds the newest
-                           master-signed roster pair from the channel release
-                           into dist/, audits the WHOLE publishing stack — Trust
-                           stage2 (real smoke-compile), the targo/tippy/ty
-                           drivers, the store's targo + trustc front door
-                           (rustup's link reported informationally), the stable x86_64
-                           slice, Apple identity + live-tested notary
-                           credential, the credentials profile, gh auth, channel
-                           token — each gap with its exact remedy, and only on a
-                           CLEAN pass mints this machine's key via the join
-                           ceremony (the paper phrase, typed once, is the only
-                           input; a roster id is irreversible and is never
-                           consumed on a machine that cannot release).
-                           Idempotent: a provisioned machine is audited and
-                           bound through the real authorize_cut gate, never
-                           re-minted. Ends in a READY TO CUT verdict.
+                           make this machine a publisher (without the Trust
+                           toolchain, run `aterm pkg install trust` first). Seeds
+                           the newest master-signed roster pair from the channel
+                           into dist/, acquires rustup, the stable slices and the
+                           wasm32 pin, audits the whole publishing stack (the
+                           Trust toolchain and its drivers, the stable slices,
+                           the Apple identity, a live-tested notary credential,
+                           the credentials profile, gh auth, the channel token)
+                           and prints every gap with its remedy. Only on a clean
+                           pass does it mint this machine's key, by the join
+                           ceremony: the paper phrase, typed once, is the only
+                           input, and a roster id is never spent on a machine
+                           that cannot release. A provisioned machine is audited,
+                           never re-minted. Ends READY TO CUT
         --cert-dir <folder>
-                           the one visible folder the Apple browser errand may
-                           use: the certificate request is copied there for the
-                           upload dialog, and the issued .cer is looked for there
-                           (and in ~/.aterm/apple). Without it every read stays
-                           inside ~/.aterm/apple — provision never touches
-                           ~/Downloads or another folder macOS guards on its own
-                           initiative; naming one is the consent, and a note says
-                           so before the errand.
-        --check            audit only: no mint, no dist/ writes. Exits non-zero
-                           if anything is open, so a caller can gate on it. The
-                           mode to run when something is wrong and you do not
-                           yet want to touch the machine.
+                           the one visible folder the Apple certificate errand
+                           may use: the request is copied there and the issued
+                           .cer looked for there and in ~/.aterm/apple. Without
+                           it nothing outside ~/.aterm/apple is read, so no folder
+                           macOS guards (~/Downloads) raises a dialog
+        --check            audit only: nothing minted or written. On a machine
+                           that holds its key it exits non-zero while anything is
+                           open
 
   targo --unverified ship status        version · ledger tail · dangling claims · newest
                            published build
@@ -183,124 +168,143 @@ USAGE
                            naming sections narrows it to them, none is all three:
         --cut              the cut's pre-claim gates that read only the commit
                            and this clone's records (cutter identity, release
-                           notes, the predecessor's handoff fixtures, the
-                           handoff policy, the `verify release` record),
-                           seconds; answered only as
-                           REV's own cutter (built from REV), else NOT RUN.
-                           publish/pre-promote runs this section
-        --export           the publication engine's export guards: its own
-                           `pub stage aterm --dry-run --no-check`, on a scratch
-                           copy of the engine at its origin's main, over a
-                           scratch clone of REV (forbidden content, private
-                           references, gitleaks, cargo metadata, README
-                           versions, dead links), about a minute. Judges only a
-                           REV on origin/main (unpushed work is not judged);
-                           needs the network (ssh for a git@ remote), the
-                           engine's checkout (--engine, else
+                           notes, the predecessor's handoff fixtures, the handoff
+                           policy, the `verify release` record), in seconds.
+                           Answered only by REV's own cutter (built from REV),
+                           else it could not run. publish/pre-promote runs this
+        --export           the publication engine's export guards (forbidden
+                           content, private references, gitleaks, cargo metadata,
+                           README versions, dead links): its own `pub stage aterm
+                           --dry-run --no-check` over a scratch clone of REV,
+                           about a minute. Judges only a REV on origin/main; needs
+                           the network, the engine (--engine, else
                            $PUBLICATION_ENGINE, else ~/publication), gitleaks,
-                           and rustup with the `trust` toolchain
-        --wasm32           publish/config.sh's wasm32 clause on its stock pin
-                           (rustup) over the export
+                           and rustup's `trust` toolchain
+        --wasm32           publish/config.sh's wasm32 clause, on its stock pin,
+                           over the export
       Exits 0 READY, 1 a gate would refuse, 2 REV names no release, 3 a gate
-      could not run (no network, engine, gitleaks or rustup, an unpushed REV,
-      another commit's cutter) — each line names its fix — 130 interrupted
+      could not run (each line names its fix), 130 interrupted
   targo --unverified ship trust run (-p <crate>... | --whole-tree | --remeasure)
         [--jobs N|auto] [--target-root DIR] [--crate-budget SECONDS] [--prover BIN-DIR]
         [--update-ratchet] [--try-refused] [--obligations] [--stop-if-narrowed]
-                           THE TRUST LANE: `targo trust check -p <lib> --lib
-                           --allow-l0-gaps` over the named libraries (-p), every
-                           workspace library and vendored fork (--whole-tree), or
-                           only what the stored facts of this tree left undecided
-                           (--remeasure), each check in a slot of its own under
-                           --target-root, ended at --crate-budget (default
-                           21600 s) as OVER-BUDGET; then the judge holds what
-                           each measured to
+                           the Trust lane: `targo trust check -p <lib> --lib
+                           --allow-l0-gaps` over the named libraries (-p <lib>
+                           also selects its feature rows, such as
+                           aterm-link+sealed), every workspace library and
+                           vendored fork (--whole-tree), or what this tree's
+                           stored facts left undecided (--remeasure). Each check
+                           runs in its own slot under --target-root (default
+                           <repo>/target-trust), is ended OVER-BUDGET at
+                           --crate-budget (default 21600 s), and is held to
                            crates/aterm-release/trust/floors.tsv. A whole-tree run
-                           on a clean checkout files facts for explicit verdicts.
-                           A member feature that turns on fork code is a row of
-                           its own, <lib>+<feature>, checked
-                           with --features <feature>; -p <lib> selects it too.
-                           --update-ratchet raises floors it meets (never lowers
-                           one) and keeps trust/memory.tsv and trust/costs.tsv
-                           current; --try-refused verifies what this host would
-                           refuse for memory; --stop-if-narrowed stops before
-                           any check when it would; --obligations keeps each check's
-                           per-obligation record beside its log
-                           (<spec>.log.oblig.tsv). Its --report-dir store is
-                           capped at 512 MiB by a prover without trust
-                           a40ddc8e9c (the seal 321aaeda75), which ends a
-                           library past it (aterm-agent) with exit 2 before
-                           its Summary: give such a library --prover <the bin/
-                           of a build that holds a40ddc8e9c>.
-                           --target-root defaults to
-                           <repo>/target-trust.noindex (Spotlight skips it), or,
-                           where `targo trust` refuses a component of that (a
-                           checkout made under umask 002 is 0775), to this
-                           checkout's aterm-trust-lane/<dir>-<hash> in
-                           $XDG_CACHE_HOME or ~/.cache (macOS:
-                           ~/Library/Caches/aterm-trust-lane.noindex/), said on
-                           one line; a named root never moves. Before any check
-                           a refused root or prover is COULD NOT RUN with its fix
-                           (chmod go-w <dir> for a directory of yours). Exit 0
-                           pass, 1 fail, 2 nothing decided, 4 narrowed by memory
+                           on a clean checkout files the facts `verdict`, `judge`
+                           and `pending` read. --update-ratchet raises the floors
+                           a run meets and keeps trust/memory.tsv current;
+                           --try-refused verifies what this host would refuse for
+                           memory; --stop-if-narrowed stops before any check when
+                           it would; --obligations keeps each check's
+                           per-obligation record. Exit 0 pass, 1 fail, 2 nothing
+                           decided, 4 narrowed by memory
+  targo --unverified ship trust verdict [--commit REV] [--prover BIN-DIR]
+                           the whole-tree lane's verdict for REV (default HEAD),
+                           judged now: the facts a whole-tree run filed for REV's
+                           tree (its floors aside), by the prover (--prover names
+                           its bin/; default the cutter's Trust toolchain), held to
+                           REV's floors. A floors-only commit reuses the facts
+                           filed before it, its floors held to the up-only rule.
+                           One line; exit 0 VERIFIED, 1 not, 2 could not answer
   targo --unverified ship trust judge [--commit REV] [--prover BIN-DIR] [--update-ratchet [--reason WHY]]
-                           the lane's whole report for REV's stored facts,
-                           judged against the WORKING tree's floors;
-                           --update-ratchet writes them as the lane's would (a
-                           first floor, a high-water mark, a total corrected, a
-                           re-base onto this prover it meets — never a
-                           lowering); with --reason WHY, a floor another prover
-                           recorded that the facts fall below is lowered onto
-                           this prover, WHY in its fifth column; working floors
-                           the up-only rule refuses are named LOWERED, and fail
+                           the lane's full report for REV's stored facts, judged
+                           against the working tree's floors. --update-ratchet
+                           writes what the facts meet (a first floor, a raise, a
+                           corrected total, a re-base onto this prover), never a
+                           lowering; with --reason WHY it lowers onto this prover a
+                           floor another prover recorded that the facts fall
+                           below, WHY in its fifth column. A working floor the
+                           up-only rule refuses is named LOWERED, and fails
+  targo --unverified ship trust pending [--commit REV] [--prover BIN-DIR]
+                           the libraries REV's stored facts leave undecided
+                           (trustd did not admit them, or lapsed budgets could
+                           cover their shortfall), one per line: what `trust run
+                           --remeasure` measures again
+  targo --unverified ship trust candidate --candidate <staged toolchain dir>
+        [--base <bin> | --base-build N] [--crate-budget SECONDS] [--jobs N|auto]
+        [--out DIR] [--min-free-gib N] [--no-guard | [--guard-footprint-gib G]
+        [--guard-swap-gib G] [--guard-level PCT] [--guard-min-free-gib G]]
+        [--measure-narrowed] [--public-repo OWNER/REPO] [--retractions FILE]
+        [--trust-repo DIR] [--dry-run]
+  targo --unverified ship trust candidate --admits <staged toolchain dir>
+        [--receipts DIR] [--base-build N] [--public-repo OWNER/REPO]
+                           the candidate gate for publishing a Trust toolchain:
+                           two whole-tree lane runs of this clean checkout on this
+                           machine, the published seal's (the build the public
+                           channel pins) then the candidate's, compared by `trust
+                           compare`. Each check runs under a memory guard that
+                           ends it at a process-tree footprint of 0.6 × RAM, 8 GiB
+                           of swap, memorystatus_level under 10, or free space
+                           2 GiB below --min-free-gib (the --guard-* flags move
+                           these). The RECEIPT under --out is what the trust pack
+                           publisher admits. Exit 0 PUBLISH-OK, 1 PUBLISH-REFUSED,
+                           2 could not compare, 3 no verdict (--dry-run).
+                           --admits asks the publisher's question: did the newest
+                           gate run for that directory pass within 7 days,
+                           against the build the channel pins now, on an aterm
+                           commit this checkout contains? Exit 0 admitted,
+                           1 refused, 2 could not check
+  targo --unverified ship trust compare --base <plan> --candidate <plan>
+        [--base-logdir DIR] [--candidate-logdir DIR] [--tsv FILE] [--base-prover ID]
+        [--ratchet FILE] [--retractions FILE] [--trust-repo DIR]
+        [--candidate-trust-commit SHA] [--base-trust-commit SHA] [--obligations-tsv FILE]
+                           the candidate gate's comparison of two whole-tree runs
+                           of one aterm tree on one machine (each run's <target
+                           root>/logs/.plan), the published seal's and a
+                           candidate's, obligation by obligation. It refuses an
+                           obligation the seal proved and the candidate does not,
+                           whatever it gains elsewhere, unless the retraction
+                           ledger (--retractions, read in --trust-repo) retracts
+                           it as a false proof; a library with no result in its
+                           budget or no usable record; and, where the seal's
+                           check gave no result, a candidate below the floor the
+                           seal's prover recorded (--ratchet, default the base
+                           plan's) or with none. --obligations-tsv lists each
+                           lost obligation by its ledger key. Exit 0 PUBLISH-OK,
+                           1 PUBLISH-REFUSED, 2 could not compare (the line says
+                           why: runs that differ in tree, machine, scope, budget
+                           or slots, an unconcluded run, one prover twice, an
+                           unreadable ledger)
   targo --unverified ship recover vX.Y.Z <full-claim-sha> --old-publisher-stopped
         [--release-credentials <profile.toml>] [--no-draft-was-posted]
                            finish or withdraw the cut of a machine that died
-                           mid-cut: withdraw it if unpublished, verify and finish
-                           it if published. Run only once its old cutter process
-                           has exited (--old-publisher-stopped says so).
+                           mid-cut: withdrawn if unpublished, verified and
+                           finished if published. Run it only once the old
+                           cutter process has exited; --old-publisher-stopped
+                           says it has.
         --no-draft-was-posted
                            you checked the channel's releases page and it shows
                            no release for vX.Y.Z (needed when the journal is lost)
   targo --unverified ship verify [vX.Y.Z]
-                           re-run the post-publish check anytime
+                           re-run the post-publish check of vX.Y.Z (default: the
+                           release the channel serves now)
   targo --unverified ship site [--latest] [--dry-run] [--no-deploy] [--skip-site]
                  [--site-dir DIR] [--releases FILE]
-                           bring alab.systems to a release: the downloads the
-                           buttons name elected from the channel (the Linux
-                           executables proved through the signed chain), the
-                           pages and /releases rendered, the /terminal engine
-                           rebuilt from the public commit, committed, pushed,
-                           deployed and checked live. The release's after-cut
-                           step runs it as --latest; --dry-run (with --releases,
-                           offline) prints the plan and changes nothing. The
-                           site checkout is SITE_DIR, else publish/site.toml's
-                           dir. Exit 0 synced, deferred or planned · 1 failed ·
-                           2 usage · 3 no usable site checkout here · 4 the live
-                           site does not show the committed site
+                           bring alab.systems to a release: elect the downloads
+                           from the channel (the Linux executables proved through
+                           the signed chain), render the pages and /releases,
+                           rebuild the /terminal engine from the public commit,
+                           commit, push, deploy and check it live. The release's
+                           after-cut step runs it as --latest. Flags and exit
+                           codes: `ship site --help`
   targo --unverified ship hook pre-promote | post-promote | transforms
-                           the publication engine's hooks (publish/pre-promote,
-                           publish/post-promote, publish/transforms.sh run them):
-                           pre-promote asks PUB_SOURCE_COMMIT's own cutter, in a
-                           throwaway worktree of it, whether a real cut would pass
-                           its pre-claim gates (0 yes, 1 refused, 2 not asked);
-                           post-promote is `ship site` (its promote-time run defers
-                           to the cut); transforms rewrites the export at EXPORT
-  targo --unverified ship tap deploy <tap checkout> [--dry-run]
-                           mirror distribution/homebrew-tap (README.md,
-                           MAINTENANCE.md, Casks/*.rb) into a checkout of
-                           alabsystems/homebrew-tap, keeping each live cask's
-                           version and sha256 lines (`pub tap --bump` owns them),
-                           refusing a .github/ or internal-only wording, and
-                           commit it there; the push is the owner's, with the
-                           owner's credential. --dry-run prints the plan
+                           the publication engine's hooks, run by
+                           publish/pre-promote, publish/post-promote and
+                           publish/transforms.sh (`ship hook --help`)
   targo --unverified ship yank <build> [--release-credentials <profile.toml>]
                  (--linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
                   [--linux-worker ARCH=HOST:REPO]... | --mac-only)
-                           publish and verify a successor FIRST (a real cut with
+                           publish and verify a successor first (a real cut with
                            min_build = <build>+1, signed with
                            --release-credentials, declaring Linux as any cut
-                           must); only then delete the bad build's origin tag
+                           must), and only then delete the bad build's origin tag
                            and demote its channel release to a prerelease
 ";
 
@@ -915,8 +919,8 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
                 }
                 .take(flag, it)?;
             }
-            // The ONE signing input. A path in the command, never an ambient file:
-            // "what signed this?" is answered by reading the command that ran.
+            // The signing profile; without it the cut resolves this machine's
+            // provisioned key ([`crate::sign::ReleaseCredentials::resolve`]).
             "--release-credentials" => {
                 if opts.release_credentials.is_some() {
                     return Err("--release-credentials given twice".to_string());

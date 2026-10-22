@@ -492,7 +492,6 @@ impl Window {
     ///
     /// ## Platform-specific
     /// - **Web, macOS:** Does nothing
-    // ---------------------------
     // Developers' Note: If this cannot be implemented on every desktop platform
     // at least, then this function should be provided through a platform specific
     // extension trait

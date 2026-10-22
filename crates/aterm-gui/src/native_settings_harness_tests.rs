@@ -207,7 +207,7 @@ fn every_page(
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                 unreachable!()
             };
-            state.page_scroll = page;
+            state.scroll_page_to(page);
             state.page_reveal = None;
         }
         pages.push(compile_settings_view(runtime, instance, view, cx));

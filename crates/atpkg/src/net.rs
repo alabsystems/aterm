@@ -163,8 +163,8 @@ fn artifact_cap(size: u64) -> u64 {
     }
 }
 
-/// A roster is a few hundred bytes per machine and is capped at 16 machines. Same ceiling
-/// `aterm-update`'s armed path uses for the identical asset — one document, one bound.
+/// A roster is a few hundred bytes per machine and at most 16 machines; `aterm-update` uses the
+/// same ceiling for the same asset.
 /// Public, like [`MANIFEST_CAP`]: the producer's anonymous head read takes the same bound.
 pub const ROSTER_CAP: u64 = 65_536;
 
@@ -204,9 +204,9 @@ const FETCH_CONCURRENCY: usize = 20;
 /// manifest fetches at once, then two).
 const MANIFEST_WAVE: usize = 64;
 
-/// The most HEADs one discovery asks AHEAD of its walk ([`ahead_of_walk`]), beyond the ones
-/// the walk itself asks (which [`WALK_HEAD_BUDGET`] bounds): a host whose answers keep
-/// defeating the guess costs at most this many more, and is then walked a HEAD at a time.
+/// The most HEADs one discovery asks ahead of its walk ([`ahead_of_walk`]), beyond the walk's
+/// own ([`WALK_HEAD_BUDGET`]): a host whose answers keep defeating the guess costs at most this
+/// many more, and is then walked a HEAD at a time.
 const WALK_AHEAD_BUDGET: usize = 2 * WALK_HEAD_BUDGET as usize;
 
 /// `job` over every item, up to [`FETCH_CONCURRENCY`] at once, the answers in item order.
@@ -418,8 +418,8 @@ pub fn published_index_run() -> Result<IndexHint, String> {
     })
 }
 
-/// The four DERIVED download URLs of one index release: the index, its machine signature,
-/// and the master-signed roster and its signature beside them.
+/// The four derived download URLs of one index release: the index, its machine signature,
+/// and the master-signed roster and its signature.
 #[derive(Debug)]
 struct IndexQuad {
     label: String,
@@ -702,14 +702,13 @@ fn probe_round(slug: &str, round: &[u64], head: &HeadFn<'_>) -> Vec<HeadVerdict>
 /// `floor` ([`newest_index`], replayed over the answers already `known`) asks after it under
 /// every answer it may get, up to `room` builds, none already known.
 ///
-/// Correctness never rests on this: the walk itself runs unchanged over the answers, asks
-/// for each build in its own order, and a build named here that it never asks is a HEAD
-/// spent for nothing. What it buys is rounds. Each replay follows a GUESS where the answers
-/// so far support one — nothing published seen yet guesses "absent" (the steady state's two
-/// HEADs, and a fresh store's power-of-two search, each in one round); at or below the
-/// highest published build seen, "published"; at or past the first miss above it, "absent"
-/// — and FORKS where they do not, both answers explored breadth first. So a fresh store's
-/// seventeen HEADs in turn are three rounds.
+/// Correctness never rests on this: the walk runs unchanged over the answers in its own order,
+/// and a build named here that it never asks is only a wasted HEAD. What it saves is rounds.
+/// Each replay follows a guess where the answers so far support one (nothing published seen
+/// yet: "absent", which puts the steady state's two HEADs and a fresh store's power-of-two
+/// search each in one round; at or below the highest published build seen: "published"; at or
+/// past the first miss above it: "absent") and forks where they do not, exploring both answers
+/// breadth first.
 ///
 /// `hint` ([`GithubFetcher::with_index_hint`]) names a build something saw published — the
 /// highest this store's §14 cache holds, the one the release cut compiled in, the one the
@@ -873,7 +872,7 @@ pub struct GithubFetcher {
     /// A build something saw published, and where the run starts when that is known
     /// ([`Self::with_index_hint`]): a guess the discovery rounds follow, never an answer.
     index_hint: Option<IndexHint>,
-    /// Whether the last discovery's HEAD failed on the LINK (curl reached no host) — what
+    /// Whether the last discovery's HEAD failed on the link (curl reached no host), which
     /// [`crate::flow::Fetcher::index_link_down`] reads.
     link_down: std::sync::atomic::AtomicBool,
     /// What the last discovery asked (its HEADs, the rounds they went out in, its asset GETs),
@@ -1541,11 +1540,7 @@ mod tests {
         );
     }
 
-    /// The artifact cap is the ROW'S SIGNED SIZE, clamped by the ceiling — the same
-    /// number `disk_gate` bounded the free-space check with. A constant 8 GiB is not a
-    /// bound on a 30 MB row: a mis-uploaded or substituted asset fits inside it whole,
-    /// lands in `staging/` through the free-space floor, and is refused only afterwards
-    /// by the sha256 gate, which cannot run until the file is complete.
+    /// The artifact cap is the row's signed size, clamped by the ceiling.
     #[test]
     fn artifact_cap_is_the_signed_size_clamped_by_the_ceiling() {
         assert_eq!(super::artifact_cap(30_000_000), 30_000_000);
@@ -2336,11 +2331,8 @@ mod tests {
         assert!(!f.index_link_down(), "a host answered this walk");
     }
 
-    /// A release whose four assets do not all arrive is LEFT OUT, never the resolve's
-    /// failure: an index can be up before its signature or roster while the publisher is
-    /// still uploading, and the build below it is then the candidate — the listing that came
-    /// before skipped an incomplete release the same way. Only when no candidate arrives does
-    /// the resolve fail, naming the first asset that did not.
+    /// A release whose four assets do not all arrive is left out, not the resolve's failure;
+    /// only when no candidate arrives does the resolve fail, naming the first missing asset.
     #[test]
     fn a_release_that_does_not_arrive_whole_is_left_out() {
         let w = walk(44, &channel(6, 46), &["atpkg-index-46/index.toml.sig"]);
@@ -2686,12 +2678,11 @@ mod tests {
         }
     }
 
-    /// How many ROUNDS discovery takes — what its wall time is made of, since a round costs
-    /// one HEAD's latency however many it asks at once. The steady state is one round of two
-    /// HEADs; a store one index behind, two; a store that has verified nothing meets the
-    /// public channel (atpkg-index-6 to 71 as this is written, the walk alone seventeen HEADs
-    /// in turn) in three; and every channel from 6 up to any build below a thousand, from no
-    /// floor or from any floor in it, in at most five.
+    /// How many rounds discovery takes, which is its wall time: a round costs one HEAD's latency
+    /// however many it asks. The steady state is one round of two HEADs; a store one index
+    /// behind, two; a store that has verified nothing, against a channel of builds 6 to 71,
+    /// three; and every channel from 6 to any build below a thousand, from no floor or from a
+    /// floor at or near either end, at most five.
     #[test]
     fn discovery_takes_a_few_rounds_where_the_walk_takes_many_heads() {
         /// Rounds and HEADs from `floor` to a channel publishing 6 to `newest`, guessing from

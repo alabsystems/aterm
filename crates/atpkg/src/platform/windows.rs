@@ -665,20 +665,14 @@ unsafe extern "system" fn swallow_ctrl_c(ctrl_type: u32) -> i32 {
 /// lose the exit code and orphan the agent. Not the `NULL`-routine ignore flag, which
 /// children inherit.
 ///
-/// A `.cmd` program (the `bin/<program>.cmd` shim `cli::cmd_landing` runs through here)
-/// goes through std's own `cmd.exe /d /c` lane with batch-safe quoting; std may refuse
-/// arguments it cannot quote safely. `cmd.exe` may ask `Terminate batch job (Y/N)?` after
-/// a Ctrl-C — once per batch level, so up to TWICE on a legacy twin's landing hand-over
-/// (`agents\<program>.cmd`, then `bin\<program>.cmd`). Unverified on a Windows host.
-///
-/// Every caller builds `command` through `aterm_uds::spawnfd::command`, or raw (the
-/// reviewed pass-throughs) with `aterm_uds::spawn::set_flags`, both `Console::Quiet`, which
-/// adds nothing from a console: typed at a prompt the tool shares that console, its
-/// Ctrl-C and its code page, exactly as a bare child did.
+/// A `.cmd` program (the `bin/<program>.cmd` shim `cli::cmd_landing` runs) goes through std's
+/// `cmd.exe /d /c` lane with batch-safe quoting; std may refuse arguments it cannot quote.
+/// `cmd.exe` may ask `Terminate batch job (Y/N)?` after a Ctrl-C, once per batch level.
+/// Callers build `command` with `aterm_uds::spawnfd::command` or `aterm_uds::spawn::set_flags`
+/// (`Console::Quiet`), which adds nothing from a console: the tool shares it, its Ctrl-C and
+/// its code page.
 pub fn exec_or_run(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
-    // Best effort: when the install fails the wrapper keeps the default disposition (it
-    // ends on Ctrl-C), and the child still runs — nothing here may stand between the
-    // user and the tool.
+    // Best effort: if the install fails the wrapper ends on Ctrl-C; the child still runs.
     let _ = add_ctrl_handler(swallow_ctrl_c);
     match command.spawn() {
         Ok(mut child) => match child.wait() {

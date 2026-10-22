@@ -22,7 +22,8 @@
 //!   sessions wrote, as a mail body is a sender's;
 //! * one line per session (at most [`LINE_CHARS`]): its sid, program, state
 //!   ([`agent_word_shown`]: an agent at a box nobody presses reads `asking`) and age, the
-//!   tool in flight, its task, its title, where it stands, its model;
+//!   tool in flight, its task, its bells while its newest is under
+//!   [`NEWLY_DONE_MS`] old, its title, where it stands, its model;
 //! * excerpt lines — the attention line it raised, what it was asked and
 //!   what it last said — for every agent, however long it has been idle, and
 //!   a session raising attention: whole while the read fits (each record as
@@ -796,18 +797,21 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
         line.push_str(&format!(" bg={n}"));
     }
     // The bells it rang, and the newest's program, sound and age:
-    // `bells=3 (zsh sounded 4m ago)` ([`newest_bell`]).
-    if let Some(n) = s.number("bells").filter(|&n| n > 0) {
-        line.push_str(&format!(" bells={n}"));
-        if let Some((ms, sound, program)) = newest_bell(s) {
-            let program = checked(program).map(|p| format!("{} ", shown(p, 16)));
-            line.push_str(&format!(
-                " ({}{} {} ago)",
-                program.unwrap_or_default(),
-                shown(checked(Some(sound)).unwrap_or("?"), 8),
-                age(ms)
-            ));
-        }
+    // `bells=3 (zsh sounded 4m ago)` ([`newest_bell`]), while that bell is
+    // as recent as `human=` and `typed by` must be: an older one is history
+    // (`status` keeps it), and on every line it would take the room of the
+    // title, the place and the model for the life of the process.
+    if let (Some(n), Some((ms, sound, program))) = (
+        s.number("bells").filter(|&n| n > 0),
+        newest_bell(s).filter(|&(ms, ..)| ms < NEWLY_DONE_MS),
+    ) {
+        let program = checked(program).map(|p| format!("{} ", shown(p, 16)));
+        line.push_str(&format!(
+            " bells={n} ({}{} {} ago)",
+            program.unwrap_or_default(),
+            shown(checked(Some(sound)).unwrap_or("?"), 8),
+            age(ms)
+        ));
     }
     if let Some(n) = s.number("ctx_left_pct") {
         line.push_str(&format!(" ctx_left={n}%"));

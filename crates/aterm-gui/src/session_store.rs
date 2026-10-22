@@ -103,13 +103,10 @@ pub(crate) struct SessionRecord {
     /// reason (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.6, item 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub land_at: Option<i64>,
-    /// CONTROL CARRY (additive, absent tolerated; round 10): `"<len>
-    /// <sha256hex>"` of this session's `seamless-<pid>-<nonce>.s<id>.ctl`
-    /// sidecar — the turn ledger and the tail of the alt-screen archive
-    /// (`crate::handoff_carry`). A plain string so an older reader skips it
-    /// like any unknown key. Best-effort by design: the sidecar is NOT in
-    /// either adoption-proof digest, a missing or mismatched one is ignored,
-    /// and nothing about it can refuse the adoption.
+    /// `"<len> <sha256hex>"` of this session's `seamless-<pid>-<nonce>.s<id>.ctl` sidecar (the
+    /// turn ledger and the alt-screen archive's tail, `crate::handoff_carry`). Best-effort: in
+    /// neither adoption-proof digest, and a missing or mismatched sidecar is ignored, never a
+    /// refusal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<String>,
     /// This session's shell was spawned by a build that does not put `<prefix>/agents/` in front
@@ -269,17 +266,11 @@ pub(crate) struct SessionRecord {
         deserialize_with = "lenient_count"
     )]
     pub render_debt_cut: u64,
-    /// THE MAILBOX'S OUTBOUND HALF AND ITS ID COUNTERS (additive, absent ⇒
-    /// none; round seven of the update audit, findings 6, 8 and 28): the posts
-    /// still waiting for a bridge, the receipts still owed, and the last inbox,
-    /// post and receipt ids this session handed out
-    /// (`crate::fabric::FabricCarry`). The successor puts them back before the
-    /// session is registered (`SessionFabric::seed_carry`), so nothing a sender
-    /// was told is queued dies with the old process, and no id is handed out
-    /// twice under the sid the update keeps. Per record, like `topics`, so it
-    /// survives every later handoff; in neither proof digest; not written when
-    /// empty, so an older reader sees the wire it always saw, and a value that
-    /// does not read is dropped ([`lenient_fabric`]), never the manifest.
+    /// The mailbox's outbound half and id counters (`crate::fabric::FabricCarry`): posts still
+    /// waiting for a bridge, receipts still owed, and the last inbox, post and receipt ids. The
+    /// successor puts them back before the session is registered (`SessionFabric::seed_carry`),
+    /// so nothing a sender was told is queued dies with the old process and no id is reused under
+    /// the kept sid. Per record; a value that does not read is dropped ([`lenient_fabric`]).
     #[serde(
         default,
         skip_serializing_if = "crate::fabric::FabricCarry::is_empty",
@@ -323,19 +314,14 @@ pub(crate) struct SessionRecord {
         deserialize_with = "lenient_row"
     )]
     pub task: Option<String>,
-    /// THE SESSION LOG'S EPOCH AND NODE-ID COUNTERS (additive, absent ⇒ none;
-    /// the session log's slice 1, 2026-10-15): `"<ep> <run> <turn> <step>"`
-    /// (`session_log::LogCarry`), the outgoing log's epoch and its last run,
-    /// turn and step ids plus their overlap reserve
-    /// (`session_log::LOG_ID_RESERVE`). The successor's log starts at the next
-    /// epoch with `gap why=handoff` and continues the ids, so `t17` names one
-    /// turn for as long as the session lives; a process that issues past the
-    /// reserve refuses its Commit (`SessionTimeline::past_handoff_ceiling`).
-    /// No records ride here (slice 1 carries none). A plain string an older
-    /// reader skips like any unknown key; a value that does not read
-    /// ([`lenient_row`], `LogCarry::parse`) carries nothing, and the successor
-    /// starts at the first epoch, never failing the manifest. In neither proof
-    /// digest.
+    /// `"<ep> <run> <turn> <step>"` (`session_log::LogCarry`): the outgoing session log's epoch
+    /// and its last run, turn and step ids plus their overlap reserve
+    /// (`session_log::LOG_ID_RESERVE`), never its records. The successor's log starts at the next
+    /// epoch with `gap why=handoff` and continues the ids, so `t17` names one turn for the
+    /// session's whole life; a process that issues past the reserve refuses its Commit
+    /// (`SessionTimeline::past_handoff_ceiling`). A value that does not read ([`lenient_row`],
+    /// `LogCarry::parse`) carries nothing, and the successor starts at
+    /// `session_log::adopted_epoch`. In neither proof digest.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -478,9 +464,7 @@ impl SessionRecord {
         parse_render_debt(self.render_debt.as_deref(), self.render_debt_cut)
     }
 
-    /// Every hold row this record carries, the first one first: [`Self::hold`]
-    /// and then [`Self::more_holds`]. A record from before the two slots
-    /// carries at most the one, which reads as exactly that hold.
+    /// Every hold row this record carries: [`Self::hold`], then [`Self::more_holds`].
     pub(crate) fn hold_rows(&self) -> Vec<String> {
         self.hold.iter().chain(&self.more_holds).cloned().collect()
     }
@@ -737,16 +721,11 @@ pub(crate) struct WindowCarry {
     /// own metrics (`App::attach_frame_px`). No digest covers it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inner_px: Option<[u32; 2]>,
-    /// THE WINDOW'S PRESENCE ROW (additive, absent ⇒ none): whether the
-    /// outgoing window had its presence row committed under its chrome
-    /// (`WindowState::presence`, the agent's status line), which its grid and
-    /// `inner_px` hold. Per window, unlike the band's shared rows below, and
-    /// the successor's presence rows are frozen until Commit, so it reserves
-    /// the row before its first attach sizes the window
-    /// (`WindowState::take_carried_frame`): without it the carried size read a
-    /// cell taller than the frame it measured and was refused, and the
-    /// Commit's lift then re-gridded the window a row shorter than its
-    /// parent's. Written only while a row stands; no digest covers it.
+    /// Whether the outgoing window had its presence row committed under its chrome
+    /// (`WindowState::presence`), which its grid and `inner_px` include. The successor's
+    /// presence rows are frozen until Commit, so it reserves the row before its first attach
+    /// sizes the window (`WindowState::take_carried_frame`); otherwise the carried size reads a
+    /// cell taller than the frame and is refused. Written only while a row stands.
     /// RETIRED with the row (owner surfaces, 2026-10-16): this build never
     /// sets it and reads it nowhere; it stays on the wire for an older
     /// successor.
@@ -812,15 +791,9 @@ pub(crate) struct WindowCarry {
     /// half of [`Self::font_size_milli`]'s pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_reset_size_milli: Option<u32>,
-    /// WHAT THE OUTGOING PROCESS'S UPDATE-HEALTH WARNINGS SAID (additive,
-    /// absent ⇒ none; round six, finding 54): one entry per kind it announced
-    /// and no proof has answered since (`App::update_health_said`), so the
-    /// successor whose landing IS the proof records "aterm updates work again"
-    /// against it. Without it the record was written only for a warning row
-    /// still live under a carried progress row — never on the automatic lane
-    /// (which carries no progress row) nor after the row's 45 s fold. Empty is
-    /// not written, so a carry with nothing to heal is the wire it always was;
-    /// an older reader ignores the key (no `deny_unknown_fields`).
+    /// The outgoing process's update-health warnings that no proof has answered, one per kind
+    /// (`App::update_health_said`), so the successor whose landing is the proof records "aterm
+    /// updates work again" against each. Empty is not written.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub update_health_said: Vec<CarriedHealthSaid>,
     /// When the messages above were captured, on the outgoing process's wall clock (Unix ms;
@@ -1287,15 +1260,12 @@ impl Drawn {
 /// `done` inside the window would otherwise cross still `working`). A change answered `OK` between the park's draw and the Commit
 /// was in no manifest, and a Commit that landed lost it with this process.
 ///
-/// The rest of a record is compared elsewhere: the six bare meta fields ride
-/// the layout, which the Commit captures again (`exact_layout`); the hold and
-/// the outbox ride the serials (`App::hold_serials`); the inbox and timeline
-/// ids their reserves. The park keeps each record's as drawn
-/// ([`Self::of_record`]), the Commit reads each live session's
-/// ([`Self::of_session`]), and any difference stands the Commit down — a
-/// lossless retry, whose next draw carries the change. Compared as final
-/// state, so a change made and undone inside the window costs nothing, and a
-/// change made just before the draw and undone after it is still caught.
+/// The rest of a record is compared elsewhere: the bare meta fields ride the layout
+/// (`exact_layout`), the holds and outbox the serials (`App::hold_serials`), the inbox and
+/// timeline ids their reserves. The park keeps each record's as drawn ([`Self::of_record`]),
+/// the Commit reads each live session's ([`Self::of_session`]), and any difference stands the
+/// Commit down for a lossless retry. Compared as final state, so a change made and undone
+/// inside the window costs nothing.
 #[cfg(unix)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CarriedClaims {
@@ -1493,8 +1463,6 @@ impl SessionHandoff {
                         viewport_from_bottom: None,
                         render_debt: None,
                         render_debt_cut: 0,
-                        // The outbound mailbox and the id counters, under the
-                        // fabric's leaf lock (round seven, findings 6/8/28).
                         fabric: h.ctx.fabric.handoff_carry(&mut post_budget),
                         timeline_id,
                         // Stamped by the park from the crash journal's state
@@ -1788,12 +1756,10 @@ pub(crate) struct SessionStore {
     /// `@*` registers here, and every journal append rings it, so a spawn or
     /// an exit reaches the push loop at once rather than on its liveness pass.
     instance_watchers: std::sync::Arc<crate::session_watch::Watchers>,
-    /// Exit statuses noted by the shell-exit path (`Wake::Exit`), keyed by local
-    /// id and CONSUMED by the deregister that follows. A side table rather than a
-    /// handle field because the handle is cloned out per control request and its
-    /// constructors are many; the status is known for the short window between
-    /// the reader's EOF and the pane's teardown (indefinitely under `--hold`),
-    /// which is exactly the window this table spans.
+    /// Exit statuses noted by the shell-exit path (`Wake::Exit`), keyed by local id and
+    /// consumed by the deregister that follows. A side table because the handle is cloned out
+    /// per control request and its constructors are many; the status lives from the reader's
+    /// EOF to the pane's teardown (indefinitely under `--hold`).
     exit_codes: HashMap<u64, i32>,
     /// Sessions whose shell has a frozen PATH ([`SessionRecord::frozen_path`]), marked at
     /// adoption (`App::register_session`) and counted by [`Self::frozen_path_tabs`].
@@ -2136,8 +2102,7 @@ impl SessionStore {
         }
     }
 
-    /// The exit code [`Self::note_exit_code`] holds for `local_id` until its
-    /// deregister moves it onto the journal row. TEST-ONLY.
+    /// The exit code [`Self::note_exit_code`] holds for `local_id` until its deregister.
     #[cfg(all(test, unix))]
     pub(crate) fn noted_exit_code(&self, local_id: u64) -> Option<i32> {
         self.exit_codes.get(&local_id).copied()

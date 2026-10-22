@@ -479,6 +479,232 @@ fn linkage_leftovers(staged: &Path) -> Vec<String> {
     out
 }
 
+/// `otool -l` LC_RPATH paths, in load order.
+#[cfg(target_os = "macos")]
+fn rpaths_from_otool(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_rpath = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("cmd ") {
+            in_rpath = line == "cmd LC_RPATH";
+        } else if in_rpath && let Some(rest) = line.strip_prefix("path ") {
+            out.push(rest.split(" (offset").next().unwrap_or(rest).to_string());
+            in_rpath = false;
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn is_mach_o(bytes: &[u8]) -> bool {
+    matches!(
+        bytes.get(..4),
+        Some([0xFE, 0xED, 0xFA, 0xCF])
+            | Some([0xCF, 0xFA, 0xED, 0xFE])
+            | Some([0xFE, 0xED, 0xFA, 0xCE])
+            | Some([0xCE, 0xFA, 0xED, 0xFE])
+            | Some([0xCA, 0xFE, 0xBA, 0xBE])
+    )
+}
+
+/// Relocate a staged `:any` bottle payload from placeholder paths
+/// to this prefix, brew's two pour-time passes with the system
+/// Mach-O tools: install names / dylib ids / rpaths rewritten by
+/// `install_name_tool`, placeholders in NUL-free (text) files
+/// replaced as bytes, and every modified binary ad-hoc re-signed
+/// (`codesign`, metadata preserved) since the edits invalidate
+/// its signature. Any tool failure delegates: the caller's
+/// `linkage_leftovers` scan then judges the result before any
+/// receipt or publication, so a half-relocated keg cannot land.
+#[cfg(target_os = "macos")]
+fn relocate_staged(prefix: &Prefix, f: &Formula, staged: &Path) -> Result<(), InstallError> {
+    use std::os::unix::fs::MetadataExt;
+    let passthrough = |what: String| {
+        InstallError::PassThrough(format!(
+            "{} bottle relocation needs Homebrew ({what})",
+            f.name
+        ))
+    };
+    let root = prefix.root.to_string_lossy().into_owned();
+    let cellar = prefix.cellar().to_string_lossy().into_owned();
+    if root.contains('\0') || cellar.contains('\0') {
+        return Err(passthrough("prefix path is not spellable".into()));
+    }
+    let java = f
+        .dependencies
+        .iter()
+        .map(|d| Formula::short_name(d))
+        .find(|d| *d == "openjdk" || d.starts_with("openjdk@"))
+        .map(|d| format!("{root}/opt/{d}/libexec/openjdk.jdk/Contents/Home"));
+    let mut pairs: Vec<(&str, String)> = vec![
+        ("@@HOMEBREW_CELLAR@@", cellar.clone()),
+        ("@@HOMEBREW_REPOSITORY@@", root.clone()),
+        ("@@HOMEBREW_LIBRARY@@", format!("{root}/Library")),
+        ("@@HOMEBREW_PERL@@", format!("{root}/opt/perl/bin/perl")),
+        ("@@HOMEBREW_PREFIX@@", root.clone()),
+    ];
+    if let Some(java) = &java {
+        pairs.push(("@@HOMEBREW_JAVA@@", java.clone()));
+    }
+    let relocate_name = |name: &str, pairs: &[(&str, String)]| -> Option<String> {
+        for (old, new) in pairs {
+            if let Some(rest) = name.strip_prefix(old) {
+                return Some(format!("{new}{rest}"));
+            }
+        }
+        None
+    };
+    // Collect regular files once, hardlink-deduped, like brew.
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut seen: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
+    fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_symlink() {
+                continue;
+            }
+            let path = e.path();
+            if kind.is_dir() {
+                collect(&path, out);
+            } else if kind.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    collect(staged, &mut files);
+    for path in files {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !seen.insert((meta.dev(), meta.ino())) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if !bytes.windows(10).any(|w| w == b"@@HOMEBREW") {
+            continue;
+        }
+        let shown = path.to_string_lossy().into_owned();
+        if is_mach_o(&bytes) {
+            let mut args: Vec<String> = Vec::new();
+            // Dylib id (otool -D prints it as the only entry).
+            let out =
+                fetch::run_capture("otool", &["-D", &shown]).map_err(|e| passthrough(e.clone()))?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(id) = text.lines().nth(1).map(str::trim)
+                && let Some(new) = relocate_name(id, &pairs)
+            {
+                args.push("-id".into());
+                args.push(new);
+            }
+            let out =
+                fetch::run_capture("otool", &["-L", &shown]).map_err(|e| passthrough(e.clone()))?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines().skip(1) {
+                let dep = line.trim().split(" (").next().unwrap_or("").trim();
+                if let Some(new) = relocate_name(dep, &pairs) {
+                    args.push("-change".into());
+                    args.push(dep.to_string());
+                    args.push(new);
+                }
+            }
+            let out =
+                fetch::run_capture("otool", &["-l", &shown]).map_err(|e| passthrough(e.clone()))?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            for rpath in rpaths_from_otool(&text) {
+                if let Some(new) = relocate_name(&rpath, &pairs) {
+                    args.push("-rpath".into());
+                    args.push(rpath);
+                    args.push(new);
+                }
+            }
+            if args.is_empty() {
+                continue;
+            }
+            let mode = meta.permissions();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+            }
+            args.push(shown.clone());
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = fetch::run_capture("install_name_tool", &refs)
+                .map_err(|e| passthrough(e.clone()))?;
+            if !out.status.success() {
+                return Err(passthrough(format!(
+                    "install_name_tool: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            let out = fetch::run_capture(
+                "codesign",
+                &[
+                    "--sign",
+                    "-",
+                    "--force",
+                    "--preserve-metadata=entitlements,requirements,flags,runtime",
+                    &shown,
+                ],
+            )
+            .map_err(|e| passthrough(e.clone()))?;
+            if !out.status.success() {
+                return Err(passthrough(format!(
+                    "codesign: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            let _ = std::fs::set_permissions(&path, mode);
+        } else if !bytes.contains(&0) {
+            // Text payload: byte-replace every placeholder pair.
+            let mut text = bytes;
+            let mut changed = false;
+            for (old, new) in &pairs {
+                let replaced = replace_bytes(&text, old.as_bytes(), new.as_bytes());
+                if replaced != text {
+                    changed = true;
+                    text = replaced;
+                }
+            }
+            if changed {
+                let mode = meta.permissions();
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+                }
+                std::fs::write(&path, &text).map_err(|e| format!("abrew: {e}"))?;
+                let _ = std::fs::set_permissions(&path, mode);
+            }
+        }
+        // A binary that is not Mach-O but still carries placeholders
+        // is left for the leftover scan to delegate.
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return haystack.to_vec();
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    while i < haystack.len() {
+        if haystack[i..].starts_with(needle) {
+            out.extend_from_slice(replacement);
+            i += needle.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReplaceMode {
     /// First install: every destination must be new.
@@ -528,6 +754,12 @@ fn install_one(
     let work =
         aterm_tempfile::TempDir::new_in(prefix.cellar()).map_err(|e| format!("abrew: {e}"))?;
     let poured = pour_bottle(prefix, f, work.path())?;
+    #[cfg(target_os = "macos")]
+    if f.bottle_for(&Machine::this().bottle_tags())
+        .is_some_and(|b| b.cellar == ":any")
+    {
+        relocate_staged(prefix, f, &poured)?;
+    }
     let leftovers = linkage_leftovers(&poured);
     if !leftovers.is_empty() {
         return Err(InstallError::PassThrough(format!(
@@ -2534,11 +2766,37 @@ mod tests {
         assert!(prefix.bin().join("other").exists());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rpaths_parse_from_otool_load_commands() {
+        let text = "\
+Load command 10\n      cmd LC_LOAD_DYLIB\n      name @@HOMEBREW_CELLAR@@/xz/1/lib/liblzma.5.dylib (offset 24)\nLoad command 11\n      cmd LC_RPATH\n      cmdsize 48\n      path @@HOMEBREW_PREFIX@@/lib (offset 12)\nLoad command 12\n      cmd LC_RPATH\n      cmdsize 40\n      path @loader_path/../lib (offset 12)\n";
+        assert_eq!(
+            rpaths_from_otool(text),
+            ["@@HOMEBREW_PREFIX@@/lib", "@loader_path/../lib"]
+        );
+        assert_eq!(
+            replace_bytes(
+                b"a@@HOMEBREW_PREFIX@@/b@@HOMEBREW_PREFIX@@",
+                b"@@HOMEBREW_PREFIX@@",
+                b"/p"
+            ),
+            b"a/p/b/p".to_vec()
+        );
+    }
+
     #[test]
     fn source_and_relocation_recipes_fall_back_before_dependencies() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let prefix = Prefix::at(&tmp.path().join("prefix"));
-        cache_formula(&prefix, 0, "unused", &"0".repeat(64), ":any", &[]);
+        cache_formula(
+            &prefix,
+            0,
+            "unused",
+            &"0".repeat(64),
+            "/opt/homebrew/Cellar",
+            &[],
+        );
         let api = Api::new(prefix.clone());
         assert!(matches!(
             install(&api, &prefix, "demo", &InstallOpts::default()),

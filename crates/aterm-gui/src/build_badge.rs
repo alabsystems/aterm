@@ -38,10 +38,9 @@ pub(crate) fn fingerprint(enabled: bool) -> u64 {
     h.finish() | 1
 }
 
-/// Build the badge tray: a small rounded pill pinned to the TOP-RIGHT of the tray with
-/// the `v{version} · {build}` caption. `card` is the pill's own bounds (top-right), so
-/// the shared rasterizer only paints that small region — not a full-frame canvas. PURE
-/// DrawPrims, same vocabulary as [`crate::about`].
+/// Build the badge tray: a small rounded pill pinned to the top-right with the
+/// `v{version} · {build}` caption. `card` is the pill's own bounds, so the shared rasterizer
+/// paints only that region.
 pub(crate) fn badge_tray(
     g: &SettingsGeom,
     theme: impl Into<crate::chrome_band::ChromePalette>,

@@ -479,7 +479,7 @@ mod tests {
     }
 
     /// A MEDIUM IS CONSUMED ONLY ONCE THE ENGINE TOOK IT, AFTER THE SLICE IS
-    /// FED (ATERM-KI-1014-6): of the `t=t` files read for a slice, the one the
+    /// FED: of the `t=t` files read for a slice, the one the
     /// engine asks for is consumed, with whether its read returned bytes, when
     /// the burst drops (after the hold), never at the read or under the hold;
     /// the one it never asks for (a raw transmission declaring no size, which

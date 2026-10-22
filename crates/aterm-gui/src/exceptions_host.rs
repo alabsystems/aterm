@@ -64,10 +64,9 @@ pub(crate) struct Ripening {
 /// longer is still a failure, and says so at every failure it makes.
 const SUPERVISOR_STEADY: Duration = Duration::from_secs(30 * 60);
 
-/// How long after this process first looked at its exceptions the resume family
-/// is handed its whole answer once, whatever the loops have told: the lines an
-/// earlier process left open end with it if no loop of this one names them. Ten
-/// minutes is long past the first point every loop reaches.
+/// How long after this process first looked at its exceptions the resume family is handed its
+/// whole answer once, whatever the loops have told: lines an earlier process left open end then
+/// if no loop of this one names them. Ten minutes is long past every loop's first point.
 pub(crate) const RESUME_SETTLE: Duration = Duration::from_secs(10 * 60);
 
 /// The `host_noted` marks that this process recorded a short volume, one per form of its line:
@@ -823,9 +822,8 @@ impl App {
                         }
                         self.except(&entry);
                     }
-                    // A roster that cannot be read says nothing of who is
-                    // signed out: the line gives way, and what the owner
-                    // filed of it holds.
+                    // A roster that cannot be read says nothing of who is signed out: the line
+                    // gives way, and what the owner filed of it holds.
                     None if unread => {
                         self.except_end(key);
                     }
@@ -1447,10 +1445,9 @@ impl App {
         if keys.is_empty() && !told {
             return;
         }
-        // Whether a line's tab is still there is decided by computing the keys
-        // of the tabs that ARE there, never by reading an id back out of a key:
-        // a key shortens a subject that does not fit its cap (a real session id
-        // is 22 characters), so it does not round-trip.
+        // Which tabs are still there is decided by computing the keys of the tabs that are,
+        // never by reading an id back out of a key: a key shortens a subject that does not fit
+        // its cap, so it does not round-trip.
         let live = self.shown_session_sids();
         let live_keys: std::collections::HashSet<String> = live
             .iter()
@@ -1478,12 +1475,10 @@ impl App {
         });
     }
 
-    /// The lines of the process-local supervisor facts that an earlier process
-    /// raised and this window adopted, ended once this process has run
-    /// [`SUPERVISOR_STEADY`] without telling of them: a supervisor that failed
-    /// again would have been noted within that time, and a survey that is still
-    /// open is told again by the successor's first look. A line this process does
-    /// hold ([`Self::supervisor_failing`], [`Self::host_noted`]) is left to its
+    /// End the supervisor-family lines an earlier process raised and this window adopted, once
+    /// this process has run [`SUPERVISOR_STEADY`] without telling of them: a supervisor that
+    /// failed again would have been noted by then, and a survey still open is told again by the
+    /// first look. A line this process holds (`supervisor_failing`, `host_noted`) is left to its
     /// own end. A `lost` line an earlier process left ends so too, though its
     /// conversation may still be lost: the handoff carries no word of it to
     /// this process's host, so nothing here would ever end it (a residual,
@@ -1531,8 +1526,7 @@ impl App {
         }
     }
 
-    /// The session id (`s-3e79`) of the pool session `local`, if it is
-    /// registered.
+    /// The session id (`s-3e79`) of pool session `local`, if registered.
     pub(crate) fn session_sid(&self, local: u64) -> Option<String> {
         let store = self.store.read().unwrap_or_else(|p| p.into_inner());
         store

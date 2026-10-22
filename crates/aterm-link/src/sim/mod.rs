@@ -88,6 +88,8 @@
 
 pub(crate) mod bus;
 pub(crate) mod conform;
+#[cfg(test)]
+mod conform_broker;
 pub(crate) mod device;
 pub(crate) mod endpoint;
 pub(crate) mod world;

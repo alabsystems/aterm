@@ -463,10 +463,8 @@ impl<C: Ctl> Session<'_, C> {
         }
         let screen = self.screen()?;
         let turn = self.point_of(screen);
-        // An idle point the turn-end policy escalated (`claude idle: …`,
-        // `claude wall: …`) is adopted like a box or a question: a loop that
-        // restarted over it decides nothing new there (no work seen since),
-        // so a badge cleared here would be raised by no one.
+        // An escalated idle point (`claude idle: …`, `claude wall: …`) is adopted like a box: a
+        // restarted loop decides nothing new there, so a badge cleared here would not come back.
         let showing = match &turn.phase {
             Phase::Limited { .. } => text.starts_with(ATTENTION_PREFIX),
             Phase::Prompt | Phase::Question | Phase::Idle => text.starts_with(&format!(
@@ -632,15 +630,13 @@ impl<C: Ctl> Session<'_, C> {
 
     /// The in-GUI host's loop: the engine's watching loop (one flushed line
     /// per approval and per review point, [`Lines`]), under `opts` (normally
-    /// [`SuperviseOpts::hosted`]), until `stop` is set. The flag is checked at
-    /// every look and before every wait ([`Self::call`] refuses a wait or a
-    /// write once it is set), so the loop ends within one wait: 20 s at most
-    /// ([`WAIT_STEP`]), a ride-out pause 8 s at most. [`Ctl::interrupter`]
-    /// ends a wait at once but loses the connection, so the badges could no
-    /// longer be cleared. Every line goes to `out` and, with `opts.journal`,
-    /// the journal; the approval ledger is kept at `opts.ledger` unless one
-    /// was set. The badges it raised are cleared as it ends. `Ok(())` for a
-    /// stop or a spent budget, `Err` with the reason for anything else.
+    /// [`SuperviseOpts::hosted`]), until `stop` is set. The flag is checked at every look and
+    /// before every wait ([`Self::call`] refuses a wait or a write once it is set), so the loop
+    /// ends within one wait ([`WAIT_STEP`], a ride-out pause at most 8 s). [`Ctl::interrupter`]
+    /// would end a wait at once but loses the connection, so the badges could not be cleared.
+    /// Lines go to `out` and, with `opts.journal`, the journal; the approval ledger is kept at
+    /// `opts.ledger` unless one was set. The badges it raised are cleared as it ends, unless it
+    /// hands the session over. `Ok(())` for a stop or a spent budget.
     pub fn run_hosted(
         &mut self,
         opts: &SuperviseOpts,
@@ -682,8 +678,8 @@ impl<C: Ctl> Session<'_, C> {
             allow: &allow,
         };
         let end = self.drive(opts, &mut review);
-        // A stop that cut a request short (the transport's interrupter)
-        // ends the loop as a stop, not as the failure the cut request saw.
+        // A stop that cut a request short ends the loop as a stop, not as the cut request's
+        // failure.
         let end = if self.stopped() { Ok(End::Quit) } else { end };
         // The hand-over is read once, here, and only after a stop: one read
         // through the door, so the latch a raised flag keeps never shows

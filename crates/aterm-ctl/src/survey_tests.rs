@@ -1108,6 +1108,61 @@ fn a_session_that_rang_names_its_newest_bell() {
     assert!(hostile.contains(" bells=1 (? sounded 4s ago)"), "{hostile}");
 }
 
+/// A BELL IS NEWS ONLY WHILE IT IS NEW: the bells segment stands on the line
+/// while the newest bell is under [`NEWLY_DONE_MS`] old, as `human=` and
+/// `typed by` do, so a tab that rang hours ago (zsh's failed completion, one
+/// Claude Code ping) reads as it did before it rang, its title, place and
+/// model whole. NEGATIVE CONTROL: the same row, its newest bell 3 minutes
+/// old, carries the segment and loses the model to it.
+#[test]
+fn an_old_bell_leaves_the_survey_line() {
+    let line = |bells: Option<&str>| {
+        let mut fields = vec![
+            ("sid", "s-00000000000000000004"),
+            ("program", "claude"),
+            ("program_kind", "agent"),
+            ("agent", "idle"),
+            ("agent_ms", "86400000"),
+            ("ctx_left_pct", "42"),
+            ("title", "Land the survey bell fix"),
+            ("cwd", "~/aterm"),
+            ("branch", "main"),
+            ("model", "opus-4.8"),
+            ("effort", "high"),
+        ];
+        if let Some(last) = bells {
+            fields.extend([
+                ("bells", "37"),
+                ("bells_sounded", "12"),
+                ("last_bell", last),
+            ]);
+        }
+        let row = wire_row(&fields);
+        let survey = parse_reply(&["instance pid=1 sessions=1".to_owned(), row]).unwrap();
+        session_line(&survey.sessions[0], None, false, false)
+    };
+    let quiet = line(None);
+    assert!(
+        quiet.ends_with(" ctx_left=42% | Land the survey bell fix | ~/aterm main | opus-4.8 high"),
+        "{quiet}"
+    );
+    let hours_ago = line(Some("10800000/sounded/claude,10900000/limited/claude"));
+    assert_eq!(hours_ago, quiet, "a bell 3h old is off the line");
+    let at_the_edge = line(Some(&format!("{NEWLY_DONE_MS}/sounded/claude")));
+    assert_eq!(at_the_edge, quiet, "a bell exactly 15 min old is off it");
+    let unaged = line(Some("-"));
+    assert_eq!(unaged, quiet, "a count with no aged bell says nothing");
+    // CONTROL: a new bell stands, and takes the model's room.
+    let new = line(Some("180000/sounded/claude"));
+    assert!(new.contains(" bells=37 (claude sounded 3m ago)"), "{new}");
+    assert!(!new.contains("opus-4.8"), "{new}");
+    let just_new = line(Some(&format!("{}/off/claude", NEWLY_DONE_MS - 1000)));
+    assert!(
+        just_new.contains(" bells=37 (claude off 14m ago)"),
+        "{just_new}"
+    );
+}
+
 /// An unanswered line too long for its cap is cut before its label, never
 /// through it, and a label cannot spell another.
 #[test]

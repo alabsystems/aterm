@@ -8,9 +8,7 @@ use super::*;
 #[cfg(unix)]
 use crate::volumes::{Mount, Table};
 
-// ---------------------------------------------------------------------------
 // State words.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn every_kernel_state_word_maps_to_one_run_state() {
@@ -46,9 +44,7 @@ fn every_kernel_state_word_maps_to_one_run_state() {
     assert_eq!(KnoteFilter::from_darwin(-99), KnoteFilter::Other(-99));
 }
 
-// ---------------------------------------------------------------------------
 // Darwin layouts, decoded from bytes written here.
-// ---------------------------------------------------------------------------
 
 fn put(b: &mut [u8], at: usize, v: &[u8]) {
     b[at..at + v.len()].copy_from_slice(v);
@@ -250,9 +246,7 @@ fn a_kinfo_answer_gives_a_zombies_parent_group_and_state() {
     assert_eq!(darwin::kinfo(&b[..100]), None);
 }
 
-// ---------------------------------------------------------------------------
 // Linux parsers.
-// ---------------------------------------------------------------------------
 
 const STAT: &str = "4711 (my (odd) cmd) S 4700 4711 4600 34817 4711 4194560 900 0 3 0 \
                     150 50 20 10 20 0 3 0 123456 0 0";
@@ -366,9 +360,7 @@ fn a_tcp_table_gives_state_peer_and_queue_and_skips_a_torn_row() {
     assert_eq!(rows[0].rx_queue, 5);
 }
 
-// ---------------------------------------------------------------------------
 // The Linux arm over a fixture tree written here.
-// ---------------------------------------------------------------------------
 
 #[cfg(unix)]
 fn write(root: &Path, rel: &str, text: &str) {
@@ -515,9 +507,7 @@ fn the_linux_arm_reads_a_fixture_tree() {
     assert!(linux::read(r, 9999, false, 100).is_none());
 }
 
-// ---------------------------------------------------------------------------
 // The output tail.
-// ---------------------------------------------------------------------------
 
 #[cfg(unix)]
 fn table(mounts: &[(&str, bool, bool)]) -> Table {
@@ -583,9 +573,7 @@ fn the_tail_check_reads_only_the_appended_bytes() {
     assert_eq!(tail_has_lf(&l, 0, 9), None);
 }
 
-// ---------------------------------------------------------------------------
 // Live self-reads (macOS): shapes only, never timings.
-// ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
 #[test]
@@ -732,9 +720,7 @@ fn a_stopped_child_and_a_zombie_child_read_their_states() {
     child.wait().expect("reaped");
 }
 
-// ---------------------------------------------------------------------------
 // Live CPU time (macOS): units, read from a stopped child.
-// ---------------------------------------------------------------------------
 
 /// The job probe's CPU times are nanoseconds: a spinning child, stopped so
 /// that every reading counts the same CPU at any load, reads its counters and

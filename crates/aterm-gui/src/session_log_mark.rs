@@ -61,9 +61,7 @@ impl SessionLog {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Control input and `cause=` (phase 3A, design §2.5-§2.6).
-// ---------------------------------------------------------------------------
 
 use aterm_slog::{Actor, Conf, Fields, Key, Kind, Mark, Node, ShortId, Src, Stamp};
 
@@ -493,10 +491,8 @@ pub(crate) fn validate_cause(ctx: &crate::SessionCtx, cause: CauseRef) -> Result
     }
 }
 
-// ---------------------------------------------------------------------------
 // `mark` (phase 3A, design §7.4): attributed, rate-limited claims that never
 // act.
-// ---------------------------------------------------------------------------
 
 /// The `mark` verb's usage line.
 pub(crate) const MARK_USAGE: &str = "ERR usage: mark <node|-> note|verdict|label|need|clear|act \
@@ -870,10 +866,8 @@ pub(crate) fn cmd_mark(
     }
 }
 
-// ---------------------------------------------------------------------------
 // `await log` (phase 3A, design §7.2; ruling R2): park on the session log
 // until a need, an open, a close or a kind, never polling and never spinning.
-// ---------------------------------------------------------------------------
 
 /// The `await log` usage line.
 pub(crate) const AWAIT_LOG_USAGE: &str = "ERR usage: await log <wait>[,<wait>...] \

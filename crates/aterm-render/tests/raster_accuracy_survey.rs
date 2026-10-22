@@ -21,9 +21,7 @@
 const DEJAVU: &[u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
 const NERD: &[u8] = include_bytes!("../assets/SymbolsNerdFontMono-Regular.ttf");
 
-// ---------------------------------------------------------------------------
 // Outline recording, in design units (y up).
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
 struct P {
@@ -102,9 +100,7 @@ fn record(face: &aterm_font::Face, gid: u16) -> Option<Rec> {
     Some(r)
 }
 
-// ---------------------------------------------------------------------------
 // The reference: exact-in-x scanline coverage, y sampled at SUB per row.
-// ---------------------------------------------------------------------------
 
 /// Sub-scanlines per pixel row. 64 is "8x supersampled" squared in y; the x
 /// axis is not sampled at all (spans are integrated exactly).
@@ -333,9 +329,7 @@ fn deposit(row: &mut [f64], xa: f32, xb: f32, w: usize) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Canvas: one absolute pixel grid every candidate is placed into.
-// ---------------------------------------------------------------------------
 
 struct Canvas {
     x0: i32,
@@ -371,9 +365,7 @@ fn place(
     true
 }
 
-// ---------------------------------------------------------------------------
 // The candidates: the shipped fill, or the same fill flattened finer.
-// ---------------------------------------------------------------------------
 
 /// The placement of one fill: design-to-pixel `scale`, the translation the
 /// outline is mapped through, and the grid it lands in.
@@ -491,9 +483,7 @@ fn crop(ras: &aterm_render::raster::Rasterizer, w: usize, h: usize, pad: usize) 
     cov
 }
 
-// ---------------------------------------------------------------------------
 // One glyph, one px: every candidate against ground truth.
-// ---------------------------------------------------------------------------
 
 #[derive(Default, Clone, Copy)]
 struct ErrStat {
@@ -645,9 +635,7 @@ impl GlyphCase {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The corpus.
-// ---------------------------------------------------------------------------
 
 fn corpus_chars() -> Vec<char> {
     (0x21u32..0x7fu32).filter_map(char::from_u32).collect()
@@ -655,9 +643,7 @@ fn corpus_chars() -> Vec<char> {
 
 const PX: [f32; 8] = [8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 24.0, 32.0];
 
-// ---------------------------------------------------------------------------
 // The guard.
-// ---------------------------------------------------------------------------
 
 /// Ground truth is expensive — 64 sub-scanlines over a 256-fold reference
 /// flattening, per glyph, ~120 ms per raster in an unoptimised build — so the

@@ -332,9 +332,18 @@ fn only_the_conversations_own_entries_end_a_notice() {
         "\"type\":\"user\",\"isCompactSummary\":true,",
     );
     assert!(summary.contains("isCompactSummary"));
+    let transcript_only = prompt.replace(
+        "\"type\":\"user\",",
+        "\"type\":\"user\",\"queueTranscriptOnly\":true,",
+    );
+    assert!(transcript_only.contains("queueTranscriptOnly"));
     for (name, after) in [
         ("meta nudge", nudge),
         ("compaction summary", summary.as_str()),
+        (
+            "transcript-only queue notification",
+            transcript_only.as_str(),
+        ),
     ] {
         let end = transcript_ends_on(&format!("{prompt}\n{notice}\n{after}"));
         assert!(confirms(WallKind::Overloaded, &end), "{name}: {end:?}");
@@ -784,7 +793,7 @@ fn a_closed_error_notice_is_the_wall_its_words_or_its_typed_fields_name() {
             None,
             Some(WallKind::Auth),
         ),
-        // The same with a 403 (ATERM-KI-1016-1, limits: "an
+        // The same with a 403 (limits: "an
         // `authentication_failed` with status 403 that no table names climbs
         // the refused-request ladder instead of typing `/login`"): the
         // vendor's typed word that the login failed decides over the status

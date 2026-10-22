@@ -1273,11 +1273,10 @@ impl PaneTextCache {
             .as_deref()
     }
 
-    /// The run of leaf `leaf_index`'s composer rule on frame row `frame_row`
-    /// of `scratch` that aterm may cover, and the rule's glyph
-    /// ([`rule_mask_into`] into `mask`, `footer::rule_run`): read off the
-    /// scratch at most once per rebuild of the pane's rows — a frame that
-    /// reuses them has the scratch their key's tokens name, cell for cell
+    /// The run of leaf `leaf_index`'s composer rule on frame row `frame_row` of `scratch`
+    /// that aterm may cover, and the rule's glyph ([`rule_mask_into`] into `mask`,
+    /// `footer::rule_run`): read off the scratch at most once per rebuild of the pane's rows.
+    /// A frame that reuses the rows has, cell for cell, the scratch their key's tokens name
     /// (what [`undo`] gives back), so its rule reads as it read — and not
     /// at all on a rebuild whose revisions vouch the rule's row unchanged
     /// (a keystroke's, a streamed row's: [`Self::rows`]).
@@ -2009,9 +2008,8 @@ fn recheck_after(now: std::time::Instant, asked: std::time::Instant) -> Duration
 
 /// Whether a session last asked for at `asked` is still watched: within
 /// [`WATCH_FOR`] of the ask, or past it while its footer shows a wall or weekly percentage
-/// and its process is ALIVE (`walled_alive`, asked only then — liveness, not
-/// a start time, so it holds on Linux too, and a sessions file a crash left
-/// behind cannot keep the clock running for days).
+/// and its process is alive (`walled_alive`, asked only then: liveness, not a
+/// start time, so a sessions file a crash left behind cannot keep it running).
 fn still_watched(
     now: std::time::Instant,
     asked: std::time::Instant,
@@ -3171,11 +3169,10 @@ fn resolve_and_post(
     );
     let (moved, found, logged) = resolve_into(timeline, &mut identity, tail, fold, roster, asks);
     job.wake.after(session, &logged);
-    // No directory is not remembered: a launch through the atpkg twin is
-    // `/bin/sh` for its first milliseconds, whose environment macOS hides,
-    // and the `exec` into Claude Code keeps both the pid and the start time
-    // — a cached `None` would outlive the shell and leave that process with
-    // no footer for its whole life.
+    // A missing directory is not remembered: a launch through the atpkg twin is `/bin/sh`
+    // for its first milliseconds, whose environment macOS hides, and the `exec` into
+    // Claude Code keeps the pid and start time, so a cached `None` would leave that
+    // process with no footer for its whole life.
     if identity.dir.is_some() {
         known.insert(session, identity);
     }
@@ -3309,13 +3306,11 @@ fn resolve_facts(
     roster: &mut RosterMemo,
     asks: Asks,
 ) -> (Option<Option<PathBuf>>, Found) {
-    // ONE footer read (`footer::read_pid`): one read of `sessions/<pid>.json`
-    // feeds the model, the Σ, the wall and the frozen-program remedy's resume
-    // line alike, so after `/clear` or `/resume` the footer never pairs one
-    // conversation's model with another's Σ or wall, nor names another's
-    // conversation to resume.
-    // `read_at` is no later than that registry read: when this read saw the
-    // process in the session the registry names.
+    // One footer read (`footer::read_pid`): one read of `sessions/<pid>.json` feeds the
+    // model, the Σ, the wall and the frozen-program remedy's resume line alike, so after
+    // `/clear` or `/resume` the footer never pairs one conversation's model with another's
+    // Σ or wall, nor names another's conversation to resume. `read_at` is no later than
+    // that registry read: when this read saw the process in the session the registry names.
     let clock = footer::ReadClock {
         read_at: std::time::SystemTime::now(),
         now: aterm_agent::supervise::limit::unix_now(),
@@ -3888,9 +3883,9 @@ fn rule_mask_into(
 /// The facts are `Script::Sub` and bold, below the cursor trail's rail
 /// (`aterm_render::SUB_CEILING`), set as a line of type (`footer::set_facts`): values in
 /// Claude's rule gray lifted [`VALUE_LIFT`] toward the pane's ink, marks in `mark_fg` mixed
-/// halfway toward the rule gray. The chips stay full-size, since they are clicked, and
-/// their place depends on nothing a title or the facts change, so a chip stays under the
-/// pointer while its title comes and goes.
+/// halfway toward the rule gray, floored to 3:1 on the pane's ground ([`visible_on`]). The
+/// chips stay full-size, since they are clicked, and their place depends on nothing a title
+/// or the facts change, so a chip stays under the pointer while its title comes and goes.
 ///
 /// Also returned: the run between the lights and the facts that is the rule's own glyph
 /// (`rule`), which the glass already shows and the splice leaves unwritten
@@ -3900,9 +3895,10 @@ fn rule_mask_into(
 /// start's blank (`footer::fact_spans`): the targets a click acts on. A
 /// hidden fact's greyed `off` is drawn in Claude's rule gray (`rule.fg`),
 /// not bold. The fact `lit` (hovered or selected) is drawn lit: its values
-/// in the pane's ink, its mark in `mark_fg`, underlined where its glyphs are
-/// drawn (`footer::drawn_cells`), each stretch of the line in the ink of the
-/// lit glyph drawn over it.
+/// in the pane's ink, its mark in `mark_fg` floored to 4.5:1 on the pane's
+/// ground ([`legible_on`]), underlined where its glyphs are drawn
+/// (`footer::drawn_cells`), each stretch of the line in the ink of the lit
+/// glyph drawn over it.
 fn compose_rule_spans(
     fit: &footer::RuleFit,
     block: Option<&crate::claude_lights::Block>,
@@ -3944,7 +3940,17 @@ fn compose_rule_spans(
             script: aterm_core::terminal::Script::Sub { nudge: 0 },
             ..blank
         };
-        let mark = quiet(mix(mark_fg, rule.fg, 0.5));
+        // The marks are the instance theme's accent (`mark_fg`), chosen for
+        // the instance's own ground, on the pane's (§8): a tab in a theme of
+        // its own (`session_theme`) lays them on that theme's paper, where
+        // an instance in Dracula put the accent halfway to a `#999999` rule
+        // at 1.5:1 on a Default Light tab. A mark at rest is floored to the
+        // graphics floor along its own hue ([`visible_on`]) and keeps its
+        // quietness wherever the theme's mix already reads; a lit mark is
+        // the accent itself, floored to the text floor as the top line's
+        // is ([`legible_on`]).
+        let mark = quiet(visible_on(mix(mark_fg, rule.fg, 0.5), blank.bg));
+        let accent = legible_on(mark_fg, blank.bg);
         let value = quiet(mix(rule.fg, blank.fg, VALUE_LIFT));
         // A hidden fact's `off`: Claude's own rule gray, not bold.
         let stub = RenderCell {
@@ -3976,7 +3982,7 @@ fn compose_rule_spans(
                 lit,
             ) {
                 (true, _, false) => mark,
-                (true, _, true) => lifted(mark, mark_fg),
+                (true, _, true) => lifted(mark, accent),
                 (false, true, false) => stub,
                 (false, true, true) => lifted(stub, value.fg),
                 (false, false, false) => value,
@@ -4326,7 +4332,7 @@ impl FooterUndo {
         }
     }
 
-    /// The rows the write on the glass wrote — none once it is undone.
+    /// The rows the write on the glass wrote; none once it is undone.
     fn written(&self) -> &[RowUndo] {
         if self.write.is_some() {
             &self.rows[..self.live]
@@ -4755,11 +4761,10 @@ impl App {
             // The agent as the host admits it: a vendor `codex` has no
             // harness of aterm's, so no chips ([`crate::harness_host::admitted`]).
             let agent = crate::harness_host::admitted_as(&entry.ctx, agent, group);
-            // So are the harness's chips where the facts show — the
-            // session's Autopilot and a click of it in flight
-            // (`crate::claude_lights`) — and the harness card on its launch
-            // card (`crate::claude_card`): one reading of the Autopilot for
-            // both, with the timeline's lock released.
+            // So are the harness's chips where the facts show (the session's Autopilot and a
+            // click of it in flight, `crate::claude_lights`) and the harness card
+            // (`crate::claude_card`): one Autopilot read serves both, after the timeline lock
+            // is released.
             let harness = if shows {
                 let (word, view, supervised, _) =
                     self.session_autopilot_for(session, agent, &claims);
@@ -5413,9 +5418,9 @@ impl App {
                 // The agent as the host admits it, read after the timeline's
                 // lock.
                 let agent = crate::harness_host::admitted_as(&entry.ctx, agent.0, agent.1);
-                // The session's Autopilot, read ONCE for this frame with no
-                // lock held (its own leaf lock alone): what the harness's
-                // chips say and whether the harness card wraps the pane.
+                // The session's Autopilot, read once per frame after the timeline lock is
+                // released (it takes only the session's meta lock): what the harness's chips
+                // say and whether the harness card wraps the pane.
                 let reading = self.session_autopilot_for(session, agent, &claims);
                 let (word, view, supervised, _) = reading;
                 // The gate's one verdict this frame, for the card and the
@@ -5694,10 +5699,9 @@ impl App {
                     continue;
                 }
                 let version = texts.footers[leaf_index].shown().version.as_deref();
-                // The rule to write into, found by structure, behind the
-                // reader's panic fence (`read_footer`) — a screen that panics
-                // it paints nothing — unless the chrome claimed that row: the
-                // reading the rows' rebuild took or kept ([`Readings`]).
+                // The rule to write into, found by structure behind the reader's panic fence
+                // (`read_footer`; a screen that panics it paints nothing), unless the chrome
+                // claimed that row: the reading the rows' rebuild took or kept ([`Readings`]).
                 let Some(readings) = texts.readings(leaf_index) else {
                     continue;
                 };
@@ -5852,8 +5856,8 @@ impl App {
                         );
                     }
                 }
-                // Every Claude Code pane is OBSERVED for its lights, painted
-                // rule or not (`App::observe_claude_lights`).
+                // Every Claude Code pane is observed for its lights, painted rule or not
+                // (`App::observe_claude_lights`).
                 lists.seen.push(SeenPane {
                     leaf_index,
                     session,
@@ -5946,12 +5950,10 @@ impl App {
                 pane.blank,
                 chips_room,
             );
-            // A block that gave up a chip for room holds all of it
-            // (`Block::holds`): the facts went before the chips, and stay
-            // gone beside fewer of them. The composition is the pane's
-            // footer's, kept while the facts, the room, the rule, the ground
-            // and every cell of the block are the last frame's
-            // ([`PaneFooter::compose`]).
+            // A block that gave up a chip for room holds all of it (`Block::holds`): the
+            // facts went before the chips and stay gone beside fewer of them. The pane's
+            // footer keeps the composition while its inputs and every cell of the block are
+            // the last frame's ([`PaneFooter::compose`]).
             // The fact hovered or selected here is drawn lit.
             let composed = self.windows.get(&wid).and_then(|ws| {
                 let lit = ws.claude_lights.lit_fact(pane.session);
@@ -6130,10 +6132,9 @@ impl App {
                     );
                 }
             }
-            // Only a light the glass shows can be pointed at: a pane whose
-            // write was skipped (`write_edits`) records none — keyed by the
-            // edit's row AND column, since two panes side by side share a
-            // frame row.
+            // Only a light the glass shows can be pointed at: a pane whose write was
+            // skipped (`write_edits`) records none, keyed by the edit's row and column,
+            // since two panes side by side share a frame row.
             let rows = claude_footer_undo.written();
             // Every chrome cell written — the chips, the facts, the card's line,
             // the top border's mark and switch — is the resident pet's occupied
@@ -6394,9 +6395,23 @@ struct TopRun {
     /// Muse Code's rule at rest is labelled (`── Voice input (⌥ + v to
     /// start) ──…`, `aterm_phase::muse::is_idle_voice_rule`): where that
     /// label stands, untouched, the whole rule from its first `─` to its
-    /// last, label and all (frame column, cells) — what the lockup takes
-    /// where it fits there ([`laid_run`]).
-    voice: Option<(usize, usize)>,
+    /// last or to the label's closing blank, whichever ends later, label
+    /// and all (frame column, cells), and the label's cells from that
+    /// column, its closing blank too — what the lockup takes where it fits
+    /// there ([`laid_run`]). In a pane under 34 columns the label is the
+    /// rule's longest run of `─` itself (`──`, a lone `─` after it at 33
+    /// columns, none at 32), so the label is read off the row's cells, never
+    /// off where its plain run starts.
+    voice: Option<VoiceRule>,
+}
+
+/// Muse Code's whole idle voice rule ([`TopRun::voice`]): `len` cells from
+/// frame column `col`, of which the label takes the first `label`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VoiceRule {
+    col: usize,
+    len: usize,
+    label: usize,
 }
 
 /// THE RUN A TOP LINE IS LAID ON ([`compose_top`]), and how many of its
@@ -6414,13 +6429,13 @@ struct TopRun {
 fn laid_run(key: &TopKey) -> (TopRun, usize) {
     let run = key.run;
     let lockup = cli_mark(key.program).map(|mark| mark.lockup_cells(key.build));
-    let whole = run.voice.filter(|&(_, len)| {
-        lay_top(top_span(len, key.face), key.switch, lockup)
+    let whole = run.voice.filter(|voice| {
+        lay_top(top_span(voice.len, key.face), key.switch, lockup)
             .is_some_and(|(rung, _)| rung.lockup.is_some())
     });
     match whole {
-        Some((col, len)) if col < run.col => (TopRun { col, len, ..run }, run.col - col),
-        _ => (run, 0),
+        Some(VoiceRule { col, len, label }) => (TopRun { col, len, ..run }, label),
+        None => (run, 0),
     }
 }
 
@@ -6638,12 +6653,23 @@ fn read_top_run(
         .then(|| {
             let first = pane_slice.iter().position(|c| c.ch == '\u{2500}')?;
             let last = pane_slice.iter().rposition(|c| c.ch == '\u{2500}')?;
-            (first < best.start
-                && (first..=last).all(untouched)
+            // The label's last ink, and the blank that closes it where the
+            // row has one (the label alone at 32 columns ends the row).
+            let ink = pane_slice
+                .iter()
+                .rposition(|c| c.ch != '\u{2500}' && c.ch != ' ')?;
+            let label_end = (ink + 2).min(pane_slice.len());
+            let end = (last + 1).max(label_end);
+            (first < ink
+                && (first..end).all(untouched)
                 && aterm_phase::muse::is_idle_voice_rule(
                     &pane_slice.iter().map(|c| c.ch).collect::<String>(),
                 ))
-            .then_some((region.col_off + first, last + 1 - first))
+            .then_some(VoiceRule {
+                col: region.col_off + first,
+                len: end - first,
+                label: label_end - first,
+            })
         })
         .flatten();
     Some(TopRun {
@@ -6951,14 +6977,29 @@ fn turning_ink(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
 
 /// `ink` floored along its own hue to read 4.5:1 on `ground`
 /// ([`aterm_effects::cli_marks::NAME_CONTRAST`], §8): the floor every
-/// letter aterm lays on a top line meets. An ink that already reads is kept
-/// as it is.
-fn legible_on(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
+/// letter aterm lays on a pane's lines meets — a top line's, the bottom
+/// rule's, the harness's chips — and the accent's, wherever it is laid as
+/// itself. An ink that already reads is kept as it is.
+pub(crate) fn legible_on(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
+    floored_on(ink, ground, aterm_effects::cli_marks::NAME_CONTRAST)
+}
+
+/// `ink` floored along its own hue to read 3:1 on `ground`
+/// ([`aterm_effects::cli_marks::ICON_CONTRAST`], WCAG 1.4.11): the floor a
+/// graphic aterm lays on a pane's lines meets — a fact's mark, a reply's
+/// bullet. A quiet ink that already reads is kept as it is: it may sit at
+/// the floor, never under it.
+fn visible_on(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
+    floored_on(ink, ground, aterm_effects::cli_marks::ICON_CONTRAST)
+}
+
+/// `ink` floored along its own hue to read `min`:1 on `ground`.
+fn floored_on(ink: [u8; 3], ground: [u8; 3], min: f32) -> [u8; 3] {
     let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
     rgb_of(aterm_effects::color_math::floor_contrast_keeping_hue(
         pack(ink),
         pack(ground),
-        aterm_effects::cli_marks::NAME_CONTRAST,
+        min,
     ))
 }
 
@@ -7938,28 +7979,87 @@ fn push_agy_inline_markdown(
     changed
 }
 
+/// THE INKS agy's and Muse Code's transcript is rewritten in
+/// ([`render_agy_markdown_row`]), made once per pane per frame
+/// ([`collect_agy_transcript_edits`]) from the pane's blank, the program's
+/// rule grey and the instance theme's accent. The accent was chosen for the
+/// instance's own ground, which a tab in a theme of its own
+/// (`session_theme`) does not lay the transcript on, so every ink made from
+/// it is floored along its own hue on the ground it is laid on (§8): a
+/// graphic to 3:1 ([`visible_on`]), letters to 4.5:1 ([`legible_on`]), the
+/// inline code's on its pill; one that already reads is kept as it is. The
+/// rule's inks are the pane's own and stand as the program drew them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MarkdownInks {
+    /// The accent as a graphic: a reply's lead `●` or `◆`, a checked box's
+    /// `✓`, a bullet's `•`.
+    mark: [u8; 3],
+    /// The accent as letters: an ordered item's number.
+    number: [u8; 3],
+    /// An H1 heading: the accent 28% toward the pane's ink.
+    h1: [u8; 3],
+    /// An H2 heading: the accent 52% toward the pane's ink.
+    h2: [u8; 3],
+    /// Inline code: the accent 55% toward the pane's ink, on [`Self::code_bg`].
+    code: [u8; 3],
+    /// Inline code's pill: the ground 16% toward the rule's grey.
+    code_bg: [u8; 3],
+    /// A link: the accent 42% toward the pane's ink.
+    link: [u8; 3],
+    /// A quiet glyph and a quote: the rule's grey lifted [`VALUE_LIFT`].
+    quiet: [u8; 3],
+    /// The rule's grey: a horizontal rule, a quote's bar.
+    rule: [u8; 3],
+}
+
+impl MarkdownInks {
+    /// The inks on `blank`'s pane, under a rule drawn in `rule` and the
+    /// instance's `accent`.
+    fn of(blank: RenderCell, rule: RenderCell, accent: [u8; 3]) -> Self {
+        let ground = blank.bg;
+        let code_bg = mix(ground, rule.fg, 0.16);
+        let toward_ink = |t: f32| mix(accent, blank.fg, t);
+        Self {
+            mark: visible_on(accent, ground),
+            number: legible_on(accent, ground),
+            h1: legible_on(toward_ink(0.28), ground),
+            h2: legible_on(toward_ink(0.52), ground),
+            code: legible_on(toward_ink(0.55), code_bg),
+            code_bg,
+            link: legible_on(toward_ink(0.42), ground),
+            quiet: mix(rule.fg, blank.fg, VALUE_LIFT),
+            rule: rule.fg,
+        }
+    }
+}
+
 /// Format one non-fenced row of an assistant reply (`● …`, `◆ …`, or 2-space
 /// continuation) with clear visual distinction across H1/H2/H3 headings,
 /// inline code pills, markdown links, nested bullets, checkboxes, ordered
 /// lists, horizontal rules, and quotes while keeping 1-to-1 row height so the
-/// screen never blows up.
-#[allow(clippy::too_many_arguments)]
+/// screen never blows up. Its inks are the pane's [`MarkdownInks`].
 fn render_agy_markdown_row(
     row: &str,
     max_cols: usize,
     orig_width: usize,
     blank: RenderCell,
-    rule: RenderCell,
-    mark_fg: [u8; 3],
+    inks: &MarkdownInks,
 ) -> Option<Vec<RenderCell>> {
     let trimmed_end = row.trim_end_matches(' ');
     if trimmed_end.is_empty() {
         return None;
     }
-    let code_fg = mix(mark_fg, blank.fg, 0.55);
-    let code_bg = mix(blank.bg, rule.fg, 0.16);
-    let link_fg = mix(mark_fg, blank.fg, 0.42);
-    let quiet_fg = mix(rule.fg, blank.fg, VALUE_LIFT);
+    let MarkdownInks {
+        mark: mark_fg,
+        number: number_fg,
+        h1: h1_fg,
+        h2: h2_fg,
+        code: code_fg,
+        code_bg,
+        link: link_fg,
+        quiet: quiet_fg,
+        rule: rule_fg,
+    } = *inks;
     let (lead, body, lead_glyph) = if let Some(rest) = trimmed_end.strip_prefix("● ") {
         ("● ", rest, Some('●'))
     } else if let Some(rest) = trimmed_end.strip_prefix("\u{25c6} ") {
@@ -7990,18 +8090,18 @@ fn render_agy_markdown_row(
         changed = true;
         let heading_base = match heading_level {
             1 => RenderCell {
-                fg: mix(mark_fg, blank.fg, 0.28),
+                fg: h1_fg,
                 bold: true,
                 underline: aterm_core::terminal::UnderlineStyle::Single,
                 ..blank
             },
             2 => RenderCell {
-                fg: mix(mark_fg, blank.fg, 0.52),
+                fg: h2_fg,
                 bold: true,
                 ..blank
             },
             _ => RenderCell {
-                fg: mix(rule.fg, blank.fg, 0.78),
+                fg: mix(rule_fg, blank.fg, 0.78),
                 bold: true,
                 italic: true,
                 ..blank
@@ -8022,7 +8122,7 @@ fn render_agy_markdown_row(
         changed = true;
         let dash_cell = RenderCell {
             ch: '\u{2500}',
-            fg: rule.fg,
+            fg: rule_fg,
             ..blank
         };
         let target = orig_width.max(12).min(max_cols);
@@ -8068,7 +8168,7 @@ fn render_agy_markdown_row(
             if out.len() < max_cols {
                 out.push(RenderCell {
                     ch,
-                    fg: mark_fg,
+                    fg: number_fg,
                     bold: true,
                     ..blank
                 });
@@ -8085,7 +8185,7 @@ fn render_agy_markdown_row(
         if out.len() < max_cols {
             out.push(RenderCell {
                 ch: '▎',
-                fg: rule.fg,
+                fg: rule_fg,
                 ..blank
             });
         }
@@ -8329,6 +8429,7 @@ fn collect_agy_transcript_edits(
     let mut in_user_msg = false;
     let mut in_muse_reply = false;
     let mut in_code_block = false;
+    let inks = MarkdownInks::of(blank, rule, mark_fg);
 
     for (r, row_str) in rows.iter().enumerate().take(limit) {
         // Track fences before any card, user-message or row heuristic. A
@@ -8435,8 +8536,7 @@ fn collect_agy_transcript_edits(
             in_code_block = false;
             continue;
         }
-        if let Some(cells) =
-            render_agy_markdown_row(row_str, region.cols, orig_width, blank, rule, mark_fg)
+        if let Some(cells) = render_agy_markdown_row(row_str, region.cols, orig_width, blank, &inks)
         {
             out.push(AgyRowEdit {
                 frame_row,
@@ -8530,6 +8630,10 @@ mod top_tests;
 #[cfg(test)]
 #[path = "claude_footer_top_lines_tests.rs"]
 mod top_lines_tests;
+
+#[cfg(test)]
+#[path = "claude_footer_floor_tests.rs"]
+mod floor_tests;
 
 #[cfg(all(test, unix))]
 #[path = "claude_footer_yolo_tests.rs"]
@@ -13064,6 +13168,111 @@ mod tests {
             "muse composer rule has model, effort, path, and branch: {bottom_rule:?}"
         );
         host.shutdown_and_join();
+    }
+
+    /// A NARROW PANE KEEPS MUSE CODE'S LOCKUP, SWITCH AND FACTS (the lab of
+    /// 2026-10-22, Muse Code 1.4.11 at 40 columns down to 26,
+    /// `aterm_phase::muse::fixtures::IDLE_NARROW`): under 40 columns the
+    /// idle voice label leaves its top rule fewer than ten `─`, and read as
+    /// no rule the composer was lost and the pane wore nothing of aterm's —
+    /// no lockup, no switch, no facts, and the harness read no agent. Now at
+    /// every width the bottom rule carries the autopilot chip and the facts;
+    /// from 32 columns, where the label alone fills the row, the lockup takes
+    /// the label at the rule's left and the switch stands at its right; under
+    /// 32 columns, where Muse Code cuts the label with `…` (any voice state's
+    /// that begins as it does), the label is left as Muse Code drew it.
+    ///
+    /// NEGATIVE CONTROL: the same frames with the label blanked out (its `─`
+    /// kept) are no composer under 40 columns, and the pane wears nothing;
+    /// no lockup stands on them at any width.
+    #[test]
+    fn a_narrow_pane_keeps_muses_lockup_switch_and_facts() {
+        let frames =
+            aterm_phase::prompt::fixtures::reflow_frames(aterm_phase::muse::fixtures::IDLE_NARROW);
+        let pane = |rows: &[String], cols: u16| {
+            let (mut app, wid, session) = glass(cols);
+            {
+                let entry = app.pool.get(session).expect("session");
+                let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                timeline.note_foreground_group(5252);
+                timeline.set_program(5252, Some("muse".into()));
+                assert!(timeline.set_claude_footer(
+                    5252,
+                    None,
+                    Some(FooterFacts {
+                        model_open: true,
+                        effort_open: true,
+                        path: Some("~/aterm".into()),
+                        owner: Some(footer::FactsOwner {
+                            floor: None,
+                            session_id: "muse-5252".into(),
+                        }),
+                        ..FooterFacts::default()
+                    }),
+                ));
+            }
+            let host = crate::harness_host::HostHandle::for_supervised_test(
+                Vec::new(),
+                std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+            );
+            app.harness = Some(host.clone());
+            let ctx = app.pool.get(session).expect("session").ctx.clone();
+            crate::session_timeline::claim_supervisor(
+                &ctx,
+                &crate::harness_host::holder(),
+                None,
+                None,
+                crate::metrics::now_us(),
+            )
+            .expect("claim");
+            super::probe::drawer(&app, session, 5252, "muse", "1.4.11");
+            feed_rows(&app, session, rows);
+            frame(&mut app, wid);
+            let strip = strip(&app, wid);
+            let cells = &app.windows[&wid].input_scratch.cells;
+            let (top, bottom) = (text_of(&cells[strip + 3]), text_of(&cells[strip + 5]));
+            let icon = app.windows[&wid]
+                .claude_card
+                .painted_layers()
+                .iter()
+                .any(|l| l.id == top_mark_id(session) && !l.content.items().is_empty());
+            host.shutdown_and_join();
+            (top, bottom, icon)
+        };
+        assert_eq!(frames.len(), 9, "the sweep's widths");
+        for (cols, rows) in &frames {
+            let (top, bottom, icon) = pane(rows, *cols);
+            assert!(
+                bottom.contains("\u{221E}") && bottom.contains("\u{25C6} lab-stub"),
+                "{cols}: the chip and the facts on the bottom rule: {bottom:?}"
+            );
+            if *cols >= 32 {
+                assert!(
+                    top.starts_with("\u{2500}\u{2500}    muse \u{2500}")
+                        && top.ends_with(" \u{25CF} on \u{2500}\u{2500}")
+                        && !top.contains("Voice"),
+                    "{cols}: the lockup over the label, the switch at the right: {top:?}"
+                );
+                assert!(icon, "{cols}: the icon over the lockup's cells");
+            } else {
+                assert_eq!(top, rows[3], "{cols}: the cut label as Muse Code drew it");
+                assert!(!icon, "{cols}: no lockup over the cut label");
+            }
+            // CONTROL: the label blanked out, its `─` kept.
+            let mut bare = rows.clone();
+            bare[3] = rows[3]
+                .chars()
+                .map(|c| if c == '\u{2500}' { c } else { ' ' })
+                .collect();
+            // At 40 columns its ten `─` are a rule, whose runs (`──`, then
+            // eight) hold no lockup.
+            let (top, bottom, icon) = pane(&bare, *cols);
+            assert_eq!(
+                (bottom.contains("\u{221E}"), top.contains("muse") || icon),
+                (*cols >= 40, false),
+                "CONTROL {cols}: fewer than ten `─` and no label are no composer: {top:?} {bottom:?}"
+            );
+        }
     }
 
     /// MUSE CODE'S SIGNED-IN CARDS POPULATE THE FOOTER (owner, 2026-10-21;

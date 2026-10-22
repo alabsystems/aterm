@@ -16,10 +16,11 @@
 //! | `guards`    | [`run_guards`]            | the [`GUARDS`] rules  |
 //!
 //! `aterm-census` (bare, or `--all`) runs every one over the checkout and
-//! exits non-zero on any finding; [`run_all`] is the same in-process, and the
-//! `live_tree_*` tests run each over this checkout. All three go through
-//! [`run_censuses`], which also holds each clean walk to its [`Floor`]s: a walk
-//! that read far less than an aterm checkout holds is blind, not clean.
+//! exits non-zero on any failure; [`run_all`] is the same in-process, and the
+//! `census` and `guards` checks of `targo --unverified verify` run them too.
+//! All three go through [`run_censuses`], which also holds each clean walk to
+//! its [`Floor`]s: a walk that read far less than an aterm checkout holds is
+//! blind, not clean.
 //!
 //! # The main-loop census
 //!
@@ -54,9 +55,9 @@
 //!   `crates/aterm-gui/src` or `crates/aterm-control/src` does O(history) work
 //!   while the `term` guard is held.
 //!
-//! These are lexical censuses, not a borrow checker; their limits are in
-//! [`PRECISION_NOTE`] and [`lock_order::LOCK_PRECISION_NOTE`], printed with the
-//! red diagnostics and documented in docs/temporal-safety-gate.md.
+//! These are lexical walks, not a borrow checker; each L0 census prints its
+//! limits (this one's are [`PRECISION_NOTE`]) with its red diagnostics.
+//! docs/L0-CATALOG.md maps the L0 classes to these obligations.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -243,7 +244,7 @@ pub const CENSUSES: &[Census] = &[
     },
     Census {
         name: "wasm",
-        about: "wasm-module reach to unbounded work; threads (OB-8..OB-10, OB-12)",
+        about: "wasm reach to unbounded work; no threads (OB-8..OB-10, OB-12)",
         run: run_wasm_census,
     },
     Census {
@@ -319,34 +320,27 @@ pub fn run_all(root: &Path) -> Vec<(&'static str, CensusOutcome)> {
 /// The walker's limits, printed after a red verdict that found an
 /// unbounded-work site. A plain multi-line literal: `\` continuations would
 /// strip the indentation the diagnostic relies on.
-pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits of this census):
-      - LEXICAL, name-based: functions are segmented by rustfmt's
-        closing-brace-at-fn-indent invariant; calls are matched as `<ident>(`;
-        there is no type, trait, or borrow information. Same-named fns are
-        merged into one node (an over-approximation — sound for a fail-closed
-        census). Macro-generated calls, fn pointers, and deliberate aliasing
-        can evade it; the realistic regression — reverting an offloaded resize
-        to a synchronous `term_lock(..).resize(..)` on a main-thread path — is
-        caught, with the reachability path printed.
-      - SCOPE: the call graph covers non-test `crates/aterm-gui/src` ONLY
-        (OB-22's per-site walk adds `crates/aterm-control/src`) —
-        test/bench FILES dropped by path, and in-file items whose `cfg` gate
-        ENTAILS `test` (`all(test, ..)` yes; `any(test, unix)` and
-        `not(test)` no) blanked before segmentation, so a gate that does not
-        entail it stays visible and fails rather than skipping silently —
-        plus ONE modeled `term_lock` hop into Terminal methods. It does NOT
-        recurse into aterm-core/aterm-grid bodies; instead the unbounded sinks
-        are pinned at their definitions by `// COST: UNBOUNDED(<dim>)` markers,
-        swept over the DERIVED GUI-process closure (the same workspace-member
-        src/ scan set as OB-7; vendored code is not swept — it carries no
-        aterm markers by definition) and kept consistent with the registry
-        fail-closed in both directions. Markers in workspace crates outside
-        the closure are reported, never registry-checked.
+pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (this census's limits):
+      - LEXICAL, name-based: fns are segmented by rustfmt's
+        closing-brace-at-fn-indent layout and calls matched as `<ident>(`,
+        with no type, trait or borrow information. Same-named fns merge into
+        one node (an over-approximation, sound for a fail-closed census).
+        Macro-generated calls, fn pointers and aliasing can evade it; a
+        synchronous `term_lock(..).resize(..)` on a main-thread path is
+        caught, with its path printed.
+      - SCOPE: the call graph covers non-test `crates/aterm-gui/src` only
+        (OB-22 adds `crates/aterm-control/src`), plus one modeled `term_lock`
+        hop into Terminal methods. Test, bench and proof files are dropped by
+        path; an in-file item is blanked only when its `cfg` entails `test`
+        (`all(test, ..)` yes; `any(test, unix)` and `not(test)` no). The walk
+        does not enter aterm-core or aterm-grid: the unbounded sinks are
+        pinned by `// COST: UNBOUNDED(<dim>)` markers, swept over the derived
+        GUI-process closure (workspace src/ only, the OB-7 scan set) and held
+        to the registry both ways. Markers outside the closure are reported,
+        never registry-checked.
 ";
 
-// ---------------------------------------------------------------------------
 // Registries (the census's fail-closed ground truth)
-// ---------------------------------------------------------------------------
 
 /// A grid/terminal function that performs O(session-history) work. Each is
 /// pinned at its definition by a `// COST: UNBOUNDED(<dim>)` marker whose
@@ -465,9 +459,7 @@ const OFFLOAD_ALLOWLIST: &[OffloadBoundary] = &[
     },
 ];
 
-// ---------------------------------------------------------------------------
 // Source scanning helpers
-// ---------------------------------------------------------------------------
 
 /// Is this file a test-only source file (excluded from "implementation" scans)?
 /// A `tests_*.rs` beside `tests.rs` is one of its parts (`include!`d or `#[path]`ed into a
@@ -1046,36 +1038,32 @@ fn fn_defined_in(root: &Path, rel_file: &str, symbol: &str) -> bool {
         .any(|l| parse_fn_def(strip_line_comment(l)).is_some_and(|(_, name)| name == symbol))
 }
 
-// ---------------------------------------------------------------------------
 // The census run
-// ---------------------------------------------------------------------------
 
 /// Append the shared why-L0 + repair block for an OB-5/OB-6 violation.
 fn append_why_and_repair(log: &mut String) {
     let _ = writeln!(
         log,
-        "    WHY THIS IS L0: the winit event-loop thread performs O(session-history)\n\
-         \x20        work (decompressing + rewrapping every scrollback line) while\n\
-         \x20        HOLDING the per-session `term` mutex. Input, redraw, and every\n\
-         \x20        window served by this loop stall until it finishes — the class\n\
-         \x20        that shipped a real 42-second whole-Mac freeze (6.6 h session;\n\
-         \x20        fixed by the a69a6bb3 offload).\n\
+        "    WHY THIS IS L0: the winit event-loop thread does O(session-history)\n\
+         \x20        work (decompressing and rewrapping every scrollback line) while\n\
+         \x20        holding the per-session `term` mutex; input, redraw and every\n\
+         \x20        window this loop serves stall until it finishes.\n\
          \x20   HOW TO REPAIR (pick one):\n\
          \x20     1. OFFLOAD (the canonical fix): replace `.resize(rows, cols)` with\n\
          \x20        `.resize_offloading_scrollback(rows, cols)` inside the lock; hand\n\
          \x20        the returned `PendingScrollbackReflow` to a worker (its `reflow()`\n\
-         \x20        runs OFF the lock), re-attach with `.finish_resize_offload(..)`,\n\
+         \x20        runs off the lock), re-attach with `.finish_resize_offload(..)`,\n\
          \x20        and call `.abort_resize_offload()` if the worker dies. Canonical\n\
-         \x20        shape: crates/aterm-gui/src/app_render.rs `resize_panes_scoped`.\n\
+         \x20        shape: `resize_panes_scoped_with_active_plan` in\n\
+         \x20        crates/aterm-gui/src/app_render.rs.\n\
          \x20     2. BOUND the work: if this site provably never reflows unbounded\n\
          \x20        history (alt-screen grid, fixed-size scratch terminal), use a path\n\
-         \x20        that cannot reach the width reflow (e.g. `resize_no_reflow`) and\n\
-         \x20        write down why at the call site.\n\
-         \x20     3. NEW JUSTIFIED BOUNDARY (last resort): wrap the bounded/deferred\n\
-         \x20        variant in a dedicated, honestly-named Terminal method and register\n\
-         \x20        it in OFFLOAD_ALLOWLIST (crates/aterm-census/src/lib.rs) WITH a\n\
-         \x20        written justification — the census fail-closes on undefined or\n\
-         \x20        unjustified entries (OB-3)."
+         \x20        that cannot reach the width reflow (e.g. `Grid::resize_no_reflow`)\n\
+         \x20        and write down why at the call site.\n\
+         \x20     3. NEW BOUNDARY (last resort): wrap the bounded or deferred variant\n\
+         \x20        in a dedicated Terminal method and register it in\n\
+         \x20        OFFLOAD_ALLOWLIST (crates/aterm-census/src/lib.rs) with a written\n\
+         \x20        justification; OB-3 fails an undefined or unjustified entry."
     );
 }
 
@@ -1101,9 +1089,9 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         Err(e) => {
             let _ = writeln!(
                 log,
-                "  ✗ FAIL [OB-1] SCAN-SET DERIVATION FAILED — the census cannot soundly \
-                 determine the aterm-gui process closure from the workspace manifests, so \
-                 it refuses to sweep a guessed marker scope (fail-closed).\n\
+                "  ✗ FAIL [OB-1] SCAN-SET DERIVATION FAILED — the aterm-gui process closure \
+                 cannot be derived from the workspace manifests, so no marker scope is \
+                 guessed.\n\
                  \x20       {e}"
             );
             return CensusOutcome::red(MAINLOOP, log, "1 obligation violation(s).");
@@ -1112,10 +1100,8 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
     let _ = writeln!(
         log,
         "    marker sweep: the DERIVED GUI-process closure ({} workspace crates, src/ \
-         only — the same scan set as OB-7). Vendored [patch] code is NOT marker-swept \
-         (aterm's marker vocabulary; vendored forks carry no aterm COST markers by \
-         definition). Markers in workspace crates OUTSIDE the closure are reported \
-         below, never registry-checked.",
+         only, the OB-7 scan set); vendored code is not swept. Markers outside the \
+         closure are reported below, never registry-checked.",
         scan.scan_dirs.len()
     );
 
@@ -1126,8 +1112,8 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             let _ = writeln!(
                 log,
                 "  ✗ FAIL [OB-1] `{}` carries a `// COST: UNBOUNDED` marker (at {}) but is \
-                 NOT in UNBOUNDED_REGISTRY (register the sink in \
-                 crates/aterm-census/src/lib.rs so the census tracks it).",
+                 NOT in UNBOUNDED_REGISTRY; register the sink there \
+                 (crates/aterm-census/src/lib.rs).",
                 m.symbol, m.span
             );
             failures += 1;
@@ -1138,9 +1124,8 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             let _ = writeln!(
                 log,
                 "  ✗ FAIL [OB-1] registered sink `{}` ({}) has LOST its `// COST: UNBOUNDED` \
-                 marker at {} (restore the marker at its def, or drop the registry entry). \
-                 NOTE: the sweep covers the derived GUI-process closure (workspace src/) — \
-                 a marker moved to a crate outside the closure cannot satisfy the registry.",
+                 marker at {}: restore the marker at its definition, or drop the registry \
+                 entry. Only a marker inside the derived GUI-process closure counts.",
                 sink.symbol, sink.dim, sink.def_file
             );
             failures += 1;
@@ -1153,13 +1138,10 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
     for m in &out_markers {
         let _ = writeln!(
             log,
-            "  • NOTE [OB-1 scope] out-of-process `// COST: UNBOUNDED({})` marker on fn \
-             `{}` at {} — this crate is OUTSIDE the derived aterm-gui process closure, so \
-             the marker documents a hazard in a process the main-loop census does not \
-             model. It is reported here (never silently dropped) but is NOT subject to \
-             the marker ↔ registry coherence. If the crate enters the aterm-gui \
-             dependency graph, it joins the closure automatically and this marker \
-             becomes an OB-1 obligation.",
+            "  • NOTE [OB-1 scope] `// COST: UNBOUNDED({})` marker on fn `{}` at {} is \
+             outside the aterm-gui process closure: reported, not registry-checked. It \
+             becomes an OB-1 obligation if its crate enters aterm-gui's dependency \
+             graph.",
             m.dim, m.symbol, m.span
         );
     }
@@ -1169,8 +1151,8 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         if b.justification.trim().is_empty() {
             let _ = writeln!(
                 log,
-                "  ✗ FAIL [OB-3] offload boundary `{}` has an EMPTY justification — every \
-                 allowlist entry must say why it is genuinely a boundary.",
+                "  ✗ FAIL [OB-3] offload boundary `{}` has an EMPTY justification; every \
+                 allowlist entry says why it is a boundary.",
                 b.symbol
             );
             failures += 1;
@@ -1179,8 +1161,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             let _ = writeln!(
                 log,
                 "  ✗ FAIL [OB-3] offload boundary `{}` is allowlisted but `fn {}` is no longer \
-                 defined in {} — a STALE entry cannot keep sanctioning the shape. Re-audit: \
-                 update def_file if it moved, or remove the entry (and re-run the census).",
+                 defined in {}: update def_file if it moved, or remove the entry.",
                 b.symbol, b.symbol, b.def_file
             );
             failures += 1;
@@ -1234,8 +1215,8 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             let _ = writeln!(
                 log,
                 "  ✗ FAIL [OB-2] declared main-thread root `{r}` not found in \
-                 crates/aterm-gui/src — a renamed handler must update MAIN_THREAD_ROOTS \
-                 (crates/aterm-census/src/lib.rs), or the walked surface silently shrinks."
+                 crates/aterm-gui/src; if the handler was renamed, rename it in \
+                 MAIN_THREAD_ROOTS (crates/aterm-census/src/lib.rs)."
             );
             failures += 1;
         }
@@ -1283,7 +1264,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
                 log,
                 "  ✗ FAIL [OB-5] L0 OBLIGATION VIOLATED — a main-thread root synchronously \
                  reaches an\n\
-                 \x20        UNBOUNDED sink under the per-session `term` mutex (whole-Mac-freeze \
+                 \x20        UNBOUNDED sink under the per-session `term` mutex (the L0 freeze \
                  class).\n\
                  \x20   PATH:  {}\n\
                  \x20   SITE:  {} (fn `{}`)\n\
@@ -1415,16 +1396,15 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         "    scope: lexical name-based walk of crates/aterm-gui/src + crates/aterm-gui-*/src + one \
          term_lock hop; \
          markers swept over the derived {}-crate GUI-process closure \
-         (precision limits: docs/temporal-safety-gate.md).",
+         (limits: PRECISION_NOTE in crates/aterm-census/src/lib.rs).",
         scan.scan_dirs.len()
     );
     let summary = format!(
-        "{} fn(s) walked from {roots_found} main-thread root(s); no synchronous reach to an \
-         UNBOUNDED sink; {offload_sites} offload boundary call(s) ({}) hold the line; {} \
-         sink(s) marked + registered; {} boundaries defined + justified; {} out-of-closure \
-         marker(s) reported; {held_acquires} `term` acquire(s) held to no unbounded work.",
+        "{} fn(s) walked from {roots_found} main-thread root(s), none reaching an UNBOUNDED \
+         sink synchronously; {offload_sites} offload-boundary call(s); {} sink(s) marked and \
+         registered; {} boundaries defined and justified; {} out-of-closure marker(s) \
+         reported; {held_acquires} `term` acquire(s), none holding unbounded work.",
         parent.len(),
-        allowlist_symbols().join("/"),
         UNBOUNDED_REGISTRY.len(),
         OFFLOAD_ALLOWLIST.len(),
         out_markers.len(),
@@ -1623,9 +1603,7 @@ mod tests {
         src.lines().map(|l| l.to_string()).collect()
     }
 
-    // ------------------------------------------------------------------
     // Unit tests for the lexical walker.
-    // ------------------------------------------------------------------
 
     #[test]
     fn parse_fn_def_recognises_qualified_definitions_not_fn_bounds() {
@@ -1782,11 +1760,9 @@ fn table() -> [f32; 256] {
         assert_eq!(hz.len(), 1, "chained term_lock_ui(..).resize( must flag");
     }
 
-    // ------------------------------------------------------------------
     // Synthetic-tree tests: the census end-to-end against a minimal checkout,
     // GREEN and RED. Marker lines are built with format!/escapes so this file
     // never carries a real marker.
-    // ------------------------------------------------------------------
 
     /// The marker + sink-def files every synthetic tree needs (OB-1/OB-3 green).
     fn synth_support_files() -> Vec<(String, String)> {
@@ -1943,9 +1919,7 @@ fn table() -> [f32; 256] {
         );
     }
 
-    // ------------------------------------------------------------------
     // The in-file unshipped mask (`#[cfg(test)]` and its conjunctive kin).
-    // ------------------------------------------------------------------
 
     #[test]
     fn cfg_predicate_entails_unshipped_only_when_it_really_does() {
@@ -2112,9 +2086,7 @@ fn table() -> [f32; 256] {
         );
     }
 
-    // ------------------------------------------------------------------
     // Closure-scoped marker sweep: positive, negative, out-of-closure reporting.
-    // ------------------------------------------------------------------
 
     #[test]
     fn out_of_closure_marker_is_not_swept_and_is_reported() {

@@ -85,11 +85,18 @@ pub fn split_test_findings(
 
 /// The variables a rerun of a test child's failures must set: the child's own
 /// (`TRAIL_LAWS_FULL`, the measuring suites' bundle) and `--test-threads`.
-/// Where the build lands and which doc driver compiles change no test's
-/// verdict, so those stay off the line.
+/// Where the build lands and which doc driver compiles (the doctests' stand-in
+/// and what it is told, [`crate::docdriver`]) change no test's verdict, so
+/// those stay off the line.
 #[must_use]
 pub fn rerun_env(cmd: &Cmd, test_threads: Option<u32>) -> Vec<(OsString, OsString)> {
-    const PLACEMENT: [&str; 3] = ["CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "RUSTDOC"];
+    const PLACEMENT: [&str; 5] = [
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_JOBS",
+        "RUSTDOC",
+        crate::docdriver::DRIVER_ENV,
+        crate::docdriver::SKIP_ENV,
+    ];
     let mut env: Vec<(OsString, OsString)> = cmd
         .envs
         .iter()
@@ -365,6 +372,8 @@ mod tests {
             .env("TRAIL_LAWS_FULL", "1")
             .env("CARGO_TARGET_DIR", "/t")
             .env("RUSTDOC", "/s/trustdoc")
+            .env(crate::docdriver::DRIVER_ENV, "/s/trustdoc")
+            .env(crate::docdriver::SKIP_ENV, "plain")
             .env("ATERM_PAINT_BIN", "/b/My App/aterm");
         let env = rerun_env(&cmd, Some(3));
         let log = failed_log("laws::full_grid", "boom");

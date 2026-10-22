@@ -112,8 +112,8 @@ impl Rig {
             .unwrap()
             .set_agent_reader_for_test(agent);
         if debt {
-            // The predecessor's engine owed a row: what `spawn_session` seeds
-            // from the handoff record (R08), and books the ledger's first look.
+            // The predecessor's engine owed a row: what `spawn_session` seeds from the
+            // handoff record; it also books the ledger's first look.
             crate::spawn::seed_adopted_render_debt(
                 &session.term,
                 &session.ctx.timeline,

@@ -1410,7 +1410,11 @@ fn turns_notice(
         let Some((kind, item)) = gapped_items(&line)
             .find_map(|item| {
                 classify(item)
-                    .filter(|k| k.reads_limited() && !generic_limit(item))
+                    .filter(|k| {
+                        k.reads_limited()
+                            && !generic_limit(item)
+                            && crate::phase::notice_reset(item).is_some()
+                    })
                     .map(|k| (k, item))
             })
             .filter(|_| !crate::phase::programs_words(rows, i))
@@ -3718,6 +3722,38 @@ mod tests {
             ),
             "{w:#?}"
         );
+        // `/goal`'s own resetless echo row (`⏺ Goal paused · usage limit reached · send a
+        // message after it resets to continue`) under the turn's notice never shadows it.
+        for (rows, kind, prefix) in [
+            (
+                &sonnet,
+                WallKind::ModelBucket { consent: false },
+                "You've hit your Sonnet limit · resets Oct 17 at 4:20pm (America/Los_Angeles) \u{2014} ⚠ Usage limit reached",
+            ),
+            (
+                &weekly,
+                WallKind::UsageWeekly,
+                "You've hit your weekly limit · resets Oct 15 at 12:33pm (America/Los_Angeles) \u{2014} ⚠ Usage limit reached",
+            ),
+        ] {
+            let rule = rows
+                .iter()
+                .position(|r| r.starts_with("────"))
+                .expect("the composer's top rule");
+            let mut paused = rows.clone();
+            paused.splice(
+                rule..rule,
+                [
+                    "",
+                    "⏺ Goal paused · usage limit reached · send a message after it resets to continue",
+                    "",
+                ]
+                .map(str::to_string),
+            );
+            let w = wall(&paused).expect("the turn's limit under Goal paused");
+            assert_eq!(w.kind, kind, "{w:#?}");
+            assert!(w.message.starts_with(prefix), "{w:#?}");
+        }
 
         // NEGATIVE CONTROLS. A five-hour limit: its banner as it reads.
         let session = screen(WALL_SESSION_AUTO_CONTINUE_ARMED_34_2_1_299);

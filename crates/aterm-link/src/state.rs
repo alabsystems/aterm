@@ -197,7 +197,9 @@
 //!
 //! The other files cannot wedge torn: `node`, `inc`, `pins`, `halts`,
 //! `rewound-log`, `logkey`, `logfloor`, `run` and `quarantine/` are durable (on
-//! the media before anything rests on them), and every other reader takes an
+//! the media before anything rests on them; `run`'s OPEN ordered ahead of
+//! everything that rests on it and its bytes ahead of its name,
+//! [`StateDir::begin_run`]), and every other reader takes an
 //! empty file as absent and a cut number as a lower one — `inc-lease` as no
 //! lease (the attach leases afresh), `seq` as a lower one the durable `inc`
 //! fences, `acked`'s torn tail as no offset ([`AckedLog`]) — save `logpin`,
@@ -282,7 +284,7 @@
 //! | `logpin` | atomic, flushed at a clean stop; durable where it replaces none of this build's | the bus mirror's one batch in flight, the node's total of mirrored bytes and its alias key ([`StateDir::logpin`]), `v=2`, which an older build refuses ([`crate::mirror::Pin`]); only while the session-log mirror runs (`[fabric] log`) | an older whole version: one batch taken again at fresh sequences, a second copy each reader dedupes; after an unclean stop in an earlier boot, its total raised to `logfloor` ([`StateDir::reconcile_logpin`]), which counts the floor's lease as mirrored. TORN there, with `logfloor` and `logkey` on the media: set aside, a whole pin written from them in its place, and the mirror resumes (rulings Q6, Q13). Torn with no floor or no key (an older build's pin, the only copy), torn as an older build's `v=1`, within one boot or after a clean stop: the mirror stops, keeps it as it is, and says what a person does |
 //! | `logkey` | durable | the bus mirror's alias key (ruling Q6), 32 hex digits, written once, before the first take that names it ([`StateDir::logkey`]); only while the session-log mirror runs (`[fabric] log`) | load-bearing: a fresh key is a second alias for every edge on the bus, so a torn pin is never set aside without it. Missing in a dir only an older build mirrored in, whose pin's `key=` is copied here before the next take |
 //! | `logfloor` | durable | the floor of the bus mirror's lifetime total (ruling Q13): at or above every body byte it sent, raised by [`crate::mirror::FLOOR_LEASE_BYTES`] past a batch before any byte of it is sent ([`StateDir::logfloor`]); only while the session-log mirror runs (`[fabric] log`) | the total a mirror resumes at when its pin is gone or may be rolled back: the lease's unused rest and the batch in flight are counted as mirrored, never a byte less. Missing: no bridge of this build sent a batch, and a torn pin stops the mirror |
-//! | `run` | durable | the boot the last bridge ran in and whether it stopped cleanly, every file of a [`TornKind`] it wrote flushed first ([`LastRun`]): OPEN admitted once per StateDir open after its sweep, and CLEAN at a clean stop (a quit: a handoff leaves it open and its successor re-establishes the publication fence) | a dir without one is judged by its lease's boot, as a build before it was; a torn file found after a stop it cannot call unclean is refused where it is read |
+//! | `run` | ordered (OPEN), durable (CLEAN) | the boot the last bridge ran in and whether it stopped cleanly, every file of a [`TornKind`] it wrote flushed first ([`LastRun`]): OPEN admitted once per StateDir open after its sweep, by two barriers ahead of every later write on the device (two full flushes over either record of this boot, over no record, or with a torn kind's directory on another device: [`StateDir::begin_run`]), and CLEAN at a clean stop (a quit: a handoff leaves it open and its successor re-establishes the publication fence) | a dir without one is judged by its lease's boot, as a build before it was; a torn file found after a stop it cannot call unclean is refused where it is read |
 //! | `quarantine/` | durable | the exact bytes of each file found torn after an unclean stop in an earlier boot, moved aside by the first bridge after it ([`StateDir::set_aside_torn`], [`QUARANTINE`]) — the mirror's pin among them, as `logpin`, once its copies are on the media ([`StateDir::reconcile_logpin`]) — and of each whole in-flight entry it retired then, as `retired.inflight.<seq>` ([`StateDir::retire_in_flight_of_an_earlier_boot`]) | nothing reads it: it is the owner's, to read or remove. Only its count is read: how many torn files it still holds ([`StateDir::quarantined_torn`]), which at none ends aterm's entry for the owner's look |
 
 use std::collections::BTreeMap;
@@ -1451,10 +1453,13 @@ pub(crate) struct Flushed {
     /// Directories whose entries moved, flushed before the record (the
     /// root's full flush for the record not counted).
     pub dirs: u64,
-    /// Barriers: a file's, a directory's, the record's bytes'.
+    /// Barriers: a file's, a directory's, the record's bytes'; at a run's
+    /// start, two (the record's temp and the root) where the start is
+    /// ordered ([`StateDir::begin_run`]).
     pub ordered: u64,
     /// Full flushes: a file's or a directory's on another device than the
-    /// root, the record's (two at a run's start, temp and directory).
+    /// root, the record's: a clean stop's one, and a start's two (temp and
+    /// root) where it is not ordered.
     pub full: u64,
 }
 
@@ -1490,7 +1495,29 @@ impl StopRules {
     };
 }
 
-/// HOW THE LAST BRIDGE OF THIS DIR STOPPED, AND IN WHICH BOOT (`run`, durable):
+/// The rules [`StateDir::begin_run`] keeps; the run fence's negative controls
+/// switch one off ([`StateDir::begin_run_with`], `sim::tests`'
+/// `an_open_ordered_by_the_barrier_keeps_a_clean_record_true`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StartRules {
+    /// The record's temp is flushed before its rename: by the start's tier,
+    /// or, with [`StartRules::flush_root`] off, by the barrier alone.
+    pub flush_record: bool,
+    /// The root, whose entry the rename moved, is flushed after it by the
+    /// start's tier, and must succeed before the admission is cached.
+    pub flush_root: bool,
+}
+
+impl StartRules {
+    /// Every rule on: what ships.
+    pub(crate) const ALL: Self = Self {
+        flush_record: true,
+        flush_root: true,
+    };
+}
+
+/// HOW THE LAST BRIDGE OF THIS DIR STOPPED, AND IN WHICH BOOT (`run`: OPEN
+/// ordered ahead of every later write, CLEAN durable, [`StateDir::begin_run`]):
 /// what tells the first bridge of a boot whether a power cut can have torn a
 /// file of a [`TornKind`] ([`StateDir::torn_files_possible`]) — astream's own
 /// unclean-stop rule for its weak tiers (`astream_broker::Durability::Relaxed`:
@@ -3773,7 +3800,7 @@ impl StateDir {
             Err(e)
                 if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ELOOP) =>
             {
-                return Ok(false)
+                return Ok(false);
             }
             Err(e) => return Err(e),
         };
@@ -3871,12 +3898,63 @@ impl StateDir {
 
     /// A BRIDGE'S RUN BEGINS, after its sweep ([`StateDir::set_aside_torn`])
     /// and before it writes any file of a [`TornKind`]: `run` names this boot,
-    /// OPEN, durably — so a power cut from here on is judged unclean by the
-    /// first bridge of the next boot ([`StateDir::torn_files_possible`]). One
-    /// durable write at the first admission of this StateDir open, including
-    /// after a kill or handoff: a predecessor may have died after its rename
-    /// but before its directory flush. Reconnects through this same open reuse
-    /// only its successfully published, still-current OPEN record.
+    /// OPEN, ordered ahead of every later write on its device — so a power cut
+    /// that keeps any file this run writes keeps the record too, and the first
+    /// bridge of the next boot judges the run unclean
+    /// ([`StateDir::torn_files_possible`]). Written at the first admission of
+    /// each StateDir open, after a kill or a handoff too: a predecessor may
+    /// have died after its rename and before its directory's flush
+    /// (768104f73e). Reconnects through this same open reuse only its
+    /// successfully published, still-current OPEN record.
+    ///
+    /// BY THE BARRIER (B07), the law a clean stop's order already rests on
+    /// ([`StateDir::end_run_clean`]): the record's temp flushed by the barrier
+    /// before its rename, so its name never reaches the media ahead of its
+    /// bytes, then the root, whose entry the rename moved, flushed by the
+    /// barrier. That flush must succeed: a refused or tolerated directory
+    /// flush orders nothing (`aterm_durable`), and the admission is not
+    /// cached. Two barriers over an earlier boot's record, where every start
+    /// paid two full flushes
+    /// (`F_FULLFSYNC`, 7.63-31.01 ms, median 10.84, at each restart in the
+    /// fabric ledger's 2026-10-22 section), which also held up every barrier
+    /// on the volume while they ran. Nothing is on the media when this
+    /// returns. The recovery that rests on:
+    ///
+    /// - ONE DEVICE. A barrier orders its own device's I/O alone, so the start
+    ///   is ordered only where every directory of a [`TornKind`] that exists
+    ///   is on the root's device, where `run` and the mirror's pin are (one
+    ///   made later is made inside the root); elsewhere both flushes are full
+    ///   ones ([`aterm_durable::Flush::ordered_if_same_device`]).
+    /// - A LOST OPEN TAKES EVERY LATER WRITE ON THE DEVICE WITH IT, so a cut
+    ///   leaves the record this start replaced over the files as they stood
+    ///   before it: an open (the next boot sweeps, as it would have) or an
+    ///   earlier boot's clean stop, whose files no write of this run reached.
+    /// - NOTHING LEAVES THE DEVICE ON AN OPEN NOT YET ON THE MEDIA. The bus's
+    ///   log may be on another volume. A bridge sends nothing before its
+    ///   attach, and the first attach of a boot leases its incarnation afresh,
+    ///   `inc` flushed in full before anything is presented
+    ///   ([`StateDir::take_incarnation`]), which puts every write ordered
+    ///   before it on the media, this boot's OPEN with them. From then on the
+    ///   media's `run` names this boot. A later start nevertheless flushes
+    ///   in full: visible OPEN alone cannot prove that this attach happened.
+    /// - SAVE OVER ANY RECORD OF THIS BOOT, which is written in full. A
+    ///   clean stop does not end every session it served: aterm crashing
+    ///   closes the bridge's lanes as a quit does, its bridge stops cleanly,
+    ///   and the PTY keeper keeps the sessions, whose sids the relaunched
+    ///   aterm's bridge serves in this boot, attaching under the lease with no
+    ///   flush. A cut that lost an ordered OPEN there would leave the clean
+    ///   record vouching for the clean stop's in-flight entries, which the
+    ///   next boot republishes behind the later posts of their senders that a
+    ///   broker on another volume kept while losing the entries' own
+    ///   republish — finding F2's disorder, which the open record's
+    ///   retirement prevents. A visible OPEN of this boot can be a failed
+    ///   attempt to replace that CLEAN: a kill after the rename and before
+    ///   the root flush, or a failed root flush, leaves the same bytes as a
+    ///   completed start. Neither a reopen nor a retry can prove which one
+    ///   the media holds. So over either record of this boot, over no record
+    ///   (a dir no bridge of this build ran in), and where a boot cannot be
+    ///   named, both flushes are full ones. Only this open's already admitted,
+    ///   unchanged OPEN can skip the fence on reconnect.
     ///
     /// And what this run must flush before it may say it stopped cleanly
     /// ([`StateDir::end_run_clean`]): what it writes itself, and — unless the
@@ -3891,6 +3969,19 @@ impl StateDir {
     /// removed to force a legacy fallback. A write may already have progressed
     /// before an I/O error; uncertainty must remain fail-closed.
     pub(crate) fn begin_run(&self) -> io::Result<Flushed> {
+        self.begin_run_by(StartRules::ALL)
+    }
+
+    /// TEST-ONLY: [`StateDir::begin_run`] with one of its rules off — the
+    /// negative controls of the run fence's law on the simulated device
+    /// (`sim::tests`' `an_open_ordered_by_the_barrier_keeps_a_clean_record_true`).
+    #[cfg(test)]
+    pub(crate) fn begin_run_with(&self, rules: StartRules) -> io::Result<Flushed> {
+        self.begin_run_by(rules)
+    }
+
+    fn begin_run_by(&self, rules: StartRules) -> io::Result<Flushed> {
+        use aterm_durable::Flush;
         use std::os::unix::fs::MetadataExt as _;
         let mut known = self.run_fence.lock().unwrap_or_else(|e| e.into_inner());
         let now = self.kernel_boot();
@@ -3935,16 +4026,29 @@ impl StateDir {
                 .unwrap_or_else(|e| e.into_inner())
                 .extend(here.into_iter().map(|(_, _, rel)| rel).chain(pin));
         }
+        let tier = self.open_tier(last, now);
         let mut flushed = Flushed::default();
         let mut bytes = open.render().into_bytes();
         bytes.push(b'\n');
-        self.replace_bytes_as_with(
-            "run",
-            &bytes,
-            Some(aterm_durable::Flush::Durable),
-            0o666,
-            std::convert::identity,
-        )?;
+        // A full flush of the temp is a durable replace, which flushes the
+        // root itself; a barrier's leaves the root to the step after it.
+        let flush = match (rules.flush_record, rules.flush_root) {
+            (false, _) => None,
+            (true, false) => Some(Flush::Ordered),
+            (true, true) => Some(tier),
+        };
+        self.replace_bytes_as_with("run", &bytes, flush, 0o666, std::convert::identity)?;
+        match flush {
+            Some(Flush::Durable) => flushed.note(flush, 2),
+            Some(Flush::Ordered) => {
+                flushed.note(flush, 1);
+                if rules.flush_root {
+                    self.flush_dir_as(&self.root, Flush::Ordered)?;
+                    flushed.note(flush, 1);
+                }
+            }
+            None => {}
+        }
         let (file, record) = self.run_file()?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -3959,8 +4063,30 @@ impl StateDir {
         }
         *known = Some(file);
         drop(previous);
-        flushed.full += 2;
         Ok(flushed)
+    }
+
+    /// WHICH FLUSH ORDERS A START'S OPEN ([`StateDir::begin_run`]): the
+    /// barrier, where the record it replaces is of an earlier named boot and
+    /// every directory of a [`TornKind`] that exists is on the root's device;
+    /// the full flush over either record of this boot, over no record, where
+    /// a boot cannot be named, and where such a directory is on another
+    /// device or cannot be read.
+    fn open_tier(&self, last: Option<LastRun>, now: Option<[u8; 16]>) -> aterm_durable::Flush {
+        use aterm_durable::Flush;
+        let ordered =
+            last.is_some_and(|run| now.is_some() && run.boot.is_some() && run.boot != now);
+        if !ordered {
+            return Flush::Durable;
+        }
+        for kind in TornKind::ALL {
+            match self.torn_kind_dir(kind) {
+                Ok(None) => {}
+                Ok(Some(dir)) if Flush::ordered_if_same_device(&dir, &self.root).is_ordered() => {}
+                Ok(Some(_)) | Err(_) => return Flush::Durable,
+            }
+        }
+        Flush::Ordered
     }
 
     /// A CLEAN STOP: every file of a [`TornKind`] this run must flush
@@ -6268,9 +6394,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // -----------------------------------------------------------------------
     // the incarnation lease
-    // -----------------------------------------------------------------------
 
     /// The boot id standing in for boot number `b` (never the all-zero "unknown").
     fn boot_id(b: u8) -> [u8; 16] {
@@ -7921,6 +8045,69 @@ mod tests {
         );
     }
 
+    /// **A START IS ORDERED BY THE BARRIER ONLY OVER AN EARLIER BOOT'S
+    /// RECORD** (B07, [`StateDir::begin_run`]). Each start is a fresh open of
+    /// one dir and says what its OPEN cost, `(barriers, full flushes)`, which
+    /// the dir's own counts match: over no record, two full flushes; over an
+    /// open of this boot (a kill's or a handoff's successor), two full flushes;
+    /// over a clean stop of this boot (the relaunch after aterm crashed, whose
+    /// sessions the PTY keeper kept), two full flushes; over an earlier boot's
+    /// open and an earlier boot's clean stop, two barriers; in a boot nobody
+    /// can name, and over a record whose boot nobody named, two full flushes;
+    /// and over an earlier boot's clean stop with a link planted where a torn
+    /// kind's directory goes (which may name another device), two full
+    /// flushes (the safe direction where a device cannot be read).
+    #[test]
+    fn a_start_is_ordered_by_the_barrier_save_over_a_clean_stop_of_this_boot() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("start-tier")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let start = |boot: IncSeam| {
+            let st = StateDir::open(root).expect("open");
+            st.set_inc_seam(boot);
+            let before = st.ops();
+            let flushed = st.begin_run().expect("a start");
+            let ops = st.ops() - before;
+            assert_eq!(
+                (ops.barriers, ops.fsyncs),
+                (flushed.ordered, flushed.full),
+                "said as made"
+            );
+            (st, (flushed.ordered, flushed.full))
+        };
+        let (_, cost) = start(in_boot(1));
+        assert_eq!(cost, (0, 2), "over no record");
+        let (st, cost) = start(in_boot(1));
+        assert_eq!(cost, (0, 2), "over an open of this boot");
+        st.end_run_clean().expect("a clean stop in boot 1");
+        let (_, cost) = start(in_boot(1));
+        assert_eq!(cost, (0, 2), "over a clean stop of this boot");
+        let (st, cost) = start(in_boot(2));
+        assert_eq!(cost, (2, 0), "over an earlier boot's open");
+        st.end_run_clean().expect("a clean stop in boot 2");
+        let (_, cost) = start(in_boot(3));
+        assert_eq!(cost, (2, 0), "over an earlier boot's clean stop");
+        let (_, cost) = start(IncSeam {
+            boot: Some(None),
+            ..IncSeam::default()
+        });
+        assert_eq!(cost, (0, 2), "in a boot nobody can name");
+        let (st, cost) = start(in_boot(4));
+        assert_eq!(cost, (0, 2), "over a record whose boot nobody named");
+        st.end_run_clean().expect("a clean stop in boot 4");
+        std::fs::remove_dir_all(root.join("sent")).expect("the reservations' directory");
+        let elsewhere = aterm_tempfile::Builder::new()
+            .prefix("start-tier-link")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        std::os::unix::fs::symlink(elsewhere.path(), root.join("sent"))
+            .expect("a link where a directory goes");
+        let (_, cost) = start(in_boot(5));
+        assert_eq!(cost, (0, 2), "a torn kind's directory that does not read");
+    }
+
     /// **AFTER A CLEAN STOP, DAMAGE IS A BUG'S, AND A REBOOT DOES NOT CHANGE
     /// THAT** — the review of finding F1's fix, against astream's clean close.
     /// A bridge in boot 1 writes a reservation and an in-flight entry and is
@@ -7936,7 +8123,7 @@ mod tests {
     fn after_a_clean_stop_damage_is_refused_across_a_reboot() {
         use aterm_durable::Flush;
         for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Unsupported] {
-            for reopen in [false, true] {
+            for (reopen, next_boot) in [(false, 1), (true, 1), (false, 2), (true, 2)] {
                 let dir = aterm_tempfile::Builder::new()
                     .prefix("clean-open-error")
                     .tempdir_in("/tmp")
@@ -7944,8 +8131,15 @@ mod tests {
                 let st = StateDir::open(dir.path()).expect("open");
                 st.set_inc_seam(in_boot(1));
                 st.begin_run().expect("initial OPEN");
+                st.take_incarnation(0).expect("a lease in this boot");
                 st.end_run_clean().expect("prior clean stop");
-                st.refuse_directory_flush(Some((dir.path(), Flush::Durable, kind)));
+                st.set_inc_seam(in_boot(next_boot));
+                let tier = if next_boot == 1 {
+                    Flush::Durable
+                } else {
+                    Flush::Ordered
+                };
+                st.refuse_directory_flush(Some((dir.path(), tier, kind)));
                 assert_eq!(
                     st.begin_run().expect_err("OPEN publication refused").kind(),
                     kind
@@ -7957,12 +8151,14 @@ mod tests {
                 let st = if reopen {
                     drop(st);
                     let st = StateDir::open(dir.path()).expect("reopen after failed publication");
-                    st.set_inc_seam(in_boot(1));
-                    st.refuse_directory_flush(Some((dir.path(), Flush::Durable, kind)));
+                    st.set_inc_seam(in_boot(next_boot));
                     st
                 } else {
                     st
                 };
+                // Its visible OPEN may still fall back to CLEAN on media.
+                // Reopen changes no such evidence: the retry must persist it.
+                st.refuse_directory_flush(Some((dir.path(), Flush::Durable, kind)));
                 assert_eq!(
                     st.begin_run()
                         .expect_err("visible OPEN is not admission")
@@ -7970,7 +8166,16 @@ mod tests {
                     kind
                 );
                 st.refuse_directory_flush(None);
-                assert_eq!(st.begin_run().expect("successful OPEN retry").full, 2);
+                let retried = st.begin_run().expect("successful OPEN retry");
+                assert_eq!((retried.ordered, retried.full), (0, 2));
+                let before = st.ops();
+                st.take_incarnation(0)
+                    .expect("the existing same-boot lease");
+                assert_eq!(
+                    (st.ops() - before).fsyncs,
+                    if next_boot == 1 { 0 } else { 2 },
+                    "only a new boot's incarnation supplies a later full flush"
+                );
                 let before = st.ops();
                 assert_eq!(
                     st.begin_run().expect("same open reconnect"),

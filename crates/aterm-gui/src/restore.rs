@@ -229,7 +229,7 @@ pub(crate) struct TerminalLeafRestore {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervised: Option<Box<AgentRestore>>,
     /// THE WORD THAT THE TAB'S AGENT CANNOT BE BROUGHT BACK, STANDING (LC-4
-    /// of ATERM-KI-1016-1; additive, absent tolerated): ON A SEAMLESS
+    /// of ; additive, absent tolerated): ON A SEAMLESS
     /// UPDATE'S HANDOFF LAYOUT ONLY, the outgoing host's word for the tab
     /// (`harness_host::HostHandle::lost_word`), for the successor's host to
     /// stand again at its Commit, before its first pass
@@ -246,21 +246,15 @@ pub(crate) struct TerminalLeafRestore {
     /// cold restore's reopened tab is another session. Boxed, as `agent` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lost: Option<Box<LostRestore>>,
-    /// HELD BY A PROGRAM (audit #8; additive, absent tolerated, written only
-    /// when true): at capture a program other than the pane's shell held its
-    /// PTY (ssh, a container's shell, vim — the quit confirm's `tcgetpgrp`
-    /// test), and it was not the agent aterm hosts there, which runs on this
-    /// machine (`App::hosted_agent`), so `cwd` may name a folder on another
-    /// machine
-    /// ([`Self::folder_may_be_remote`]). The restore then takes it only when
-    /// a shell can start in it here ([`Self::start_cwd`]), as a New Tab from
-    /// that pane does. Only the durable capture (quit,
-    /// crash journal, a closed tab) records it; the seamless update's layout
-    /// never does, since its Commit compares layouts and a program may start
-    /// or end in between.
+    /// At capture a program other than the shell held the PTY (ssh, a container shell, vim:
+    /// the quit confirm's `tcgetpgrp` test) and it was not the agent aterm hosts there, so
+    /// `cwd` may name a folder on another machine ([`Self::folder_may_be_remote`]); the
+    /// restore takes it only when a shell can start in it here ([`Self::start_cwd`]). Written
+    /// only by durable captures (quit, crash journal, a closed tab): the seamless update's
+    /// Commit compares layouts, and a program may start or end in between.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub held: bool,
-    /// THE TAB'S STANDING HOLDS (round twenty, LC-8 of ATERM-KI-1015-1;
+    /// THE TAB'S STANDING HOLDS (round twenty, LC-8 of ;
     /// additive, absent tolerated, written only when one stood; not
     /// [`Self::held`], a program's hold on the PTY): the session's holds, one
     /// per origin (`fabric::Holds`), as [`crate::fabric::render_holds`] writes
@@ -366,24 +360,17 @@ pub(crate) struct AgentRestore {
     pub cwd: String,
     /// Its version, when it had registered one.
     pub version: Option<String>,
-    /// THE CLAUDE HOME IT RAN UNDER (2026-10-09; additive, absent tolerated,
-    /// written only when set): the raw `CLAUDE_CONFIG_DIR` of its own exec
-    /// environment, as the host read it while it ran
-    /// (`aterm_agent::harness::relaunch::Snapshot::home`). The relaunch after
-    /// aterm ended puts it back on its line as every live relaunch does
-    /// (`relaunch::required_env`): without it, an agent a wrapper or its own
-    /// command line started under another home came back on
-    /// `~/.claude.json`, in the first-run theme picker, never resuming
-    /// (measured live for the explicit restart, `b16490d3d`). An older
-    /// producer never writes it, and that leaf restores as it always did; an
-    /// older successor ignores it.
+    /// The raw `CLAUDE_CONFIG_DIR` of its exec environment, as the host read it while it ran
+    /// (`aterm_agent::harness::relaunch::Snapshot::home`). The relaunch puts it back on its
+    /// line as a live relaunch does (`relaunch::required_env`); without it, an agent started
+    /// under another home comes back on `~/.claude.json`, in the first-run theme picker, never
+    /// resuming.
     pub home: Option<String>,
-    /// THE LOGIN IT RAN UNDER, the same way: the raw
-    /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` (`Snapshot::login`). Set and empty —
-    /// the default login NAMED — is written `""`, which is not the same line
-    /// as none. A leaf that names a home or a login is relaunched under
-    /// them, never under the roster's proven active account, which is for an
-    /// agent nothing says the login of (`harness_host::RestoredAgent::unread`).
+    /// The raw `CLAUDE_SECURESTORAGE_CONFIG_DIR` (`Snapshot::login`), the same way. Set and
+    /// empty (the default login named) is written `""`, which differs from none. A leaf naming
+    /// a home or a login is relaunched under them, never under the roster's proven active
+    /// account, which is for an agent nothing names the login of
+    /// (`harness_host::RestoredAgent::unread`).
     pub login: Option<String>,
     /// THE RUN OF A LANE PAST CLAUDE CODE'S (a Codex's: its home, and
     /// codex-alab's validated line): what its relaunch reads beside the
@@ -400,18 +387,12 @@ pub(crate) struct AgentRestore {
     /// ([`Self::agent`], [`Self::snapshot`]); with no word the agent is read
     /// off its run, as every older producer's leaf is.
     pub word: String,
-    /// THE EXPLICIT RESTART ENDED IT (round eighteen; additive, absent
-    /// tolerated, written only when set): the act's cause — `asked` or
-    /// `stall` (`restart_stamp::Cause::word`) — on a relaunch OWED for it
-    /// (`harness_host::OwedRelaunch::asked`), so the relaunch that takes it
-    /// up is the act's: carried through a hand it waits on rather than
-    /// counted, and made on its cause
-    /// (`harness_host::RestoredAgent::asked`; ruling 20's (iv)). ON A
-    /// SEAMLESS UPDATE'S HANDOFF LAYOUT ONLY, whose successor adopts the
-    /// very tab (`App::pending_restored_agent`): never on a durable layout,
-    /// whose agent a cold restore relaunches in a reopened tab as aterm's own
-    /// end (the review of round eighteen's first cut). An older successor
-    /// ignores it and relaunches it as aterm's own end, as before.
+    /// The explicit restart's cause (`asked` or `stall`, `restart_stamp::Cause::word`) on a
+    /// relaunch owed for it (`harness_host::OwedRelaunch::asked`), so the relaunch is the act's:
+    /// carried through a hand it waits on rather than counted, and made on its cause
+    /// (`harness_host::RestoredAgent::asked`). On a seamless update's handoff layout only,
+    /// whose successor adopts the very tab (`App::pending_restored_agent`); a durable layout's
+    /// agent is relaunched in a reopened tab as aterm's own end.
     pub cause: Option<String>,
     /// THE TAB IT RAN IN (2026-10-15; additive, absent tolerated, written
     /// only when set): that tab's sid at capture
@@ -960,10 +941,9 @@ impl AgentRestore {
             cwd: self.cwd,
             version: self.version,
             run,
-            // Read by the frozen remedy's wording alone
-            // (`relaunch::resumes_on_exit`), never by the relaunch, whose plan
-            // reads the shell's dialect itself when it runs; and not read here,
-            // on the event loop, from a shell that just started.
+            // Read only by the frozen remedy's wording (`relaunch::resumes_on_exit`); the
+            // relaunch's plan reads the shell's dialect itself, and nothing is read here on the
+            // event loop.
             dialect: None,
             // Not carried: read from its home and its `cwd`
             // (`upgrade_drive::Records::of_snapshot`).
@@ -4315,7 +4295,6 @@ pub(crate) fn take_from(path: &Path) -> Option<RestoreManifest> {
     take_quit_from(path).map(|taken| taken.manifest)
 }
 
-// ---------------------------------------------------------------------------
 // THE LAUNCH'S TAKE, IN TWO PHASES (r6 sweep #7, START-1).
 //
 // A macOS window takes `session.toml` before its `NSApplication` build (LAG-11:
@@ -4727,7 +4706,6 @@ fn taken_together(texts: Vec<(String, Option<u64>)>) -> Option<TakenQuit> {
     Some(taken)
 }
 
-// ---------------------------------------------------------------------------
 // The per-scale cell-metrics cache.
 //
 // A windowed cold launch sizes its first, hidden OS window from `seed_cell_px` (a 0.6×/1.2×
@@ -7644,7 +7622,7 @@ metadata = "opaque=copy-me"
     /// The sid of a tab a crashed run held.
     const OLD_TAB: &str = "s-00000000000000000001";
 
-    /// THE TAB'S HOLDS RIDE ITS LEAF (2026-10-15, ATERM-KI-1015-1 LC-8 and
+    /// THE TAB'S HOLDS RIDE ITS LEAF (2026-10-15 and
     /// its review; ruling 23): [`RestoreManifest::fill_holds`] puts the hold
     /// rows of the session a leaf names (`fabric::render_holds`'
     /// `"<origin> <reason>"`) on that leaf alone, an agent on it or none, and

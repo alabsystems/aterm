@@ -23,7 +23,6 @@ fn scrolled(input: &[u8]) -> Vec<String> {
     (0..4).map(|r| s.row(r)).collect()
 }
 
-// =========================================================================
 // SD — Scroll Down, the ECMA-48 spelling (CSI Ps ^)
 //
 // xterm ctlseqs: "CSI Ps ^  Scroll down Ps lines (default = 1) (SD), ECMA-48.
@@ -31,7 +30,6 @@ fn scrolled(input: &[u8]) -> Vec<String> {
 // corrected in 2003."
 //
 // The engine's primary spelling is the VT420 "CSI Ps T".
-// =========================================================================
 
 #[test]
 fn sd_spelled_with_caret_scrolls_down_like_sd_spelled_with_t() {
@@ -73,7 +71,6 @@ fn sd_spelled_with_caret_scrolls_only_inside_the_scroll_region() {
     );
 }
 
-// =========================================================================
 // XTPUSHSGR / XTPOPSGR spelled `# p` / `# q`
 //
 // xterm ctlseqs: "CSI # p / CSI Pm # p  Push video attributes onto stack
@@ -84,7 +81,6 @@ fn sd_spelled_with_caret_scrolls_only_inside_the_scroll_region() {
 // An unrecognized push is worse than a no-op: the program's later pop is then
 // unbalanced, so every attribute it set after the push leaks past the point it
 // meant to restore.
-// =========================================================================
 
 /// Style fingerprint after feeding `input` — `(fg, bg, flags)`.
 fn style_after(input: &[u8]) -> (u32, u32, u16) {

@@ -141,8 +141,8 @@ enum Post {
         /// destroyed after the EGL surface.
         wl_window: *mut c_void,
     },
-    /// A `GLXWindow` of the device's GLX context.
-    Glx { window: GLXDrawable },
+    /// A `GLXWindow` of the device's GLX context, on the X11 window `xid`.
+    Glx { window: GLXDrawable, xid: u64 },
 }
 
 /// One window's surface, its stand-in and its present mode.
@@ -162,10 +162,26 @@ pub(crate) struct GlWindowSurface {
     /// ever bound ([`bind_failure_is_loss`]).
     bind_failures: u32,
     bound: bool,
+    /// A test's answers for the back buffer's size in place of the window
+    /// system's, which lag the buffer as NVIDIA's GLX answer can:
+    /// `asked_size` at every ask, `asked_once` at the next one only.
+    #[cfg(test)]
+    pub(crate) asked_size: Option<(i32, i32)>,
+    #[cfg(test)]
+    pub(crate) asked_once: std::cell::Cell<Option<(i32, i32)>>,
     /// The window the surface draws into, held so it outlives the surface
     /// (dropped after it).
     _window: Box<dyn std::any::Any + Send + Sync>,
 }
+
+/// A scissor extent past any window's edge (an X11 window is at most 32767
+/// pixels a side).
+const PAST: i32 = 1 << 15;
+
+/// The times a present posts again because its window's size moved between
+/// the ask and the swap; a window still resizing posts again at its next
+/// present.
+const REPOSTS: u32 = 2;
 
 /// The failed binds in a row at which a GLX window that bound before is
 /// taken as lost.
@@ -319,6 +335,7 @@ impl GlWindowSurface {
                 };
                 Post::Glx {
                     window: glx.create_window(xid, visual)?,
+                    xid,
                 }
             }
             None => Self::egl_post(shared, native, w, h)?,
@@ -354,6 +371,10 @@ impl GlWindowSurface {
             standin: None,
             bind_failures: 0,
             bound: false,
+            #[cfg(test)]
+            asked_size: None,
+            #[cfg(test)]
+            asked_once: std::cell::Cell::new(None),
             _window: window,
         })
     }
@@ -434,7 +455,7 @@ impl GlWindowSurface {
     #[cfg(test)]
     pub(crate) const fn glx_window(&self) -> Option<GLXDrawable> {
         match self.post {
-            Post::Glx { window } => Some(window),
+            Post::Glx { window, .. } => Some(window),
             Post::Egl { .. } => None,
         }
     }
@@ -477,10 +498,13 @@ impl GlWindowSurface {
 
     /// Post the stand-in: bind the window surface, copy the stand-in into the
     /// back buffer with its rows flipped and its top-left at the window's
-    /// top-left, and swap. `Err` names the EGL, GLX or GL failure; a lost
-    /// context, a reset one and a GLX window that keeps refusing its bind
-    /// are latched on the device.
-    pub(crate) fn present(&mut self, dev: &GlDevice) -> Result<(), GlPresentError> {
+    /// top-left, and swap; where the window's size moved between the ask and
+    /// the swap, post again ([`REPOSTS`]). `fill` (`0xRRGGBB`, the frame's
+    /// background) covers any part of the back buffer past the size the
+    /// window system answered.
+    /// `Err` names the EGL, GLX or GL failure; a lost context, a reset one and
+    /// a GLX window that keeps refusing its bind are latched on the device.
+    pub(crate) fn present(&mut self, dev: &GlDevice, fill: u32) -> Result<(), GlPresentError> {
         let standin = self
             .standin
             .as_ref()
@@ -512,7 +536,7 @@ impl GlWindowSurface {
                 }
                 (sw, sh)
             }
-            Post::Glx { window } => {
+            Post::Glx { window, xid } => {
                 let glx = cur.glx().ok_or("gl: a GLX window on an EGL device")?;
                 if let Err(e) = glx.bind_window(*window) {
                     self.bind_failures = self.bind_failures.saturating_add(1);
@@ -548,80 +572,151 @@ impl GlWindowSurface {
                         .unwrap_or_else(note);
                     self.interval_set = true;
                 }
-                let (sw, sh) = glx.size(*window);
-                (
-                    i32::try_from(sw).unwrap_or(0),
-                    i32::try_from(sh).unwrap_or(0),
-                )
+                self.ask(glx, *xid)
             }
         };
         let (tw, th) = (standin.width as i32, standin.height as i32);
-        let sw = if sw > 0 { sw } else { tw };
-        // The window's top row is its default framebuffer's last row.
-        let top = if sh > 0 { sh } else { th };
+        let [_, r, g, b] = fill.to_be_bytes();
+        let fill = [
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+            1.0,
+        ];
         let fbo = standin.fbo(&cur)?;
-        let gl = cur.gl();
-        // SAFETY: the context and the window surface are current; the
-        // stand-in's framebuffer is complete; the blit is colour-only and
-        // NEAREST between equal-sized rects (no filtering, no conversion: the
-        // back buffer and the stand-in are both linear RGBA8).
-        unsafe {
-            (gl.disable)(ffi::GL_SCISSOR_TEST);
-            if dev.caps().srgb_views {
-                (gl.disable)(ffi::GL_FRAMEBUFFER_SRGB_EXT);
+        let mut asked = (sw, sh);
+        let mut reposts = 0;
+        loop {
+            draw_standin(&cur, dev.caps().srgb_views, fbo, (tw, th), asked, &fill);
+            cur.check("present blit")?;
+            let (window, xid) = match &self.post {
+                Post::Egl { fns, surface, .. } => {
+                    return cur.swap(fns, *surface).map_err(Into::into);
+                }
+                Post::Glx { window, xid } => (*window, *xid),
+            };
+            let glx = cur.glx().ok_or("gl: a GLX window on an EGL device")?;
+            glx.swap(window);
+            // A resize that lands between the ask and the swap loses the
+            // frame: NVIDIA's GLX takes the window's new size at the swap and
+            // posts a fresh back buffer, black, which stays on screen until
+            // the next present (the desk, 2026-10-22: the whole window black
+            // for 60 to 400 ms in a burst of resizes, the back buffer reading
+            // black just after the blit). The size is asked again after the
+            // swap; where it moved, the context is bound afresh, so the driver
+            // takes the new size before the draw, and the stand-in posted
+            // again at once. A steady window pays the one ask, a round trip
+            // (with the one before the draw, as many as the two of
+            // `glXQueryDrawable` this replaced).
+            if reposts == REPOSTS || self.ask(glx, xid) == asked {
+                return Ok(());
             }
-            (gl.color_mask)(ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE);
-            (gl.bind_framebuffer)(ffi::GL_READ_FRAMEBUFFER, fbo);
-            (gl.bind_framebuffer)(ffi::GL_DRAW_FRAMEBUFFER, 0);
+            if glx
+                .make_current()
+                .and_then(|()| glx.bind_window(window))
+                .is_err()
+            {
+                return Ok(());
+            }
+            asked = self.ask(glx, xid);
+            reposts += 1;
+        }
+    }
+
+    /// The X11 window `xid`'s size as the server answers it now (a test's
+    /// answer in its place).
+    fn ask(&self, glx: &super::glx::GlxContext, xid: u64) -> (i32, i32) {
+        #[cfg(test)]
+        if let Some(size) = self.asked_once.take().or(self.asked_size) {
+            return size;
+        }
+        let (w, h) = glx.size(xid);
+        (i32::try_from(w).unwrap_or(0), i32::try_from(h).unwrap_or(0))
+    }
+}
+
+/// Copy the stand-in (`tw` x `th`, its framebuffer `fbo`) into the bound
+/// window's back buffer, which the window system answered as `sw` x `sh`
+/// (0: unknown, the stand-in's): rows flipped, its top-left at the window's,
+/// the buffer past the answer cleared to `fill` and past the stand-in
+/// stretched from its edges.
+fn draw_standin(
+    cur: &super::device::Current<'_>,
+    srgb_views: bool,
+    fbo: ffi::GLuint,
+    (tw, th): (i32, i32),
+    (sw, sh): (i32, i32),
+    fill: &[f32; 4],
+) {
+    let sw = if sw > 0 { sw } else { tw };
+    // The window's top row is its default framebuffer's last row.
+    let top = if sh > 0 { sh } else { th };
+    let gl = cur.gl();
+    // SAFETY: the context and the window surface are current; the
+    // stand-in's framebuffer is complete; the blit is colour-only and
+    // NEAREST between equal-sized rects (no filtering, no conversion: the
+    // back buffer and the stand-in are both linear RGBA8); each clear
+    // reads four floats for the one colour buffer.
+    unsafe {
+        (gl.disable)(ffi::GL_SCISSOR_TEST);
+        if srgb_views {
+            (gl.disable)(ffi::GL_FRAMEBUFFER_SRGB_EXT);
+        }
+        (gl.color_mask)(ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE);
+        (gl.bind_framebuffer)(ffi::GL_READ_FRAMEBUFFER, fbo);
+        (gl.bind_framebuffer)(ffi::GL_DRAW_FRAMEBUFFER, 0);
+        // The back buffer can be larger than the answered size (the window
+        // grew after the ask, which a burst of resizes makes common), so
+        // the frame lands short and low in a buffer whose bytes past it
+        // read black (the desk's NVIDIA GLX, 2026-10-22: a strip one resize
+        // step wide at the right and at the top, until the next present).
+        // Right of that size and above it the buffer is cleared to the
+        // frame's background; where the answer is right, these scissors
+        // hold no pixel.
+        (gl.enable)(ffi::GL_SCISSOR_TEST);
+        for [x, y, w, h] in [[sw, 0, PAST, PAST], [0, top, sw, PAST]] {
+            (gl.scissor)(x, y, w, h);
+            (gl.clear_bufferfv)(ffi::GL_COLOR, 0, fill.as_ptr());
+        }
+        (gl.disable)(ffi::GL_SCISSOR_TEST);
+        (gl.blit_framebuffer)(
+            0,
+            0,
+            tw,
+            th,
+            0,
+            top,
+            tw,
+            top - th,
+            ffi::GL_COLOR_BUFFER_BIT,
+            ffi::GL_NEAREST as u32,
+        );
+        // A window larger than the stand-in (it grew before the frontend
+        // heard of it) would show the back buffer's undefined bytes past
+        // the frame: its right column, its bottom row and its corner pixel
+        // are stretched over them instead.
+        let extend = |src: [i32; 4], dst: [i32; 4]| {
             (gl.blit_framebuffer)(
-                0,
-                0,
-                tw,
-                th,
-                0,
-                top,
-                tw,
-                top - th,
+                src[0],
+                src[1],
+                src[2],
+                src[3],
+                dst[0],
+                dst[1],
+                dst[2],
+                dst[3],
                 ffi::GL_COLOR_BUFFER_BIT,
                 ffi::GL_NEAREST as u32,
             );
-            // A window larger than the stand-in (it grew before the frontend
-            // heard of it) would show the back buffer's undefined bytes past
-            // the frame: its right column, its bottom row and its corner pixel
-            // are stretched over them instead.
-            let extend = |src: [i32; 4], dst: [i32; 4]| {
-                (gl.blit_framebuffer)(
-                    src[0],
-                    src[1],
-                    src[2],
-                    src[3],
-                    dst[0],
-                    dst[1],
-                    dst[2],
-                    dst[3],
-                    ffi::GL_COLOR_BUFFER_BIT,
-                    ffi::GL_NEAREST as u32,
-                );
-            };
-            if sw > tw {
-                extend([tw - 1, 0, tw, th], [tw, top, sw, top - th]);
-            }
-            if top > th {
-                extend([0, th - 1, tw, th], [0, top - th, tw, 0]);
-            }
-            if sw > tw && top > th {
-                extend([tw - 1, th - 1, tw, th], [tw, top - th, sw, 0]);
-            }
+        };
+        if sw > tw {
+            extend([tw - 1, 0, tw, th], [tw, top, sw, top - th]);
         }
-        cur.check("present blit")?;
-        match &self.post {
-            Post::Egl { fns, surface, .. } => cur.swap(fns, *surface).map_err(Into::into),
-            Post::Glx { window, .. } => {
-                cur.glx()
-                    .ok_or("gl: a GLX window on an EGL device")?
-                    .swap(*window);
-                Ok(())
-            }
+        if top > th {
+            extend([0, th - 1, tw, th], [0, top - th, tw, 0]);
+        }
+        if sw > tw && top > th {
+            extend([tw - 1, th - 1, tw, th], [tw, top - th, sw, 0]);
         }
     }
 }

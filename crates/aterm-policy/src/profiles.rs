@@ -11,9 +11,7 @@
 
 use crate::{Defaults, OriginTag, Policy, Profile, RateLimit, Response, Rule, SCHEMA_VERSION};
 
-// ---------------------------------------------------------------------------
 // Small helpers
-// ---------------------------------------------------------------------------
 
 fn rule(
     sequence: &str,
@@ -78,9 +76,7 @@ fn response_limit() -> RateLimit {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Permissive (xterm-compatible)
-// ---------------------------------------------------------------------------
 
 /// xterm-compatible baseline. `unmatched = Execute`, no rules narrow anything
 /// except the clipboard-set rate limiter (kept for DoS protection).
@@ -111,9 +107,7 @@ pub fn permissive() -> Policy {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Standard (interactive default)
-// ---------------------------------------------------------------------------
 
 /// Default for interactive sessions (§7.2).
 ///
@@ -208,9 +202,7 @@ pub fn standard() -> Policy {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Hardened (maximum restriction)
-// ---------------------------------------------------------------------------
 
 /// Maximum restriction (§7.3). Everything that could reach host state from
 /// `Pty` is dropped; clipboard, modal protocols, and notifications are all
@@ -270,9 +262,7 @@ pub fn hardened() -> Policy {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Refinement scaffolding
-// ---------------------------------------------------------------------------
 
 /// Refinement helpers for the `Hardened ⊆ Standard ⊆ Permissive` invariant:
 /// the scalar rank the refinement tests (`tests.rs`) use to catch an inversion.

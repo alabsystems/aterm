@@ -23,10 +23,8 @@ static PROF: heapprof::Prof = heapprof::Prof;
 
 use aterm_render::{FaceId, Renderer, Theme};
 
-// ---------------------------------------------------------------------------
 // THE GATE: it runs in the normal suite, and it is the standing guard on what
 // the Windows font seal is allowed to keep.
-// ---------------------------------------------------------------------------
 
 /// What the seal may leave behind on the heap. Since
 /// `font_file::admit_font_file` maps files under `C:\Windows\Fonts`

@@ -533,8 +533,7 @@ fn a_downloads_network_words_never_show_and_another_load_shows_at_once() {
             caps,
             "@{cols}: at the tail, before the capsules"
         );
-        // Another load than the work's own shows at once (it was declared
-        // with the post's load, or after LOAD_AFTER).
+        // A load other than the work's own shows at once.
         c.restate(
             id,
             Restatement {

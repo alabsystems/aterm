@@ -76,10 +76,9 @@ pub fn stamp_info_plist(
     Ok(plist)
 }
 
-/// Replace-or-insert one `<key>K</key><string>V</string>` pair. Textual on
-/// purpose: the committed template is trusted, tab-indented XML; a full plist
-/// parser would be a new dependency for zero gain (spec: in-process string
-/// substitution). Values are XML-escaped so a stamp can never break the plist.
+/// Replace or insert one `<key>K</key><string>V</string>` pair, textually: the committed
+/// template is trusted, tab-indented XML, and a plist parser would be a dependency for no
+/// gain. Values are XML-escaped so a stamp cannot break the plist.
 pub(crate) fn set_plist_string(plist: &str, key: &str, value: &str) -> Result<String, String> {
     let value = xml_escape(value);
     let key_tag = format!("<key>{key}</key>");
@@ -671,7 +670,7 @@ mod staging_tests {
         let dev = dist.join("aterm.app");
         std::fs::create_dir_all(&dev).unwrap();
 
-        // "Could not look" removes NOTHING.
+        // "Could not look" removes nothing.
         prune_staging_dirs(&dist, &keep, None);
         assert!(legacy.is_dir() && old.is_dir() && live.is_dir());
 

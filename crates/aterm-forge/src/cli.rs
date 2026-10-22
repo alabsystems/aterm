@@ -7,18 +7,18 @@
 use std::path::PathBuf;
 
 pub const USAGE: &str = "\
-cargo forge — aterm's third-party surface: survey, notarize, ratchet.
+targo --unverified forge — aterm's third-party dependency surface.
 
 USAGE
   targo --unverified forge survey [--cell NAME]... [--top N]
-        Emit the inventory: packages, LOC, unsafe tokens, build scripts,
-        proc macros, duplicate versions, and dominator cost per package.
-        Read-only. Needs no compiler. This is the answer to \"what are all
-        the third-party dependencies of aterm?\", per target.
+        The inventory per cell: packages, LOC, unsafe tokens, build scripts,
+        proc macros, duplicate versions, and packages ranked by dominator
+        cost (what removing one would actually remove). Read-only.
 
-  targo --unverified forge blame <name>[@<version>] [--cell NAME]
-        Why is this package here? Prints every path from the root to it and
-        its dominator cost in each cell.
+  targo --unverified forge blame <name>[@<version>] [--cell NAME]...
+        Why a package is here: its shortest paths from the cell root, its
+        direct dependants, its dominator cost per cell, and whether a
+        [patch.crates-io] fork reaches that version.
 
   targo --unverified forge budget [--update] [--allow-regress \"<reason>\"]
         Compare the live surface against tools/forge-budget.tsv. --update may
@@ -26,35 +26,36 @@ USAGE
         written into the file's 4th column.
 
   targo --unverified forge attest
-        Provenance and license obligations over vendor/: patch agreement,
-        [workspace] stubs, .cargo_vcs_info.json, Cargo.toml.orig, licenses,
-        NOTICE, Apache-only pristine diffs when available, and fork markers.
-        The vendor/astream submodule is checked against its gitlink: the
-        .gitmodules entry, a clean checkout at exactly the pinned commit, and
-        Cargo metadata resolving its crates from there outside the workspace.
+        Provenance and license obligations over the [patch.crates-io] targets
+        (vendor/ forks, and upstream code absorbed under crates/): patch,
+        vendor/ and Cargo.lock agreement, [workspace] stubs,
+        .cargo_vcs_info.json and Cargo.toml.orig, retained licenses, NOTICE,
+        Apache-2.0 §4(b) notices, fork markers, deny.toml's license list and
+        .gitignore. vendor/astream must be a clean checkout of its gitlink,
+        not behind origin/main's pin.
 
   targo --unverified forge check [--cell NAME]...
-        THE GATE VERB. attest + patch-liveness + census cross-check, with no
-        compilation and no network. Run by `verify forge`.
-        What it does not prove: [OB-11] scores path forks forward only (each
-        needs a reviewed row; the reverse is attest [OB-1] and the census scan
-        set).
+        The `forge` check of `targo --unverified verify`, without compiling:
+        attest, plus a review row for every vendored fork, every fork live in
+        each cell, carved paths still gone, the budget ratchet, no patch
+        redirecting a dev-dependency oracle, vendor/forge.toml matching the
+        forks, and deny.toml's bans and sources.
 
   targo --unverified forge serde-attrs [PATH]...
-        Every #[serde(...)] key and form under crates/ (crates/aterm-serde,
-        the implementation and its suite, left out), as TSV on stdout: the
-        closed set the first-party derive accepts (AUDIT-third-party SP.5).
-        PATHs, relative to the workspace root, list those trees instead.
-        Read-only.
+        Every #[serde(...)] key and form under crates/ (except
+        crates/aterm-serde), as TSV on stdout: the closed set the first-party
+        derive accepts. PATHs, relative to the workspace root, scan those
+        trees instead. Read-only.
 
 OPTIONS
-  --root PATH      Workspace root (default: discovered from CWD)
-  --cell NAME      Restrict to one cell; repeatable. Default: every cell.
-  --top N          Rows in the ranked survey table (default 40)
+  --root PATH      Workspace root (default: the nearest one above the CWD)
+  --cell NAME      One cell, a target triple and its root package (mac-arm,
+                   linux, win, ...); repeatable. Default: every cell.
+  --top N          Rows per ranked survey table; 0 = all (default 40)
   -h, --help       This text
 
 EXIT CODES
-  0 pass   1 policy failure   2 usage   3 could-not-run
+  0 pass   1 fail   2 usage   3 could not run
 ";
 
 #[derive(Debug, PartialEq, Eq)]

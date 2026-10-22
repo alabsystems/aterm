@@ -60,9 +60,7 @@ use crate::spectrum::{
 use crate::spectrum::{SPECTRUM_STOPS, spectrum_stop};
 use crate::trail_sound::SoundKind;
 
-// ===========================================================================
 // 1. The pool, the deal, the tint (§5.2, §5.3, §5.6)
-// ===========================================================================
 
 /// The live cap (§5.6); typical at 12 cps is ≈ 20. Over the cap the oldest
 /// star is put on its [`EVICT_FINISH_MS`] finish and the newborn takes the
@@ -302,9 +300,7 @@ pub const LIGHT_COUNT_SCALE: f32 = 0.6;
 /// step every live star to a third (T5, C3).
 pub const TEXT_SAFE_DIV: f32 = 3.0;
 
-// ---------------------------------------------------------------------------
 // 1a. The coverage requests: §5.2's two ceilings, one floor
-// ---------------------------------------------------------------------------
 //
 // `c` is the coverage request handed to the class's recipe. Sky stars live
 // above the ribbon and are priced by the sparkle law
@@ -443,9 +439,7 @@ pub const HALO_HUE_SWING_ENTRIES: i32 = 15;
 /// centre, then [`settle_under_ceiling`] the pixels away from it.
 pub const STAR_LIGHT_CEIL: f32 = RAINBOW_CARET_LIGHT_FLOOR * RAINBOW_SPARKLE_LIGHT_SHARE / 255.0;
 
-// ---------------------------------------------------------------------------
 // 1a′. The aurora: the veil above the live ribbon
-// ---------------------------------------------------------------------------
 // A soft rainbow glow in the sky band above the live ribbon, carrying the
 // ribbon's spectrum walk so the two read as one rainbow. One [`Veil`] cell
 // per laid cell, born on the key that laid it, priced by momentum at birth,
@@ -580,9 +574,7 @@ const _: () = {
     );
 };
 
-// ---------------------------------------------------------------------------
 // 1b. The envelopes: §5.6's `H` / `τ` / life table
-// ---------------------------------------------------------------------------
 //
 // `α = 1` for a hold `H`, then half-life `τ`; cull at `α < 0.20`, so
 // `life = H + 2.32·τ` ([`half_life_life_s`]). Keyed on (lane kind, class),
@@ -617,9 +609,7 @@ pub const HOLD_M3_TRANSIENT_MS: f32 = 20.0;
 /// Transient m3 half-life, ms.
 pub const TAU_M3_TRANSIENT_MS: f32 = 67.0;
 
-// ---------------------------------------------------------------------------
 // 1c. Motion: three laws, one per population family (§5.6)
-// ---------------------------------------------------------------------------
 
 /// The sky lift for an m1/m2 strike star, px per second (§5.6: "lift −3 px/s,
 /// integer-stepped, 1-2 px over life"). Negative is up. At 460 ms it is a
@@ -634,9 +624,7 @@ pub const fn sky_lift_px_per_s(ch: f32) -> f32 {
     SKY_LIFT_PX_PER_S * px_scale(ch)
 }
 
-// ---------------------------------------------------------------------------
 // 1d. The slipstream: the sky streams past a hand at speed
-// ---------------------------------------------------------------------------
 
 /// The slipstream's share: a sky star born under a hand at speed inherits a
 /// backward drift of `STREAM_SHARE_CW · cw / IOI` px/s, `IOI` being the
@@ -723,10 +711,8 @@ fn stream_unit(age_ms: f32) -> f32 {
     ((1.0 - (-age_ms.max(0.0) / STREAM_TAU_MS).exp()) / STREAM_SPENT).min(1.0)
 }
 
-// ---------------------------------------------------------------------------
 // 1e. The mend's pull: the fix pulls the erased cell's light into the
 //     caret's cell
-// ---------------------------------------------------------------------------
 
 /// The mend's pull window, ms: a key that mends a typo run ([`super::Mend`],
 /// §23) takes its strike as an m2 born at the erased cell's sky (grabbing the
@@ -867,9 +853,7 @@ pub const MINI_FAN_M2_N: u16 = 1;
 /// …and this many m3 grains (§5.6, D17).
 pub const MINI_FAN_M3_N: u16 = 2;
 
-// ---------------------------------------------------------------------------
 // 1f. The budgets §18 holds this producer to
-// ---------------------------------------------------------------------------
 
 /// Quads stardust may spend on one frame (§18: "Stardust | 40 live | ≤ 284").
 /// The worst case is the cap's census, `4·23 + 12·10 + 24·3`; the budget is
@@ -901,9 +885,7 @@ const _: () = assert!(
 /// this is the larger of the two.
 pub const LIGHT_ALPHA_CAP: f32 = 236.0;
 
-// ===========================================================================
 // 2. Class, lane, and the star itself
-// ===========================================================================
 
 /// A star's magnitude: the distribution that makes a field a field (§5.1
 /// no. 2, §5.2). With [`StarLane`] it states shape and brightness explicitly.
@@ -1652,9 +1634,7 @@ impl Star {
     }
 }
 
-// ===========================================================================
 // 3. The glint bucket (§13)
-// ===========================================================================
 
 /// The shared glint token bucket (§8.1 no. 2, §13, D5), refilled on the frame
 /// clock in `Engine::tick`: `tokens = min(GLINT_CAP, tokens + GLINT_REFILL_PER_S · dt)`.
@@ -1747,9 +1727,7 @@ pub struct Glint {
     pub f: f32,
 }
 
-// ===========================================================================
 // 4. The glyph probe (§5.4's hard gate, L4, D16)
-// ===========================================================================
 
 /// What this frame knows about the glyphs: the snapshot §5.4's birth gate is
 /// asked of, so a star is never drawn over a stroke (L4). An off-grid row is
@@ -2072,9 +2050,7 @@ impl GlyphProbe {
     }
 }
 
-// ===========================================================================
 // 5. Sow specs: the transient-lane entry points the meteor needs (§6.5)
-// ===========================================================================
 
 /// What the meteor hands stardust for one shed station (§6.5 layer 5, §5.6).
 /// The meteor owns the stations and their timing, calling
@@ -2193,9 +2169,7 @@ struct Throw {
     fixed: bool,
 }
 
-// ===========================================================================
 // 6. The producer
-// ===========================================================================
 
 /// The stardust producer: the star pool, the glint bucket, the glyph probe
 /// and the aurora.
@@ -3956,9 +3930,7 @@ fn light_keeps(seed: u32, cfg: &Config) -> bool {
     cfg.dark_theme || hash01(mix32(seed ^ SALT_LIGHT)) < LIGHT_COUNT_SCALE
 }
 
-// ===========================================================================
 // 7. Paint: one star, resolved for one frame
-// ===========================================================================
 
 /// The quads a grain needs (one core, four arms), and the floor of a star's
 /// fair share of the quad budget, so a truncated frame still draws every
@@ -4300,7 +4272,7 @@ impl Paint {
     /// needles, its four tips at [`M3_CROSS_ADD`]`·c` like the dark grain's
     /// arms. No atmosphere halo; the ink carries the tint.
     ///
-    /// The ink tax buys mass, never a bigger step (ruling 2026-10-16, §5.5):
+    /// The ink tax buys mass, never a bigger step:
     /// every steady part (the dot, the nucleus, body and waist, the glint
     /// offset) is sized from the arm clock's trough, and only the tips take
     /// the clock's step above it, 1 px per tip as the dark arms do. On
@@ -4429,9 +4401,7 @@ fn next_sine_crossing_s(theta: f32, a0: f32, omega: f32) -> Option<f32> {
     }
 }
 
-// ===========================================================================
 // 8. Small shared shapes
-// ===========================================================================
 
 /// Salt for the one strike draw (§5.6's m1 / m2 / m3 partition).
 const SALT_STRIKE: u32 = 0x0000_0101;
@@ -4774,9 +4744,7 @@ fn push_halo_quads_clipped(
     }
 }
 
-// ===========================================================================
 // 8a. The aurora's cell, and the colour helpers the coloured sky needs
-// ===========================================================================
 
 /// One cell of the aurora: the veil above one laid ribbon cell (1a′). `Copy`
 /// and flat like a [`Star`]; everything on glass derives from these fields
@@ -5600,9 +5568,7 @@ fn stacked_ink_alpha(cov: u8, role: InkRole) -> u32 {
     ((1.0 - (1.0 - a1).powf(lays)) * 255.0).clamp(1.0, ceiling) as u32
 }
 
-// ===========================================================================
 // 9. The laws, measured (§20.1)
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -7247,7 +7213,7 @@ mod tests {
             .sum()
     }
 
-    /// The ruling of 2026-10-16 (owner: the stars "looked jittery" on a white
+    /// The (owner: the stars "looked jittery" on a white
     /// background): a light star's ink is steady on §5.5's size clock. Its
     /// body is the arm clock's trough taxed by [`STAR_ARM_INK`] and only its
     /// tips take the clock's step, as the dark twin's arms do, so its dot or
@@ -8894,7 +8860,7 @@ mod tests {
             ((held * 100.0 / span) as u32, (bare * 100.0 / span) as u32)
         };
         // On both themes: light thins the exhaust's ink, not its throw, so its
-        // frame train is dark's (ruling 2026-10-16).
+        // frame train is dark's.
         for dark in [true, false] {
             let c = cfg(dark);
             let theme = if dark { "dark" } else { "light" };

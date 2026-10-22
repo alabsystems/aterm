@@ -238,8 +238,8 @@ fn look_at(
         .map(|p| tail_to_end(&p, TAIL_BYTES).0);
     let limit_until = tail.as_deref().and_then(upgrade::transcript_limit_until);
     let limit_reset = tail.as_deref().and_then(upgrade::transcript_limit_reset);
-    // The word the look records on the read's own record: only a Claude Code
-    // visit's dry read says where it read, so only its act reads are worded.
+    // Only a Claude Code visit's dry read says where it read, so only its reads
+    // are worded.
     let claude = owed
         .iter()
         .any(|(name, st)| session.as_deref() == Some(name.as_str()) && reads_transcript(st.agent));

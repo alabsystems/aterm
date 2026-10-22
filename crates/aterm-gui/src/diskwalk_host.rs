@@ -480,9 +480,7 @@ pub(crate) struct DiskReport {
     pub(crate) walker: WalkerState,
 }
 
-// ---------------------------------------------------------------------------
 // The messages, and the board readers read.
-// ---------------------------------------------------------------------------
 
 /// Down the walker's inbox.
 #[derive(Debug)]
@@ -664,9 +662,7 @@ fn spawn_walker(
     }
 }
 
-// ---------------------------------------------------------------------------
 // The report.
-// ---------------------------------------------------------------------------
 
 /// The bytes of `path` (a claimed folder) that two or more panes claim, given
 /// `above`, the panes that claim it whole (it or a folder above it). Below
@@ -916,9 +912,7 @@ fn build_report(scope: DiskScope, p: &Published, walker: WalkerState) -> DiskRep
     }
 }
 
-// ---------------------------------------------------------------------------
 // Root discovery (on the walker thread).
-// ---------------------------------------------------------------------------
 
 /// Add `kind` to the claim on `path` (canonical), creating it.
 fn claim(out: &mut Vec<Claim>, path: &Path, kind: RootKind, linked: bool) {
@@ -1166,9 +1160,7 @@ fn own_claims(own: &[PathBuf], opt_in: &[PathBuf]) -> Vec<Claim> {
     out
 }
 
-// ---------------------------------------------------------------------------
 // The walker thread.
-// ---------------------------------------------------------------------------
 
 /// A root's place in the lifetime law (§10.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2324,9 +2316,7 @@ fn group(n: u32) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // The loop's side.
-// ---------------------------------------------------------------------------
 
 /// What the loop keeps: the walker's publications, when it next looks at the
 /// panes' facts and what it last sent, and the §10.8 set it last stated.

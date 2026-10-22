@@ -105,8 +105,8 @@ impl fmt::Display for WireFault {
 
 impl std::error::Error for WireFault {}
 
-/// The canonical encoder: an append-only byte buffer. Every method appends one field and
-/// cannot fail.
+/// The canonical encoder: an append-only byte buffer. Every field method appends one field
+/// and cannot fail; [`Enc::clear`] starts a new encoding in the same room.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Enc {
     buf: Vec<u8>,
@@ -148,6 +148,19 @@ impl Enc {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf
+    }
+
+    /// Forgets every byte written, keeping the room they took: the next field starts a new
+    /// encoding, which is then exactly what a fresh encoder would write. For an encoder reused
+    /// across many values (one per replayed step, one per input of a trace digest).
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
+    /// Makes room for at least `additional` more bytes, so the next writes up to that many
+    /// do not grow the buffer one doubling at a time. Writes nothing.
+    pub fn reserve(&mut self, additional: usize) {
+        self.buf.reserve(additional);
     }
 
     /// Fixed bytes with no length prefix (a magic). The reader must know their length.

@@ -300,15 +300,14 @@ const AGY_HEAD: &str = concat!(agy_manifests!(), "windows_arm64.json");
 )))]
 const AGY_HEAD: &str = agy_manifests!();
 
-/// The final legacy pins this code vouches for ([`VendorSpec::legacy_ceiling`]), read from
-/// the live index 46 on 2026-09-24: claude 2026092401 (2.1.281) and codex 2026092301
-/// (0.156.1), whose versions are the floors. An index may pin either program above it (the
-/// live one did, hourly, through index 71 on 2026-10-16). A legacy build above it has its
-/// version read once from its signed manifest, under any verified index whether or not that
-/// index still names the program, and kept in the stamp (`lane::legacy_facts`); then it is
-/// decided like any read build. Only while that read fails is it kept (`LegacyUnread`), and
-/// the next pass reads again. Raising the ceiling means raising the floors with it — never
-/// one without the other.
+/// The final legacy pins this code vouches for ([`VendorSpec::legacy_ceiling`]), from live
+/// index 46: claude 2026092401 (2.1.281) and codex 2026092301 (0.156.1), whose versions are
+/// the floors. An index may pin either program above the ceiling. A legacy build above it
+/// has its version read once from its signed manifest, under any verified index whether or
+/// not that index still names the program, and kept in the stamp (`lane::legacy_facts`),
+/// then is decided like any read build; while that read fails it is kept (`LegacyUnread`)
+/// and the next pass reads again. Raise the ceiling and the floors together, never one
+/// without the other.
 pub(crate) const LEGACY_CEILING: u64 = 2_026_092_401;
 
 /// The [`VendorSpec::legacy_ceiling`] of a program no ALab index ever pinned: no legacy
@@ -662,7 +661,7 @@ pub const VENDORS: &[VendorSpec] = &[
         floor: revision_floor(1, 4, 9, 6297, Some(1)),
         legacy_ceiling: NEVER_INDEX_PINNED,
     },
-    // OPENAI'S OWN CODEX BESIDE `codex` (owner ruling 2026-10-20: `codex` is codex-alab
+    // OPENAI'S OWN CODEX BESIDE `codex` (`codex` is codex-alab
     // where ALab builds it, upstream Codex is `codex-old`, and both are bundled). Its own
     // program — store, `current`, stamp, digest log and shims — so the source rule that
     // hands `codex` to the ALab index never reaches it ([`crate::alab`] has no row for

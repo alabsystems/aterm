@@ -374,9 +374,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // TokenBucket semantics
-    // -----------------------------------------------------------------
 
     #[test]
     fn burst_capacity_drains_then_denies() {
@@ -444,9 +442,7 @@ mod tests {
         assert!(!bucket.try_consume(0, &clock));
     }
 
-    // -----------------------------------------------------------------
     // per_sequence_max semantics
-    // -----------------------------------------------------------------
 
     #[test]
     fn per_sequence_cap_rejects_oversized_call() {
@@ -473,9 +469,7 @@ mod tests {
         assert!(!bucket.try_consume(1, &clock));
     }
 
-    // -----------------------------------------------------------------
     // RateLimiterSet
-    // -----------------------------------------------------------------
 
     #[test]
     fn known_id_enforces_bucket() {
@@ -518,9 +512,7 @@ mod tests {
         assert_eq!(set.len(), 1);
     }
 
-    // -----------------------------------------------------------------
     // RateLimitSlot — the pre-resolved form of the same debit
-    // -----------------------------------------------------------------
 
     fn two_bucket_policy() -> Policy {
         Policy {

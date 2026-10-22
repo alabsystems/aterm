@@ -39,7 +39,7 @@
 //! 8. The same chords with Option as Alt (`WindowExtMacOS::set_option_as_alt`,
 //!    which aterm sets in Meta mode while the terminal takes the window's typing):
 //!    for each, no dead key, no preedit, and one key event whose text is the key's
-//!    bare character (ATERM-KI-1015-9), so Option+B is `b`, never `∫`. Stage 7 is
+//!    bare character, so Option+B is `b`, never `∫`. Stage 7 is
 //!    its control. "No dead key" claims something only for a chord whose stage 7
 //!    press started one. Stages 7 and 8 judge only presses of the keys they send:
 //!    while the drive is the active app a person's typing reaches its window (seen
@@ -238,7 +238,7 @@ mod macos {
     }
 
     /// The U.S. layout's Option dead keys (acute, umlaut, circumflex, tilde,
-    /// grave) and Option+B, which types `∫` there: the chord ATERM-KI-1015-9 names,
+    /// grave) and Option+B, which types `∫` there: the chord names,
     /// whose Meta form must be ESC `b`.
     pub(super) const CHORDS: [Chord; 6] = [
         Chord {

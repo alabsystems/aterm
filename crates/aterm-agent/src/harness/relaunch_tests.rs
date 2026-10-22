@@ -800,7 +800,7 @@ fn an_exit_someone_asked_for_is_invisible_to_the_crash_back_off() {
 /// restart, `claude --resume` of a conversation Claude refuses, until that
 /// conversation ran. NEGATIVE CONTROL: the word of an agent that cannot be
 /// brought back (a refusal) stands through another agent's run and that
-/// agent's own end (LC-4 of ATERM-KI-1015-1).
+/// agent's own end (LC-4 of ).
 #[test]
 fn a_failing_relaunchs_word_ends_with_its_trying() {
     const CONVERSATION: &str = "0badf00d-1111-2222-3333-444455556666";
@@ -1380,7 +1380,7 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
             a.name
         );
     }
-    // LC-6 and LC-4 of ATERM-KI-1015-1, on the real type: a relaunch that
+    // LC-6 and LC-4 of , on the real type: a relaunch that
     // is no crash's leaves the back-off where it was (the buggy host's
     // `Land` climbed it); another agent leaves a word that asks for a
     // conversation (its `PersonRuns` cleared it).
@@ -2019,11 +2019,9 @@ fn a_muse_exit_is_decided_on_its_shells_word() {
     assert_eq!(exit_record(claude, |_| true), ExitRecord::Removed);
 }
 
-// ------------------------------------------------------------------------
 // The login a relaunch line carries
 // (`docs/DESIGN-claude-accounts-2026-10-01.md` §6, "The move"). Labels are
 // the design's (`main`, `work-2`, `pool-a`); directories are invented.
-// ------------------------------------------------------------------------
 
 /// A login directory with a space and an apostrophe in it: the two
 /// characters a shell line is most easily broken by.
@@ -2657,7 +2655,7 @@ fn a_cold_relaunch_carries_the_proven_active_account_and_nothing_else() {
 }
 
 /// A RELAUNCH LINE TYPED IS ON ITS RECORD BEFORE ANYTHING AFTER IT RUNS
-/// (ATERM-KI-1016-1 host-5): a step that panics after the line is typed —
+/// (host-5): a step that panics after the line is typed —
 /// in the ledger's line, or anything later — leaves the record `Relaunched`
 /// with the line's block and no adopted process, so the next step awaits
 /// that line's agent and never types it again. NEGATIVE CONTROL: what runs
@@ -2780,7 +2778,7 @@ fn whether_the_adopted_agent_is_gone_is_the_records_to_say() {
         adopted_gone(&o, "s-restored", ID)
     };
     let gone = |phase: upgrade::Phase, pid: u32| gone_in("s-restored", phase, pid);
-    // IN FLIGHT HERE, ADOPTED OR NOT (ATERM-KI-1016-1 host-5): a relaunch's
+    // IN FLIGHT HERE, ADOPTED OR NOT (host-5): a relaunch's
     // record is in flight before its line is typed, none adopted yet; another
     // tab's and one not in flight are not.
     let here_in = |tab: &str, phase: upgrade::Phase| {
@@ -3283,7 +3281,7 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
     // Unset under another home is the login that home's directory names
     // (the vendor hashes `CLAUDE_CONFIG_DIR` verbatim for the keychain item
     // then, the accounts design §1): a move to that login is met by it
-    // (ATERM-KI-1016-1's unset login variable). Read as no login, the old
+    // ('s unset login variable). Read as no login, the old
     // account's row held the loop until that account reset.
     assert!(
         !stands("/alt", &live(None, Some("/alt"))),
@@ -3317,7 +3315,7 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
 }
 
 /// THE COMMAND A PERSON IS TOLD CARRIES THE HOME ITS RELAUNCH CARRIES
-/// ([`told_command`]; ATERM-KI-1015-1 LC-4): an agent under another `HOME`
+/// ([`told_command`] LC-4): an agent under another `HOME`
 /// is told `HOME=<it> claude --resume <id>`, one under an absolute
 /// `CLAUDE_CONFIG_DIR` that variable, as the relaunch line carries them;
 /// told bare, run at its tab's shell under another home, the line found no
@@ -3385,10 +3383,8 @@ fn the_command_a_person_is_told_carries_the_home_its_relaunch_carries() {
     assert_eq!(told_command(user, None, &codex), None, "a Codex");
 }
 
-// ------------------------------------------------------------------------
 // The usage tap on a relaunch line (`super::super::tap`; the accounts
 // design v2 §3.1).
-// ------------------------------------------------------------------------
 
 /// The tap's value for the installed app's path.
 #[cfg(unix)]
@@ -4422,7 +4418,7 @@ fn a_model_switch_onto_a_model_billed_to_usage_credits_is_refused() {
 }
 
 /// EVERY LANE'S CARRY-ON ENDS ON THE CONTINUATION AND ITS NEEDS YOU
-/// SENTENCE (FOREVER CRUISE / FOREVER LAND): Claude Code's, Gemini CLI's,
+/// SENTENCE (Autopilot Cruise / Land): Claude Code's, Gemini CLI's,
 /// agy's and Muse Code's relaunch, for every cause, and the upgrade's own,
 /// end on [`upgrade::CARRY_ON`] — whose last sentence asks for a NEEDS YOU
 /// line ([`crate::supervise::policy::needs::NEEDS_HINT`]) and which names no

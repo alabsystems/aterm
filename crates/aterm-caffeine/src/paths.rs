@@ -41,6 +41,13 @@ impl Paths {
         self.state_dir.join("caffeine.lock")
     }
 
+    /// The pid of the bridge that keeps the Mac awake while an update restart's new mug
+    /// starts (`aterm caffeine bridge`); it holds while this file names it.
+    #[must_use]
+    pub fn bridge_file(&self) -> PathBuf {
+        self.state_dir.join("caffeine.bridge")
+    }
+
     /// Where the mug keeps the bundle copies it runs from ([`crate::code`]). `.noindex` keeps
     /// Spotlight from listing a copy as a second aterm.
     #[must_use]
@@ -90,6 +97,7 @@ mod tests {
         };
         assert_eq!(paths.state_file(), PathBuf::from("/s/caffeine.state"));
         assert_eq!(paths.lock_file(), PathBuf::from("/s/caffeine.lock"));
+        assert_eq!(paths.bridge_file(), PathBuf::from("/s/caffeine.bridge"));
         assert_eq!(paths.code_dir(), PathBuf::from("/s/caffeine-code.noindex"));
         assert_eq!(
             paths.session_plist("x.y"),

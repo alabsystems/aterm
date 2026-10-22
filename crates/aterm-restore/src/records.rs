@@ -80,9 +80,7 @@ use aterm_core::scrollback::{
 };
 use aterm_core::terminal::{CHECKPOINT_META_REQUIRED_KEYS, CheckpointMeta, TerminalCheckpoint};
 
-// ---------------------------------------------------------------------------
 // Tail records
-// ---------------------------------------------------------------------------
 
 /// A tail record's header length.
 pub const TAIL_RECORD_HEADER: usize = 16;
@@ -461,9 +459,7 @@ pub fn decode_tail_payload<'a>(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Shared step-record reading
-// ---------------------------------------------------------------------------
 
 /// What made a step record unreadable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -566,9 +562,7 @@ impl std::fmt::Display for EncodeError {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The control record (CTR v1, increment 7)
-// ---------------------------------------------------------------------------
 
 /// The control record's body version.
 pub const CTR_VERSION: u8 = 1;
@@ -632,9 +626,7 @@ pub fn decode_control(record: &[u8], seq: u64) -> Result<Vec<u8>, ControlFault> 
     bounded_lz4(compressed, MAX_CONTROL_CARRY).ok_or(ControlFault::Compressed)
 }
 
-// ---------------------------------------------------------------------------
 // Keyframes (KFR v1)
-// ---------------------------------------------------------------------------
 
 /// The keyframe record's body version.
 pub const KFR_VERSION: u8 = 1;
@@ -981,9 +973,7 @@ fn parse_meta(bytes: &[u8]) -> Result<CheckpointMeta, KeyframeFault> {
     aterm_json::from_value(value).map_err(|_| KeyframeFault::Meta)
 }
 
-// ---------------------------------------------------------------------------
 // History chunks (HCR v1)
-// ---------------------------------------------------------------------------
 
 /// The history chunk body version.
 pub const HCR_VERSION: u8 = 1;

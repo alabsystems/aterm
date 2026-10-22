@@ -215,7 +215,7 @@ fn map_dom_named_key(key: &str) -> Option<NamedKey> {
 mod tests {
     use super::*;
 
-    /// ATERM-KI-1015-9 review: the DOM key is the layout's glyph, and a Ctrl chord on a
+    /// review: the DOM key is the layout's glyph, and a Ctrl chord on a
     /// non-ASCII glyph with no control byte takes the physical key's US byte, as the native
     /// path does. Ctrl+Alt is a chord: an AltGr press arrives as its glyph only once the host
     /// clears the Ctrl+Alt the browser reports for it (`encode_dom_key`'s contract).

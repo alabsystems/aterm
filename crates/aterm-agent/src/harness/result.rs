@@ -9,7 +9,7 @@
 //! done edge, into `<state>/tasks/<gsid>-<rev>.result.md` ([`snapshot`]).
 //! A turn typed into a landed worker (the live upgrade's READY, a person's
 //! question) cannot change it. Only Autopilot Land ends a task (FOREVER
-//! CRUISE / FOREVER LAND): its done edge is the yield of a land act whose
+//! CRUISE / Autopilot Land): its done edge is the yield of a land act whose
 //! reply is a clean `Nothing left:` defense, and a later landing of the same
 //! session (someone else's turn opened it again) replaces the snapshot before
 //! it ([`prune_results`]).
@@ -238,6 +238,7 @@ fn row_of(line: &str) -> Option<Value> {
     if flag("isSidechain")
         || flag("isMeta")
         || flag("isCompactSummary")
+        || flag("queueTranscriptOnly")
         || flag("isApiErrorMessage")
     {
         return None;
@@ -630,7 +631,7 @@ fn mark_of(line: &str) -> Option<Mark> {
         "assistant" => Some(Mark::Said),
         "user" => {
             let words = words_of(v.get("message")?)?;
-            let meta = flag("isMeta") || flag("isCompactSummary");
+            let meta = flag("isMeta") || flag("isCompactSummary") || flag("queueTranscriptOnly");
             Some(Mark::Opens {
                 uuid: v.get("uuid").and_then(Value::as_str).map(str::to_owned),
                 prompt: !(meta || words.starts_with('<')),

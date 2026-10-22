@@ -465,9 +465,7 @@ fn path_search_in(exe: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathB
         .find(|cand| cand.is_file() && !is_pending_stub(cand))
 }
 
-// ---------------------------------------------------------------------------
 // Provenance: discovery names the binary it resolved (see the module doc).
-// ---------------------------------------------------------------------------
 
 /// A copy of a tool in the atpkg store: `<prefix>/store/<program>/current/bin/<exe>`.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1395,10 +1393,8 @@ fn missing_tool_tail(bin: &str) -> (&'static str, String) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The tiered derived-model discharges: the interpreter always, and `ty` too when the checkers run,
 // on the same derived model; a disagreement panics.
-// ---------------------------------------------------------------------------
 
 /// How a tiered obligation was discharged; every variant is real coverage. The no-coverage case is
 /// [`NotRun`], the `Err` half of the `_tiered` functions' return, so holding a `Covered` always

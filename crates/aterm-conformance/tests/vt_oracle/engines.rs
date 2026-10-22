@@ -141,9 +141,7 @@ impl Snap {
     }
 }
 
-// ---------------------------------------------------------------------------
 // astream-term
-// ---------------------------------------------------------------------------
 
 fn paint_of(c: Color) -> Paint {
     match c {
@@ -203,9 +201,7 @@ impl Astream {
     }
 }
 
-// ---------------------------------------------------------------------------
 // aterm
-// ---------------------------------------------------------------------------
 
 /// Every underline style aterm stores (single, double, curly, dotted, dashed
 /// are combinations of these three bits). astream-term models one underline

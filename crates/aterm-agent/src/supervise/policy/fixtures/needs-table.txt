@@ -909,7 +909,7 @@ NONE || Merged the parser fix and pushed main.\nNEEDS  YOU: nothing\nNothing lef
 NONE || Merged the parser fix and pushed main.\n`NEEDS YOU:` lines reach the person now.\nNothing left: all on origin/main.
 
 # The rebuild's own heads and blocks: a head past the start of its line,
-# a list under a head with words, a comma's addressee, an arrow and a
+# a list under a head with no need of its own, a comma's addressee, an arrow and a
 # semicolon, and none said with an ask after it on another line.
 NEED publish the crate || Merged and pushed.\nNothing left: all on origin/main. NEEDS YOU: publish the crate.
 NONE || Merged and pushed.\nNothing left: all on origin/main. NEEDS YOU: none.
@@ -918,7 +918,9 @@ NEED the key || Merged and pushed.\nNothing left: all on origin/main; NEEDS YOU 
 NONE || Merged and pushed. The primer says a NEEDS YOU: line reaches the person.\nNothing left: all on origin/main.
 NONE || Merged and pushed; see `done. NEEDS YOU: x` in the brief.\nNothing left: all on origin/main.
 NEED the signing key || Merged and pushed.\nNEEDS YOU: none.\n- the signing key\nNothing left: all on origin/main.
-NEED the tag || Merged and pushed.\nNEEDS YOU: the key\n- the tag\nNothing left: all on origin/main.
+# One need a line (2026-10-22): a head whose words name a need is that one need, and a
+# list under it is the report's (the lab stub's tall reply was read as 80 needs).
+NEED the key || Merged and pushed.\nNEEDS YOU: the key\n- the tag\nNothing left: all on origin/main.
 NEED the key || Merged and pushed.\nNEEDS YOU: two things:\n\n- the key\n- the tag\nNothing left: all on origin/main.
 NONE || Merged and pushed.\n- NEEDS YOU: none\n- Tests: 1412 passed\n- Nothing left: all on origin/main.
 NEED the key || Merged and pushed.\n- NEEDS YOU: none\n  - the key\n- Nothing left: all on origin/main.

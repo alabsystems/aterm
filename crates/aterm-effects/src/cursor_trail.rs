@@ -39,9 +39,8 @@ const READABLE_ALPHA_CAP: u8 = 70;
 /// (`cursor_fx`'s bed legibility share), so the whole bed keeps its fade
 /// shape under the cap.
 pub const BED_PEAK_ALPHA: u8 = READABLE_ALPHA_CAP;
-/// At full ignition a spark lives this many times longer than the configured fade,
-/// so a fast sustained burst leaves a LONGER visible comet (more overlapping live
-/// sparks) while a lone keystroke fades in the base time.
+/// At full ignition a spark lives this many times the configured fade, so a fast sustained
+/// burst leaves a longer comet while a lone keystroke fades in the base time.
 const IGNITED_LIFE_MULT: f32 = 1.6;
 /// Typing continuity: at full sub-ignition warmth ([`TypingCadence::warmth`]) a spark lives up
 /// to this many extra base durations, so keystrokes ~150-350 ms apart chain into a continuous
@@ -909,9 +908,7 @@ impl CursorTrail {
     }
 }
 
-// ===========================================================================
 // Typing-cadence ignition
-// ===========================================================================
 //
 // Each keystroke adds a fixed quantum of heat, which decays with a fixed half-life between
 // keys: fast typing compounds toward a hot steady state, slow typing never climbs. A knee
@@ -1084,8 +1081,8 @@ impl TypingCadence {
 fn heat_color(base: u32, q: f32) -> u32 {
     /// The tint an ignited trail heats toward: the comet's own ice white.
     const HOT: u32 = crate::cursor_comet::ICE_WHITE;
-    /// Even at full ignition the colour is only this far toward [`HOT`] — tasteful,
-    /// and it keeps enough of the base hue that the wake still "matches the theme".
+    /// Even at full ignition the colour is only this far toward [`HOT`], so the wake keeps the
+    /// base hue.
     const HEAT_COLOR_MAX: f32 = 0.5;
     let t = (q.clamp(0.0, 1.0) * HEAT_COLOR_MAX).clamp(0.0, 1.0);
     if t == 0.0 {
@@ -1314,9 +1311,8 @@ mod tests {
         assert_eq!(trail.sparks.len(), 1, "off-top light retires");
         assert_eq!(trail.sparks[0].row, 8, "surviving light follows exactly");
 
-        // Tier 1: bind the genuine CursorTrail transition to the same derived
-        // all-effect scroll decision used by CursorGlow. The concrete asserts
-        // above cover every position-bearing field in this engine.
+        // Tier 1: bind the real transition to the derived all-effect scroll model CursorGlow
+        // uses.
         let base_model = aterm_models_effects::cursor_effect_scroll_model();
         let overrides = [("StartY", 10), ("Delta", 2)];
         let model = aterm_spec::interp::with_consts(&base_model, &overrides);

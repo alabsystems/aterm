@@ -3215,9 +3215,8 @@ mod tests {
             std::collections::BTreeSet::from(["trail_sound_volume", "trail_sounds"]),
             "Windows has dialogs/notifications but no trail-audio consumer"
         );
-        // `confirm_multiline_paste` is deliberately absent: the confirm is
-        // live on every platform (Linux's in-window paste_banner included),
-        // so warning that it "has no protective effect" would be the lie.
+        // `confirm_multiline_paste` is absent: the confirm is live on every platform
+        // (Linux's in-window paste banner included).
         // `allow_notifications` too on Linux, which delivers over D-Bus.
         assert_eq!(
             keys(ConfigCapabilityPlatform::Linux),

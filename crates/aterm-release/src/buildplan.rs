@@ -1171,11 +1171,9 @@ fn build_one(
         (stage2.join("targo"), "targo")
     };
     let (driver_path, driver_name) = driver;
-    // Toolchain PATH, per lane. Native: the Trust stage2 bin dir first, so
-    // targo resolves its co-located trustc/trustdoc (the physical dir —
-    // protected Trust drivers refuse symlinked toolchain paths). Compat: the
-    // validated, canonical rustup shim directory first, so stable supplies
-    // the other Apple arch's std without an ambient PATH lookup.
+    // Toolchain PATH, per lane. Native: the physical Trust stage2 bin dir first, so targo
+    // resolves its co-located trustc/trustdoc (protected Trust drivers refuse symlinked
+    // toolchain paths). Compat: the validated rustup shim directory first.
     let tool_dir = if let Some(shim) = &compat_shim {
         shim
     } else {

@@ -7,7 +7,7 @@
 //! astream-term (`vendor/astream/crates/astream-term`) is a pure,
 //! zero-dependency fold over a deliberately bounded VT subset (its
 //! `src/screen.rs` header names it: one codepoint per cell, the 16/256-colour
-//! palette, no scrollback, no reflow, no charsets or origin mode). Inside that
+//! palette, no scrollback, no reflow, no charsets). Inside that
 //! subset the two engines must agree on the visible text, every cell's
 //! palette colours and bold/underline/reverse, the cursor with its pending
 //! wrap, cursor visibility and which buffer is up (`engines.rs`). Two
@@ -299,6 +299,11 @@ fn the_subset_check_sees_what_a_dropped_token_rebuilds() {
         ris_keeps_alt: false,
         alt_clears: false,
         utf8_subparts: false,
+        origin_mode: false,
+        insert_mode: false,
+        scroll_up_down: false,
+        newline_mode: false,
+        charsets: false,
     };
     let program = |kinds: &[Kind]| Program {
         cols: 4,

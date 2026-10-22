@@ -67,9 +67,7 @@ pub const DEFAULT_JOBS: u32 = 8;
 // Every live suite uses its own pid-keyed scratch directory (private sockets,
 // state, and HOME), so binaries booting headless instances do not collide.
 
-// ---------------------------------------------------------------------------
 // The record: what cargo would have started.
-// ---------------------------------------------------------------------------
 
 const RECORD_MAGIC: &[u8] = b"aterm-verify test record 1\0";
 
@@ -297,9 +295,7 @@ pub fn recording_cmd(serial: &Cmd, config: &str) -> Cmd {
     c
 }
 
-// ---------------------------------------------------------------------------
 // What the compile reported.
-// ---------------------------------------------------------------------------
 
 /// A test executable the compile built, with cargo's target flag for it
 /// (`--lib`, `--bin <name>`, `--test <name>`, …).
@@ -387,9 +383,7 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The plan: records, cargo's headers and the compile's list, in agreement.
-// ---------------------------------------------------------------------------
 
 /// One test binary the run will run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -466,9 +460,7 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
         .collect()
 }
 
-// ---------------------------------------------------------------------------
 // Running them.
-// ---------------------------------------------------------------------------
 
 /// Run every binary through [`pool`], `jobs` at a time. EVERY binary runs with
 /// the whole `threads`, as cargo's own run hands each one. `run_one(binary, its

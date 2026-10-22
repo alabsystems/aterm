@@ -955,9 +955,7 @@ fn a_withheld_carry_is_booked_as_the_policys() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // A link-dense line in the carried history
-// ---------------------------------------------------------------------------
 
 /// A shell at 80 columns with `total` lines of output: a short OSC 8 link on
 /// every 97th line, and at line `dense` a row of twelve 8 KiB links, whose

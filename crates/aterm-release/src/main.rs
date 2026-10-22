@@ -78,8 +78,8 @@ mod site;
 // tap and committed there, each live cask's version and sha256 kept; the push is the
 // owner's.
 mod tap;
-// The source a release builds, made from git objects into a per-clone cache, its
-// dependencies vendored and checked against Cargo.lock, digested and re-verified.
+// The source a release builds, taken from git objects into a per-clone cache, its
+// dependencies vendored and checked against Cargo.lock.
 mod snapshot;
 // The export's source rewrites the publication engine runs at `pub stage`.
 mod transforms;

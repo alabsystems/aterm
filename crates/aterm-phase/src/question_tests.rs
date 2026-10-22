@@ -793,7 +793,7 @@ fn a_cut_question_is_head_off_screen_never_idle() {
     assert!(!parse_prompt_v2(&r[rule..]).expect("whole").head_off_screen);
 }
 
-/// ATERM-KI-1015-1 F2, measured on Claude Code 2.1.302: a multi-select
+/// F2, measured on Claude Code 2.1.302: a multi-select
 /// whose policy text wraps over more rows than a read's top leaves of the
 /// dialog. The harness types the long-term text at 41 columns into a fresh
 /// session's dialog drawn from row 7 of a 60-row pane; the 40-row tail the
@@ -864,7 +864,7 @@ fn a_multi_select_cut_inside_its_free_text_row_is_head_off_screen() {
 /// `QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302`), all measured on Claude Code
 /// 2.1.302, and the 2.1.283 captures at 120 columns. The cut AT the focused
 /// `❯    Submit` is the one the supervisor's 40-row tail makes in a fresh
-/// pane `top + 11 + N + 40` rows tall (the review of round 21, measured on
+/// pane `top + 11 + N + 40` rows tall (measured on
 /// 2.1.302 at 41x67: the dialog from row 7, `Submit` on row 27): Claude Code
 /// parks the cursor on that row, the tail's first, so only the reading's
 /// own `head_off_screen` sends the supervisor to the whole grid. Read as a
@@ -950,7 +950,7 @@ fn cuts_under_the_head(r: &[String], what: &str) -> Vec<(String, bool, QuestionF
         .collect()
 }
 
-/// The review of round 21's F2 lane, on Claude Code 2.1.302: every frame of
+/// , on Claude Code 2.1.302: every frame of
 /// the four reflow sweeps from 33 columns (under it option 1 wraps), both
 /// policy texts typed and `down` to `Submit`, rebuilt whole
 /// ([`reflow_dialog`], first held to the nine measured dialogs it redraws
@@ -2085,7 +2085,7 @@ fn a_question_whose_footer_wraps_is_read_whole() {
     }
 }
 
-/// Claude Code 2.1.300 MEASURED (2026-10-15, ATERM-KI-1015-1 F2, the
+/// Claude Code 2.1.300 MEASURED (2026-10-15, the
 /// real-Claude lab): a multi-select whose free-text row holds the long-term
 /// text, typed by hand, after `down` to `Submit` — at 47 columns every row
 /// kept, the text drawn one cell left of its label column (`[✔]Decide`); at
@@ -2195,7 +2195,7 @@ fn reflowed(text: &str, cols: usize, col: usize) -> Vec<String> {
     out
 }
 
-/// THE CHECKBOX DRAWN WITHOUT ITS SPACE (ATERM-KI-1015-1 F2). 2.1.300 draws
+/// THE CHECKBOX DRAWN WITHOUT ITS SPACE (F2). 2.1.300 draws
 /// a multi-select's free-text checkbox as a text with its space inside it
 /// (`["[", tick, "]", " "]`, no fixed-width box, unlike every option's), and
 /// once the focus leaves a text that overflows the row, the flex layout takes
@@ -2339,7 +2339,7 @@ fn a_ticked_free_text_row_drawn_without_a_space_is_read_whole() {
     assert_eq!(d.focus(), QuestionFocus::Button);
 }
 
-/// ATERM-KI-1015-1's F2 residual: only a person's keys put the focus on a
+/// 's F2 residual: only a person's keys put the focus on a
 /// dialog's `Chat about this` row (the loop never moves it there), and a
 /// tail cut AT that row is the dialog with its head off the screen, focused
 /// or not: the walk up from the footer finds no divider over the chat row,
@@ -2437,7 +2437,7 @@ fn a_cut_at_the_chat_row_a_person_focused_is_the_dialog_with_its_head_off() {
     );
 }
 
-/// ATERM-KI-1016-1 (Questions): `Submit` drawn over the text's last row
+/// (Questions): `Submit` drawn over the text's last row
 /// leaves the rest of that row on the button row. Where the rest has a
 /// space (`❯    Submit asked.)`, 39 columns) the row is no button and the
 /// dialog is not read whole; where it has none (`❯    Submitked.)`, 57

@@ -107,10 +107,11 @@ const CONTENT_PART: Shape = Shape::Object(&[("type", Shape::Scalar), ("text", Sh
 /// A message's content: its parts' type and text, or the plain string.
 const CONTENT: Shape = Shape::Seq(&CONTENT_PART);
 /// A tool call or a tool's result as the approval loop reads it
-/// (`supervise::policy::box_call`): its kind, the call's id, its tool and the
-/// file it names, and the id of the call a result answers. Never the call's
-/// other arguments (`old_string`, `new_string`, `command`) nor the result's
-/// content.
+/// (`supervise::policy::box_call::pending_calls`): its kind, the call's id,
+/// its tool, the file it names and a Bash call's `command` (the rm breaker's
+/// too-many box is judged by it, `supervise::policy::box_command`), and the
+/// id of the call a result answers. Never the call's other arguments
+/// (`old_string`, `new_string`, `content`) nor the result's content.
 const CALL_PART: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("id", Shape::Scalar),
@@ -121,14 +122,19 @@ const CALL_PART: Shape = Shape::Object(&[
         Shape::Object(&[
             ("file_path", Shape::Scalar),
             ("notebook_path", Shape::Scalar),
+            ("command", Shape::Scalar),
         ]),
     ),
 ]);
 /// A row as the approval loop reads it for the calls still waiting on a
-/// result: its type, whether it is a subagent's, and its content's calls and
-/// results (a prompt's plain string kept as it is).
+/// result: its type, its own `uuid` and its `parentUuid` (the conversation's
+/// order, which a first turn's file does not keep), whether it is a
+/// subagent's, and its content's calls and results (a prompt's plain string
+/// kept as it is).
 const CALLS: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
+    ("uuid", Shape::Scalar),
+    ("parentUuid", Shape::Scalar),
     ("isSidechain", Shape::Scalar),
     (
         "message",
@@ -205,6 +211,7 @@ const CONVERSATION: Shape = Shape::Object(&[
     ("isSidechain", Shape::Scalar),
     ("isMeta", Shape::Scalar),
     ("isCompactSummary", Shape::Scalar),
+    ("queueTranscriptOnly", Shape::Scalar),
     ("isApiErrorMessage", Shape::Scalar),
     ("error", Shape::Scalar),
     // A notice's typed kind (since 2.1.295) and the status it answered: what
@@ -285,7 +292,7 @@ const STEP_PARTS: Shape = Shape::Parts(&STEP_PART);
 /// `scheduledTaskId`: `upgrade::begins_unnumbered_by`), and the build and
 /// effort that wrote it. [`STEPS`] adds the content's parts; this, read for
 /// a row that holds no call or result, never visits the content at all.
-const STEPS_BARE_FIELDS: [Field; 17] = [
+const STEPS_BARE_FIELDS: [Field; 18] = [
     ("type", Shape::Scalar),
     ("subtype", Shape::Scalar),
     ("durationMs", Shape::Scalar),
@@ -297,6 +304,7 @@ const STEPS_BARE_FIELDS: [Field; 17] = [
     ("promptId", Shape::Scalar),
     ("isMeta", Shape::Scalar),
     ("isCompactSummary", Shape::Scalar),
+    ("queueTranscriptOnly", Shape::Scalar),
     ("origin", Shape::Object(&[("kind", Shape::Scalar)])),
     ("turnOrigin", Shape::Scalar),
     ("scheduledTaskId", Shape::Scalar),
@@ -314,9 +322,9 @@ const STEPS_BARE_FIELDS: [Field; 17] = [
 const STEPS_BARE: Shape = Shape::Object(&STEPS_BARE_FIELDS);
 /// [`STEPS_BARE`] and the content's parts ([`STEP_PARTS`]): for a row
 /// whose raw bytes hold a call's or a result's key (`steps::wants_parts`).
-const STEPS_FIELDS: [Field; 17] = {
+const STEPS_FIELDS: [Field; 18] = {
     let mut fields = STEPS_BARE_FIELDS;
-    fields[16] = (
+    fields[17] = (
         "message",
         Shape::Object(&[
             ("id", Shape::Scalar),
@@ -344,6 +352,7 @@ const EXCERPT: Shape = Shape::Object(&[
     ("isSidechain", Shape::Scalar),
     ("isMeta", Shape::Scalar),
     ("isCompactSummary", Shape::Scalar),
+    ("queueTranscriptOnly", Shape::Scalar),
     ("isApiErrorMessage", Shape::Scalar),
     (
         "message",
@@ -370,6 +379,7 @@ const EXCHANGE: Shape = Shape::Object(&[
     ("isSidechain", Shape::Scalar),
     ("isMeta", Shape::Scalar),
     ("isCompactSummary", Shape::Scalar),
+    ("queueTranscriptOnly", Shape::Scalar),
     ("isApiErrorMessage", Shape::Scalar),
     (
         "message",
@@ -672,8 +682,9 @@ pub(super) fn exchange(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Exchange>(line).map(|v| v.0)
 }
 
-/// The approval loop needs which calls wait on a result, their tools and the
-/// files they name, but never what a call writes or a result holds.
+/// The approval loop needs which calls wait on a result in the conversation's
+/// order, their tools, the files they name and a Bash call's command, but
+/// never what a call writes or a result holds.
 pub(crate) fn calls(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Calls>(line).map(|v| v.0)
 }

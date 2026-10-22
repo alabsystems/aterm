@@ -218,8 +218,8 @@ fn a_need_however_headed_holds_the_landing() {
 }
 
 /// A HOLDOUT, MEASURED (a tool, not a check): Land's whole reading of every
-/// case of the file `ATERM_LAND_HOLDOUT` names, or of round 3's blind holdout
-/// (`fixtures/land-holdout-2026-10-20.tsv`, ATERM-KI-1020-2) where it names
+/// case of the file `ATERM_LAND_HOLDOUT` names, or of the prior blind holdout
+/// (`fixtures/land-holdout-2026-10-20.tsv`) where it names
 /// none: one case a line, `label<TAB>id<TAB>prov<TAB>source<TAB>reply` (`#`
 /// lines skipped, a literal `\n` a line break; a label is `open`, `clean` or
 /// `debatable`). It prints each false landing (an open case read clean), each

@@ -391,3 +391,140 @@ fn a_hot_glow_crossing_the_horizon_ends_the_attach_and_still_cools() {
     assert_eq!(paused.next_change_deadline(past, LANE), None);
     assert!(paused.aos_attached() && paused.aos_paused());
 }
+
+/// The live host links every observation through one reused encoder and copies each frame's
+/// quads into the held overlay's recycled vectors, and neither changes a byte: on random
+/// streams (in and out of the profile) and the typing story on both pages, whose frames grow,
+/// shrink and draw nothing, after every tick the held overlay is exactly the frame and quads
+/// that tick appended, with no room kept when it drew nothing, and the live chain is the
+/// replay's, which encodes each observation from a fresh copy of its quads.
+#[test]
+fn the_reused_encoder_and_recycled_overlay_change_no_link_and_no_held_quad() {
+    let t0 = Instant::now();
+    let (mut grew, mut shrank, mut empty) = (0u32, 0u32, 0u32);
+    let mut check = |host: &mut MomentumHost, calls: &[Call], what: &str| {
+        let mut before = 0usize;
+        for (i, call) in calls.iter().enumerate() {
+            let seen = play(host, t0, std::slice::from_ref(call));
+            let h = hosted(host);
+            if let (Call::Tick { .. }, [Seen::Frame { frame, out, under }]) = (call, &seen[..]) {
+                let held = h.held.as_ref().expect("a delivered tick is held");
+                assert_eq!(
+                    (&held.frame, &held.out, &held.under),
+                    (frame, out, under),
+                    "{what}, call {i}: the held overlay"
+                );
+                let n = out.len() + under.len();
+                if n == 0 {
+                    empty += 1;
+                    assert_eq!(
+                        (held.out.capacity(), held.under.capacity()),
+                        (0, 0),
+                        "{what}, call {i}: an overlay that holds nothing keeps no room"
+                    );
+                } else if n > before {
+                    grew += 1;
+                } else if n < before {
+                    shrank += 1;
+                }
+                before = n;
+            }
+        }
+        let run = replay_log(host, MomentumCode::Shipped);
+        let h = hosted(host);
+        assert_eq!(run.refused, None, "{what}");
+        assert_eq!(run.observation_chain, h.chain.chain, "{what}: the chain");
+        assert_eq!(run.observations.len() as u64, h.chain.len, "{what}");
+    };
+    for seed in 1..=8u64 {
+        for in_profile in [true, false] {
+            let calls = random_stream(seed, 300, in_profile);
+            let mut host = attached(t0, MomentumCode::Shipped);
+            check(
+                &mut host,
+                &calls,
+                &format!("seed {seed} in profile {in_profile}"),
+            );
+        }
+    }
+    for dark in [true, false] {
+        // The story's calls, recorded on an engine and played on the host one at a time.
+        let c = cfg(dark);
+        let mut recorder = Recorder {
+            glow: MomentumGlow::default(),
+            t0,
+            calls: Vec::new(),
+        };
+        let mut seen = Vec::new();
+        let (last, cell) = burst(&mut recorder, t0, 24, &c, &mut seen);
+        let _ = run_lane(&mut recorder, last, LANE, cell, &c, &mut seen);
+        let mut host = attached(t0, MomentumCode::Shipped);
+        check(&mut host, &recorder.calls, &format!("story dark={dark}"));
+    }
+    assert!(
+        grew > 0 && shrank > 0 && empty > 0,
+        "fixture: frames grew ({grew}), shrank ({shrank}) and drew nothing ({empty})"
+    );
+}
+
+/// The shipped engine, keeping each call made on it as a [`Call`], to be played on a host one
+/// call at a time.
+struct Recorder {
+    glow: MomentumGlow,
+    t0: Instant,
+    calls: Vec<Call>,
+}
+
+impl Recorder {
+    fn at(&self, now: Instant) -> std::time::Duration {
+        now.saturating_duration_since(self.t0)
+    }
+}
+
+impl super::test_fixtures::Glow for Recorder {
+    fn key(&mut self, now: Instant, tau: f32) {
+        self.calls.push(Call::Key {
+            at: self.at(now),
+            tau,
+        });
+        self.glow.on_key(now, tau);
+    }
+    fn rest(&mut self) {
+        self.calls.push(Call::Reset);
+        self.glow.reset();
+    }
+    fn frame(
+        &mut self,
+        cur: Option<(u16, u16)>,
+        now: Instant,
+        geom: crate::cursor_glow::Geom,
+        cfg: &crate::cursor_momentum::MomentumGlowConfig,
+        out: &mut Vec<aterm_render::GlowQuad>,
+        under: &mut Vec<aterm_render::GlowQuad>,
+    ) -> crate::cursor_momentum::MomentumGlowFrame {
+        self.calls.push(Call::Tick {
+            cur,
+            at: self.at(now),
+            geom,
+            cfg: *cfg,
+            prefix: out.len(),
+        });
+        self.glow.tick(cur, now, geom, cfg, out, under)
+    }
+    fn active(&self) -> bool {
+        self.glow.is_active()
+    }
+    fn settles(&self) -> bool {
+        self.glow.settling()
+    }
+    fn cold(&self) -> Option<Instant> {
+        self.glow.cold_at()
+    }
+    fn wake(&mut self, now: Instant, lane: std::time::Duration) -> Option<Instant> {
+        self.calls.push(Call::Query {
+            at: self.at(now),
+            lane,
+        });
+        self.glow.next_change_deadline(now, lane)
+    }
+}

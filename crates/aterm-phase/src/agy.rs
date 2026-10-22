@@ -1266,9 +1266,7 @@ pub(crate) fn is_agy_screen(rows: &[String]) -> bool {
         || signed_out(rows).is_some()
 }
 
-// ---------------------------------------------------------------------------
 // The boxes.
-// ---------------------------------------------------------------------------
 
 /// A box's rows.
 #[derive(Debug, Clone, Copy)]
@@ -2313,6 +2311,14 @@ pub mod fixtures {
         /// footer counting `1 task(s)`.
         pub const BG_PANEL_OFF_DAEMON: &str =
             include_str!("fixtures/agy-1.4.0-lab-bg-panel-off-daemon.txt");
+        /// A redraw split by one 1024-byte PTY read, three tabs at once (measured
+        /// 2026-10-22, `docs/measured/half-drawn-frame-2026-10-22.md`), read at the split:
+        /// the frame's erase-below took the spinner row and the composer, its list cut
+        /// mid-word. No screen agy drew whole, so no layout names agy on it; the
+        /// terminal holds its DEC 2026 frame back from every reader of whole frames.
+        pub const SPLIT_HALF: &str = include_str!("fixtures/agy-1.4.0-lab-split-half.txt");
+        /// [`SPLIT_HALF`]'s frame whole, 1.2 ms on: the spinner over the composer.
+        pub const SPLIT_WHOLE: &str = include_str!("fixtures/agy-1.4.0-lab-split-whole.txt");
     }
 }
 

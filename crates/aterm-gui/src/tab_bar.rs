@@ -442,13 +442,12 @@ pub(crate) enum TabHit {
     /// Apply the staged update (a click on the leading `↻`, shown only while a build
     /// is staged).
     Update,
-    /// The build's VERSION LABEL at the strip's trailing end (Windows only —
-    /// [`STRIP_VERSION_SLOT`]): the macOS menu bar's Version title without its
-    /// colour emoji ([`crate::menu::strip_version_label`] at `rung`, ` ↑` after
-    /// it while `attention` holds). A BUTTON, committed on the press like the
-    /// `+` and the `↻`: it fires [`crate::menu::version_slot_click`] — Settings ▸
-    /// About — and is never caption, so it neither drags nor maximizes the
-    /// window. Laid out only where it fits without costing any tab its seat
+    /// The build's version label at the strip's trailing end (Windows only,
+    /// [`STRIP_VERSION_SLOT`]): the macOS menu bar's Version title without its colour
+    /// emoji ([`crate::menu::strip_version_label`] at `rung`, ` ↑` after it while
+    /// `attention` holds). A button committed on press like `+` and `↻`: it fires
+    /// [`crate::menu::version_slot_click`] and is never caption, so it neither drags
+    /// nor maximizes the window. Laid out only where it costs no tab its seat
     /// ([`layout_segments_with_version`]).
     Version {
         /// Which length of the label this layout had room for.
@@ -1308,16 +1307,11 @@ impl VersionSlotCols {
 /// no needs pill and its tabs are not sized; the layout tests hold the strip's
 /// own contract here.
 ///
-/// THE LABEL YIELDS; THE TABS NEVER DO. Everything left of the label is today's
-/// layout of `cols - w` columns, to the column — the `+` (clamped to
-/// `cols - w - NEW_TAB_W`), the leading `↻`, the `‹`/`›` marks (which only take
-/// columns no segment covers) — so nothing can land in the label's columns, and
-/// the label is admitted only while it costs no tab anything
-/// ([`version_rung_that_fits`]): a lone chip keeps its full [`LONE_CHIP_COLS`],
-/// and two or more tabs keep an equal share at least their seat
-/// ([`strip_seat_cols`]), so the strip never enters its pressure or windowed
-/// layout on the label's account. The full rung is tried first, then the short
-/// one; if neither fits there is no label and the layout is today's whole strip.
+/// The label yields; the tabs never do. Everything left of the label (tabs, `+`,
+/// leading `↻`, `‹`/`›` marks) is the layout of `cols - w` columns, so nothing lands
+/// in the label's columns, and the label is admitted only while it costs no tab
+/// anything ([`version_rung_that_fits`]). The full rung is tried first, then the
+/// short one.
 #[cfg(test)]
 #[must_use]
 pub(crate) fn layout_segments_with_version(
@@ -1791,9 +1785,9 @@ enum StripRole {
 /// terminal background.
 ///
 /// Not on macOS: there the in-grid strip is a fallback for the native AppKit
-/// toolbar (`DEFAULT_TAB_STRIP_ROWS` is 0), composites over titlebar vibrancy, and
-/// a grey band looked heavy (see [`strip_colors`]). Elsewhere it is the window's
-/// only chrome, so it takes a surface of its own.
+/// toolbar (`DEFAULT_TAB_STRIP_ROWS` is 0) and composites over titlebar vibrancy,
+/// where a grey band reads heavy (see [`strip_colors`]). Elsewhere it is the
+/// window's only chrome, so it takes a surface of its own.
 pub(crate) const STRIP_IS_CHROME_BAND: bool = !cfg!(target_os = "macos");
 
 /// Whether the strip carries the build's version label at its trailing end
@@ -2177,8 +2171,8 @@ fn strip_colors_on(p: impl Into<ChromePalette>, floor: StripFloor) -> StripColor
     } else {
         fg
     };
-    // Surface blends take the RAW theme fg (a surface is not ink and must not be
-    // dragged around by an ink floor); only the inks below are floored.
+    // Surface blends take the raw theme fg (a surface is not ink and must not move
+    // with an ink floor); only the inks below are floored.
     let raise_bg = crate::chrome_band::mix3(band_bg, rise, active_t);
     // Each ink is floored against the surface it lands on: band and raised card are
     // two surfaces, and the raise also moves the card toward its ink.
@@ -3032,7 +3026,7 @@ fn paint_strip_impl(
     palette: ChromePalette,
     floor: StripFloor,
 ) -> (Vec<(usize, ImageRef)>, Option<usize>) {
-    // Derive the strip tones ONCE (frame-invariant), not per cell.
+    // Derive the strip tones once (frame-invariant), not per cell.
     let colors = strip_colors_for_on(palette, floor);
     let mut images = Vec::new();
     // The rename well's caret column, when a rename field paints this frame —
@@ -4424,9 +4418,9 @@ fn distinct_chip_labels_in(
             p + head[p..].chars().next().map_or(1, char::len_utf8)
         });
         let remainder = &core[boundary..];
-        // Twins by subject: no cut tells this title from members with the same
-        // subject (nothing but the shared suffix told them apart), so a non-active
-        // twin is labelled by ordinal. The active twin keeps its subject.
+        // Twins by subject: no cut tells this title from members whose shed title
+        // matches its own, so a non-active twin is labelled by ordinal. The active
+        // twin keeps its subject.
         let twins = members
             .iter()
             .filter(|&&m| cut_core(&titles[m], suffix) == core)
@@ -7817,8 +7811,8 @@ pub(crate) mod pixel_band {
                 "each ref names its own tile"
             );
             let (rgba, w, h) = image_of(&rows);
-            // The canvas is the cell footprint PLUS the chrome lip, carried as
-            // the image's band lift so the renderers seat it at the window top.
+            // The canvas is the cell footprint plus the chrome lip, carried as the
+            // image's band lift so the renderers seat it at the window top.
             let lift = BAND_TOP;
             assert_eq!((w, h), (80 * CELL_W, CELL_H + lift), "canvas vs footprint");
             assert_eq!((first.cols, first.rows, first.z_index), (80, 1, 0));
@@ -8156,7 +8150,7 @@ pub(crate) mod pixel_band {
         /// whose cascade has the faces, unparsed).
         #[test]
         fn a_cjk_title_no_face_maps_falls_to_the_cell_lane() {
-            // A settled cascade with NO chain face: the embedded primary alone.
+            // A settled cascade with no chain face: the embedded primary alone.
             let mut renderer = aterm_render::Renderer::from_bytes(
                 aterm_render::embedded_font(),
                 14.0,
@@ -9879,7 +9873,7 @@ mod tests {
                 subtitle: None,
                 rename: Some(StripRenameField {
                     tab: 0,
-                    // Caret ON the wide char: "日" starts at byte 2.
+                    // Caret on the wide char: "日" starts at byte 2.
                     text: "bu日ld",
                     cursor: 2,
                 }),

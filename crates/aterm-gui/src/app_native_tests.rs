@@ -1111,6 +1111,73 @@ fn legacy_control_enqueue_reports_an_unknown_key_without_stranding_a_reply() {
     assert!(app.native_config_pending.is_empty());
 }
 
+/// NO CTL VERB WRITES THE OCCUPANCY GRANT (`docs/DESIGN-harness-occupancy-2026-10-20.md` §1.1):
+/// `[harness] occupancy = "prompt"` is the owner's to write by hand, so `aterm ctl settings
+/// set|unset harness.occupancy` is refused at once with the hand-written key's answer, nothing
+/// queued and the file untouched, because Settings carries no row for it
+/// (`prefs::editable_fields`). NEGATIVE CONTROL: `harness.autopilot`, a Settings row, passes the
+/// same gate, and its write saves.
+#[test]
+fn settings_set_never_writes_the_occupancy_grant() {
+    let mut app = App::headless_for_test();
+    let file = "[harness]\nautopilot = \"cruise\"\n";
+    app.native_config_service =
+        crate::native_config_service::VersionedConfigService::new(file.to_string()).unwrap();
+    let rows: Vec<&str> = crate::prefs::editable_fields(&app.config)
+        .into_iter()
+        .map(|field| field.key)
+        .collect();
+    assert!(!rows.contains(&"harness.occupancy"), "no Settings row");
+    assert!(rows.contains(&crate::prefs::EDIT_HARNESS_AUTOPILOT));
+    let refused = crate::native_config_language::control_settings_refusal("harness.occupancy");
+    for value in [Some("prompt"), Some("observe"), Some("off"), None] {
+        let (reply, answer) = std::sync::mpsc::channel();
+        app.queue_control_settings_field(
+            "harness.occupancy".to_string(),
+            value.map(str::to_string),
+            reply,
+        );
+        assert_eq!(
+            answer.try_recv().expect("answered at once"),
+            Err(refused.clone()),
+            "{value:?}"
+        );
+        assert!(
+            app.native_config_pending.is_empty(),
+            "{value:?}: nothing is queued"
+        );
+        assert_eq!(
+            &*app.native_config_service.snapshot().text,
+            file,
+            "{value:?}"
+        );
+    }
+    // The control: the same gate lets a Settings row through (a headless App
+    // then stops at the missing event-loop proxy, which is no refusal of the
+    // key), and its write lane saves it.
+    let (reply, answer) = std::sync::mpsc::channel();
+    app.queue_control_settings_field(
+        crate::prefs::EDIT_HARNESS_AUTOPILOT.to_string(),
+        Some("off".to_string()),
+        reply,
+    );
+    let past_the_gate = answer.try_recv().expect("answered");
+    assert_ne!(
+        past_the_gate,
+        Err(crate::native_config_language::control_settings_refusal(
+            crate::prefs::EDIT_HARNESS_AUTOPILOT
+        )),
+        "a Settings row passes the gate"
+    );
+    assert_eq!(
+        complete_control_field(&mut app, crate::prefs::EDIT_HARNESS_AUTOPILOT, Some("off")),
+        Ok(format!(
+            "saved: {} = off",
+            crate::prefs::EDIT_HARNESS_AUTOPILOT
+        ))
+    );
+}
+
 #[test]
 fn applied_completion_observation_failure_closes_gate_before_pumping_next_write() {
     let dir = std::env::temp_dir().join(format!(
@@ -2559,7 +2626,7 @@ fn linux_status_holding(running: u64, staged: Option<u64>) -> DurableUpdateStatu
     durable
 }
 
-/// A LINUX BUILD HELD FOR A PERSON IS ON THE BAND (ATERM-KI-1015-2, U21). With
+/// A LINUX BUILD HELD FOR A PERSON IS ON THE BAND. With
 /// automatic install off, a Linux check downloads a newer build and holds it for
 /// `aterm update apply`. Settings ▸ Software Update showed it once re-read; the
 /// band never did, since the macOS apply authority takes no Linux stage
@@ -4057,10 +4124,8 @@ fn activity_revoked_retry_spacing_saturates_and_never_exhausts() {
 }
 
 #[cfg(unix)]
-/// A fork-lane park miss is booked as a refusal where `update status` reads
-/// it (`apply_refusal=`), never a failure (`failing_applies` does not move),
-/// with the spaced activity retry armed. A person's apply is told it failed
-/// and arms nothing.
+/// A fork-lane park miss is booked as a refusal (`apply_refusal=`), never a failure, with the
+/// activity retry armed; a person's apply is told it failed.
 // The bundle apply lane and its ledger (`aterm_update::apply_lane_report`) are
 // macOS's: a Linux update replaces the executable on disk and hands nothing off.
 #[cfg(target_os = "macos")]

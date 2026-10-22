@@ -323,7 +323,7 @@ fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
         (next, frame)
     };
 
-    // THE DESK.
+    // The desk.
     let mut desk = App::headless_for_test();
     let base = desk.font_size;
     assert_eq!(
@@ -347,7 +347,7 @@ fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
     assert_eq!(frame, dragged, "and the size it had");
     assert_eq!(grid(&next, w0), (29, 100));
 
-    // A ZOOMED QUIT: the saved size holds the zoomed grid only at the zoom.
+    // A zoomed quit: the saved size holds the zoomed grid only at the zoom.
     desk.set_font_size(base + crate::FONT_ZOOM_STEP);
     size_to(&mut desk, w0, first);
     size_to(&mut desk, w1, dragged);
@@ -498,7 +498,7 @@ fn restore_leaf_reseeds_user_metadata_onto_the_respawned_session() {
     }
 }
 
-/// A RESTORED WORKER WITH NO WORD STAYS LAND (FOREVER LAND §1.4): an
+/// A RESTORED WORKER WITH NO WORD STAYS LAND (Autopilot Land): an
 /// older build's worker, its task record carried, comes back with an
 /// identity that names no Autopilot word — the reseed of a respawned
 /// session and the graft onto a live one each store that none, and each is
@@ -2132,7 +2132,7 @@ fn owed_relaunch(tab: &str) -> aterm_agent::harness::relaunch::Snapshot {
 }
 
 /// A LAYOUT AN END NOBODY CHOSE LEAVES NAMES THE CONVERSATION ITS AGENT IS
-/// IN (2026-10-15, ATERM-KI-1015-1 LC-1): an in-app `/clear` or `/resume`
+/// IN (2026-10-15): an in-app `/clear` or `/resume`
 /// rewrites Claude Code's own record of the process, which the host follows
 /// only at its next wake. The crash journal's image and a system quit's
 /// layout (`fill_desk_agents`) read that record as they are taken, and the
@@ -2367,7 +2367,7 @@ fn a_restored_leafs_agent_is_handed_to_its_new_tab_once() {
 }
 
 /// THE OWNER'S HOLD SURVIVES A QUIT OR A CRASH, AND EVERY ONE AFTER
-/// (2026-10-15, ATERM-KI-1015-1 LC-8 and its review, on the tab's holds of
+/// (2026-10-15 and its review, on the tab's holds of
 /// ruling 23): a tab the owner HELD was reopened unheld, and its agent
 /// relaunched and told to keep going. The layouts an end nobody chose leaves
 /// ([`App::fill_desk_agents`]) carry each session's hold rows on the tab's
@@ -2786,13 +2786,9 @@ fn the_handoff_layout_carries_the_agent_a_restored_tab_is_still_owed() {
     let at_park = tried.load(std::sync::atomic::Ordering::SeqCst);
     app.rollback_overlap(None, &[]);
     tried_past(at_park); // the rollback resumes the queue
-    // A RESTART'S QUIT NAMES IT TOO (restore audit round two,
-    // 2026-10-02): the quit retires the journal that named it, so its
-    // layout is the one record left. `main_entry`'s order: the host
-    // shuts down first, its queue's worker sees that, then the fill.
-    // RED before: the quit asked for hosted agents only, and the
-    // shutdown emptied the queue — `[(Some(0), None), (Some(1), None)]`
-    // with either half of the fix alone.
+    // A restart's quit names it too: the quit retires the journal, so its layout is the one
+    // record left. `main_entry`'s order: the host shuts down first, its queue's worker sees
+    // that, then the fill.
     host.shutdown_and_join();
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
@@ -3120,7 +3116,7 @@ fn the_handoff_leaf_names_the_supervised_agent_where_nothing_is_owed() {
 }
 
 /// THE HANDOFF LEAF CARRIES THE HOST'S LOST WORD, AND THE SUCCESSOR'S HOST
-/// STANDS IT AT ITS COMMIT (LC-4 of ATERM-KI-1016-1): the word standing
+/// STANDS IT AT ITS COMMIT (LC-4 of ): the word standing
 /// that a tab's agent cannot be brought back rides that tab's handoff leaf
 /// (`TerminalLeafRestore::lost`) — through the wire, never on a durable
 /// layout — and is compared at the Commit with the agents, the topology
@@ -3238,7 +3234,7 @@ fn the_handoff_leaf_carries_the_lost_word_and_the_successor_stands_it() {
 }
 
 /// THE SUCCESSOR'S COMMIT CARRIES WHAT THE PREDECESSOR LEFT FOR ITS HOST
-/// BEFORE THE HOST RESUMES (LC-4 of ATERM-KI-1016-1; the review's KR-1):
+/// BEFORE THE HOST RESUMES (LC-4 of ; the review's KR-1):
 /// run through the Commit wake's own step
 /// (`App::take_over_supervision_at_commit`), the adopted shell reads the
 /// person's stamp the outgoing process wrote at its Commit, the sidecar is
@@ -3324,7 +3320,7 @@ fn the_successors_commit_carries_the_stamps_and_words_before_its_host_resumes() 
 }
 
 /// THE HANDOFF LEAF NAMES THE CONVERSATION ITS AGENT'S RECORD NAMES, AND A
-/// MOVE OF IT REFUSES NOTHING (2026-10-15, ATERM-KI-1015-1 LC-1): the agent a
+/// MOVE OF IT REFUSES NOTHING (2026-10-15): the agent a
 /// handoff leaf's `supervised` carries is the host's copy followed through
 /// Claude Code's own record of the process as the layout is taken, so the
 /// successor watches the conversation an in-app `/clear` the host has not
@@ -3487,7 +3483,7 @@ fn a_durable_layout_never_carries_the_explicit_restarts_cause() {
     host.shutdown_and_join();
 }
 
-/// LC-8 (ATERM-KI-1015-1, the 2026-10-15 sweep against Claude Code 2.1.300):
+/// LC-8 (the 2026-10-15 sweep against Claude Code 2.1.300):
 /// A TAB ITS OWNER HELD STAYS THE HOLDER'S ACROSS ATERM'S END. `hold` is a
 /// stop: nothing is typed into the tab while it stands, and an exit read
 /// under it is the holder's (`relaunch::on_exit`'s `Held`). The layouts an
@@ -6919,7 +6915,7 @@ fn a_session_theme_rides_the_layout_and_comes_back_restored() {
 }
 
 /// WINDOWS' END-SESSION SNAPSHOT CARRIES A WORD ABOUT TYPING AT ONCE
-/// (ATERM-KI-1016-1): the `WM_ENDSESSION` handler writes the layout the loop
+/// : the `WM_ENDSESSION` handler writes the layout the loop
 /// last published (`platform_win::set_end_session_snapshot`), which was taken
 /// at most every 2 s — so a Land, Off or hold set within 2 s of a logoff was
 /// lost, and the reopened tab was typed into. Now the snapshot is due at once
@@ -7231,7 +7227,7 @@ fn a_word_about_typing_inside_the_write_interval_is_journaled_at_once_and_reopen
     );
 }
 
-/// THE `OK` OF `hold` IS A DURABILITY ACK (ATERM-KI-1016-1): the control
+/// THE `OK` OF `hold` IS A DURABILITY ACK: the control
 /// verb's answer comes once the crash journal's image that carries the hold
 /// is on disk, so a kill sent at the reply cannot lose it. The live lab had
 /// the reply up to 0.4 ms before the image was renamed into place in 16 of
@@ -7329,7 +7325,7 @@ fn a_holds_ok_comes_once_the_journal_image_carrying_it_is_on_disk() {
 }
 
 /// THE FLEET'S HOLDS ARE ANSWERED AT ONCE; THE OWNER'S WAIT ON THE JOURNAL
-/// (the review's KR-J-1 of ATERM-KI-1016-1). The bridge writes its holds one
+/// (the review's KR-J-1 of ). The bridge writes its holds one
 /// session at a time on one blocking connection, and every `OK` of theirs
 /// waited on the journal: where the lane journals the desk but cannot
 /// capture yet (here: no first frame, as before it, in a cold restore's
@@ -7410,7 +7406,7 @@ fn a_fleet_hold_is_answered_at_once_where_the_owners_waits_on_the_journal() {
 }
 
 /// A HOLD LIFTED BEFORE A SEAMLESS SUCCESSOR'S FIRST IMAGE COMES BACK HELD,
-/// AND ITS LIFT SAYS SO (ATERM-KI-1016-1 LC-8, lifecycle-3; decided by ruling
+/// AND ITS LIFT SAYS SO (LC-8, lifecycle-3; decided by ruling
 /// 23 (iii) and (iv) of `docs/HANDOFF-robustness-rounds-2026-10-08.md`: an
 /// end nobody chose fails toward the holder's stop). At its Commit the
 /// successor takes its parent's journal image over, the owner's hold on the
@@ -7572,7 +7568,7 @@ fn a_hold_lifted_before_a_successors_first_image_comes_back_held_and_says_so() {
 }
 
 /// THE `OK` OF `meta set|unset autopilot` IS A DURABILITY ACK, AS `hold`'s
-/// IS (ATERM-KI-1016-1; the review's KR-J-2: no test ran a `meta` line
+/// IS (the review's KR-J-2: no test ran a `meta` line
 /// through the verb's own door, so the arm's wait could be taken out with
 /// every test green). Each line runs on a thread of its own, as a control
 /// lane does, through the dispatch's `meta` answer
@@ -7806,7 +7802,7 @@ fn restored_up(app: &App) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// A RESTORED ROW SAID BEFORE A LATER ONE IS PASSED OVER (ATERM-KI-1016-1
+/// A RESTORED ROW SAID BEFORE A LATER ONE IS PASSED OVER (
 /// host-7): the host counts each row as it makes it, under its queue's lock,
 /// and the later one names it all. Two sayers raced after a Commit, and the
 /// one queued last could be the older, taking the newer one's tabs off. Here
@@ -7838,7 +7834,7 @@ fn a_restored_row_said_before_a_later_one_is_passed_over() {
     }
 }
 
-/// WHAT THE OWNER SAW THROUGH STAYS DOWN (ATERM-KI-1016-1 host-7): once the
+/// WHAT THE OWNER SAW THROUGH STAYS DOWN (host-7): once the
 /// row this process showed is dismissed, the next row names only what was
 /// said since. Until then the dismissed row came back inside the next one.
 /// CONTROL: the row still up, the next names both, in its place.
@@ -7875,7 +7871,7 @@ fn a_restored_row_the_owner_dismissed_does_not_come_back_inside_the_next() {
     }
 }
 
-/// EACH TAB WHERE IT IS NOW (ATERM-KI-1016-1 host-7): a tab renumbered since
+/// EACH TAB WHERE IT IS NOW (host-7): a tab renumbered since
 /// its miss is named by its place now, and an earlier miss whose tab closed
 /// leaves the row. Until then every line kept the place worded at its miss,
 /// which named another tab once tab 1 closed. CONTROL: the row in the words
@@ -7918,7 +7914,7 @@ fn a_restored_row_names_each_tab_where_it_is_now() {
 }
 
 /// A SUCCESSOR NEVER SUPERSEDES THE ROW CARRIED FROM THE ATERM BEFORE IT
-/// (ATERM-KI-1016-1 host-7): that row names the tabs said at the park, which
+/// (host-7): that row names the tabs said at the park, which
 /// this process never said, so its own row stands beside it. Until then the
 /// successor's first row superseded it and those tabs left the view.
 /// CONTROL: a row under the carried row's key supersedes it, as before.
@@ -7965,7 +7961,7 @@ fn a_successors_restored_row_stands_beside_the_one_carried_to_it() {
     }
 }
 
-/// A ROW NOBODY SAW THROUGH COMES BACK INSIDE THE NEXT (ATERM-KI-1016-1
+/// A ROW NOBODY SAW THROUGH COMES BACK INSIDE THE NEXT (
 /// host-7, the review of its first cut): a restored agents' row that left the
 /// band unseen — it never reached the glass, or its reporter withdrew it — is
 /// not seen through: the next row still names its misses, as it names those

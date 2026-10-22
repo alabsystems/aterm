@@ -1121,8 +1121,7 @@ fn shipped_state_corpus(release: Option<(&str, &Path)>) -> (Corpus, [usize; 3], 
     let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "shipped-state");
     let (mut manifests, mut layouts, mut metas) = (0, 0, 0);
     let mut refused = Vec::new();
-    // Every `Ok` here is pinned by digest: the bytes are the fixture's, read
-    // and written back, and a drift is found by re-running one desk.
+    // Each `Ok` is pinned by the digest of the fixture read and written back.
     for (rel, path) in shipped_files(&fixtures(), release) {
         let name = rel
             .file_name()
@@ -1169,8 +1168,8 @@ fn shipped_state_corpus(release: Option<(&str, &Path)>) -> (Corpus, [usize; 3], 
         }
         corpus.record(id, answer.map(|bytes| answers::digest(&bytes)));
     }
-    // The negative control the harness asks for: a manifest whose schema line
-    // is torn, as a truncated write would leave it.
+    // Negative control: a manifest whose schema line is torn, as a truncated
+    // write leaves it.
     corpus.record(
         "negative-control/torn-manifest",
         aterm_toml::from_str::<SessionHandoff>("schema = ").map(|_| String::new()),
@@ -1183,8 +1182,8 @@ fn shipped_state_corpus(release: Option<(&str, &Path)>) -> (Corpus, [usize; 3], 
 #[test]
 fn state_written_by_shipped_producers_answers_as_recorded() {
     let (corpus, [manifests, layouts, metas], _) = shipped_state_corpus(None);
-    // A fixture tree that moved would leave nothing of a kind to read (the
-    // answers file names every fixture it read, so a lost one is a red too).
+    // A moved fixture tree leaves nothing of a kind to read (and the answers
+    // file names every fixture it read, so a lost one is a red too).
     assert!(
         manifests > 0 && layouts > 0 && metas > 0,
         "the shipped-producer sweep read {manifests} manifests, {layouts} layouts, {metas} metas"

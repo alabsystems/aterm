@@ -436,20 +436,22 @@ impl OutputEchoTracker {
         self.sent.load(Ordering::Acquire)
     }
 
-    /// [`Self::input_sent`] where no input write is in flight: every write it
-    /// counts has reached the sink or failed by the time this returns, so a
-    /// screen read after it shows whatever those writes could have changed
-    /// by then, and any later write is past the count. `text --json`'s
-    /// `"inputs"` reads it before the rows ([`crate::control_query`]): the
-    /// count a later read's is set against, so that no key, submitting or
-    /// not, reached the session in between. `None` while a write is in
-    /// flight: it is counted but may land after the rows are read. A write
-    /// is in flight from before it is counted until it is over
-    /// ([`Self::begin`]).
+    /// [`Self::input_sent`] where no tracked write is in flight and the
+    /// actual sink has neither a partial frame nor process-local spill.
+    /// Acceptance alone is insufficient: an interactive write can finish
+    /// with its bytes still buffered here. Unknown or contended egress is
+    /// no baseline. The non-parking fence is dropped before any screen
+    /// lock; a new write after this count is seen by the count after the
+    /// rows. Kernel acceptance is not acknowledgment that the child has
+    /// processed an input or drawn its effect.
     #[must_use]
-    pub(crate) fn input_settled(&self) -> Option<u64> {
+    pub(crate) fn input_settled(&self, sink: &SinkWriter) -> Option<u64> {
         let sent = self.sent.load(Ordering::Acquire);
-        (self.active_writes.load(Ordering::Acquire) == 0).then_some(sent)
+        if self.active_writes.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+        let _fence = sink.try_fence_egress()?;
+        Some(sent)
     }
 
     /// How many Enters written to the session submitted something typed
@@ -2139,13 +2141,10 @@ pub(crate) mod paste_order {
         queued_or_inline(queue, term, modes, sink, echo, ev, ticket, hot_key)
     }
 
-    /// A control socket lane's write into a session that is not on screen
-    /// (`crate::control`'s background arms): [`ordered_or_inline`]'s route —
-    /// behind whatever this session's ordered writer holds, through it always
-    /// where a write can block (Windows), otherwise inline through the
-    /// non-parking interactive egress — except that a paste with nothing queued
-    /// ahead of it is written inline too, into the sink's own spill, whose
-    /// drain the paste's reply waits on. Never parks the lane on the program.
+    /// A control lane's write into a session not on screen: [`ordered_or_inline`]'s
+    /// route, except that a paste with nothing queued ahead of it is written inline
+    /// too, into the sink's own spill, whose drain the paste's reply waits on. Never
+    /// parks the lane on the program.
     ///
     /// An event handed to the ordered writer comes with its [`Written`]: admission
     /// is not the write, so the lane's reply waits, bounded, for the write's own
@@ -2365,15 +2364,11 @@ pub(crate) mod paste_order {
         OrderingPin { sink: sink.clone() }
     }
 
-    /// Test-only: the jobs and retained bytes `sink`'s serializer holds admitted now
-    /// (the job being written included); `(0, 0)` when it has none.
-    ///
-    /// Decided by sink identity, not fd number: the entry under `sink.master()`
-    /// counts only when its `Weak` points at `sink` itself. Fixtures build borrowed
-    /// sinks on pipes they close, so a closed fixture's live serializer can stay
-    /// registered under a number the next fixture's `pipe()` reuses; pruning dead
-    /// sinks cannot drop it. The pointer compare is sound for a dead entry too, since
-    /// a `Weak` keeps its allocation.
+    /// Test-only: the jobs and retained bytes `sink`'s serializer holds admitted now;
+    /// `(0, 0)` when it has none. Decided by sink identity, not fd number: a closed
+    /// fixture's live serializer can stay registered under a number the next fixture's
+    /// `pipe()` reuses. The pointer compare is sound for a dead entry too, since a
+    /// `Weak` keeps its allocation.
     #[cfg(all(test, unix))]
     pub(crate) fn admitted_for_test(sink: &Arc<SinkWriter>) -> (u64, u64) {
         REG.lock()
@@ -5761,18 +5756,12 @@ impl App {
                         let sample = act.is_some().then(|| {
                             // The predictor's no-echo gate: the alt screen (vim/less own
                             // the cursor), Kitty REPORT_ALL_KEYS_AS_ESC, or Kitty
-                            // REPORT_EVENT_TYPES (Codex's shape: an app-owned composer on
-                            // the main screen with full-line repaints, where a ghost could
-                            // duplicate the app's text). Disambiguate-only shells stay
-                            // eligible, since fish can push that flag at a line-echoing
-                            // prompt. A read-only display gate; the seam remains the sole
-                            // encoder-feeding reader of the keyboard mode.
-                            // `rows` lets the predictor continue a guess across the right
-                            // margin at `(row + 1, 0)`; a wrap off the last row declines.
-                            //
-                            // The content-coordinate generation rides with the cursor:
-                            // rows that moved since the predictor last looked (a prompt
-                            // scrolled onto the proven bottom row) end its epoch.
+                            // REPORT_EVENT_TYPES (Codex's app-owned composer on the main
+                            // screen, where a ghost could duplicate the app's text).
+                            // Disambiguate-only shells stay eligible, since fish can push
+                            // that flag at a line-echoing prompt. `rows` lets a guess
+                            // continue across the right margin; the coordinate generation
+                            // ends the predictor's epoch when rows moved since it looked.
                             //
                             // The last field: an arrow with a lock on, or the keypad's,
                             // while Kitty reports functional keys (DISAMBIGUATE), goes
@@ -5823,8 +5812,7 @@ impl App {
                         {
                             crate::predict_seen::seen_row(&t, cursor.row, row);
                         }
-                        // Read once under the SAME lock for the PHOSPHOR PgUp/
-                        // PgDn reading gate below (no second acquisition).
+                        // Read under this lock for the rain's PgUp/PgDn reading gate.
                         let is_alt = t.is_alternate_screen();
                         // The width the key-time click normalizes its stereo pan
                         // against, the same the frame drain uses. Unconditional; the
@@ -6403,9 +6391,8 @@ impl App {
                     completion,
                 );
                 let outcome = receipt_outcome(receipt);
-                // The input queue is full: the program stopped reading or the ordered
-                // writer could take no more, so this key was refused. Nothing reached
-                // the PTY; say so once ([`App::refuse_input`]).
+                // The program stopped reading or the ordered writer is full: nothing
+                // reached the PTY; say so once.
                 if receipt.input_queue_full() {
                     self.refuse_input(session, InputRefusal::Busy);
                 }
@@ -6428,11 +6415,9 @@ impl App {
                     ws.fx.companion_mut().note_console_input(now, kind);
                 }
                 // A queued key has not crossed the PTY boundary, and a failed inline
-                // write never will, so its arrival-time licences must not be spendable
-                // by concurrent program output. This method is one event-loop turn, so
-                // no effect tick sees the arm above before this timestamp-matched
-                // revoke; the licence returns at delivery through the ticket's key class
-                // (`revoke_dispatch` says which engine keeps what).
+                // write never will, so its arrival-time licences are revoked
+                // (timestamp-matched, within this one event-loop turn); the licence
+                // returns at delivery through the ticket.
                 if (!wrote_inline || outcome.failed())
                     && let Some(armed_at) = input_now
                     && let Some(ws) = self.windows.get_mut(&wid)
@@ -6571,15 +6556,11 @@ impl App {
                     if summoned.canine {
                         self.summon_typed_dog(wid, session, input_now);
                     }
-                    // The kitty-command listener (`aterm_effects::typed_tricks`), the
-                    // typed-line machine behind `sit␣`, `kitty jump␣`, `good kitty␣`.
-                    // It has its own cascade: Enter is judged, ⌃C / ⌃U reset without
-                    // judging, Tab and arrows poison, which `brk` cannot distinguish.
-                    // Same provenance law (this press only; a paste feeds it a break; no
-                    // branch on `src`), and fed always, even with the feature off or in
-                    // Serious Mode, so a re-enable never calls an unwatched line pure;
-                    // only the events are gated. O(1) per press; the vocabulary is
-                    // borrowed only when a token closes on a still-pure line.
+                    // The kitty-command listener (`aterm_effects::typed_tricks`) behind
+                    // `sit␣`, `kitty jump␣`, `good kitty␣`, with its own cascade
+                    // ([`feed_trick_listener`]). Fed always, even with the feature off or
+                    // in Serious Mode, so a re-enable never calls an unwatched line pure;
+                    // only the events are gated.
                     let pet_note = {
                         let tricks = self.prepared_sparkle.tricks();
                         let press = TrickPress {
@@ -9001,10 +8982,8 @@ impl App {
         let option_composes = self.option_composes_in(wid);
         let (ev, mods) = self.option_as_layout_level(ev, mods, option_composes);
         let press = mods.and_then(|m| physical_press(&ev, m, option_composes));
-        // Selection custody: a bare modifier/lock press is inert; it does not
-        // cancel scroll motion, snap the viewport, or clear the selection.
-        // Resolved once here off the key identity; the seam re-derives the same
-        // answer from the engine key for presses that reach it.
+        // A bare modifier/lock press is inert: no scroll cancel, snap or deselect.
+        // The seam re-derives the same answer from the engine key.
         let inert = keymap::press_is_inert(&ev);
         // Modifier normalization clones the event's owned Key, so it is done
         // lazily, at most once, for the paste test, the configured bindings and
@@ -9173,16 +9152,10 @@ impl App {
         // `keybinding::resolve_chord`) take precedence; a miss falls through to the
         // hardcoded matches.
         if !self.keybindings.is_empty() || !self.key_sequences.is_empty() {
-            // Match on the modifier-independent base key (`]` under Shift, not
-            // `}`) so a binding matches across layouts. For the keypad the
-            // encoder keeps the keypad identity (`Numpad5`, `NumpadEnter`) while
-            // `base_logical_key` hands this lookup the NumLock-aware main-block
-            // key it stands in for (`Key::main_block_twin`), so a binding on
-            // `enter` fires for KP_Enter, `1` for a NumLock-on keypad 1, and
-            // `end` for it with NumLock off. The keybindings-then-key_sequences
-            // precedence is `keybinding::resolve_chord`; running this block
-            // before the hardcoded Cmd block (so a key_sequences rule shadows a
-            // built-in chord) is `on_key`'s policy.
+            // Match on the modifier-independent base key ([`base_logical_key`]), so a
+            // binding matches across layouts and a keypad key looks up as its
+            // NumLock-aware main-block twin. Ahead of the hardcoded Cmd block, so a
+            // configured rule shadows a built-in chord.
             //
             // A pane-focus chord on an arrow is decided HERE, before dispatch:
             // with no pane that way it resolves as unbound and this press
@@ -9200,11 +9173,8 @@ impl App {
                 &self.key_sequences,
                 |dir| self.focus_pane_would_move(dir),
             ) {
-                // A configured chord that would type, copy or move the viewport
-                // is suspended while the find field owns input, so a bound
-                // `ctrl+a` / `cmd+v` works inside the field and `Paste` cannot
-                // write the clipboard to the PTY from under it. Window, tab,
-                // pane, font, settings and Find actions still fire.
+                // A configured chord that would type, copy or move the viewport is
+                // suspended while the find field owns input ([`find_suspends_action`]).
                 keybinding::ChordResolution::Action(action)
                     if find_suspends_action(action)
                         && self.windows.get(&wid).is_some_and(|ws| ws.search.is_some()) =>
@@ -9875,11 +9845,8 @@ impl App {
         let base = base_logical_key(ev);
         let bare_cmd =
             mods.super_key() && !mods.shift_key() && !mods.control_key() && !mods.alt_key();
-        // Whether this keystroke is the chord Paste is bound to. Resolved before
-        // the match because a guard may not borrow `self` that the arm needs
-        // mutably. `[keybindings]` alone is the right map: it wins over
-        // `[key_sequences]` in `resolve_chord`, and asking it directly avoids
-        // `resolve_chord`'s Vec.
+        // Resolved before the match, since a guard may not borrow `self` mutably;
+        // `[keybindings]` alone, which wins over `[key_sequences]` anyway.
         let paste_chord = self
             .keybindings
             .action_for(&base, ev.physical_key, mods)
@@ -10458,8 +10425,8 @@ impl App {
             Action::FontIncrease => self.set_font_size(self.font_size + FONT_ZOOM_STEP),
             Action::FontDecrease => self.set_font_size(self.font_size - FONT_ZOOM_STEP),
             Action::FontReset => self.set_font_size(self.default_font_size),
-            // Scrollback viewport navigation (the SAME machinery the wheel/trackpad
-            // and the control socket drive via InputEvent::ScrollView).
+            // Scrollback viewport navigation, through the `InputEvent::ScrollView`
+            // machinery the wheel and the control socket drive.
             Action::ScrollPageUp => {
                 self.input(wid, InputEvent::ScrollView(ScrollIntent::Up), Source::Human);
             }
@@ -10532,8 +10499,8 @@ impl App {
             }
             Action::OpenPalette => self.toggle_palette(),
             Action::ChooseTheme => self.open_theme_palette(),
-            // Opens the inline pin editor over the ACTIVE tab of the window the
-            // chord landed in — the keyboard face of the double-click.
+            // The inline pin editor over the active tab of the window the chord
+            // landed in: the keyboard face of the double-click.
             Action::RenameSession => {
                 self.begin_active_session_rename(wid);
             }
@@ -10732,21 +10699,13 @@ impl App {
     pub(crate) fn on_ime_commit(&mut self, wid: WindowId, text: String) {
         // One routing decision, so the fence and the consumer agree.
         let route = self.ime_route(wid);
-        // A grid commit holding a control character is a paste (L2), unless it
-        // is one C0 or DEL key (`committed_text_is_paste`). Not while an
-        // overlay or the tab menu owns the window: the seam hands the commit to
-        // them as text and nothing reaches the PTY, whereas the paste path pins
-        // the session behind them.
+        // Not a paste while an overlay or the tab menu owns the window: the seam hands
+        // the commit to them as text, whereas the paste path would pin the session
+        // behind them.
         let as_paste = keymap::committed_text_is_paste(&text) && self.typing_reaches_grid(wid);
-        // This fence precedes every consumer below (native tabs, rename/find
-        // fields, the empty commit). A commit that reaches the PTY is more
-        // typing, not a class change: it stamps its own typed licence in
-        // `App::input` below, and the banked stamps of keys still in flight
-        // ahead of it must survive, so it takes the bank-preserving supersede
-        // the Text arm applies. A commit a native view, the rename field or the
-        // find bar consumes takes the full fence, and one that pastes takes a
-        // paste press's fence ([`press_fence`]), at the gesture as ⌘V does,
-        // since the guard can hold the delivery.
+        // A commit reaching the PTY is more typing: the Text arm's bank-preserving
+        // supersede. One a field or native view consumes takes the full fence; one
+        // that pastes takes a paste press's fence at the gesture, as ⌘V does.
         let reaches_pty = !text.is_empty() && matches!(route, PreeditOwner::Grid);
         if as_paste {
             self.clear_move_license_keeping_hand(wid);
@@ -10841,7 +10800,7 @@ impl App {
     /// an Option chord as its M- chord (Option+b is M-b, backward-word; Option+u is M-u,
     /// never a dead key). A GUI field that owns the keyboard (the find bar, the inline
     /// rename, the palette, another native page) keeps Option composing, so German Option+L
-    /// types '@' there and Option+e e types 'é' (ATERM-KI-1015-9).
+    /// types '@' there and Option+e e types 'é'.
     pub(crate) fn option_is_alt(&self, wid: WindowId) -> bool {
         self.option_as_meta && (self.typing_reaches_grid(wid) || self.typing_reaches_editor(wid))
     }
@@ -10890,7 +10849,7 @@ impl App {
     /// AltGr is on Linux: the press types the character, with Option taken off the
     /// modifiers it carries. Every Option chord of the U.S. layout stays Meta (its Option
     /// characters are not ASCII, or a key of their own types them too), and a chord with
-    /// Control or Command is left as it came (ATERM-KI-1015-9).
+    /// Control or Command is left as it came.
     fn option_as_layout_level(
         &self,
         mut ev: KeyEvent,
@@ -11356,7 +11315,6 @@ impl App {
                     self.pending_action_refusal = Some(why.to_string());
                 }
             }
-            // Font size — identical to on_key_font_zoom (⌘= / ⌘- / ⌘0).
             MenuAction::FontIncrease => self.set_font_size(self.font_size + FONT_ZOOM_STEP),
             MenuAction::FontDecrease => self.set_font_size(self.font_size - FONT_ZOOM_STEP),
             MenuAction::FontActualSize => self.set_font_size(self.default_font_size),
@@ -11401,6 +11359,9 @@ impl App {
             MenuAction::Messages => {
                 self.open_settings_tab(crate::native_settings::SettingsRoute::Messages);
             }
+            // The System State tab beside Settings: first-run setup and the secrets
+            // vault, the way the control socket's `open app system-state` opens it.
+            MenuAction::SystemState => self.open_system_state_from_menu(),
             // …and at the Harness route — the bar and palette path to the
             // coding agent harness's page (the Autopilot menu's `Harness
             // settings…` opens it in the window it was chosen in:
@@ -11416,7 +11377,7 @@ impl App {
             // …scoped to the front tab: its own theme, nothing written.
             MenuAction::ChooseTabTheme => self.open_tab_theme_palette(),
             MenuAction::ClearTabTheme => self.clear_front_tab_theme(),
-            // …and Settings ▸ Themes, the Theme Showcase.
+            // Settings ▸ Themes, the Theme Showcase.
             MenuAction::BrowseThemes => {
                 self.open_settings_tab(crate::native_settings::SettingsRoute::Themes);
             }

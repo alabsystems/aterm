@@ -237,8 +237,8 @@ pub struct Flight {
 }
 
 impl Flight {
-    /// The spine value to force on frame 0 ([`FLYING_DISP_FLOOR`]), as a floor
-    /// so a cat already at full momentum is not pulled down.
+    /// The spine value forced on frame 0 ([`FLYING_DISP_FLOOR`]), a floor so a cat already at
+    /// full momentum is not pulled down.
     #[inline]
     #[must_use]
     pub const fn disp_floor(&self) -> f32 {
@@ -790,9 +790,8 @@ impl PetOffer {
     }
 }
 
-/// `at + ms`, saturating rather than panicking on an absurd offset. The one
-/// place milliseconds become an `Instant` in this module, so nobody rounds on
-/// the way and lands a frame early (§8.1's reasoning for [`timing::flight`]).
+/// `at + ms`, saturating. The module's one ms-to-`Instant` conversion, so nothing rounds to
+/// whole milliseconds and lands a frame early.
 #[inline]
 fn add_ms(at: Instant, ms: f32) -> Instant {
     at.checked_add(std::time::Duration::from_secs_f32(ms / 1000.0))

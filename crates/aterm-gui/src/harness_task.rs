@@ -32,7 +32,7 @@
 //! * COUNTS the same end, the landing, in the A/B book (§11.6.3, item 4:
 //!   `AbBook::landed`), by the same rule as the record, before the page is
 //!   republished — so Settings ▸ Harness's Ends row reads a landing once
-//!   however often its face is told. Under FOREVER CRUISE / FOREVER LAND
+//!   however often its face is told. Under Autopilot Cruise / Land
 //!   nothing else ends a task: Cruise has no done to count, and Land is
 //!   never quiet.
 //!
@@ -41,7 +41,7 @@
 //!
 //! THE ONE END (§11.2.3, items 1 to 6), ahead of all that, at every move
 //! ([`App::note_harness_end`]): whether the task CAME DOWN is decided here
-//! once ([`is_a_task_end`]) — under FOREVER CRUISE / FOREVER LAND only a
+//! once ([`is_a_task_end`]) — under Autopilot Cruise / Land only a
 //! landing: the face moved to `landed` from a face the window knew (open,
 //! theirs), under Land, after at least [`END_WORK_MS`] of the agent's busy
 //! time since the task opened (`AbBook::worked`). An end is told to the
@@ -61,7 +61,7 @@ use crate::App;
 use crate::autopilot::AutopilotView;
 use crate::harness_glass::EndFace;
 
-/// CODEX-ALAB'S LANDING (FOREVER LAND §10.3): the act a proven self-claim's
+/// CODEX-ALAB'S LANDING (Autopilot Land): the act a proven self-claim's
 /// holder records with `meta set harness_act landed@v1` once all of its work
 /// is on the remote main branch — never typed, and the one act that makes the
 /// session's face `landed` ([`self_claim_act_face`]). The one spelling is the
@@ -69,7 +69,7 @@ use crate::harness_glass::EndFace;
 /// gives it its session-log word.
 pub(crate) const SELF_CLAIM_LANDED: &str = aterm_agent::harness::acts::RULE_LANDED;
 
-/// THE FACE A PROVEN SELF-CLAIM'S ACT `act` TELLS (FOREVER LAND §10.4):
+/// THE FACE A PROVEN SELF-CLAIM'S ACT `act` TELLS (Autopilot Land):
 /// [`TaskFace::Landed`] for its landing ([`SELF_CLAIM_LANDED`]),
 /// [`TaskFace::Theirs`] for a point it left to a person's own exchange
 /// (`left-to-person@v1`, aterm's own loop's `LEFT` rule: recorded, never
@@ -106,6 +106,45 @@ pub(crate) fn holds_until_another_turn(face: TaskFace) -> bool {
     matches!(face, TaskFace::Landed | TaskFace::Theirs)
 }
 
+/// THE LANDING'S OWN TURN, IN THE ORDER THE PROGRAM SAW IT (Autopilot Land
+/// §10.4): the count of turns begun a proven self-claim's landing is marked
+/// at, from `counted`, the engine's count as its `landed@v1` arrived, and
+/// `typed_at`, the count its holder's last act that starts a turn stood at
+/// as it arrived with the program's report at rest
+/// (`SessionTimeline::typed_turn`; an act that starts none, such as a report
+/// mailed after the land turn ended, moves nothing:
+/// `aterm_agent::harness::acts::self_claim_types_turn`).
+///
+/// The holder lands at the yield of the turn its last act typed, and records
+/// that act once the turn has started (codex-alab's `submit`), so the
+/// program saw the turn begin before it landed. aterm sees the two on two
+/// channels: the acts on the control socket, the turn's begin as an OSC 7501
+/// report the TUI writes to the PTY, parsed when the reader gets to it. Where
+/// the landing's act outran that report — no turn counted since the act, at
+/// rest — the report still to come is the landing's own turn's, and the mark
+/// holds it: `typed_at + 1`. It cannot be a turn begun after the landing:
+/// nobody else's turn starts between the holder's act and its turn's yield
+/// (a person's turn there is their own exchange, never landed on), and the
+/// holder keeps every native turn start behind the landing's acknowledgement
+/// (`meta prepare harness_act`). So that report reopens nothing, and the next
+/// turn's does. Every other landing is marked at `counted`, as before: the
+/// typed turn was counted already (the act came with the report in that turn,
+/// or a turn was counted after it).
+///
+/// What this cannot tell: an act whose own turn's begin and end were both
+/// parsed before the act arrived reads as one that outran them, so the next
+/// turn after its landing reopens nothing either, until the holder's next act
+/// (its act after that turn) reopens the task. The act is recorded the moment
+/// its turn starts, so the turn would have to run its whole length while the
+/// act crossed the socket.
+#[must_use]
+pub(crate) fn landing_turns(counted: u64, typed_at: Option<u64>) -> u64 {
+    match typed_at {
+        Some(at) if at == counted => counted.saturating_add(1),
+        _ => counted,
+    }
+}
+
 /// THE WORK FLOOR OF AN END (§11.2.3, items 1 and 3): a landing marks the
 /// tab only after this much of the agent's busy time since its task opened —
 /// the kitty's own line between a quick success and a build
@@ -118,7 +157,7 @@ pub(crate) const END_WORK_MS: u64 = 30_000;
 
 /// THE ONE END (§11.2.3, item 1): the move from `was` to `face`, after
 /// `worked_ms` of the agent's busy time since the task opened, is a task
-/// that CAME DOWN — under FOREVER CRUISE / FOREVER LAND only a landing:
+/// that CAME DOWN — under Autopilot Cruise / Land only a landing:
 /// `face` is landed, `was` a face the window knew (open, theirs; never
 /// "unknown", `None`, the host's word between loop runs and a new process's
 /// first, whose next face is a restatement: [`is_an_end`]'s rule), and the
@@ -140,7 +179,7 @@ impl App {
     /// Whether session `session`'s live supervisor claim is a PROVEN
     /// self-claim (`SessionMeta::supervisor_proven`): an agent that supervises
     /// itself (codex-alab), beside which this window's hosted loop only
-    /// watches, so the task's face is the self-claim's (FOREVER LAND §10.4).
+    /// watches, so the task's face is the self-claim's (Autopilot Land).
     /// One leaf lock (the session's metadata).
     pub(crate) fn beside_proven_self_claim(&self, session: u64) -> bool {
         self.pool.get(session).is_some_and(|entry| {
@@ -150,6 +189,23 @@ impl App {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .supervisor_proven(crate::metrics::now_us())
+        })
+    }
+
+    /// Whether session `session` is in the gap of its proven self-claim's
+    /// own re-exec (`SessionTimeline::in_self_reexec`): the claim given back
+    /// right after its holder's `upgrade@v1`, not yet taken again, at most
+    /// `session_timeline::SELF_REEXEC_GAP_US` ago. The self-claim's face
+    /// stands through it (Autopilot Land: `upgrade@v1` moves no face, the
+    /// landing carried across). One leaf lock (the session's timeline).
+    pub(crate) fn in_self_claim_reexec(&self, session: u64) -> bool {
+        self.pool.get(session).is_some_and(|entry| {
+            entry
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .in_self_reexec(crate::metrics::now_us())
         })
     }
 
@@ -247,7 +303,7 @@ impl App {
     }
 
     /// A TURN BEGUN SINCE A PROVEN SELF-CLAIM'S LANDING on session `session`
-    /// reopens it (FOREVER LAND §10.4). Its holder types nothing after its
+    /// reopens it (Autopilot Land). Its holder types nothing after its
     /// landing until someone else's turn, so the turn is someone else's — a
     /// person's prompt, a driver's — and the work is open again, as aterm's
     /// own loop opens its face at the first live read of another's turn.
@@ -268,6 +324,13 @@ impl App {
     /// other face or claim. Called by the status sweep for a session whose
     /// counts may have moved, and as the landing's face is applied (a turn
     /// the sweep counted between the act and its face).
+    ///
+    /// IN THE ORDER THE PROGRAM SAW IT: codex-alab's acts reach aterm on the
+    /// control socket, its turns' reports on the PTY, so its `landed@v1` can
+    /// arrive before the begin of the very turn it lands (the land turn its
+    /// last act typed, that act come at rest). That begin is the landing's
+    /// own turn, and its mark holds it ([`landing_turns`]): it reopens
+    /// nothing, and the turn after it does.
     ///
     /// A POINT LEFT TO A PERSON reopens the same way
     /// ([`holds_until_another_turn`]): its `left-to-person@v1` is marked as a

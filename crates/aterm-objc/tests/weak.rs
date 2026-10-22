@@ -48,9 +48,7 @@ fn new_mutable_string() -> Obj {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The safe handle
-// ---------------------------------------------------------------------------
 
 /// A container to move a `WeakObj` INTO, so the move is a real struct move and
 /// not something the optimiser can elide as a no-op rebinding.
@@ -134,9 +132,7 @@ fn a_boxed_weak_survives_every_move_rust_can_perform() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Ordinary behaviour
-// ---------------------------------------------------------------------------
 
 /// `load` is +1, and the +1 is what keeps the object alive across the drop of
 /// every other strong reference.
@@ -313,9 +309,7 @@ fn dropping_the_handle_unregisters_before_the_box_is_freed() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The quarantining allocator
-// ---------------------------------------------------------------------------
 
 /// This binary's global allocator: [`std::alloc::System`], except that a thread
 /// which has armed [`quarantine`] leaks its deallocations, so a test can read

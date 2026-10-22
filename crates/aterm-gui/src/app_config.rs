@@ -8538,15 +8538,11 @@ impl App {
         {
             self.on_scale_factor_changed(wid, live);
         }
-        // Fullscreen transitions collapse and restore the titlebar band without a
-        // scale change, so re-derive the headroom from AppKit on every real resize
-        // of a chrome'd window (macOS only), before `grid_dims_for`.
-        //
-        // Each sample fails closed (`titlebar_band_decision`): fullscreen forces 0;
-        // a windowed chrome'd sample of 0 or above the sanity cap restores
-        // `last_windowed_band_pts` (not `head_pts`, which is 0 throughout
-        // fullscreen). The vendored winit also emits one settled Resized per
-        // completed transition.
+        // Fullscreen transitions move the titlebar band without a scale change,
+        // so re-derive the headroom from AppKit on every real resize of a
+        // chrome'd window (macOS), before `grid_dims_for`. Each sample fails
+        // closed (`titlebar_band_decision`): fullscreen forces 0; an implausible
+        // windowed sample restores `last_windowed_band_pts`.
         if cfg!(target_os = "macos")
             && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone())
         {
@@ -9326,8 +9322,8 @@ impl App {
             return;
         }
         let size = self.font_size;
-        // Configured LOGICAL padding, resolved before the `windows` borrow (the
-        // per-window record stays a function of the window's OWN scale).
+        // Configured logical padding, resolved before the `windows` borrow (the
+        // per-window record stays a function of the window's own scale).
         let (pad_l, pad_top_l) = (
             self.config.window_padding_or_default(),
             self.config.window_padding_top_or_default(),
@@ -9574,17 +9570,11 @@ impl App {
         }
     }
 
-    /// Apply a worker-prepared config observation of `aterm.toml`. Parsing,
-    /// asset loading and font preparation happen off the event loop; this
-    /// installs the generation into every live session.
-    ///
-    /// Malformed, partial or unreadable input never reaches this seam and cannot
-    /// replace the running config; malformed UTF-8 TOML still reaches Manual for
-    /// diagnostics.
-    ///
-    /// Font size uses [`resolve_font_px`] (`--font-px > config > default`). GPU
-    /// is a launch-time decision; only font size, renderer theme and engine
-    /// `TerminalConfig` (via `Terminal::apply_config`) are re-applied.
+    /// Queue font preparation for a worker-prepared observation of `aterm.toml`
+    /// on the font catalog lane (inline when there is no event-loop proxy);
+    /// [`Self::finish_font_catalog_generation`] installs the result. Malformed,
+    /// partial or unreadable input never reaches this seam and cannot replace the
+    /// running config.
     ///
     /// `reason` is what asked (a config observation is `ConfigReload`); the
     /// publish installs the colours under it. Returns whether the request was
@@ -10224,8 +10214,8 @@ impl App {
         // removed feature's settings are an entry naming what replaced it.
         collect_key_notices(&mut warns, &config_snapshot.text);
         self.note_removed_settings(&config_snapshot.text);
-        // …and so does a refused Secure Keyboard Entry transition (see the
-        // apply site above): same class exactly — an edit that did not take.
+        // A refused Secure Keyboard Entry transition is an edit that did not take
+        // too.
         if let Some(status) = secure_input_refusal {
             warns.push(
                 ConfigFamily::SecureKeyboard,
@@ -10477,7 +10467,6 @@ impl App {
         };
         let new_font_px = crate::font_px_for_scale(new_font_size, self.front_scale());
         self.font_size = new_font_size;
-        // The renderer bakes the theme in, so any change needs a backend rebuild.
         let theme_changed = new_theme != self.theme;
         let font_changed = (new_font_px - self.font_px).abs() >= 0.5;
         // Effective family keeps `--font` > config > platform default, via the
@@ -12339,19 +12328,17 @@ mod cfg_engine_tests {
         );
     }
 
-    /// A typo added by a live edit is reported like one present at launch, even
-    /// though the parsed `Config` is equal and the reload takes the dedupe path.
-    ///
-    /// The empty case is published too, so fixing the typo clears its row; only
-    /// rows this path re-derives are replaced (an unrelated chord row stays).
+    /// A typo added by a live edit is reported like one present at launch,
+    /// though the parse is equal and the reload dedupes; fixing it clears only
+    /// its row (an unrelated chord row stays).
     #[test]
     fn a_misspelled_key_added_by_a_live_edit_still_warns_through_the_dedupe() {
         let dir = std::env::temp_dir().join(format!("aterm-typo-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let mut app = crate::App::headless_for_test();
 
-        // A key this build does not know, and NOTHING else — so the parse is
-        // equal to what is already applied and the dedupe fires.
+        // A key this build does not know and nothing else, so the parse equals
+        // what is applied and the dedupe fires.
         apply_config_text(&mut app, &dir, "windw_padding = 20\n");
         let ignored = app
             .messages
@@ -13065,8 +13052,8 @@ mod decorative_effect_default_tests {
         // The two neighbours stay on everywhere.
         assert!(fresh.cursor_trail_bloom_or_default());
         assert!(fresh.sparkle_words_enabled_or_default());
-        // …and each still answers to its own key, in both directions, on every
-        // platform: this is a DEFAULT, never a veto.
+        // Each answers to its own key in both directions, on every platform: a
+        // default, never a veto.
         assert!(cfg("cursor_trail_style = \"comet\"").cursor_trail_drawn());
         assert!(!cfg("cursor_trail_style = \"off\"").cursor_trail_drawn());
         assert!(!cfg("cursor_trail_bloom = false").cursor_trail_bloom_or_default());
@@ -13919,7 +13906,7 @@ mod reload_dedupe_tests {
         std::fs::write(&lex, "two").unwrap();
         let lexed = config.path_feed_fingerprints();
         assert_ne!(lexed.deco, base.deco, "lexicon content feeds deco");
-        // A file DISAPPEARING is a content change too (fail-visible, never stale).
+        // A vanished file is a content change too (fail-visible, never stale).
         std::fs::remove_file(&lex).unwrap();
         assert_ne!(
             config.path_feed_fingerprints().deco,
@@ -15254,7 +15241,7 @@ mod trail_style_resolution_tests {
                 "{raw:?}: an explicit instrument is the user's"
             );
         }
-        // The old escape and every other unknown word: the default, reported.
+        // The `v1` spellings are unknown words like any other: the default, reported.
         let fallback = resolve_trail_presentation(default);
         for v1 in [
             "rainbow kitty v1",
@@ -15322,7 +15309,7 @@ mod trail_style_resolution_tests {
             !glow(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE, false).enabled,
             "`cursor_trail = false` owns the whole effect"
         );
-        // `off` is the ONLY builtin spelling that means off, and no alias adds
+        // `off` is the only builtin spelling that means off, and no alias adds
         // a second one.
         for &s in crate::prefs::CURSOR_TRAIL_STYLES {
             assert_eq!(

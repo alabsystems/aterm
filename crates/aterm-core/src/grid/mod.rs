@@ -66,10 +66,6 @@ pub use aterm_grid::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
 };
 
-// ============================================================================
-// Re-exports
-// ============================================================================
-
 pub use cell::{Cell, CellFlags, PackedColor, PackedColors};
 pub use damage::{Damage, DamagedRowIterator, LineDamageBounds, RowDamageBounds};
 pub use extra::{CellCoord, CellExtra, CellExtras, UniformExtras};

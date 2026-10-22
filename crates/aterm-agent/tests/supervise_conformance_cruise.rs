@@ -4,7 +4,7 @@
 //! Tier-1 for `SupervisorCruise` (aterm-models-harness
 //! `supervisor_cruise_model`): the real turn-end decider (`decide_turn_end`,
 //! with its `TurnEndState`) driven under Autopilot Cruise along every
-//! reachable state of the model — FOREVER CRUISE: nothing the worker says
+//! reachable state of the model — Autopilot Cruise: nothing the worker says
 //! ends the task.
 //!
 //! Someone else's turn is a point observed with real work (its last words
@@ -33,7 +33,7 @@
 //! real decider types the defend prompt, holds a worker's defend prompt for
 //! the back-off where the real decider types it, answers a worker at once
 //! past its bound where the real decider waits, ends the task at the defend
-//! prompt's own defense (the policy before FOREVER CRUISE) where the real
+//! prompt's own defense (the policy before Autopilot Cruise) where the real
 //! decider defends again past the back-off — with or without work in the
 //! repository — takes an old journal's or record's done on where the real
 //! decider refuses it, ends the task at the busy screen over a running shell
@@ -397,7 +397,7 @@ fn tier1_the_real_decider_defends_every_claim_and_never_rests() {
         for inv in &m.invariants {
             assert!(m.check_invariant(inv.name, &st), "{} at {st:?}", inv.name);
         }
-        // FOREVER CRUISE: never done, at any state, and no record's done
+        // Autopilot Cruise: never done, at any state, and no record's done
         // taken on.
         assert!(!real.st.task_done(), "the task ended at {st:?}");
         assert!(
@@ -479,7 +479,7 @@ fn tier1_the_buggy_model_is_refuted_by_the_real_decider() {
     assert_eq!(verdict(&real.clone().decide()), Verdict::Check);
 
     // THE DEFEND PROMPT'S OWN DEFENSE: the Buggy model ends the task there
-    // (the done reply to the check ended the job before FOREVER CRUISE) —
+    // (the done reply to the check ended the job before Autopilot Cruise) —
     // with or without work in the repository; the real decider waits the
     // back-off the claim earned, then defends again, and its task is never
     // done.

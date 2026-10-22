@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Who gets Option as an Alt (ATERM-KI-1015-9). In Meta mode a press bound for
+//! Who gets Option as an Alt. In Meta mode a press bound for
 //! the terminal goes out as ESC + the key, so AppKit must not compose it; a GUI
 //! text field (the find bar, the inline rename, the palette, a native page)
 //! types what Option composes (German Option+L is '@', Option+e e is 'é'), as
@@ -199,7 +199,7 @@ fn the_sync_carries_each_change_to_the_window() {
 /// window's Option is an Alt, the event AppKit then hands over (German
 /// Option+Shift+2 reads '"' without Option: ESC '"'). While Option composes, the
 /// text is what it composed ('„'), so the chord goes out as ESC and the US
-/// table's glyph, as before ATERM-KI-1015-9.
+/// table's glyph, as before .
 #[cfg(target_os = "macos")]
 #[test]
 fn an_option_chord_carries_the_layouts_character_only_while_option_is_an_alt() {
@@ -244,7 +244,7 @@ fn an_option_chord_carries_the_layouts_character_only_while_option_is_an_alt() {
     );
 }
 
-/// A CHARACTER ONLY OPTION REACHES IS TYPED IN META MODE (ATERM-KI-1015-9). While
+/// A CHARACTER ONLY OPTION REACHES IS TYPED IN META MODE. While
 /// the window's Option is an Alt, an Option chord goes out as ESC and the key,
 /// except one whose layout reaches its character only with Option
 /// ([`crate::platform::OptionOnly`], here a German-shaped fake): Option+L types

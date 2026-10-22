@@ -141,7 +141,7 @@ mod render_fx;
 pub mod scrollback;
 pub mod search;
 
-/// Sixel graphics decoder (extracted to `aterm-sixel` crate).
+/// Sixel graphics decoder (the `aterm-sixel` crate).
 pub(crate) use aterm_sixel as sixel;
 pub mod terminal;
 pub(crate) mod vt_level;

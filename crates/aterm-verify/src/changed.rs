@@ -29,9 +29,7 @@ use std::process::Command;
 use crate::scope::Scope;
 use crate::toolchain::Toolchain;
 
-// ---------------------------------------------------------------------------
 // The inputs, as values
-// ---------------------------------------------------------------------------
 
 /// One workspace member, as the resolved graph reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,9 +139,7 @@ impl<S: Into<String>> FromIterator<(S, Option<S>)> for Manifests {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The result
-// ---------------------------------------------------------------------------
 
 /// What the selection decided.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -398,9 +394,7 @@ fn differing<'a>(
     keys
 }
 
-// ---------------------------------------------------------------------------
 // The pure selection
-// ---------------------------------------------------------------------------
 
 /// The parent directory of a repo-relative path; `""` at the top.
 fn parent_dir(path: &str) -> &str {
@@ -623,9 +617,7 @@ pub fn default_base(root: &Path, path_env: &OsStr) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Fetching the inputs. The only judgement here is "I could not read this".
-// ---------------------------------------------------------------------------
 
 /// Run the cone's selection against a real repo.
 #[must_use]

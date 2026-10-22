@@ -253,7 +253,6 @@ fn display_detail(d: &Display) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
 // The VM's keyboard, tablet and screens
 
 fn qmp(l: &Layout, command: String) -> Result<(), String> {
@@ -333,7 +332,6 @@ fn shot(l: &Layout, path: &Path, device: Option<&str>) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
 // One aterm-gui in the desktop
 
 struct Session<'a> {
@@ -667,7 +665,6 @@ impl<'a> Watch<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The rows
 
 /// One row: its name, and a pass's detail or a failure's.

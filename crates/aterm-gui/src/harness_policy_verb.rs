@@ -27,7 +27,7 @@
 //!   way aterm's own continuation is ([`continuation_text`]);
 //! - `questions=`, resolved: the session's own `meta questions` word over
 //!   `answer_questions` (off reads `ask`) and `question_priority`;
-//! - then FOREVER CRUISE / FOREVER LAND's fixed words, ADDITIVE keys after
+//! - then Autopilot Cruise / Land's fixed words, ADDITIVE keys after
 //!   `questions=` (the codex-alab contract's §3; owner 2026-10-19, "we need
 //!   this functionality in ALL HARNESSES"), each the exact text aterm's own
 //!   loop types for this session ([`act_texts`]), so a self-supervising agent
@@ -134,7 +134,7 @@ pub(crate) const ACT_TEXT_KEYS: [&str; 6] = [
     "needs_ack_text",
 ];
 
-/// FOREVER CRUISE / FOREVER LAND's fixed words as aterm's own loop types them
+/// Autopilot Cruise / Land's fixed words as aterm's own loop types them
 /// for a session whose standing rules read `rules` (module doc), keyed by
 /// [`ACT_TEXT_KEYS`]: the four whole acts through the turn-end policy's own
 /// composers (the rules after the words), the two suffixes bare.
@@ -500,7 +500,7 @@ mod tests {
     }
 
     /// THE SIX ADDITIVE TEXTS ARE aterm's OWN WORDS, AS ITS LOOP TYPES THEM
-    /// (the codex-alab contract's §3, FOREVER CRUISE / FOREVER LAND): after
+    /// (the codex-alab contract's §3, Autopilot Cruise / Land): after
     /// `questions=`, `done_check_text`, `land_text`, `land_nudge_text` and
     /// `land_answer_text` are the turn-end policy's own acts — its constants
     /// with no rules standing, and with rules standing composed exactly as

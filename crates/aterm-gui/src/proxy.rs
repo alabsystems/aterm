@@ -1297,11 +1297,9 @@ fn deliver_then_relay(
     // Prove the host is serving before it is handed the line, then send the
     // line as the next request.
     prove_host_serving(&child, &token, accept_within)?;
-    // The host's pid is read NOW, while the connection is surely up: Darwin answers
-    // `ENOTCONN` to `LOCAL_PEERPID` once the peer has closed, and the host this
-    // exists for (an update's Commit `_exit`s it) hangs up as soon as it has read
-    // the verb - read after the delivery, a relay that was descheduled between the
-    // two found no pid, and the client a bare EOF instead of `ERR gone`.
+    // The host's pid is read now, while the connection is surely up: Darwin answers
+    // `ENOTCONN` to `LOCAL_PEERPID` once the peer has closed, and an updating host
+    // (its Commit `_exit`s) hangs up as soon as it has read the verb.
     let pid = aterm_uds::fdpass::peer_pid(&child).ok();
     (&child).write_all(line.as_bytes())?;
     (&child).write_all(b"\n")?;

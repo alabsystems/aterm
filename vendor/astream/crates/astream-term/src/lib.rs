@@ -68,6 +68,6 @@ pub use render::{
     Image,
 };
 pub use screen::{
-    apply_ops, emit_ops, fold, screen_clamp_dim, screen_coord_in_bounds, Cell, Color, Folder,
-    Screen,
+    apply_ops, dec_special_graphic, emit_ops, fold, screen_clamp_dim, screen_coord_in_bounds, Cell,
+    Charset, Color, Folder, Screen,
 };

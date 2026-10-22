@@ -133,9 +133,9 @@ impl CtlClient {
     /// streams, so the supervisor can tell a `124` timeout and an `ERR usage`
     /// from a failure. `Err` only when the client could not be launched.
     pub fn run_raw(&self, args: &[&str]) -> Result<supervise::CtlReply, String> {
-        // `aterm-ctl` is a console image: a supervisor in a process with no
-        // console (the window's harness host) opened a visible console window
-        // for every request on Windows until `spawnfd::command` decided it.
+        // `aterm-ctl` is a console image: `spawnfd::command` keeps a supervisor
+        // with no console (the window's harness host) from opening a visible
+        // console window per request on Windows.
         let mut cmd = aterm_uds::spawnfd::command(&self.ctl);
         cmd.args(&self.lead);
         if let Some(s) = &self.socket {

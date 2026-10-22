@@ -786,10 +786,9 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
     }
     read.push(PathBuf::from("/proj/rel/.claude"));
     assert_eq!(reach.map(|r| r.dirs), Ok(read));
-    // And the directory ANY process was started with: a Claude Code the
-    // kernel does not name one (a copy renamed `cc-work`, started with
-    // `CLAUDE_CONFIG_DIR=alt/.claude`) keeps its registry there, which names
-    // the linked session running.
+    // And the directory any process was started with: a renamed Claude Code (`cc-work`,
+    // started with `CLAUDE_CONFIG_DIR=alt/.claude`) keeps its registry there, which names the
+    // linked session running.
     let renamed = Process {
         pid: 4243,
         exe: Some(Exe::At("/u/bin/cc-work".into())),
@@ -868,9 +867,7 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
     );
 }
 
-// ---------------------------------------------------------------------------
 // The report and the pass
-// ---------------------------------------------------------------------------
 
 /// A config with the floor at 10 GiB and the dead-build switch as given.
 fn cfg(dead: bool) -> Config {
@@ -1459,9 +1456,7 @@ fn the_hogs_a_tick_hands_the_window_name_what_the_pass_left() {
     assert_eq!((went.whole, went.in_part), (1, 1), "{:#?}", done.removed);
 }
 
-// ---------------------------------------------------------------------------
 // Ownership and process probes
-// ---------------------------------------------------------------------------
 
 /// An ended session's scratch folder: its temp directory (a task output
 /// in it) and its transcript, both days old by `now`; no build directory.

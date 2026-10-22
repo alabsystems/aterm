@@ -19,9 +19,9 @@
 //!   binary agree;
 //! * signed with the "aterm dev" identity when `ship dev-app identity` made it (grants
 //!   then survive a rebuild), else ad hoc — never distributable, never notarized;
-//! * marked [`DEV_MARK_KEY`] (unless `--no-pin`): the updater's gate is the build
-//!   number, and a dev build of an older commit sits below the channel head, so without
-//!   the mark the next background check silently replaces it.
+//! * marked [`DEV_MARK_KEY`] (unless `--no-pin`), which the updater leaves alone: a dev
+//!   build of an older commit sits below the channel head, so without the mark the
+//!   updater tries it, and every update fails on it.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -55,39 +55,38 @@ const APPLICATIONS: &str = "/Applications";
 pub const USAGE: &str = "
   targo --unverified ship dev-app [--sign-id IDENTITY] [--out DIRECTORY]
                  [--no-install | --install-dir DIRECTORY] [--no-link] [--no-pin]
-      Build THIS checkout, dirty or not, into `aterm (dev).app`: its own bundle id
-      (com.aterm.aterm.dev), this Mac's slice only, HEAD's committer epoch as its
-      build number, the Trust toolchain the cutter resolves (`targo --unverified
-      build --release -p aterm`). Sign it locally and install it beside the release.
-      Nothing is claimed, notarized or published.
+      Build this checkout, dirty or not, into `aterm (dev).app` with the Trust
+      toolchain the cutter resolves (`targo --unverified build --release -p
+      aterm`): its own bundle id (com.aterm.aterm.dev), this Mac's slice only,
+      HEAD's committer epoch as its build number. It is signed locally and
+      installed beside the release; nothing is claimed, notarized or published.
         --sign-id IDENTITY  sign with this codesign identity; `-` signs ad hoc.
                             Default: the \"aterm dev\" identity once `ship dev-app
                             identity` made it (macOS privacy grants then survive a
-                            rebuild), else ad hoc; a STOP, with the reason, when
-                            its keychain exists but cannot be used
+                            rebuild), else ad hoc; refuses, saying why, when its
+                            keychain exists but cannot be used
         --out DIRECTORY     assemble there (default: dist/)
         --no-install        assemble only
         --install-dir DIRECTORY
-                            install there, not in /Applications (~/Applications
-                            when /Applications is not writable); LaunchServices is
-                            told only of an install in those two
-        --no-link           leave `aterm` and `amacs` on PATH (~/.local/bin) as
-                            they are; by default a link there is pointed at this
-                            build, which never updates, and what it displaced is
-                            named (a regular file there is always left alone)
+                            install there instead of /Applications (or
+                            ~/Applications when /Applications is not writable);
+                            only an install in those is told to LaunchServices
+        --no-link           leave ~/.local/bin/aterm as it is; by default a link
+                            there is pointed at this build, which never updates,
+                            and what it displaced is named (a file that is not a
+                            link is left alone)
         --no-pin            omit the ATermDevBuild mark: the updater then tries
-                            this install and every apply fails
+                            this install and every update fails
 
   targo --unverified ship dev-app identity [--remove] [--keychain FILE]
       Make the self-signed \"aterm dev\" code-signing identity `ship dev-app` signs
       with by default, in ~/Library/Keychains/aterm-dev.keychain-db (empty
-      password, never locks, put on the search list): no dialog, nothing typed.
+      password, never locks, on the search list): no dialog, nothing typed.
       Idempotent; ends by signing a scratch bundle with it.
-        --remove            delete that keychain — only one that opens with the
-                            empty password; grants made under it die once
-        --keychain FILE     act on FILE instead; it is never put on the search
-                            list, so codesign cannot sign with it from there and
-                            the signing self-check is skipped
+        --remove            delete that keychain (only one that opens with the
+                            empty password); privacy grants made under it are lost
+        --keychain FILE     act on FILE instead; it is not put on the search list,
+                            so the signing self-check is skipped
 ";
 
 /// A parsed `ship dev-app …`.

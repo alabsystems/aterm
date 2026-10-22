@@ -860,8 +860,7 @@ mod tests {
         }
     }
 
-    /// A plain single-`char` cell (the kind a `=>` operator occupies). All
-    /// rendition flags off so it is shapeable by default.
+    /// A plain single-`char` cell with every rendition flag off.
     fn cell(ch: char) -> RenderCell {
         RenderCell {
             ch,

@@ -139,8 +139,8 @@ struct DayFile {
 }
 
 /// One day's ends on disk ([`AbEnds`]). An older build's `done` and `quiet`
-/// counts (Cruise's dones, Land's quiet ends, both gone under FOREVER CRUISE /
-/// FOREVER LAND) are unknown fields here, passed over.
+/// counts (Cruise's dones, Land's quiet ends, both gone under Autopilot Cruise /
+/// Autopilot Land) are unknown fields here, passed over.
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct EndsFile {
     /// Land's landings.

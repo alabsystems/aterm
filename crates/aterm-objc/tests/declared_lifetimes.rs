@@ -28,9 +28,7 @@ fn mtm() -> aterm_objc::MainThread {
     unsafe { aterm_objc::MainThread::new_unchecked() }
 }
 
-// ---------------------------------------------------------------------------
 // The +0 object return, by retain count.
-// ---------------------------------------------------------------------------
 
 struct OwnerIvars {
     calls: Cell<i64>,
@@ -141,9 +139,7 @@ fn an_autoreleased_return_is_at_plus_one_owned_by_the_pool() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // A sixteen-byte aligned ivar.
-// ---------------------------------------------------------------------------
 
 /// An ivar that needs 16-byte alignment (`class_addIvar` takes it as log2 4).
 #[repr(align(16))]

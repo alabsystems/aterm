@@ -295,14 +295,10 @@ pub(super) fn drain(pipe: [i32; 2]) -> Vec<u8> {
     bytes[..read as usize].to_vec()
 }
 
-/// A frame observing a key is presented on the key's own clock. Every
-/// licence a key banks (typed stamp, Return, newline, nav, quench, gesture)
-/// is fresh for a quarter second from its edge (the dispatch for an inline
-/// key, the writer's completed write for a queued one), and the render
-/// prelude judges it at the observing frame's clock. Reading that clock off
-/// `Instant::now()` after polling the FIFO writer would judge it at the
-/// scheduler's whim; the observing frame is presented at most one refresh
-/// after the edge.
+/// A frame observing a key is presented at most one refresh after the key's edge (its dispatch
+/// inline, the writer's completed write when queued). The licences a key banks (typed stamp,
+/// Return, newline, nav, quench, gesture) are fresh for a quarter second from that edge and are
+/// judged at the observing frame's clock, not at `Instant::now()` after polling the FIFO writer.
 #[cfg(unix)]
 pub(super) const OBSERVING_FRAME: Duration = Duration::from_millis(16);
 

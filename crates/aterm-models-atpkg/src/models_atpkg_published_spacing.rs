@@ -6,17 +6,14 @@
 
 use aterm_spec::derive::*;
 
-/// The pass-end writer binds a requested or resolved index to the outcome and
-/// end time in one durable record. `target` is 0 unknown, 1 old build 44, or 2
-/// current build 45. `current` says that witness belongs to the latest attempt;
-/// older schemas and a later unrelated attempt fail closed. Both readers run
-/// for a strictly newer 45 only with that witness and no live holder (there is
-/// no metered hold: the pass makes no metered request, owner ruling R3).
-/// `Buggy=1` reverses the run/wait verdict at the shared reader
-/// boundary: it catches both the old blanket wait for a fresh higher target
-/// and unsafe bypasses of each spacing guard. `Buggy=2` bypasses every target
-/// independently (catches duplicate failed 45).
-/// Tier-1 drives the real status writer/parser, GUI gate and queued CLI child.
+/// The pass-end writer binds a requested or resolved index to the outcome and end time in one
+/// durable record. `target` is 0 unknown, 1 old build 44, 2 current build 45. `current` says
+/// that witness belongs to the latest attempt; older schemas and a later unrelated attempt
+/// fail closed. Both readers run for a strictly newer 45 only with that witness and no live
+/// holder. `Buggy = 1` reverses the run/wait verdict at the shared reader boundary (catching
+/// both a blanket wait for a fresh higher target and unsafe bypasses of each spacing guard);
+/// `Buggy = 2` bypasses every target independently (a duplicate failed 45). Tier 1 drives the
+/// real status writer/parser, GUI gate and queued CLI child.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_published_spacing_model() -> Model {

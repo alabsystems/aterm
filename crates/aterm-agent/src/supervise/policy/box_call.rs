@@ -15,7 +15,7 @@
 //! captures), and `Read file` is every read-only file tool's. So the owner's
 //! ask rule or hook for any of those tools holds the box
 //! (`approval.rs`'s `settings_ask`), and a status hook with matcher `*` holds
-//! every Edit of the session (ATERM-KI-1015-1 F1, the over-hold).
+//! every Edit of the session (F1, the over-hold).
 //!
 //! [`drew`] returns a transcript candidate ([`BoxCall`]) where the screen
 //! shape passes [`box_may_prove`], every unspent pending call names one
@@ -24,7 +24,7 @@
 //! These conditions do not bind a call to the current box: an older call
 //! can remain pending while a later box is already on screen.
 //!
-//! THE SCREEN'S WORD (ATERM-KI-1016-1, MEASURED 2026-10-18 on 2.1.303, and
+//! THE SCREEN'S WORD (MEASURED 2026-10-18 on 2.1.303, and
 //! in the 2.1.295 and 2.1.300 captures): the rows above the box tell the two
 //! tools of an `Edit file` box apart where its own rows cannot. The Edit
 //! tool's call row stands childless, `⏺ Update(notes.txt)`, while its box
@@ -41,8 +41,16 @@
 //! tool it stood there 350 ms after the box. The candidate reader can retry while
 //! it names no call the box may be ([`LAG_TRIES`], [`LAG_STEP`],
 //! [`lagging`]). Waiting does not establish identity, and the loop does
-//! not perform these reads where the owner's hold cannot be lifted.
+//! not perform these reads where the owner's hold cannot be lifted, which
+//! today is everywhere: the loop asks for a candidate only where
+//! `approval::proof_would_lift` holds, an owner hold (`settings_ask`) that
+//! some candidate would lift, and `decide` escalates at that hold whatever
+//! the candidate, so it never holds and no Edit or Write candidate is read
+//! or written to the tape (`facts.box_call` stays `None`). [`pending_calls`]
+//! is read at runtime only by the Bash lane
+//! ([`super::box_command::pending_bash`]).
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -64,13 +72,15 @@ pub const LAG_TRIES: u32 = 4;
 /// this interval; waiting it does not establish current-call identity.
 pub const LAG_STEP: Duration = Duration::from_millis(250);
 
-/// A main-chain tool call with no result yet: its id, its tool, and the file
-/// it names (`file_path`, or a notebook's `notebook_path`).
+/// A main-chain tool call with no result yet: its id, its tool, the file it
+/// names (`file_path`, or a notebook's `notebook_path`) and a Bash call's
+/// `command`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingCall {
     pub id: String,
     pub tool: String,
     pub file: Option<String>,
+    pub command: Option<String>,
 }
 
 /// A matching transcript candidate ([`drew`]), without current-box identity.
@@ -80,20 +90,39 @@ pub struct BoxCall {
     pub id: String,
 }
 
-/// The main chain's calls with no result, in a transcript tail. Only `user`
-/// and `assistant` rows count, and no subagent's (`isSidechain`): an
-/// assistant row's calls are added, a user row's results take theirs away,
-/// and a user row with no result (a person's turn, a task notification, a
-/// meta row) ends every call before it. Any row that does not parse is
-/// passed over, including an internal malformed row as well as a torn tail
-/// boundary; the result does not attest complete or current evidence.
+/// THE MAIN CHAIN'S CALLS WITH NO RESULT, in a transcript tail, IN THE
+/// CONVERSATION'S ORDER (the one reader of both box lanes: this module's and
+/// [`super::box_command::pending_bash`]). Only `user` and `assistant` rows
+/// count, and no subagent's (`isSidechain`). An assistant row's `tool_use`
+/// parts are calls; a `tool_result` in any user row of the tail answers its
+/// call, wherever it is written; and a user row with no result (a person's
+/// turn, an interrupt's note, a task notification, a meta row) ends every
+/// call written before it, unless it is that call's own ANCESTOR (on the
+/// call row's `parentUuid` chain, followed through every row of the tail that
+/// has a `uuid`, attachments included). MEASURED 2026-10-22: Claude Code
+/// 2.1.307 (a bypass session's first Bash call) and 2.1.308 (two of six
+/// first-turn Edit calls and one of four first-turn Write calls, manual
+/// mode) wrote the assistant row of a first turn's call BEFORE the prompt
+/// row and the attachment rows the call's `parentUuid` chain runs up
+/// through, so in the file's order the call's own prompt follows it
+/// (`docs/measured/breaker-transcript-and-zsh-2026-10-22.md` §P). The calls
+/// come in the file's order. Any row that does not parse is passed over,
+/// including an internal malformed row as well as a torn tail boundary; the
+/// result does not attest complete or current evidence.
 #[must_use]
 pub fn pending_calls(jsonl: &str) -> Vec<PendingCall> {
-    let mut pending: Vec<PendingCall> = Vec::new();
-    for line in jsonl.lines() {
+    let mut parent: HashMap<String, String> = HashMap::new();
+    let mut calls: Vec<(usize, Option<String>, PendingCall)> = Vec::new();
+    let mut answered: Vec<String> = Vec::new();
+    let mut prompts: Vec<(usize, Option<String>)> = Vec::new();
+    for (at, line) in jsonl.lines().enumerate() {
         let Ok(row) = crate::harness::transcript::calls(line) else {
             continue;
         };
+        let uuid = row.get("uuid").and_then(Value::as_str).map(str::to_owned);
+        if let (Some(u), Some(p)) = (uuid.as_ref(), row.get("parentUuid").and_then(Value::as_str)) {
+            parent.insert(u.clone(), p.to_owned());
+        }
         let kind = row.get("type").and_then(Value::as_str);
         if !matches!(kind, Some("user" | "assistant"))
             || row.get("isSidechain").and_then(Value::as_bool) == Some(true)
@@ -114,33 +143,68 @@ pub fn pending_calls(jsonl: &str) -> Vec<PendingCall> {
                     continue;
                 };
                 let input = p.get("input");
-                let file = ["file_path", "notebook_path"]
-                    .iter()
-                    .find_map(|k| input.and_then(|i| i.get(k)).and_then(Value::as_str));
-                pending.push(PendingCall {
-                    id: id.to_owned(),
-                    tool: tool.to_owned(),
-                    file: file.map(str::to_owned),
-                });
+                let arg = |k: &str| {
+                    input
+                        .and_then(|i| i.get(k))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                };
+                calls.push((
+                    at,
+                    uuid.clone(),
+                    PendingCall {
+                        id: id.to_owned(),
+                        tool: tool.to_owned(),
+                        file: arg("file_path").or_else(|| arg("notebook_path")),
+                        command: arg("command"),
+                    },
+                ));
             }
             continue;
         }
-        let results: Vec<&Value> = parts
+        let results: Vec<String> = parts
             .iter()
             .filter(|p| part_type(p) == Some("tool_result"))
+            .filter_map(|p| p.get("tool_use_id").and_then(Value::as_str))
+            .map(str::to_owned)
             .collect();
         if results.is_empty() {
-            pending.clear();
+            prompts.push((at, uuid));
         } else {
-            let answered = |c: &PendingCall| {
-                results
-                    .iter()
-                    .any(|r| r.get("tool_use_id").and_then(Value::as_str) == Some(c.id.as_str()))
-            };
-            pending.retain(|c| !answered(c));
+            answered.extend(results);
         }
     }
-    pending
+    let ended = |at: usize, of: Option<&String>| {
+        prompts.iter().any(|(row, prompt)| {
+            *row > at
+                && !matches!(
+                    (prompt, of),
+                    (Some(prompt), Some(of)) if ancestor(&parent, of, prompt)
+                )
+        })
+    };
+    calls
+        .into_iter()
+        .filter(|(at, of, c)| !answered.contains(&c.id) && !ended(*at, of.as_ref()))
+        .map(|(_, _, c)| c)
+        .collect()
+}
+
+/// Whether `who` is on the `parentUuid` chain above the row `of`, followed
+/// through `parent` (each row's `uuid` to its parent's) for at most as many
+/// steps as it has rows: a chain that leaves the tail, or loops, is no proof.
+fn ancestor(parent: &HashMap<String, String>, of: &str, who: &str) -> bool {
+    let mut at = of;
+    for _ in 0..parent.len() {
+        let Some(up) = parent.get(at) else {
+            return false;
+        };
+        if up == who {
+            return true;
+        }
+        at = up;
+    }
+    false
 }
 
 /// A content part's `type`.

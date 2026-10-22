@@ -14,8 +14,7 @@ autotests = false
 
 [dependencies]
 aterm-core = { workspace = true }
-# The paint scanner decodes captured frames with the workspace's one PNG
-# decoder, and reads a recording's index.json with its one JSON parser.
+# The paint scanner's PNG decoder and its recording index.json parser.
 aterm-png = { workspace = true }
 aterm-json = { workspace = true }
 

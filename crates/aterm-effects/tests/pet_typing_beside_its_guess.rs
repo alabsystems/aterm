@@ -938,12 +938,13 @@ fn a_stand_between_two_legs_lasts_a_stride() {
     let mut control = Host::new(&TAKES[0], Knobs::SHIPPED);
     control.present();
     let first = control.shots[0];
-    let with = |pose| Shot {
-        frame: PetFrame {
-            pose,
-            ..first.frame
-        },
-        ..first
+    // Field writes, not `..first` in a closure: stock rustc 1.95 (the cross
+    // cells' compiler) breaks its MIR on that update syntax over these
+    // frames' array fields.
+    let with = |pose| {
+        let mut shot = first;
+        shot.frame.pose = pose;
+        shot
     };
     use aterm_effects::pet_glyphs_gen::PetGlyphId::{PetRun0, PetSit, PetStand, PetWalk1};
     let shots: Vec<Shot> = [
@@ -951,9 +952,10 @@ fn a_stand_between_two_legs_lasts_a_stride() {
     ]
     .into_iter()
     .enumerate()
-    .map(|(i, pose)| Shot {
-        ms: i as u64 * 8,
-        ..with(pose)
+    .map(|(i, pose)| {
+        let mut shot = with(pose);
+        shot.ms = i as u64 * 8;
+        shot
     })
     .collect();
     assert_eq!(motion(&shots, 8).stands, [(8, 16)]);
@@ -1561,14 +1563,13 @@ fn no_pose_is_a_one_frame_flash() {
     let shots: Vec<Shot> = [PetSit, PetRun0, PetRun1, PetStand, PetSit, PetSit]
         .into_iter()
         .enumerate()
-        .map(|(i, pose)| Shot {
-            ms: i as u64 * 8,
-            frame: PetFrame {
-                pose,
-                alpha: 255,
-                ..first.frame
-            },
-            ..first
+        // Field writes, as in `a_stand_between_two_legs_lasts_a_stride`.
+        .map(|(i, pose)| {
+            let mut shot = first;
+            shot.ms = i as u64 * 8;
+            shot.frame.pose = pose;
+            shot.frame.alpha = 255;
+            shot
         })
         .collect();
     let measured: Vec<(u64, &str, u64)> = pose_runs(&shots)

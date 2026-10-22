@@ -474,7 +474,7 @@ pub(crate) fn is_restart_signal(sig: libc::c_int) -> bool {
     )
 }
 
-/// Whether the PTY `master`'s foreground job is STOPPED (`SIGSTOP`/`SIGTSTP`):
+/// Whether the PTY `master`'s foreground job is stopped (`SIGSTOP`/`SIGTSTP`):
 /// its group leader's `pbi_status` is `SSTOP` (macOS) or `/proc/<pid>/stat`
 /// state is `'T'`/`'t'` (Linux). `false` when unknown.
 pub(crate) fn fg_stopped(master: i32) -> bool {
@@ -1855,15 +1855,15 @@ impl crate::App {
         }
     }
 
-    /// At Commit, probe every ADOPTED session's input (`handoff_local_id` set)
-    /// once, as its attach wake would have: the wake that attach posted was
-    /// dropped before Commit ([`Self::release_input_wake_dropped_before_commit`]),
-    /// and bytes the predecessor queued between the reader's prepare and
-    /// Commit are announced by no wake at all. Each probe rearms the hook
-    /// first ([`Self::observe_input_stalls`]), so a session with nothing
-    /// unread is left idle — no watch, no deadline — and one with input
-    /// unread is watched from here, its bytes dated from the sink's birth.
-    /// Returns the sessions whose publication moved.
+    /// At Commit, probe every adopted session's input (`handoff_local_id` set)
+    /// once, as its attach wake would have: that wake was dropped before Commit
+    /// ([`Self::release_input_wake_dropped_before_commit`]), and bytes the
+    /// predecessor queued between the reader's prepare and Commit are announced
+    /// by no wake at all. Each probe rearms the hook first
+    /// ([`Self::observe_input_stalls`]), so a session with nothing unread is
+    /// left idle and one with input unread is watched from here, its bytes
+    /// dated from the sink's birth. Returns the sessions whose publication
+    /// moved.
     #[cfg(unix)]
     pub(crate) fn rewatch_adopted_input(&mut self, now: Instant) -> Vec<u64> {
         let adopted: Vec<u64> = self
@@ -1949,7 +1949,7 @@ pub(crate) mod tests {
 
     use super::*;
 
-    /// Past [`input_backlog::WARN_AFTER`] with margin: the plan's 1.1 s.
+    /// Past [`input_backlog::WARN_AFTER`] with margin.
     #[cfg(target_os = "macos")]
     const TICK: Duration = Duration::from_millis(1100);
 
@@ -3836,7 +3836,7 @@ pub(crate) mod tests {
         // Another holder's claim: it restarts nothing.
         claim("manager@4242");
         assert!(!restarts(&relaunching), "another holder");
-        // NEGATIVE CONTROL: the host's own claim, a launch it would plan.
+        // Negative control: the host's own claim, a launch it would plan.
         claim(&crate::harness_host::holder());
         assert!(restarts(&relaunching), "the host restarts it");
     }

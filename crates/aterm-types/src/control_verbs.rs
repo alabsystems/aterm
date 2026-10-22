@@ -828,8 +828,7 @@ impl VerbSpec {
         self
     }
 
-    /// The verb's FULL help text: `summary`, then `detail` after one space when there
-    /// is any.
+    /// The verb's full help text: `summary`, then `detail` after one space when there is any.
     #[must_use]
     pub fn help_line(&self) -> String {
         if self.detail.is_empty() {
@@ -1155,13 +1154,10 @@ pub const VERBS: &[VerbSpec] = &[
     )
     // Outside the halt: the `help` alias.
     .input(Input::NONE),
-    // The macOS consent posture: instance-wide, self-scoped, and `AnyScopeMeta` for
-    // the same reason `version` is — an agent that just took an EPERM has to be able
-    // to ask a `--headless` instance what its permission state is. `Read`, not
-    // `Owner`: every fact here is one `status` already exposes a session at a time
-    // (so an edge's report carries only the sessions it may read),
-    // or an instance-level fact about this Mac that any program running as this
-    // user can read for itself (`DevToolsSecurity -status`, the unified log).
+    // The macOS consent posture: `AnyScopeMeta` like `version`, so an agent that just took
+    // an EPERM can ask a `--headless` instance. `Read`, not `Owner`: each fact is one `status`
+    // exposes per session (an edge sees only sessions it may read) or one any program running
+    // as this user can read for itself.
     va(
         "privacy",
         Read,
@@ -1361,9 +1357,9 @@ pub const VERBS: &[VerbSpec] = &[
          included; an adopted shell nothing was carried for counts from the successor's \
          Commit); \"inputs\":[<n|null>,<n>], just before submits: how many input writes of any kind \
          (keys, text, pastes, raw bytes, whoever sent them; never a report) this instance had \
-         made to the session before the rows were read, null while one was still in flight, \
-         and after them, so a later read's second equal to an earlier read's first says no \
-         key reached the session between the two screens; \"submits\":<n> ends the object: \
+         attempted before the rows, null with an active write, partial frame or buffered spill, \
+         and after them; equal counts exclude new attempts and known buffered input, not \
+         delayed child handling of kernel-queued input; \"submits\":<n> comes next: \
          how many Enters this instance has \
          written to the session's program over something typed since the Enter before \
          (a plain Enter key, keypad Enter, or a CR in raw bytes, after any key that is no \
@@ -1371,7 +1367,10 @@ pub const VERBS: &[VerbSpec] = &[
          window, a `send`/`key`/`paste`/`feed`/`turn` — counted as the sink accepts the \
          write and read after the rows, so rows that show a submission's answer come with a \
          count that holds it; an Enter over nothing typed since the last is none, and a \
-         session carried across a seamless update starts again at 0",
+         session carried across a seamless update starts again at 0; \"frame\":\"open\" \
+         ends the object only while the program's DEC 2026 frame is unfinished (read under \
+         the rows' lock, never past its 60 s hang detector): the rows are a prefix of a \
+         redraw the PTY's reads split, so read again after `await frame`",
     )
     .json(Json::Emits),
     v(
@@ -1417,9 +1416,8 @@ pub const VERBS: &[VerbSpec] = &[
         "[truncated=<lost>]",
     )
     .json(Json::Refused),
-    // LINES framing, not `lines`'s Status: the reply is `OK <n> …` + n rows, and the
-    // client picks its framing from this row (`framing_of`), so a Status row would
-    // make `aterm ctl offscreen` print the header and drop every row.
+    // Lines framing, unlike `lines`: the client picks its framing from this row
+    // (`framing_of`), so Status would make `aterm ctl offscreen` drop every row.
     v(
         "offscreen",
         Read,
@@ -1433,7 +1431,7 @@ pub const VERBS: &[VerbSpec] = &[
          16 ms for an app that sends \
          none) with the one before. Reply `OK <n> first=<i> last=<j> lost=<k> breaks=<b> back=<d> \
          [back_at=<i> pin=<p>] epoch=<e> origin=<o> alt=<0|1> seq=<s> [enabled=0] [more=1] \
-         [screen_rows=<m>]` then n lines, oldest first: line m is archived row first+m, and last= \
+         [frame=open] [screen_rows=<m>]` then n lines, oldest first: line m is archived row first+m, and last= \
          is the reply's own last row. since= is exclusive, so page and poll with since=<last>; \
          since=<origin>:<i> (a `history` arch= mark) from another origin reads from the start and \
          origin= shows it; an index past the newest is `ERR bad since`. An aterm self-update \
@@ -1449,14 +1447,15 @@ pub const VERBS: &[VerbSpec] = &[
          back= how many archived rows the screen shows again: screen rows pin..pin+back are \
          archived rows back_at.. (pin= header rows above them). enabled=0: the archive is off, so \
          nothing that scrolled away was kept. screen=1 appends the current screen rows, read \
-         under the same lock: n counts them too, and they are the last screen_rows=<m> lines. \
+         under the same lock: n counts them too, and they are the last screen_rows=<m> lines; \
+         frame=open with them says the program's DEC 2026 frame was unfinished at the read (as \
+         `text --json`'s \"frame\":\"open\"), so read again after `await frame`. \
          Anything else is `ERR usage: offscreen [since=<i>] [tail=<n>] [max=<n>] [screen=1]`; \
          there is no --json form",
     )
     .json(Json::Refused),
-    // Write, not Read: it moves the screen the driven program's next byte lands
-    // on, which is not view state — a read-only edge must not be able to pull a
-    // running full-screen app off its screen. No PTY byte, so not `feed`.
+    // Write, not Read: it moves the screen the driven program's next byte lands on, so a
+    // read-only edge must not pull a full-screen app off its screen. No PTY byte, so not `feed`.
     v(
         "mainscreen",
         Write,
@@ -1728,10 +1727,8 @@ pub const VERBS: &[VerbSpec] = &[
         "",
     )
     .json(Json::Refused),
-    // `copy` is the EXFIL BOUNDARY: it moves the selection OUT of the process onto
-    // the system clipboard, so it is `ClipboardWrite`, not `Read`. `scroll`/`select`
-    // (below) stay `Read` — viewport nav is part of reading and nothing leaves the
-    // process. A read-only edge can pan and select but cannot exfiltrate.
+    // `copy` is the exfil boundary: it moves the selection out of the process, so it is
+    // `ClipboardWrite`. `scroll`/`select` stay `Read`: nothing leaves the process.
     v(
         "copy",
         ClipboardWrite,
@@ -1877,9 +1874,8 @@ pub const VERBS: &[VerbSpec] = &[
     // Outside the halt: posts a row on the pull-down status bars or a note to their record
     // (chrome, not the grid), and it is Owner-only besides.
     .input(Input::NONE),
-    // `messages` is the unified message system's READ face: the log the band and
-    // Settings ▸ Messages show, one engine-built row per record (design rulings
-    // 163-198). `appstatus` stays its toolchain/update/harness projection.
+    // `messages` is the unified message system's read face: the log the band and Settings ▸
+    // Messages show. `appstatus` stays its toolchain/update/harness projection.
     v(
         "messages",
         Read,
@@ -2774,7 +2770,8 @@ pub const VERBS: &[VerbSpec] = &[
          ticket=<t> view=<v>`, for any caller, and so do `hwkey`, `invoke Paste` and every \
          `pointer` but `pointer status` while this session's tab is the one on screen. \
          `bells=` counts the BELs this session's programs rang (the bell that may play the \
-         Mac's alert sound), `bells_sounded=` how many of them played it, and `last_bell=` \
+         Mac's alert sound; BELs under 100 ms apart, one write's or a flood's, ring and \
+         count once), `bells_sounded=` how many of them played it, and `last_bell=` \
          keeps the last four, the newest first, each as how long ago it rang (ms), what \
          became of its sound — `sounded`, else the gate that kept it quiet: `headless` (a \
          headless instance never beeps), `serious` (serious mode), `off` (`bell_sound = \
@@ -3994,12 +3991,10 @@ pub const VERBS: &[VerbSpec] = &[
     ),
     v("mouse", Write, Status, Session, "inject a mouse event", "")
     .input(DRIVEN.with(Input::STAMPS_SEQ)),
-    // `pointer` is `Write` because it drives the WINDOW's pointer through the very
-    // entry point winit's `CursorMoved` calls, and under DEC 1000/1002/1003 that
-    // motion is REPORTED to the driven program — `Op::WriteInput`'s own doc lists
-    // the mouse in the human vocabulary. It deliberately reports NOTHING derived
-    // from the grid: `link=` here would hand a keystroke-only edge a fact only
-    // `cell` (`Read`) is entitled to answer, and write does not imply read.
+    // `pointer` is `Write`: it drives the window's pointer through winit's `CursorMoved` entry
+    // point, and under DEC 1000/1002/1003 that motion reaches the driven program. It reports
+    // nothing derived from the grid: `link=` would hand a keystroke-only edge what only `cell`
+    // (`Read`) may answer.
     v(
         "pointer",
         Write,
@@ -4256,12 +4251,9 @@ pub const VERBS: &[VerbSpec] = &[
     // verb and a gate keyed on its arguments are the pair of literals that disagreed before.
     // A driver cannot navigate tabs while a halt stands; the human still can.
     .input(Input::PTY),
-    // `pane` is `tab`'s within-a-window twin and carries `tab`'s class for `tab`'s
-    // reason: choosing which pane the keyboard drives is an input-routing authority,
-    // so a read-only edge must not be able to redirect the human's next keystroke.
-    // Its reply is one bit about the caller's OWN act — strictly less than the tab
-    // COUNT `tab` already hands a write edge — so it needs no read authority beside
-    // it; `panes` (`Read`) is what answers where focus went and what the rects are.
+    // `pane` carries `tab`'s class: choosing which pane the keyboard drives is input routing,
+    // so a read-only edge must not redirect the human's next keystroke. Its reply is one bit
+    // about the caller's own act; `panes` (`Read`) answers where focus went.
     v(
         "pane",
         Write,
@@ -4379,10 +4371,8 @@ pub const VERBS: &[VerbSpec] = &[
     // Outside the halt: dispatches a semantic action against a native app view, not the
     // grid.
     .input(Input::NONE),
-    // `settings set|unset` atomically REWRITES the durable on-disk `aterm.toml`
-    // (flipping default-OFF security knobs), so it is `ConfigWrite` — a strictly
-    // greater authority than the `Write` keystroke class, and NOT carried by a
-    // child's inherited write edge.
+    // `settings set|unset` rewrites the durable `aterm.toml` (including default-off security
+    // knobs), so it is `ConfigWrite`, which a child's inherited write edge does not carry.
     v(
         "settings",
         ConfigWrite,
@@ -4414,9 +4404,8 @@ pub const VERBS: &[VerbSpec] = &[
     // Only an action whose `MenuAction::writes_pty_input` says so writes input; that needs
     // the argument, so the unread-input gate asks it beside this column.
     .input(Input::PTY.with(Input::APP_UNREAD)),
-    // `invoke`'s class and lane: `confirm yes` finishes the close an `invoke` parked
-    // in the window (aterm-gui `close_confirm`), so it retires sessions and is in
-    // the halt set beside `tab`.
+    // `invoke`'s class: `confirm yes` finishes the close an `invoke` parked in the window, so
+    // it retires sessions and is in the halt set beside `tab`.
     v(
         "confirm",
         Write,
@@ -4477,8 +4466,7 @@ pub const VERBS: &[VerbSpec] = &[
     // under any hold (`control_media::person_invoke_act`, `control::app_verb_halt`); it
     // writes no input. A press runs what a click on the menu bar runs.
     .input(Input::NONE),
-    // Runtime-only per-session visual toggle (nothing durable is written); the
-    // observability face scripts/tests read (`status` = one Status line).
+    // Runtime-only per-session visual toggle; `rain status` is the face scripts read.
     v(
         "rain",
         Write,
@@ -4491,11 +4479,9 @@ pub const VERBS: &[VerbSpec] = &[
     )
     // Outside the halt: a visual effect on the window.
     .input(Input::NONE),
-    // Read-only observability for an effect that is otherwise nearly INVISIBLE
-    // by design: PRISM WAKE answers program output with a ~0.10-coverage comet
-    // that lives under a second, so "off", "W11-demoted", "suppressed" and
-    // "resting" all look identical on glass. No write form — the knobs are
-    // durable config (`settings set output_streak.…`).
+    // Read-only observability for an effect that is nearly invisible by design (a faint comet
+    // under a second long), so its off, suppressed and resting states look alike on glass.
+    // The knobs are durable config (`settings set output_streak.…`).
     v(
         "streak",
         Read,
@@ -4546,11 +4532,9 @@ pub const VERBS: &[VerbSpec] = &[
     // Outside the halt: arms or reports a window effect; it puts no bytes on a PTY and
     // cannot synthesize the key or command completion that fires it.
     .input(Input::NONE),
-    // Read-only observability for an effect that is otherwise audible-only: the
-    // tone-of-typing mood steering the trail synth's melody, AND the
-    // AUDIBILITY ORACLE — the one verb that must be able to refute "sound is
-    // broken" without a second reading. No write form — the knob is durable
-    // config (`settings set tone_melody`).
+    // Read-only observability for an audible-only effect: the tone-of-typing mood steering
+    // the trail synth's melody, and the oracle that can refute "sound is broken". The knob is
+    // durable config (`settings set tone_melody`).
     v(
         "tone",
         Read,
@@ -4606,9 +4590,8 @@ pub const VERBS: &[VerbSpec] = &[
     // and `fx`. It writes the machine-owned toy ledger, which is why it is Write, but a
     // halted agent changing the cat changes nothing the halted program can see.
     .input(Input::NONE),
-    // Read-only observability for the cursor-trail engine: the last N
-    // licensed/declined verdicts from the fixed-size admission diagnosis ring,
-    // and (`trail status`) the engine's standing state.
+    // Read-only observability for the cursor-trail engine: the admission diagnosis ring's
+    // last verdicts and (`trail status`) the engine's standing state.
     v(
         "trail",
         Read,
@@ -5095,7 +5078,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "await <idle|seq|match|gone|block|inbox|consent|momentum|agent|task|log|sys> … [timeout=]: wait",
+        "await <idle|seq|match|gone|block|frame|inbox|consent|momentum|agent|task|log|sys> …: wait",
         "Full grammar: `await idle <ms>` (no output for that long — measured only while aterm is \
          reading the session: while an update has its reader parked the clock is held, and a \
          whole <ms> is counted again once output flows; `ready` and a `turn`'s idle settle alike), \
@@ -5109,10 +5092,19 @@ pub const VERBS: &[VerbSpec] = &[
          thinks and can sit static for seconds mid-turn, so neither `match` on the prompt nor \
          `idle` says the turn is over, but its busy footer disappearing does — `await gone \
          esc.to.interrupt`, ONE whitespace-free token, since the wire never quotes; \
-         level-triggered like match/seq, so a surface already clear of the \
-         pattern latches at arm; a `rows <a> <b>` span must meet a row of the current grid — \
+         level-triggered like match/seq; gone latches at once on a screen that is a DEC 2026 \
+         frame the program closed with nothing drawn since, and on any other screen only once \
+         every row in range has read clear for 1 s, from the screen's last change for one \
+         clear at arm: a program that brackets nothing (Gemini CLI) can show a redraw split \
+         across reads, its busy row not drawn yet, and a later read finishes it (within \
+         milliseconds, or a few hundred under load); a `rows <a> <b>` span must meet a row of the current grid — \
          `ERR bad rows` otherwise, since an empty span scans nothing and nothing-scanned is \
-         never \"clear\"), `await block` (the running \
+         never \"clear\"; match and gone read WHOLE frames only, never the rows of a DEC 2026 \
+         frame the program has not finished, whose busy footer a read that split it has not \
+         reached yet), `await frame` (that frame is whole: at its `?2026l`, or once reads \
+         have ended inside unfinished frames for 60 s running, the hang detector; at once \
+         with none open — `text --json` says `\"frame\":\"open\"` while one is), `await \
+         block` (the running \
          command completed), `await sys <predicate> [for=<dur>] [scope=tab|aterm]` — THE \
          MACHINE: `<predicate>` is \
          `quiet [<term> …]` or `<term> [and <term> …]`, a term `<metric><op><value>` (op < <= > \
@@ -5428,11 +5420,9 @@ pub const VERBS: &[VerbSpec] = &[
     // A topic reaches no PTY, moves no keyboard and re-aims no seam that writes; refusing it
     // would only stop an operator arming a held session to hear the all-clear.
     .input(Input::NONE),
-    // The TYPED RE-KEY (aterm-gui `shell_rekey::typed`): the live agent
-    // upgrade heals a shell whose integration is degraded in the relaunch line it
-    // types at that shell's prompt. Owner-only because it hands out a key that
-    // lets a session's OSC 133/633 marks through; Session target because it names
-    // the tab; `Owner` op because no fine op authorizes minting mark authority.
+    // The typed re-key (aterm-gui `shell_rekey::typed`): the agent upgrade heals a shell with
+    // degraded integration in the relaunch line it types. Owner-only, `Owner` op: it hands out
+    // a key that lets a session's OSC 133/633 marks through, which no fine op authorizes.
     va(
         "rekey",
         Owner,
@@ -5727,11 +5717,9 @@ pub const VERBS: &[VerbSpec] = &[
     // Outside the halt: the notice explaining a halt arrives on this verb; halting the
     // bridge plane would halt the only party that can lift a halt.
     .input(Input::NONE),
-    // `link`: the bridge's report of ITS OWN broker link — what turns `fabric=`
-    // from "a bridge process is attached" into "mail can move". Bridge-only
-    // because Owner scope is what every in-session client holds, and a client
-    // that could say `link up` would make `post --wait` burn its timeout on a
-    // link the bridge itself knows is down.
+    // `link`: the bridge's report of its own broker link, which turns `fabric=` from "a bridge
+    // is attached" into "mail can move". Bridge-only: an in-session Owner client that could
+    // say `link up` would make `post --wait` burn its timeout on a link known to be down.
     va(
         "link",
         Write,
@@ -6037,11 +6025,8 @@ pub const VERBS: &[VerbSpec] = &[
     // Outside the halt: moves the bus mirror's cursors and writes nothing to a PTY; a
     // halt that stopped it would stall the mirror, not a driver.
     .input(Input::NONE),
-    // sessions, presence & capability — the OwnerOnly access declares the owner
-    // gate IN the table (the dispatch reads it, no hardcoded verb list). `who`
-    // keeps its `Read` op-class (a fleet-wide presence readout) yet is Owner-gated:
-    // op-class and scope-gate are orthogonal, which is exactly why `access` is a
-    // separate field.
+    // sessions, presence & capability. `who` keeps its `Read` op-class yet is Owner-gated:
+    // op-class and scope gate are orthogonal, which is why `access` is its own field.
     // `fabric`: the bridge SUPERVISOR of a running instance. Session-independent
     // (answered before session resolution, so a windowless instance can be
     // attached), Owner-only because arming the supervisor starts the process
@@ -6103,9 +6088,8 @@ pub const VERBS: &[VerbSpec] = &[
     // instance; a held instance with no bridge is the one that needs a bridge to hear `hold
     // off`.
     .input(Input::NONE),
-    // `sessions` is the fleet roster. Its trailing tokens are ADDITIVE (old clients
-    // key on the sid field and ignore the tail); `window=`/`active=`/`wfocus=` come
-    // from ONE main-thread hop per call.
+    // `sessions` is the fleet roster. Trailing tokens are additive (old clients key on the sid
+    // and ignore the tail); `window=`/`active=`/`wfocus=` come from one main-thread hop.
     va(
         "sessions",
         Owner,
@@ -6320,8 +6304,8 @@ pub const VERBS: &[VerbSpec] = &[
          budget shared newest first, and a closing line counting what it left out.",
     )
     .for_fleet(),
-    // `exits` reads the instance's roster journal — every sid the instance ever
-    // hosted — so it is Owner-gated like `sessions`, whose past it is.
+    // `exits` reads the roster journal (every sid the instance hosted), Owner-gated like
+    // `sessions`, whose past it is.
     va(
         "exits",
         Owner,
@@ -6367,11 +6351,8 @@ pub const VERBS: &[VerbSpec] = &[
     )
     // Outside the halt: reports this connection's own scope.
     .input(Input::NONE),
-    // `family` is `Read`/`Scoped`: the no-arg form walks the RESOLVED (already
-    // gated) session. Its EXPLICIT-sid sub-form (`family <sid>`) additionally
-    // demands Owner in the handler — a PER-ARGUMENT check the static table cannot
-    // express (the authority depends on whether an arbitrary node is named), so it
-    // stays a documented runtime check beyond the table, not an `access` value.
+    // `family` is `Read`/`Scoped` over the resolved session; the explicit `family <sid>` form
+    // also demands Owner in the handler, a per-argument check the table cannot express.
     v(
         "family",
         Read,
@@ -6432,9 +6413,8 @@ pub const VERBS: &[VerbSpec] = &[
     )
     // Outside the halt: removes authority; strictly de-escalating.
     .input(Input::NONE),
-    // Session connections (design §6): the connection-grain verbs over the
-    // `grant`/`revoke` op-level primitives. All Owner-only, all self-scoped —
-    // the endpoints ride as `dst=`/`src=` ARGUMENTS, never a selector.
+    // Session connections (design §6): connection-grain verbs over `grant`/`revoke`. All
+    // Owner-only and self-scoped: the endpoints are `dst=`/`src=` arguments, never a selector.
     va(
         "connect",
         Owner,
@@ -6595,10 +6575,8 @@ pub fn json_verbs() -> impl Iterator<Item = &'static str> {
         .map(|s| s.name)
 }
 
-/// Whether `verb` is OWNER-ONLY per the table — only the instance god-token may run
-/// it, regardless of op-class. The dispatch reads THIS (not a hardcoded verb list),
-/// so classifying a verb `OwnerOnly` in the table is what gates it. Unknown verbs
-/// are not owner-only (they fall through to `ERR unknown verb`).
+/// Whether `verb` is owner-only per the table, whatever its op-class. The dispatch reads this;
+/// unknown verbs are not owner-only (`ERR unknown verb`).
 #[inline]
 #[must_use]
 pub fn is_owner_only(verb: &str) -> bool {
@@ -7073,9 +7051,7 @@ mod tests {
         // `result` answers `OK <n>` + the text's lines, `result full` too.
         assert_eq!(framing_of("result", "@s-a result"), Lines);
         assert_eq!(framing_of("result", "result full"), Lines);
-        // `--json` read mode replies Lines-framed (`OK 1\n<body>`) for every
-        // json-capable verb; the Status-base ones (cursor/dims) must flip or the
-        // client drops the JSON body. Both `--json` and bare `json` are accepted.
+        // `--json` and bare `json` both flip the Status-base json-capable verbs to Lines.
         assert_eq!(framing_of("cursor", "cursor --json"), Lines);
         assert_eq!(framing_of("dims", "dims json"), Lines);
         assert_eq!(framing_of("cursor", "@s-a cursor --json"), Lines);
@@ -7227,9 +7203,7 @@ mod tests {
         );
         assert_eq!(framing_of("hold", "hold s-a on reason=x"), Status);
         assert_eq!(framing_of("post", "post to=@s-b kind=ask hello"), Status);
-        // `outbox` flips the same way `inbox` does: the base drain is a byte frame,
-        // the `sent` sub-form a status line. A client that read `OK` as a byte count
-        // would park waiting for a body that never comes.
+        // `outbox` flips as `inbox` does: the drain is a byte frame, `sent` a status line.
         assert_eq!(framing_of("log-take", "log-take n=32 tier=wire"), Bytes);
         assert_eq!(framing_of("log-landed", "log-landed s-a 1:4:2"), Status);
         assert_eq!(framing_of("outbox", "outbox"), Bytes);

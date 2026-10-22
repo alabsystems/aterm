@@ -634,11 +634,17 @@ VERBS
       build's keeps running, still on.
   aterm caffeine serve
       The mug itself: what its launchd job runs, not a command to type.
+  aterm caffeine bridge
+      Keeps the Mac awake while the mug restarts onto an update, until the
+      new mug does: what a restarting mug runs, not a command to type.
 
 WHEN IT TURNS OFF BY ITSELF
   A timed span ends on the wall clock: 8 hours set at 09:00 end at 17:00
   whether or not the Mac slept between. A restart of the Mac starts the mug
-  off, whatever it was before. Quit turns it off.
+  off, whatever it was before. Quit turns it off, from the menu, `aterm
+  caffeine quit` or Activity Monitor. A logout keeps what was on: the
+  mug's next start in the same boot (the next login's, with Enable at
+  Startup on) comes back on.
 
 WHERE IT RUNS
   The mug is its own launchd job in your login session
@@ -649,8 +655,10 @@ WHERE IT RUNS
   ATERM_STATE_HOME). It runs from its own copy of the app: an AppKit process
   started from aterm.app itself would check in as aterm, and every Finder,
   Dock or Spotlight open of aterm would go to the mug and open no window.
-  After an update of aterm it restarts on the new build within a minute; if
-  the new build has no `caffeine` (an older aterm put back), it ends instead
+  After an update of aterm it restarts on the new build within a minute,
+  and a mug that was on keeps the Mac awake until the new one is (macOS
+  checks the new copy first, which can take minutes); if the new build has
+  no `caffeine` (an older aterm put back), it ends instead
   and Enable at Startup goes off. An older aterm put back while no mug runs
   keeps the login item, which then fails at each login: turn it off under
   aterm in System Settings > General > Login Items.
@@ -661,6 +669,9 @@ FILES
   ~/Library/Application Support/aterm/caffeine.lock
       Held by the running mug, its pid and its job's label inside: one
       mug per user.
+  ~/Library/Application Support/aterm/caffeine.bridge
+      While the mug restarts onto an update, the pid of the bridge keeping
+      the Mac awake; the new mug removes it, and the bridge lets go.
   ~/Library/Application Support/aterm/caffeine-code.noindex/
       The copy of the app the mug runs from, kept out of backups and
       removed when the mug quits. A copy whose mug ended before it started
@@ -898,9 +909,11 @@ Optional GitHub bootstrap reads ~/.config/aterm/init.toml:
 The profile stores source locations, never a token value. Keep the token source
 owned by this user and private (0600), as a regular file. Raw tokens and a named
 literal env-file assignment are supported; shell expansion is never executed.
-Install gh and Apple's Command Line Tools first. Apply verifies the token's
-account before logging gh in over private stdin, then configures the GitHub HTTPS
-git helper. Existing correct authentication does not reread the token source.
+Apple's Command Line Tools come first (aterm init --only base.clt). Apply checks
+the token's account with GitHub before storing it in the login keychain (git
+credential approve over private stdin, through CLT git's osxkeychain helper),
+then points the GitHub HTTPS git helper at it and reads both back. Existing
+correct authentication does not reread the token source.
 
 All accessible repositories owned by that account, including private and empty
 repositories, are enumerated over every API page and cloned into ~/<repo>.
@@ -960,7 +973,9 @@ WHERE THE VAULT IS
   (the vault key's public half, base64) to pin it, a path to an envelope
   (pinned the same way: /path/file#<signer>), or a path to a plain text file
   of their own (owned by them, no group or other bits). `aterm secrets
-  create` and `aterm secrets server on` stand up a vault in two commands.
+  server on` and then `aterm secrets create <url>` stand up a vault in two
+  commands; create also installs the subscriber of the Mac it runs on, whose
+  approver lets in a machine that types the join password.
 
 JOINING
   A new Mac looks for the ALab vault first: aterm's first launch and `aterm
@@ -1022,7 +1037,9 @@ A MACHINE
       whether it is in (while it waits: what an admin runs, and the join
       that fixes a mistyped join password), the version it holds and when it
       last heard the server, the names it wrote, and whether the subscriber
-      runs. Never a value.
+      runs; on an admin of a vault that lets machines in by itself (a join
+      password, or open), whether its approver runs, naming `aterm secrets
+      agent on` when it does not. Never a value.
   aterm secrets join [<url>|<path>] [--name <host>] [--password-stdin]
                      [--no-agent] [--no-wait]
       Make this machine's key if it has none and print its public key and
@@ -1046,7 +1063,8 @@ A MACHINE
   aterm secrets watch
       The subscriber: sync, then wait on the server for each new version;
       on an admin Mac, also approve the requests that prove the join
-      password. What `agent on` runs, not a command to type.
+      password (on an open vault, every request): the approver, which runs
+      nowhere else. What `agent on` runs, not a command to type.
   aterm secrets get <name>
       One value on stdout, for scripts.
   aterm secrets ls
@@ -1062,9 +1080,15 @@ AN ADMIN
   Mac's copy back first. A path, like the server, takes only a newer
   version: a publish that began before another admin's is refused.
   aterm secrets create <url>|<path> [--import <dir>] [--name <host>]
+                      [--no-agent]
       A new vault: a new signing key, a new join password, this machine its
       only machine and admin, every regular file in <dir> (e.g. ~/.secrets)
-      in [everyone]. Prints the pin.
+      in [everyone]. Prints the pin. For a <url>, installs this Mac's
+      subscriber, as join does, unless it runs already: its approver is what
+      lets in a machine that types the join password. --no-agent installs
+      none; then, as when the install fails, create says no approver runs
+      here and that `aterm secrets agent on` starts one. A vault at a <path>
+      has no join queue (machines join it by key), so needs no approver.
   aterm secrets edit
       The file in $EDITOR, in a fresh private directory. Saving publishes;
       an unchanged file publishes nothing; an invalid one reopens with the
@@ -1091,7 +1115,7 @@ AN ADMIN
       nothing from a version holding one, and cannot open it as an admin.
   aterm secrets unset <name> [--for <host|code>…]
       Remove it.
-  aterm secrets password [show|set|new|open|off]
+  aterm secrets password [show|set|new|open|off] [--no-agent]
       The join password: print it (the bare verb), set one typed twice at
       the terminal or piped in (12 characters at least), make a new random
       one and print it, open the vault, or remove it (machines then wait
@@ -1107,7 +1131,11 @@ AN ADMIN
       joins only as you name it (approve <age1…> --name). `set` or `new`
       closes it with a password, `off` closes it to approval by code. An
       admin Mac on an older aterm cannot open a vault that has been opened
-      until it updates.
+      until it updates. Only an admin Mac's subscriber lets a machine in
+      without you, so `set`, `new` and `open` on a vault served at a URL
+      install this Mac's where it does not run (or say it cannot, naming
+      `aterm secrets agent on`); --no-agent installs none, for an admin
+      whose subscriber is off on purpose.
   aterm secrets requests
       The pending join requests: host, code, key, age, whether the request
       carries a join-password proof, and whether its key joins only by code.
@@ -1171,7 +1199,8 @@ THE SERVER
       request waits for a new version (default 50). It keeps no key and
       decides nothing: it takes a new version only when it verifies under
       that pin with a higher number and carries on the endorsements of the
-      version it holds.
+      version it holds. A store that holds no vault yet says so at start: a
+      joining machine finds none until an admin Mac puts its copy there.
   aterm secrets server on|off|status [--program <path>] [serve flags]
       Install, remove or report the server as a service.
   Both services are a launchd user agent on macOS and a systemd --user unit
@@ -1357,6 +1386,8 @@ THE VERBS
                             over it is locked again when the walk ends or is
                             stopped (Ctrl-C), or by the Mac itself a minute
                             after aterm is killed or loses it
+  github login              keep the [github] machine user's token in the login
+                            keychain (typed, not echoed; GitHub checks it first)
   github revoke | rekey     a host's GitHub keys (never registered again once
                             revoked); the signers every host trusts
   here plan|apply <file>    run a baseline on this Mac directly (apply under sudo)
@@ -2270,13 +2301,14 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   Every default is full power except limit_reset (no limit reset is taken),
   usage_tap (no status line is put on a session), usage_notes (no record of
   the usage of a machine's one account), usage_credits (no session is carried
-  onto usage credits), stall_term (a frozen worker is warned about, not
-  ended), stall_term_after_s, human_grace_s and trust_roots: limit_reset =
-  true, usage_tap = true, usage_notes = true, usage_credits = true, stall_term
-  = true, a lower stall_term_after_s or human_grace_s, or a trust_roots folder
-  gives the supervisor more; limit_reset_kinds says which reset limit_reset
-  takes, neither more nor less; every other key you write can only take
-  power away.
+  onto usage credits), occupancy (a session's wait is measured, nothing typed
+  for it), stall_term (a frozen worker is warned about, not ended),
+  stall_term_after_s, human_grace_s and trust_roots: limit_reset = true,
+  usage_tap = true, usage_notes = true, usage_credits = true, occupancy =
+  "prompt", stall_term = true, a lower stall_term_after_s or human_grace_s, or
+  a trust_roots folder gives the supervisor more; limit_reset_kinds says which
+  reset limit_reset takes, neither more nor less; every other key you write
+  can only take power away.
   enabled [true]           the master switch — in Settings, search "harness"
   headless [true]          supervise a headless instance's sessions too
   autopilot ["cruise"]     the default Autopilot (above) of a session with no
@@ -2605,6 +2637,14 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                            macOS a folder-trust dialog the person's own launch
                            drew, with no gesture since, is still answered:
                            `status launch=`)
+  occupancy ["observe"]    what the supervisor does with a session's wait on its
+                           own background work: observe measures it (OCCUPANCY
+                           journal lines, fact-hold@v1 ledger rows) and types
+                           nothing; off measures nothing; prompt is the owner's
+                           grant for a fact line to be typed (this build types
+                           none), read only from this table — Settings and
+                           `aterm ctl settings set` never write it. A switch's
+                           true, yes or on is no mode: it keeps observe
   Only an explicit setting takes power away: an off (false, "no", "off", 0, "none")
   is that key's limit — except continue_per_hour and human_grace_s, which take only a
   number (0 included), so an off word there (false, "no", "off", "none") is no
@@ -8377,9 +8417,10 @@ HOW TO USE IT
   ctl @sid status` says `bells=<n> bells_sounded=<n>` and `last_bell=<ms>/<sound>/<program>`
   for the last four, the newest first — how long ago, `sounded` or the gate that kept it
   quiet (`headless`, `serious`, `off`, `limited`), and the program in front then — and
-  `aterm ctl survey` puts `bells=3 (zsh sounded 4m ago)` on the line of each tab that
-  rang. A fact for later, never an alert; a self-update starts the counts over. A ping no
-  tab counts as `sounded` was not a program's BEL in this aterm.
+  `aterm ctl survey` puts `bells=3 (zsh sounded 4m ago)` on the line of each tab whose
+  newest bell rang in the last 15 minutes. BELs under 100 ms apart (one write's, a
+  flood's) ring, and count, once. A fact for later, never an alert; a self-update starts
+  the counts over. A ping no tab counts as `sounded` was not a program's BEL in this aterm.
 
 THE SERVER'S VERB CATALOG (generated from the protocol table):",
     );
@@ -8588,7 +8629,7 @@ fn push_macos_walls(s: &mut String) {
     // consent kind=debugger` and the launch ask live on the page. Its last
     // sentence is the other macOS gotcha with "Developer Tools" in its name,
     // the first-run check that parks a new program at `_dyld_start` (owner
-    // ruling 2026-10-14, design §9.1 O18, which reverses O16's "no
+    // , design §9.1 O18, which reverses O16's "no
     // agent-brief line"): one pointer to doctor's row.
     s.push_str(
         "\nDEBUGGER ACCESS (a password dialog, not privacy)\n  \
@@ -9107,9 +9148,10 @@ TURNING IT ON (the operator does this once)
   0. Make the private root:  mkdir -p <root> <state>; chmod 700 <root> <state>
      Everything below lives inside it, and its mode bounds who can reach the socket.
   1. Make the mint secret, then run the broker GUARDED by it. The secret is 32 raw
-     bytes in a 0600 file, given ONLY as --secret-file, never on argv where `ps` shows
-     it for the life of the call; a shorter one, or one another user can read, is
-     refused (a short key seals nothing):
+     bytes in a 0600 file in the private root, given ONLY as --secret-file, never on argv
+     where `ps` shows it for the life of the call; a shorter one, one another user can
+     read (by its mode or a macOS access list), a symlink or a second link to it, or one
+     in a directory another user can reach, is refused (a short key seals nothing):
          head -c32 /dev/urandom > <root>/mint.secret; chmod 600 <root>/mint.secret
          aterm link broker <sock> <log> --secret-file <root>/mint.secret
      Every attach must carry a cap minted under that secret and every request is checked
@@ -10270,7 +10312,7 @@ mod tests {
         }
     }
 
-    /// FOREVER CRUISE / FOREVER LAND (owner, 2026-10-19) retired the
+    /// Autopilot Cruise / Land (owner, 2026-10-19) retired the
     /// completion token: the agent brief, which `aterm help` prints into an
     /// agent's context inside a session and out of one, names it nowhere, so
     /// no agent is taught to end its work on it (the harness page still says

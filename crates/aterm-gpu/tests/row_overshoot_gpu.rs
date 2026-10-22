@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// The GPU twin of aterm-render's `tests/row_overshoot.rs` (ATERM-KI-1020-1):
+// The GPU twin of aterm-render's `tests/row_overshoot.rs`:
 // glyphs that ink above their own cell (accented capitals at some sizes) beside
 // the scissored dirty-row repaint. `present_input` keeps the prior frame
 // (`LoadOp::Load`), scissors to the hull of the dirty bands and draws only the

@@ -321,13 +321,11 @@ macro_rules! bind {
                 self.pred_row_scratch = scratch;
             }
 
-            /// The ghost cells to paint THIS frame, as flat `[row, col, codepoint]`
-            /// triples (a `Uint32Array` in JS). The host renders them tentatively
-            /// (dim/underline) and may advance its DRAWN cursor past the last one,
-            /// mosh-style. Runs the expiry self-heal first, then the display gate:
-            /// `always` ⇒ all pending; `adaptive` ⇒ all pending after an echo is confirmed
-            /// on this line and measured RTT is high enough to help. Empty in app-owned
-            /// Kitty composers and while scrolled into history.
+            /// The ghost cells to paint this frame as flat `[row, col, codepoint]` triples (a
+            /// `Uint32Array` in JS), drawn tentatively; the host may advance its drawn cursor
+            /// past the last one. Runs the expiry self-heal, then the display gate (`always`:
+            /// all pending; `adaptive`: once this line's echo is confirmed and RTT is high
+            /// enough). Empty in a no-echo context and while scrolled into history.
             ///
             /// While [`predict_overlay_cursor`](Self::predict_overlay_cursor) is
             /// non-empty these are the cells of an edit's displayed state (a typed
@@ -575,10 +573,8 @@ mod tests {
 
     #[test]
     fn line_submit_ends_the_epoch_no_same_row_leak() {
-        // The native note_line_submit seam through the export: after Enter, a
-        // non-echoing prompt on the SAME physical row (a terminal scrolled to
-        // the bottom reuses its last row across logical lines) must not
-        // inherit the previous command's confirmation and flash a secret.
+        // After Enter, a non-echoing prompt on the same physical row must not
+        // inherit the previous command's confirmation.
         let mut t = terminal();
         t.set_predictive_echo("adaptive");
         assert!(t.predict_char('a'));
@@ -609,9 +605,8 @@ mod tests {
 
     #[test]
     fn only_a_line_terminator_carries_the_guesses_in_flight() {
-        // The two boundary exports differ in what they do to the pixels already
-        // painted: a terminator keeps the line's unechoed tail, any other key
-        // (Ctrl+W, Ctrl+H) may have erased it and retires it.
+        // A terminator keeps the line's unechoed tail; any other key may have
+        // erased it (Ctrl+W, Ctrl+H) and retires it.
         let mut t = terminal();
         t.set_predictive_echo("always");
         assert!(t.predict_char('a'));

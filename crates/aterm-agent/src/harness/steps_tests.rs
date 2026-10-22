@@ -274,6 +274,10 @@ fn the_user_rows_that_ask_nothing_emit_no_prompt() {
             r#""type":"user","#,
             r#""type":"user","isCompactSummary":true,"#,
         ),
+        prompt("j2", 0, "orphaned workflow notification").replace(
+            r#""type":"user","#,
+            r#""type":"user","queueTranscriptOnly":true,"#,
+        ),
         prompt("k", 0, "a wake").replace(
             r#""type":"user","#,
             r#""type":"user","origin":{"kind":"task-notification"},"#,

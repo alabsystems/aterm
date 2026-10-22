@@ -447,7 +447,7 @@ fn test_git_bash_records_the_typed_line_and_marks_a_subshell_line() {
 /// `$TMPDIR` is unset, as in a Git Bash tab. Where an MSYS2 process the test did not
 /// start holds the session's `/tmp` (the Git Bash a `cargo test` was typed into), the
 /// test is COULD NOT RUN: it never takes away a folder that is not its own. Measured
-/// 2026-10-21 on Git Bash 5.3.15 before the fix (ATERM-KI-1020-3): after `rmdir /tmp`,
+/// 2026-10-21 on Git Bash 5.3.15 before the fix: after `rmdir /tmp`,
 /// each line printed `bash: function_substitute: cannot open anonymous file for output:
 /// No such file or directory`, ran nothing, and drew the same prompt number again: bash
 /// keeps a `${ ...; }` substitution's output in a file it makes in `/tmp`, and PS0's hook

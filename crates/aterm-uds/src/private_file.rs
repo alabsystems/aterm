@@ -3,6 +3,16 @@
 // Author: Andrew Yates
 
 //! Strict private files: the rules aterm's fleet state and agh's token files share.
+//!
+//! What makes one file or directory private is astream's one owner-only rule, judged
+//! on the open descriptor ([`astream_sys::owner_private`],
+//! [`astream_sys::owner_private_dir`]): the kind asked for, this user's (the effective
+//! uid), no access-list entry that allows anyone anything (macOS checks an extended
+//! ACL before the mode bits), and no group or other mode bit. This module keeps the
+//! rest of the rules: a directory is made 0700 or narrowed to it
+//! ([`ensure_private_dir`]), a file is one path component directly in its directory,
+//! opened without following a link or waiting on a FIFO, with one link, and is
+//! written whole ([`write_private`]).
 
 use std::fmt;
 use std::io::{self, Read};
@@ -40,119 +50,34 @@ impl fmt::Display for PrivateFileError {
 
 impl std::error::Error for PrivateFileError {}
 
-/// Whether `meta` is this user's and nobody else's: `whose` and `open` name
-/// the two ways it is not. The mode bits only; [`granted_to_others`] judges
-/// an access list, which mode bits do not show.
-fn private(
-    meta: &std::fs::Metadata,
-    whose: &'static str,
-    open: &'static str,
-) -> Result<(), PrivateFileError> {
-    use std::os::unix::fs::MetadataExt as _;
-    if meta.uid() != crate::peer::our_uid() {
-        Err(PrivateFileError::NotPrivate(whose))
-    } else if meta.mode() & 0o077 != 0 {
-        Err(PrivateFileError::NotPrivate(open))
-    } else {
-        Ok(())
-    }
-}
-
 /// What a file or directory an extended access list opens to others is
-/// refused as ([`granted_to_others`]).
+/// refused as.
 const ACL_OPEN: &str = "an access list (ACL) grants other users access; `chmod -N` removes it";
 
-/// Whether `target` — a path, read without following a link, or an open
-/// descriptor — carries an access list that ALLOWS anyone anything: on macOS
-/// an extended ACL is checked before the mode bits, so a 0600 file in a 0700
-/// directory with an `everyone allow read` entry (one inherited from a
-/// parent's `file_inherit` entry, say) is open to every user. A deny entry
-/// (the `group:everyone deny delete` macOS puts on `~/Library`) takes nothing
-/// away from privacy, and is no reason to refuse. Elsewhere mode bits are the
-/// rule, and this is `false`.
-#[cfg(target_os = "macos")]
-fn granted_to_others(target: AclOf<'_>) -> io::Result<bool> {
-    use std::os::raw::{c_char, c_int, c_void};
-    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
-    const ACL_FIRST_ENTRY: c_int = 0;
-    const ACL_NEXT_ENTRY: c_int = -1;
-    const ACL_EXTENDED_ALLOW: c_int = 1;
-    // SAFETY (the declarations): `<sys/acl.h>`'s, `acl_t` and `acl_entry_t`
-    // opaque pointers and `acl_type_t`/`acl_tag_t` C enums (`int`).
-    unsafe extern "C" {
-        fn acl_get_fd_np(fd: c_int, kind: c_int) -> *mut c_void;
-        fn acl_get_link_np(path: *const c_char, kind: c_int) -> *mut c_void;
-        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
-        fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
-        fn acl_free(object: *mut c_void) -> c_int;
-    }
-    let acl = match target {
-        // SAFETY: `fd` is open for the call (the caller holds its file).
-        AclOf::Fd(fd) => unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) },
-        AclOf::Path(path) => {
-            use std::os::unix::ffi::OsStrExt as _;
-            let path = std::ffi::CString::new(path.as_os_str().as_bytes())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL in a path"))?;
-            // SAFETY: `path` is a NUL-terminated string that outlives the call.
-            unsafe { acl_get_link_np(path.as_ptr(), ACL_TYPE_EXTENDED) }
-        }
-    };
-    if acl.is_null() {
-        let error = io::Error::last_os_error();
-        // No extended ACL at all: ENOENT.
-        return match error.raw_os_error() {
-            Some(libc::ENOENT) => Ok(false),
-            _ => Err(error),
-        };
-    }
-    let mut allows = false;
-    let mut entry: *mut c_void = std::ptr::null_mut();
-    let mut which = ACL_FIRST_ENTRY;
-    // SAFETY: `acl` is the list just returned, freed once below; each entry
-    // and its tag are read only while it lives.
-    while unsafe { acl_get_entry(acl, which, &mut entry) } == 0 {
-        which = ACL_NEXT_ENTRY;
-        let mut tag: c_int = 0;
-        // SAFETY: `entry` is an entry of the live `acl`; `tag` is this frame's.
-        if unsafe { acl_get_tag_type(entry, &mut tag) } == 0 && tag == ACL_EXTENDED_ALLOW {
-            allows = true;
-            break;
-        }
-    }
-    // SAFETY: `acl` came from `acl_get_*_np` and is freed exactly once.
-    unsafe { acl_free(acl) };
-    Ok(allows)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn granted_to_others(target: AclOf<'_>) -> io::Result<bool> {
-    match target {
-        AclOf::Fd(_fd) => Ok(false),
-        AclOf::Path(_path) => Ok(false),
-    }
-}
-
-/// What [`granted_to_others`] reads the access list of.
-#[derive(Clone, Copy)]
-enum AclOf<'a> {
-    /// An open descriptor.
-    Fd(std::os::raw::c_int),
-    /// A path, not followed if it is a link.
-    Path(&'a Path),
-}
-
-/// [`granted_to_others`] as a privacy refusal.
-fn no_acl(target: AclOf<'_>) -> Result<(), PrivateFileError> {
-    match granted_to_others(target) {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(PrivateFileError::NotPrivate(ACL_OPEN)),
-        Err(e) => Err(PrivateFileError::Io(e)),
+/// astream-sys's verdict on an open FILE ([`astream_sys::owner_private`]) in
+/// this module's words. The rule is astream's one owner-only rule, read off the
+/// descriptor: a regular file, this user's (the effective uid), no access-list
+/// entry that allows anyone anything (macOS checks an extended ACL before the
+/// mode bits, so a 0600 file with an inherited `everyone allow read` entry is
+/// open to every user; a deny entry takes nothing away), and no group or other
+/// mode bit.
+fn file_verdict(file: &std::fs::File) -> Result<std::fs::Metadata, PrivateFileError> {
+    use astream_sys::NotPrivate;
+    match astream_sys::owner_private(file).map_err(PrivateFileError::Io)? {
+        Ok(meta) => Ok(meta),
+        Err(NotPrivate::Kind(_)) => Err(PrivateFileError::Malformed("not a regular file")),
+        Err(NotPrivate::Owner(_)) => Err(PrivateFileError::NotPrivate("it is another user's")),
+        Err(NotPrivate::Acl) => Err(PrivateFileError::NotPrivate(ACL_OPEN)),
+        Err(NotPrivate::Mode(_)) => Err(PrivateFileError::NotPrivate(
+            "it is open to other users (want 0600)",
+        )),
     }
 }
 
 /// The bytes of `name` directly in `dir`, read under the key file's rules:
 /// the directory and the file are this user's and nobody else's — by their
-/// mode bits and by any access list ([`granted_to_others`]) — neither is a
+/// mode bits and by any access list, astream's one owner-only rule read off
+/// each open descriptor ([`astream_sys::owner_private`]) — neither is a
 /// symlink, and the file is one link to a regular file of at most `max`
 /// bytes. Read without following a link and without waiting on a FIFO. No
 /// such file is [`PrivateFileError::Missing`] whatever the directory is: a
@@ -195,6 +120,58 @@ fn one_component_io(name: &str) -> io::Result<()> {
     }
 }
 
+/// What a directory is under the private-directory rule.
+enum DirIs {
+    /// There is none.
+    Missing,
+    /// This user's, no access-list grant, no group or other mode bit.
+    Private,
+    /// This user's and no access-list grant, but these mode bits (`& 0o777`) open
+    /// it to others: narrowing them makes it private.
+    Open(u32),
+    /// A symlink, which the rule never follows.
+    Symlink,
+    /// Something other than a directory.
+    NotDir,
+    /// Another user's.
+    Others,
+    /// An access-list entry allows someone something.
+    Acl,
+}
+
+/// `dir` judged by astream's one owner-only rule on the OPEN directory
+/// ([`astream_sys::owner_private_dir`]): opened read-only, non-blocking and
+/// refusing a symlink at its last component, then judged off the descriptor —
+/// a directory, this user's (the effective uid), no access-list entry that
+/// allows anyone anything (macOS), and no group or other mode bit, in that
+/// order, so [`DirIs::Open`] means every other clause held. A directory that
+/// cannot be opened is refused either way; its `lstat` only words why when it
+/// names a rule broken (a symlink, no directory, another user's), and any other
+/// failure is the open's own error.
+fn dir_is(dir: &Path) -> io::Result<DirIs> {
+    use astream_sys::NotPrivate;
+    use std::os::unix::fs::MetadataExt as _;
+    let opened = match astream_sys::open_nonblocking(dir, astream_sys::Links::Refuse) {
+        Ok(opened) => opened,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(DirIs::Missing),
+        Err(e) => {
+            return match std::fs::symlink_metadata(dir) {
+                Ok(meta) if meta.file_type().is_symlink() => Ok(DirIs::Symlink),
+                Ok(meta) if !meta.is_dir() => Ok(DirIs::NotDir),
+                Ok(meta) if meta.uid() != crate::peer::our_uid() => Ok(DirIs::Others),
+                _ => Err(e),
+            };
+        }
+    };
+    Ok(match astream_sys::owner_private_dir(&opened)? {
+        Ok(_meta) => DirIs::Private,
+        Err(NotPrivate::Mode(mode)) => DirIs::Open(mode),
+        Err(NotPrivate::Kind(_)) => DirIs::NotDir,
+        Err(NotPrivate::Owner(_)) => DirIs::Others,
+        Err(NotPrivate::Acl) => DirIs::Acl,
+    })
+}
+
 /// `name` directly in `dir`, opened under [`read_private`]'s rules, with the
 /// metadata of the open descriptor (`fstat`, never a second `stat` by path).
 /// The caller keeps this handle when a later operation (such as an advisory lock)
@@ -206,21 +183,18 @@ pub fn open_private(
     dir: &Path,
     name: &str,
 ) -> Result<(std::fs::File, std::fs::Metadata), PrivateFileError> {
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::unix::fs::MetadataExt as _;
     if !one_component(name) {
         return Err(PrivateFileError::Malformed(ONE_COMPONENT));
     }
-    let meta = match std::fs::symlink_metadata(dir) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(PrivateFileError::Missing),
-        Err(e) => return Err(PrivateFileError::Io(e)),
-    };
-    if meta.file_type().is_symlink() {
-        return Err(PrivateFileError::Symlink);
-    }
-    if !meta.is_dir() {
-        return Err(PrivateFileError::Malformed("the directory is no directory"));
+    let judged = dir_is(dir).map_err(PrivateFileError::Io)?;
+    match judged {
+        DirIs::Missing => return Err(PrivateFileError::Missing),
+        DirIs::Symlink => return Err(PrivateFileError::Symlink),
+        DirIs::NotDir => {
+            return Err(PrivateFileError::Malformed("the directory is no directory"));
+        }
+        _ => {}
     }
     match std::fs::symlink_metadata(dir.join(name)) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(PrivateFileError::Missing),
@@ -231,17 +205,21 @@ pub fn open_private(
         // mode, which the directory's judgement names): judge both.
         _ => {}
     }
-    private(
-        &meta,
-        "the directory is another user's",
-        "the directory is open to other users (want 0700)",
-    )?;
-    no_acl(AclOf::Path(dir))?;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(dir.join(name));
-    let file = match file {
+    match judged {
+        DirIs::Others => {
+            return Err(PrivateFileError::NotPrivate(
+                "the directory is another user's",
+            ));
+        }
+        DirIs::Acl => return Err(PrivateFileError::NotPrivate(ACL_OPEN)),
+        DirIs::Open(_) => {
+            return Err(PrivateFileError::NotPrivate(
+                "the directory is open to other users (want 0700)",
+            ));
+        }
+        _ => {}
+    }
+    let file = match astream_sys::open_nonblocking(&dir.join(name), astream_sys::Links::Refuse) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(PrivateFileError::Missing),
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
@@ -249,19 +227,10 @@ pub fn open_private(
         }
         Err(e) => return Err(PrivateFileError::Io(e)),
     };
-    let meta = file.metadata().map_err(PrivateFileError::Io)?;
-    if !meta.file_type().is_file() {
-        return Err(PrivateFileError::Malformed("not a regular file"));
-    }
+    let meta = file_verdict(&file)?;
     if meta.nlink() != 1 {
         return Err(PrivateFileError::NotPrivate("it has another link"));
     }
-    private(
-        &meta,
-        "it is another user's",
-        "it is open to other users (want 0600)",
-    )?;
-    no_acl(AclOf::Fd(file.as_raw_fd()))?;
     Ok((file, meta))
 }
 
@@ -383,21 +352,17 @@ fn dir_acl_refused(dir: &Path) -> io::Error {
 /// `PermissionDenied` naming the directory, with no OS error code; or the
 /// filesystem's own error, which carries one.
 pub fn judge_private_dir(dir: &Path) -> io::Result<PrivateDir> {
-    use std::os::unix::fs::MetadataExt as _;
-    match std::fs::symlink_metadata(dir) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(PrivateDir::Missing),
-        Err(e) => Err(e),
-        Ok(meta) if meta.file_type().is_symlink() => Err(dir_refused(
+    match dir_is(dir)? {
+        DirIs::Missing => Ok(PrivateDir::Missing),
+        DirIs::Private => Ok(PrivateDir::Private),
+        DirIs::Open(mode) => Ok(PrivateDir::Open(mode)),
+        DirIs::Symlink => Err(dir_refused(
             dir,
             "is a symlink; it must be a directory of its own",
         )),
-        Ok(meta) if !meta.is_dir() => Err(dir_refused(dir, "is no directory")),
-        Ok(meta) if meta.uid() != crate::peer::our_uid() => {
-            Err(dir_refused(dir, "is another user's"))
-        }
-        Ok(_) if granted_to_others(AclOf::Path(dir))? => Err(dir_acl_refused(dir)),
-        Ok(meta) if meta.mode() & 0o077 != 0 => Ok(PrivateDir::Open(meta.mode() & 0o777)),
-        Ok(_) => Ok(PrivateDir::Private),
+        DirIs::NotDir => Err(dir_refused(dir, "is no directory")),
+        DirIs::Others => Err(dir_refused(dir, "is another user's")),
+        DirIs::Acl => Err(dir_acl_refused(dir)),
     }
 }
 
@@ -421,10 +386,13 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<Option<u32>> {
             }
             std::fs::DirBuilder::new().mode(0o700).create(dir)?;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-            if granted_to_others(AclOf::Path(dir))? {
-                return Err(dir_acl_refused(dir));
+            match judge_private_dir(dir)? {
+                PrivateDir::Private => Ok(None),
+                PrivateDir::Missing | PrivateDir::Open(_) => Err(dir_refused(
+                    dir,
+                    "is not 0700 and this user's after it was made so",
+                )),
             }
-            Ok(None)
         }
         PrivateDir::Open(mode) => {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
@@ -435,28 +403,35 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<Option<u32>> {
 }
 
 /// Whether `dir` is a private directory as it stands: this user's, mode 0700
-/// (no group or other bit), no symlink and no ACL grant. Nothing is changed.
+/// (no group or other bit), no symlink and no ACL grant, judged on the open
+/// directory by astream's one owner-only rule ([`astream_sys::owner_private_dir`]).
+/// Nothing is changed.
+///
+/// # Errors
+/// `NotFound` when there is no such directory; `PermissionDenied` naming the
+/// directory and the rule it breaks; or the open's own error.
 pub fn check_private_dir(dir: &Path) -> io::Result<()> {
-    let meta = std::fs::symlink_metadata(dir)?;
     let refused = |why: &dyn fmt::Display| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("the directory {}: {why}", dir.display()),
         )
     };
-    if meta.file_type().is_symlink() {
-        return Err(refused(&PrivateFileError::Symlink));
+    match dir_is(dir)? {
+        DirIs::Private => Ok(()),
+        DirIs::Missing => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "the directory {}: there is no such directory",
+                dir.display()
+            ),
+        )),
+        DirIs::Symlink => Err(refused(&PrivateFileError::Symlink)),
+        DirIs::NotDir => Err(refused(&"no directory")),
+        DirIs::Others => Err(refused(&"it is another user's")),
+        DirIs::Acl => Err(refused(&ACL_OPEN)),
+        DirIs::Open(_) => Err(refused(&"it is open to other users (want 0700)")),
     }
-    if !meta.is_dir() {
-        return Err(refused(&"no directory"));
-    }
-    private(
-        &meta,
-        "it is another user's",
-        "it is open to other users (want 0700)",
-    )
-    .and_then(|()| no_acl(AclOf::Path(dir)))
-    .map_err(|e| refused(&e))
 }
 
 /// Write `name` directly in the private state directory `dir`, 0600, whole:
@@ -790,6 +765,60 @@ mod tests {
         let refusal = judge_private_dir(&link).unwrap_err();
         assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(refusal.raw_os_error().is_none(), "{refusal}");
+    }
+
+    /// The file's clauses are astream's owner-only rule, worded here: a FIFO in the file's
+    /// place is refused as no regular file AT ONCE (the open does not wait for a writer;
+    /// the read runs behind the one-minute hang detector), and on macOS a 0600 file with
+    /// an `everyone allow read` entry is not private, naming `chmod -N`. Controls: the same
+    /// file reads once `chmod -N` clears the entry, and a plain 0600 file beside the FIFO
+    /// reads.
+    #[test]
+    fn a_fifo_or_an_access_list_in_the_files_place_is_refused() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        file_in(&dir, "token", b"x", 0o600);
+        let made = crate::spawnfd::command("/usr/bin/mkfifo")
+            .arg("-m")
+            .arg("600")
+            .arg(dir.join("fifo"))
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_private(&at, "fifo", 64).map(|_| ()));
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("a FIFO is judged without waiting for a writer");
+        assert!(
+            matches!(
+                refused,
+                Err(PrivateFileError::Malformed("not a regular file"))
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(read_private(&dir, "token", 64).unwrap(), b"x");
+
+        #[cfg(target_os = "macos")]
+        {
+            let token = dir.join("token");
+            chmod(&[
+                "+a".as_ref(),
+                "everyone allow read".as_ref(),
+                token.as_os_str(),
+            ]);
+            match read_private(&dir, "token", 64) {
+                Err(PrivateFileError::NotPrivate(why)) => {
+                    assert!(why.contains("chmod -N"), "{why}")
+                }
+                other => panic!("an access list that allows others: {other:?}"),
+            }
+            chmod(&["-N".as_ref(), token.as_os_str()]);
+            assert_eq!(read_private(&dir, "token", 64).unwrap(), b"x");
+        }
     }
 
     /// A symlink in the file's place is refused as one.

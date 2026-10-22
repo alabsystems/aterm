@@ -32,9 +32,7 @@ fn state(current_version: &str, has_section: bool, published: bool) -> RemoteSta
     }
 }
 
-// ---------------------------------------------------------------------------
 // the remote-derived decision table (no journal: derive from the remote)
-// ---------------------------------------------------------------------------
 
 /// `RemoteState.current_version` is the release version as `[workspace.package] version`
 /// writes it, so a cut never invents a successor: a version rolled into `## [X.Y.Z]` with no
@@ -73,9 +71,7 @@ fn recutting_a_published_version_is_refused() {
     assert!(verify::derive_cut_mode(&state("0.2.0", false, true)).is_err());
 }
 
-// ---------------------------------------------------------------------------
 // journal-based re-entry
-// ---------------------------------------------------------------------------
 
 fn journal() -> Journal {
     Journal {
@@ -246,8 +242,8 @@ fn an_older_journal_format_is_refused_and_triaged_by_its_header() {
             triage.expect_err("an unfinished one blocks");
         }
     }
-    // NEGATIVE CONTROL: the current step list at the current format loads and is
-    // cleared by the next cut; an in-flight one blocks it, by name.
+    // Negative control: the current step list at the current format loads and is cleared by
+    // the next cut; an in-flight one blocks it, by name.
     let now_through_unlock = "\"lock\", \"sign\", \"selfcheck\", \"tag\", \"publish\", \"unlock\"";
     write(
         &format!("format = {}\n", publish::JOURNAL_FORMAT),
@@ -328,7 +324,7 @@ done = ["lock", "build", "selfcheck", "draft", "upload", "preflip", "tag", "flip
         .expect_err("main's finished 0.92 journal is refused, never walked")
         .to_string();
     assert!(error.contains("format-9"), "{error}");
-    // …and by its header it IS finished: the next cut clears it.
+    // …and by its header it is finished: the next cut clears it.
     let header = publish::JournalHeader::read(&path).unwrap().unwrap();
     assert!(header.finished());
     assert!(publish::fresh_cut_journal_triage(Some(&header), publish::CutKind::Real).unwrap());
@@ -514,9 +510,7 @@ fn journal_persists_signature_ratchet_and_actual_key_fail_closed() {
     assert!(downgrade.save(&path).is_err());
 }
 
-// ---------------------------------------------------------------------------
 // pure publish helpers the pipeline steps hang off
-// ---------------------------------------------------------------------------
 
 #[test]
 fn version_helpers_port_the_shell_derivations() {
@@ -537,9 +531,8 @@ fn version_helpers_port_the_shell_derivations() {
         publish::release_version_from_workspace("0.2.0").unwrap(),
         "0.2.0"
     );
-    // NEGATIVE CONTROL: a non-zero patch is refused, never rewritten — the binary
-    // reports the version as written, so a rewrite would ship an app whose version
-    // is not its release's.
+    // Negative control: a non-zero patch is refused, never rewritten: the binary reports the
+    // version as written, so a rewrite would ship an app whose version is not its release's.
     for bad in [
         "0.2.1", "1.10.7", "0.2", "0.2.1.1", "v0.2.1", "01.2.1", "0.2.x", "",
     ] {
@@ -1574,9 +1567,7 @@ fn exhaustive_history_rejects_duplicate_exact_names() {
     assert!(err.contains("duplicate assets"), "{err}");
 }
 
-// ---------------------------------------------------------------------------
 // the hand-rolled CLI
-// ---------------------------------------------------------------------------
 
 fn parse(args: &[&str]) -> Result<cli::Cmd, String> {
     cli::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())

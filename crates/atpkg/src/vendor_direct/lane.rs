@@ -3280,7 +3280,7 @@ mod tests {
         }
     }
 
-    /// CODEX-OLD LANDS OPENAI'S BUILD UNDER ITS OWN NAME (owner ruling 2026-10-20), end to
+    /// CODEX-OLD LANDS OPENAI'S BUILD UNDER ITS OWN NAME, end to
     /// end on a scratch store: OpenAI's own package, read from OpenAI's head under codex's
     /// pins, lands in `codex-old`'s own store with its entry cloned to `bin/codex-old` — a
     /// regular file holding exactly OpenAI's `bin/codex` bytes at its mode, beside the

@@ -9,9 +9,9 @@ use aterm_spec::derive::Model;
 /// `PublishBacklog` is acknowledged by the broker before the opt-in; the bridge
 /// may or may not have run `ObserveBacklog` when it handles the topic event.
 /// `AddHead` resolves once, and `TakeBacklog` models the pending say record.
-/// `Buggy=1` replays the old bridge decision from its stale observed head,
-/// making the backlog appear in a session that asked to start at head. Tier-1
-/// projects the real bridge's durable topic cursor and delivered ring rows.
+/// `Buggy=1` takes the cursor from the bridge's stale observed head, so the
+/// backlog reaches a session that asked to start at head. Tier-1 projects the
+/// real bridge's durable topic cursor and delivered ring rows.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn broadcast_head_subscription_model() -> Model {

@@ -1,31 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Flip when quiet (gap #12(b)): an unattended update stages a new Trust toolchain and
-//! flips it only when nothing is using the one it replaces — the decision
-//! `atpkg::quiet::decide`, looked at once per pass or park re-check.
+//! Flip when quiet: an unattended update stages a new Trust toolchain and flips it only when
+//! nothing is using the one it replaces (`atpkg::quiet::decide`, once per pass or park
+//! re-check).
 
 use aterm_spec::derive::*;
 
-/// A staged Trust toolchain waiting for its flip, one look per period. `pending` is whether
-/// a staged build waits; `busy` what the toolchain it replaces is doing — 0 quiet, 1 in
-/// use (a run's lease on it, or a process running from it), 2 cannot be told (the process
-/// table or the leases unreadable); `forced` whether the live build is revoked (yanked,
-/// below the floor, tombstoned); `age` how many periods the flip has waited; `looked`
-/// whether this period's look ran. The look FLIPS when the build is revoked, the toolchain
-/// is quiet or the wait reached `Ceiling`, and otherwise HOLDS; a period passes only after
-/// its look (`Tick`).
+/// A staged Trust toolchain waiting for its flip, one look per period. `pending`: a staged
+/// build waits; `busy`: the toolchain it replaces is 0 quiet, 1 in use (a run's lease on it, or
+/// a process running from it), 2 unknown (process table or leases unreadable); `forced`: the
+/// live build is revoked (yanked, below the floor, tombstoned); `age`: periods waited;
+/// `looked`: this period's look ran. The look flips when the build is revoked, the toolchain is
+/// quiet or the wait reached `Ceiling`, and otherwise holds; a period passes only after its
+/// look (`Tick`).
 ///
-/// Three claims, each with its outcome variable: a flip never lands under a build — in use
-/// OR not known — before the ceiling, unforced (`NoFlipUnderABuild`, over `early`); a
-/// revoked build's flip is never held (`RevokedNeverWaits`, over `stalled`); and the wait
-/// is bounded (`WaitIsBounded`).
-///
-/// `Buggy=1` is the three ways the decision gets this wrong, one per claim: an unreadable
-/// table read as quiet (the flip lands under a build nobody could see), a hold that ignores
-/// revocation, and a hold that ignores the ceiling. Tier-1 (`atpkg::quiet`'s tests) drives
-/// the real `decide` and the real `Busy` classification over every reachable look, with
-/// the unknown-is-quiet decision as the caught negative control.
+/// No flip lands under a build in use or unknown before the ceiling, unforced
+/// (`NoFlipUnderABuild`, over `early`); a revoked build's flip is never held
+/// (`RevokedNeverWaits`, over `stalled`); the wait is bounded (`WaitIsBounded`). `Buggy = 1`
+/// breaks each: an unknown table read as quiet, a hold that ignores revocation, a hold that
+/// ignores the ceiling. Tier 1 (`atpkg::quiet`'s tests) drives the real `decide` and `Busy`
+/// classification over every reachable look, with unknown-is-quiet as the negative control.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_flip_quiet_model() -> Model {
@@ -87,11 +82,8 @@ pub fn atpkg_flip_quiet_model() -> Model {
                 looked = 0;
             }
 
-            // No flip lands under a build (in use or not known) before the ceiling unforced.
             invariant NoFlipUnderABuild: early == 0;
-            // A revoked build's flip is never held.
             invariant RevokedNeverWaits: stalled == 0;
-            // The wait is bounded by the ceiling.
             invariant WaitIsBounded: age <= Ceiling;
         }
     }

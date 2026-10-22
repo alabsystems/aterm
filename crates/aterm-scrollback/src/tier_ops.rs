@@ -318,15 +318,13 @@ impl Scrollback {
                 let lost = block.line_count();
                 self.pressure_evicted_lines =
                     self.pressure_evicted_lines.saturating_add(lost as u64);
-                // Its ROWS stay, blank (what every reader showed for them),
-                // when older history sits in cold: dropping them from the
-                // middle would hand each older line the absolute row of the
-                // line `lost` rows newer, a renumbering no fence or mark sees.
-                // With nothing older, dropping them is the oldest history
-                // going, as any eviction goes. The one other drop is cold
-                // refusing the blank block itself (its LZ4 step failing on
-                // a page of empty lines): then the rows leave the
-                // middle after all, the renumbering above, with no epoch bump.
+                // Its rows stay, blank (what every reader showed for them), when
+                // older history sits in cold: dropping them from the middle would
+                // give each older line the absolute row of the line `lost` rows
+                // newer, a renumbering no fence or mark sees. With nothing older,
+                // dropping them is just the oldest history going. If cold refuses
+                // even the blank block, the rows leave the middle after all, with
+                // no epoch bump.
                 // Kept, the blank page is marked LOST: the budget evicting it
                 // later must not count these lines a second time.
                 let kept = self.cold.line_count() > 0 && {
@@ -376,7 +374,7 @@ impl Scrollback {
             // Real retention LOSS (not a user limit): count it so the host can
             // surface the truncation out-of-band (audit E10a). A quarantined
             // block's blank rows were counted when it was quarantined, so they
-            // count once (ATERM-KI-1015-12).
+            // count once.
             let newly_lost = evicted.lines.saturating_sub(evicted.already_lost);
             self.pressure_evicted_lines += newly_lost as u64;
             self.sync_accounting();

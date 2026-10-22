@@ -117,9 +117,7 @@ use std::time::SystemTime;
 
 use aterm_json::Value;
 
-// ---------------------------------------------------------------------------
 // Codex's names: thread ids and rollout files
-// ---------------------------------------------------------------------------
 
 /// Whether `s` is a thread id Codex prints and takes back: a hyphenated UUID
 /// (8-4-4-4-12 hex digits). Nothing else is ever put on a relaunch line.
@@ -241,9 +239,7 @@ pub(crate) fn tail_after(path: &Path, floor: u64, bytes: u64) -> Option<String> 
     })
 }
 
-// ---------------------------------------------------------------------------
 // Spend: each served turn of a rollout, once (module header)
-// ---------------------------------------------------------------------------
 
 /// How far apart, in milliseconds, two lines of a legacy fork's copied
 /// prefix may be stamped, in a fork that writes no `thread_settings_applied`

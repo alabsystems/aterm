@@ -282,9 +282,7 @@ pub(crate) struct Requested {
 /// [`parse_mail_params`], and a mistyped stream name outside `mail:` still reaches
 /// the `_ => return None` arm.
 fn fold_mail_params(s: &str) -> Vec<String> {
-    // THE ONE VOCABULARY, plus the `ts` alias the catalog spells inside
-    // `timestamps`. A fourth hand-written copy is how `mail` came to be missing
-    // from the refusal for a whole round.
+    // The one vocabulary, plus the `ts` alias the catalog spells inside `timestamps`.
     // A piece names a stream by the part before any `:` (`log:class=turn` is
     // the `log` stream, never a continuation of `mail:`'s comma list).
     let is_stream = |t: &str| {
@@ -759,12 +757,11 @@ impl Frame {
 #[derive(Clone, Copy, Debug)]
 struct Gone;
 
-/// The ONE door from a [`Frame`] to the subscriber socket. It owns the writer for the
-/// push loop's whole life, owns the timestamp policy, and owns the per-wake stamp
-/// LEDGER — so `T <tag> <t_us>` is emitted once per tag per wake for EVERY frame
-/// kind, including the four that were structurally unstampable while the stamp lived
-/// inside one producer: the `bytes` bursts, the instance lifecycle events, a closing
-/// target's `exited`, and the events-resume `GAP`.
+/// The one door from a [`Frame`] to the subscriber socket. It owns the writer for the
+/// push loop's life, the timestamp policy and the per-wake stamp ledger, so
+/// `T <tag> <t_us>` is emitted once per tag per wake for every frame kind, including
+/// `bytes` bursts, instance lifecycle events, a closing target's `exited` and the
+/// events-resume `GAP`.
 ///
 /// NO BUFFER. The writer is the socket itself; each producer's frames go out
 /// by one vectored write ([`Egress::send`]), so there is nothing to flush and
@@ -893,11 +890,9 @@ fn frame_cursor(sid: &str, seq: u64, row: u16, col: u16, visible: bool, style: &
     )
 }
 
-/// Format a styled CELLS DELTA — the lossless styled-screen frame pushed live.
-/// LENGTH-PREFIXED so the (large, single-line) JSON body frames cleanly on the
-/// line-based socket: `DELTA <sid> seq=<n> cells <nbytes>\n<json>\n`. The body is
-/// exactly Item 1's `styled_frame_payload` (one physical line); the trailing `\n`
-/// is a non-counted terminator the client discards after reading `<nbytes>`.
+/// Format a styled cells DELTA, length-prefixed so the large single-line JSON body
+/// frames cleanly: `DELTA <sid> seq=<n> cells <nbytes>\n<json>\n`. The body is
+/// `styled_frame_payload`'s one line; the trailing `\n` is an uncounted terminator.
 ///
 /// Returned as the segments it is written from: `head` (whatever the watch
 /// formatted before it, then the header line), the session's published body
@@ -919,9 +914,9 @@ fn frame_cells(sid: &str, seq: u64, frame: Arc<StyledFrame>, head: &mut String) 
 /// bursts whenever the per-subscriber queue overflowed since the last drain. Framing:
 /// `BYTES <sid> <len>\n<len bytes>\n`.
 ///
-/// Takes `&Watch`, not `&mut`: the byte queue IS its own watermark (draining empties
-/// it), so unlike the seq/turn/block streams this producer moves no send cursor — and
-/// that is what lets [`Closing::drain`] read the tail of a watch it is consuming.
+/// Takes `&Watch`, not `&mut`: the byte queue is its own watermark (draining empties
+/// it), so this producer moves no send cursor, which lets [`Closing::drain`] read the
+/// tail of a watch it is consuming.
 ///
 /// Each burst is written from the reader's own allocation, never copied: its
 /// header text, then the burst, and one burst's terminator leads the next
@@ -1459,10 +1454,9 @@ fn frame_gap(sid: &str, seq: u64) -> String {
 /// session's watchers, so the row is pushed on the wake it causes.
 fn drain_mail_events(watch: &mut Watch, sid: &str, out: &mut String) {
     let since = watch.src.fabric.mail_since(watch.last_mail_id, &watch.mail);
-    // WHAT WAS ISSUED ABOVE THE CURSOR, LESS WHAT THE RING STILL HOLDS. Not
-    // "everything below the oldest row": eviction is BY CLASS, so a human row
-    // pinned at the front leaves `oldest` where it was while agent rows behind
-    // it go, and a front-anchored gap would report none of them.
+    // What was issued above the cursor, less what the ring still holds. Not
+    // "everything below the oldest row": eviction is by class, so a pinned human row
+    // at the front stays while agent rows behind it go.
     let issued = since.high.saturating_sub(watch.last_mail_id);
     let missed = issued.saturating_sub(since.present);
     if missed > 0 {
@@ -2017,17 +2011,10 @@ fn engine_seed(
     }
 }
 
-/// Build one target's send cursors — the per-`Watch` seeding, in ONE place.
-///
-/// It was inline in [`push_loop_with_peer_probe`]'s `map`, which was fine while the target set
-/// was frozen at subscribe time. A `@*` subscription ADOPTS sessions later, and
-/// an adopted watch has to be seeded by exactly the same rules or it would
-/// replay a backlog (empty watermarks) or start blind (wrong watermarks). One
-/// function is the only way to keep those two paths from drifting.
-///
-/// The `opts.since*` resume anchors are per-session and are refused for a
-/// multi-target subscription (and for `@*` outright), so in adopt mode they are
-/// always `None` here and this function behaves identically for both callers.
+/// Build one target's send cursors: the one seeding rule for the initial targets and for
+/// a `@*` adoption, so an adopted watch neither replays a backlog nor starts blind. The
+/// `opts.since*` resume anchors require a single target and are refused for `@*`, so in
+/// adopt mode they are `None` here.
 ///
 /// Each source is read under its own lock, one at a time: the engine's values
 /// under one `term` guard ([`engine_seed`]), then the turn ledger, the timeline
@@ -2059,8 +2046,7 @@ fn new_watch_at(
     Watch {
         local_id: *local_id,
         term: term.clone(),
-        // Seeded to the ring's high so only mail DELIVERED after subscription
-        // pushes — the same live-stream rule as turns, blocks, title and bell.
+        // The ring's high: only mail delivered after subscription pushes.
         last_mail_id: if streams.mail {
             src.fabric.last_msg_id()
         } else {
@@ -2087,29 +2073,23 @@ fn new_watch_at(
         }),
         closing: false,
         timeline_held: false,
-        // `since-turn=<id>` resumes the turn stream from that id (push turns
-        // with id > since_turn); absent it, seed to the live high so only
-        // post-subscription turns push. Only meaningful with the events stream.
-        //
-        // AN ANCHOR ABOVE EVERY TURN ID THIS PROCESS HAS MINTED is from
-        // elsewhere (a relay resumed across an update onto a successor that
-        // did not continue the count — round seven of the update audit,
-        // finding 51): it would hide every turn until the count passed it, so
-        // it seeds at the live high instead, as an absent anchor does.
+        // `since-turn=<id>` resumes after that id; absent, the live high, so only
+        // post-subscription turns push. An anchor above every turn id this process has
+        // minted comes from elsewhere (a relay resumed across an update onto a successor
+        // that restarted the count) and would hide every turn until the count passed it,
+        // so it seeds at the live high too.
         last_turn_id: opts
             .since_turn
             .filter(|anchor| *anchor <= crate::control::turn_ids_minted())
             .or_else(|| initial_turn_watermark(&src.turns, streams)),
-        // Seed to the live timeline high so only meta changes AFTER
-        // subscription push (a live stream, like turns/blocks/title).
+        // The live high: only records after subscription push.
         last_timeline_id,
         last_resize_id,
         last_title: engine.title,
         last_bell: engine.bell,
         last_sent_seq: opts.since.unwrap_or(0),
         last_alt: engine.alt,
-        // Seed to a sentinel so the FIRST content/cursor wake always emits the
-        // caret (a fresh subscriber has no prior cursor); real positions differ.
+        // A sentinel no real caret matches, so the first wake emits the cursor.
         last_cursor: (u16::MAX, u16::MAX, false, ""),
         last_text: engine.text,
         last_rows_hash: engine.rows_hash,
@@ -2122,8 +2102,8 @@ fn new_watch_at(
         // afresh — round seven, finding 51): it is lowered to the live high,
         // so it can never hide a block the engine completes from here.
         last_block_id: resume_block_watermark(opts.since_block, engine.newest_block),
-        // Register on the byte fan-out ONLY when `bytes` is requested, so an
-        // idle/unsubscribed session pays nothing for the live byte channel.
+        // On the byte fan-out only when `bytes` is requested, so an unwatched channel
+        // costs nothing.
         byte_sub: streams.bytes.then(|| src.byte_fanout.subscribe()),
         non_coalesced: opts.non_coalesced,
         pace: Paces::default(),
@@ -2475,16 +2455,12 @@ fn timeline_owed(watches: &[Watch]) -> bool {
 /// own thread between a wake's wait and its closing pass, which is where a
 /// test that must act at that instant acts.
 ///
-/// `handshake` is the subscription's ack — `OK subscribe <n>` and one `sub
-/// <local> <sid>` line per target, formatted by the control dispatch — and it
-/// is written HERE, once every one of `targets` has its watch seeded, before
-/// the first frame. It used to be written by the dispatch before this loop
-/// seeded anything, so a reader acting on a `sub` line — the fabric bridge
-/// reads that session's `topic ls` there — could read before the seed, and a
-/// change the session recorded between that read and the seed was below the
-/// watch's watermark: in no read and pushed by nobody. Every `sub` line on the
-/// wire, the handshake's and each adoption's ([`drain_membership`]), now
-/// follows its watch's seed.
+/// `handshake` (`OK subscribe <n>` and one `sub <local> <sid>` line per target, formatted
+/// by the control dispatch) is written once every watch is seeded, before the first
+/// frame. A reader acting on a `sub` line (the fabric bridge reads that session's
+/// `topic ls`) must not race the seed, or a change recorded between its read and the
+/// seed would sit below the watermark and be pushed by nobody. Every `sub` line, the
+/// handshake's and each adoption's ([`drain_membership`]), follows its watch's seed.
 pub(crate) fn push_loop_with_peer_probe<W: Write, L: PeerLiveness>(
     store: &Store,
     targets: &[ResolvedTarget],
@@ -2570,9 +2546,8 @@ pub(crate) fn push_loop_with_peer_probe<W: Write, L: PeerLiveness>(
         let _ = sub.watch(peer);
     }
 
-    // THE HANDSHAKE, NOW THAT EVERY WATCH IN IT IS SEEDED: see the doc above.
-    // A write failure is the client gone, which ends the stream as `Gone`
-    // does below.
+    // The handshake, now that every watch is seeded (see the doc above). A failed write
+    // is the client gone.
     // Each log-streaming target's `sub` line names where its stream starts,
     // read from the watch just seeded ([`with_log_anchors`]).
     let handshake = with_log_anchors(handshake, &watches);
@@ -3149,7 +3124,7 @@ fn drain_membership(
             drain_roster(&g, cursor, watched, &mut roster);
         }
         (t_us, picked, roster)
-        // guard drops here, BEFORE `new_watch` takes any Terminal lock
+        // The guard drops here, before `new_watch` takes any Terminal lock.
     };
     let mut out = Vec::with_capacity(picked.len() + 1);
     for (target, sid, fresh) in picked {
@@ -7720,8 +7695,8 @@ mod tests {
     fn a_spawn_between_adoption_and_the_roster_is_announced_with_its_watch() {
         const T: u64 = 1;
         let store = crate::session_store::new_store();
-        // T predates the subscription but is not among its initial targets, so
-        // the FIRST wake adopts it, and acking that adoption is the injection.
+        // T predates the subscription but is not an initial target, so the first wake
+        // adopts it, and acking that adoption is the injection point.
         store
             .write()
             .unwrap_or_else(|p| p.into_inner())

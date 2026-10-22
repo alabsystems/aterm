@@ -132,7 +132,7 @@
 //! A crash, or the quit of a restart, a logout or a shutdown, leaves the next
 //! launch a layout that names each tab's standing holds
 //! (`restore::TerminalLeafRestore::holds`, [`render_holds`]; ruling 23 of the
-//! robustness handoff, LC-8 of ATERM-KI-1015-1). The cold restore relaunches
+//! robustness handoff, LC-8 of ). The cold restore relaunches
 //! no agent of a held tab, whatever the origin, and puts the owner's
 //! (`origin=local`) slot back on the reopened tab ([`SessionFabric::seed_holds`]
 //! with [`Holds::of_origin`], `carried=1`), lifted as any local hold is:
@@ -429,7 +429,7 @@ pub const POST_INLINE_MAX: usize = 4 * 1024;
 ///
 /// AND THE BYTE BOUND COUNTS EVERY CALLER-SIZED FIELD, not the body alone
 /// ([`PostRow::caller_sized_bytes`]).
-/// It once folded `p.body.len()` alone, which left `via=` — the other
+/// It once folded `p.body.len` alone, which left `via=` — the other
 /// caller-chosen string on the same request line, and at the time bounded by
 /// nothing at all — outside the number this constant names.
 ///
@@ -692,7 +692,7 @@ pub struct InboxRow {
     pub from: String,
     /// One of [`KINDS`].
     pub kind: String,
-    /// One of [`TRUSTS`] — the receiver's verdict on what the content IS.
+    /// One of [`TRUSTS`]: the receiver's verdict on what the content is.
     pub trust: String,
     /// The offset this message answers, when it answers one.
     pub re: Option<u64>,
@@ -910,7 +910,7 @@ pub struct PostRow {
     /// `deliver`/`inbox seen`, and the retention bound is the reason the pair
     /// exists at all: a body held forever behind an unreachable broker is the
     /// "unbounded wait fixed into an unbounded buffer" trade this codebase keeps
-    /// refusing. `len()` is reported on the `post` row so the bytes are visible.
+    /// refusing. `len` is reported on the `post` row so the bytes are visible.
     pub body: String,
 }
 
@@ -1277,7 +1277,7 @@ impl PostRow {
 ///
 /// ONE FUNCTION BECAUSE IT IS ONE QUANTITY. The door and the fold are the two
 /// ends of [`OUTBOX_BYTES_MAX`], and they were computing different numbers: the
-/// fold counted `body + via` while the door added `body.len()` of the RAW frame
+/// fold counted `body + via` while the door added `body.len` of the RAW frame
 /// bytes and nothing else. Both halves of that were wrong in the same direction.
 /// `via` went uncounted for exactly the row being admitted, and the raw byte
 /// count is not the byte count the row keeps — the body is stored through
@@ -2482,7 +2482,7 @@ impl SessionFabric {
     }
 
     /// Whether [`Self::close`] has run. Not named `closed`: the lock-order census
-    /// resolves a call by its name, and `DeferredReaderGate::closed()` would
+    /// resolves a call by its name, and `DeferredReaderGate::closed` would
     /// then read as taking this inbox lock.
     pub fn endpoint_closed(&self) -> bool {
         self.lock().closed
@@ -3405,9 +3405,7 @@ impl SessionFabric {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The instance's bridge link
-// ---------------------------------------------------------------------------
 
 /// `fabric=` states, in the order [`FabricLink::state`] encodes them.
 const FABRIC_ABSENT: u8 = 0;
@@ -3518,7 +3516,7 @@ struct LinkReport {
     /// failed). `None` while up, and `None` for a fresh attach that has said
     /// nothing yet: a link that never came up has no stall to date, and the
     /// band prints `~` with no figure rather than a number it made up
-    /// (round 19's review measured `~ 0s` for the life of a dialing bridge,
+    /// (the prior review measured `~ 0s` for the life of a dialing bridge,
     /// and `~ 3600s` one second into the stall of a link that had been quiet
     /// for an hour — the ack's age, [`fabric_link_facts`], is NOT the stall's).
     stalled_at: Option<std::time::Instant>,
@@ -4031,7 +4029,7 @@ fn note_work_owed() {
         return;
     }
     // A SIBLING TEST'S `post` OWES THIS BRIDGE NOTHING (see [`LINK_SECTION`]),
-    // and the round-21 gate above is not enough to say so: it refuses a write
+    // and the gate above is not enough to say so: it refuses a write
     // while the link is not connected, which is exactly the state a live
     // section has moved it OUT of. So a test running outside the section, whose
     // own store has posted, armed the debt inside someone else's measurement
@@ -4300,7 +4298,7 @@ pub fn bridge_attached(generation: BridgeGeneration) {
 /// `fabric=` moves to `connected` with no round trip (`fabric_rtt_ms=-`) and
 /// the verb's arrival as the ack.
 ///
-/// Measured 2026-09-14 (the round-13 review): the installed 0.85.0 bridge
+/// Measured 2026-09-14 (the review): the installed 0.85.0 bridge
 /// under this endpoint read `stalled reason=starting` for life while its mail
 /// flowed, every `post --wait` from its sessions failed at once with `ERR
 /// fabric stalled`, and `aterm fabric on` could not arm it. Once an
@@ -5121,7 +5119,7 @@ fn link_reason_token(raw: &str) -> String {
 /// Ctxs are cloned out from under the registry guard first: the fabric lock is
 /// a leaf and is never taken while the store is held. Each condvar is signalled
 /// UNDER its session's own fabric lock, after the caller's state store. A `post
-/// --wait` reads `fabric_state()` while holding that lock and releases it only
+/// --wait` reads `fabric_state` while holding that lock and releases it only
 /// inside `wait_timeout`, so mutual exclusion gives the whole property: either
 /// this lock waits until the waiter is parked (and the signal reaches it), or it
 /// wins the lock first — in which case the waiter's next read already sees the
@@ -5314,7 +5312,7 @@ pub fn bridge_lost_waking(
     // other reason to wake. Without this it sits out its whole wait (up to
     // `WAIT_MAX_MS`) and answers `ERR timeout` for a landing nothing could ever
     // have reported, which is the exact outcome `cmd_post`'s entry check
-    // (§11.2 deviation 9) exists to avoid. The waiter re-reads `fabric_state()`
+    // (§11.2 deviation 9) exists to avoid. The waiter re-reads `fabric_state`
     // on each wake and answers `ERR fabric disconnected id=<n> queued=1` instead
     // — see [`fabric_wait_refusal`] for why the queued token is not decoration.
     // The same sweep, for the same reason, runs when the bridge reports its
@@ -5368,9 +5366,7 @@ fn advise(ctx: &dyn FabricSession, lost: Hold, generation: BridgeGeneration) -> 
     true
 }
 
-// ---------------------------------------------------------------------------
 // The hold gate
-// ---------------------------------------------------------------------------
 
 /// Whether a fleet halt refuses `verb` (§5.3): its verb row's
 /// [`Input::PTY`](aterm_types::control_verbs::Input::PTY) flag. Every row that can
@@ -5536,9 +5532,7 @@ pub fn open_halt_refusal(store: &impl AsStore, verb: &str, rest: &str) -> Option
     app_halt_refusal(store, "invoke")
 }
 
-// ---------------------------------------------------------------------------
 // Small wire helpers
-// ---------------------------------------------------------------------------
 
 /// A principal ADDRESS: a bare principal ([`is_principal`]), or
 /// `<owner>@<node>` for a session behind a node, both halves bare. Nothing a
@@ -5621,9 +5615,7 @@ fn reason_token(raw: &str) -> String {
     if out.is_empty() { "-".to_string() } else { out }
 }
 
-// ---------------------------------------------------------------------------
 // hold
-// ---------------------------------------------------------------------------
 
 const HOLD_USAGE: &str = "ERR usage: hold <sid> on|off [reason=<pct>] [origin=fleet|local]\n";
 
@@ -5982,7 +5974,7 @@ fn apply_hold_as(
 /// [`with_link_reset`] serializes every test that MOVES the link, and that was
 /// not enough: [`link_evidence`] is reached from `deliver` and `outbox sent`,
 /// which sibling tests call OUTSIDE that mutex, and in a test there is no
-/// serving lane — so `lane_generation()` is `None`, which is exactly the shape
+/// serving lane — so `lane_generation` is `None`, which is exactly the shape
 /// `link_evidence`'s own gate accepted ("a bridge from before the report")
 /// until it came to require the explicit incarnation that owns the link. Such
 /// a call found the SECTION's fresh attach (`stalled reason=starting`, a
@@ -6034,7 +6026,7 @@ pub fn also_reset_with_the_link(reset: fn()) {
 /// The link is per-INSTANCE state in a `static`, which is right for production
 /// (one bridge, one instance) and a hazard for a parallel test binary: a test
 /// that attaches or loses a bridge is visible to every other test that reads
-/// `fabric_state()`, `status`'s own record included. Every such test takes THIS,
+/// `fabric_state`, `status`'s own record included. Every such test takes THIS,
 /// so they serialize and each starts from `absent`.
 #[cfg(any(test, debug_assertions))]
 pub fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
@@ -6078,7 +6070,7 @@ pub fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
     /// reset below happens while `_lock` — the field that serializes the section
     /// — is still held, and the mutex is released only afterwards. The two-binding
     /// form this replaced (`let guard = …; let _reset_on_exit = Reset; let out =
-    /// f(); drop(guard); out`) released the lock FIRST on the success path,
+    /// f; drop(guard); out`) released the lock FIRST on the success path,
     /// because the explicit `drop(guard)` ran before the reset guard's scope-end
     /// drop — so the reset landed outside the lock and could clear the link under
     /// the next section, which then saw `fabric=absent` where it had just
@@ -6432,9 +6424,7 @@ pub fn person_hold(ctx: &dyn FabricSession, on: bool, wake: &dyn Fn()) -> Person
     }
 }
 
-// ---------------------------------------------------------------------------
 // deliver
-// ---------------------------------------------------------------------------
 
 const DELIVER_USAGE: &str = "ERR usage: deliver <sid> off=<n> from=<p> kind=<k> trust=<t> \
                              [re=<n>] [dl=<ms>] [late=1] [demoted=<k>] [via=<p,...>] \
@@ -6979,9 +6969,7 @@ fn retire_post(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // outbox / outbox sent
-// ---------------------------------------------------------------------------
 
 const OUTBOX_USAGE: &str = "ERR usage: outbox [<max>] [earlier-receipts=1] | outbox sent <sid> <post-id> off=<n|-> \
                             [dup=1] [reason=<word>]\n";
@@ -7027,7 +7015,7 @@ pub fn cmd_outbox_verb_waking(
 /// separate, explicit act (`outbox sent`), which is what makes the pair the
 /// outbound mirror of `deliver` / `inbox seen`.
 ///
-/// FRAMING. `OK <nbytes>` then that many bytes, holding a `post …  len=<n>` line
+/// FRAMING. `OK <nbytes>` then that many bytes, holding a `post … len=<n>` line
 /// and then that post's `n` body bytes, repeated. A length prefix rather than
 /// rows because a body may contain newlines — the reason `deliver`'s inline
 /// `text=` is pct-encoded and this is not.
@@ -7547,9 +7535,7 @@ fn evict_for(inbox: &mut Inbox) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // topic — the receiver-side broadcast opt-in
-// ---------------------------------------------------------------------------
 
 /// `topic add <t> [since=head|@<off>] | topic drop <t> | topic ls` — the
 /// RECEIVER-SIDE OPT-IN for broadcast.
@@ -7848,9 +7834,7 @@ pub const MAX_TOPICS: usize = 32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TopicsFull;
 
-// ---------------------------------------------------------------------------
 // inbox / inbox get / inbox seen
-// ---------------------------------------------------------------------------
 
 const INBOX_USAGE: &str = "ERR usage: inbox [<n>] [since=<id>] [--peek] [--meta] \
                            | inbox get <id> | inbox get @<off> \
@@ -8382,9 +8366,7 @@ fn addressed_floor(inbox: &Inbox) -> Option<u64> {
         .or_else(|| inbox.addressed_head.map(|h| h.saturating_add(1)))
 }
 
-// ---------------------------------------------------------------------------
 // post
-// ---------------------------------------------------------------------------
 
 const POST_USAGE: &str = "ERR usage: post to=<@<sid>[@<node>]|<principal>|say[:<topic>]> \
                           kind=<ask|answer|task|report|note|ack|control> [re=<n>] [dl=<ms>] \
@@ -8652,7 +8634,7 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
     // retired ones hold no body and cost nothing.
     //
     // THE INCOMING ROW IS MEASURED THE WAY THE QUEUED ONES ARE, by the same
-    // function: [`caller_sized_bytes`]. This line used to add `body.len()`
+    // function: [`caller_sized_bytes`]. This line used to add `body.len`
     // alone, so the one row whose admission was being decided was the one row
     // whose `via` went uncounted.
     let (queued, queued_bytes) = inbox.queued_load();
@@ -8703,7 +8685,7 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
     // record rings the bridge's push lane, and a bridge that drained, landed
     // and settled the post before this ran would leave the clock armed with
     // nothing owed, so `fabric=` would read `stale` and cut the next `--wait`
-    // short. `ctx.fabric()` → `LINK.link` is this file's one order.
+    // short. `ctx.fabric` → `LINK.link` is this file's one order.
     note_work_owed();
     let fact = FabricFact::MailOut {
         kind: &kind,
@@ -8888,7 +8870,7 @@ fn wait_receipt_on_log(
         // PARK NO LONGER THAN THE STALE HORIZON ([`park_until`]). THIS WAIT
         // IS THE LONGER OF THE TWO — its bound is the sender's `dl=` plus a
         // grace, up to `WAIT_MAX_MS` — so sitting it out is the more expensive
-        // mistake, and round 21 shipped the cap on the landing wait alone.
+        // mistake, and shipped the cap on the landing wait alone.
         guard = aterm_control::park::park_guarded(
             &ctx.fabric().changed,
             guard,
@@ -8909,9 +8891,9 @@ fn wait_receipt_on_log(
 /// clock wakes no parked waiter: another session's `post` arms it under that
 /// session's own fabric lock and notifies only its own condvar, and a
 /// bridge's first `link up` with posts queued arms it with a presence wake.
-/// A debt armed after this instant goes stale no sooner than `stale_after()`
+/// A debt armed after this instant goes stale no sooner than `stale_after`
 /// from now, so a wait that parked debt-free still looks by its horizon, at
-/// one look per `stale_after()`.
+/// one look per `stale_after`.
 fn park_until(deadline: std::time::Instant) -> std::time::Instant {
     let horizon = stale_in()
         .filter(|d| !d.is_zero())
@@ -8967,7 +8949,7 @@ fn fabric_wait_refusal(id: u64) -> String {
 /// Whether a `post --wait` parked now could only time out: no bridge, a
 /// bridge that is gone, or a bridge that has SAID its link is down. A bridge
 /// that is attached and has said nothing yet (`stalled reason=starting`) is
-/// none of those: a round-13 bridge reports within milliseconds either way
+/// none of those: a bridge reports within milliseconds either way
 /// and a `down` wakes the waiter ([`link_report`]); a bridge from before the
 /// report never says anything and lands the post all the same, and the
 /// landing itself is what moves the state ([`link_evidence`]). Refusing the
@@ -8990,9 +8972,7 @@ fn wait_is_futile() -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
 // await inbox
-// ---------------------------------------------------------------------------
 
 /// `await inbox since=<id> [kinds=<k,...>] [topic=<t>] | await inbox re=<off>
 /// [since=<id>] [kinds=<k,...>]` — the fabric wake predicate.
@@ -9455,7 +9435,7 @@ mod inbox_hold {
 
     /// Attach one incarnation AND bring its link up — what a bridge whose
     /// broker answers does within milliseconds of being served. An attach on
-    /// its own is `stalled` (round 13): the link is the bridge's to report.
+    /// its own is `stalled`: the link is the bridge's to report.
     fn attach_up(store: &Store, generation: BridgeGeneration) {
         bridge_attached(generation);
         assert!(link_report(store, Some(generation), true, "", Some(1)));
@@ -9787,7 +9767,7 @@ mod inbox_hold {
     /// THE OUTBOX'S TWO BOUNDS COUNT EVERY CALLER-SIZED FIELD, AND A RETIRED ROW
     /// KEEPS NONE OF THEM.
     ///
-    /// `queued_load` folded `p.body.len()` alone, so `via` — the other
+    /// `queued_load` folded `p.body.len` alone, so `via` — the other
     /// caller-chosen string on the same `post` line — was outside the 4 MiB
     /// bound; and `retire_post` cleared the body and left `via` on the row, which
     /// [`RETIRED_KEEP`] then held 512 of for the life of the session, while both
@@ -9879,7 +9859,7 @@ mod inbox_hold {
     ///
     /// [`OUTBOX_BYTES_MAX`] has two ends and they computed different numbers.
     /// `queued_load` folds `body + via` over the STORED rows; the admission test
-    /// added the raw frame's `body.len()` and nothing else. So the one row whose
+    /// added the raw frame's `body.len` and nothing else. So the one row whose
     /// admission was being decided was the one row whose `via` went uncounted,
     /// and a frame of non-UTF-8 was weighed at its wire length while the row
     /// keeps `String::from_utf8_lossy`'s — three bytes for every invalid one.
@@ -10939,7 +10919,7 @@ mod inbox_hold {
         });
     }
 
-    /// THE LINK IS THE BRIDGE'S TO REPORT (round 13). An attach is `stalled`
+    /// THE LINK IS THE BRIDGE'S TO REPORT. An attach is `stalled`
     /// with `reason=starting` and no numbers; `link up rtt=` is the ONLY way to
     /// `connected` and stamps the ack; `link down reason=` is `stalled` with
     /// that reason, keeps the last rtt as history, and a `post --wait` under it
@@ -11048,7 +11028,7 @@ mod inbox_hold {
     /// `disconnected` can see: the helper process holds both inherited fds open
     /// — so no `BridgeLostGuard` fires — and publishes nothing — so it never
     /// reaches its own 5 s ack deadline and never reports `link down`. Before
-    /// round 21 its instance read `connected` for as long as it hung, and a
+    /// its instance read `connected` for as long as it hung, and a
     /// `post --wait` from its sessions sat out the whole `--wait` (up to
     /// `WAIT_MAX_MS` = 600 s) for a landing nothing was going to report.
     ///
@@ -11105,7 +11085,7 @@ mod inbox_hold {
 
             // AND LET IT GO UNANSWERED. No report, no landing, no ack — only
             // time passing with the post still owed: the production horizon,
-            // which `stale_after()` keeps with no seam set.
+            // which `stale_after` keeps with no seam set.
             backdate_work_owed(STALE_AFTER);
             assert_eq!(fabric_state(), "stale");
             assert!(wait_is_futile());
@@ -11157,7 +11137,7 @@ mod inbox_hold {
 
     /// **THE DEBT BELONGS TO THE OLDEST OUTSTANDING POST, NOT TO THE LAST EVENT.**
     ///
-    /// Round 21's first cut of `stale` cleared the owed clock on ANY evidence the
+    /// the prior first cut of `stale` cleared the owed clock on ANY evidence the
     /// bridge was moving. That reintroduced the freeze it exists to cut short, one
     /// post further along: queue two, let the bridge land the first and then wedge,
     /// and the landing clears a debt the SECOND post is still owed. The instance
@@ -11227,7 +11207,7 @@ mod inbox_hold {
     /// **`post --wait-ack`'s SECOND WAIT IS CUT TO THE STALE HORIZON TOO.**
     ///
     /// [`wait_landing`] caps its park so a waiter is not left asleep when the
-    /// bridge stops answering; round 21 shipped that cap on the landing wait
+    /// bridge stops answering; shipped that cap on the landing wait
     /// alone and claimed both. The receipt wait is the LONGER of the two — its
     /// bound is the sender's `dl=` plus a grace, up to `WAIT_MAX_MS` — so sitting
     /// it out is the more expensive half of the bug.
@@ -11562,7 +11542,7 @@ mod inbox_hold {
     }
 
     /// A BRIDGE THAT NEVER REPORTS ITS LINK IS READ BY WHAT IT DOES (the
-    /// round-13 review's finding 1). Both lanes of a 0.85 bridge attach and
+    /// review's finding 1). Both lanes of a 0.85 bridge attach and
     /// no `link` record ever comes; its first delivery moves the endpoint to
     /// `connected` with no round trip and the delivery as the ack, and a
     /// `post --wait` under `stalled reason=starting` PARKS (here: runs its
@@ -12166,7 +12146,7 @@ mod inbox_hold {
                 })
             };
             // Inside the wait's own life: an unanswered post turns the link
-            // `stale` at `stale_after()`, which ends a parked wait — so a wake that
+            // `stale` at `stale_after`, which ends a parked wait — so a wake that
             // came only after the wait would come only after that.
             assert!(
                 watcher.wait(stale_after() / 2),
@@ -14895,9 +14875,7 @@ mod inbox_hold {
         });
     }
 
-    // -----------------------------------------------------------------------
     // outbox / outbox sent — the outbound mirror of deliver / inbox seen
-    // -----------------------------------------------------------------------
 
     /// Parse one `outbox` reply into `(header, [(fields, body)])`. Written as a
     /// real parser rather than a substring check because the framing IS the
@@ -15167,9 +15145,7 @@ mod inbox_hold {
         assert_eq!(cmd_outbox(&store, "nope"), OUTBOX_USAGE);
     }
 
-    // -----------------------------------------------------------------------
     // R1 audit regressions
-    // -----------------------------------------------------------------------
 
     /// A PARKED `post --wait` LEARNS THE BRIDGE DIED instead of sitting out its
     /// whole wait.

@@ -3,11 +3,8 @@
 
 //! The single modal-overlay slot for the in-grid surfaces: the command Palette and
 //! the Overview share one card slot, one
-//! rasterize/composite call, and one `RepaintKey::settings_fp` term. Rather than parallel `Option` fields on
-//! `WindowState` (whose mutual exclusion had to be enforced by hand, and whose on_key gate
-//! ordering was a latent "hidden overlay swallows keys" bug), they collapse into one
-//! [`Overlay`] enum. Mutual exclusion is now STRUCTURAL — one slot can only hold one
-//! variant. Settings is not one of them: shipping Settings is a native tab.
+//! rasterize/composite call and one `RepaintKey::settings_fp` term. One [`Overlay`] enum
+//! makes their mutual exclusion structural. Settings is not one of them: it is a native tab.
 //!
 //! Each variant's model fans out to the SAME paint/lifecycle observers through the
 //! [`OverlayModel`] trait: pixels ([`OverlayModel::tray`]), the repaint fingerprint
@@ -34,10 +31,9 @@ pub(crate) trait OverlayModel {
     /// (`avail`).
     fn wanted_rows(&self, avail: usize) -> usize;
 
-    /// Paint the surface as a [`TrayInput`] card of pure [`crate::widget::DrawPrim`]s
-    /// — the PIXELS, captured WYSIWYG through the SACRED `composite_tray` path.
-    /// (Palette paints a frosted top band; a floating card returns its own rect
-    /// in the `TrayInput`, which tells the splice where.)
+    /// Paint the surface as a [`TrayInput`] card of [`crate::widget::DrawPrim`]s, composited
+    /// through `composite_tray`. A floating card returns its own rect in the `TrayInput`,
+    /// which tells the splice where.
     /// `palette` is the chrome palette the card paints from
     /// ([`crate::app_render::ChromeSurface::OverGrid`], or `NativePage` for a modal
     /// over a native page).
@@ -170,8 +166,6 @@ impl Overlay {
     /// two surfaces never collide in the `settings_card` cache (which would reuse the wrong
     /// surface's card); `| 1` keeps `0` for "closed".
     pub(crate) fn fingerprint(&self) -> u64 {
-        // The INNER hash comes from the same `OverlayModel` that paints the tray; the
-        // wrapper folds in the variant tag + forces non-zero.
         seal(self.kind().tag(), self.model().fingerprint())
     }
 

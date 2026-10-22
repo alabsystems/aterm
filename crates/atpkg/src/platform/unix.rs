@@ -298,8 +298,7 @@ pub fn universal_control_state() -> [crate::machine::Read<bool>; 2] {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // Not macOS: there is no domain to read, which is a measured absence of the
-        // feature, not a failed read.
+        // No domain to read: a known absence of the feature, not a failed read.
         [crate::machine::Read::Absent, crate::machine::Read::Absent]
     }
 }

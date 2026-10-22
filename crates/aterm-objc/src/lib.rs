@@ -20,9 +20,7 @@
 //! 6. **[A thread-affinity container](main_thread_bound)** —
 //!    [`MainThreadBound<T>`][MainThreadBound], built from the [`MainThread`]
 //!    witness and [`run_on_main`].
-//! 7. **[The run-loop wake timer](wake_timer)** — the event-loop waker. Its
-//!    repeat interval is a year because CoreFoundation walks a late repeating
-//!    timer forward one interval at a time with the run-loop lock held.
+//! 7. **[The run-loop wake timer](wake_timer)** — the event-loop waker.
 //! 8. **[CoreFoundation](cf)** — the flat C the windowing backend calls beside
 //!    its sends: run-loop sources and observers, retain/release. Each
 //!    declaration is held to the SDK headers by clang (`tests/cf_sdk.rs`).

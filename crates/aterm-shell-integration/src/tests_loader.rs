@@ -832,17 +832,15 @@ fn without_first(path: &str, entry: &str) -> String {
     entries.join(sep)
 }
 
-/// A LIVE SHELL FROM BEFORE LOADERS — spawned from main's pre-loader script,
-/// with its nonce — takes the typed upgrade: before the line it signs no
-/// revision (the negative control); the window's one-use file holds a FRESH
-/// key (the heal of a DEGRADED tab, whose key the engine lost; a healthy tab's
-/// file hands back the key it already signs with), this build's folder and its
-/// body pointer; after the line (whose command still runs) the file is gone,
-/// the shell signs THIS build's revision with the FILE'S key, its prompt hooks
-/// are the ones it had, and — the point of it — a body pointer written later is
-/// taken at its next prompt like any loader shell's. A second line naming a
-/// file that is gone changes nothing, prints nothing, and the command after it
-/// runs.
+/// A live shell from before loaders (spawned from the pre-loader script, with its nonce)
+/// takes the typed upgrade. Before the line it signs no revision (the negative control).
+/// The window's one-use file holds a fresh key (healing a degraded tab whose key the engine
+/// lost; a healthy tab's file hands back the key it already signs with), this build's
+/// folder and its body pointer. After the line (whose command still runs) the file is gone,
+/// the shell signs this build's revision with the file's key, its prompt hooks are the ones
+/// it had, and a body pointer written later is taken at its next prompt like any loader
+/// shell's. A second line naming a missing file changes nothing, prints nothing, and the
+/// command after it runs.
 ///
 /// And THE OLD `~/.aterm/bin` goes: the pre-loader script put that folder (the
 /// caller lays it, [`lay_aterm_bin`]) FIRST on PATH, and the user has added a

@@ -92,14 +92,12 @@ pub mod broker_health;
 /// The retention rules every broker aterm opens keeps its log by — see
 /// [`broker_rules::default_rules`].
 pub mod broker_rules;
-/// The bridge command line, as a library entry - see [`cli::dispatch`].
 pub mod cli;
 pub mod ctl;
 /// The broker's `--durability strict|ordered|relaxed`, and how a relaxed
 /// log's power loss reaches every reader as a generation that continues —
 /// see [`durability::open`].
 pub mod durability;
-/// `aterm fabric on|off|doctor` — see [`enable::on`].
 pub mod enable;
 pub mod fabric;
 pub mod fabric_brief;
@@ -116,7 +114,6 @@ pub mod pct;
 /// cap of their own; see [`person::main`].
 pub mod person;
 mod pipeline;
-/// The presence row's meaning fields (`role= detail= phase= title=`).
 pub mod presence;
 /// The live view of who advertises which session, so a bare `@s-<sid>` post
 /// routes on one bounded read instead of a walk of the presence index; see

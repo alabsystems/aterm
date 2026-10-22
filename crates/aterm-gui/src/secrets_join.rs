@@ -145,9 +145,7 @@ pub(crate) fn is_alab_source(source: &str) -> bool {
     source.is_empty() || source == aterm_secrets::ALAB_DEFAULT_URL
 }
 
-// ---------------------------------------------------------------------------
 // The events
-// ---------------------------------------------------------------------------
 
 /// The ALab vault that answered the probe: the version it serves and its signer's
 /// fingerprint (public; for the log).
@@ -280,9 +278,7 @@ pub(crate) enum VaultWake {
 /// Where the lane's threads post: the window's queue.
 pub(crate) type Post = Arc<dyn Fn(VaultWake) + Send + Sync>;
 
-// ---------------------------------------------------------------------------
 // The launch read
-// ---------------------------------------------------------------------------
 
 /// The subscriber's launchd plist, as the launch read finds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -495,9 +491,7 @@ pub(crate) fn note_owed(config_path: Option<&Path>, host: Option<&str>, still_ow
     }
 }
 
-// ---------------------------------------------------------------------------
 // The probe lane
-// ---------------------------------------------------------------------------
 
 /// A probe that failed: what failed, and whether the vault's name resolves. A name that
 /// resolves is a host on this LAN that did not answer (Local Network consent, a server
@@ -799,9 +793,7 @@ fn live_configured_now() -> bool {
     )
 }
 
-// ---------------------------------------------------------------------------
 // The join
-// ---------------------------------------------------------------------------
 
 /// A join to run: the typed password (wiped when the job drops; `None` to be approved by
 /// code), where its end goes, and `aterm.toml`'s path ([`OWED_RECORD`] lives beside it).
@@ -1071,9 +1063,7 @@ fn watch_membership(config_path: Option<&Path>, post: &dyn Fn(VaultWake)) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The ask
-// ---------------------------------------------------------------------------
 
 /// What the ask is judged on at a look. Pure data, gathered by the App.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1331,9 +1321,7 @@ impl Lane {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The words
-// ---------------------------------------------------------------------------
 
 /// The band row's key: the join in flight, then the answer to the press, in place.
 pub(crate) const KEY_JOIN: &str = "secrets.join";
@@ -1410,10 +1398,26 @@ pub(crate) fn joined_notice(names: usize, follows: bool) -> Message {
 /// [`JOIN_AGAIN`] says), never shown here, since it may carry a query or a pin.
 const RETYPE: &str = "a mistyped join password is fixed by running aterm secrets join in a terminal, adding the vault's URL if not the ALab one (it asks for the password again)";
 
-/// What the digest line of a join that failed or never finished asks: a join again, which
-/// names the vault's URL for any vault but the ALab default, the bare verb's.
+/// What the digest line of a join that failed or never finished, or of a subscriber that
+/// could not be installed, asks: System State's secrets vault row (*Sync credentials from
+/// the secrets vault*), whose Apply joins the vault in its field (the ALab default, the
+/// configured source or one typed there) with the join password typed there, if any, and
+/// installs the subscriber. No message intent opens that tab, so the step names its menu
+/// row.
+fn sync_in_system_state() -> String {
+    format!(
+        "Sync the secrets vault in {}",
+        crate::message_reporters::SYSTEM_STATE_MENU
+    )
+}
+
+/// The same join from a terminal, beside [`sync_in_system_state`]: it names the vault's URL for
+/// any vault but the ALab default, the bare verb's.
 const JOIN_AGAIN: &str =
-    "Run aterm secrets join in a terminal, adding the vault's URL if not the ALab one";
+    "In a terminal, aterm secrets join does the same, adding the vault's URL if not the ALab one";
+
+/// The same subscriber install from a terminal, beside [`sync_in_system_state`].
+const AGENT_ON: &str = "In a terminal, aterm secrets agent on installs it too";
 
 /// The answer to Join: asked, and an admin Mac approves `code`; [`RETYPE`] when a join
 /// password went with the request.
@@ -1489,10 +1493,11 @@ pub(crate) fn failed_entry(why: &str) -> Entry {
         CAUSE_FAILED,
         "Joining the secrets vault failed",
         Why::YourAction(Reason::new("the secrets vault did not let this Mac in")),
-        Then::step(JOIN_AGAIN),
+        Then::step(sync_in_system_state()),
     )
     .severity(Severity::Warn)
     .more(clean(why))
+    .more(JOIN_AGAIN)
     .log_line("secrets join-failed")
 }
 
@@ -1507,34 +1512,30 @@ pub(crate) fn unfinished_entry() -> Entry {
         Why::YourAction(Reason::new(
             "this Mac was set up for a secrets vault but nothing will let it in",
         )),
-        Then::step(JOIN_AGAIN),
+        Then::step(sync_in_system_state()),
     )
     .severity(Severity::Warn)
     .more("A join was cut off before it asked the vault or installed its subscriber.")
+    .more(JOIN_AGAIN)
     .log_line("secrets join-unfinished")
 }
 
 /// The digest line for a Mac that joined (or asked) but whose subscriber is not running,
-/// so its secrets do not follow the vault: the remedy follows the reason.
+/// so its secrets do not follow the vault: the remedy follows the reason. A copy that goes
+/// away is moved, which System State cannot do (its own secrets vault row says the same);
+/// a failed install is that row's Apply again.
 pub(crate) fn unsynced_entry(why: &Unsynced) -> Entry {
     let (reason, step) = match why {
         Unsynced::Fleeting(_) => (
             "aterm runs from a copy that goes away, so it installed no subscriber",
-            "Move aterm to Applications and open it from there",
+            "Move aterm to Applications and open it from there".to_string(),
         ),
         Unsynced::Failed(_) => (
             "aterm could not install the subscriber that keeps ~/.secrets in sync",
-            "Run aterm secrets agent on in a terminal",
+            sync_in_system_state(),
         ),
     };
-    let more = match why {
-        Unsynced::Fleeting(at) => format!(
-            "This aterm runs from {}. Opened from Applications, it installs the subscriber by itself.",
-            clean(at)
-        ),
-        Unsynced::Failed(why) => clean(why),
-    };
-    Entry::new(
+    let entry = Entry::new(
         Family::Privacy,
         SUBJECT,
         CAUSE_UNSYNCED,
@@ -1542,14 +1543,18 @@ pub(crate) fn unsynced_entry(why: &Unsynced) -> Entry {
         Why::YourAction(Reason::new(reason)),
         Then::step(step),
     )
-    .severity(Severity::Warn)
-    .more(more)
+    .severity(Severity::Warn);
+    match why {
+        Unsynced::Fleeting(at) => entry.more(format!(
+            "This aterm runs from {}. Opened from Applications, it installs the subscriber by itself.",
+            clean(at)
+        )),
+        Unsynced::Failed(why) => entry.more(clean(why)).more(AGENT_ON),
+    }
     .log_line("secrets not-synced")
 }
 
-// ---------------------------------------------------------------------------
 // The App's side
-// ---------------------------------------------------------------------------
 
 impl App {
     /// Where the join worker posts: the event loop's proxy (none on the test App).
@@ -2764,6 +2769,51 @@ mod tests {
         for entry in [failed_entry("x"), unfinished_entry()] {
             let shown = format!("{:?}", entry.message().unwrap());
             assert!(shown.contains("adding the vault's URL"), "{shown}");
+        }
+    }
+
+    /// THE DIGEST LINES SEND THE PERSON WHERE THE REMEDY IS. A join that failed or never
+    /// finished, and a subscriber that could not be installed, are System State's secrets
+    /// vault row (its Apply joins the vault in its field with the password typed there, and
+    /// installs the subscriber), named by its menu row, with the terminal command kept in
+    /// the details. An approval on an admin Mac and a copy of aterm that goes away are not
+    /// System State's to do, and keep their own steps.
+    #[test]
+    fn the_vault_lines_name_system_state_only_where_it_has_the_remedy() {
+        let words = |entry: &Entry| {
+            let msg = entry
+                .message()
+                .unwrap_or_else(|fault| panic!("{}: {fault:?}", entry.key()));
+            let aterm_messages::need::Need::Later(ask) = msg.need() else {
+                panic!("{}: a digest line", entry.key());
+            };
+            (ask.then().words().to_string(), msg.detail[2..].to_vec())
+        };
+        for (entry, terminal) in [
+            (failed_entry("the vault refused"), "aterm secrets join"),
+            (unfinished_entry(), "aterm secrets join"),
+            (
+                unsynced_entry(&Unsynced::Failed("launchctl failed".into())),
+                "aterm secrets agent on",
+            ),
+        ] {
+            let (then, more) = words(&entry);
+            assert_eq!(
+                then,
+                "Sync the secrets vault in aterm \u{25B8} System State\u{2026}",
+                "{}",
+                entry.key()
+            );
+            assert!(
+                more.iter()
+                    .any(|line| line.starts_with("In a terminal, ") && line.contains(terminal)),
+                "{more:?}"
+            );
+        }
+        let dmg = Unsynced::Fleeting("/Volumes/aterm/aterm.app/Contents/MacOS/aterm".into());
+        for entry in [pending_entry("ABCD2345", "m99", true), unsynced_entry(&dmg)] {
+            let (then, _) = words(&entry);
+            assert!(!then.contains("System State"), "{then}");
         }
     }
 

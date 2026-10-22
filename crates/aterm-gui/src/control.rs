@@ -1085,7 +1085,7 @@ fn help_short_catalog() -> String {
     let json_verbs = json_verbs().collect::<Vec<_>>().join("/");
     let mut body = format!(
         "# Framing: one \"OK …\"/\"ERR …\" status line, or \"OK <count>\" + <count> content lines; \
-         EMPTY content = no data, never an error\n\
+         empty content = no data, never an error\n\
          # --json on {json_verbs} = structured output · \"@<sid> <verb>\" = run it on that session \
          (a bare @, what @$W is when $W is empty, is refused)\n\
          # help <verb> = the full entry · help --full = the complete catalog\n"
@@ -1124,7 +1124,7 @@ fn help_json_catalog() -> String {
 
 /// `help --full`: the complete catalog under the full protocol header.
 fn help_full_catalog() -> String {
-    // "OK <count> …\n" plus <count> body lines so aterm-ctl streams it like other
+    // "OK <count> …\n" plus <count> body lines so aterm ctl streams it like other
     // list verbs. A fixed header (framing, cross-session, targeting, seeing
     // modes), then the catalog generated from `VERBS`; the `--json` list is the
     // table's JSON-emitting rows.
@@ -1154,24 +1154,23 @@ fn help_full_catalog() -> String {
 #
 # SEEING a terminal (yours or a peer's) — five modes, pick by need:
 #   text / screen        what the PROGRAM wrote (plain rows / lossless styled grid)
-#   image                what ATERM submitted (client frame: decorations, tab strip,
-#                        overlays; `image plain` strips host bling for bare pixels;
-#                        compositor visibility/scanout is outside this boundary)
-#   subscribe            the LIVE movie (pushed frames; every-frame for animations, mail)
-#   cast | temporal <t>  HISTORY: replayable timestamped recording | the screen as it WAS
-#                        at instant <t> (temporal needs config temporal_recording=true)
-#   search <pat>         FIND across the full scrollback history (trigram-indexed, = ⌘F)
+#   image                what ATERM drew (decorations, tab strip, overlays; `image plain`
+#                        leaves out the visual effects), not what the compositor showed
+#   subscribe            the LIVE stream (pushed deltas, events, mail; every-frame for animation)
+#   cast | temporal <t>  HISTORY: a replayable timestamped recording | the screen as it was
+#                        at <t> (temporal needs config temporal_recording = true)
+#   search <pat>         FIND in the scrollback (its newest search_history_lines lines)
 #
-# NATIVE TAB APPS (the active window is retained; canonical documents are reused):
+# NATIVE TAB APPS (open in the front window; a document already open is focused):
 #   open app settings /about              About inside the Settings tab
 #   open app settings /updates            Software Update inside the Settings tab
 #   open app markdown file:///abs/doc.md  read one bounded, local UTF-8 file
 #   open app editor file:///abs/doc.md    edit that file through a read/write grant
-#   inspect app/v1 tabs                    discover stable native view ids
+#   inspect app/v1 tabs                   discover stable native view ids
 #   inspect app/v1 view <id> text|controls|tree|audit
 #   act app/v1 view <id> <key> <action> [value]
-# Local documents require an absolute file: URI. The host canonicalizes it, rejects remote
-# authorities/non-files/oversize/non-UTF-8 input, and grants only that exact file.
+# A document is an absolute local file: URI (no remote host, no cloud-storage folder); the
+# grant covers that one file.
 #
 "#
     );
@@ -1205,7 +1204,7 @@ mod help_tests {
         let header: Vec<&str> = lines.clone().take(3).collect();
         assert!(header.iter().all(|l| l.starts_with("# ")), "{header:?}");
         assert!(
-            header[0].contains("ERR") && header[0].contains("EMPTY"),
+            header[0].contains("ERR") && header[0].contains("empty"),
             "framing line documents the OK/ERR/empty framing: {}",
             header[0]
         );
@@ -1293,13 +1292,10 @@ mod help_tests {
         }
     }
 
-    /// `help --full` is the one wire surface people pipe for the whole catalog,
-    /// and it is GENERATED: the header plus exactly `catalog_lines_full()`. No
-    /// checked-in copy of that text is kept (it was a 178 KB fixture that 289
-    /// commits touched in ten days, every one a merge conflict for the next):
-    /// what is worth asserting is the shape, not the wording — the tail is
-    /// trimmed, nothing is empty, and every verb's full row is in the answer
-    /// exactly once and in catalog order.
+    /// `help --full` is GENERATED: the header plus exactly `catalog_lines_full()`.
+    /// What is asserted is the shape, not the wording: the tail is trimmed,
+    /// nothing is empty, and every verb's full row is in the answer in catalog
+    /// order.
     #[test]
     fn help_full_is_the_header_and_every_catalog_row_in_order() {
         let got = super::cmd_help("--full");
@@ -5036,7 +5032,7 @@ fn dispatch_hold_verb(
         );
     }
     // THE OWNER'S SLOT WAITS ON THE JOURNAL; THE FLEET'S IS ANSWERED AT ONCE
-    // (the review's KR-J-1 of ATERM-KI-1016-1). The fleet's halt has a
+    // (the review's KR-J-1 of ). The fleet's halt has a
     // durable home of its own, the bus's standing halt row that every attach
     // of a bridge applies again, and the bridge reads its `OK` as "applied"
     // and nothing more (the fleet's ack, §5.3). It writes its holds one
@@ -5074,7 +5070,7 @@ fn hold_names_local_slot(rest: &str, issuer: crate::fabric::HoldIssuer) -> bool 
 }
 
 /// A VERB THAT MOVED A WORD ABOUT TYPING ANSWERS ONCE THE CRASH JOURNAL'S
-/// IMAGE THAT CARRIES IT IS DURABLE (ATERM-KI-1016-1;
+/// IMAGE THAT CARRIES IT IS DURABLE (
 /// [`crate::crash_journal::Durable::settle`]): `hold`'s `OK hold=…` on the
 /// owner's slot ([`hold_names_local_slot`]) and an `OK` of `meta set|unset
 /// autopilot`. Their `OK` came as the word was
@@ -5102,7 +5098,7 @@ fn word_journaled(store: &Store, reply: String) -> String {
 /// waits on the journal ([`word_journaled`]): the window repaints and the
 /// loop captures the word while the verb waits. One door for the dispatch
 /// and a test (`meta_line_for_test`), so the wait the answer takes is the
-/// wait the wire's answer takes (the review's KR-J-2 of ATERM-KI-1016-1:
+/// wait the wire's answer takes (the review's KR-J-2 of
 /// the arm's wait could be taken out with every test green). `prove` is the
 /// kernel's look at a self-claim's holder (the arm's [`prove_self_claim`] on
 /// its PTY master).
@@ -5130,8 +5126,16 @@ fn serve_meta(
     // hold the landing turn's own reports. The screen's count is read with it,
     // so a busy a sweep's read began meanwhile stays past it too. Leaf locks,
     // each let go before the next: the terminal, then the timeline.
+    //
+    // An act that opens the task (`open`) is read the same way: the count and
+    // whether the report stood at rest as it arrived say whether the turn it
+    // typed was already counted, which the landing after it is marked by
+    // (`harness_task::landing_turns`).
     let snapshot = control_session::harness_act_face(rest)
-        .is_some_and(crate::harness_task::holds_until_another_turn)
+        .is_some_and(|face| {
+            crate::harness_task::holds_until_another_turn(face)
+                || face == aterm_agent::harness::acts::TaskFace::Open
+        })
         .then(|| {
             use aterm_core::terminal::program_state::ProgramStateWord as W;
             let report = term_lock(term).program_state();
@@ -5213,7 +5217,7 @@ fn serve_meta_wired(
 /// (sid `sid`, line `rest`), in the order it posts them
 /// ([`serve_meta_wired`]): `Wake::MetaChanged` (the tab's repaint), then, for
 /// a proven self-claim's recorded act, the face that act tells
-/// (`Wake::HarnessFact`, FOREVER LAND §10.4: `landed@v1` lands the task,
+/// (`Wake::HarnessFact`, Autopilot Land: `landed@v1` lands the task,
 /// `left-to-person@v1` leaves it to a person, any other act reopens it).
 fn meta_change_wakes(session: u64, sid: &str, rest: &str) -> Vec<Wake> {
     let mut wakes = vec![Wake::MetaChanged { session }];

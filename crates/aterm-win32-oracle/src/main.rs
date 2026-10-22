@@ -17,7 +17,7 @@ use std::process::{ExitCode, Output};
 type Result<T> = std::result::Result<T, String>;
 const VERSION: &str = "0.61.2";
 const TRIPLES: [&str; 2] = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"];
-const HELP: &str = "aterm-win32-oracle — generated declaration closure and independent Windows ABI oracle\n\nusage: targo --unverified run -p aterm-win32-oracle -- <gen|check|record|oracle|oracle-052> [options]\n\n  --root <checkout>     containing win32-oracle/ (default: ancestor of cwd)\n  --upstream <dir>      pinned registry windows-sys0.61.2 source (not oracle-052;\n                        default: the Cargo registry's copy, fetched when absent)\n  --out <dir>           gen only: write a checkout-shaped private output tree\n  --target-dir <dir>    oracle builds (default: <root>/win32-oracle/target; oracle-052:\n                        <root>/crates/aterm-windows-sys-052/tests/oracle/target)\n  --stock <toolchain>   foreign oracle toolchain (default: stable)\n  --no-format          gen only: leave emitted Rust unformatted\n\nThe driver, graph and host recorder use Trust. oracle and oracle-052 are a STOCK\nEXCEPTION: absolute stock Cargo/RUSTC compile Windows std, no Windows program runs.\nThe reference workspaces have no patch table; gen/check read its pinned registry\nsource and Cargo's actual consumer/feature graph. record explicitly rewrites\nrecorded.json from the reference's host answers. check never blesses drift.\noracle-052 holds crates/aterm-windows-sys-052 (WB.1) to registry windows-sys 0.52.0:\nconformance, imports, and every planted mismatch caught.\nExit:0 pass,1 finding,2 usage,3 could not run; no proof or Windows-runtime claim.\n";
+const HELP: &str = "aterm-win32-oracle — generated declaration closure and independent Windows ABI oracle\n\nusage: targo --unverified run -p aterm-win32-oracle -- <gen|check|record|oracle|oracle-052> [options]\n\n  --root <checkout>     containing win32-oracle/ (default: ancestor of cwd)\n  --upstream <dir>      pinned registry windows-sys0.61.2 source (not oracle-052;\n                        default: the Cargo registry's copy, fetched when absent)\n  --out <dir>           gen only: write a checkout-shaped private output tree\n  --target-dir <dir>    oracle builds (default: <root>/win32-oracle/target.noindex; oracle-052:\n                        <root>/crates/aterm-windows-sys-052/tests/oracle/target.noindex)\n  --stock <toolchain>   foreign oracle toolchain (default: stable)\n  --no-format          gen only: leave emitted Rust unformatted\n\nThe driver, graph and host recorder use Trust. oracle and oracle-052 are a STOCK\nEXCEPTION: absolute stock Cargo/RUSTC compile Windows std, no Windows program runs.\nThe reference workspaces have no patch table; gen/check read its pinned registry\nsource and Cargo's actual consumer/feature graph. record explicitly rewrites\nrecorded.json from the reference's host answers. check never blesses drift.\noracle-052 holds crates/aterm-windows-sys-052 (WB.1) to registry windows-sys 0.52.0:\nconformance, imports, and every planted mismatch caught.\nExit:0 pass,1 finding,2 usage,3 could not run; no proof or Windows-runtime claim.\n";
 #[derive(Clone)]
 struct Tools {
     targo: PathBuf,
@@ -480,7 +480,8 @@ fn start() -> Result<u8> {
     if verb == "oracle-052" {
         // The 0.52 facade has its own reference workspace and no harvest.
         let tools = tools(&root, Some(stock.as_str()))?;
-        let target = target.unwrap_or_else(|| root.join(facade052::WORKSPACE).join("target"));
+        let target =
+            target.unwrap_or_else(|| root.join(facade052::WORKSPACE).join("target.noindex"));
         return facade052::gate(&root, &tools, &target);
     }
     let up = match up {
@@ -514,7 +515,7 @@ fn start() -> Result<u8> {
     for note in &model.notes {
         println!("note: {note}")
     }
-    let target = target.unwrap_or_else(|| root.join("win32-oracle/target"));
+    let target = target.unwrap_or_else(|| root.join("win32-oracle/target.noindex"));
     match verb.as_str() {
         "gen" => {
             generate(

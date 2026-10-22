@@ -452,11 +452,9 @@ const RESETS: u64 = 1_791_097_200;
 /// The control verbs that only read: all a dry-run visit may send.
 const READS: [&str; 5] = ["sessions", "text", "cell", "status", "help"];
 
-/// A control socket at `<dir>/t.sock` standing in for tab #1's aterm with no
-/// hands: `sessions` names `tab`, `text --json` is an idle Claude's screen, a
-/// `cell` a plain blank, `status` holds nothing, and every other request
-/// (`send`, `key`, `turn`, `paste`, `signal`, a lease, …) is refused. Every
-/// request is logged, in order.
+/// A control socket at `<dir>/t.sock` standing in for tab one's aterm with no hands:
+/// `sessions` names `tab`, `text` is an idle Claude's screen, `cell` a plain blank, `status`
+/// holds nothing, and every other request is refused. Every request is logged, in order.
 fn no_hands_instance(dir: &Path, tab: &'static str) -> (String, crate::harness::FakeInstanceLog) {
     crate::harness::fake_instance(&dir.join("t.sock"), TOKEN, move |line| {
         let verb = line

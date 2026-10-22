@@ -32,9 +32,7 @@ use crate::{
     verify,
 };
 
-// ---------------------------------------------------------------------------
 // CLI-facing surface
-// ---------------------------------------------------------------------------
 
 /// Every `cut` flag (spec §5), parsed by cli.rs. `PartialEq` serves the CLI parse
 /// tests.
@@ -86,9 +84,7 @@ pub const CUT_COMMAND: &str = crate::release::RELEASE_COMMAND;
 /// `verify`.
 pub const SHIP_COMMAND: &str = "targo --unverified ship";
 
-// ---------------------------------------------------------------------------
 // transcript printing
-// ---------------------------------------------------------------------------
 
 /// The column every value starts in: two spaces of indent, the label, then one hard
 /// space (a `{:<11}` pad alone vanishes for an 11-character label).
@@ -242,9 +238,7 @@ pub fn fmt_elapsed(start: Instant) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
 // version + slug helpers (pure)
-// ---------------------------------------------------------------------------
 
 /// Read the source tree's `[workspace.package]` `MAJOR.MINOR.0` version. A cut never
 /// rewrites it; [`release_version_from_workspace`] derives the release version from it.
@@ -443,9 +437,7 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-// ---------------------------------------------------------------------------
 // gh plumbing (3 retries with backoff — spec §7)
-// ---------------------------------------------------------------------------
 
 /// The release-org token on disk. Without it every call authenticates with
 /// `gh auth token` (the dev account, with no push on the public channel), so the cut
@@ -574,9 +566,7 @@ pub(crate) fn gh_retry_guarded(
     )))
 }
 
-// ---------------------------------------------------------------------------
 // cross-machine release lease (atomic remote lightweight tag)
-// ---------------------------------------------------------------------------
 
 /// Dedicated cooperative lock for every real release cut. A lightweight tag
 /// points at the journaled claim commit, making ownership inspectable and
@@ -778,9 +768,7 @@ pub fn publisher_fence(git: &dyn GitRunner) -> Result<Option<PublisherFence>> {
     Ok(Some(PublisherFence { token, owner }))
 }
 
-// ---------------------------------------------------------------------------
 // publisher liveness: who holds the fence, and can this machine prove they are gone?
-// ---------------------------------------------------------------------------
 //
 // Two concurrent publishers would corrupt a release, and Git fencing cannot cancel an
 // in-flight GitHub REST request. So the fence records who wrote it, and `--resume`
@@ -2024,7 +2012,7 @@ pub fn withdraw_tag_then_unlock(
     release_completed_publisher_session(git, owner, fence)
 }
 
-/// Final unlock deletes the persistent owner and the process token in ONE
+/// Final unlock deletes the persistent owner and the process token in one
 /// atomic ref transaction.  Deleting the owner first could strand a killed
 /// process's fence with no claim identity; deleting the fence first could let
 /// a same-claim resume enter while the old process was still unlocking.
@@ -2187,9 +2175,7 @@ pub fn release_completed_session_without_guard(
     }
 }
 
-// ---------------------------------------------------------------------------
 // the resume journal (dist/cut-state.toml)
-// ---------------------------------------------------------------------------
 
 /// Pipeline steps in execution order, as journaled. Gates and claim precede the journal
 /// (a journal on disk means the claim is verified). `sign` covers
@@ -2622,9 +2608,7 @@ impl Journal {
     }
 }
 
-// ---------------------------------------------------------------------------
 // pure publish helpers (tested in tests/it/resume.rs)
-// ---------------------------------------------------------------------------
 
 /// Admission decision for a non-idempotent remote POST whose response may be
 /// lost. The durable intent is deliberately conservative: once persisted, an
@@ -3082,13 +3066,10 @@ fn release_post_failure_detail(out: &RunOut, posted_body_len: usize) -> String {
     detail
 }
 
-/// **THE RELEASE BODY, READ AND BOUNDED AT THE POST ITSELF.**
-///
-/// [`changelog::release_notes_document`] bounds what it writes, but the file read
-/// here can come from an older binary, a resumed cut, or an operator's hand; each
-/// would still post over the limit as an opaque 422. Guard the OPERATION.
-///
-/// Idempotent: a body already within the limit is returned verbatim.
+/// The release body, read and bounded at the POST itself:
+/// [`changelog::release_notes_document`] bounds what it writes, but the file read here
+/// can come from an older binary, a resumed cut or an operator's hand. Idempotent: a
+/// body within the limit is returned verbatim.
 ///
 /// The one constructor of [`ReleaseBody`], the only body [`release_create_payload`]
 /// takes: a release body is posted bounded by construction.
@@ -3347,9 +3328,7 @@ pub fn roster_floor_covered(carried: Option<u64>, newest_channel: Option<u64>) -
     }
 }
 
-// ---------------------------------------------------------------------------
 // the channel's appcast listing, for the head-signature replay
-// ---------------------------------------------------------------------------
 
 /// One GitHub release asset relevant to the head-signature replay.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -3498,9 +3477,7 @@ fn list_appcast_releases(slug: &str) -> Result<Vec<AppcastRelease>> {
     Ok(releases)
 }
 
-// ---------------------------------------------------------------------------
 // cryptographic channel ratchet + exact asset reads
-// ---------------------------------------------------------------------------
 
 fn update_key_fingerprint(encoded: &str) -> Result<String> {
     let canonical = canonical_update_pubkey(encoded)?;
@@ -4345,14 +4322,12 @@ fn exact_release_asset_download(slug: &str, id: u64) -> Result<std::process::Chi
         .map_err(|error| Error::new(format!("spawn exact GitHub asset-ID download: {error}")))
 }
 
-// ---------------------------------------------------------------------------
 // asset transfer retry
 //
 // `gh_retry` repeats on any non-zero exit, so it cannot tell a lost body (`gh`:
 // "unexpected end of JSON input") from a server that answered "no". A 404, a 401
 // and a permission refusal are answers; only a transport failure can come out
 // differently the second time.
-// ---------------------------------------------------------------------------
 
 /// Whether repeating a bounded asset transfer can possibly change its outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5734,9 +5709,7 @@ pub fn monotonic_ok(n: u64, our_tag: &str, best: Option<(&str, u64)>) -> Result<
     }
 }
 
-// ---------------------------------------------------------------------------
 // the cut orchestrator
-// ---------------------------------------------------------------------------
 
 /// Everything the pipeline steps share, resolved once up front (or from the
 /// journal on `--resume`).
@@ -7545,16 +7518,10 @@ pub fn verified_release_bundle(
 /// The whole `targo --unverified ship cut` (spec §7 order): gates → claim →
 /// sign+package the verified bundle → self-check → origin tag → the one publication.
 /// The version is `[workspace.package] version` as written
-/// ([`release_version_from_workspace`], which refuses a non-zero patch) — NOT from
-/// the ledger, which supplies only the build number. Cutting twice without
-/// bumping Cargo.toml therefore lands on the already-published guard in
-/// [`verify::derive_cut_mode`], which names the bump.
-///
-/// `repo` is the operator's checkout: `dist/` and the journal live there (the release's
-/// records are the repository's, shared by every worktree, and the
-/// release cache is the clone's), and the cut never moves it. Every cut signs the bundle
-/// its release built once and `verify release` passed ([`verified_release_bundle`]) and builds
-/// nothing: a real cut, the release of the published commit, read in the cut tree
+/// ([`release_version_from_workspace`]); the ledger supplies only the build number.
+/// `repo` is the operator's checkout, holding `dist/` and the journal, and is never
+/// moved. Every cut signs its release's verified bundle ([`verified_release_bundle`]):
+/// a real cut, the release of the published commit, in the cut tree
 /// ([`gates::place_published`]); a dry run, the release of `repo`'s own
 /// commit, under its reserved number, claimed nowhere.
 pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
@@ -7872,7 +7839,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         step("lock", "release lock is free");
     }
     if kind == CutKind::Real {
-        // Prove the channel is public and writable BEFORE the ledger claim — with the
+        // Prove the channel is public and writable before the ledger claim — with the
         // credential `publish` will use (the release-org token). Failing at `publish`
         // would burn a build number, and no amount of `--resume` fixes a missing
         // permission grant.
@@ -8562,10 +8529,8 @@ fn step_unlock(ctx: &mut CutCtx) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Notarize + package: the ordered middle of `step_sign`, extracted so the order is a
 // tested fact
-// ---------------------------------------------------------------------------
 
 /// The two container builders and the two digest reads, behind a trait. `hdiutil` and
 /// `ditto` want a real signed bundle and tens of seconds, and a mutation of the
@@ -9618,9 +9583,7 @@ fn step_tag(ctx: &mut CutCtx) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // step "publish": the one publication, straight onto the release channel
-// ---------------------------------------------------------------------------
 
 /// Proof that the release channel is reachable, public and writable by this operator's
 /// credential: pre-claim, and again inside `publish` before the first write. A missing
@@ -10837,21 +10800,12 @@ fn upload_channel_asset(
     // immediate probe after a timeout may be visibility lag, not proof of
     // non-delivery; a resume first converges on any exact-name object.
     let out = post.issue(permit)?;
-    // BEFORE ANY REMOTE PROBE. This verdict is local and provable, and the probe below
-    // is a network call that can fail — under exactly the conditions that produce a
-    // curl exit 2 in the first place (memory pressure kills the gh spawn; a hammered
-    // API answers 5xx three times). A failed probe must not leave the intent standing:
-    // that is the permanent wedge this retraction exists to prevent. The pre-POST probe
-    // above already answered "did this asset exist beforehand".
-    //
-    // THE ANSWERED 4xx IS THE OTHER VERDICT THAT IS SPENT BEFORE ANY PROBE, and it
-    // follows the release create's rule exactly: nothing was created, so the intent is
-    // spent on nothing and must not wedge every resume at "refusing a duplicate POST" —
-    // a token that expired mid-cut, a throttle, a refused upload. One best-effort probe
-    // follows it ([`after_upload_post`]): `422 already_exists` is a 4xx too, and an
-    // object that is there must stay named by the journal. A 5xx, a timeout or a reset
-    // is neither verdict: each can hide a stored object, so each keeps the conservative
-    // intent and goes on to the probe.
+    // Settled before any remote probe. Curl's exit 2 is a local, provable verdict, and
+    // the probe below can fail under the very conditions that produce it; a failed
+    // probe must not leave the intent standing (the permanent wedge). An answered 4xx
+    // is spent here too: nothing was created. One best-effort probe follows it
+    // (`after_upload_post`), since `422 already_exists` is a 4xx and an object that is
+    // there must stay journaled. A 5xx, a timeout or a reset keeps the intent.
     let visible = || {
         release_asset_identity_for_release_id_optional(slug, release_id, name)
             .map(|found| found.is_some())
@@ -11372,17 +11326,10 @@ mod roster_wiring_tests {
         );
     }
 
-    /// THE PIN EXPECTATION IS THE COMMITTED PAPER MASTER, whoever signs.
-    ///
-    /// `aterm-gui/build.rs` embeds `__DATA,__aterm_upin` from `PAPER_MASTER_PUBKEYS[0]`,
-    /// so that is what a shipped binary can prove. The build (`artifact::build`) holds
-    /// every slice to it, `step_sign` writes the fingerprint into the provenance, and
-    /// `step_selfcheck` then
-    /// checks the binary's `--diagnose` line and the provenance against it — both through
-    /// `expected_embedded_pin`, so the two can never state different expectations.
-    ///
-    /// Negative control: the SIGNING key's fingerprint is a different string, so an
-    /// implementation that derived the pin from `signature_pubkey` fails the last assert.
+    /// The pin expectation is the committed paper master, whoever signs: what
+    /// `aterm-gui/build.rs` embeds, given to both `step_sign` and `step_selfcheck` by
+    /// `expected_embedded_pin`. Negative control: the signing key's fingerprint differs,
+    /// so deriving the pin from `signature_pubkey` fails the last assert.
     #[test]
     fn the_pin_expectation_is_the_committed_master_whoever_signs() {
         let master = aterm_update_core::pins::PAPER_MASTER_PUBKEYS
@@ -11501,12 +11448,8 @@ mod roster_wiring_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A recovery reconstructs the roster pair from what the PUBLISHED MANIFEST says
-    /// about itself, so the set it rebuilds is the set `channel_asset_paths` will demand.
-    ///
-    /// Kills the mutation "reconstruct nothing": the two sets then disagree, and
-    /// `publish` dies on a file recovery never wrote — with advice naming the command
-    /// that was already running.
+    /// A recovery rebuilds the roster pair from what the published manifest says about
+    /// itself: exactly the set `channel_asset_paths` demands.
     #[test]
     fn recovery_rebuilds_exactly_the_roster_assets_publish_will_demand() {
         let mut manifest = manifest_out::build(&manifest_out::ManifestInputs {

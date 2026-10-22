@@ -18,9 +18,7 @@
 
 use aterm_render::{floor_fg_contrast, floor_min_contrast_fg};
 
-// ---------------------------------------------------------------------------
 // Independent WCAG oracle (not the shipping implementation).
-// ---------------------------------------------------------------------------
 
 fn srgb_to_linear(c: u32) -> f32 {
     let n = (c & 0xff) as f32 / 255.0;
@@ -58,9 +56,7 @@ const EPS: f32 = 1e-3;
 
 const RATIOS: [f32; 7] = [1.0, 1.5, 3.0, 4.5, 7.0, 10.0, 21.0];
 
-// ---------------------------------------------------------------------------
 // The bound, exhaustively on grayscale.
-// ---------------------------------------------------------------------------
 
 /// All 256×256 grayscale pairs at 7 ratios spanning the knob's domain meet the bound.
 #[test]
@@ -91,9 +87,7 @@ fn floor_meets_bound_grayscale_exhaustive() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The bound on a dense full-color lattice.
-// ---------------------------------------------------------------------------
 
 /// An RGB lattice (125 fgs, 512 bgs) at 4.5 and 21: the bound holds for cross-hue pairs,
 /// including mid-luminance backgrounds, where a midpoint pole rule picks the weaker pole.
@@ -141,9 +135,7 @@ fn floor_meets_bound_rgb_lattice() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The wrapper's documented exemptions stay pinned.
-// ---------------------------------------------------------------------------
 
 /// `floor_min_contrast_fg` exempts exactly `min <= 1` (knob off) and `fg == bg` (SGR 8
 /// conceal stays concealed); everything else delegates to the floor.

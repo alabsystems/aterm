@@ -127,7 +127,7 @@ fn ctrl_on_a_cyrillic_layout_writes_the_control_byte() {
 }
 
 /// A chord on a non-US layout sends the layout's character through the shipping
-/// `on_key` (ATERM-KI-1015-9). German Ctrl+Shift+ß reads '?' without Ctrl, so it
+/// `on_key`. German Ctrl+Shift+ß reads '?' without Ctrl, so it
 /// sends the DEL of '?', not the US position's Ctrl+_ (0x1f); German
 /// Option+Shift+2, as the window hands it over with Option as an Alt (text '"';
 /// the sync below is what the event loop runs as every callback ends), is
@@ -158,7 +158,7 @@ fn a_chord_on_a_non_us_layout_sends_the_layouts_character() {
     unsafe { libc::close(pipe) };
 }
 
-/// ATERM-KI-1015-9 review: a chord under Caps Lock sends the bytes it sent
+/// review: a chord under Caps Lock sends the bytes it sent
 /// before chords carried the layout's character. A chord's text that differs
 /// from what the unshifted key derives only by letter case is the lock's, and
 /// the chord keeps the key's own case, as kitty's legacy encoding drops the
@@ -187,7 +187,7 @@ fn a_chord_under_caps_lock_keeps_the_keys_own_case() {
     unsafe { libc::close(pipe) };
 }
 
-/// ATERM-KI-1015-9 review: a chord's letter takes Shift's case, never the
+/// review: a chord's letter takes Shift's case, never the
 /// lock's, for every case pair a layout types. Turkish Q's dotless key (the
 /// US I key) types 'I' under Caps Lock, and its dotted key (the US ' key)
 /// 'İ'; neither pair round-trips through Unicode's default lowercase, so

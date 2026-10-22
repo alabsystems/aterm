@@ -75,9 +75,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-// ---------------------------------------------------------------------------
 // errno values, pinned so classification stays pure on every platform
-// ---------------------------------------------------------------------------
 
 /// `EPERM`. A TCC denial is `EPERM`, not `EACCES` (design §1.5). A literal so the classifiers
 /// stay pure off macOS; `errno_constants_match_the_platform` pins it to `libc::EPERM`.
@@ -103,9 +101,7 @@ const TCC_DB_RELATIVE: &str = "Library/Application Support/com.apple.TCC/TCC.db"
 /// Hard cap on an `Info.plist` read; a larger plist reads as absent.
 const INFO_PLIST_MAX_BYTES: u64 = 256 * 1024;
 
-// ---------------------------------------------------------------------------
 // Full Disk Access
-// ---------------------------------------------------------------------------
 
 /// Whether the responsible app holds Full Disk Access (`kTCCServiceSystemPolicyAllFiles`).
 /// `Unknown` (an out-of-bundle caller, a disabled probe, an unexpected errno) is a real answer
@@ -521,9 +517,7 @@ fn format_uuid(id: &[u8; 16]) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
 // The in-bundle guard
-// ---------------------------------------------------------------------------
 
 /// `true` when `exe` lies inside a `.app` bundle: a `.app` component followed by `Contents`,
 /// `MacOS` and at least one more. Lexical by design: it is the gate that decides whether the
@@ -714,9 +708,7 @@ fn path_has_interior_nul(path: &Path) -> bool {
     path.as_os_str().as_encoded_bytes().contains(&0)
 }
 
-// ---------------------------------------------------------------------------
 // Responsibility
-// ---------------------------------------------------------------------------
 
 /// Why the responsibility SPI could not answer. It returns `-1` for every process the caller
 /// does not own (a euid mismatch, not privilege), so `errno` separates the cases; `-1` is never
@@ -930,9 +922,7 @@ pub fn responsible_app(pid: i32) -> Option<ResponsibleApp> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Designated-requirement class
-// ---------------------------------------------------------------------------
 
 /// The class of a code-signing designated requirement, which `tccd` stores in the `csreq`
 /// column and re-validates the running code against. A Developer-ID DR names an `identifier`
@@ -1053,9 +1043,7 @@ fn without_quoted_strings(text: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Code identity of a bundle on disk
-// ---------------------------------------------------------------------------
 //
 // Shared by the claimant census below and `aterm_gui::signing_identity`'s
 // self-report, so the two cannot disagree about a bundle's requirement.
@@ -1359,9 +1347,7 @@ fn classify_signing(report: &str) -> &'static str {
     "unknown"
 }
 
-// ---------------------------------------------------------------------------
 // The claimant census
-// ---------------------------------------------------------------------------
 //
 // macOS keeps one code requirement per bundle identifier. A copy that does not satisfy it is
 // not merely denied when it asks: `tccd` answers `DB Action:Update, UpdateVerifierData` and
@@ -2280,9 +2266,7 @@ pub fn retire_claimants(
         .collect()
 }
 
-// ---------------------------------------------------------------------------
 // Protected roots
-// ---------------------------------------------------------------------------
 
 /// The protected roots, resolved once, as absolute paths.
 ///
@@ -2389,9 +2373,7 @@ pub fn other_homes_root(home: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-// ---------------------------------------------------------------------------
 // Folders
-// ---------------------------------------------------------------------------
 
 /// One promptable per-folder service, named the way `[privacy] warmup_folders`
 /// names it. The path literals live only here; `aterm-gui` and `aterm-cli`
@@ -2951,9 +2933,7 @@ pub fn folders_declined(attempts: &[ResetAttempt]) -> Vec<(Folder, Option<i32>)>
         .collect()
 }
 
-// ---------------------------------------------------------------------------
 // Debugger access (developer mode): observation
-// ---------------------------------------------------------------------------
 //
 // `docs/DESIGN-macos-debugger-access-2026-09-29.md` §3.2. The "Developer Tools Access needs to
 // take control of another process" dialog is not TCC: it is the Authorization Services right
@@ -3527,9 +3507,7 @@ pub fn probe_debugger(gate: ProbeGate) -> DebuggerProbe {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Developer Tools list (kTCCServiceDeveloperTool): observation
-// ---------------------------------------------------------------------------
 //
 // `docs/DESIGN-macos-debugger-access-2026-09-29.md` §9.1. Privacy & Security ▸ Developer Tools
 // is a TCC service with no dialog: only a human adds an app, in System Settings. On the first
@@ -4158,9 +4136,7 @@ pub fn probe_devtool(gate: ProbeGate, subject: &str) -> DevToolProbe {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Developer Tools list: the switch, read from the system TCC.db
-// ---------------------------------------------------------------------------
 //
 // tccd's log ([`probe_devtool`]) answers only after a new program starts, only within its
 // 10-minute window and only to an administrator, so a quiet machine or a standard account
@@ -4920,9 +4896,7 @@ mod json {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Debugger access: the owner's change
-// ---------------------------------------------------------------------------
 //
 // Design §3.4 step 3 (owner ruling O7). [`run_devtools_change`] is the one place a
 // `DevToolsSecurity -enable`/`-disable` process is constructed, and it runs only what the
@@ -5211,9 +5185,7 @@ pub fn run_devtools_change<F: FnOnce(DevtoolsChild)>(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Attribution and the posture join
-// ---------------------------------------------------------------------------
 
 /// Whether a session's file access is attributed to the live aterm process or to one that has
 /// exited: aterm's own adoption record, which [`Responsible`] only corroborates and never
@@ -5439,9 +5411,7 @@ impl ConsentPosture {
     }
 }
 
-// ---------------------------------------------------------------------------
 // macOS implementation — the only code here that touches the OS
-// ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -6254,9 +6224,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------
     // The claimant census
-    // -----------------------------------------------------------------
 
     const DEV_ID: &str = "designated => identifier \"x\" and anchor apple generic and \
                           certificate leaf[subject.OU] = A66A9P66Z7";
@@ -9254,9 +9222,7 @@ mod tests {
         assert_eq!(unobserved, [true; 9], "a default that is a verdict");
     }
 
-    // -----------------------------------------------------------------
     // Debugger access (developer mode)
-    // -----------------------------------------------------------------
 
     /// Each argv carries its flag (`-enable` spelled out) on an absolute path.
     #[test]

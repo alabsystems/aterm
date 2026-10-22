@@ -1944,9 +1944,7 @@ fn a_check_gives_a_reason_per_peer() {
     drop(silent);
 }
 
-// ---------------------------------------------------------------------------
 // the issuer's book, read by a member
-// ---------------------------------------------------------------------------
 
 /// The member's entry for its issuer on loopback `port`, as `aterm fleet
 /// join` records it.

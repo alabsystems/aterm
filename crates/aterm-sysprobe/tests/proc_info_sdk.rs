@@ -2,12 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! The job probe's Darwin layouts (`src/jobs/darwin.rs`), the process
-//! records' (`src/kproc.rs`) and the holder scan's (`aterm_uds::holders`) held
-//! to the SDK headers on both arches: every row of `jobs::darwin::SDK_ROWS`,
-//! `kproc::SDK_ROWS` and `aterm_uds::holders::SDK_ROWS` (a flavor, a flag,
-//! a struct's size, a field's offset) becomes one `_Static_assert` that clang
-//! compiles against `sys/proc_info.h`, `sys/sysctl.h`, `sys/event.h`,
-//! `vis.h` and `xlocale.h` for `arm64` and `x86_64`, through aterm-objc's
+//! records' (`src/kproc.rs`), the code-signing flags and categories
+//! (`src/identity.rs`) and the holder scan's (`aterm_uds::holders`) held to
+//! the SDK headers on both arches: every row of `jobs::darwin::SDK_ROWS`,
+//! `kproc::SDK_ROWS`, `identity::SDK_ROWS` and `aterm_uds::holders::SDK_ROWS`
+//! (a flavor, a flag, a struct's size, a field's offset) becomes one
+//! `_Static_assert` that clang compiles against `sys/proc_info.h`,
+//! `sys/sysctl.h`, `sys/event.h`, `vis.h`, `xlocale.h` and
+//! `Kernel/kern/cs_blobs.h` for `arm64` and `x86_64`, through aterm-objc's
 //! shared probe
 //! (`crates/aterm-objc/tests/support/sdk_consts.rs`, mounted here). The
 //! decoders read the answers at exactly these offsets, so a header that
@@ -26,13 +28,14 @@
 )]
 mod sdk_consts;
 
-use aterm_sysprobe::{jobs, kproc};
+use aterm_sysprobe::{identity, jobs, kproc};
 
 /// Every table's rows.
 fn rows() -> impl Iterator<Item = &'static (&'static str, i64)> {
     jobs::darwin::SDK_ROWS
         .iter()
         .chain(kproc::SDK_ROWS)
+        .chain(identity::SDK_ROWS)
         .chain(aterm_uds::holders::SDK_ROWS)
 }
 
@@ -48,7 +51,8 @@ const HEADERS: &str = "#include <stddef.h>\n\
                        #include <sys/proc_info.h>\n\
                        #include <libproc.h>\n\
                        #include <vis.h>\n\
-                       #include <xlocale.h>\n";
+                       #include <xlocale.h>\n\
+                       #include <Kernel/kern/cs_blobs.h>\n";
 
 /// The probe, with the row named `off` (if any) asserted one higher.
 fn probe(off: Option<&str>) -> String {
@@ -81,10 +85,12 @@ fn every_layout_row_matches_the_sdk_on_both_arches() {
     assert!(
         jobs::darwin::SDK_ROWS.len() >= 60
             && kproc::SDK_ROWS.len() >= 15
+            && identity::SDK_ROWS.len() >= 14
             && aterm_uds::holders::SDK_ROWS.len() >= 23,
-        "a table lost rows: {}, {} and {}",
+        "a table lost rows: {}, {}, {} and {}",
         jobs::darwin::SDK_ROWS.len(),
         kproc::SDK_ROWS.len(),
+        identity::SDK_ROWS.len(),
         aterm_uds::holders::SDK_ROWS.len()
     );
     let body = probe(None);

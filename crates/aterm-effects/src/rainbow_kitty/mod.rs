@@ -98,9 +98,7 @@ use witness::{RowSample, Witness};
 /// (T6) is below the block fill's u8 resolution.
 const RELIGHT_LIFE_S: f32 = SPRING_SNAP_RESPONSE_S + 8.0 * SPRING_SNAP_RESPONSE_S;
 
-// ===========================================================================
 // The event vocabulary
-// ===========================================================================
 
 /// Travel direction, resolved to the dominant axis: the same rule D15 uses to
 /// pick a rasterizer, so the kitty's facing, the cue's `dir` and the train's
@@ -309,9 +307,7 @@ pub enum Event {
     },
 }
 
-// ===========================================================================
 // Config, Frame, Ctx
-// ===========================================================================
 
 /// Everything v2 needs from the host's `GlowConfig`, and nothing else. Narrow
 /// on purpose, so no v2 producer can branch on another style's state.
@@ -548,9 +544,7 @@ pub struct Status {
     pub fp: u64,
 }
 
-// ===========================================================================
 // Cadence — what a producer may ask the host for (§18, T6)
-// ===========================================================================
 
 /// The frame cadence a producer asks for while something on glass moves every
 /// frame: the design's 120 Hz reference tick (§18); the host substitutes its
@@ -675,9 +669,7 @@ pub(crate) fn level_step_spend(peak: f32, u: f32, span_s: f32) -> Option<f32> {
     Some(((u_next - u) * span_s).max(0.0))
 }
 
-// ===========================================================================
 // The echo ledger
-// ===========================================================================
 
 /// The echo patience, seconds, before a press is forgotten as swallowed: the
 /// host's in-flight patience, so one press has one patience in every layer.
@@ -904,9 +896,7 @@ impl EchoLedger {
     }
 }
 
-// ===========================================================================
 // The engine
-// ===========================================================================
 
 /// The v2 engine (§17.1) `CursorGlow` delegates to at the twelve seam points.
 /// Every entry point takes an injected `now`; no per-frame RNG (§18).
@@ -7187,9 +7177,7 @@ mod tests {
         assert!(eng.drain_sound_cues().next().is_none());
     }
 
-    // -----------------------------------------------------------------------
     // Panel #10: the pet and the sky (D13)
-    // -----------------------------------------------------------------------
 
     /// A resident pet as its own frame publishes it: six cells wide, feet on
     /// `row`, standing with its left edge at `col`.

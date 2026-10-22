@@ -110,11 +110,6 @@ use aterm_time::Instant;
 
 use crate::cursor_glow::{Geom, OVER_INK_COV_CAP};
 use crate::effect_util::mix_rgb;
-// Window-absolute: the halo lands in `cursor_glow_add`, whose quads are window
-// px (the producer folds in the grid origin; the renderer adds no offset). A
-// grid-relative centre would match only at origin (0,0) and float into the
-// chrome band in a real window. The Fire arm in `cursor_glow/spawn.rs` notes
-// the same trap.
 use crate::effect_util::push_fx_ramp;
 
 /// What one printable key adds, from wherever the decayed value is.

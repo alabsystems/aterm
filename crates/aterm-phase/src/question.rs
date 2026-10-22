@@ -20,17 +20,17 @@
 //! row `  N+2. Chat about this`; a blank row; the key-hint footer, which a narrow pane
 //! word-wraps ([`crate::prompt`] joins it first).
 //!
-//! **2.1.283** draws the same geometry (measured 2026-09-25 and read by
-//! this module unchanged; the fixtures `claude-2.1.283-question-*.txt`).
-//! Text typed into the free-text row wraps greedily at spaces onto rows at
-//! its label column (5, or 9 in multi-select), the dialog growing upward,
-//! and reflows by a cell when the focus leaves it; the row reads as its
-//! rows joined with one space, which is the text typed, exactly. The
-//! multi-select row ticks itself `[✔]` when typed into, and Enter with the
-//! focus in it unticks it. **2.1.300** may draw that ticked box with no
-//! space after it, its rows a column short (MEASURED at 50 columns: `4.
-//! [✔]Decide yourself: …` over rows at column 8, where 80 columns draws `[✔]
-//! Decide` over column 9; ATERM-KI-1015-1 F2): read either way
+//! The preview form ([`preview_zone`]) draws its options in a 30-cell column with the pane
+//! to their right and the notes row under them, no descriptions, no free-text row and an
+//! unnumbered chat row. The review tab ([`review`]) draws the answers over `1. Submit
+//! answers` / `2. Cancel`, and no footer. Under a dialog the host may draw the AFK
+//! countdown, one plugin notice and the panel-waiting row ([`trailers`]).
+//!
+//! Text typed into the free-text row wraps greedily at spaces onto rows at its label
+//! column, the dialog growing upward, and reflows by a cell when the focus leaves; the
+//! row reads as its rows joined with one space, which is the text typed. The multi-select
+//! row ticks itself `[✔]` when typed into, and Enter on it unticks it; 2.1.300 at 50
+//! columns may draw that box with no space after it, its rows a column short
 //! ([`checkbox`], [`label_col`]), a row continuing at the column its own
 //! text starts at, never another.
 //!
@@ -444,7 +444,7 @@ fn numbered(row: &str) -> Option<(Pointer, u8, &str)> {
 /// `(true, "x")` — and `[✔]x`, the box with no space after it, as Claude
 /// Code 2.1.300 draws a ticked free-text row in a narrow pane (MEASURED at 50
 /// columns: `4. [✔]Decide yourself: …`, its rows at column 8, the fixture
-/// `claude-2.1.300-question-multi-typed-50col.txt`; ATERM-KI-1015-1 F2). The
+/// `claude-2.1.300-question-multi-typed-50col.txt` F2). The
 /// same row unticked, `[ ]x`, is read alike: a row that reads unticked, its
 /// answer none, never a form with no rows.
 ///

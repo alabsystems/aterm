@@ -1,0 +1,44 @@
+# claude-code 2.1.308 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (144x50, aterm 0.112.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the Bash box over `Probe w-zero-width`, its command scripted into the lab's stub (one tool call)
+✻ Cooked for 0s · done 7:43 AM
+
+❯ toolstart
+
+⏺ Bash(echo $(true)
+              echo    $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+      $(true) $(true) $(tru…)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Crunched for 0s · done 7:43 AM
+
+❯ toolstart
+
+⏺ Bash(㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀㐀䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿䶿
+      䶿䶿䶿
+      一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿鿿
+      鿿鿿…)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Churned for 0s · done 7:47 AM
+
+❯ toolstart
+
+⏺ Bash(echo ab cx $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+      $(true) $(true) $(true) $(t…)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Probe w-zero-width
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ echo a�b c�x $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+ │ $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ Dangerous rm operation not ruled out — too many command substitutions to analyze (65)
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

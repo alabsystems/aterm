@@ -1879,9 +1879,9 @@ fn escape_hatch_dispatch_and_fail_closed_run_in_a_real_shell() {
         String::from_utf8_lossy(&out.stdout),
         "atpkg: __reroute cargo build\n"
     );
-    // Embedded path dangling and no atpkg on PATH — THE DEFAULT: upstream runs, after
-    // one line, with the announced marker stamped on it — never the escape; its exit
-    // code is upstream's.
+    // Embedded path dangling and no atpkg on PATH, the default: upstream runs after one
+    // line, with the announced marker stamped on it (never the escape); its exit code is
+    // upstream's.
     let gone = stub_body_sh("cargo", Path::new("/gone/atpkg"), &d, false);
     let out = run(&gone, None);
     assert_eq!(out.status.code(), Some(0), "{out:?}");

@@ -174,12 +174,10 @@ fn state_override() -> Option<PathBuf> {
     }
 }
 
-/// The rule behind [`aterm_config_dir`] and [`resolve_aterm_config_path`]
-/// (which is this directory joined with `aterm.toml`): `$XDG_CONFIG_HOME/aterm`
-/// when set and non-empty on every platform, else `%APPDATA%\aterm` on Windows
-/// when set and non-empty, else `$HOME/.config/aterm`. One rule for the file
-/// and its folder, so a sibling of `aterm.toml` can never be looked for in a
-/// different tree than the config it belongs to.
+/// The rule behind [`aterm_config_dir`], the folder of [`resolve_aterm_config_path`]'s file:
+/// `$XDG_CONFIG_HOME/aterm`, else `%APPDATA%\aterm` on Windows, else `$HOME/.config/aterm`
+/// (an empty variable counts as unset). One rule for both, so a sibling of `aterm.toml` is
+/// never looked for in another tree.
 #[must_use]
 pub fn resolve_aterm_config_dir(
     xdg_config_home: Option<&OsStr>,
@@ -376,11 +374,9 @@ pub fn not_own_account_with(
 /// harness state, the document journal, the workers' tasks). ONE rule, so
 /// every state reader agrees on the directory:
 ///
-/// - in a development build only, the `ATERM_STATE_HOME` seam
-///   ([`crate::dev_seam!`], absolute; a relative value is refused as `None`,
-///   never joined onto an arbitrary cwd) — what a test keeps its state in a temp
-///   root with. A shipped binary reads no such variable: a scratch `$HOME` (or
-///   `$XDG_STATE_HOME` off macOS) is how a release launch is isolated;
+/// - in a development build only, the `ATERM_STATE_HOME` seam ([`crate::dev_seam!`]; must be
+///   absolute, a relative value is `None`). A shipped binary is isolated by a scratch `$HOME`
+///   (or `$XDG_STATE_HOME` off macOS);
 /// - else, in a Cargo test binary, its `<root>/state` ([`test_root`]);
 /// - **macOS**: `$HOME/Library/Application Support/aterm`;
 /// - **Linux/other Unix**: `$XDG_STATE_HOME/aterm` (absolute) or `$HOME/.local/state/aterm`;
@@ -510,9 +506,7 @@ pub fn resolve_state_dir(
 /// and session's `aterm.log`, atpkg's `packages.log`) so the files sit side by side:
 ///
 /// - in a development build only, `$ATERM_STATE_HOME/logs` when that seam is set
-///   ([`crate::dev_seam!`], as [`state_dir`] reads it; a relative value is refused as
-///   `None`, as [`state_dir`] refuses it) — an instance given its own state root keeps
-///   its log there too, never in the person's log beside their real instance's;
+///   ([`crate::dev_seam!`]; a relative value is refused as `None`, as in [`state_dir`]);
 /// - else, in a Cargo test binary, its `<root>/state/logs` ([`test_root`]);
 /// - **macOS**: `$HOME/Library/Logs/aterm` (Console.app's convention);
 /// - **Linux/other Unix**: `$XDG_STATE_HOME/aterm/logs` (absolute) or

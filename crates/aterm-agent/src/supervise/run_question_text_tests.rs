@@ -336,7 +336,7 @@ fn in_fresh_pane(rows: &[String], pane: usize) -> Vec<String> {
     out
 }
 
-/// The review of round 21 (measured on Claude Code 2.1.302 at 41x67 in the real-Claude lab,
+/// (measured on Claude Code 2.1.302 at 41x67 in the real-Claude lab,
 /// its local stub; built here by [`in_fresh_pane`] from the 41x60 captures drawn from row 7):
 /// a fresh multi-select drawn from row 7 of a pane `7 + 11 + N + 40` rows tall, the long-term
 /// text `N` rows once the focus leaves it. The text is typed (it keeps its rows at 41
@@ -407,7 +407,7 @@ fn a_tail_cut_at_the_focused_submit_is_read_whole_and_submitted() {
     );
 }
 
-/// ATERM-KI-1015-1's F2 residual, at the loop: a fresh 2.1.302 multi-select at 41 columns drawn
+/// 's F2 residual, at the loop: a fresh 2.1.302 multi-select at 41 columns drawn
 /// from row 7 of a pane whose 40-row tail begins AT `5. Chat about this`, where a person's keys
 /// moved the focus (the loop never puts it there). That tail is the dialog with its head off
 /// the screen, so it is read again whole, where the focus is on the chat row: the loop moves it
@@ -477,7 +477,7 @@ fn a_tail_cut_at_a_chat_row_a_person_focused_is_read_whole_and_answered() {
 
 /// `frame`, a multi-select with its free-text row ticked and the focus on
 /// `❯    Submit`, as 2.1.300 draws a text that overflows its row once the
-/// focus left it (ATERM-KI-1015-1 F2): the checkbox without its space
+/// focus left it (F2): the checkbox without its space
 /// (`[✔]Decide`) and every wrap row one cell left, at column 8. SYNTHETIC:
 /// measured at 38 to 51 columns, drawn here on c3-06's 120; the reader asks
 /// no width. `wraps_too`: false moves the first row only.
@@ -505,7 +505,7 @@ fn against_its_checkbox(frame: &[String], wraps_too: bool) -> Vec<String> {
         .collect()
 }
 
-/// ATERM-KI-1015-1 F2, the move across the column change: the decision read
+/// F2, the move across the column change: the decision read
 /// has the focus in the field, its text at column 9 (`❯ 4. [✔] Decide`); the
 /// `↓` lands on a frame whose text 2.1.300 drew against its checkbox, at
 /// column 8 (`  4. [✔]Decide`). The Enter goes on `Submit` only because the
@@ -797,7 +797,7 @@ fn a_question_asked_again_after_its_dialog_went_is_written_afresh() {
     assert_eq!(sends(&m).len(), 2, "{:#?}", m.requests);
 }
 
-/// ATERM-KI-1016-1 (Questions): the loop answered a question by its own text and its Enter
+/// (Questions): the loop answered a question by its own text and its Enter
 /// went, and the worker asked the same question again in a new dialog with no read between
 /// them (no busy read, no composer: the gap the reads did not sample). The re-ask's pristine
 /// field read as the loop's text "gone" from the dialog it had answered, and was handed over.
@@ -919,7 +919,7 @@ fn a_look_took_a_missed_frame(lines: &[String]) {
     );
 }
 
-/// ATERM-KI-1015-1 F4's forget, held to its evidence: a dialog ends at a look
+/// F4's forget, held to its evidence: a dialog ends at a look
 /// that reads the worker at its COMPOSER with no dialog up, never at one that
 /// reads no dialog only. Here the loop's Enter is skipped (`reason=changed`)
 /// and a whole settled look takes a frame of the same dialog the reader

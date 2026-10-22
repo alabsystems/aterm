@@ -467,13 +467,9 @@ fn the_first_party_verifier_matches_its_recorded_expectations() {
 
 #[test]
 fn the_shipped_constructor_trusts_no_fixture_anchor() {
-    // THE anchor-seam assertion. `PlatformVerifier::new` is what
-    // `crate::tls::client_config` calls, and it must know nothing about the
-    // fixture root — otherwise the test seam would be a live trust override.
-    //
-    // The stronger half of this guarantee is structural rather than behavioural:
-    // `new_with_extra_roots` is `#[cfg(test)]`, so no non-test caller can name
-    // it and the compiler enforces that. This is the behavioural half.
+    // `PlatformVerifier::new`, which `crate::tls::client_config` calls, must not
+    // trust the fixture root. `new_with_extra_roots` being `#[cfg(test)]` is the
+    // structural half; this is the behavioural half.
     require_trust_service();
     let shipped = match PlatformVerifier::new(provider()) {
         Ok(verifier) => verifier,
@@ -496,9 +492,8 @@ fn the_shipped_constructor_trusts_no_fixture_anchor() {
         "the shipped verifier accepted a chain rooted in a fixture CA: {got:?}"
     );
 
-    // ...and the SAME chain accepts once the anchor is supplied, which proves
-    // the rejection above is about the anchor set and not about the fixture
-    // being broken in some other way.
+    // The same chain accepts with the anchor: the rejection is about the anchor
+    // set.
     assert!(
         case.run(&mine()).accepted(),
         "the fixture chain must be good; only its anchor is missing"
@@ -578,9 +573,7 @@ fn extra_anchors_add_to_the_system_set_rather_than_replacing_it() {
 
 #[test]
 fn a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict() {
-    // If `BadEncoding` were reported as an ordinary rejection, a future change
-    // that broke DER handling would look like a suite full of healthy reject
-    // cases. It is called out separately for exactly that reason.
+    // Kept apart so broken DER handling cannot pass as healthy reject cases.
     let mine = mine();
     for (what, bytes) in [
         ("nine bytes of garbage", MALFORMED),
@@ -605,27 +598,12 @@ fn a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict() {
 
 #[test]
 fn a_degenerate_server_name_fails_closed_instead_of_disabling_name_checking() {
-    // THE NULL-HOSTNAME BACKDOOR. `SecPolicyCreateSSL`'s hostname argument is
-    // NULLABLE, and a NULL switches name verification OFF. MEASURED on this
-    // machine with a standalone clang probe against Security.framework, all four
-    // runs over the same `good.der` chain at the same pinned instant:
-    //
-    //     SecPolicyCreateSSL(true, NULL)                 -> ACCEPT
-    //     SecPolicyCreateSSL(true, "")                   -> REJECT  -67602
-    //     SecPolicyCreateSSL(true, "evil.test")          -> REJECT  -67602
-    //     SecPolicyCreateSSL(true, "test.aterm.invalid") -> ACCEPT
-    //
-    // So the danger is the NULL POINTER specifically, not a short or odd string.
-    // `verifier::apple` cannot produce that pointer: there is exactly one call to
-    // `SecPolicyCreateSSL`, its hostname comes from a `CfOwned`, and a `cf_string`
-    // failure is `?`-propagated rather than defaulted to null — the mistake this
-    // guards against is `unwrap_or(ptr::null())`, which compiles and which every
-    // other test in this file would still pass, because they all pass the RIGHT
-    // name.
-    //
-    // What is asserted here is the adjacent value a refactor is most likely to
-    // let through — the EMPTY name — plus the fact that name checking is on at
-    // all. Neither may accept.
+    // A NULL hostname to `SecPolicyCreateSSL` switches name checking off (the
+    // same chain is accepted); an empty or wrong name is rejected with -67602.
+    // `apple` cannot pass NULL: a `cf_string` failure is propagated, never
+    // `unwrap_or(ptr::null())`, which every other test here would still pass.
+    // So this asserts the adjacent value a refactor might let through, the empty
+    // name, and that name checking is on at all.
     let mine = mine();
 
     // Name checking is live: a certificate for another name is refused.

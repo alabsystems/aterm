@@ -538,9 +538,7 @@ pub(crate) fn file_id_of_handle(handle: BorrowedHandle<'_>) -> Result<FileId, i3
     })
 }
 
-// ---------------------------------------------------------------------------
 // Another process of this account, read through a handle (`crate::peb`).
-// ---------------------------------------------------------------------------
 
 /// `OpenProcess` right: the image, where the environment block is.
 pub(crate) const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
@@ -936,9 +934,7 @@ pub(crate) fn read_units(h: BorrowedHandle<'_>, addr: u64, len: usize) -> Option
     (ok != 0 && got == len).then_some(units)
 }
 
-// ---------------------------------------------------------------------------
 // The tests' own writes: a directory junction made without a child process.
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[link(name = "kernel32")]

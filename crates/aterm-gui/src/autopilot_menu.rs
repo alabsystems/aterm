@@ -72,7 +72,12 @@
 //! chip at the menu's anchor (a box covered the composer, the pane narrowed,
 //! the chip did not fit), and on a focus or tab change — so a box that
 //! replaces Claude's composer under an open menu is answered by whoever
-//! answers boxes, never by the menu's Return.
+//! answers boxes, never by the menu's Return. A re-grid (a window resize, a
+//! font zoom) closes nothing of itself: the next frame lays the card again
+//! where the chip still stands at the anchor, or closes it by that rule;
+//! until then the card the last frame laid on the old grid answers no
+//! pointer (`App::laid_cell_at`), and the card laid again counts as rows
+//! that moved under a resting pointer.
 //!
 //! **Under the master switch (or no host)** the mode and timer rows are
 //! shown disabled under the line `harness off in Settings`, and only `⚙
@@ -908,6 +913,16 @@ fn paint_plot(
     cells
 }
 
+/// The card a menu choice just closed (`App::spends_menu_follow_up`): its
+/// window, where it was painted, the grid it was laid on, and when.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpentCard {
+    pub(crate) wid: WindowId,
+    pub(crate) rect: MenuRect,
+    pub(crate) laid: Option<crate::app_mouse::GlassGrid>,
+    pub(crate) at: std::time::Instant,
+}
+
 /// One open Autopilot menu (one at a time, in one window).
 #[derive(Clone, Debug)]
 pub(crate) struct AutopilotMenu {
@@ -938,6 +953,12 @@ pub(crate) struct AutopilotMenu {
     /// Where the last frame painted it, for the hit test; `None` before the
     /// first frame.
     pub(crate) rect: Option<MenuRect>,
+    /// The grid that frame laid [`Self::rect`] on
+    /// ([`crate::app_mouse::GlassGrid`]): under any other — a re-grid since,
+    /// its frame not yet painted — the rect answers no pointer
+    /// ([`App::laid_cell_at`]), and the next frame lays the card again where
+    /// its chip still stands at the anchor, or closes it.
+    pub(crate) laid: Option<crate::app_mouse::GlassGrid>,
     /// How many times the rows moved under the open menu (0 at the open).
     pub(crate) generation: u64,
     /// Where the pointer last moved to while the menu was open, and what it
@@ -1329,6 +1350,7 @@ impl App {
             cancels: self.autopilot_timers.land_at_ms(session),
             highlight,
             rect: None,
+            laid: None,
             generation: 0,
             rest: PointerRest::at_open(px),
         });
@@ -1453,7 +1475,7 @@ impl App {
         else {
             return false;
         };
-        let Some((row, mut col)) = self.frame_cell_at(wid, x, y) else {
+        let Some((row, mut col)) = self.glass_cell_at(wid, x, y) else {
             return false;
         };
         while col > 0 && self.shows_autopilot_chip(wid, session, (row, col - 1)) {
@@ -1546,14 +1568,18 @@ impl App {
             self.close_autopilot_menu();
             return None;
         };
-        // A CARD THAT ARRIVES UNDER A RESTING POINTER (the first paint, or a
-        // card laid out anew): the pointer saw none of the rows now under it
-        // — the right press that opened a card over its own chip, a keyboard
-        // open beside a resting pointer — so they moved under it, as rows
-        // built again do, and its next press chooses nothing
-        // ([`AutopilotMenu::press_lands`]). Only where the rect changed: once
-        // a paint, never a frame's at rest.
-        let arrived = menu.rect != Some(rect)
+        // The grid this paint lays the card on: its rect answers the pointer
+        // on it alone (`App::laid_cell_at`).
+        let laid = self.glass_grid(wid);
+        // A CARD THAT ARRIVES UNDER A RESTING POINTER (the first paint, a
+        // card laid out anew, or laid again on a grid a re-grid moved — a
+        // font zoom puts other rows under the same pixel): the pointer saw
+        // none of the rows now under it — the right press that opened a card
+        // over its own chip, a keyboard open beside a resting pointer — so
+        // they moved under it, as rows built again do, and its next press
+        // chooses nothing ([`AutopilotMenu::press_lands`]). Only where the
+        // rect or its grid changed: once a paint, never a frame's at rest.
+        let arrived = (menu.rect != Some(rect) || menu.laid != laid)
             && menu
                 .rest
                 .px
@@ -1605,6 +1631,7 @@ impl App {
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
         if let Some(menu) = self.autopilot_menu.as_mut() {
             menu.rect = Some(rect);
+            menu.laid = laid;
             if arrived {
                 menu.generation = menu.generation.wrapping_add(1);
             }
@@ -1757,7 +1784,10 @@ impl App {
     /// fired, or was armed or cancelled elsewhere, and another choice now
     /// stands where the pointer rests — chooses nothing: the choice under it
     /// is lit, and the next press takes it ([`AutopilotMenu::press_lands`]).
-    /// Whether the menu took the press — always, while one is open there.
+    /// Between a re-grid and the frame that lays the card again the card
+    /// answers nothing ([`App::laid_cell_at`]): the press closes it, as one
+    /// before its first paint does. Whether the menu took the press — always,
+    /// while one is open there.
     pub(crate) fn autopilot_menu_press(
         &mut self,
         wid: WindowId,
@@ -1768,7 +1798,7 @@ impl App {
         let Some(menu) = self.autopilot_menu.as_ref().filter(|m| m.wid == wid) else {
             return false;
         };
-        let cell = self.frame_cell_at(wid, x, y);
+        let (laid, cell) = (menu.laid, self.laid_cell_at(wid, menu.laid, x, y));
         let on_card = menu
             .rect
             .zip(cell)
@@ -1782,8 +1812,12 @@ impl App {
                         // after it on the same card is that gesture's, not
                         // a press on what the card covered (`Self::spends_menu_follow_up`).
                         if self.autopilot_menu.as_ref().is_none_or(|m| m.wid != wid) {
-                            self.autopilot_menu_spent =
-                                Some((wid, rect, std::time::Instant::now()));
+                            self.autopilot_menu_spent = Some(SpentCard {
+                                wid,
+                                rect,
+                                laid,
+                                at: std::time::Instant::now(),
+                            });
                         }
                     } else if let Some(menu) = self.autopilot_menu.as_mut() {
                         menu.highlight = Some(i);
@@ -1807,19 +1841,26 @@ impl App {
     /// gesture that stops the very press a typed row began
     /// (`crate::claude_slash`). Any other press lets the mark go, and so
     /// does a menu opened since (whose own presses are its card's).
+    ///
+    /// The press is judged on the grid the card was laid on
+    /// ([`crate::app_mouse::GlassGrid::cell_at`]), not the window's now: the
+    /// card is gone, and what is asked is whether the second press fell where
+    /// the first one's card was — a re-grid between the two (a font zoom, a
+    /// window resize) moves no pixel of the gesture.
     pub(crate) fn spends_menu_follow_up(&mut self, wid: WindowId) -> bool {
-        let Some((at_wid, rect, at)) = self.autopilot_menu_spent.take() else {
+        let Some(spent) = self.autopilot_menu_spent.take() else {
             return false;
         };
         let (x, y) = self
             .windows
             .get(&wid)
             .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-        at_wid == wid
-            && at.elapsed().as_millis() <= crate::multi_click_ms()
-            && self
-                .frame_cell_at(wid, x, y)
-                .is_some_and(|(row, col)| rect.contains(row, col))
+        spent.wid == wid
+            && spent.at.elapsed().as_millis() <= crate::multi_click_ms()
+            && spent
+                .laid
+                .and_then(|laid| laid.cell_at(x, y))
+                .is_some_and(|(row, col)| spent.rect.contains(row, col))
     }
 
     /// The pointer moved over window `wid` while the menu is open there: the
@@ -1827,17 +1868,20 @@ impl App {
     /// every choice). Where it is on the painted card or off it is noted
     /// ([`AutopilotMenu::note_pointer`]), before the first paint too: a card
     /// that then comes up or grows under a pointer resting beside it takes no
-    /// press it did not see. Whether the menu took the motion — over the card.
+    /// press it did not see. Between a re-grid and the frame that lays the
+    /// card again it answers nothing ([`App::laid_cell_at`]): the pointer is
+    /// noted on no frame cell, and nothing is lit from it. Whether the menu
+    /// took the motion — over the card.
     pub(crate) fn autopilot_menu_motion(&mut self, wid: WindowId, x: f64, y: f64) -> bool {
-        let Some(rect) = self
+        let Some((rect, laid)) = self
             .autopilot_menu
             .as_ref()
             .filter(|m| m.wid == wid)
-            .map(|m| m.rect)
+            .map(|m| (m.rect, m.laid))
         else {
             return false;
         };
-        let cell = self.frame_cell_at(wid, x, y);
+        let cell = self.laid_cell_at(wid, laid, x, y);
         let Some(menu) = self.autopilot_menu.as_mut() else {
             return false;
         };

@@ -821,9 +821,8 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
             ..Recovery::default()
         };
     }
-    // Room for what the HELLO hands over, before it does (round seven,
-    // finding 26's review): each adopted session holds about four
-    // descriptors, and a cold launch runs at launchd's soft 256.
+    // Room for what the HELLO hands over, before it does: each adopted session
+    // holds about four descriptors, and a cold launch runs at launchd's soft 256.
     crate::descriptor_limit::raise_descriptor_limit_for_recovery();
     let mut recovery = Recovery::default();
     let mut retained_counts = Vec::new();
@@ -3106,10 +3105,8 @@ mod tests {
         );
     }
 
-    /// A META NOT SENT IS RETRIED (R17-HANDOFF-1): the pump recorded the
-    /// fingerprint of every terminal it looked at, sent or not, so a META that
-    /// could not be built — or found no link, or a full queue — was never
-    /// tried again until the modes moved. It records only what it sent.
+    /// A META not sent (not built, no link, a full queue) is retried on the next pass: the
+    /// pump records only the fingerprints it sent.
     ///
     /// AND THE FABRIC MOVES IT TOO (the fabric audit's fourth round, findings
     /// 2-5): a hold set or lifted, or a topic added, with the modes standing

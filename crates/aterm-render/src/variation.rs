@@ -614,18 +614,11 @@ pub(crate) fn inked_wght_font() -> (Vec<u8>, VfAxis, char, u16) {
 mod tests {
     use super::*;
 
-    /// [`RASTER_PAD`] EXISTS, demonstrated on the exact geometry that ate the
-    /// hinted `'2'` at ppem 19 — no font, no hinter, just the rasterizer.
-    ///
-    /// [`crate::raster`] marches a segment's x incrementally
-    /// (`xnext = x + dxdy * dy`), and for the segment
-    /// `(1.828125, 0.21875) → (0.0, 0.875)` that arithmetic overshoots to
-    /// `-1.19e-7`: `floor()` is `-1`, `linestart + x0i` is negative, and the
-    /// scanline's whole area is `continue`d away. `for_each_pixel` carries one
-    /// running accumulator across the flat buffer, so the loss offsets every
-    /// texel after it. Filled flush against the grid's left edge this triangle
-    /// loses 46% of its ink and smears the rest; given ONE pixel of slack it is
-    /// exact, and more slack changes nothing.
+    /// Why [`RASTER_PAD`] exists, on a bare rasterizer: the segment
+    /// `(1.828125, 0.21875) → (0.0, 0.875)` marches to `x = -1.19e-7`, floors to `-1`,
+    /// and its scanline's area is skipped. Flush against the grid's left edge this
+    /// triangle loses 46% of its ink; with one pixel of slack it is exact, and more
+    /// slack changes nothing.
     #[test]
     fn a_boundary_hugging_outline_needs_the_raster_pad() {
         // Area by the shoelace formula: exactly what a correct fill deposits.

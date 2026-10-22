@@ -594,7 +594,7 @@ fn a_primary_screen_resize_owes_nothing() {
     assert_eq!(t.render_debt(), RenderDebt::default());
 }
 
-/// S2R-F4 (ATERM-KI-1015-1, the sweep of 2026-10-15): a net-zero row flap on
+/// S2R-F4 (the sweep of 2026-10-15): a net-zero row flap on
 /// the PRIMARY screen with a blank row below the cursor and history above it.
 /// The shrink trimmed the blank bottom row (nothing moved) and the grow revealed
 /// the newest history line at the top, so every row and the cursor ended one
@@ -783,7 +783,7 @@ fn a_conpty_resize_owes_nothing() {
     assert_eq!(t.render_debt(), RenderDebt::of_rows(-1, 0));
 }
 
-/// S2R-F3 (ATERM-KI-1015-1): a column flap on the alternate screen cuts the drawn cells
+/// S2R-F3: a column flap on the alternate screen cuts the drawn cells
 /// past the narrower width and the grow back brings blanks there, so the cut is debt as a
 /// moved row is, until the program repaints from scratch. Cutting only blanks owes nothing.
 #[test]

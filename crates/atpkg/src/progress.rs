@@ -190,9 +190,8 @@ pub struct ProgressFile {
     /// require a live-pass observation instead of guessing from an ended timestamp.
     #[serde(default)]
     pub generation: Option<String>,
-    /// Unix seconds of the last write; the staleness input for
-    /// [`HEARTBEAT_STALE_SECS`]. Defaults to 0 when absent — epoch-stale, which fails
-    /// to the safe "not running" state.
+    /// Unix seconds of the last write, the staleness input for [`HEARTBEAT_STALE_SECS`].
+    /// Absent ⇒ 0, epoch-stale: the safe "not running" reading.
     #[serde(default)]
     pub heartbeat_unix: u64,
     /// The whole-pass rollup.
@@ -211,9 +210,7 @@ pub struct ProgressFile {
     pub ended_unix: Option<u64>,
 }
 
-// ---------------------------------------------------------------------------
 // The writer: ProgressSink.
-// ---------------------------------------------------------------------------
 
 /// Current unix seconds, saturating at 0 for a clock before the epoch (backward skew
 /// then reads as epoch-stale — the safe, "not running" direction).
@@ -671,11 +668,9 @@ fn maybe_write(s: &mut SinkState) {
     }
 }
 
-/// Serialize + land the snapshot atomically (temp + rename, the `status.rs`
-/// discipline), refreshing the heartbeat and the overall download rollup. The
-/// destination is checked with `symlink_metadata` FIRST — a non-regular file at the
-/// path (symlink, FIFO) disables the sink rather than being followed or written
-/// through. Best-effort: progress is diagnostics, never load-bearing.
+/// Serialize and land the snapshot atomically (temp + rename), refreshing the heartbeat
+/// and the overall download rollup. A non-regular file at the path (symlink, FIFO) disables
+/// the sink rather than being written through. Best-effort: progress is diagnostics.
 fn write_now(s: &mut SinkState) -> bool {
     if s.disabled {
         return false;
@@ -709,7 +704,6 @@ fn write_now(s: &mut SinkState) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The process-global sink and its flow hooks.
 //
 // The download/extract meters live deep inside `flow`/`extract`, behind API
@@ -719,7 +713,6 @@ fn write_now(s: &mut SinkState) -> bool {
 // The slot's `enabled` flag keeps the disabled path to one relaxed atomic load, so the
 // extract loop's per-chunk tick costs nothing when no pass is live (a pipe with no
 // `--progress-file`, every test that begins none).
-// ---------------------------------------------------------------------------
 
 /// The wait both pass-owned threads use between ticks: hold for `tick`, but return as soon
 /// as [`stop_and_join`] raises `stop`. The joiner is the pass thread, which holds the store
@@ -1019,8 +1012,8 @@ pub fn end_pass() {
         && let Some((sink, _, heartbeat)) = g.take()
     {
         slot.enabled.store(false, Ordering::Release);
-        // Stop the heartbeat FIRST: a tick landing after the terminal
-        // snapshot would restamp a live heartbeat onto a pid-cleared file.
+        // Heartbeat first: a tick after the terminal snapshot would restamp a live
+        // heartbeat onto a pid-cleared file.
         heartbeat.stop();
         sink.finish();
     }
@@ -1258,9 +1251,7 @@ impl Drop for DownloadWatch {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The readers: untrusted progress and bump access.
-// ---------------------------------------------------------------------------
 
 /// Read `<prefix>/progress.json` under the untrusted-reader rules: symlink-refusing bounded
 /// open ([`crate::metadata_io`]), [`PROGRESS_READ_CAP`], malformed or oversize ⇒ `None`.
@@ -1429,7 +1420,6 @@ pub fn clear_bump(layout: &crate::store::Layout) {
     let _ = std::fs::remove_file(layout.bump_file());
 }
 
-// ---------------------------------------------------------------------------
 // The promise: `pass-owed.json`.
 //
 // `progress.json` appears only once a pass begins, seconds into a first launch: the
@@ -1444,7 +1434,6 @@ pub fn clear_bump(layout: &crate::store::Layout) {
 // — its pid and, where it can be read, its start time — and lapses at either. No
 // other reader looks at it: to every `progress.json` reader nothing is running until the
 // pass begins.
-// ---------------------------------------------------------------------------
 
 /// Read cap for `pass-owed.json`; a larger file reads as no promise.
 pub const PROMISE_READ_CAP: usize = 1024;
@@ -1971,14 +1960,9 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The heartbeat promise, kept INDEPENDENTLY of flow calls (audit-2 item
-    /// 8): a pass that makes zero sink calls for longer than the writer's
-    /// minimum interval — a multi-GB Verify sha256, an Extract — must still
-    /// read as RUNNING, because the pass heartbeat thread ticks the file on its
-    /// own. Before it, the promise rested on the download poller alone (one
-    /// phase), so those phases went red "stopped" under a live writer. Asserted
-    /// on the heartbeat ADVANCING while the pass thread is deliberately asleep
-    /// — a flow call from this thread would defeat the point of the test.
+    /// A pass that makes no sink calls for longer than the writer's minimum interval (a
+    /// multi-GB Verify, an Extract) still reads as running: the heartbeat thread ticks the
+    /// file on its own.
     ///
     /// The interval passes on the PASS'S clock ([`ManualPassClock`]), not in seconds
     /// slept, and the heartbeat thread looks every millisecond ([`TICK_OVERRIDE`]): the

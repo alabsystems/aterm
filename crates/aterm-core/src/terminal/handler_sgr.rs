@@ -390,8 +390,7 @@ impl SgrStyleHandler<'_> {
 
             // SGR 58 (underline color) with colon subparameters.
             if param == 58 && next_is_subparam {
-                // Compute colon-group size first so parse receives only the
-                // colon-linked slice, not trailing semicolon params.
+                // Only the colon group, as for 58.
                 let mut skip = 1;
                 while i + skip < params.len()
                     && i + skip < 32

@@ -11,8 +11,9 @@
 //!   `corpus.rs`). Those found so far: a refused SGR 38/48/58 colour
 //!   re-dispatched its tail, DECSEL/DECSED erased to the default background,
 //!   RI kept the pending wrap at the top margin and left a one-row screen
-//!   standing, and a `?47`/`?1047` switch left the incoming buffer's BCE
-//!   background stale. The pinned fold models each of those behaviours, so
+//!   standing, a `?47`/`?1047` switch left the incoming buffer's BCE
+//!   background stale, and `CSI 0 T` (xterm's highlight mouse tracking)
+//!   scrolled. The pinned fold models each of those behaviours, so
 //!   each case is held to agree with it byte by byte.
 //! - **an astream-term gap** ([`Triage::Astream`]): the fold lacks an xterm
 //!   behaviour, and an astream branch (the entry names it) adds it. The aterm
@@ -135,6 +136,24 @@ const fn text(rows: &'static [&'static str], cursor: (u16, u16)) -> Want {
 }
 
 pub const EXCLUSIONS: &[Exclusion] = &[
+    Exclusion {
+        case: "decrc_under_origin_mode_above_the_region",
+        triage: Triage::ByDesign {
+            diverges: |c| c.origin_mode,
+        },
+        want: text(&["", "", "X"], (2, 1)),
+        why: "a DECRC that restores origin mode over a region that no longer \
+              holds the saved row: xterm's CursorRestore hands CursorSet the \
+              row less the top margin, and CursorSet adds the margin back and \
+              clamps the sum to [0, bottom margin] (cursor.c), so a row saved \
+              above the region stays above it, where the fold puts it (row 0). \
+              aterm clamps the restored row into the region, [top, bottom], as \
+              VT510 describes DECRC under DECOM (aterm-core handler_state.rs \
+              `restore_cursor_state`, `restore_cursor_snapshot`), so a cursor \
+              under origin mode never sits outside the region it addresses. \
+              The generator restores a slot saved under origin mode only while \
+              no DECSTBM has come since (generator.rs `OriginSlot`).",
+    },
     Exclusion {
         case: "stray_1049l_with_a_saved_slot",
         triage: Triage::ByDesign { diverges: |_| true },

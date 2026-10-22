@@ -251,9 +251,9 @@
 //! * `codex-alab-proof` proves the codex-alab native harness end to end on
 //!   the real package ([`codex_alab_proof`], its jail, fake model and
 //!   stand-ins in [`codex_rig`], its scripted model in [`codex_alab_model`]):
-//!   the proven claim and the parked lane, FOREVER CRUISE (a done claim, the
+//!   the proven claim and the parked lane, Autopilot Cruise (a done claim, the
 //!   retired token's included, gets the defend prompt and work goes on),
-//!   FOREVER LAND (the instruction, unbounded nudges, a landing only at a
+//!   Autopilot Land (the instruction, unbounded nudges, a landing only at a
 //!   clean defense over a clean folder, then quiet, reopened by a person's
 //!   turn; a dirty repository not landed until pushed), NEEDS YOU (raised at
 //!   once, never blocking), an approval, the question overlay and Land's
@@ -343,6 +343,8 @@ mod gemini;
 mod gemini_captures;
 #[cfg(target_os = "macos")]
 mod gemini_proof;
+#[cfg(target_os = "macos")]
+mod halfdraw;
 #[cfg(target_os = "macos")]
 mod input_sources;
 #[cfg(target_os = "macos")]
@@ -644,6 +646,10 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  on a lab of its own, in the fixture shape; --subscriber and --settings pick the variant
                                  (the corpus's own: --subscriber --settings
                                  '{\"model\":\"opus\",\"env\":{\"CLAUDE_CODE_EFFORT_LEVEL\":\"xhigh\"}}')
+  halfdraw scan <cast> --program claude|agy|muse|gemini [--show N] [--event I]
+                                 a tab's cast (`aterm ctl @<sid> cast`) replayed into the engine one PTY read per batch:
+                                 its DEC 2026 brackets, the reads that ended inside one, and every busy gap (the busy
+                                 row gone mid-turn) with what reads it today (open frame, torn by its reader, UNGUARDED)
   probe [tag] [--replica]        the isolation probes: this lab's jail (a fresh one if none is up) and a replica home
                                  (--replica: the replica alone, which never touches the owner's tree)
   selftest [tag] [--keep]        the whole proof in ~25 s: up, launch, \"hi\", forced survey card, harness 0, egress,
@@ -1137,6 +1143,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "sleep" => sleep::cmd_sleep(args),
         "workers" => workers::cmd_workers(args),
         "footers" => footers::cmd_footers(args),
+        "halfdraw" => halfdraw::cmd_halfdraw(args),
         "paths" => verbs::cmd_paths(),
         "instance" => instance::cmd_instance(args),
         "resource-attribution" => resource_attribution::cmd(args),

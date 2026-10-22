@@ -219,7 +219,7 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::WholeTree,
         needs: &["desktop"],
         also: "--app <APP>",
-        runs: "the ignored paint/spin rows on <APP>, GUI pacing smoke (alone)",
+        runs: "aterm-conformance's paint/spin rows, then the GUI typing smoke, on <APP> (alone)",
     },
     Spec {
         check: Check::CodexAlab,
@@ -253,7 +253,7 @@ pub const DEV: [Check; 5] = [
 ];
 
 /// What publication requires: the whole workspace, and a skip is not a pass.
-/// `cells` is not in it (owner ruling 2026-10-16): the release builds only the
+/// `cells` is not in it: the release builds only the
 /// macOS bundle, so nothing it builds is for the foreign triples, and a
 /// Windows-only type error or a stable without a cross std stopped a macOS
 /// release. `verify cells` runs by hand.

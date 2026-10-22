@@ -1,0 +1,73 @@
+# muse 1.4.11-R6667.1 · MEASURED 2026-10-22, `aterm ctl text --json` of a private headless aterm (Wx12, aterm at 3d33a191a6) running the real Muse Code in the real-agent lab (crates/aterm-lab: `lab muse`, a scratch HOME, the lab's fake key and stub) · idle at its composer, no turn yet, the pane resized to each width W from 40 down to 26 columns (`aterm ctl resize 12 W`): each frame's rows under a `## W columns` line, the cursor at 4,2 in every frame · the top rule's label leaves ten `─` at 40 columns, nine at 39, one at 33, none at 32 (the label alone), and is cut with `…` under that · that instance's own status said agent=idle at 40 columns and agent=unknown from 39 down · cursor=4,2 (visible) · the project dir is spelled /private/tmp/at.lab0 here
+## 40 columns
+
+  Muse Code 1.4.11
+
+── Voice input (⌥ + v to start) ────────
+❯
+────────────────────────────────────────
+  lab-stub · high · …/proj · Auto-review
+## 39 columns
+
+  Muse Code 1.4.11
+
+── Voice input (⌥ + v to start) ───────
+❯
+───────────────────────────────────────
+  lab-stub · high · proj · Auto-review
+## 38 columns
+
+  Muse Code 1.4.11
+
+── Voice input (⌥ + v to start) ──────
+❯
+──────────────────────────────────────
+  lab-stub · high · proj · Auto-review
+## 36 columns
+
+  Muse Code 1.4.11
+
+── Voice input (⌥ + v to start) ────
+❯
+────────────────────────────────────
+  lab-stub · high · p… · Auto-review
+## 34 columns
+
+  Muse Code 1.4.11
+
+── Voice input (⌥ + v to start) ──
+❯
+──────────────────────────────────
+  lab-stub · high · Auto-review
+## 33 columns
+
+  Muse Code 1.4.11
+
+── Voice input (⌥ + v to start) ─
+❯
+─────────────────────────────────
+  lab-stub · high · Auto-review
+## 32 columns
+
+  Muse Code 1.4.11
+
+── Voice input (⌥ + v to start)
+❯
+────────────────────────────────
+  lab-stub · high · Auto-review
+## 30 columns
+
+  Muse Code 1.4.11
+
+── Voice input (⌥ + v to sta…
+❯
+──────────────────────────────
+  lab-stub · high · …/proj
+## 26 columns
+
+  Muse Code 1.4.11
+
+── Voice input (⌥ + v to…
+❯
+──────────────────────────
+  lab-stub · high · …/proj

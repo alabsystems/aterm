@@ -47,13 +47,14 @@ pub use world::Real;
 /// What `ship site` takes on its command line (the post-promote hook takes the same).
 pub const USAGE: &str = "usage: targo --unverified ship site [--latest] [--dry-run] [--no-deploy] \
      [--skip-site] [--site-dir DIR] [--releases FILE]
-  --latest       sync to the public repo's main tip (else PUB_PUBLIC_COMMIT names it)
+  --latest       sync to the public repo's main tip; PUB_PUBLIC_COMMIT, when set, names
+                 the commit instead (one of the two is required)
   --dry-run      compute and print the plan; change nothing (PUB_DRY_RUN=1 too)
   --no-deploy    commit and push, no deploy, no live check (SITE_NO_DEPLOY=1 too)
   --skip-site    do nothing, say so, exit 0
   --site-dir DIR the site checkout (else SITE_DIR, else publish/site.toml's dir)
-  --releases FILE plan from this release list instead of asking gh (with --dry-run only:
-                 an offline plan, never a commit or a deploy)
+  --releases FILE plan offline from this release list instead of asking gh (needs
+                 --dry-run)
 exit: 0 synced (or synced and the live site unreadable, said), deferred or planned · 1 failed · 2 usage or an unreadable publish/site.toml · \
      3 no usable site checkout · 4 the live site does not show the committed site";
 

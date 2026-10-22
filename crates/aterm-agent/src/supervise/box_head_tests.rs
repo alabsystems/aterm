@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 // A box taller than the pane, read whole from the history above the screen (`box_head.rs`,
-// ATERM-KI-1016-1's review, KR-DLG-1): the join of two measured boxes split at every row a pane
+// 's review, KR-DLG-1): the join of two measured boxes split at every row a pane
 // can cut them at, its negative controls, the decision on the rows joined (`approval_loop.rs`'s
 // `whole_box_decision`), and the loop over a host whose main-screen history holds the head.
 // Included from `run_tests.rs` (`mod box_head_loop`), so the `Mock` and helpers are in scope.
@@ -412,7 +412,7 @@ fn a_cut_question_reads_no_history() {
     assert!(read.is_empty(), "{read:?}");
 }
 
-/// ATERM-KI-1016-1 screens-1, DECIDED: A HEAD IS READ FROM AT MOST
+/// screens-1, DECIDED: A HEAD IS READ FROM AT MOST
 /// [`HEAD_ROWS`] ROWS ABOVE THE SCREEN, one `line` read a row, and a box
 /// whose top rule lies further up is held as the cut is, its history never
 /// read. The rm breaker grown by description rows between its title and the

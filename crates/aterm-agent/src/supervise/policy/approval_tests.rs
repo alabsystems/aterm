@@ -256,7 +256,7 @@ fn an_rm_breaker_on_scratch_is_approved_in_bypass_under_its_row_guard() {
     assert!(reason(&on_screen(&rows, &none(bypass()))).contains("approve = \"none\""));
     let d = on_screen(&rm_box("S=/usr; rm -rf \"$S/t5\""), &bypass());
     assert!(reason(&d).contains("not strictly inside"), "{d:?}");
-    // The legacy `rm_breaker = false`: the loop leaves the rule no
+    // The retired `rm_breaker = false`: the loop leaves the rule no
     // scratch root, and the same box is a person's.
     let withheld = ApprovalCtx {
         scratch_roots: Vec::new(),
@@ -1051,11 +1051,9 @@ fn a_read_outside_cwd_is_approved_under_an_allowed_root_unless_it_is_a_secret() 
         assert!(approved(&d).is_none(), "{odd}: {d:?}");
     }
     assert!(approved(&on_screen(&read_box("/etc/hosts"), &none(ctx()))).is_none());
-    // The view the model asked for rides INSIDE the call (MEASURED on 2.1.292:
-    // `Read(/etc/ssl/cert.pem · lines 1-5)`, and a `.env` with an offset was
-    // pressed and read): the press is for the path under every reading of the
-    // text, so a secret stays held under any decoration, and a plain file is
-    // pressed under its WHOLE call row.
+    // The view rides inside the call (`Read(/etc/ssl/cert.pem · lines 1-5)`): the
+    // path is judged under every reading of the text, so a secret stays held under
+    // any view, and a plain file is pressed under its whole call row.
     for view in [" · lines 1-5", " · pages  1 - 3 ", " · whatever"] {
         let rows = read_call_box(&format!("/etc/hosts{view}"));
         let d = on_screen(&rows, &ctx());
@@ -1442,11 +1440,8 @@ fn the_limit_options_dialog_whose_title_wraps_chooses_the_wait_row() {
 /// its row is guarded on the path, not on the dashed rule under it.
 #[test]
 fn a_title_whole_on_its_row_leaves_the_box_its_body() {
-    // MEASURED on 2.1.300 at 50 columns (the lab, manual mode): the background
-    // agent's `wc -l /etc/hosts` under its `Tip:` row, which the safe rules
-    // escalated live ("the box header is not a Bash header: … agent Tip: …"),
-    // and the Create box whose path fills its row, which full power pressed
-    // guarded on the dashed rule, journaling the rule as the subject.
+    // 2.1.300 at 50 columns: the background agent's box under its `Tip:` row, and
+    // the Create box whose path fills its row (guarded on the path, not the rule).
     let rows = phase_fixtures::screen(phase_fixtures::BOX_BASH_SUBAGENT_TIP_50_2_1_300);
     let d = on_screen(&rows, &ctx());
     assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{d:?}");
@@ -2325,7 +2320,7 @@ fn no_rule_ever_spends_a_limit_reset() {
         let own = chosen(RULE_LIMIT_RESET, choice.clone());
         assert_eq!(never_spends(&reading, &dialog, own.clone()), own);
     }
-    // CONTROLS: every other choice passes unchanged.
+    // Controls: every other choice passes unchanged.
     for choice in [Choice::Digit(1), Choice::Digit(9), focus(WAIT_OCT_9)] {
         let d = chosen(RULE_ALLOW_ONCE, choice);
         assert_eq!(never_spends(&reading, &dialog, d.clone()), d);
@@ -3225,7 +3220,11 @@ pub(crate) fn stale_box_commands() -> (String, String) {
 /// twin both escalate. An older harmless echo also draws exactly as a new
 /// newline-touch command: pending/stable/shape agreement cannot approve it.
 /// Controls retain mismatched/missing/subagent refusal diagnostics and the
-/// existing unambiguous per-row echo approval, including under zsh.
+/// existing unambiguous per-row echo approval, including under zsh. The
+/// captured newline twin (the same box rows, another call's row above them,
+/// MEASURED on 2.1.308) is no call of the box's (`breaker-read-only@v4`
+/// draws the call's row too), and under its own captured box and call's row
+/// it is added and refused with the screen's readings.
 #[test]
 fn a_transcript_call_cannot_remove_the_boxes_other_readings() {
     use super::super::box_command::tests::command_of;
@@ -3279,7 +3278,7 @@ fn a_transcript_call_cannot_remove_the_boxes_other_readings() {
                 "the newline twin",
                 rows.clone(),
                 call(&twin),
-                "not read-only (newline reading): a command whose name this check cannot read",
+                "; the transcript's waiting Bash call is not the box's: the call's row ",
             ),
             (
                 "another command",
@@ -3348,10 +3347,215 @@ fn a_transcript_call_cannot_remove_the_boxes_other_readings() {
             assert_eq!(unproven_of(&d), None);
         }
     }
+    let twin = command_of("Probe too-many-newline-twin");
+    let c = ApprovalCtx {
+        box_command: call(&twin),
+        ..ctx()
+    };
+    let r = reason(&on_screen(
+        &screen(super::super::box_command::tests::TWIN_SCREEN),
+        &c,
+    ))
+    .to_string();
+    assert!(
+        r.starts_with(&format!("{label}: ")),
+        "the twin's own box: {r}"
+    );
+    assert!(
+        r.contains(
+            "not read-only (newline reading): a command whose name this check cannot read ($(…)) \
+             (the matching transcript call does not remove screen readings)"
+        ),
+        "the twin's own box: {r}"
+    );
+}
+
+/// `breaker-read-only@v4` ADDS THE TRANSCRIPT'S COMMAND FOR A TOO-MANY BOX
+/// OVER TABS OR WIDE CHARACTERS, AND KEEPS THE SCREEN'S READINGS (MEASURED
+/// 2026-10-22, 2.1.308): the captured boxes over `echo` lines with tabs, with
+/// a tab after a wide character, with CJK words and with kana and Hangul draw
+/// as their calls' commands in the box and in the call's row, so each call is
+/// added as a reading, and the box is still escalated on the screen's own
+/// newline reading, which puts a `$(true)` where a command's name goes; the
+/// reason says that the matching call removes no reading. v2 drew no tab and
+/// no wide character, and took no such call.
+///
+/// NEGATIVE CONTROLS, each escalated with the reason the call was not taken:
+/// the tabs box with its command's tabs made single spaces (what the box's
+/// own `replace` would leave, were the tabs not expanded first) does not draw
+/// as the box; each box over an ideographic space, a zero-width space or a
+/// soft hyphen is not drawn again, the character named.
+#[test]
+fn a_too_many_box_over_tabs_or_wide_characters_adds_the_transcripts_command() {
+    use super::super::box_command::tests::{CALLS_308, REFUSED_308, SCREENS_308, command_in};
+    let label = "the rm circuit breaker (not ruled out: too many command substitutions to \
+                 analyze; the command need not name rm)";
+    let call = |command: &str| {
+        Some(Ok(BoxCommand {
+            id: "toolu_lab0c1b6e02".to_string(),
+            command: command.to_string(),
+        }))
+    };
+    let capture = |name: &str| {
+        SCREENS_308
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, t)| phase_fixtures::screen(t))
+            .expect(name)
+    };
+    for name in ["w-tabs", "w-tab-after-wide", "w-cjk-words", "w-hangul"] {
+        let command = command_in(CALLS_308, &format!("Probe {name}"));
+        assert!(classify_command(&command).read_only, "{name}");
+        let c = ApprovalCtx {
+            box_command: call(&command),
+            ..ctx()
+        };
+        let r = reason(&on_screen(&capture(name), &c)).to_string();
+        assert!(r.starts_with(&format!("{label}: ")), "{name}: {r}");
+        assert!(
+            r.contains("not read-only (newline reading)")
+                && r.ends_with(" (the matching transcript call does not remove screen readings)"),
+            "{name}: {r}"
+        );
+    }
+    // NEGATIVE CONTROLS
+    let tabs = command_in(CALLS_308, "Probe w-tabs");
+    assert!(tabs.contains('\t'));
+    let c = ApprovalCtx {
+        box_command: call(&tabs.replace('\t', " ")),
+        ..ctx()
+    };
+    let r = reason(&on_screen(&capture("w-tabs"), &c)).to_string();
+    assert!(r.starts_with(&format!("{label}: ")), "{r}");
+    assert!(
+        r.contains("; the transcript's waiting Bash call is not the box's: the command's row 1"),
+        "{r}"
+    );
+    for (name, text, named) in REFUSED_308 {
+        let command = command_in(CALLS_308, &format!("Probe {name}"));
+        let c = ApprovalCtx {
+            box_command: call(&command),
+            ..ctx()
+        };
+        let r = reason(&on_screen(&phase_fixtures::screen(text), &c)).to_string();
+        assert!(r.starts_with(&format!("{label}: ")), "{name}: {r}");
+        assert!(r.contains(named), "{name}: {r}");
+    }
+}
+
+/// NO RULE PROVES A BASH BOX FROM A READING WHOSE WORDS TURN ON A BLANK THE
+/// SCREEN CANNOT SHOW (`read-only@classify-v5`, `breaker-read-only@v4`,
+/// `rm-breaker@v4`; [`blanks_shown`]; MEASURED 2026-10-22 under `/bin/bash`
+/// 3.2, the measured note's §B). The screen draws a tab as the blanks to its
+/// stop and shows no blank at a row's end, so `echo \⇥#; tee x` (the tab at
+/// column 6, drawn as two blanks) draws as `echo \  #; tee x`, which reads as
+/// an echo and a comment, and `echo a\ ⏎tee x` draws as `echo a\⏎tee x`,
+/// which reads as one echo: each command runs `tee x`, and every reading of
+/// its rows classifies read-only. Each box is escalated, the reason naming
+/// the reading and the form: a one-row Bash box and a barred one under the
+/// read-only rule, the too-many breaker with nothing read and with the
+/// matching transcript call (which adds its reading and removes none), and
+/// the rm breaker over a proven rm. (A here-document on barred rows needs
+/// no such check here: the classifier refuses its space reading, which
+/// holds no body.)
+///
+/// NEGATIVE CONTROLS, each approved under its rule: a backslash before one
+/// blank and a word (`a\ b`, read alike whether the blank is a tab drawn as
+/// one), blanks before a `#` that no backslash escapes, and a here-string.
+#[test]
+fn a_reading_that_turns_on_a_blank_the_screen_cannot_show_proves_no_box() {
+    use super::super::box_command::tests::drawn_screen;
+    // The commands the rows below are drawn for.
+    assert!(!classify_command("echo \\\t#; tee x").read_only);
+    assert!(!classify_command("echo a\\ \ntee x").read_only);
+    assert!(classify_command("echo \\  #; tee x").read_only);
+    assert!(classify_command("echo a\\\ntee x").read_only);
+
+    let refused = |d: &Decision, lead: &str, why: &str, what: &str| {
+        let r = reason(d);
+        assert!(r.starts_with(lead), "{what}: {r}");
+        assert!(r.contains(why), "{what}: {r}");
+    };
+    let tab =
+        "not read as drawn (space reading): a backslash stands before blanks that may be a tab";
+    let ends = "not read as drawn (newline reading): a backslash ends a line of it";
+    for (what, rows, why) in [
+        (
+            "one row",
+            bash_box(&["echo \\  #; tee x"], Some("Echo a blank")),
+            tab,
+        ),
+        (
+            "barred",
+            bash_box(&["\u{2502} echo a\\", "\u{2502} tee x"], None),
+            ends,
+        ),
+    ] {
+        refused(&on_screen(&rows, &ctx()), "not read as drawn", why, what);
+    }
+    for (what, rows) in [
+        (
+            "an escaped blank",
+            bash_box(&["cat My\\ File"], Some("Show the file")),
+        ),
+        ("a comment", bash_box(&["echo a  #; tee x"], Some("Echo a"))),
+        (
+            "a here-string",
+            bash_box(&["cat <<< hello"], Some("Echo hello")),
+        ),
+        (
+            "barred",
+            bash_box(&["\u{2502} echo a\\ b", "\u{2502} echo c"], None),
+        ),
+    ] {
+        let d = on_screen(&rows, &ctx());
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{what}: {d:?}");
+    }
+
+    let label = "the rm circuit breaker (not ruled out: too many command substitutions to \
+                 analyze; the command need not name rm)";
+    let five = "echo $(true) $(true) $(true) $(true) $(true)";
+    let mut lines = sixty_five(&[(12, &format!("{five} a\\"))]);
+    lines.push("tee x".to_string());
+    let shown = lines.join("\n");
+    let call = Some(Ok(BoxCommand {
+        id: "toolu_lab0c1b6e03".to_string(),
+        command: shown.clone(),
+    }));
+    for base in [ctx(), bypass()] {
+        let rows = too_many_box(&lines, base.bypass_mode);
+        refused(&on_screen(&rows, &base), label, ends, "the too-many box");
+    }
+    let (_, rows) = drawn_screen(&shown);
+    let c = ApprovalCtx {
+        box_command: call,
+        ..ctx()
+    };
+    let d = on_screen(&rows, &c);
+    refused(&d, label, ends, "the too-many box and its call");
+    assert!(
+        reason(&d).ends_with(" (the matching transcript call does not remove screen readings)"),
+        "{d:?}"
+    );
+    let control = sixty_five(&[(12, &format!("{five} a\\ b"))]);
+    for base in [ctx(), bypass()] {
+        let d = on_screen(&too_many_box(&control, base.bypass_mode), &base);
+        assert_eq!(
+            pressed(&d),
+            (RULE_BREAKER_READ_ONLY, Choice::Digit(1)),
+            "{d:?}"
+        );
+    }
+
+    let rm = "S=/private/tmp/claude-502/x; rm -rf \"$S/t5\"";
+    let d = on_screen(&rm_box(&format!("{rm}; echo \\  #; tee x")), &bypass());
+    refused(&d, "rm circuit breaker: ", tab, "the rm breaker");
+    let d = on_screen(&rm_box(&format!("{rm}; echo a\\ b")), &bypass());
+    assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{d:?}");
 }
 
 /// THE RM BREAKER'S TOO-MANY BOX OVER A COMMAND PROVEN A READ IS APPROVED
-/// UNDER ITS OWN RULE (`breaker-read-only@v2`): Claude Code 2.1.307 draws the
+/// UNDER ITS OWN RULE (`breaker-read-only@v4`): Claude Code 2.1.307 draws the
 /// box over any command with more than 64 command substitutions, rm or none,
 /// in a bypass session too (MEASURED). The MEASURED box with its rows made
 /// thirteen lines of `echo` and five `$(true)` is pressed `1` under the safe
@@ -4956,7 +5160,7 @@ fn with_row(rows: &[String], from: &str, to: &str) -> Vec<String> {
 /// possibly-empty-variable form reaches its resolver, and only it is pressed
 /// with the warning under `approve = "safe"`'s default (every other kind stays
 /// a person's). The two kinds by which the vendor could not rule a removal out
-/// go to `breaker-read-only@v2` instead, which refuses this line for its rm
+/// go to `breaker-read-only@v4` instead, which refuses this line for its rm
 /// and the nested kind outright. The boxes are `CAP_RM` with its note row
 /// replaced. At full power each is pressed, its kind first in the unproven
 /// reason.
@@ -5604,7 +5808,7 @@ fn a_held_message_half_drawn_in_a_narrow_pane_never_focuses_a_piece_of_its_deny(
     }
 }
 
-/// ATERM-KI-1016-1, "Dialogs in narrow panes": a dialog whose label Ink wraps
+/// , "Dialogs in narrow panes": a dialog whose label Ink wraps
 /// at a name (the held message's `Deliver this message to` over `Claude`
 /// under 34 columns, Computer Use's `Deny, and tell` over `Claude what to do
 /// differently (esc)` at 18-24) or inside a word (the usage-limit dialog's
@@ -5818,7 +6022,7 @@ fn a_yes_is_never_taken_by_its_label_under_a_rest_that_opens_with_no_capital() {
     assert_eq!(approved(&d), Some(RULE_ALLOW_ONCE), "{d:?}");
 }
 
-/// ATERM-KI-1016-1 (Dialogs in narrow panes): a box whose head is off the screen stays a box of
+/// (Dialogs in narrow panes): a box whose head is off the screen stays a box of
 /// no kind and is escalated at every level, by rule (the manual, `manual.rs` "A box taller than
 /// the pane": pressed at no level until the pane shows it whole, unless the loop reads its head
 /// back from the main screen's history, `box_head_tests.rs`; `approval.rs`'s module doc, the
@@ -8025,7 +8229,7 @@ const ASK_BASH_SED_SPECIFIER_300: &str =
 const ASK_BASH_SED_HOOK_300: &str =
     include_str!("fixtures/claude-2.1.300-box-bash-sed-hook-ask.txt");
 
-/// ATERM-KI-1015-1 F1 (DECIDED 2026-10-15, fail-closed toward the owner's
+/// F1 (DECIDED 2026-10-15, fail-closed toward the owner's
 /// rules): an `Edit file` box is held at every level wherever the agent's own
 /// settings chain carries any `Bash(…)` ask rule or any PreToolUse hook whose
 /// matcher can match Bash — the Bash tool draws a `sed -i` as that box with
@@ -8883,7 +9087,7 @@ fn traced(rows: &[String], ctx: &ApprovalCtx) -> (Decision, Vec<super::super::tr
 
 /// THE TRACE NAMES THE RULE THAT DECIDED, and tells of the very decision the
 /// loop makes: a read-only box under the safe rules is decided at the safe
-/// rules by `read-only@classify-v4`, after the gates it passed (the program
+/// rules by `read-only@classify-v5`, after the gates it passed (the program
 /// supervised, no owner's review, no ask rule, no forced read, the box read
 /// whole); a write under full power is unproven by the safe rules and
 /// decided by full power; a box under `none` goes to a person at that check,
@@ -9043,7 +9247,7 @@ fn the_lab_boxes_are_answered_as_measured() {
     // Full power presses `1`, naming the breaker; the safe rules hand each to
     // a person, in a bypass session too: the too-many boxes because one names
     // rm and the other's barred rows, newline-joined, put a `$(true)` where a
-    // command's name goes (`breaker-read-only@v2` with no transcript call
+    // command's name goes (`breaker-read-only@v4` with no transcript call
     // taken: the screen cannot tell a wrap from a newline), the nested box because nothing proves its kind a
     // read, and the mounted drive because the rm rule resolves only an rm on
     // a possibly-empty variable.

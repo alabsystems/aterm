@@ -126,7 +126,6 @@ fn shift_enter_distinct_from_enter_in_every_mode() {
     }
 }
 
-// =========================================================================
 // KEY-RELEASE REPORTING obligation — the always-on, exhaustively MODEL-CHECKED
 // proof behind "keys are never doubled in a progressive-keyboard TUI".
 //
@@ -145,7 +144,6 @@ fn shift_enter_distinct_from_enter_in_every_mode() {
 // representative key/modifier grid spanning every encoder path: printable text,
 // digits, the legacy text keys (Enter/Tab/Backspace/Space), Escape, arrows,
 // F-keys, and bare modifier keys.
-// =========================================================================
 
 /// The key grid: one representative per encoder path.
 fn release_obligation_keys() -> Vec<Key> {

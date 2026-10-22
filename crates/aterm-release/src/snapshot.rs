@@ -423,9 +423,7 @@ impl Snapshot {
     }
 }
 
-// ---------------------------------------------------------------------------
 // git objects
-// ---------------------------------------------------------------------------
 
 /// One file of the tree: which repository holds its blob, where it goes, and how.
 struct TreeEntry {
@@ -945,9 +943,7 @@ fn check_relative(path: &[u8]) -> Result<(), String> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // the byte-wise sync
-// ---------------------------------------------------------------------------
 
 /// Writes a tree into `root` one path at a time, touching only what differs, then removes
 /// every path it was not given: in a completed subtree at [`Syncer::prune_under`], everywhere
@@ -1263,9 +1259,7 @@ fn write_beside(full: &Path, data: &[u8], exec: bool) -> Result<(), String> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // vendoring
-// ---------------------------------------------------------------------------
 
 /// One crates.io package the lockfile names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1624,9 +1618,7 @@ fn is_exec(_meta: &fs::Metadata) -> bool {
     false
 }
 
-// ---------------------------------------------------------------------------
 // the digest
-// ---------------------------------------------------------------------------
 
 /// Every file under `root`, by relative path: `file\0<mode>\0<sha256>`. The sync
 /// writes no link, so one found here is something else's, recorded as

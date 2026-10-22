@@ -212,9 +212,8 @@ mod tests {
         out
     }
 
-    /// PROVE (2), companion: the in-place move equals the out-of-place reference
-    /// that reads only pristine source rows — so the top-down walk is correct
-    /// (never reads an already-overwritten row) AND writes exactly the band.
+    /// The in-place move equals the pristine-source reference: no row is read after it
+    /// is overwritten.
     #[test]
     fn matches_out_of_place() {
         let (w, h) = (6usize, 24usize);

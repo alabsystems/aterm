@@ -1043,10 +1043,8 @@ pub unsafe fn send_id_id_id_sel(recv: Id, sel: Sel, a: Id, b: Id, c: Sel) -> Id 
     }
 }
 
-// ---------------------------------------------------------------------------
 // Shapes `crates/aterm-window` needs. Each carries the SDK declaration it was derived
 // from, since the prototype is the safety obligation.
-// ---------------------------------------------------------------------------
 
 /// `-(void)sel:(NSRect)a flag:(BOOL)b`.
 ///
@@ -1446,12 +1444,10 @@ pub unsafe fn send_id_usize_point_usize_f64_isize_id_i16_isize_isize(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Shapes `cursor.rs` and `view.rs` need. `-magnification` is `d16@0:8` but
 // `-rotation` is `f16@0:8`: on AAPCS64 a `float` return arrives in `s0`, so
 // reading it with the `double` prototype yields garbage. Only
 // `method_getTypeEncoding` tells them apart, hence [`send_f32`].
-// ---------------------------------------------------------------------------
 
 /// `-(float)sel` — a C `float`, not a `CGFloat`.
 ///
@@ -1727,11 +1723,9 @@ pub unsafe fn send_v_ptr_usize(recv: Id, sel: Sel, a: *mut core::ffi::c_void, b:
     }
 }
 
-// ---------------------------------------------------------------------------
 // Shapes the Developer Tools helper panel needs (`aterm-gui`'s
 // `devtools_helper.rs`). Each carries the SDK declaration it was derived from;
 // a debug build checks each send against the runtime's own encoding (`typed`).
-// ---------------------------------------------------------------------------
 
 /// `-(id)sel:(NSRect)a styleMask:(NSUInteger)b backing:(NSUInteger)c defer:(BOOL)d`.
 ///

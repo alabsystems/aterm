@@ -17,9 +17,9 @@
 //! every line of it in front of the history the checkpoint restored (adoption alone cannot see a
 //! broken import).
 //!
-//! A red here is never fixed by regenerating a fixture: the bytes are what that
-//! release's producer sends, forever. It is fixed by making the consumer admit
-//! them again (law L3: consumer changes only ever become more lenient).
+//! A red here is never fixed by regenerating a fixture: the bytes are what that release's producer
+//! sends, forever. It is fixed by making the consumer admit them again (consumer changes only ever
+//! become more lenient).
 //!
 //! ONE DIRECTION, the only one an update hands in: an older producer's bytes
 //! into this consumer. No update authority names a build at or below the
@@ -322,6 +322,25 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.113.0", "stalled-sequence"),
     ("v0.113.0", "twelve-panes"),
     ("v0.113.0", "variants"),
+    ("v0.114.0", "carried-state"),
+    ("v0.114.0", "claude-code-1049"),
+    ("v0.114.0", "colour-and-shell"),
+    ("v0.114.0", "engine-state"),
+    ("v0.114.0", "fold"),
+    ("v0.114.0", "held-failed"),
+    ("v0.114.0", "held-pane"),
+    ("v0.114.0", "held-withheld"),
+    ("v0.114.0", "history"),
+    ("v0.114.0", "history-carry"),
+    ("v0.114.0", "incident-55x149"),
+    ("v0.114.0", "link-dense"),
+    ("v0.114.0", "link-dense-history"),
+    ("v0.114.0", "policy-repaint"),
+    ("v0.114.0", "policy-visible"),
+    ("v0.114.0", "shell-integration"),
+    ("v0.114.0", "stalled-sequence"),
+    ("v0.114.0", "twelve-panes"),
+    ("v0.114.0", "variants"),
 ];
 
 /// The desk set, one `("vX.Y.0", "<desk>")` row per desk: every release from that floor on must
@@ -1856,18 +1875,14 @@ fn assert_settings_drafts_placed(desk: &Desk, incoming: &IncomingHandoff) -> usi
     count
 }
 
-/// THE GUARD. Every desk of every shipped release adopts in THIS build
-/// exactly: every session, repainting only what its producer flagged (a
-/// `carry = "repaint"` policy desk, v0.97.0 on), each screen the carried
-/// bytes verbatim at the carried geometry, each control carry read, each
-/// meta's numbering, colour and shell state reassembled
-/// ([`assert_meta_state_crosses`]), the layout placed with every Settings
-/// draft it carries ([`assert_settings_drafts_placed`]) — and both digests,
-/// and so the adoption proof, equal what that release's parent committed to.
-/// Every history sidecar the parent named is taken before the proof
-/// ([`assert_history_taken`]) and imported whole after it
-/// ([`assert_history_imports`]), a held pane's too
-/// ([`assert_held_history_imports`]).
+/// The guard: every desk of every shipped release adopts in this build exactly. Every session,
+/// repainting only what its producer flagged (a `carry = "repaint"` policy desk, v0.97.0 on), each
+/// screen the carried bytes verbatim at the carried geometry, each control carry read, each meta's
+/// state reassembled ([`assert_meta_state_crosses`]), the layout placed with every Settings draft
+/// ([`assert_settings_drafts_placed`]), and both digests, so the adoption proof, equal what that
+/// release's parent committed to. Every history sidecar is taken before the proof
+/// ([`assert_history_taken`]) and imported whole after it ([`assert_history_imports`]), a held
+/// pane's too ([`assert_held_history_imports`]).
 ///
 /// FOUR CHILD PROCESSES, EVERY FOURTH DESK EACH ([`run_in_children`]), side by side: each shard
 /// prints how many Settings drafts it placed, and this test holds their sum to the same floor.

@@ -104,9 +104,7 @@ fn check_every_cell(root: &Path) -> (bool, String) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The fixture workspace
-// ---------------------------------------------------------------------------
 
 /// A miniature aterm workspace, rebuilt from scratch for each test in a directory of its own
 /// under the cargo target tmpdir, removed with it: two runs of this binary at once (a check
@@ -363,9 +361,7 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The proofs
-// ---------------------------------------------------------------------------
 
 /// `[OB-13]` the carve ledger: a path recorded as deleted is present again.
 /// Green before in every default cell, red after.

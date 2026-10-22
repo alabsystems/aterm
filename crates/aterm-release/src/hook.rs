@@ -35,15 +35,17 @@ use aterm_uds::spawnfd::{Stdio, command};
 pub const USAGE: &str =
     "usage: targo --unverified ship hook pre-promote | post-promote [ship site's \
      flags] | transforms
-  the publication engine's hooks (publish/pre-promote, publish/post-promote,
-  publish/transforms.sh run these):
-  pre-promote   would a real cut of PUB_SOURCE_COMMIT pass its pre-claim gates, asked by
-                that commit's own cutter: ATERM_RELEASE_CUTTER (the running release's),
-                else one built in a throwaway worktree of it; exit 0 yes, 1 a gate
-                refuses (named), 2 it could not be asked
-  post-promote  `ship site` (the promote-time run, PUB_STAGING_COMMIT set, does nothing)
-  transforms    the export's source rewrites over EXPORT, CAPTURED_COMMIT's own (ROOT);
-                exit 0 done, 1 refused or failed (named)";
+  the publication engine's hooks, run by publish/pre-promote, publish/post-promote and
+  publish/transforms.sh:
+  pre-promote   would a real cut of PUB_SOURCE_COMMIT pass its pre-claim gates (`ship
+                check --commit <it> --cut`)? Asked by that commit's own cutter:
+                ATERM_RELEASE_CUTTER (the running release's) when set, else one built
+                in a throwaway worktree of it. Exit 0 yes, 1 a gate refuses (named),
+                2 it could not be asked
+  post-promote  `ship site`; its promote-time run (PUB_STAGING_COMMIT set, no --latest)
+                does nothing
+  transforms    rewrite the export at EXPORT by CAPTURED_COMMIT's own rules (ROOT: the
+                repository); exit 0 done, 1 refused or failed (named)";
 
 /// `ship hook …`: the hook's exit code.
 #[must_use]

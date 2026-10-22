@@ -55,8 +55,8 @@ impl HostDiagnosticsLane {
             "aterm-config-diagnostics",
             crate::qos::Role::Background,
             move || {
-                // QoS (port of 61a6c8b62): Manual diagnostics are read on a
-                // settings screen; they answer through the proxy, hold no lock.
+                // Background QoS: the results feed a settings screen through
+                // the proxy and hold no lock.
                 worker_loop(request_rx, proxy);
             },
         )

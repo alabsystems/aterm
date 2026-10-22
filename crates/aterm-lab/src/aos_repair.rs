@@ -10,12 +10,13 @@
 //!
 //! The run: a private windowed instance ([`crate::instance`]: scratch HOME and XDG dirs,
 //! the automatic lanes off, its own control socket, a lifeline, ended by its process
-//! group) whose tab runs a program that prints one line and sleeps, so nothing but the
-//! typed keys' echo and the cursor effects ever draws. Only the momentum glow is lit
-//! (`cursor_trail_style = "off"`, `cursor_momentum_glow = true`, no blink, full motion, no
-//! sounds, Serious Mode off) and the GPU-only present passes are off (bloom, shimmer, EDR,
-//! the SDR crown) so the window's frame and its `image clean` twin differ only in the
-//! model's overlays. On one held control connection ([`aterm_agent::RelayClient`]):
+//! group, the stats Deck off) whose tab runs a program that prints one line and sleeps,
+//! so nothing but the typed keys' echo and the cursor effects ever draws. Only the
+//! momentum glow is lit (`cursor_trail_style = "off"`, `cursor_momentum_glow = true`, no
+//! blink, full motion, no sounds, Serious Mode off) and the GPU-only present passes are
+//! off (bloom, shimmer, EDR, the SDR crown) so the window's frame and its `image clean`
+//! twin differ only in the model's overlays. On one held control connection
+//! ([`aterm_agent::RelayClient`]):
 //!
 //! 1. `aos attach code=demo-stranded-settle` (`--control`: `code=shipped`);
 //! 2. 24 printable keys, unguarded `key <c>` to the front tab, 60 ms apart (the normal
@@ -115,6 +116,11 @@ exit: 0 every gate passed; 1 a gate failed or a step never happened (a one-minut
 ";
 
 /// The aterm.toml lines that light the momentum glow alone and keep the window quiet.
+/// Top-level keys only: the run appends [`instance::CONFIG_OFF`]'s tables and then
+/// [`crate::linux_proof::DECK_OFF`], which holds the stats Deck off as the Linux lane and
+/// the Windows lane's `--cpu` runs hold it. The Deck redraws its live CPU figures every
+/// second, so with it on, in a key window, a frame and its `image clean` twin differed
+/// outside the caret, and its presents ticked a stranded glow cold.
 pub const CONFIG: &[&str] = &[
     "cursor_trail_style = \"off\"",
     "cursor_momentum_glow = true",
@@ -129,6 +135,17 @@ pub const CONFIG: &[&str] = &[
     "hdr_glow = false",
     "cursor_glow_sdr_boost = 0.0",
 ];
+
+/// The instance's aterm.toml: [`CONFIG`], [`instance::CONFIG_OFF`]'s tables, then the
+/// stats Deck held off.
+fn world_config() -> String {
+    let top: Vec<String> = CONFIG.iter().map(|l| (*l).to_string()).collect();
+    format!(
+        "{}{}",
+        instance::config_with(&top),
+        crate::linux_proof::DECK_OFF
+    )
+}
 
 /// The tab's program: one line, then nothing ever draws again but the line discipline's
 /// echo of the typed keys.
@@ -1371,8 +1388,7 @@ pub fn cmd_aos_repair(args: &[String]) -> Res {
         })
         .transpose()?;
     let aterm = instance::resolve_aterm(aterm).map_err(|e| Fail::exit(3, e))?;
-    let config: Vec<String> = CONFIG.iter().map(|l| (*l).to_string()).collect();
-    let mut world = World::new(&instance::config_with(&config))?;
+    let mut world = World::new(&world_config())?;
     if keep {
         world.keep();
     }
@@ -2282,6 +2298,17 @@ mod tests {
             result_line("control", &[], &[]),
             "aos-repair result=fail mode=control gates=0/0 failed=none"
         );
+    }
+
+    #[test]
+    fn the_instance_config_lights_the_glow_alone_and_holds_the_deck_off() {
+        let doc: aterm_toml::Value = aterm_toml::from_str(&world_config()).expect("valid TOML");
+        assert_eq!(doc["cursor_momentum_glow"].as_bool(), Some(true));
+        assert_eq!(doc["cursor_trail_style"].as_str(), Some("off"));
+        assert_eq!(doc["cursor_glow_sdr_boost"].as_float(), Some(0.0));
+        assert_eq!(doc["sys"]["stats_bars"].as_str(), Some("off"));
+        assert_eq!(doc["harness"]["enabled"].as_bool(), Some(false));
+        assert_eq!(doc["update"]["enabled"].as_bool(), Some(false));
     }
 
     #[test]

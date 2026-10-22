@@ -33,9 +33,7 @@ fn deserialize_lines_bounds_capacity_for_inflated_count() {
     );
 }
 
-// ============================================================================
 // RLE Attribute Tests
-// ============================================================================
 
 #[test]
 fn cell_attrs_from_raw_preserves_main_cell_wide_geometry() {
@@ -196,9 +194,7 @@ fn serialize_lines_roundtrip_with_attrs() {
     assert_eq!(deserialized[2].get_attr(5).flags, 0x01); // bold
 }
 
-// ============================================================================
 // Hyperlink Tests
-// ============================================================================
 
 #[test]
 fn line_with_multiple_hyperlinks() {
@@ -508,9 +504,7 @@ fn line_hyperlink_with_id_serialize_roundtrip() {
     assert!(span1.id.is_none());
 }
 
-// =============================================================================
 // Robustness tests for untrusted input
-// =============================================================================
 
 /// A record declaring content past `MAX_LINE_CONTENT_BYTES` is rejected, not
 /// materialized; a normal line round-trips.

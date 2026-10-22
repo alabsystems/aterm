@@ -1543,7 +1543,7 @@ fn x86_slice_check() -> Check {
 /// The std targets the `cells` check (`targo --unverified verify cells`, by hand)
 /// compiles the foreign cells for, on upstream stable (Trust has none of them). A full
 /// run acquires them ([`acquire`]) so the check can run here; no release needs them
-/// (`cells` is in no set, owner ruling 2026-10-16), so the audit does not ask for them.
+/// (`cells` is in no set), so the audit does not ask for them.
 #[cfg(unix)]
 const FOREIGN_CELL_TARGETS: [&str; 4] = [
     "x86_64-pc-windows-msvc",

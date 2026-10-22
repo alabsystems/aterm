@@ -146,7 +146,7 @@ fn every_page(
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                 unreachable!()
             };
-            state.page_scroll = page;
+            state.scroll_page_to(page);
         }
         pages.push(compile_settings_view(runtime, instance, view, cx));
         let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
@@ -421,7 +421,7 @@ fn the_ai_fact_cards_keep_their_labels_whole_at_large_type() {
     });
 }
 
-/// A CLI ROW PAINTS ITS WHOLE NAME AND FACT AT EVERY WIDTH (the round-14
+/// A CLI ROW PAINTS ITS WHOLE NAME AND FACT AT EVERY WIDTH (the
 /// audit): a CLI not installed by aterm whose copy lives under
 /// `~/Library/Application Support/` — a path with a space, where aterm's
 /// own reroute copies live — and every other CLI paint their name and fact

@@ -1200,6 +1200,10 @@ impl Bridge {
             return true;
         }
         let top = need.saturating_add(mirror::FLOOR_LEASE_BYTES);
+        // The first raise of this open is a start's cost (a restart's, a
+        // handoff successor's): said with its time, as the run record's is.
+        let first = !self.state.logfloor_admitted();
+        let began = self.fx.now();
         #[cfg(test)]
         let raised = if self
             .fx
@@ -1213,6 +1217,13 @@ impl Bridge {
         let raised = self.state.raise_logfloor(top);
         match raised {
             Ok(floor) => {
+                if first {
+                    eprintln!(
+                        "aterm-link: mirror: the floor of the node's total is on the media at \
+                         {floor}, this open's first: 2 full flushes in {} us",
+                        self.fx.now().saturating_duration_since(began).as_micros()
+                    );
+                }
                 if let Some(m) = self.mirror.as_deref_mut() {
                     m.floor = floor;
                     m.floored = true;

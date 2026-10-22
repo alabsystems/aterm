@@ -213,9 +213,7 @@ where
     }
 }
 
-// ---------------------------------------------------------------------------
 // The record of a containment, the count, and the sink
-// ---------------------------------------------------------------------------
 
 /// One contained exception, as handed to the installed sink. Fields are
 /// borrowed from the reporting frame; copy out what you keep.
@@ -420,9 +418,7 @@ pub fn contain<R, B: FnOnce() -> R>(method: &str, body: B) -> Result<R, Containe
     })
 }
 
-// ---------------------------------------------------------------------------
 // The inert return value
-// ---------------------------------------------------------------------------
 
 /// A return type whose all-zero value means "nothing happened".
 ///

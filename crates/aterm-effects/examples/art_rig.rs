@@ -51,9 +51,7 @@ fn write(path: &Path, text: &str) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-// ---------------------------------------------------------------------------
 // Shared numerics
-// ---------------------------------------------------------------------------
 
 /// One decimal, a trailing `.0` dropped (`12.0` is `12`, `-0.04` is `-0`).
 fn fmt(v: f64) -> String {
@@ -109,9 +107,7 @@ fn layer_block(out: &mut Vec<String>, role: &str, fill: &str, recolor: &str, pat
     ]);
 }
 
-// ---------------------------------------------------------------------------
 // The segment-list path model the dog and robot rigs share
-// ---------------------------------------------------------------------------
 
 mod seg {
     use super::{fmt, radians};
@@ -217,9 +213,7 @@ mod seg {
     }
 }
 
-// ---------------------------------------------------------------------------
 // dogs: one parameterized head rig, ten breeds
-// ---------------------------------------------------------------------------
 
 mod dogs {
     //! The breed heads for the typed-word dog cameo, in the cat-head schema.
@@ -739,9 +733,7 @@ mod dogs {
     }
 }
 
-// ---------------------------------------------------------------------------
 // pet: the full-body cursor companion
-// ---------------------------------------------------------------------------
 
 mod pet {
     pub use poses::main;

@@ -742,7 +742,7 @@ fn a_display_face_id_folds_ascii_case_like_every_other_config_value() {
         );
     }
 
-    // NEGATIVE CONTROL: case folding must not widen what is accepted.
+    // Negative control: folding must not widen what is accepted.
     for nonsense in ["pixelated", "pix el", ""] {
         assert_eq!(
             display_face_canonical_id(nonsense),

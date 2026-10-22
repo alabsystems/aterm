@@ -128,8 +128,6 @@ impl Grid {
     /// When `selective`, only unprotected cells are cleared and extras are
     /// preserved. Non-selective erase uses the BCE cursor template for fill.
     fn erase_to_end_of_line_impl(&mut self, selective: bool) {
-        // Record selection damage for the cursor row: a `\r` + EL progress bar
-        // rewriting the row must not leave a stale highlight over new text.
         let cursor_row = self.storage.cursor.row;
         self.damage_selection_visible_rows(cursor_row, cursor_row);
         self.erase_to_end_of_line_core(selective);

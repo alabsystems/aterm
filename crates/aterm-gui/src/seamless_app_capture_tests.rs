@@ -1819,9 +1819,7 @@ fn a_held_exited_pane_keeps_its_screen() {
             "{at}: THE NAME THE PERSON GAVE IT CROSSED"
         );
     }
-    // ROUND EIGHT, FINDING 21: and its session id, so `aterm ctl @<sid>`
-    // read/status reach the pane after the update as they did before it.
-    // RED before the fix: a freshly minted sid, and `@<old sid>` unknown.
+    // And its session id, so `aterm ctl @<sid>` read/status reach the pane after the update.
     assert_eq!(
         session.ctx.self_id, held_sid,
         "{at}: THE HELD PANE ANSWERS TO THE SID IT HAD"

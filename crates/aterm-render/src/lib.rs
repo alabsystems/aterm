@@ -14553,8 +14553,7 @@ impl Renderer {
                 return false;
             }
             self.subpix_mode = mode;
-            // Rgb↔Bgr re-orders the cached channel bytes; Off keeps the
-            // overlay dead until re-enabled. Either way the overlay is stale.
+            // Any mode change makes the overlay stale.
             self.subpx_glyphs.clear();
             true
         }
@@ -14565,10 +14564,8 @@ impl Renderer {
         }
     }
 
-    /// The active Linux subpixel mode's canonical spelling (`"off"` / `"rgb"`
-    /// / `"bgr"`) — the [`Self::set_font_subpixel`] round-trip, for change
-    /// detection and diagnostics. Always `"off"` on the targets without the
-    /// subpixel seam.
+    /// The active Linux subpixel mode's spelling (`"off"` / `"rgb"` / `"bgr"`), the
+    /// [`Self::set_font_subpixel`] round-trip. Always `"off"` without the subpixel seam.
     #[inline]
     #[must_use]
     pub fn font_subpixel(&self) -> &'static str {
@@ -14615,9 +14612,8 @@ impl Renderer {
         &self.resolved_features
     }
 
-    /// Whether the primary face advertises a `liga`/`calt` `GSUB` feature (probed
-    /// once at construction). `false` means the font cannot ligate, so the planner
-    /// short-circuits shaping to the per-cell path. Exposed for tests/diagnostics.
+    /// Whether the primary face advertises a `liga`/`calt` `GSUB` feature (probed at
+    /// construction); without one the planner skips shaping.
     #[inline]
     #[must_use]
     pub const fn has_ligature_features(&self) -> bool {
@@ -14674,8 +14670,8 @@ impl Renderer {
         // first so the presence `run_face_pick` sees matches what `rasterize` sees when it
         // draws the gids (afterwards only setters that clear `shaped_runs` change it).
         self.ensure_styled_faces();
-        // A run normally needs ≥2 cells to ligate; when user features are present a
-        // single cell can still substitute (`zero` on a lone `0`).
+        // A run normally needs ≥2 cells; with user features one cell can substitute
+        // (`zero` on a lone `0`).
         let min_run = ligature_shaping::shaping_min_run(self.has_user_features);
         let row_clusters = input.clusters.get(r).map(Vec::as_slice).unwrap_or(&[]);
         let row_images = input.images.get(r).map(Vec::as_slice).unwrap_or(&[]);
@@ -14699,17 +14695,11 @@ impl Renderer {
         // independently), but the first cell of the right pane must still be free to ligate
         // with its own neighbours.
         ligature_run_boundaries_into(input, r, &mut self.run_boundary_scratch);
-        // A private-use point a face of this row YIELDS (`primary_unicode_gid`
-        // and its styled twins) is drawn by the embedded Nerd Font, never by the
-        // face a run shapes on. Inside a run it would not stay per-cell on its
-        // own: Cascadia Mono PL's GSUB substitutes most of its private-use
-        // glyphs in a run (the branch U+E0A0 among them), so the shaper reads
-        // the column as changed and would draw the face's own glyph
-        // (`a_yielded_point_breaks_the_shaping_run` in `bundled`). Such a point
-        // breaks the run the way a procedural cell does. ANY face a run of this
-        // row can shape on counts — the primary, the injected bold, a styled
-        // slot — since a run's face follows its style and a broken run is
-        // always safe.
+        // A private-use point a face of this row yields (`primary_unicode_gid` and its
+        // styled twins) is drawn by the embedded Nerd Font. Inside a run the shaper could
+        // substitute it (Cascadia Mono PL's GSUB does, e.g. U+E0A0) and draw the face's own
+        // glyph (`a_yielded_point_breaks_the_shaping_run` in `bundled`), so it breaks the
+        // run. Any face a run of this row can shape on counts.
         let any_face_yields = self.primary_yields_private_use
             || (self.bold_font.is_some() && self.bold_yields_private_use)
             || self
@@ -14717,8 +14707,8 @@ impl Renderer {
                 .iter()
                 .flatten()
                 .any(|sf| sf.yields_private_use);
-        // Index form (not `iter_mut`) so the body can read `self.break_mask_scratch`
-        // and write `self.shapeable_scratch` as disjoint field borrows.
+        // Index form so the body can read `break_mask_scratch` and write
+        // `shapeable_scratch` as disjoint borrows.
         #[allow(
             clippy::needless_range_loop,
             reason = "index drives disjoint field borrows (read break_mask_scratch, write shapeable_scratch) plus cluster/image lookups by column"
@@ -14726,10 +14716,8 @@ impl Renderer {
         for c in 0..cols.min(cells.len()) {
             let has_cluster = cluster_for(row_clusters, c).is_some();
             let img = image_covers(row_images, c);
-            // A procedurally-rendered cell (box-drawing/block/braille/sextant/
-            // powerline) must keep its FaceId::Procedural routing for seamless edges,
-            // so it BREAKS the shaping run rather than being drawn from the primary
-            // face — even when an adjacent cell has an effective ligature/feature.
+            // A procedural cell (box-drawing, block, braille, sextant, powerline) keeps its
+            // `FaceId::Procedural` routing for seamless edges, so it breaks the run.
             let is_procedural = procedural::covers(cells[c].ch);
             // A yielded private-use point (`any_face_yields` above) breaks the
             // run the same way and keeps its per-cell routing; so does a
@@ -14749,20 +14737,15 @@ impl Renderer {
                     && !yielded
                     && !layered;
         }
-        // The planner and its shape closure borrow disjoint renderer fields:
-        // row scratch belongs to the planner, and the run cache to the closure.
-        // Publish a miss immediately so a repeated run later in this same row
-        // hits the cache instead of shaping and allocating its key again.
+        // The planner owns the row scratch and the closure the run cache; a miss is
+        // published immediately so a repeated run later in the row hits.
         let style_of = |c: usize| cell_style(&cells[c]);
-        // Borrow only the font fields, independently of the mutable run cache
-        // and scratch below; even a fully cached row needs no Arc refcount bumps.
+        // Borrow only the font fields, apart from the mutable cache and scratch.
         let rb = self.shaping_primary_bytes.as_deref();
         let rb_index = self.primary_index;
-        // W6: the per-style run faces, borrowed for this row. A styled run
-        // shapes against the REAL styled face (`resolve_styled_face` on presence),
-        // so a bold `=>` ligates with the genuine Bold face's gids instead of the
-        // regular face + dilation; `rasterize`'s MonoGid arm re-derives the same
-        // pick to draw them.
+        // The per-style run faces: a styled run shapes against the real styled face, so a
+        // bold `=>` ligates with the Bold face's gids; `rasterize`'s MonoGid arm re-derives
+        // the same pick.
         let injected_bold = self
             .bold_font_bytes
             .as_deref()
@@ -14791,12 +14774,10 @@ impl Renderer {
         let mut row_face: Option<Option<ligature_shaping::RowShaper<'_>>> = None;
         let mut styled_row_faces: [Option<Option<ligature_shaping::RowShaper<'_>>>; 4] =
             std::array::from_fn(|_| None);
-        // Inserting does not rotate the cache: generations still rotate only
-        // at the frame boundary. This produces the same final memo as batching
-        // inserts after the row, without the batch allocation or duplicate work.
+        // Inserting does not rotate the cache; generations rotate only at the frame
+        // boundary.
         let cache = &mut self.shaped_runs;
-        // Borrow the feature array resolved once at config time — no per-run alloc
-        // or scan of `font_features`. Empty user features => the base [liga, calt].
+        // The feature array resolved at config time (base [liga, calt] when empty).
         let features = &self.engine_features;
         let shaping_buffer = &mut self.shaping_buffer;
         // The Cascadia N:1 opt-in (config `merged_ligatures`), copied out so the closure does
@@ -14840,11 +14821,8 @@ impl Renderer {
                     let face = row_face.get_or_insert_with(|| {
                         rb.and_then(|b| {
                             let mut f = aterm_font::Face::parse(b, rb_index).ok()?;
-                            // W9: instantiate at the resolved coords once, so shaper
-                            // and rasterizer agree (byte-identical to the byte-slice
-                            // path). Empty for non-variable primaries (common case).
-                            // `primary_vars` is the resident cache slice, so this
-                            // stamps the same coords the byte-slice path would.
+                            // Instantiate at the resolved coords once, so shaper and
+                            // rasterizer agree.
                             for &(tag, value) in primary_vars {
                                 f.set_variation(tag, value);
                             }
@@ -14861,9 +14839,8 @@ impl Renderer {
                         f.shape(run, run_chars, admit_collapsed, shaping_buffer)
                     })
                 } else {
-                    // Preserve each sibling's collection index. These are
-                    // separate, non-instantiated files, so no primary variation
-                    // coordinates apply to them.
+                    // Keep each sibling's collection index; no primary variation coords
+                    // apply to these separate files.
                     let (slot, source) = match pick {
                         FacePick::Styled { slot, .. } => (slot, styled_bytes[slot]),
                         FacePick::InjectedBold { .. } => (3, injected_bold),
@@ -14922,12 +14899,9 @@ impl Renderer {
         ligature_break_cols_into(input, r, &self.shaping, out);
     }
 
-    /// Discard every raster image the glyph frame that just ended did not read,
-    /// with its byte accounting — the capacity eviction — and record what was
-    /// kept ([`Self::glyph_kept`]). Rasters are pure functions of their keys, so
-    /// a kept entry is exactly what re-rasterizing it would make, and the room
-    /// measured from the old set is dropped as [`Self::clear_glyph_images`]
-    /// drops it.
+    /// Discard every raster the frame that just ended did not read (the capacity eviction)
+    /// and record what was kept ([`Self::glyph_kept`]). Rasters are pure functions of their
+    /// keys, and the measured room is dropped as [`Self::clear_glyph_images`] drops it.
     fn retain_glyph_working_set(&mut self) {
         let frame = self.glyph_frame;
         let mut bytes = 0usize;
@@ -14945,19 +14919,17 @@ impl Renderer {
         self.chrome_room_memo = None;
     }
 
-    /// Discard raster images and their byte accounting together. Font, geometry,
-    /// seal and capacity invalidations all use this; their other cache families
-    /// retain each caller's existing invalidation policy.
+    /// Discard raster images with their byte accounting; used by font, geometry, seal and
+    /// capacity invalidations.
     fn clear_glyph_images(&mut self) {
-        // The memoized ink boxes live in the entries, so they go with them: a
-        // re-rasterization under the same key (a font swap, a geometry change)
-        // can never be described by the old raster's ink.
+        // The memoized ink boxes go with the entries: a re-raster under the same key may
+        // differ.
         self.glyphs.clear();
         #[cfg(all(unix, not(target_os = "macos")))]
         self.subpx_glyphs.clear();
         self.glyph_bytes = 0;
         self.glyph_kept = (0, 0);
-        // …and so does the room measured from them.
+        // And the room measured from them.
         self.chrome_room_memo = None;
     }
 
@@ -15055,10 +15027,9 @@ impl Renderer {
         self.ascii_ink_room()
     }
 
-    /// `(head, foot)`: the pixel rows above the tallest and below the lowest
-    /// ink of printable ASCII, regular and bold, as the cell draws it —
-    /// [`Self::chrome_room_for`]'s measure, and the ceiling of a drawn band
-    /// icon ([`Self::icon_metrics`]). Memoized until the glyph images or the
+    /// `(head, foot)`: the pixel rows above the tallest and below the lowest printable-ASCII
+    /// ink, regular and bold, as the cell draws it. [`Self::chrome_room_for`]'s measure and
+    /// a band icon's ceiling ([`Self::icon_metrics`]). Memoized until the glyph images or
     /// cell geometry change.
     fn ascii_ink_room(&mut self) -> (usize, usize) {
         if let Some((h, b, room)) = self.chrome_room_memo
@@ -15087,17 +15058,14 @@ impl Renderer {
         room
     }
 
-    /// The rasterized image for `key`, cached. External rasterizers (the GPU
-    /// atlas) consume the exact bytes the CPU blit path uses, so their output
-    /// can match pixel-for-pixel without duplicating the font logic/fallback.
+    /// The rasterized image for `key`, cached. The GPU atlas consumes these exact bytes.
     #[inline]
     pub fn glyph_image(&mut self, key: GlyphKey) -> &GlyphImage {
         &self.cached_glyph(key).img
     }
 
-    /// `key`'s cache entry — the raster together with the facts memoized off it
-    /// ([`CachedGlyph`]), for a reader that wants more than one of them and
-    /// should pay only one hash probe for the set.
+    /// `key`'s cache entry: the raster and the facts memoized off it ([`CachedGlyph`]), for
+    /// one hash probe.
     fn cached_glyph(&mut self, key: GlyphKey) -> &CachedGlyph {
         if !self.glyphs.contains_key(&key) {
             let mut img = self.rasterize(key);
@@ -15159,8 +15127,7 @@ impl Renderer {
             ph = img.height();
             pxmin = img.xmin();
             pymin = img.ymin();
-            // Only Mono coverage slices (a ligature glyph is coverage, never Rgba);
-            // an unexpected Rgba wide glyph yields empty bytes -> a blank tile.
+            // Only Mono coverage slices; an Rgba wide glyph yields a blank tile.
             pbytes = match img {
                 GlyphImage::Mono { bytes, .. } => bytes.clone(),
                 GlyphImage::Rgba { .. } => Vec::new(),
@@ -15171,7 +15138,6 @@ impl Renderer {
         GlyphImage::Mono {
             width: cell_w,
             height: ph,
-            // Cell-local: the tile fills the cell from its own origin (no bearing).
             xmin: 0,
             ymin: pymin,
             advance: cell_w as f32,
@@ -15242,17 +15208,12 @@ impl Renderer {
         }
         match key.glyph_class {
             GlyphClass::Mono => {
-                // A Procedural key whose char IS in the procedural ranges is
-                // cell-exact (the bitmap IS the cell, so the blit anchor
-                // `(cell_x + xmin, cell_y + baseline - height - ymin)` lands on
-                // the cell's top-left corner). A shade key carries its absolute
-                // dither-phase bits above the code point (`shade_phase_key`) —
-                // strip + decode them here, the ONE place procedural bytes are
-                // produced, so CPU blit and GPU atlas get identical variants.
-                // A Procedural key for a char outside those ranges can only be
-                // hand-built; fail safe to the primary face below rather than
-                // panicking. The key's `px_q` stands in for (cell_w, cell_h):
-                // both are pure functions of this renderer's px and face.
+                // A Procedural key for a char in the procedural ranges is cell-exact (the
+                // blit anchor lands on the cell's top-left). A shade key carries dither-phase
+                // bits above the code point (`shade_phase_key`), decoded here, the one place
+                // procedural bytes are made. A Procedural key outside those ranges can only
+                // be hand-built and falls back to the primary face. The key's `px_q` stands
+                // in for (cell_w, cell_h), both functions of this renderer's px and face.
                 if key.source == FaceId::Procedural && key.ch_or_id & REGIONAL_PAIR_BIT != 0 {
                     return self.rasterize_regional_pair(key);
                 }
@@ -15305,10 +15266,8 @@ impl Renderer {
                             bytes,
                         };
                     }
-                    // The chain's last-resort symbol tier: a `span`-cell box
-                    // anchored at the lead cell's top-left, exactly like the
-                    // box-drawing bitmap above (one cell when the key carries
-                    // no span, e.g. a hand-built key).
+                    // The chain's last-resort symbol tier: a `span`-cell box at the lead cell's
+                    // top-left, like the box-drawing bitmap (one cell for a spanless key).
                     let span = usize::from(key.cell_span).clamp(1, 2);
                     if let Some(ch) = char::from_u32(cp)
                         && let Some(bytes) =
@@ -15325,10 +15284,8 @@ impl Renderer {
                     }
                 }
                 let ch = key.chr().unwrap_or(char::REPLACEMENT_CHARACTER);
-                // A monochromatized colour glyph: the sbix bitmap's alpha
-                // silhouette as foreground-tinted coverage (the last-resort
-                // default-text path). Falls through to the primary `.notdef` if
-                // the colour face/bitmap is gone.
+                // A monochromatized colour glyph: the sbix alpha silhouette as fg-tinted
+                // coverage, falling through to the primary `.notdef` if the bitmap is gone.
                 if key.source == FaceId::ColorEmojiMono
                     && let Some(img) = self.rasterize_color_emoji_mono(ch)
                 {
@@ -15369,8 +15326,7 @@ impl Renderer {
                         .and_then(|sf| sf.unicode_gid(ch));
                     #[cfg(target_os = "macos")]
                     let ct = {
-                        // Extract the face bytes/index so the immutable borrow ends
-                        // before the `&mut self` CoreText call.
+                        // End the immutable borrow before the `&mut self` CoreText call.
                         let src = match (gid, self.styled_faces[slot].as_ref()) {
                             (Some(g), Some(sf)) => {
                                 Some((sf.bytes.as_ptr() as usize, sf.bytes.clone(), sf.index, g))
@@ -15456,10 +15412,8 @@ impl Renderer {
                     t
                 } else {
                     let face = match key.source {
-                        // ColorEmoji never carries a Mono class (it rasterizes via the
-                        // Rgba arm); ColorEmojiMono is handled just above; the three
-                        // fallback sources are handled by the arm above. Cover all:
-                        // fail safe to the primary face (`.notdef`).
+                        // Sources handled above or never Mono-class fall back to the primary
+                        // face (`.notdef`).
                         FaceId::Primary
                         | FaceId::Procedural
                         | FaceId::ColorEmoji
@@ -15468,9 +15422,7 @@ impl Renderer {
                         | FaceId::SymbolFallback
                         | FaceId::RuntimeFallback
                         | FaceId::DisplayMix => &self.font,
-                        // BoldPrimary keys are always built as MonoGid (handled in the
-                        // MonoGid arm); this Mono-class case is unreachable on the real
-                        // path, so fail safe to the bold face (then the primary).
+                        // BoldPrimary keys are always MonoGid; fail safe to the bold face.
                         FaceId::BoldPrimary => self.bold_font.as_ref().unwrap_or(&self.font),
                     };
                     let (m, b) = face.rasterize(ch, self.px);
@@ -15487,23 +15439,18 @@ impl Renderer {
                 } else {
                     StyleBits::REGULAR
                 };
-                // FONT-DISPLAY-FIT (weight): a bundled display face marked `embolden`
-                // takes the synthetic-bold dilation on REGULAR cells too — the
-                // face is either drawn too light to read as body text, or draws a
-                // comma whose hairline tail collapses into its period at body px.
-                // This rides the EXISTING synthesis rather than adding a second
-                // thickening path, so a genuinely bold cell is unaffected (the bit
-                // is already set) and `font_synthetic_style = false` still
-                // suppresses everything. See [`DisplayFace::embolden`].
+                // Display-face fit (weight): a bundled face marked `embolden` takes the
+                // synthetic-bold dilation on regular cells too, through the existing synthesis
+                // (so `font_synthetic_style = false` still suppresses it). See
+                // [`DisplayFace::embolden`].
                 let synth_style =
                     if self.synthetic_styles && layer_fit.is_some_and(|fit| fit.embolden) {
                         StyleBits(synth_style.0 | StyleBits::BOLD.0)
                     } else {
                         synth_style
                     };
-                // A fallback face's synthetic ITALIC is deferred into the fit
-                // (`harmonize_fallback_raster`): the shear is applied to the
-                // FITTED mask, so an italic symbol keeps its upright size.
+                // A fallback face's synthetic italic is applied to the fitted mask
+                // (`harmonize_fallback_raster`), so an italic symbol keeps its upright size.
                 let defer_italic = harmonized_fallback_source(key.source)
                     && key.cell_span > 0
                     && synth_style.contains(StyleBits::ITALIC);
@@ -15576,8 +15523,7 @@ impl Renderer {
             }
             GlyphClass::Rgba => {
                 let ch = key.chr().unwrap_or(char::REPLACEMENT_CHARACTER);
-                // Empty image on any failure (missing/undecodable bitmap): the
-                // blit treats a 0-sized Rgba glyph as a no-op, same as a space.
+                // An empty Rgba image on failure blits as a no-op.
                 self.rasterize_color_emoji(key.colour_face(), ch)
                     .unwrap_or_else(empty_rgba)
             }
@@ -15704,19 +15650,13 @@ impl Renderer {
                         src.and_then(|(kp, b, idx)| self.hinted_glyph(kp, &b, idx, gid, &[], 0));
                     (hinted, false)
                 };
-                // WINDOWS (the `not(unix)` third of the split): the portable twin of
-                // the CoreText block above, and the arm that actually decides how BOLD
-                // looks here — this is the by-ID path plain primary text takes, so a
-                // bold cell that never reaches the per-char Mono arm is drawn from the
-                // real `wght` instance here or synthesized nowhere. Same precondition
-                // as the CT block — a BOLD-styled PRIMARY pick on a face whose `wght`
-                // axis yields a usable bold instance — and the same discipline: only a
-                // SUCCESSFUL raster sets `drawn`, so a declined one keeps the fontdue +
-                // `embolden` fail-safe. An `InjectedBold`/`Styled` pick is excluded
-                // because it already draws from a real bold FILE, which outranks an
-                // instantiated axis. `ct` is the shared name for "a native/instanced
-                // raster the fail-safes below should not override"; there is no
-                // CoreText here.
+                // Windows (`not(unix)`): the portable twin of the CoreText block and the arm
+                // that decides how bold looks, since plain primary text takes this by-id path.
+                // Same precondition (a bold-styled primary pick on a face whose `wght` axis
+                // yields a usable bold instance) and discipline (only a successful raster
+                // sets `drawn`, keeping the fontdue + `embolden` fail-safe). InjectedBold and
+                // Styled picks are excluded: a real bold file outranks an instantiated axis.
+                // `ct` names any native or instanced raster the fail-safes should not override.
                 //
                 // WINDOWS CRISPNESS: it is also the arm PLAIN primary text takes,
                 // so it is where grid fitting had to land to be felt at all. The
@@ -15922,7 +15862,6 @@ impl Renderer {
         let dst_w = ((src_w as f32 * scale).round() as usize).clamp(1, box_w);
         let dst_h = ((src_h as f32 * scale).round() as usize).clamp(1, box_h);
         let rgba = resample_rgba(&src, src_w, src_h, dst_w, dst_h);
-        // Coverage = the alpha channel (the glyph's opacity/silhouette).
         let coverage: Vec<u8> = rgba.as_chunks::<4>().0.iter().map(|px| px[3]).collect();
 
         let xmin = ((box_w - dst_w) / 2) as i32;
@@ -16062,10 +16001,9 @@ impl Renderer {
         ((2 * self.cell_w).max(1), self.cell_h.max(1))
     }
 
-    /// Place a fitted colour emoji image: centred horizontally in the 2-cell
-    /// box, vertically in the cell. The blit anchors at `cell_y + baseline -
-    /// height - ymin`, so to land the image `top_inset` px below the cell top
-    /// `ymin` carries it.
+    /// Place a fitted colour emoji image, centred horizontally in the 2-cell box and
+    /// vertically in the cell (`ymin` carries the `top_inset`, since the blit anchors at
+    /// `cell_y + baseline - height - ymin`).
     fn place_color_emoji(&self, bytes: Vec<u8>, width: usize, height: usize) -> GlyphImage {
         let (box_w, box_h) = self.color_emoji_box();
         let xmin = (box_w.saturating_sub(width) / 2) as i32;
@@ -16097,17 +16035,15 @@ impl Renderer {
         // with the square of the pixel size (the count cap measured 9.6 MB at 1x, 23.8 MB
         // on Retina). 12 MiB is above the 1x footprint, so this binds only large cells.
         const GLYPH_CACHE_BYTES: usize = 12 * 1024 * 1024;
-        // The shaped-run cache grows with distinct (run, style) pairs; a feature/
-        // ligature font catting unique content can grow it independently of the
-        // glyph cache, so it is capped — and cleared — on its own.
+        // The shaped-run cache grows with distinct (run, style) pairs independently of the
+        // glyph cache, so it has its own cap.
         const SHAPED_RUN_CAP: usize = 16_384;
         // `cluster_shapes` is keyed by cluster text (PTY-influenceable); a non-colour
         // cluster adds a `None` entry but nothing to `glyphs`, so it is capped on its own.
         // Its composited runs go with it (at most `MAX_RUN_GLYPHS` each). The keyed hash
         // (`TwoGenTextCache`) bounds lookup cost.
         const CLUSTER_CAP: usize = 16_384;
-        // A trip waits for the caps, or for twice what the last trip kept if
-        // that is more (hysteresis: see below).
+        // A trip waits for the caps, or for twice what the last trip kept if more.
         let (kept_entries, kept_bytes) = self.glyph_kept;
         if self.glyphs.len() > GLYPH_CACHE_CAP.max(kept_entries.saturating_mul(2))
             || self.glyph_bytes > GLYPH_CACHE_BYTES.max(kept_bytes.saturating_mul(2))
@@ -16210,16 +16146,9 @@ impl Renderer {
     /// Render an owned snapshot, rejecting excessive dimensions or a failed
     /// framebuffer reservation before drawing.
     pub fn try_render_input(&mut self, input: &RenderInput) -> Result<Frame, String> {
-        // ONE rendering code path: do the damage render into the cache, then
-        // transfer its completed pixel buffer into the owned Frame.
-        //
-        // The owned-`Frame` path is the snapshot / `read_image` / test path: it
-        // returns a fresh owned buffer every call, so a window's PERSISTENT damage
-        // cache buys it nothing (it never re-presents a borrow). It therefore uses
-        // a THROWAWAY `WindowCpu` — a full repaint into a discarded cache —
-        // byte-identical to the borrow path; only cache REUSE (not the pixels) is
-        // forgone. The per-frame presentation hot path holds a persistent
-        // `WindowCpu` and calls `render_input_cached(wc, ..)` directly.
+        // One rendering path: a full repaint into a throwaway `WindowCpu`, whose pixels move
+        // into the owned Frame. The hot path holds a persistent `WindowCpu` and calls
+        // `render_input_cached`.
         let mut wc = WindowCpu::new();
         // A snapshot is final and has no later frame to repaint a provisional `.notdef`, so it
         // draws, waits for the parses the draw started, and redraws while the routing epoch
@@ -16315,11 +16244,8 @@ impl Renderer {
                 font_epoch: self.font_epoch,
             });
         }
-        // Damage-render into the (untranslated) cache, then apply the M1b sub-row
-        // present translate — a zero-copy cache borrow unless this frame carries a
-        // `scroll_frac_px`. Keeping the two steps separate leaves the incremental
-        // damage cache in UNTRANSLATED space (see `WindowCpu::present_scratch`), so
-        // a frac-only drag frame re-presents without dirtying a cell.
+        // Damage-render into the untranslated cache, then apply the sub-row present
+        // translate, so a frac-only drag frame re-presents without dirtying a cell.
         let (w, h) = self.render_core(wc, input);
         if !preserve_cache {
             return Ok(Self::cached_view(wc, w, h));
@@ -16380,8 +16306,7 @@ impl Renderer {
         // before a row is planned and before the dirty decision reads `font_epoch` (a
         // retire bumps it, so the frame that drops a face repaints in full).
         self.begin_frame_boundary();
-        // ...and the window's image cache: the images this frame shows are its
-        // working set from here on, decoded at sizes that fit it together.
+        // The window's image cache: this frame's images are its working set from here on.
         let cell = (self.cell_w, self.cell_h);
         wc.image_cache
             .begin_frame(input.images.iter().flatten().map(|(_, image)| {
@@ -16399,8 +16324,7 @@ impl Renderer {
         // reuse is frame-scoped. After the fallback install, the last thing that can
         // re-route glyphs this frame.
         self.glyph_plan_row = None;
-        // Frame-scope the background-run diagnostic (see the fields): both
-        // render paths below run underneath this entry.
+        // Frame-scope the background-run diagnostic.
         self.bg_runs_total.set(0);
         self.bg_runs_at_base.set(0);
         self.bg_fills_emitted.set(0);
@@ -16459,8 +16383,7 @@ impl Renderer {
                     self.row_bands(),
                     &mut dirty,
                 );
-                // What the ordinary diff would cost, in rows: every row on a
-                // `FullRepaint`, the marked ones otherwise.
+                // The ordinary diff's cost in rows.
                 let baseline = match &d {
                     DirtyDecision::FullRepaint => rows,
                     DirtyDecision::Rows(_) => dirty.iter().filter(|&&b| b).count(),
@@ -16475,9 +16398,8 @@ impl Renderer {
                         self.cursor_blink_phase,
                         self.cursor_style_override,
                         self.row_bands(),
-                        // The CPU pixel move is a `memmove` of the cached grid
-                        // band; a retained row that changed is re-rasterized over
-                        // it rather than refusing the whole plan.
+                        // The CPU move is a memmove, so a changed retained row is
+                        // re-rasterized rather than refusing the plan.
                         RetainedRows::Diff,
                         &mut shift,
                     )
@@ -16566,7 +16488,7 @@ impl Renderer {
             wc.last_damage = DamageOutcome::GateHit;
             return (w, h);
         }
-        // Upward overshoot (ATERM-KI-1020-1): a row's glyphs may ink into the band above
+        // Upward overshoot: a row's glyphs may ink into the band above
         // it. On a row frame, rebuild the row above every marked row whose ink there may
         // have changed; the scroll plan marks its own apron rows.
         if scroll_delta.is_none() {
@@ -16580,8 +16502,6 @@ impl Renderer {
         // path's fresh buffer does. `cache` is out of `wc`, so `&mut wc.image_cache` is a
         // disjoint borrow that ends before `Self::cached_view` reborrows `wc`.
         let band_bg = self.frame_bg(input) | (self.bg_transmittance() << 24);
-        // `wallpaper_px` and `image_cache` are disjoint `wc` fields, so the
-        // wallpaper base slice rides alongside the mutable image-cache borrow.
         let base = wc.wallpaper_px.as_ref().map(|p| p.px.as_slice());
         self.composite_free(
             &mut wc.image_cache,
@@ -16628,8 +16548,6 @@ impl Renderer {
             self.full_render(wc, input, w, h);
             return (w, h);
         }
-        // (The comet ember bed now draws INSIDE `composite_free` — phase B2b,
-        // under the glyph ink — not as a post-pass here.)
         // LUMEN aurora (additive light) UNDER the cursor; damaged path → dirty rows.
         self.draw_glow(&mut cache.pixels, w, h, input, Some(&dirty));
         // Fx layers of the Glow slot, right after the aurora (== the GPU's
@@ -16643,8 +16561,6 @@ impl Renderer {
             FxBlend::Exact,
             Some(&dirty),
         );
-        // GLOW-HALO radial cursor-effect light, right after the aurora and
-        // BEFORE the nova/rain streams; damaged path → dirty rows.
         self.draw_glow_halo(&mut cache.pixels, w, h, input, Some(&dirty));
         self.draw_nova(&mut cache.pixels, w, h, input, Some(&dirty));
         // Exact fx layers of the Over slot, right AFTER the nova (which carries
@@ -16659,7 +16575,6 @@ impl Renderer {
             FxBlend::Exact,
             Some(&dirty),
         );
-        // PHOSPHOR rain bright-head halos; damaged path → dirty rows.
         self.draw_rain_add(&mut cache.pixels, w, h, input, Some(&dirty));
         self.draw_decorations(&mut cache.pixels, w, h, input, Some(&dirty));
         // Over-text free sprites: over everything but the cursor (the GPU `FreeOver` slot),
@@ -16686,7 +16601,6 @@ impl Renderer {
             FxBlend::Linear,
             Some(&dirty),
         );
-        // Cursor overlay — the EXACT same code the full path runs.
         self.draw_cursor(&mut cache.pixels, w, h, input);
 
         // Refresh the cache to this frame. `clone_damage_cache_from_stamped` reuses the
@@ -16700,9 +16614,8 @@ impl Renderer {
         // next frame full-repaints (rows drawn before the landing used provisional keys).
         wc.cache = Some(cache);
         wc.dirty_scratch = dirty;
-        // A rescued scroll blit reports the whole-row shift so a CPU presenter can
-        // move its own retained surface rows in lockstep before repainting the
-        // flagged bands; ordinary row damage reports `Rows`.
+        // A rescued scroll blit reports its row shift so a CPU presenter can move its
+        // surface rows in lockstep; ordinary damage reports `Rows`.
         wc.last_damage = match scroll_delta {
             Some(delta_rows) => DamageOutcome::Scroll { delta_rows },
             None => DamageOutcome::Rows,
@@ -16733,8 +16646,6 @@ impl Renderer {
             return Self::cached_view(wc, w, h);
         }
         wc.last_translated = true;
-        // Split-borrow `wc`: read the pristine cache (and the apron raster), write
-        // the present scratch.
         let WindowCpu {
             cache,
             present_scratch,
@@ -16773,10 +16684,9 @@ impl Renderer {
         }
     }
 
-    /// Borrow the given window's damage cache as a [`RenderView`]. Only called
-    /// right after a render has populated `wc.cache`, so the `expect` cannot fire.
-    /// An associated fn (not `&self`) so the returned borrow ties to `wc`, not to
-    /// the shared `Renderer` — letting one `Renderer` serve many `WindowCpu`.
+    /// Borrow the window's damage cache as a [`RenderView`]; only called after a render
+    /// filled `wc.cache`. An associated fn so the borrow ties to `wc`, letting one `Renderer`
+    /// serve many windows.
     fn cached_view(wc: &WindowCpu, w: usize, h: usize) -> RenderView<'_> {
         let pixels = &wc.cache.as_ref().expect("cache populated by render").pixels;
         RenderView::Borrowed {
@@ -16845,9 +16755,7 @@ impl Renderer {
     )]
     fn full_render(&mut self, wc: &mut WindowCpu, input: &RenderInput, w: usize, h: usize) {
         let rows = input.rows;
-        // Frame-scope the cursor-row plan reuse (see `glyph_plan_row`): the
-        // resident plan describes the previous frame's input until Phase C re-keys
-        // it. This path is also reachable directly (not only via `render_core`).
+        // The resident plan describes the previous frame until Phase C re-keys it.
         self.glyph_plan_row = None;
         // Capture the routing epoch before any row rasterizes: a fallback parse landing
         // mid-frame bumps `font_epoch` after this, so the cache is stamped stale and the
@@ -16880,9 +16788,8 @@ impl Renderer {
             Some(wp) => pixels.extend_from_slice(wp),
             None => pixels.resize(w.saturating_mul(h), bg),
         }
-        // Take the per-window image cache out of `wc` so the row passes can borrow it
-        // mutably while `self` is borrowed for rasterization (and `wc.cache` is
-        // written below). Restored before return.
+        // Take the image cache out of `wc` so the row passes can borrow it mutably beside
+        // `self`; restored before return.
         let mut ic = std::mem::take(&mut wc.image_cache);
         // The buffer is already base-filled, so the phase runner (FREE_OVERLAY_LAYER_DESIGN
         // §3.2.2) needs no per-band clear here (`band_bg: None`).
@@ -16892,8 +16799,7 @@ impl Renderer {
         // Fx layers of the Glow slot, right after the aurora — the same slot
         // on both paths.
         self.draw_fx(&mut pixels, w, h, input, FxSlot::Glow, FxBlend::Exact, None);
-        // GLOW-HALO radial cursor-effect light, right after the aurora and
-        // BEFORE the nova/rain streams — the same slot on both paths.
+        // Glow-halo light after the aurora, before the nova and rain.
         self.draw_glow_halo(&mut pixels, w, h, input, None);
         // Supernova light over the aurora, under the decorations (the GPU's second One/One
         // stream).
@@ -16901,8 +16807,7 @@ impl Renderer {
         // Exact fx layers of the Over slot, right after the nova and before
         // the rain halos — the same slot on both paths.
         self.draw_fx(&mut pixels, w, h, input, FxSlot::Over, FxBlend::Exact, None);
-        // PHOSPHOR rain bright-head halos: the same additive contract, the
-        // same slot on both paths (after the nova, before the decorations).
+        // Rain head halos, after the nova and before the decorations.
         self.draw_rain_add(&mut pixels, w, h, input, None);
         self.draw_decorations(&mut pixels, w, h, input, None);
         // Over-text free sprites: over everything but the cursor (the GPU `FreeOver` slot).
@@ -16977,8 +16882,8 @@ impl Renderer {
         // the frame default, so `render_row_bg` gave them no transmittance), and a
         // see-through gutter beside a solid band is the broken edge this helper closes.
         let color = bleed.color & 0x00ff_ffff;
-        // A metered band row continues its own edge cells into the gutters
-        // (`ChromeBleed::row_edges`); every other row wears the band tone.
+        // A metered band row continues its edge cells into the gutters
+        // (`ChromeBleed::row_edges`); other rows wear the band tone.
         let (left_tone, right_tone) = bleed.gutter_tones(r);
         // The grid occupies `[pad, w - pad)` (`frame_size` = `cols·cell_w + 2·pad`); the
         // right gutter comes from the frame, not `cols·cell_w`, so a clamped or oversized
@@ -17033,8 +16938,6 @@ impl Renderer {
             .filter(|_| r + 1 == bleed.rows && !chrome_rail_covers_gutters(input.chrome_raster(r)))
         {
             let deco = self.deco_metrics();
-            // Both metrics are `usize` (underline_t documented `>= 1`), so the
-            // only live guards are the band clamps.
             let t = deco.underline_t.max(1).min(band_h);
             let uy = y0 + deco.underline_y.min(band_h - t);
             let seam = seam & 0x00ff_ffff;
@@ -17093,8 +16996,7 @@ impl Renderer {
         }
     }
 
-    /// The `[y0, y1)` device-pixel span of grid row `r`'s band (`grid_top +
-    /// r·cell_h` down, one cell tall), clamped to the frame height `h`.
+    /// The `[y0, y1)` device-pixel band of grid row `r`, clamped to height `h`.
     #[inline]
     fn row_band_px(&self, r: usize, h: usize) -> (usize, usize) {
         let y0 = (self.grid_top() + r * self.cell_h).min(h);
@@ -17260,11 +17162,8 @@ impl Renderer {
         pixels[sy0 * w..sy1 * w].copy_from_slice(band);
     }
 
-    /// The SHARED per-frame phase runner (FREE_OVERLAY_LAYER_DESIGN §3.2.2),
-    /// called by BOTH `render_core` (the damaged path, passing the dirty rows)
-    /// and `full_render` (passing `0..rows`) IN PLACE OF their per-row
-    /// fused per-row loops — so cached(damaged) and fresh(full) are twins by
-    /// construction. Phases, in painter's order:
+    /// The per-frame phase runner shared by `render_core` (damaged path, dirty rows) and
+    /// `full_render` (`0..rows`), so the two paths paint alike. Phases in painter's order:
     ///
     /// * **A — backgrounds.** Per row: the damaged path's full-width band clear
     ///   (`band_bg: Some`, over [`Self::row_pixel_band`], whose grid-edge bands
@@ -17300,11 +17199,8 @@ impl Renderer {
     /// * **C — foreground.** [`Self::render_row_fg`] (ordinary z<0 images,
     ///   glyphs, z>=0 images, decorations).
     ///
-    /// OVER-TEXT free sprites are NOT a phase here: over-text means over
-    /// everything except the cursor (the GPU `FreeOver` slot — after the wdeco
-    /// streams, immediately before the cursor), so both callers stamp them as
-    /// the LAST post-pass before `draw_cursor`, over the additive post-passes
-    /// and `draw_decorations`.
+    /// Over-text free sprites are not a phase: they go over everything but the cursor (the
+    /// GPU `FreeOver` slot), so both callers stamp them last before `draw_cursor`.
     ///
     /// * **A, backgrounds.** Per row: the damaged path's full-width band clear
     ///   (`band_bg: Some`, over [`Self::row_pixel_band`]; the full path's one fill already
@@ -17396,10 +17292,7 @@ impl Renderer {
         // same sRGB-view law (== the GPU's fx-linear draw after `FreeUnder` in
         // its base-bg group). Gated on the same dirty set.
         self.draw_fx(pixels, w, h, input, FxSlot::Under, FxBlend::Linear, dirty);
-        // Phase B2b — comet EMBER BED: the motion-trail cell tint, a
-        // background-class fill UNDER the additive light below and UNDER the
-        // glyph ink Phase C lays (== the GPU's trail quads at the end of its
-        // base-bg half). Gated on the same dirty set `rows` came from.
+        // Phase B2b: the trail's ember bed, a background tint under the light and the ink.
         self.draw_trail(pixels, w, h, input, dirty);
         // Phase B3: the under-glyph flame body, additive over bg and sprites, under the
         // glyph ink (the GPU's Unorm glow_under pass between its base-bg and base-fg draws).
@@ -17409,11 +17302,7 @@ impl Renderer {
         // body, today's order of the card's light inside glow_under (== the
         // GPU's `FxUnder` after `GlowUnder`). Gated on the same dirty set.
         self.draw_fx(pixels, w, h, input, FxSlot::Under, FxBlend::Exact, dirty);
-        // Phase B3b — EMBERFORGE per-pixel fire field: the full-art flame
-        // body, in the SAME under-glyph z-slot right after the glow_under
-        // quads (== the GPU's fire draws after glow_under inside its Unorm
-        // interpose pass), Add patches then Over patches. Gated on the same
-        // dirty set.
+        // Phase B3b: the fire field, in the same slot right after glow_under (Add then Over).
         self.draw_fire_patch(pixels, w, h, input, dirty);
         // Phase C: foreground. The upper apron: a rebuilt row under a band kept from the
         // last frame draws nothing above its own band. That band holds the row's upward
@@ -17716,9 +17605,8 @@ impl Renderer {
         }
     }
 
-    /// Pass 1 of one row: fill every cell rect with its background colour.
-    /// Done before any glyph so a wide glyph (which overflows into its
-    /// continuation column) isn't clobbered by that column's fill.
+    /// Pass 1 of one row: fill every cell rect with its background, before any glyph so a
+    /// wide glyph overflowing into its continuation column is not clobbered.
     fn render_row_bg(
         &self,
         pixels: &mut [u32],
@@ -17793,8 +17681,7 @@ impl Renderer {
             // merged clipped fill. `resolve` still runs per column; only rects merge.
             let n = cells.len().min(cols);
             let mut run_start = 0usize;
-            // `None` runs (wallpaper show-through) merge exactly like colour runs
-            // and simply emit no fill — the base texels stay.
+            // `None` runs (wallpaper show-through) merge like colour runs and emit no fill.
             let mut run_bg: Option<u32> = None;
             for (c, cell) in cells[..n].iter().enumerate() {
                 let bg = resolve(c, cell);
@@ -17898,8 +17785,6 @@ impl Renderer {
                 }
                 default_bg | (bg_t << 24)
             };
-            // Same placement seam as the materialized loop: hoisted arithmetic
-            // when uniform, the owning pane's run box when mixed.
             if uniform {
                 self.fill_rect(pixels, w, h, self.pad + c * cw, y0, cw, self.cell_h, bg);
             } else {
@@ -18099,8 +17984,7 @@ impl Renderer {
         // stream, so the ink never recolours.
         let fire_present = !input.fire_patch.is_empty();
         let mut halo_walk = FireHaloWalk::new(fire_halo_row);
-        // A pixel-resolution chrome row's ink split, hoisted: one lookup per
-        // row, and `None` on every row that is not the band's meter.
+        // The chrome raster's ink split, looked up once per row.
         let row_raster = input.chrome_raster(r);
         let raster_split = row_raster.and_then(|m| m.split);
         let may_have_sel = input.any_selection();
@@ -18129,9 +18013,8 @@ impl Renderer {
                         .at(c as u16)
                         .unwrap_or_else(|| rgb_to_u32(cell.fg)),
                 };
-                // A ligature-owned column draws the shaped primary glyph (the lead
-                // cells of a ligature get the empty placeholder, the final cell the
-                // wide ligature glyph); all other columns use per-cell dispatch.
+                // A ligature-owned column draws the shaped glyph (lead cells an empty
+                // placeholder, the final cell the wide glyph); others use per-cell dispatch.
                 let key = match plan.get(c).copied().unwrap_or(ColumnGlyph::PerCell) {
                     ColumnGlyph::Ligated(gid) => self.ligature_key(gid, cell_style(cell)),
                     // A collapsed (N:1) ligature cell draws its per-cell tile of the wide
@@ -18151,8 +18034,7 @@ impl Renderer {
                 // phase, and on a mixed row the phase follows the cell to its run's place.
                 let key = self.chrome_icon_key(row_raster, cells, c).unwrap_or(key);
                 let key = shade_phase_key(key, x, y0);
-                // Selected cells floor their glyph fg against the selection bg so
-                // colour-on-selection stays legible (GPU mirrors this identically).
+                // Selected cells floor their glyph fg against the selection bg (as the GPU).
                 let hit = if may_have_sel {
                     input.selection_hit(r, c, cells.get(c + 1).is_some_and(|n| n.wide), cell.wide)
                 } else {
@@ -18245,11 +18127,8 @@ impl Renderer {
                     let mut stack = MarkStack::default();
                     for &m in marks {
                         let mk = self.combining_mark_key(m, cell);
-                        // ONE cache probe for all four facts: the ink box is
-                        // MEMOIZED in the entry (`CachedGlyph`), never scanned
-                        // per mark per frame — it is a pure function of a raster
-                        // that cannot change while the entry lives. The GPU loop
-                        // reads the SAME memo entry.
+                        // One cache probe: the ink box is memoized in the entry
+                        // (`CachedGlyph`), which the GPU loop reads too.
                         let (gw, gh, xmin, ink) = {
                             let cg = self.cached_glyph(mk);
                             (cg.img.width(), cg.img.height(), cg.img.xmin(), cg.ink)
@@ -18263,12 +18142,8 @@ impl Renderer {
                         let Some((ink_h, ink_ymin)) = ink else {
                             continue;
                         };
-                        // `mark_cell_x_at` takes the cell's LEFT PIXEL rather
-                        // than re-deriving it from `c * rcw`, because on a
-                        // composed row the column's run — not the row — decides
-                        // where that is. On a uniform row `x == pad_x + c * cw`,
-                        // so this is the old `mark_cell_x(c, cw, ..) + pad_x`
-                        // term for term (same centring, same integer division).
+                        // `mark_cell_x_at` takes the cell's left pixel because on a composed
+                        // row the column's run decides where that is.
                         let cx = mark_cell_x_at(x as i32, cw, gw, xmin, scale)
                             + mark_script_shift(cell.script, cw);
                         let dy = stack.dy(ink_h, ink_ymin, self.baseline, self.cell_h, scale.ys);
@@ -18356,9 +18231,8 @@ impl Renderer {
             } = sel.at_hit(hit);
             let inks = deco_inks(cell, sel_fg, min_contrast, base_fg, selected, sel_bg);
             let ucolor = inks.underline;
-            // A curly underline under a mask-supported cell size emits no rect
-            // here (`underline_rects_into`); pass 3b blends its curl instead,
-            // from this placement and ink.
+            // A curly underline at a mask-supported size emits no rect here; pass 3b blends
+            // its curl from this placement and ink.
             if curly_mask_ok && matches!(cell.underline, UnderlineStyle::Curly) {
                 curls.push((c, x, cw, lo, hi, dw, ucolor));
             }
@@ -18603,8 +18477,7 @@ impl Renderer {
         let Some((by0, by1)) = band else {
             return false;
         };
-        // Mirror the Pass-2 glyph predicate: cells that draw no glyph have no
-        // ink to skip around.
+        // As pass 2: cells that draw no glyph have no ink to skip around.
         if cell.ch == ' ' || cell.ch.is_control() || input.image_hides_glyph_at(r, c) {
             return false;
         }
@@ -18768,7 +18641,7 @@ impl Renderer {
                 .and_then(|r| r.get(t.col))
                 .map_or(default_bg, |c| rgb_to_u32(c.bg));
             let mut color = blend(cell_bg, input.cursor_trail_color, t.alpha);
-            // Default-bg cells keep the window's translucency (see doc above).
+            // Default-bg cells keep the window's translucency.
             if bg_t != 0 && cell_bg == default_bg {
                 color |= bg_t << 24;
             }
@@ -18826,7 +18699,7 @@ impl Renderer {
             return;
         }
         for q in quads {
-            // Mirror the GPU glow loop, which skips quads past the grid's last row.
+            // As the GPU glow loop: skip quads past the grid's last row.
             if q.row as usize >= rows {
                 continue;
             }
@@ -18846,16 +18719,10 @@ impl Renderer {
             if x0 >= xend {
                 continue;
             }
-            // THE MODE IS PER QUAD AND THE BRANCH IS PER QUAD (see
-            // [`GlowQuad::alpha`]): hoisted out of the pixel loop, so an
-            // all-additive stream pays one predictable test per rect and the
-            // inner loop is a plain `add_sat` walk.
-            // `over_premul(dst, c, 0) == add_sat(dst, c)`, so the split is a
-            // pure specialization rather than two laws. The GRADIENT branch
-            // ([`GlowQuad::color2`]) is the third specialization of the same
-            // law: per column, the colour and the opacity are [`glow_lerp`]'d
-            // between the quad's two edges and composited source-over — which
-            // IS `add_sat` wherever the opacity is 0. A flat quad never enters it.
+            // The mode is per quad ([`GlowQuad::alpha`]) and so is the branch, hoisted out of
+            // the pixel loop. `over_premul(dst, c, 0) == add_sat(dst, c)`, so it is one law
+            // specialized. The gradient branch ([`GlowQuad::color2`]) [`glow_lerp`]s colour
+            // and opacity per column between the quad's edges; flat quads never enter it.
             //
             // The span loop is [`fx_raster::fill_glow_span`], SHARED with the
             // fx rects (pixel law F's Rect rule is this quad law with no row
@@ -18921,28 +18788,13 @@ impl Renderer {
         );
     }
 
-    /// Draw the UNDER-GLYPH light (`glow_under`: EMBERFORGE's flame BODY that
-    /// the engulfed glyphs silhouette against, and the rainbow trail's BED) —
-    /// [`GlowQuad`]-shaped premultiplied quads, the SAME compositing contract as
-    /// [`Self::draw_glow`] (CPU `add_sat`/[`over_premul`] == GPU
-    /// One/One and One/OneMinusSrcAlpha on the Unorm view, byte-exact, chosen
-    /// per quad by [`GlowQuad::alpha`]) but at a DIFFERENT z-slot: called from the shared phase
-    /// runner [`Self::composite_free`] AFTER the row backgrounds + every
-    /// under-text sprite phase and BEFORE the glyph foreground phase, so the
-    /// light lands UNDER the letterforms on BOTH paths (the GPU draws the same
-    /// stream in its own Unorm pass between the base-bg and base-fg draws).
-    ///
-    /// The per-quad rasterization is [`Self::draw_flat_add`], SHARED with
-    /// [`Self::draw_glow`] / [`Self::draw_nova`] so the flat streams cannot
-    /// drift. THIS is the stream that carries source-over quads — the rainbow
-    /// bed emits `alpha > 0` — and it needs no separate phase for them: the
-    /// blend is one equation and the additive mode is it at `alpha == 0`, so a
-    /// mixed field composites in one walk, in emit order, on both backends. Row
-    /// gating is the aurora discipline:
-    /// [`compute_dirty_rows`] marks every prev∪cur glow_under row dirty
-    /// whenever the stream changes, and the phase runner hands this the SAME
-    /// dirty set its row iterator was built from. An empty `glow_under` is a
-    /// no-op (byte-identical to the pre-glow_under path).
+    /// Draw the under-glyph light (`glow_under`: the flame body engulfed glyphs silhouette
+    /// against, and the rainbow trail's bed): [`GlowQuad`] quads composited like
+    /// [`Self::draw_glow`] (`add_sat` or [`over_premul`] per [`GlowQuad::alpha`]), but called
+    /// from [`Self::composite_free`] after the row backgrounds and under-text sprites and
+    /// before the glyph foreground, so the light lands under the letterforms on both paths.
+    /// Additive is source-over at `alpha == 0`, so a mixed stream composites in one walk in
+    /// emit order. Gated by the dirty set the phase runner's row iterator was built from.
     #[inline]
     fn draw_glow_under(
         &self,
@@ -18987,7 +18839,7 @@ impl Renderer {
         }
         for mode in [FireMode::Add, FireMode::Over] {
             for q in input.fire_patch.iter().filter(|q| q.mode == mode) {
-                // Mirror the GPU loop, which skips quads past the grid's last row.
+                // As the GPU loop: skip quads past the grid's last row.
                 if q.row as usize >= input.rows {
                     continue;
                 }
@@ -19223,7 +19075,7 @@ impl Renderer {
         if input.rain_quads.is_empty() {
             return;
         }
-        // Count into slot r+1 so the prefix sum lands the start offsets in place.
+        // Count into slot r+1 so the prefix sum leaves the start offsets in place.
         for q in &input.rain_quads {
             let rr = q.row as usize;
             if rr < rows {
@@ -19235,7 +19087,6 @@ impl Renderer {
         }
         let total = self.rain_row_starts[rows] as usize;
         self.rain_row_idx.resize(total, 0);
-        // Fill cursor = a copy of the row starts, advanced as we place indices.
         self.rain_row_cursor.clear();
         self.rain_row_cursor
             .extend_from_slice(&self.rain_row_starts[..rows]);
@@ -19266,7 +19117,6 @@ impl Renderer {
         {
             return white;
         }
-        // Scan RGB (skip alpha): white iff every R,G,B byte is 255.
         let mut white = true;
         let mut i = 0;
         while i + 3 < atlas.rgba.len() {
@@ -19335,7 +19185,7 @@ impl Renderer {
         {
             for q in &input.cat_quads {
                 if q.row as usize == r {
-                    // Cats keep the general path: their atlas is not guaranteed white.
+                    // Cats keep the general path: their atlas need not be white.
                     stamp_cat_quad::<false>(pixels, w, h, pad_x, pad_y, atlas, q);
                 }
             }
@@ -19451,9 +19301,8 @@ impl Renderer {
         }
     }
 
-    /// Fetch (or rasterize + cache) the base-width coverage sprite for a
-    /// decoration glyph. The cache is keyed on `(glyph, base_cell_w, cell_h)` and
-    /// survives across frames, so an animating sparkle re-rasterizes nothing.
+    /// Fetch or rasterize the base-width coverage sprite for a decoration glyph, cached
+    /// across frames on `(glyph, base_cell_w, cell_h)`.
     fn deco_mask(&self, glyph: DecoGlyph, bcw: usize, ch: usize) -> std::sync::Arc<Vec<u8>> {
         let key = (glyph, bcw, ch);
         let mut cache = self.deco_masks.borrow_mut();
@@ -19546,13 +19395,9 @@ impl Renderer {
                 None => self.frame_cursor(input),
             };
             let cursor_fill = floor_cursor_fill(base_fill, cursor_cell_bg, min_contrast);
-            // Cursor-opacity coverage: 255 at opacity 1.0 → the opaque fill +
-            // block cut-out. Below 255 the (W5b-floored) fill
-            // is BLENDED over the rendered cell so the glyph shows through, and the
-            // cut-out is skipped (the glyph is already visible under the translucent
-            // fill) — Ghostty `cursor-opacity` semantics. The translucent fill spans
-            // OUR W4 wide width `cur_w`. The GPU mirrors both the blend and the skip
-            // (parity).
+            // Cursor opacity: at 255 the fill is opaque and the block cut-out runs; below,
+            // the fill is blended over the rendered cell across `cur_w` and the cut-out is
+            // skipped (Ghostty `cursor-opacity`). The GPU mirrors both.
             let cursor_cov = (self.cursor_opacity * 255.0).round() as u8;
             if cursor_cov < 255 {
                 for_each_cursor_rect(style, x0, y0, cur_w, self.cell_h, |[rx, ry, rw, rh]| {
@@ -19667,8 +19512,7 @@ impl Renderer {
                     );
                 }
                 self.glyph_plan_scratch = plan;
-                // The buffer round-trips with its key: it still holds `cr`'s plan
-                // (either the reused one or the one just built here).
+                // The buffer still holds `cr`'s plan, so it keeps its key.
                 self.glyph_plan_row = Some(cr);
             }
         }
@@ -19703,8 +19547,7 @@ impl Renderer {
         }
     }
 
-    /// Fill an arbitrary pixel rectangle with a solid colour, clipped to the
-    /// frame.
+    /// Fill a pixel rectangle with a solid colour, clipped to the frame.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn fill_rect(
@@ -19774,9 +19617,8 @@ impl Renderer {
         let sx0 = image.cell_col as usize * cw;
         let lip = if image.cell_row == 0 { lift } else { 0 };
         let sy0 = image.cell_row as usize * ch + lift - lip;
-        // A footprint past `MAX_PLACEMENT_RASTER_PX`, or past its frame's
-        // raster cap, was decoded smaller: each footprint pixel then draws the
-        // raster pixel under its centre.
+        // A footprint past `MAX_PLACEMENT_RASTER_PX` or the frame's raster cap was decoded
+        // smaller; each footprint pixel draws the raster pixel under its centre.
         let scaled = (decoded.w, decoded.h) != (fp_w, fp_h);
         // Frame edge and (on a composed row) pane edge, and the footprint's right edge: one
         // tile width, taken once (none of them moves per pixel).
@@ -20104,10 +19946,10 @@ pub fn clip_span(gx0: i64, len: i64, clip_lo: i64, clip_hi: i64) -> Option<(i64,
     (lo < hi).then_some((lo, hi))
 }
 
-/// The valid destination framebuffer index for `(x, y)`, clipped to the frame, the
-/// DECDHL top/bottom dest-row window (`clip_y0..clip_y1`) and the cursor cut-out
-/// dest-column window (`clip_x0..clip_x1`). Shared by the general blit paths so
-/// the 1×1 fast path's hand-derived column window is provably the same clip.
+/// The destination framebuffer index for `(x, y)`, clipped to the frame, the DECDHL
+/// dest-row window (`clip_y0..clip_y1`) and the cursor cut-out dest-column window
+/// (`clip_x0..clip_x1`). The general blit paths use it; the 1×1 fast path derives the same
+/// window per row.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn fb_at(
@@ -20584,9 +20426,8 @@ fn blit_rgba_1x(
     }
 }
 
-/// Whether a cursor of `style` is drawn at this blink phase: `Hidden` never,
-/// the `Blinking*` styles only while the phase is on, steady styles always.
-/// Shared by the CPU and GPU renderers so their suppression rules agree.
+/// Whether a cursor of `style` is drawn at this blink phase: `Hidden` never, `Blinking*`
+/// while the phase is on, steady styles always. Shared by both renderers.
 #[inline]
 #[must_use]
 pub const fn cursor_shown(style: CursorStyle, blink_phase: bool) -> bool {
@@ -20599,15 +20440,15 @@ pub const fn cursor_shown(style: CursorStyle, blink_phase: bool) -> bool {
     }
 }
 
-/// The pixel rects (`[x, y, w, h]`) a cursor of `style` paints in the theme's
-/// cursor colour, for the cell at `(x0, y0)` of size `cell_w` x `cell_h`:
+/// The pixel rects (`[x, y, w, h]`) a cursor of `style` paints in the cursor colour for the
+/// cell at `(x0, y0)` of size `cell_w` x `cell_h`:
 ///
-/// * block — the whole cell (the caller re-draws the glyph over it, "cut out"),
-/// * underline — the bottom strip, `max(2, cell_h/8)` px tall,
-/// * bar — the left strip, `max(2, cell_w/8)` px wide,
-/// * hollow block — a `max(1, cell_h/16)` px outline rectangle,
-/// * bolt — a jagged lightning-bolt silhouette, one strip per pixel row,
-/// * hidden — nothing.
+/// * block: the whole cell (the caller redraws the glyph over it),
+/// * underline: the bottom `max(2, cell_h/8)` px,
+/// * bar: the left `max(2, cell_w/8)` px,
+/// * hollow block: a `max(1, cell_h/16)` px outline,
+/// * bolt: a lightning-bolt silhouette, one strip per pixel row,
+/// * hidden: nothing.
 ///
 /// Shared by the CPU and GPU renderers. Rects are visited in paint order without
 /// allocating.
@@ -20665,8 +20506,7 @@ pub fn for_each_cursor_rect(
                 visit([x0 + lx, y0 + y, rx - lx, 1]);
             }
         }
-        // Hidden (and, fail-safe, any future variant: the enum is
-        // non-exhaustive) paints nothing.
+        // Hidden, and any future variant of the non-exhaustive enum, paints nothing.
         _ => {}
     }
 }
@@ -20721,8 +20561,7 @@ pub fn underline_rects_into(
     if matches!(style, UnderlineStyle::None) || w == 0 || cell_h == 0 {
         return;
     }
-    // Re-clamp defensively so a hand-built DecoMetrics can't leave the cell;
-    // `Renderer::deco_metrics` values pass through unchanged (already in-cell).
+    // Re-clamp so a hand-built DecoMetrics stays in the cell.
     let t = deco.underline_t.clamp(1, cell_h);
     let uy = y0 + deco.underline_y.min(cell_h - t);
     match style {
@@ -20832,8 +20671,7 @@ fn cluster_for(row_clusters: &[(usize, Box<str>)], col: usize) -> Option<&str> {
         .map(|i| row_clusters[i].1.as_ref())
 }
 
-/// Find the combining marks for column `col` in a row's sparse combining list
-/// (sorted by column — see [`cluster_for`] for why binary search is used).
+/// The combining marks for column `col` in a row's sparse combining list (sorted by column).
 #[inline]
 fn combining_for(row_combining: &[(usize, Box<[char]>)], col: usize) -> Option<&[char]> {
     row_combining
@@ -20917,9 +20755,7 @@ pub const fn kitty_image_is_below_non_default_bg(z_index: i32) -> bool {
     z_index < KITTY_IMAGE_BELOW_BG_Z_THRESHOLD
 }
 
-/// Whether `col` carries a placement of Kitty's deepest tier. The sparse list is
-/// sorted by column (see [`cluster_for`]), so the background-cover pass stays
-/// logarithmic per cell.
+/// Whether `col` carries a placement of Kitty's deepest tier (sorted list, binary search).
 #[inline]
 fn image_below_non_default_bg_covers(
     row_images: &[(usize, aterm_core::grid::extra::ImageRef)],
@@ -21036,9 +20872,8 @@ fn row_meta_differs(
     a.line_sizes[ra] != b.line_sizes[rb]
         || row_spans(a, ra) != row_spans(b, rb)
         || default_bg_spans(a, ra) != default_bg_spans(b, rb)
-        // The BiDi map decides which painted cells a (logical) selection
-        // lights, and two orders of the same cells can look alike. Empty on
-        // every unpermuted row, so O(1) there.
+        // The BiDi map decides which painted cells a logical selection lights; empty (O(1))
+        // on unpermuted rows.
         || a.visual_to_logical_row(ra) != b.visual_to_logical_row(rb)
         || !memo.rows_eq(&a.images[ra], &b.images[rb])
 }
@@ -21528,9 +21363,8 @@ fn effect_stream_changed<T: PartialEq>(
     prev != current
 }
 
-/// Mark prev∪current rows from compact metadata when possible; otherwise walk
-/// the exact payloads, preserving compatibility for producers that have not
-/// opted into the metadata contract.
+/// Mark prev∪current rows from compact metadata when possible, else by walking the
+/// payloads (producers without the metadata contract).
 #[inline]
 fn mark_effect_stream_rows(
     dirty: &mut [bool],
@@ -21683,9 +21517,8 @@ impl DirtyRows {
         }
     }
 
-    /// True iff the frame is pixel-identical to the prior one: no dirty row, no
-    /// cursor change, the same blink/override state, and unchanged overlays. This
-    /// is exactly the CPU/GPU gate-hit condition.
+    /// True iff the frame is pixel-identical to the prior one: no dirty row, no cursor,
+    /// blink or override change, and unchanged overlays.
     #[inline]
     #[must_use]
     pub const fn is_gate_hit(&self) -> bool {
@@ -21710,12 +21543,9 @@ impl DirtyRows {
     }
 }
 
-/// Resolve the shape painted for this frame.
-///
-/// The renderer/backend override is presentation authority (most notably an
-/// unfocused window's HollowBlock), so it remains highest precedence. The
-/// frame-carried host/effect override comes next without mutating terminal
-/// DECSCUSR, and the terminal style is the fallback.
+/// Resolve the cursor shape painted this frame: the renderer/backend override (e.g. an
+/// unfocused window's HollowBlock) first, then the frame's host/effect override, then the
+/// terminal's DECSCUSR.
 #[inline]
 #[must_use]
 pub fn effective_cursor_style(
@@ -21961,11 +21791,9 @@ pub fn chrome_ring_floor_cols(ring: &ChromeRing) -> std::ops::Range<usize> {
     start + 1..end - 1
 }
 
-/// Whether a frame is a PURE-GRID frame the E7 whole-row scroll-blit can shift
-/// rigidly: no position-keyed overlay stream (which the blit does not relocate)
-/// and no active selection (a per-row span the blit would strand). The cursor is
-/// handled separately (it is a single relocatable overlay). Every stream is
-/// empty in the common history-scroll case, so this is a cheap `is_empty` fan.
+/// Whether a frame is pure grid, so the whole-row scroll blit can shift it rigidly: no
+/// position-keyed overlay stream (the blit does not relocate them) and no active selection.
+/// The cursor is handled separately.
 ///
 /// ROW-LOCAL overlays do not refuse: the animated ink (per-cell fg overrides,
 /// drawn inside their row's band) and every sparkle-word decoration that sits
@@ -21986,9 +21814,8 @@ fn scroll_blittable_content(input: &RenderInput) -> bool {
         damage.was_empty().unwrap_or(payload.is_empty())
     }
 
-    // A pixel-resolution chrome row ([`ChromeRaster`]) does not refuse the
-    // blit: [`scroll_shift_plan`] marks every such row, and every row the blit
-    // fills from one, dirty — repainted in place over the slid pixels.
+    // A chrome raster row does not refuse the blit: [`scroll_shift_plan`] marks it, and
+    // every row the blit fills from one, dirty.
     input.cursor_trail.is_empty()
         && absent(&input.cursor_glow_add, &input.cursor_glow_add_damage)
         && absent(&input.glow_halo, &input.glow_halo_damage)
@@ -22040,15 +21867,11 @@ fn row_decorations(input: &RenderInput, r: usize) -> impl Iterator<Item = WordDe
         .map(|d| WordDecoration { row: 0, ..*d })
 }
 
-/// E7 overshoot-apron reconciliation depth: how many RETAINED rows directly above
-/// a bottom-exposed strip the scroll blit re-rasters so the upward-overshoot seam
-/// (a re-rastered row's fresh ink over the blitted row above it) is reconciled
-/// rather than left to DRIFT upward a row per notch. Two — the ≤1-cell upward
-/// overshoot reaches the first retained row, and re-rastering that row makes its
-/// own overshoot into the second stale relative to the rigidly-blitted copy; the
-/// third boundary is between two rigidly-moved rows and is blit-consistent. See
-/// `scroll_blit_plan`'s overshoot-invariant loop; proven geometry-independent by
-/// the `tests/scroll_blit.rs` px×direction×glyph sweep.
+/// Retained rows above a rebuilt row that the scroll blit re-rasters so the upward-overshoot
+/// seam does not drift up a row per notch: the ≤1-cell overshoot reaches the first, and
+/// re-rastering that one makes its own overshoot into the second stale; the third boundary
+/// lies between two rigidly moved rows. Geometry-independent per the `tests/scroll_blit.rs`
+/// sweep.
 const OVERSHOOT_APRON_ROWS: usize = 2;
 
 /// The scroll-blit planner: whether `input` is a rigid whole-row history scroll of the
@@ -22141,9 +21964,8 @@ pub fn scroll_shift_plan(
         return None;
     }
     let da = da as i32; // |da| < rows, and rows is small
-    // Geometry / default-bg change, or a double-height row, is a genuine full
-    // repaint (dims fix the pixel band; DECDHL spans two bands so a per-row shift
-    // would seam).
+    // A geometry or default-bg change, or a double-height row (it spans two bands), is a
+    // full repaint.
     if prev.rows != rows
         || prev.cols != input.cols
         || prev.default_bg != input.default_bg
@@ -22328,10 +22150,9 @@ fn row_has_y_phase_cell(input: &RenderInput, r: usize) -> bool {
 /// rendered from `prev_input` (at `prev_blink_phase` / `prev_cursor_style_
 /// override`) row-by-row, and if so, exactly which rows differ.
 ///
-/// The result is consumed by BOTH renderers:
-///   * the CPU damage path repaints the `dirty` rows into its cached framebuffer,
-///   * the GPU scissored path re-encodes ONLY the `dirty` rows into the persistent
-///     offscreen (LoadOp::Load + a scissor over the dirty band(s)),
+/// `dirty` is a caller-owned scratch, resized to `rows` and reset to `false`; on
+/// [`DirtyDecision::Rows`] `dirty[r]` is row `r`'s repaint flag, on `FullRepaint` it is
+/// left untouched.
 ///
 /// so they share one dirty set and cannot drift. `FullRepaint` is the always-safe
 /// fallback (whole-frame Clear + all rows), taken whenever reuse is unsafe.
@@ -22778,8 +22599,8 @@ pub fn compute_dirty_rows(
         );
         let (mut i, mut j) = (0usize, 0usize);
         while i < pq.len() || j < cq.len() {
-            // The next row present in either frame; group both frames' quads
-            // for that row into contiguous slices (row-sorted ⇒ one group each).
+            // The next row in either frame; row-sorted, so each frame has one contiguous
+            // group for it.
             let row = match (pq.get(i), cq.get(j)) {
                 (Some(p), Some(c)) => p.row.min(c.row),
                 (Some(p), None) => p.row,
@@ -22825,23 +22646,12 @@ pub fn compute_dirty_rows(
         (&input.fx_layers, &input.fx_occluders),
     );
 
-    // UNCONDITIONAL-OVERLAY scissor-band fill (runs LAST — it reads the band
-    // the arms above produced). The GPU builds the cat/rain/free sprite
-    // streams UNGATED by row (a free sprite has no row tag; a settled cat's
-    // instances are rebuilt bytes-equal every frame) and clips them with ONE
-    // scissor over the dirty rows' BOUNDING band. A SETTLED sprite whose rows
-    // fall INSIDE that band (unrelated dirt above and below it) would be
-    // Load-preserved by the base pass yet redrawn by the sprite stream — a
-    // translucent texel re-blends over its own cached pixels every damaged
-    // frame. Mark every band row a CURRENT-frame
-    // sprite overlaps as dirty, so every overlay pixel inside the scissor
-    // lands on a fully rebuilt row. Marks stay INSIDE [first, last], so the
-    // band (and scissor rect) is unchanged; a changed overlay already marked
-    // its prev∪cur rows above, so only settled overlays gain marks here. Rows
-    // OUTSIDE the band keep their cached sprite pixels on both backends (the
-    // scissor clips the redraw; the CPU stamp is band-clipped) — a fully
-    // settled frame still gate-hits (no dirty row ⇒ no band ⇒ no marks). A
-    // frame with no current sprite marks nothing, so it skips the band search.
+    // Scissor-band fill (runs after the arms above, reading their band). The GPU builds the
+    // cat/rain/free sprite streams ungated by row and clips them with one scissor over the
+    // dirty rows' bounding band, so a settled sprite inside that band would re-blend over
+    // its own Load-preserved pixels each damaged frame. Mark every band row a current sprite
+    // overlaps; marks stay inside [first, last], so the band is unchanged, and a frame with
+    // no dirty row still gate-hits.
     if !(input.free_sprites.is_empty() && input.cat_quads.is_empty() && input.rain_quads.is_empty())
         && let Some(first) = dirty.iter().position(|&d| d)
     {
@@ -22849,8 +22659,7 @@ pub fn compute_dirty_rows(
         let ch = cell_h.max(1) as i32;
         let last_row = rows.saturating_sub(1) as i32;
         for s in &input.free_sprites {
-            // Mirror the GPU instance build's skip: a degenerate sprite
-            // draws nothing, so it forces no repaint.
+            // As the GPU instance build: a degenerate sprite draws nothing.
             if s.w == 0 || s.h == 0 || s.aw == 0 || s.ah == 0 {
                 continue;
             }
@@ -23117,8 +22926,7 @@ pub fn chrome_lifted(
     (scale, anchor_y - lift as i32)
 }
 
-/// The on-screen cell advance (px) for a row of `line_size` — doubled for any
-/// double-width/height row, single otherwise.
+/// The on-screen cell advance (px) for a row of `line_size`: doubled on double-size rows.
 #[inline]
 #[must_use]
 pub const fn row_cell_w(line_size: LineSize, cell_w: usize) -> usize {
@@ -23260,26 +23068,16 @@ pub fn mark_script_shift(script: aterm_core::terminal::Script, cell_width: usize
 /// Running vertical placement of ONE cell's combining marks, so a second mark on
 /// the same side of the base STACKS on the first instead of overprinting it.
 ///
-/// The painters place a mark by its own outline alone (`baseline - gh - ymin`),
-/// and a font's combining glyphs all sit at the same height over the x-height,
-/// so `e` + U+0301 + U+0301 used to be pixel-equal to `e` + U+0301 up to
-/// double-coverage darkening: every mark past the first was invisible. The
-/// cell is never shaped as a cluster, so no GPOS `mkmk` anchor can lift the
-/// second mark; this synthesises the lift from the INK boxes both painters
-/// already hold ([`GlyphImage::ink_box`] — the rasterized box trimmed of its
-/// zero-coverage edge rows, never the raster box itself: fontdue sizes that
-/// one from the scaled outline bbox, and a surplus row there moves a mark to
-/// the wrong side of every test below).
+/// A mark with `ink_ymin >= 0` is an above-mark, one with `ink_ymin + ink_h <= 0` a
+/// below-mark; one straddling the baseline (nukta-like, enclosing) keeps its place and joins
+/// no stack. An above-mark is lifted to sit one glyph row clear of the highest ink so far, a
+/// below-mark dropped one row clear of the lowest. The first mark on each side gets
+/// `dy == 0`, and a mark already clear of the stack is not moved.
 ///
-/// Each mark is classified by where its ink lies relative to the baseline —
-/// `ink_ymin >= 0` is an above-mark, `ink_ymin + ink_h <= 0` a below-mark,
-/// anything that straddles the baseline (a nukta-like or enclosing mark) keeps
-/// its designed place and joins no stack. An above-mark is lifted so its bottom
-/// sits one glyph row clear of the highest ink so far; a below-mark is dropped
-/// so its top sits one row clear of the lowest. The first mark on each side
-/// needs no lift (`dy == 0`), so every single-mark cell is byte-identical to
-/// what it was, and a mark whose designed place already clears the stack is not
-/// moved.
+/// The operand is the ink box ([`glyph_ink_box`]), never the reported raster box: CoreText
+/// pads that box by a pixel per side plus a phase row ([`ct_padded_extent`]), which makes
+/// U+0323 COMBINING DOT BELOW straddle the baseline and never stack. The pad rows are blank,
+/// so an ink-derived lift moves the raster correctly. Other raster paths do not pad rows.
 ///
 /// The cell is never shaped as a cluster (no GPOS `mkmk`), so the lift comes from the ink
 /// boxes both painters hold ([`glyph_ink_box`]). A mark with `ink_ymin >= 0` is an
@@ -23868,10 +23666,8 @@ pub fn srgb8_to_linear(channel: u8) -> f32 {
     SRGB_TO_LINEAR_LUT[usize::from(channel)]
 }
 
-/// Linear-light (0..1) → 8-bit sRGB, precomputed over a fine grid so the hot
-/// blend path re-encodes with a table lookup instead of a `powf`. `LIN2SRGB_N`
-/// steps (index = round(l·N)); 4096 keeps the max quantization error well under
-/// 1 LSB across the whole curve (verified in `blend_linear_light_*` tests).
+/// Linear light (0..1) to 8-bit sRGB over a `LIN2SRGB_N`-step grid (index =
+/// round(l·N)); 4096 steps keep the error under 1 LSB (`blend_linear_light_*` tests).
 const LIN2SRGB_N: usize = 4096;
 static LINEAR_TO_SRGB_LUT: std::sync::LazyLock<[u8; LIN2SRGB_N + 1]> =
     std::sync::LazyLock::new(|| {
@@ -23921,10 +23717,9 @@ pub enum TextBlending {
 /// `fs_glyph` uses the same literal.
 pub const TEXT_BLEND_EPS: f32 = 0.001;
 
-/// ghostty's linear-corrected ALPHA REMAP (W2): given the linear-light
-/// luminances of the foreground `fg_l` and destination `bg_l` and the glyph
-/// coverage `a` (all 0..=1), return the coverage that makes the LINEAR blend's
-/// luminance land where a gamma-space (sRGB-lerp) blend would put it:
+/// ghostty's linear-corrected alpha remap: given the linear luminances `fg_l` and `bg_l` and
+/// coverage `a` (all 0..=1), the coverage that puts the linear blend's luminance where a
+/// gamma-space (sRGB-lerp) blend would:
 ///
 /// ```text
 /// blend_l = linearize(unlinearize(fg_l)·a + unlinearize(bg_l)·(1-a))
@@ -32199,19 +31994,12 @@ mod tests {
         );
     }
 
-    /// A PENDING RETIRE CONDEMNS A FACE, NOT A SLOT NUMBER.
-    ///
-    /// The condemnation is recorded mid-frame and executed at the next frame
-    /// boundary, and the slot can be REPLACED in between — the host resolving
-    /// `font_family_bold` and pushing real bytes is exactly that, and it lands on
-    /// the render thread between two frames. Retiring on the slot alone dropped
-    /// the newcomer for its predecessor's parse failure: bold went synthetic and
-    /// STAYED synthetic (nothing re-discovers an injected face), so a config the
-    /// user just set silently did nothing.
-    ///
-    /// Two halves are pinned here: the injection drops the stale condemnation, and
-    /// the apply checks identity anyway — so a future writer that forgets the first
-    /// still cannot execute a verdict on the wrong face.
+    /// A pending retire condemns a face, not a slot number. It is recorded
+    /// mid-frame and executed at the next frame boundary, and the slot can be
+    /// replaced in between (the host resolving `font_family_bold` and pushing
+    /// real bytes); retiring by slot would drop the newcomer and leave bold
+    /// synthetic for good. The injection drops the stale condemnation, and the
+    /// apply checks identity anyway.
     #[test]
     fn a_pending_styled_retire_never_condemns_a_replacement_face() {
         let mut r = bundled_path_backed_renderer();
@@ -32860,14 +32648,11 @@ mod tests {
         );
     }
 
-    /// DEFECT 3, PART TWO — A FACE WHOSE DEFERRED PARSE FAILS MUST DROP OUT OF
-    /// THE CHAIN, NOT SHADOW: the lazy path RETIRES the entry and re-resolves,
-    /// rather than drawing tofu from a face it cannot rasterize.
-    ///
-    /// The failed verdict is manufactured (`LazyFontdue::failed_parse`) because
-    /// `face_admissible` is written precisely so real bytes cannot produce it;
-    /// what is under test is the handling, not the trigger. The fontdue backend
-    /// is forced so CoreText cannot quietly draw the bad entry on macOS.
+    /// A chain face whose deferred parse fails is retired and the glyph
+    /// re-resolved, not drawn as tofu. The failed verdict is manufactured
+    /// (`LazyFontdue::failed_parse`) because `face_admissible` keeps real bytes
+    /// from producing it. The portable backend is forced so CoreText cannot draw
+    /// the bad entry on macOS.
     #[cfg(feature = "embedded-font")]
     #[test]
     fn a_chain_face_whose_deferred_parse_fails_is_retired_not_left_shadowing() {
@@ -32914,11 +32699,11 @@ mod tests {
         );
     }
 
-    /// `retire_unparsable_fallback` must drop BOTH the entry and every memo that
-    /// outlived it: `fallback_pick` holds chain INDICES (removal shifts them),
-    /// `keys` holds routing decisions taken against the longer chain, and
-    /// `glyphs` holds rasters under byte-identical keys — clearing the first two
-    /// without the third hands back the retired face's own bitmap.
+    /// `retire_unparsable_fallback` drops the entry and every memo that outlived
+    /// it: `fallback_pick` holds chain indices (removal shifts them), `keys`
+    /// holds routing decisions against the longer chain, and `glyphs` holds
+    /// rasters under byte-identical keys that would hand back the retired face's
+    /// own bitmap.
     #[cfg(feature = "embedded-font")]
     #[test]
     fn retiring_a_fallback_entry_clears_the_memos_that_outlived_it() {
@@ -33275,7 +33060,6 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // GLYPH-FIDELITY: the formal guard that WOULD HAVE CAUGHT the Mac Roman
     // substitution bug (·→∑, é→È). The grid stores Unicode scalars; the renderer
     // must rasterize, for each cell, the font's UNICODE glyph for that scalar —
@@ -33287,7 +33071,6 @@ mod tests {
     // Unicode-subtable cmap; the prove-and-catch test below adds independence by
     // demonstrating divergence from the enumerated-cmap char lookup (fontdue's,
     // kept by `crate::font`).
-    // =========================================================================
 
     /// Walk EVERY Unicode scalar (0..=0x10FFFF, surrogates excluded) and prove the
     /// renderer's primary-face glyph for each covered scalar is exactly the

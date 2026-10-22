@@ -400,14 +400,27 @@ impl GlxContext {
         unsafe { (self.glx.fns.destroy_window)(self.display, window) };
     }
 
-    /// `window`'s width and height now (it follows the X11 window's size by
-    /// itself).
-    pub(crate) fn size(&self, window: GLXDrawable) -> (u32, u32) {
-        let (mut w, mut h): (c_uint, c_uint) = (0, 0);
-        // SAFETY (both): a drawable of this display and a live out-pointer.
-        unsafe { (self.glx.fns.query_drawable)(self.display, window, ffi::GLX_WIDTH, &raw mut w) };
-        unsafe { (self.glx.fns.query_drawable)(self.display, window, ffi::GLX_HEIGHT, &raw mut h) };
-        (w, h)
+    /// The X11 window `xid`'s width and height now, which its `GLXWindow`
+    /// follows: one round trip (`glXQueryDrawable` takes one a side); (0, 0)
+    /// when the server answers none.
+    pub(crate) fn size(&self, xid: u64) -> (u32, u32) {
+        let (mut root, mut x, mut y) = (0, 0, 0);
+        let (mut w, mut h, mut border, mut depth): (c_uint, c_uint, c_uint, c_uint) = (0, 0, 0, 0);
+        // SAFETY: a window of this display and live out-pointers.
+        let ok = unsafe {
+            (self.glx.x.get_geometry)(
+                self.display,
+                xid,
+                &raw mut root,
+                &raw mut x,
+                &raw mut y,
+                &raw mut w,
+                &raw mut h,
+                &raw mut border,
+                &raw mut depth,
+            )
+        };
+        if ok == 0 { (0, 0) } else { (w, h) }
     }
 
     /// Set `window`'s swap interval (0: post at once; 1: wait for the
@@ -991,6 +1004,10 @@ mod tests {
     /// too.
     const POSTED: &str = "GL-X11-POST: the window holds the posted colour, grown too";
 
+    /// The frame background the posts fill past the answered size with
+    /// (`0xRRGGBB`), unlike the stand-in's colour and black.
+    const FILL: u32 = 0x30_50_70;
+
     /// A frame the arm posts to an X11 window becomes that window's content:
     /// the X server answers `XGetImage` with the colour the stand-in held.
     /// On an Xorg server the NVIDIA X driver runs, the EGL binding this
@@ -1008,6 +1025,21 @@ mod tests {
     /// colour. The negative control: without `present`'s edge stretch, that
     /// area reads [0, 0, 0] on this desk's NVIDIA GLX (2026-10-22), the back
     /// buffer's bytes.
+    ///
+    /// Then the window grows again while the size the window system answers
+    /// lags it (`asked_size`), as NVIDIA's GLX answer does in a burst of
+    /// resizes (the desk, 2026-10-22: one resize step of black at the right
+    /// and the top): the frame lands low and short, and the buffer above it
+    /// and right of the answered width reads the frame's background. The
+    /// negative control: without `present`'s scissored clears, those points
+    /// read the buffer's bytes.
+    ///
+    /// Last the answer lags once (`asked_once`), as when a resize lands
+    /// between the ask and the swap: the post lands low, the ask after the
+    /// swap answers the window's size, and the stand-in is posted again at
+    /// it, so the window reads the stand-in at its top-left and its stretched
+    /// edges everywhere else. The negative control: without the post-swap ask
+    /// in `present`, the point above the low frame keeps the fill.
     ///
     /// The arm posts once the window maps ([`Desk::open`]), and again on each
     /// `Expose`, as a terminal does; the wait for the colour is a one-minute
@@ -1085,12 +1117,12 @@ mod tests {
             }
             cur.check("clear the stand-in").expect("no GL error");
         }
-        surface.present(&dev).expect("the first post");
+        surface.present(&dev, FILL).expect("the first post");
         let mut posts = 1_u32;
         let mut last = None;
         let held = within(MUST_HAPPEN, std::time::Duration::from_millis(10), || {
             if desk.drain().exposed {
-                surface.present(&dev).expect("the post on an expose");
+                surface.present(&dev, FILL).expect("the post on an expose");
                 posts += 1;
             }
             last = desk.pixel(32, 24);
@@ -1107,13 +1139,15 @@ mod tests {
         // stand-in's right edge, past its bottom edge, and past both.
         // SAFETY: a live display and its window.
         unsafe { (x.resize_window)(desk.dpy, desk.win, 2 * w, 2 * h) };
-        surface.present(&dev).expect("the post past the stand-in");
+        surface
+            .present(&dev, FILL)
+            .expect("the post past the stand-in");
         posts += 1;
         let past = [(100, 10), (10, 70), (100, 70)];
         let mut read = Vec::new();
         let covered = within(MUST_HAPPEN, std::time::Duration::from_millis(10), || {
             if desk.drain().exposed {
-                surface.present(&dev).expect("the post on an expose");
+                surface.present(&dev, FILL).expect("the post on an expose");
                 posts += 1;
             }
             read = past.iter().map(|&(px, py)| desk.pixel(px, py)).collect();
@@ -1124,6 +1158,73 @@ mod tests {
             covered.is_some(),
             "past the stand-in the grown window read {read:?} at {past:?}, not {want:?}, \
              {MUST_HAPPEN:?} after {posts} posts ({errors} X errors)"
+        );
+
+        // The window grows again, and the size the window system answers lags
+        // it, as NVIDIA's GLX answer does in a burst of resizes: the frame
+        // lands low and short. Points above it, right of the answered width,
+        // and both read the fill; one inside the landed frame reads the
+        // stand-in. The window is 192 x 144, the answer 128 x 96, so the frame
+        // lands 48 rows low.
+        surface.asked_size = Some((128, 96));
+        // SAFETY: a live display and its window.
+        unsafe { (x.resize_window)(desk.dpy, desk.win, 3 * w, 3 * h) };
+        surface
+            .present(&dev, FILL)
+            .expect("the post past the answered size");
+        posts += 1;
+        let fill = FILL.to_be_bytes();
+        let fill = [fill[1], fill[2], fill[3]];
+        let points = [
+            (10, 10, fill),
+            (148, 134, fill),
+            (148, 10, fill),
+            (10, 134, want),
+        ];
+        let mut read = Vec::new();
+        let filled = within(MUST_HAPPEN, std::time::Duration::from_millis(10), || {
+            if desk.drain().exposed {
+                surface.present(&dev, FILL).expect("the post on an expose");
+                posts += 1;
+            }
+            read = points
+                .iter()
+                .map(|&(px, py, _)| desk.pixel(px, py))
+                .collect();
+            read.iter()
+                .zip(&points)
+                .all(|(p, &(_, _, colour))| *p == Some(colour))
+                .then_some(())
+        });
+        let errors = xlib::ERRORS.load(Ordering::Relaxed);
+        assert!(
+            filled.is_some(),
+            "past an answered size that lags the buffer the window read {read:?}, not \
+             {points:?}, {MUST_HAPPEN:?} after {posts} posts ({errors} X errors)"
+        );
+
+        // The answer lags once, as when a resize lands between the ask and
+        // the swap: the first post lands 48 rows low and the second, made at
+        // the size asked after the swap, covers the window. No post follows,
+        // so what the window reads is that present's.
+        surface.asked_size = None;
+        surface.asked_once.set(Some((128, 96)));
+        surface
+            .present(&dev, FILL)
+            .expect("the post whose answer lags once");
+        posts += 1;
+        let points = [(10, 10), (148, 134), (148, 10), (10, 134)];
+        let mut read = Vec::new();
+        let reposted = within(MUST_HAPPEN, std::time::Duration::from_millis(10), || {
+            desk.drain();
+            read = points.iter().map(|&(px, py)| desk.pixel(px, py)).collect();
+            read.iter().all(|p| *p == Some(want)).then_some(())
+        });
+        let errors = xlib::ERRORS.load(Ordering::Relaxed);
+        assert!(
+            reposted.is_some(),
+            "after an answer that lagged the swap the window read {read:?} at {points:?}, not \
+             {want:?}, {MUST_HAPPEN:?} after {posts} posts ({errors} X errors)"
         );
         println!("{POSTED} ({posts} posts, {errors} X errors)");
     }
@@ -1335,13 +1436,15 @@ mod tests {
                 .expect("a window surface");
             surface.standin(&dev).expect("the stand-in");
             for _ in 0..2 {
-                surface.present(&dev).expect("an undrilled present posts");
+                surface
+                    .present(&dev, FILL)
+                    .expect("an undrilled present posts");
             }
             assert!(!dev.shared().lost(), "undrilled presents latch nothing");
             let what = dev.shared().inject_context_loss();
             assert!(what.contains("GL_UNKNOWN_CONTEXT_RESET"), "{what}");
             let err = surface
-                .present(&dev)
+                .present(&dev, FILL)
                 .expect_err("the drilled present fails")
                 .to_string();
             assert!(
@@ -1399,13 +1502,13 @@ mod tests {
             .expect("a window surface");
         surface.standin(&dev).expect("the stand-in");
         surface
-            .present(&dev)
+            .present(&dev, FILL)
             .expect("the window's first present posts");
         glx.destroy_window(surface.glx_window().expect("a GLX surface"));
         desk.sync();
         let mut seen = Vec::new();
         for n in 1..=3 {
-            let posted = surface.present(&dev);
+            let posted = surface.present(&dev, FILL);
             seen.push((posted.is_ok(), dev.shared().lost()));
             if let Err(e) = posted {
                 assert_eq!(

@@ -464,25 +464,15 @@ fn every_themes_screen_names_the_section_it_starts_in() {
     for (width, height) in [(584.0, 350.0), (738.0, 418.0), (1_074.0, 684.0)] {
         let cx = view_cx_at(width, height);
         let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
-        let _ = compile_settings_view(&runtime, instance, view, &cx);
-        let limit = state(&runtime, view).result_page_limit.get().unwrap_or(0);
-        for top in 0..=limit {
-            {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                    unreachable!()
-                };
-                state.page_scroll = top;
-                state.page_reveal = None;
-            }
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
-            let list = rect_of(&compiled, "settings/showcase/list");
+        let cards = state(&runtime, view).showcase.cards.clone();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+            let list = rect_of(compiled, "settings/showcase/list");
             // A list whose room cannot hold a caption over a row (the
             // smallest windows, where the demo is down to one row) shows the
             // row, its stop's content, and no caption can repeat.
             if list.height < 24.0 + 8.0 + 32.0 {
-                continue;
+                return;
             }
-            let showcase = &state(&runtime, view).showcase;
             // The first row whose top is on the screen.
             let first = compiled
                 .semantics
@@ -491,17 +481,17 @@ fn every_themes_screen_names_the_section_it_starts_in() {
                 .filter(|node| node.rect.y >= list.y - 0.5)
                 .min_by(|a, b| a.rect.y.total_cmp(&b.rect.y));
             let Some(first) = first else {
-                continue;
+                return;
             };
             let slug = first.key.as_str().trim_start_matches(ROW);
-            let Some(card) = showcase.card_by_slug(slug) else {
-                continue;
+            let Some(card) = cards.iter().find(|card| card.slug == slug) else {
+                return;
             };
             let Some(caption) = card.section.caption() else {
-                continue;
+                return;
             };
             if card.section == Section::Community {
-                continue;
+                return;
             }
             let heading = compiled.semantics.iter().find(|node| {
                 node.role == SemanticRole::Heading
@@ -514,7 +504,7 @@ fn every_themes_screen_names_the_section_it_starts_in() {
                 "{width}x{height} screen {top}: {slug} with no {caption} over it"
             );
             inside += 1;
-        }
+        });
     }
     assert!(inside > 0, "some screen starts inside a captioned section");
 
@@ -531,29 +521,19 @@ fn every_themes_screen_names_the_section_it_starts_in() {
             "settings/showcase/customize",
             None,
         );
-        let _ = compile_settings_view(&runtime, instance, view, &cx);
-        let limit = state(&runtime, view).result_page_limit.get().unwrap_or(0);
-        for top in 0..=limit {
-            {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                    unreachable!()
-                };
-                state.page_scroll = top;
-                state.page_reveal = None;
-            }
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
             let Some(list) = compiled
                 .semantic(&UiKey::new("settings/showcase/sheet-list"))
                 .map(|node| node.rect)
             else {
-                continue;
+                return;
             };
             // The first colour row whose top is on the screen: a row peeking
             // in over the last screen's top is the screen before's.
             let first = compiled
                 .semantics
                 .iter()
-                .filter(|node| !node.offscreen && own_top(&compiled, node) >= list.y - 0.5)
+                .filter(|node| !node.offscreen && own_top(compiled, node) >= list.y - 0.5)
                 .filter(|node| {
                     showcase_page::SHOWCASE_COLOR_KEYS
                         .iter()
@@ -561,13 +541,13 @@ fn every_themes_screen_names_the_section_it_starts_in() {
                 })
                 .min_by(|a, b| a.rect.y.total_cmp(&b.rect.y));
             let Some(first) = first else {
-                continue;
+                return;
             };
             if first.key.as_str()
                 == format!("settings/control/{}", showcase_page::SHOWCASE_COLOR_KEYS[0])
                 || list.height < 24.0 + 4.0 + 36.0
             {
-                continue;
+                return;
             }
             assert!(
                 compiled
@@ -581,7 +561,7 @@ fn every_themes_screen_names_the_section_it_starts_in() {
                 first.key.as_str()
             );
             inside += 1;
-        }
+        });
     }
     let _ = inside;
 }
@@ -3197,9 +3177,8 @@ fn a_yours_card_keeps_its_name_beside_its_file_actions() {
 fn list_arrows_walk_rows_and_the_list_follows() {
     let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
     let cx = view_cx_at(1_074.0, 684.0);
-    let _ = compile_settings_view(&runtime, instance, view, &cx);
-    let order = state(&runtime, view).showcase.listed();
     let first_frame = compile_settings_view(&runtime, instance, view, &cx);
+    let order = state(&runtime, view).showcase.listed();
     assert!(
         order.len()
             > first_frame
@@ -3777,9 +3756,7 @@ fn save_as_theme_labels_its_type_switch() {
     );
 }
 
-// -----------------------------------------------------------------------
 // The chooser, the strip and the demo (design §2–§8)
-// -----------------------------------------------------------------------
 
 const ROW: &str = "settings/showcase/card/";
 const STATUS: &str = "settings/showcase/status";
@@ -3803,7 +3780,7 @@ fn list_at_top(runtime: &mut NativeRuntime, view: crate::native_app::ViewId) {
     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
         unreachable!()
     };
-    state.page_scroll = 0;
+    state.scroll_page_to(0);
     state.page_reveal = None;
     state.scroll_record.replace(None);
 }
@@ -3836,6 +3813,14 @@ fn rect_of(compiled: &crate::native_ui::CompiledUi, key: &str) -> LogicalRect {
         .semantic(&UiKey::new(key))
         .unwrap_or_else(|| panic!("{key} is in the tree"))
         .rect
+}
+
+/// Whether the chooser's row `key` is drawn whole inside the list's room.
+fn whole_in_list(compiled: &crate::native_ui::CompiledUi, key: &str) -> bool {
+    let list = rect_of(compiled, "settings/showcase/list");
+    compiled.semantic(&UiKey::new(key)).is_some_and(|row| {
+        !row.offscreen && row.rect.y >= list.y - 0.5 && row.rect.bottom() <= list.bottom() + 0.5
+    })
 }
 
 /// The chooser's rows in the compiled tree, by key.
@@ -4390,6 +4375,127 @@ fn the_chooser_comes_on_glass_on_the_row_in_use_whole() {
     let _ = act(&mut runtime, instance, view, "settings/route/themes", None);
     assert_eq!(state(&runtime, view).showcase_landing(), None);
     assert_eq!(state(&runtime, view).page_reveal, None);
+}
+
+/// A LANDING A SCREEN HAS DRAWN IS LET GO AS DRAWN: Themes opened with the
+/// keyboard already on its Community disclosure (pressed open before the
+/// page first drew, as a driver's press ahead of the frame does) draws the
+/// disclosure, the landing on the row in use yielding to it, and so does the
+/// next frame, with no event between. The next frame landed on the row in
+/// use instead: the list went back up to Nord. CONTROL: with no press, the
+/// first screen lands on Nord, the disclosure off it.
+#[test]
+fn a_landing_the_keyboard_took_over_is_let_go_as_drawn() {
+    const PACK: &str = "settings/showcase/pack";
+    let cx = view_cx_at(1_284.0, 714.0);
+    let on_screen = |compiled: &crate::native_ui::CompiledUi, key: &str| {
+        compiled
+            .semantic(&UiKey::new(key))
+            .is_some_and(|node| !node.offscreen)
+    };
+    let (_service, runtime, instance, view) = themes_view("theme = \"Nord\"\n");
+    let in_use = card_action(&runtime, view, "Nord");
+    let landed = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        on_screen(&landed, &in_use) && !on_screen(&landed, PACK),
+        "the control: the page lands on {in_use}, the disclosure off its screen"
+    );
+    let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
+    let _ = act(&mut runtime, instance, view, PACK, None);
+    let first = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        on_screen(&first, PACK),
+        "the first screen shows the disclosure, where the keyboard is"
+    );
+    assert!(
+        compile_settings_view(&runtime, instance, view, &cx) == first,
+        "the next frame draws the same screen"
+    );
+}
+
+/// A LIST MEASURED AGAIN LANDS AGAIN: a window resized or a text size
+/// changed sends the view no event, so the frame after it measures the list
+/// otherwise before any event has let the landing go, and lands again —
+/// Themes opened on the theme in use (One Dark, Nord, Dracula, each listed
+/// past the list's first screen), drawn and then drawn shorter or at 2×
+/// text with nothing between, keeps that row whole in the list. (Let go as
+/// drawn by every frame before an event, the landing went with the resize:
+/// Nord at 1144x700 made 1144x462 left its row out of view.) NEGATIVE
+/// CONTROL: the same frames after an event has let the landing go
+/// ([`SettingsViewState::settle_page_scroll`]) lose the row, for a resize
+/// and for a text size.
+#[test]
+fn a_resize_before_any_event_keeps_the_theme_in_use_in_view() {
+    let set_scale = |scale: f32| {
+        crate::native_appearance::install_preferences(
+            crate::native_appearance::AppearancePreferences {
+                text_scale: scale,
+                ..crate::native_appearance::current_preferences()
+            },
+        );
+    };
+    // The theme in use, the window's width, and each frame's height and
+    // text size.
+    let mut cases = Vec::new();
+    for theme in ["One Dark", "Nord", "Dracula"] {
+        for width in [864.0, 1_144.0] {
+            for tall in [900.0, 700.0, 600.0, 520.0] {
+                for short in [462.0, 418.0, 380.0, 348.0] {
+                    cases.push((theme, width, (tall, 1.0), (short, 1.0)));
+                }
+            }
+            for height in [900.0, 700.0, 520.0] {
+                cases.push((theme, width, (height, 1.0), (height, 2.0)));
+            }
+        }
+    }
+    // Each case whose second frame did not show the row whole, and whether
+    // an event had let the landing go.
+    let lost = std::sync::Mutex::new(Vec::new());
+    on_workers(&cases, "landings measured again", |case| {
+        let &(theme, width, first, then) = case;
+        for let_go in [false, true] {
+            set_scale(first.1);
+            let (_service, mut runtime, instance, view) =
+                themes_view(&format!("theme = \"{theme}\"\n"));
+            let key = card_action(&runtime, view, theme);
+            let landed =
+                compile_settings_view(&runtime, instance, view, &view_cx_at(width, first.0));
+            assert!(
+                whole_in_list(&landed, &key),
+                "{case:?}: the page lands on {key}"
+            );
+            if let_go {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!()
+                };
+                state.settle_page_scroll();
+            }
+            set_scale(then.1);
+            let compiled =
+                compile_settings_view(&runtime, instance, view, &view_cx_at(width, then.0));
+            if !whole_in_list(&compiled, &key) {
+                lost.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((let_go, *case));
+            }
+        }
+    });
+    let lost = lost
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let kept: Vec<_> = lost.iter().filter(|(let_go, _)| !let_go).collect();
+    assert!(
+        kept.is_empty(),
+        "a frame measured again before any event keeps the theme in use whole: {kept:?}"
+    );
+    for (what, rescaled) in [("a resize", false), ("a text size", true)] {
+        assert!(
+            lost.iter()
+                .any(|(let_go, (_, _, first, then))| *let_go && (first.1 != then.1) == rescaled),
+            "the control: {what} after the landing was let go loses the row"
+        );
+    }
 }
 
 /// THE THEMES PAGE IS MEASURED, NEVER CUT: wherever the window is short,
@@ -5322,22 +5428,13 @@ fn needs_attention_holds_only_the_files_that_did_not_load() {
             1,
             "premise: one file failed"
         );
-        let _ = compile_settings_view(&runtime, instance, view, &cx);
-        let limit = state(&runtime, view).result_page_limit.get().unwrap_or(0);
-        for top in 0..=limit {
-            {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                    unreachable!()
-                };
-                state.page_scroll = top;
-                state.page_reveal = None;
-            }
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let cards = state(&runtime, view).showcase.cards.clone();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
             let Some(list) = compiled
                 .semantic(&UiKey::new(showcase_page::SHOWCASE_LIST))
                 .map(|node| node.rect)
             else {
-                continue;
+                return;
             };
             // On the list: the sidebar's captions sit beside it.
             let on_list = |rect: LogicalRect| {
@@ -5353,12 +5450,11 @@ fn needs_attention_holds_only_the_files_that_did_not_load() {
                     node.role == SemanticRole::Heading && !node.offscreen && on_list(node.rect)
                 })
                 .collect();
-            let showcase = &state(&runtime, view).showcase;
             for row in compiled.semantics.iter().filter(|node| {
                 node.role == SemanticRole::ListBoxOption && !node.offscreen && on_list(node.rect)
             }) {
                 let slug = row.key.as_str().trim_start_matches(ROW);
-                let Some(card) = showcase.card_by_slug(slug) else {
+                let Some(card) = cards.iter().find(|card| card.slug == slug) else {
                     continue;
                 };
                 if card.section == Section::Community {
@@ -5387,7 +5483,7 @@ fn needs_attention_holds_only_the_files_that_did_not_load() {
                     signature_captioned += 1;
                 }
             }
-        }
+        });
     }
     assert!(
         signature_captioned > 0,
@@ -5585,7 +5681,7 @@ fn colour_rows_show_the_colour_they_draw() {
 /// right edge whether or not a row has a Reset. A stacked row (the name over
 /// a page-wide field) fails it. The keyboard on a field left to the theme
 /// paints the theme's hex, whole, not the field's own words cut ("Theme…",
-/// the round-7 audit at every size): NEGATIVE CONTROL, those words,
+/// the audit at every size): NEGATIVE CONTROL, those words,
 /// "Theme (default)", are wider than the field.
 #[test]
 fn colour_rows_are_one_line_with_one_field_column() {
@@ -5830,7 +5926,7 @@ fn the_filter_clears_from_its_own_end() {
 fn every_listed_theme_is_in_the_tree_and_only_the_screen_is_live() {
     let cx = view_cx_at(1_284.0, 684.0);
     let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
-    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    let top = compile_settings_view(&runtime, instance, view, &cx);
     let order = state(&runtime, view).showcase.listed();
     assert!(order.len() > 12, "the list scrolls: {} rows", order.len());
     // Off the screen below it at the list's top, and above it at its end.
@@ -5881,7 +5977,7 @@ fn every_listed_theme_is_in_the_tree_and_only_the_screen_is_live() {
             .validate_parity()
             .expect("the screen keeps paint and hit parity");
     };
-    check(&compile_settings_view(&runtime, instance, view, &cx), "top");
+    check(&top, "top");
     focus_on(&mut runtime, view, &format!("{ROW}{}", order[0]));
     for _ in 0..order.len() {
         runtime
@@ -5931,8 +6027,10 @@ fn a_closed_disclosure_opens_for_a_row_it_holds() {
 /// row in the middle of the screen moves the list by the rows it adds, so
 /// that row stays where it was, and every row is in the tree once. (Two
 /// seatings in one render put the screen's rows off it too, and the page did
-/// not compile: `DuplicateKey`.) Negative control: seating that list a
-/// second time in the same render chooses another top.
+/// not compile: `DuplicateKey`.) Seated again before any event — the next
+/// frame — the list keeps that place. Negative control: once an event has
+/// taken the place, the scroll the render was asked to draw seats the list
+/// at another top.
 #[test]
 fn rows_added_over_the_keyboards_row_hold_its_place_and_list_each_row_once() {
     let cx = view_cx_at(1_284.0, 684.0);
@@ -6007,12 +6105,24 @@ fn rows_added_over_the_keyboards_row_hold_its_place_and_list_each_row_once() {
         "each listed row is in the tree once"
     );
 
-    let state = state(&runtime, view);
+    // The next frame, before any event, seats it there again.
+    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        unreachable!()
+    };
     let (plan, shown) = state.scroll_shown().expect("the render recorded it");
+    let asked = state.page_scroll;
     let reseated = state.seat_scroll(&mut plan.clone());
-    assert_ne!(
+    assert_eq!(
         reseated.start, shown.start,
-        "the control: a second seating in one render moves the list"
+        "a second seating before any event keeps the place"
+    );
+    // NEGATIVE CONTROL: once an event has taken that place, the scroll the
+    // render was asked to draw is a scroll away from it.
+    state.scroll_page_to(asked);
+    let scrolled = state.seat_scroll(&mut plan.clone());
+    assert_ne!(
+        scrolled.start, shown.start,
+        "the control: scrolled back to where it was asked, the list moves"
     );
 }
 
@@ -6728,12 +6838,6 @@ fn a_chooser_rows_name_comes_before_its_slab() {
 /// does not show that row whole.
 #[test]
 fn the_themes_page_opens_on_the_theme_in_use() {
-    let whole = |compiled: &crate::native_ui::CompiledUi, key: &str| {
-        let list = rect_of(compiled, "settings/showcase/list");
-        compiled.semantic(&UiKey::new(key)).is_some_and(|row| {
-            !row.offscreen && row.rect.y >= list.y - 0.5 && row.rect.bottom() <= list.bottom() + 0.5
-        })
-    };
     for (width, height) in [(864.0, 462.0), (1_144.0, 462.0)] {
         let cx = view_cx_at(width, height);
         for source in ["theme = \"One Dark\"\n", ""] {
@@ -6744,7 +6848,7 @@ fn the_themes_page_opens_on_the_theme_in_use() {
                 .expect("a highlighted row");
             let key = format!("settings/showcase/card/{slug}");
             assert!(
-                whole(&compiled, &key),
+                whole_in_list(&compiled, &key),
                 "{width}x{height} {source:?}: {key} is whole in the list"
             );
             if source.is_empty() {
@@ -6755,13 +6859,13 @@ fn the_themes_page_opens_on_the_theme_in_use() {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                     unreachable!()
                 };
-                state.page_scroll = 0;
+                state.scroll_page_to(0);
                 state.page_reveal = None;
                 state.scroll_record.replace(None);
             }
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             assert!(
-                !whole(&compiled, &key),
+                !whole_in_list(&compiled, &key),
                 "{width}x{height}: the control shows {key} from the top"
             );
         }
@@ -7222,12 +7326,12 @@ fn captions_over_no_colour(compiled: &crate::native_ui::CompiledUi, key: &str) -
 /// instance's 80x24, 584x348, `Selected text` showed 20 of its 32pt at the
 /// sheet's foot — and the 40pt Community disclosure and a NEEDS ATTENTION
 /// row's two lines left the rows after them cut at the chooser's foot; then
-/// the round-7 review of the stacked page, whose lists ended on a peek: every
+/// the review of the stacked page, whose lists ended on a peek: every
 /// screen but the last ended on a cut row, at 514x348 (70x24) the last
 /// screen of a one-row list cut "Follow system light/dark" under the filter,
 /// at 584x516 and 584x530 (80x36, 80x37) it kept BUILT IN over a cut GitHub
 /// Light, and at 584x558 (80x39) the sheet's last screen kept PALETTE over
-/// its first chips, scrolled under it; then the round-8 audit of the sheet's
+/// its first chips, scrolled under it; then the audit of the sheet's
 /// last screen, measured 4pt longer than it draws: at 80x37 and 106x24 it
 /// was PALETTE and "Choose a color to change it" over Save as, no chip on
 /// it, where the bright chips fitted over them, and the screen before it
@@ -7454,7 +7558,7 @@ fn land_writes(
 /// chooser, 2026-10-20: at 72x24 the chooser is 192pt so the demo beside it
 /// keeps its 40 cells, but the sheet in its place took 224.2pt to hold its
 /// colour rows on one line, and the demo, 255.8pt, moved right and wrapped
-/// its lines; then the round-7 audit: Reset's place came with the first
+/// its lines; then the audit: Reset's place came with the first
 /// colour set and went with the last reset, so at a Retina default window
 /// the first set moved the demo 18pt, and at the 1x default window every
 /// colour row went from one line to two and back). At 528, 556, 584, 766 and
@@ -7724,7 +7828,7 @@ fn no_screen_of_the_sheet_is_mostly_blank() {
     );
 }
 
-/// EVERY PALETTE CHIP IS A TARGET A POINTER CAN HIT (the round-7 audit of
+/// EVERY PALETTE CHIP IS A TARGET A POINTER CAN HIT (the audit of
 /// the sheet at 72x24: the chooser's 192pt kept eight chips to a row, 15.2pt
 /// targets 21.2pt apart, a 7pt sliver of colour in each; at a Retina 70x24
 /// 17.9pt, 23.9pt apart). At 528x348 and 556x348, on every screen of the

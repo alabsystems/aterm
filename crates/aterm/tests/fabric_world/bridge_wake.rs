@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **The bridge's prompt wake, and the roster backstop behind it.**
-//!
-//! A queued bus fetch or a post wakes the bridge through its own push event;
-//! when that event is lost, the roster round still delivers the post. Every
-//! assertion is an `until` over an observable the bridge publishes.
+//! The bridge's prompt wake, and the roster backstop behind it: a queued bus fetch or a
+//! post wakes the bridge through its own push event, and when that event is lost the
+//! roster round still delivers the post.
 
 use crate::harness;
 
@@ -30,25 +28,20 @@ fn a_queued_fetch_has_a_prompt_event_without_the_roster_drain() {
             .filter(|body| body.contains("state=live"))
             .map(|_| ())
     });
-    // AND THE PUSH LANE TO WATCH IT. The presence row is published by the
-    // bridge's roster read, which can list the new session before the push
-    // lane adopts it; a watch pushes only what is recorded after its seed, so
-    // a fetch event recorded in that window reaches no bridge, and with the
-    // roster drain disabled nothing answers. `watchers>=1` is aterm's own
-    // word that the seed happened (the adoption path registers only after it
-    // seeds, aterm-gui subscribe.rs), and every later event follows it.
+    // And the push lane must watch it: the roster read can list the session before
+    // the push lane adopts it, and a watch pushes only what is recorded after its
+    // seed, so with the roster drain off an earlier fetch event reaches nothing.
+    // `watchers>=1` is aterm's word that the seed happened.
     until("the push lane to watch the fetcher's session", || {
         (watchers(&w, &b)? >= 1).then_some(())
     });
     std::fs::write(w.state.join("skip-roster-outbox"), b"1\n").unwrap();
 
     let off = 1_000_000;
-    // A HANG DETECTOR, NOT A DEADLINE. The endpoint bounds one parked read at
-    // 10 s (`ERR timeout off=`) and frees its slot, so on a loaded machine the
-    // read is asked again, recording another `fetch` event, until the minute's
-    // hang detector. Promptness is proved by WHICH path answered — the roster
-    // drain is disabled and `fault-fired` says the event arrived — not by a
-    // clock.
+    // A hang detector, not a deadline: the endpoint bounds one parked read at 10 s
+    // (`ERR timeout off=`), so a loaded machine asks again. Promptness is proved by
+    // which path answered (the roster drain is off, `fault-fired` says the event
+    // arrived), not by a clock.
     let reply = until("the pushed fetch to be answered", || {
         let reply = w.verb(&format!("@{b} inbox get @{off}"));
         (!reply.header().starts_with("ERR timeout")).then_some(reply)

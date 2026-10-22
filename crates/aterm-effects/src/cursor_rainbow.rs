@@ -826,9 +826,7 @@ impl CursorRainbow {
         } else {
             fill
         };
-        // The flare (§7.1): on a v2 meteor's birth frame the block fills white
-        // (the vivid hue on a light theme), then springs back to `fill` on a
-        // critically damped `spring-snap`. `None` leaves `fill` untouched.
+        // The flare (§7.1): white on the birth frame, then a spring back to `fill`.
         let flare_age = cfg
             .flare_at
             .map(|t| now.saturating_duration_since(t).as_secs_f32());

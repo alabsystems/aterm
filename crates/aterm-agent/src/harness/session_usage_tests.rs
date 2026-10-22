@@ -49,9 +49,7 @@ fn output_of(fold: &TranscriptUsage, model: &str) -> u64 {
 
 const BIG: u64 = u64::MAX;
 
-// ---------------------------------------------------------------------------
 // The incremental fold
-// ---------------------------------------------------------------------------
 
 /// The cost rule: a re-read reads what was appended and nothing else — the
 /// appended bytes plus the one boundary byte — and a re-read of an unchanged
@@ -359,9 +357,7 @@ fn a_fifo_is_not_folded() {
     assert_eq!(cursor.bytes_read(), 0);
 }
 
-// ---------------------------------------------------------------------------
 // One session: the transcript and its subagents
-// ---------------------------------------------------------------------------
 
 /// The session's spend is its transcript's plus every subagent transcript
 /// the vendor keeps beside it (`<session>/subagents/…/agent-*.jsonl`) — and
@@ -1191,9 +1187,7 @@ fn a_missing_transcript_is_not_caught_up() {
     assert!(session.total_fold().per_model().is_empty());
 }
 
-// ---------------------------------------------------------------------------
 // The limit wall
-// ---------------------------------------------------------------------------
 
 /// The newest limit-notice row per window, as the fold keeps them.
 fn notices(rows: &[(&str, Option<&str>, i64)]) -> BTreeMap<String, LimitNoticeRow> {
@@ -1408,9 +1402,7 @@ fn a_span_is_said_as_the_local_clock() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The footer's text
-// ---------------------------------------------------------------------------
 
 fn spend(input: u64, output: u64, cache_write: u64, cache_read: u64) -> ModelSpend {
     ModelSpend {
@@ -1701,9 +1693,7 @@ fn unread_is_said_with_no_tokens_shown() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Its subagents' calls in flight (`super::super::flight`)
-// ---------------------------------------------------------------------------
 
 /// The measured rows of `testdata/flight/<name>`, the header left out, each
 /// with its newline.

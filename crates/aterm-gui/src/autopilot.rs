@@ -6,9 +6,9 @@
 //! Harness sets, and `aterm ctl @<sid> meta set autopilot` writes.
 //!
 //! **The modes** are aterm-agent's ([`Autopilot`]): `cruise` keeps the work
-//! going, and nothing the agent says ends it (FOREVER CRUISE), `land` lands
+//! going, and nothing the agent says ends it (Autopilot Cruise), `land` lands
 //! all of the work on the remote main branch and then types nothing until
-//! someone's turn (FOREVER LAND), `off` keeps the harness's hands off the
+//! someone's turn (Autopilot Land), `off` keeps the harness's hands off the
 //! session (plain Claude Code, the owner's A/B baseline). The ENGINE reads
 //! `land` at each point (its turn-end policy); the HOST implements `off`: it
 //! stops the session's worker and starts none while the word holds
@@ -749,7 +749,7 @@ pub(crate) fn land_at_field(land_at: Option<i64>) -> String {
 /// session's loop last told it (`open|landed|theirs`) for a supervisable
 /// agent session (`agent`) whose face this window knows (`told_here`: its
 /// host holds the live supervisor claim, or the live claim is a proven
-/// self-claim whose own acts tell it, FOREVER LAND §10.4), and `-` otherwise
+/// self-claim whose own acts tell it, Autopilot Land), and `-` otherwise
 /// — another process's supervisor sends no fact here, so a face it would
 /// leave stale is never printed, and `-` too before anyone has told one.
 #[must_use]

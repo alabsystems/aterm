@@ -719,10 +719,8 @@ fn a_team_mismatch_fails_the_self_check() {
     assert!(err.contains("TeamIdentifier"), "{err}");
 }
 
-// ---------------------------------------------------------------------------
 // The call sites that decide whether any of the above runs; each test names the mutation
 // it kills.
-// ---------------------------------------------------------------------------
 
 // --- step_sign's hook: `notarize_and_package` --------------------------------
 

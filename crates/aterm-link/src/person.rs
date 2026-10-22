@@ -693,9 +693,7 @@ fn went_silent(e: io::Error, bound: Duration) -> io::Error {
     }
 }
 
-// ---------------------------------------------------------------------------
 // mint-for
-// ---------------------------------------------------------------------------
 
 /// `aterm fabric mint-for`'s flags.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

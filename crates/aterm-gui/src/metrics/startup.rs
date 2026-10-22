@@ -648,7 +648,6 @@ fn derive_startup_attach(
     sample
 }
 
-// ---------------------------------------------------------------------------
 // BACKEND-BUILD WORKER — the inside of `backend_finalize`.
 //
 // `startup_attach_backend_finalize_ns` measures ONE `handle.join()`: the event
@@ -747,7 +746,6 @@ pub(crate) fn mark_backend_worker_done() {
     let _ = STARTUP.worker_done.set(Instant::now());
 }
 
-// ---------------------------------------------------------------------------
 // THE SUCCESSOR'S CLAIM TIMELINE (warm successor P0,
 // docs/DESIGN-warm-successor-2026-09-29.md "Where the milliseconds go").
 //
@@ -1069,7 +1067,6 @@ fn render_claim_timeline_log(inputs: &ClaimTimelineInputs) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
 // GUI PREPARATION, SPLIT (CS-2 of the 2026-10-15 launch audit).
 //
 // `startup_gui_prepare_ns` (GUI entry → ready for winit) was one number: on the

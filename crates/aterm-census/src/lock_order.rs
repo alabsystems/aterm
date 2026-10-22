@@ -568,9 +568,7 @@ const STANDARD_METHOD_NAMES: &[&str] = &[
     "try_write",
 ];
 
-// ---------------------------------------------------------------------------
 // Site model
-// ---------------------------------------------------------------------------
 
 /// The identity namespace of the aterm workspace crates, which carry no
 /// prefix; only vendored forks and absorbed crates do (`aterm_window::…`).
@@ -641,9 +639,7 @@ struct EdgeWitness {
     via: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
 // Lexical preprocessing
-// ---------------------------------------------------------------------------
 
 /// Mask string literals (`"…"`, honoring `\"`) and char literals with spaces,
 /// so token scans and brace counting never fire inside literal text.
@@ -871,9 +867,7 @@ fn logical_lines(body: &[String], start_line: usize) -> Vec<LogicalLine> {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Enclosing-impl resolution — the identity of a `self` receiver
-// ---------------------------------------------------------------------------
 
 /// Self types an `impl` may not lend to a `self`-rooted lock identity. An
 /// `impl .. for Mutex<T>` (or `Arc<T>`, `Box<T>`, …) is the extension-trait
@@ -1146,9 +1140,7 @@ fn impl_spans(text: &str) -> Vec<ImplSpan> {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Acquisition + identity resolution
-// ---------------------------------------------------------------------------
 
 /// A raw acquisition found on one logical line, ordered by byte position.
 struct RawAcq {
@@ -1677,9 +1669,7 @@ fn held_call_targets(line: &str) -> (Vec<TrustedCall>, Vec<FieldRecvCall>) {
     (out, field_recv)
 }
 
-// ---------------------------------------------------------------------------
 // Per-fn scan: sites, intra-fn edges, held calls
-// ---------------------------------------------------------------------------
 
 /// Everything the census learned about one fn.
 struct FnLockFacts {
@@ -2112,9 +2102,7 @@ fn scan_fn(
     facts
 }
 
-// ---------------------------------------------------------------------------
 // The census run
-// ---------------------------------------------------------------------------
 
 /// Append the why + repair block for a lock-order cycle. `invert` names the
 /// minority edge (fewest witness sites) — the single edge whose inversion
@@ -2148,8 +2136,6 @@ fn append_cycle_repair(log: &mut String, invert: &str) {
 /// The lock-order census's verdict title.
 const LOCKS: &str = "lock-order census";
 
-/// Run the lock-order census over the checkout at `root` (the directory
-/// holding `crates/`). A pure function of the source tree.
 pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     let mut log = String::new();
     let mut failures = 0usize;
@@ -3141,9 +3127,7 @@ mod tests {
         run_lock_order_census(&synth_tree("aterm-lock-census", name, &files))
     }
 
-    // ------------------------------------------------------------------
     // Walker unit tests
-    // ------------------------------------------------------------------
 
     /// The aliases ledger of a fn that has bound none.
     fn no_aliases() -> BTreeMap<String, (i32, String)> {
@@ -3528,9 +3512,7 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
     // Synthetic-tree tests: the census end-to-end, GREEN and RED.
-    // ------------------------------------------------------------------
 
     #[test]
     fn synthetic_diamond_without_cycle_is_green() {
@@ -4359,9 +4341,7 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
     // Vendored-identity mode.
-    // ------------------------------------------------------------------
 
     #[test]
     fn synthetic_vendored_identities_are_namespaced_and_never_merge() {

@@ -548,10 +548,8 @@ struct ExactSlot<K> {
 /// Host-side LRU of exact-size tiles (see the module docs for the budgets):
 /// the structure behind every exact-size roster, [`PetBaker`],
 /// [`DogBaker`](crate::dog_baker::DogBaker) and
-/// [`AnimalBaker`](crate::animal_baker::AnimalBaker).
-///
-/// `Default` is a valid empty baker; the first
-/// [`begin_frame`](ExactTileBaker::begin_frame) adopts the cell metrics.
+/// [`AnimalBaker`](crate::animal_baker::AnimalBaker). `Default` is a valid empty baker; the
+/// first [`begin_frame`](ExactTileBaker::begin_frame) adopts the cell metrics.
 pub struct ExactTileBaker<K> {
     slots: Vec<ExactSlot<K>>,
     /// Sum of resident tile bytes, kept incrementally so the [`MAX_ATLAS_BYTES`] bound is O(1)

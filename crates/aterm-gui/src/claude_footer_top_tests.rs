@@ -68,9 +68,12 @@ const LOCKUPS: [(aterm_phase::Program, Build); 6] = [
 /// last one's on a tie — over a row wholly on the ground; none where a cell
 /// is off it; for Muse Code (`muse`), also the whole rule from its first
 /// `─` to its last where its idle voice label stands at its left, no cell of
-/// it a cluster, a combining mark or an image (main's of 2026-10-21). What
-/// [`read_top_run`] must read, and the span the switch's placement oracle
-/// lays hb-int's switch in.
+/// it a cluster, a combining mark or an image (main's of 2026-10-21), and
+/// in a pane under 34 columns, where the label's own `──` is the longest
+/// run and at 32 columns the label ends the row, the whole rule to the
+/// label's closing blank (the lab of 2026-10-22). What [`read_top_run`] must
+/// read, and the span the switch's placement oracle lays hb-int's switch
+/// in.
 fn scan_run(
     scratch: &RenderInput,
     region: PaneTextRegion,
@@ -117,21 +120,30 @@ fn scan_run(
     }
     let mut voice = None;
     if muse
-        && let (Some(first), Some(last)) = (
+        && let (Some(first), Some(last), Some(ink)) = (
             pane_slice.iter().position(|c| c.ch == '\u{2500}'),
             pane_slice.iter().rposition(|c| c.ch == '\u{2500}'),
+            pane_slice
+                .iter()
+                .rposition(|c| c.ch != '\u{2500}' && c.ch != ' '),
         )
-        && first < best.start
+        && first < ink
     {
+        let label = (ink + 2).min(pane_slice.len());
+        let end = (last + 1).max(label);
         let text: String = pane_slice.iter().map(|c| c.ch).collect();
-        let untouched = (first..=last).all(|idx| {
+        let untouched = (first..end).all(|idx| {
             let col = region.col_off + idx;
             !touches(&scratch.clusters, frame_row, &(col..col + 1))
                 && !touches(&scratch.combining, frame_row, &(col..col + 1))
                 && !touches(&scratch.images, frame_row, &(col..col + 1))
         });
         if untouched && aterm_phase::muse::is_idle_voice_rule(&text) {
-            voice = Some((region.col_off + first, last + 1 - first));
+            voice = Some(VoiceRule {
+                col: region.col_off + first,
+                len: end - first,
+                label: label - first,
+            });
         }
     }
     Some(TopRun {
@@ -169,7 +181,11 @@ fn screen_with(cols: usize, top: &str) -> String {
 /// in its violet at the right, one `─` after it); in two styles, the left
 /// half's and the right's; with a cell off the ground (a highlight); with a
 /// combining mark mid-run; with Muse Code's idle voice label at the left
-/// (measured `4b4f55` rule, `8a9098` label), which Muse Code's lockup takes.
+/// (measured `4b4f55` rule, `8a9098` label), which Muse Code's lockup takes
+/// — down to 32 columns, where the label alone fills the row — and under
+/// 32 columns cut with `…` as Muse Code 1.4.11 cuts it (measured at 26, 28
+/// and 30 columns: the row's first `cols − 2` cells of the label, then
+/// `…`), which no lockup takes.
 fn top_rules(cols: usize) -> Vec<(&'static str, String)> {
     let gray = "\x1b[38;2;90;90;90m";
     let rule = |n: usize| "\u{2500}".repeat(n);
@@ -208,14 +224,23 @@ fn top_rules(cols: usize) -> Vec<(&'static str, String)> {
             ),
         ),
     ];
-    // The label alone is 32 cells: a rule it fills is no voice rule.
-    if cols >= 40 {
+    // The label and its closing blank are 32 cells.
+    if cols >= 32 {
         rules.push((
             "voice label",
             format!(
                 "\x1b[38;2;75;79;85m\u{2500}\u{2500}\x1b[38;2;138;144;152m Voice input (\u{2325} + v to start) \x1b[38;2;75;79;85m{}",
                 rule(cols - 32)
             ),
+        ));
+    } else {
+        let cut: String = " Voice input (\u{2325} + v to start)"
+            .chars()
+            .take(cols - 4)
+            .collect();
+        rules.push((
+            "voice label cut",
+            format!("\x1b[38;2;75;79;85m\u{2500}\u{2500}\x1b[38;2;138;144;152m{cut}\u{2026}"),
         ));
     }
     rules
@@ -280,7 +305,10 @@ fn key_for(
 /// icon's two blanks, the CLI's word. On Muse Code's idle voice label the
 /// lockup takes the label (owner, 2026-10-21): it stands at the rule's left
 /// and every cell of the label is written over, while any other program's
-/// line, and Muse's where no lockup is laid, leaves the label as drawn.
+/// line, and Muse's where no lockup is laid, leaves the label as drawn —
+/// down to the 32 columns the label alone fills, where the label's own
+/// `──` is the rule's longest run (the lab of 2026-10-22: under 34 columns
+/// nothing was laid on Muse's line), and never the cut label under that.
 ///
 /// NEGATIVE CONTROL: the comparison sees a difference — the plain rule's
 /// composition at a run one cell shorter is not the run's own.
@@ -293,7 +321,8 @@ fn the_switch_sits_where_the_scan_put_it_with_no_ghost() {
     let mut drawn = 0;
     let mut lockups = 0;
     let mut voiced = 0;
-    const COLS: [usize; 8] = [26, 30, 40, 52, 60, 80, 120, 200];
+    let mut narrow = std::collections::BTreeSet::new();
+    const COLS: [usize; 12] = [26, 30, 32, 33, 34, 36, 40, 52, 60, 80, 120, 200];
     for cols in COLS {
         for (what, top) in top_rules(cols) {
             let mut app = App::headless_for_test();
@@ -340,14 +369,20 @@ fn the_switch_sits_where_the_scan_put_it_with_no_ghost() {
                     };
                     compose_top(&key, &mut top, None);
                     let (laid, _) = laid_run(&key);
-                    if what == "voice label" {
+                    if what.starts_with("voice label") {
                         let mut after = before.clone();
                         for (k, cell) in top.cells.iter().enumerate() {
                             after[top.col + k] = *cell;
                         }
-                        let left: String = after[..LABEL].iter().map(|c| c.ch).collect();
-                        let was: String = before[..LABEL].iter().map(|c| c.ch).collect();
+                        // Under 32 columns the cut label's row ends at its `…`.
+                        let label = LABEL.min(before.len());
+                        let left: String = after[..label].iter().map(|c| c.ch).collect();
+                        let was: String = before[..label].iter().map(|c| c.ch).collect();
                         if muse && !top.lockup.is_empty() {
+                            assert_eq!(what, "voice label", "{at}: never the cut label");
+                            if cols < 40 {
+                                narrow.insert(cols);
+                            }
                             // The lockup took the label: at the rule's left,
                             // none of the label's words left on the glass.
                             assert_eq!(
@@ -446,6 +481,11 @@ fn the_switch_sits_where_the_scan_put_it_with_no_ghost() {
     assert!(drawn > 300, "most compositions lay a switch: {drawn}");
     assert!(lockups > 600, "most compositions lay the lockup: {lockups}");
     assert!(voiced > 0, "Muse Code's lockup took its label: {voiced}");
+    assert_eq!(
+        narrow.into_iter().collect::<Vec<_>>(),
+        [32, 33, 34, 36],
+        "Muse Code's lockup takes its label in a narrow pane"
+    );
 }
 
 /// The pane's frame row `row` as the glass shows it, char by char.
@@ -2132,7 +2172,8 @@ fn writes_only_the_run(
 /// — Claude Code 2.1.304's with its KEY tag at 26, 34, 61, 80, 120 and 144
 /// columns, the plain rule aterm's ghost stands on, agy 1.4.0's full-width
 /// rule, Muse Code 1.4.10's after its `── Voice input (⌥ + v to start) `
-/// label and Gemini CLI 0.46.0's full-width live-zone rule (`idle`,
+/// label (and 1.4.11's label alone, and cut with `…`, in a pane under 32
+/// columns) and Gemini CLI 0.46.0's full-width live-zone rule (`idle`,
 /// `end-of-turn`, `narrow-end-of-turn`; Codex's slab is
 /// `codex_gets_a_switch_only_as_codex_alab`'s) — each laid out again at every
 /// width from 20 to 160 the CLI draws
@@ -2143,8 +2184,8 @@ fn writes_only_the_run(
 /// Claude's tag, the ghost and the `─` after it are byte-identical before
 /// and after. Muse's idle label is the one cell range the lockup may take
 /// (owner, 2026-10-21): where it does, the lockup stands at the rule's left
-/// and none of the label's words are left; where it does not, the label is
-/// byte-identical.
+/// and none of the label's words are left; where it does not — the label
+/// cut, which may be any voice state's — the label is byte-identical.
 ///
 /// NEGATIVE CONTROL: Muse's composition on the plain run after its label,
 /// laid one cell left (a lead of `run.col − 1`), writes the label's last
@@ -2170,7 +2211,13 @@ fn marks_write_only_the_run() {
     };
     let muse: Line = |w| {
         let label = "\u{2500}\u{2500} Voice input (\u{2325} + v to start) ";
-        let r = "\u{2500}".repeat(w.checked_sub(label.chars().count())?);
+        let Some(fill) = w.checked_sub(label.chars().count()) else {
+            // Under 32 columns, cut as Muse Code 1.4.11 cuts it: the row's
+            // first `w − 2` cells of the label, then `…`.
+            let cut: String = label.chars().take(w - 2).chain(['\u{2026}']).collect();
+            return Some((cut.clone(), format!("\x1b[38;2;136;136;136m{cut}")));
+        };
+        let r = "\u{2500}".repeat(fill);
         Some((
             format!("{label}{r}"),
             format!("\x1b[38;2;136;136;136m{label}{r}"),

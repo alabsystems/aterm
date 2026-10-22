@@ -1033,7 +1033,7 @@ fn the_pages_press_acts_through_the_engine_and_words_the_outcome() {
     ));
 }
 
-/// ROUND 16 REVIEW (ruling 267): the page's status line (`Copied`) is
+/// REVIEW (ruling 267): the page's status line (`Copied`) is
 /// timed by the projections, and on a quiet page those came once a
 /// minute — so it stood one to two minutes, never about five seconds. The
 /// host now arms the publish that starts its clock and, five seconds on,
@@ -2427,7 +2427,7 @@ fn a_landed_update_leaves_no_outcome_row_that_said_it_had_not() {
 
 /// Every window of `app` shows its band on screen (`band_on_screen_for_test`):
 /// a row said there is seen, so it holds its time and folds, and nothing is owed
-/// (ATERM-KI-1015-2, U37: a row said where no band is seen waits to be seen).
+/// (U37: a row said where no band is seen waits to be seen).
 fn band_seen(app: &mut App) {
     for ws in app.windows.values_mut() {
         ws.band_on_screen_for_test = true;
@@ -4335,9 +4335,7 @@ fn a_frame_drawn_in_another_look_is_due_at_once() {
     assert_eq!(app.band_motion_due(now), vec![wid], "and back again");
 }
 
-// -----------------------------------------------------------------------
 // The update lane on the band.
-// -----------------------------------------------------------------------
 
 fn download(version: &str) -> aterm_update::Progress {
     aterm_update::Progress::Downloading {
@@ -5416,7 +5414,7 @@ fn notice_act_is_the_pages_press() {
     );
 }
 
-// ---- round 44: the second adversarial hunt's host repros -------------
+// ---- the second adversarial hunt's host repros -------------
 //
 // Each states the EXPECTED behaviour its candidate names and failed on
 // the code it was written against; the fix stage makes each pass.
@@ -5574,7 +5572,7 @@ fn r44_host3_a_retired_rows_live_intents_are_gone_from_the_page() {
 }
 
 /// AN UPDATE WARNING SAID WHILE NO WINDOW IS ON SCREEN IS SHOWN WHEN ONE IS,
-/// AS ONE ENTRY (ATERM-KI-1015-2, U37 and its review). The warning held its 45 s
+/// AS ONE ENTRY (U37 and its review). The warning held its 45 s
 /// from the post whether or not any window's band was on screen (minimized,
 /// fully covered, or no OS window at all), the kind stays latched for the
 /// launch, and no OS banner stands in for it unless desktop alerts are on — so a
@@ -5849,7 +5847,7 @@ fn an_owed_update_warning_is_shown_once_and_only_while_unanswered() {
 }
 
 /// AN OWED WARNING GOES WITH THE HANDOFF, AND WAITS FOR A BAND THAT IS SEEN (the
-/// reviews of ATERM-KI-1015-2, U37). A check warning said while no band was on screen
+/// reviews of , U37). A check warning said while no band was on screen
 /// is carried to the successor, which takes the warning up — its updater adopts the
 /// class as announced, so it is not said again — and owes it to its own windows. A
 /// handoff boot's windows start hidden and not yet occluded (`pending_reveal`), and
@@ -5928,7 +5926,7 @@ fn an_owed_update_warning_is_shown_by_the_successor_it_is_carried_to() {
 }
 
 /// THE LINUX WAIT FOR A START IS A NOTICE, NEVER A HEALTH WARNING (the review of
-/// ATERM-KI-1015-2, U21). On Linux every automatic install waits for the next
+/// , U21). On Linux every automatic install waits for the next
 /// aterm a person starts, so the updater's notice of that wait
 /// (`aterm_update::INSTALL_AWAITS_START_TITLE`) is an Info row under its own key:
 /// no banner is owed, no kind is latched, no row reads as a health warning, and
@@ -5994,7 +5992,7 @@ fn a_linux_install_waiting_for_a_start_is_a_notice_and_its_end_takes_it_down() {
     );
 }
 
-/// A SECOND LINUX CRASH LOOP IS A ROW OF ITS OWN (ATERM-KI-1015-2, U21). A newer
+/// A SECOND LINUX CRASH LOOP IS A ROW OF ITS OWN. A newer
 /// build installed over a crash loop's rollback crash-looped too before anything
 /// answered the first: the updater restated it, and the window's latch made it a
 /// log line, so no row said that a second build had failed. Each crash loop's end
@@ -6089,7 +6087,7 @@ fn a_linux_start_wait_said_unseen_is_shown_once_seen_unless_it_ended() {
 }
 
 /// AN OWED INSTALL WARNING IS ANSWERED BY THE LANDING IT IS CARRIED TO, NEVER
-/// SHOWN AGAIN BEFORE IT (the second review of ATERM-KI-1015-2, U37). The
+/// SHOWN AGAIN BEFORE IT (the second review of , U37). The
 /// overdue update's "Couldn't install updates" was said while no band was on
 /// screen and folded unseen; the automatic lane then applied the update. The
 /// handoff carried the warning as owed, and the successor posted it on its first
@@ -6444,7 +6442,7 @@ fn a_fixed_config_problem_is_logged_in_the_words_of_how_it_ended() {
     }
 }
 
-/// A RESTATEMENT CARRIES THE TITLE'S SHORT FORM (the review of round 6:
+/// A RESTATEMENT CARRIES THE TITLE'S SHORT FORM (
 /// [`restatement_of`], "every field a builder authored", left it out, and a
 /// restatement that changes the title drops the short form it had — so a
 /// tab's notice re-worded in place under a new title read, where the whole

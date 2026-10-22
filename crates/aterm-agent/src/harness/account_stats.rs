@@ -535,9 +535,7 @@ pub fn held_windows(
     held
 }
 
-// ---------------------------------------------------------------------------
 // The dollars
-// ---------------------------------------------------------------------------
 
 /// How a figure's source was read, for its resolution ([`spend::ReadingKind`]).
 fn reading_kind(source: &str) -> spend::ReadingKind {
@@ -602,9 +600,7 @@ pub fn dollars(look: &Look<'_>, view: &View, win: &Win) -> Option<spend::Figure>
     Some(spend::figure(spend, &ask))
 }
 
-// ---------------------------------------------------------------------------
 // The text
-// ---------------------------------------------------------------------------
 
 const DASH: &str = "\u{2014}";
 const DOT: &str = " \u{b7} ";
@@ -946,9 +942,7 @@ pub fn text(look: &Look<'_>, view: &View) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // The JSON (design §7.2, schema 1)
-// ---------------------------------------------------------------------------
 
 /// `key` as Unix seconds and `key_rfc3339` as the same instant in UTC, both
 /// `null` for an instant nobody read.

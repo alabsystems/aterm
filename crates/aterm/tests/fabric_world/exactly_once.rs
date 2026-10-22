@@ -26,16 +26,15 @@ use crate::harness;
 
 use harness::{FLEET, PERIODIC_DEADLINE, World, until, until_within};
 
-/// How many records sit on one session's `in` lane, by `Fetch` from zero — the
-/// authority a duplicate publish cannot hide behind (the endpoint ring dedups
-/// on `off=`, the log does not).
+/// How many records sit on one session's `in` lane, by `Fetch` from zero: a duplicate
+/// publish cannot hide here (the ring dedups on `off=`, the log does not).
 fn lane_len(w: &World, to_sid: &str, src: &str, kind: &str) -> usize {
     let lane = format!("/f/{FLEET}/in/{}/{to_sid}/{src}/{kind}", w.node);
     let (rows, _) = w.read(|c| c.fetch(0, &lane, 256)).expect("fetch the lane");
     rows.len()
 }
 
-/// The `msg` rows in B's inbox whose text matches, `--peek` so nothing is marked.
+/// The rows of `sid`'s inbox containing `needle` (`World::inbox` peeks, marking nothing).
 fn matching(w: &World, sid: &str, needle: &str) -> Vec<String> {
     w.inbox(sid)
         .into_iter()
@@ -43,20 +42,16 @@ fn matching(w: &World, sid: &str, needle: &str) -> Vec<String> {
         .collect()
 }
 
-/// **`post key=` IS EXACTLY ONCE ACROSS A BRIDGE RESTART AND A BROKER RESTART.**
-///
-/// The sender posts once under a key, then re-posts the identical body under the
-/// same key three times — as an agent would after an `ERR timeout` it could not
-/// tell from a loss — with a bridge kill and a broker restart in between. Every
-/// re-post answers the first record's offset with `dup=1`, and B's lane holds
-/// exactly one record throughout.
+/// One post under a key, then three identical re-posts under it (as after an `ERR timeout`
+/// indistinguishable from a loss), with a bridge kill and a broker restart between: each
+/// answers the first offset with `dup=1`, and B's lane holds one record throughout.
 #[test]
 fn post_key_is_exactly_once_across_a_bridge_and_a_broker_restart() {
     let mut w = World::boot("r15key", &[]);
     w.wait_ready();
     let (a, b) = w.two_sessions();
 
-    // The first post lands. `--wait` gives us the offset the key reserved.
+    // The first post lands; `--wait` answers the offset the key reserved.
     let first = w.verb(&format!(
         "@{a} post to=@{b} kind=note key=k-abc --wait=60000 only once"
     ));
@@ -82,7 +77,7 @@ fn post_key_is_exactly_once_across_a_bridge_and_a_broker_restart() {
         "one record after the first post"
     );
 
-    // A RE-POST under the same key, with a live bridge: deduped, same offset.
+    // A re-post under the same key, with a live bridge: deduped, same offset.
     let again = w.verb(&format!(
         "@{a} post to=@{b} kind=note key=k-abc --wait=60000 only once"
     ));
@@ -98,8 +93,8 @@ fn post_key_is_exactly_once_across_a_bridge_and_a_broker_restart() {
         "still one record after the re-post"
     );
 
-    // A RE-POST across a BRIDGE restart: the reservation is in the state dir the
-    // relaunched bridge reads, and the key rides the outbox peek.
+    // Across a bridge restart: the reservation is in the state dir the relaunched bridge
+    // reads, and the key rides the outbox peek.
     w.restart_bridge();
     let after_bridge = w.verb(&format!(
         "@{a} post to=@{b} kind=note key=k-abc --wait=60000 only once"
@@ -121,8 +116,8 @@ fn post_key_is_exactly_once_across_a_bridge_and_a_broker_restart() {
         "still one record after a bridge restart"
     );
 
-    // A RE-POST across a BROKER restart: R7 — the dedup map is rebuilt from the
-    // log, so the identical `(producer_id, producer_seq)` is still deduped.
+    // Across a broker restart: the broker rebuilds its `(producer_id, producer_seq)` dedup
+    // from the log (R7).
     w.stop_broker();
     w.start_broker();
     let after_broker = w.verb(&format!(
@@ -150,8 +145,8 @@ fn post_key_is_exactly_once_across_a_bridge_and_a_broker_restart() {
         "and one row in B's inbox"
     );
 
-    // NEGATIVE CONTROL: the guarantee is PER KEY — the same body under a fresh
-    // key is a fresh record.
+    // Negative control: the guarantee is per key, so the same body under a fresh key is a
+    // fresh record.
     let other = w.verb(&format!(
         "@{a} post to=@{b} kind=note key=k-other --wait=60000 only once"
     ));
@@ -170,20 +165,16 @@ fn post_key_is_exactly_once_across_a_bridge_and_a_broker_restart() {
     );
 }
 
-/// **A DEADLINE THAT PASSES WITH NO ANSWER YIELDS EXACTLY ONE `expired` ROW ON
-/// THE ASKER'S LANE (R8), AND NONE WHEN AN ANSWER ARRIVED FIRST.**
-///
-/// The broker holds no timers; the asker's OWN bridge notices on its sweep and
-/// publishes `expired re=<off> dl=<ms>` into the asker's own inbox. A second ask
-/// is answered before its deadline and never earns a verdict.
+/// A deadline that passes unanswered yields exactly one `expired` row on the asker's lane
+/// (R8), and an ask answered first yields none. The broker holds no timers: the asker's own
+/// bridge publishes `expired re=<off> dl=<ms>` into the asker's inbox.
 #[test]
 fn a_deadline_that_passes_records_one_expired_and_an_answered_one_records_none() {
     let w = World::boot("r15dl", &[]);
     w.wait_ready();
     let (a, b) = w.two_sessions();
 
-    // A short deadline, no reply. `--wait=0` is not passed — we want the offset,
-    // so a normal wait for the landing.
+    // A short deadline and no reply; `--wait` returns the ask's offset.
     let asked = w.verb(&format!(
         "@{a} post to=@{b} kind=ask dl=200 --wait=60000 unanswered?"
     ));
@@ -200,7 +191,7 @@ fn a_deadline_that_passes_records_one_expired_and_an_answered_one_records_none()
         .and_then(|n| n.parse().ok())
         .expect("the ask offset");
 
-    // A second ask, ANSWERED before its (longer) deadline passes.
+    // A second ask, answered before its longer deadline passes.
     let answered = w.verb(&format!(
         "@{a} post to=@{b} kind=ask dl=60000 --wait=60000 answered?"
     ));
@@ -216,10 +207,8 @@ fn a_deadline_that_passes_records_one_expired_and_an_answered_one_records_none()
     ));
     assert!(ans.ok(), "answer: {}", ans.header());
 
-    // The asker's bridge records `expired re=<ask_off>` on the asker's own lane.
-    // The bridge arms this ask's due time, then checks the bus before recording
-    // expiry. The bound includes that check and the machine, not a free-running
-    // quarter-second timer.
+    // The asker's bridge checks the bus before recording `expired re=<ask_off>`, so the
+    // bound is `PERIODIC_DEADLINE`, not the 200 ms deadline.
     let expired = until_within(
         PERIODIC_DEADLINE,
         "the asker's bridge to record expired",
@@ -234,19 +223,16 @@ fn a_deadline_that_passes_records_one_expired_and_an_answered_one_records_none()
         "the verdict echoes the deadline: {expired}"
     );
 
-    // EXACTLY ONE, on the lane itself (the ring would dedup a second delivery on
-    // off=, so the lane is the sharper count). The sweep removes the entry on the
-    // tick it publishes, so there is nothing left to repeat — and even a
-    // relaunched bridge reading a stale durable table checks the bus first and
-    // finds this very record. The `aterm fabric` WARNINGS wiring that lists it is
-    // pinned by the unit test `an_ask_past_its_deadline_with_no_reply_is_a_warning`.
+    // Exactly one, counted on the lane (the ring would dedup a second delivery on `off=`).
+    // The sweep drops the entry on the tick it publishes, and a relaunched bridge reading a
+    // stale durable table checks the bus first and finds this record.
     assert_eq!(
         lane_len(&w, &a, &w.node, "expired"),
         1,
         "exactly one expired record on the asker's lane, never a repeat"
     );
 
-    // The ANSWERED ask never earns a verdict: no expired row names its offset.
+    // The answered ask never earns a verdict: no expired row names its offset.
     assert!(
         matching(&w, &a, &format!("re={answered_off}"))
             .iter()
@@ -258,28 +244,15 @@ fn a_deadline_that_passes_records_one_expired_and_an_answered_one_records_none()
 /// **A KEYED RE-POST IS RESOLVED AGAINST THE LIVE ROSTER BEFORE ITS KEY CHOOSES A
 /// SEQUENCE — and the key still names its one record.**
 ///
-/// `drain_outbox` re-reads the endpoint's roster before it resolves a single
-/// address, because the bridge's REMEMBERED roster can still list a session
-/// that has gone. The idempotency key sits INSIDE that door: the address is
-/// resolved, and only a post that routes has its key looked up and its
-/// sequence reused. The two meet on a re-post under a key whose recipient has
-/// left — the one case where
-/// the key alone would have "worked": a stale roster routes it, the reserved
-/// sequence dedups, and the sender hears `OK off=<first> dup=1` for a door that
-/// never checked the session was still there.
+/// With the `session-exited` line held back
+/// (`ATERM_LINK_FAULT=drop-session-exited-while-marked`, the state a `GAP`, a late attach or
+/// a lost push fd leaves):
 ///
-/// The merged rule, asserted here with the `session-exited` line held back
-/// (`ATERM_LINK_FAULT=drop-session-exited-while-marked`, the state a `GAP`, a late
-/// attach or a lost push fd leaves) so the stale picture is guaranteed rather than
-/// raced:
-///
-/// * the re-post to the departed session is retired `unroutable`, like any post
-///   the door cannot route, and puts NOTHING on the bus (its lane still holds the
-///   first record alone);
-/// * that retirement neither consumes nor re-points the key: a later re-post under
-///   it that DOES route answers the first record's offset `dup=1` — the broker's
-///   `(producer_id, producer_seq)` dedup, not the address, is what makes a key one
-///   record — and appends nothing to the new address's lane either.
+/// * the re-post to the departed session is retired `unroutable` and puts nothing on the
+///   bus;
+/// * the retirement neither consumes nor re-points the key: a later re-post that routes
+///   answers the first record's offset `dup=1` (the broker's dedup, not the address, makes
+///   a key one record) and appends nothing to the new lane either.
 #[test]
 fn a_keyed_re_post_to_a_session_whose_exit_line_never_arrives_is_unroutable_and_the_key_holds() {
     let w = World::boot_with(
@@ -288,7 +261,7 @@ fn a_keyed_re_post_to_a_session_whose_exit_line_never_arrives_is_unroutable_and_
         &[("ATERM_LINK_FAULT", "drop-session-exited-while-marked")],
     );
     w.wait_ready();
-    // OPEN THE WINDOW BEFORE THE SESSION THAT WILL FALL INTO IT EXISTS.
+    // Arm the fault before the session that will fall into it exists.
     std::fs::write(w.state.join("drop-session-exited"), b"1\n").expect("arm the dropped line");
     let (a, b) = w.two_sessions();
     let spawned = w.verb("spawn");
@@ -303,7 +276,7 @@ fn a_keyed_re_post_to_a_session_whose_exit_line_never_arrives_is_unroutable_and_
         (w.sessions().len() >= 3).then_some(())
     });
 
-    // THE FABRIC HAS ADVERTISED THE PEER, so a stale `live` row exists to lie.
+    // The fabric has advertised the peer, so a stale `live` row exists to lie.
     let presence = format!("/f/{FLEET}/pub/{}/{b}/presence", w.node);
     until("the peer's presence row to say live", || {
         w.row(&presence)
@@ -320,15 +293,14 @@ fn a_keyed_re_post_to_a_session_whose_exit_line_never_arrives_is_unroutable_and_
         "one record after the first post"
     );
 
-    // THE PEER GOES, and the bridge is never told.
+    // The peer goes, and the bridge is never told.
     assert!(w.verb(&format!("@{b} close")).ok(), "close the peer");
     until("the peer to leave the roster", || {
         (!w.sessions().iter().any(|(_, sid, _)| *sid == b)).then_some(())
     });
 
-    // THE RE-POST UNDER THE SAME KEY, TO THE SESSION THAT WENT: the door asks the
-    // endpoint, finds no such session, and retires it — no `dup=1` off a stale
-    // route.
+    // The re-post to the session that went: the door asks the endpoint, finds no such
+    // session and retires it, with no `dup=1` off a stale route.
     let gone = w.verb(&format!(
         "@{a} post to=@{b} kind=note key=k-gone --wait=60000 once only"
     ));
@@ -343,8 +315,8 @@ fn a_keyed_re_post_to_a_session_whose_exit_line_never_arrives_is_unroutable_and_
         "nothing appended to the departed session's face"
     );
 
-    // THE KEY STILL NAMES ITS RECORD. A re-post under it that routes answers the
-    // first record, and the new address's lane gets nothing.
+    // The key still names its record: a re-post under it that routes answers the first
+    // record, and the new address's lane gets nothing.
     let routed = w.verb(&format!(
         "@{a} post to=@{c} kind=note key=k-gone --wait=60000 once only"
     ));
@@ -367,21 +339,15 @@ fn a_keyed_re_post_to_a_session_whose_exit_line_never_arrives_is_unroutable_and_
     );
 }
 
-/// **A DEDUPED ANSWER TO A SEQUENCE THE BRIDGE NEVER SENT IS A COLLISION, NOT
-/// A RETRY (DF §6.2):** nothing is remembered as the node's own, the
-/// connection is dropped so the re-attach rolls the incarnation past the
-/// claimed range, and `ev cap-compromised … reason=deduped` names the
-/// sequence and the other writer's offset.
+/// A deduped answer to a sequence the bridge never sent is a collision, not a retry
+/// (DF §6.2): nothing is remembered as the node's own, the connection drops so the
+/// re-attach rolls the incarnation past the claimed range, and `ev cap-compromised …
+/// reason=deduped` names the sequence and the other writer's offset.
 ///
-/// Ordered, not raced: the broker is taken away, so the bridge is detached and
-/// reserves nothing, and while it is away the test — as a holder of the fleet
-/// root, publishing under the NODE's producer id — claims the first sequence
-/// of the incarnation the next attach will take, on a scratch socket the
-/// bridge does not dial. Then the broker is served on its own path again, and
-/// the bridge's `live` row is that sequence's first send.
-///
-/// Negative control: with the dedup taken as success, the attach goes on with
-/// no `live` row on the bus and no alarm, and the alarm wait below fails.
+/// Ordered, not raced: with the broker away the bridge reserves nothing, and the test,
+/// holding the fleet root, claims the next incarnation's first sequence under the node's
+/// producer id on a scratch socket. The broker then returns on its own path, and the
+/// bridge's `live` row is that sequence's first send.
 #[test]
 fn a_deduped_first_send_is_a_collision_that_rolls_the_incarnation() {
     let mut w = World::boot("collide", &[]);
@@ -435,8 +401,8 @@ fn a_deduped_first_send_is_a_collision_that_rolls_the_incarnation() {
         !acked.split(',').any(|o| o == claimed_off.to_string()),
         "the other writer's offset was remembered as the node's own: {acked}"
     );
-    // AND THE NODE STILL WORKS under the new incarnation: `start_broker`
-    // returned on the `connected` of the attach that took it.
+    // The node still works under the new incarnation (`start_broker` returned on the
+    // attach that took it).
     let posted = w.verb(&format!("@{a} post to=@{b} kind=note --wait=60000 rolled"));
     assert!(
         posted.ok(),

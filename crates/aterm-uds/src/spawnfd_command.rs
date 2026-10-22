@@ -747,9 +747,7 @@ fn set_nonblocking(fd: RawFd, on: bool) -> io::Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Darwin: posix_spawn, CLOEXEC_DEFAULT
-// ---------------------------------------------------------------------------
 
 #[cfg(target_vendor = "apple")]
 type Handle = super::LaneChild;
@@ -917,9 +915,7 @@ impl Command {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Elsewhere: std's fork, with the strip in the child
-// ---------------------------------------------------------------------------
 
 /// A `std` child: on drop collected if it has exited, else handed to
 /// [`crate::reaper`].

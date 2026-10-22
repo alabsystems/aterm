@@ -15,7 +15,7 @@
 //!   [`harden_file`]/[`set_mode`] are no-ops, [`dir_meta_is_private`] is a best-effort
 //!   `true`, [`permission_mode`]/[`our_uid`] report a not-applicable sentinel.
 //! * **Disk**: [`volume_free_bytes`] calls `GetDiskFreeSpaceExW` instead of `statvfs`;
-//!   both fail **OPEN** (`None` on any error).
+//!   both fail open (`None` on any error).
 //! * **Exec**: [`exec_or_run`] is `spawn().wait()` + `process::exit` (no `execve`).
 //!
 //! `ensure_private_dir` and [`FileLock`] come from `aterm_update_core` on both
@@ -122,7 +122,7 @@ pub(crate) fn make_dirs_born(dir: &Path, mode: u32) -> io::Result<()> {
     }
 }
 
-/// Make one open file or directory DURABLE: the barrier an atomic publish takes on its
+/// Make one open file or directory durable: the barrier an atomic publish takes on its
 /// temp before the rename, and [`crate::store::sync_dir`] on the directory after it:
 /// [`aterm_durable::durable`], which on Apple targets is `fcntl(F_FULLFSYNC)`, a
 /// drive-cache flush. A write that needs only its order kept takes
@@ -311,11 +311,9 @@ pub fn shim_executable_env(
     shim_executable_to_env(shim, &build_bin_dir.join(tool.exe_file()), env)
 }
 
-// ---------------------------------------------------------------------------
 // Pure `.cmd` shim formatting/parsing, compiled under `cfg(any(windows, test))` so the
 // Unix tests cover the Windows format. The frame ([`CMD_FRAME_HEAD`], [`cmd_framed`])
 // compiles everywhere: `crate::stub` picks its `.cmd` renderer at runtime (`cfg!(windows)`).
-// ---------------------------------------------------------------------------
 
 /// The tail of every `.cmd` forward line after the target's closing quote:
 /// `@"<target>" %* & @exit /b`. `cmd.exe` parses a line whole before running any of it, so
@@ -827,7 +825,7 @@ pub(crate) fn sh_shim_content_routed(
     env: &crate::shim_env::ShimEnv,
     route: Option<&Path>,
 ) -> String {
-    sh_shim_body(target, env, route, "")
+    sh_shim_body(target, env, route, None, "")
 }
 
 /// The note line of the legacy `sh` landing prelude ([`sh_landing_prelude`]).
@@ -1359,7 +1357,19 @@ pub(crate) fn sh_shim_content_twin(
     route: Option<&Path>,
     prelude: &str,
 ) -> String {
-    sh_shim_body(target, env, route, prelude)
+    sh_shim_body(target, env, route, None, prelude)
+}
+
+/// An admitted ALab primary runs through its stable exec entry. Keep the final physical
+/// target line for the package ownership readers; the guarded exec preserves argv0.
+#[cfg(unix)]
+pub(crate) fn sh_shim_content_managed(
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+    launch: &Path,
+    prelude: &str,
+) -> String {
+    sh_shim_body(target, env, None, Some(launch), prelude)
 }
 
 /// The one body every Unix shim renders through — see [`sh_shim_content_routed`] for
@@ -1369,6 +1379,7 @@ fn sh_shim_body(
     target: &Path,
     env: &crate::shim_env::ShimEnv,
     route: Option<&Path>,
+    launch: Option<&Path>,
     prelude: &str,
 ) -> String {
     let mut s = String::from(
@@ -1396,6 +1407,16 @@ fn sh_shim_body(
         s.push_str(&block);
     }
     let target_q = sh_shim_quote(target);
+    if let Some(launch) = launch {
+        let launch = sh_shim_quote(launch);
+        s.push_str("[ -L ");
+        s.push_str(&launch);
+        s.push_str(" ] && [ -x ");
+        s.push_str(&launch);
+        s.push_str(" ] && exec ");
+        s.push_str(&launch);
+        s.push_str(" \"$@\"\n");
+    }
     if let Some(route) = route {
         let marker = route
             .parent()
@@ -2257,10 +2278,8 @@ mod sh_shim_tests {
         install_shim_to_env(&shim, &target, &env).unwrap();
         assert_eq!(resolve_shim(&shim).as_deref(), Some(target.as_path()));
         assert_eq!(shim_env_of(&shim), env);
-        // The test's own process may run under a managed agent shim that already
-        // exports DISABLE_AUTOUPDATER=1 (an aterm-spawned Claude Code session does);
-        // the child must see only what the shim under test lays, so scrub the
-        // ambient copy from both invocations.
+        // The ambient environment may already export DISABLE_AUTOUPDATER (an aterm-spawned
+        // Claude Code does): scrub it so the child sees only what the shim lays.
         // Each shim was just laid: past the `ETXTBSY` a sibling test's fork can hold it in.
         let run_shim = || {
             aterm_spec::wait::past_text_busy(|| {

@@ -33,8 +33,9 @@ astream-digest = { path = "crates/astream-digest", version = "0.2.0" }
 # `astream-aead = "^0.1.0"` against a 0.2.0 crate, so `pub bump` undid itself).
 astream-cap = { path = "crates/astream-cap", version = "0.2.0" }
 astream-aead = { path = "crates/astream-aead", version = "0.2.0" }
-# The durable log's OS cordon (F_BARRIERFSYNC, the boot session id): zero dependencies,
-# its only unsafe confined to one cfg(target_vendor = "apple") module.
+# The OS cordon (F_BARRIERFSYNC, the boot session id, the owner-only file rule): zero
+# dependencies, its only unsafe confined to two modules, cfg(target_vendor = "apple")
+# and cfg(unix).
 astream-sys = { path = "crates/astream-sys", version = "0.2.0" }
 # Third-party (crates.io only — no git, no path-to-private):
 serde = { version = "1.0", features = ["derive"] }

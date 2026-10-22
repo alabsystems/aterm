@@ -710,10 +710,8 @@ impl MessageView {
             "aged" => after("aged out"),
             "superseded" => "replaced".to_string(),
             // The outcome the echo showed, never "cleared" over a failure
-            // (`resolve(Warn)` is failed or refused). Work that was delivered
-            // or a problem that was fixed (its record now reads ✓ Success)
-            // took its span; anything else withdrawn lasted it, never the
-            // wire's `withdrawn`, nor `done` under a fixed warning.
+            // (`resolve(Warn)` is failed or refused): delivered work or a fixed problem
+            // (now ✓ Success) took its span; anything else withdrawn lasted it.
             "resolved-ok" | "withdrawn" => match (&story, self.severity) {
                 (Some(span), "success") => format!("took {span}"),
                 (Some(span), _) => format!("lasted {span}"),
@@ -1016,8 +1014,8 @@ pub fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
         (Intent::ShowTab { .. }, false) => "That tab is gone".to_string(),
         (Intent::ShowSession { .. }, true) => "Showed session".to_string(),
         (Intent::ShowSession { .. }, false) => "That session is gone".to_string(),
-        // Written off this thread and queued, not done: what it did lands as
-        // the pressed entry's own words, or as a row if the harness refuses it.
+        // Queued, not done: what it did lands as the pressed entry's own words, or as
+        // a row if the harness refuses it.
         (Intent::AgentUpgrade { .. }, true) => {
             format!("Sent {}; what it did shows in this log", intent.label())
         }

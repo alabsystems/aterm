@@ -154,7 +154,7 @@ pub fn hdr_screen_upgrade_decision(
     hdr_screen_upgrade_wants_f16(hdr_glow, supports_f16, false, screen_edr_potential())
 }
 
-/// PRESENT: what the HDR path does THIS present. See [`HdrPlan`].
+/// Present: what the HDR path does on this present. See [`HdrPlan`].
 #[must_use]
 #[inline]
 pub const fn hdr_present_plan(

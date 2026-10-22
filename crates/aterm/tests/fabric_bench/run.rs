@@ -111,9 +111,7 @@ const SUPERVISOR_HEALTHY: Duration = Duration::from_millis(5_500);
 /// load on the broker being measured.
 const PID_POLL: Duration = Duration::from_millis(1);
 
-// ---------------------------------------------------------------------------
 // the control-socket verbs the phases speak
-// ---------------------------------------------------------------------------
 
 fn request(ctl: &mut Ctl, line: &str) -> Reply {
     ctl.request(line).unwrap_or_else(|e| panic!("{line}: {e}"))
@@ -557,9 +555,7 @@ fn await_durable(broker: &Broker) {
     });
 }
 
-// ---------------------------------------------------------------------------
 // the broker's flushes, counted
-// ---------------------------------------------------------------------------
 
 /// The flushes a window cost: `after - before`, field by field, of
 /// [`Broker::flush_counts`] read at its two ends (under the log lock, so each
@@ -656,9 +652,7 @@ fn ticks_line(t: Ticks) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
 // the yardstick: the disk, measured beside the stack
-// ---------------------------------------------------------------------------
 
 /// Publishes in one yardstick block.
 const CALIBRATION_PUBLISHES: usize = 50;
@@ -938,9 +932,7 @@ fn fmt_x(v: Option<f64>) -> String {
     v.map_or("–".to_string(), |v| format!("{v:.2}"))
 }
 
-// ---------------------------------------------------------------------------
 // 1. messaging
-// ---------------------------------------------------------------------------
 
 /// One measured round trip.
 struct LatSample {
@@ -1528,9 +1520,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     (json, md)
 }
 
-// ---------------------------------------------------------------------------
 // 2. attach
-// ---------------------------------------------------------------------------
 
 /// One bridge restart.
 struct Round {
@@ -2009,9 +1999,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     (json, md)
 }
 
-// ---------------------------------------------------------------------------
 // the run
-// ---------------------------------------------------------------------------
 
 /// What the run's broker promised, for the report's head and its JSON. Each
 /// world's section also says what its broker SERVES, read from the broker

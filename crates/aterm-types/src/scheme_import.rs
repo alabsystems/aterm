@@ -834,9 +834,7 @@ fn line_of(text: &str, offset: usize) -> usize {
         .saturating_add(1)
 }
 
-// ---------------------------------------------------------------------------
 // aterm (native)
-// ---------------------------------------------------------------------------
 
 fn convert_native(text: &str) -> Result<ImportReport, ImportError> {
     match parse_theme_str(text) {
@@ -878,9 +876,7 @@ fn convert_native(text: &str) -> Result<ImportReport, ImportError> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // kitty
-// ---------------------------------------------------------------------------
 
 /// kitty: `key value` lines, `#` comments, and the kitty-themes metadata
 /// comments (`## name: …`, `## author: …`, `## blurb: …`). Later lines win.
@@ -951,9 +947,7 @@ fn convert_kitty(text: &str) -> Result<ImportReport, ImportError> {
     draft.finish()
 }
 
-// ---------------------------------------------------------------------------
 // Ghostty
-// ---------------------------------------------------------------------------
 
 /// Ghostty: `key = value` lines with hyphenated keys, `palette = N=#hex`.
 /// Later lines win.
@@ -1004,9 +998,7 @@ fn convert_ghostty(text: &str) -> Result<ImportReport, ImportError> {
     draft.finish()
 }
 
-// ---------------------------------------------------------------------------
 // Alacritty (a TOML subset)
-// ---------------------------------------------------------------------------
 
 /// Where `#` starts a comment in a TOML line (outside strings), or the
 /// line's length.
@@ -1268,9 +1260,7 @@ fn alacritty_assign(draft: &mut Draft, path: &[String], value: Option<&str>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // iTerm2 (.itermcolors, an XML property list)
-// ---------------------------------------------------------------------------
 
 /// A property-list value, reduced to what a colour theme needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -1594,9 +1584,7 @@ fn convert_iterm(text: &str) -> Result<ImportReport, ImportError> {
     draft.finish()
 }
 
-// ---------------------------------------------------------------------------
 // Windows Terminal (JSON, with comments and trailing commas)
-// ---------------------------------------------------------------------------
 
 /// A JSON value, reduced to what a colour scheme needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -1918,9 +1906,7 @@ fn scheme_objects(items: &[JsonValue]) -> Vec<&[(String, JsonValue)]> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
 // base16 / base24 (YAML)
-// ---------------------------------------------------------------------------
 
 /// The base16 / base24 slot names, `base00` … `base17`.
 const BASE_NAMES: [&str; 24] = [

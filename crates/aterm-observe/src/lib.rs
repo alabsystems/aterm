@@ -250,7 +250,7 @@ pub const fn decode_row_verdict_wire(bytes: &[u8]) -> Option<(RowVerdict, u16, u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aterm_core::terminal::{ClockReading, RowRange, Terminal};
+    use aterm_core::terminal::{ClockReading, GONE_SETTLE, RowRange, Terminal};
     use std::time::{Duration, Instant};
 
     fn clock_at(base: Instant, off_ms: u64) -> ClockReading {
@@ -298,20 +298,30 @@ mod tests {
         );
     }
 
-    /// The inverse predicate, level-triggered: a surface with no matching row
-    /// latches AT ARM (the `watch_rows_gone` immediate eval), so an agent asking
-    /// "is the busy footer gone?" of an already-finished turn is told yes now.
+    /// The inverse predicate, level-triggered: a surface with no matching row,
+    /// unchanged for `GONE_SETTLE`, latches AT ARM (the `watch_rows_gone`
+    /// immediate eval), so an agent asking "is the busy footer gone?" of an
+    /// already-finished turn is told yes now. Drawn more recently, with no closed
+    /// DEC 2026 frame to vouch for it, it settles to `GONE_SETTLE` past its last
+    /// change.
     #[test]
     fn row_gone_latches_immediately_if_nothing_matches() {
         let base = Instant::now();
         let mut t = Terminal::new(24, 80);
         t.process_at(b"Done.\r\n", clock_at(base, 5));
+        let drawn = base + Duration::from_millis(5);
         let m = row_matcher("esc to interrupt").expect("compile");
-        let id = t.watch_rows_gone(m, RowRange::All, base).expect("arm");
+        let id = t
+            .watch_rows_gone(m.clone(), RowRange::All, drawn + GONE_SETTLE)
+            .expect("arm");
         assert!(
             t.watch_poll(id).is_some(),
             "no matching row at arm => latched at arm time"
         );
+        let recent = t.watch_rows_gone(m, RowRange::All, drawn).expect("arm");
+        assert!(t.watch_poll(recent).is_none(), "drawn just now: settling");
+        assert!(t.watch_expire(drawn + GONE_SETTLE));
+        assert!(t.watch_poll(recent).is_some());
     }
 
     /// The inverse of `row_matcher_latches_on_real_engine_output`, through the
@@ -339,8 +349,11 @@ mod tests {
             "content advanced but the row is still visible => still pending"
         );
 
-        // Clear the screen (home + ED 2): the footer leaves => latched.
+        // Clear the screen (home + ED 2): the footer leaves => latched once the
+        // range has read clear for `GONE_SETTLE` (no closed frame vouches for it).
         t.process_at(b"\x1b[H\x1b[2JDone.\r\n", clock_at(base, 20));
+        assert!(t.watch_poll(id).is_none(), "settling");
+        assert!(t.watch_expire(base + Duration::from_millis(20) + GONE_SETTLE));
         let sat = t
             .watch_poll(id)
             .expect("the row leaving the real surface latched `gone`");
@@ -386,8 +399,10 @@ mod tests {
             "a readable match holds `gone`"
         );
 
-        // The match leaves: every row is read and clear, so `gone` latches.
+        // The match leaves: every row is read and clear, so `gone` latches once
+        // it has stayed so for `GONE_SETTLE`.
         t.process_at(b"\x1b[H\x1b[2JDone.\r\n", clock_at(base, 30));
+        assert!(t.watch_expire(base + Duration::from_millis(30) + GONE_SETTLE));
         assert!(t.watch_poll(gone).is_some(), "the row left => `gone`");
     }
 

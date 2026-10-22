@@ -7,48 +7,34 @@
 
 use aterm_spec::derive::*;
 
-/// TERMINAL MODES — the DEC/ANSI mode-flag state machine the VT handler
-/// maintains, and the reset discipline over it. The 28 actions are exactly the
-/// `#[refines(machine="terminal_modes", action=…)]` set in
-/// `aterm-core/src/terminal/handler_{dec,dec_refinement,esc,state,report}.rs`:
-/// thirteen `Set*`/`Reset*` toggle pairs and the two resets (`SoftReset` =
-/// DECSTR, `FullReset` = RIS). The DEC modes the handler does NOT model (VT52,
-/// 132-column, reverse video, BiDi, …) are `#[spec_unmodeled(reason=…)]`
-/// waivers, not actions here.
+/// Terminal modes: the DEC/ANSI mode-flag state machine the VT handler maintains, and the
+/// reset discipline over it. The 28 actions are exactly the
+/// `#[refines(machine = "terminal_modes", action = …)]` set in
+/// `aterm-core/src/terminal/handler_{dec,dec_refinement,esc,state,report}.rs`: thirteen
+/// `Set*`/`Reset*` toggle pairs and the two resets (`SoftReset` = DECSTR, `FullReset` = RIS).
+/// Unmodeled DEC modes (VT52, 132-column, reverse video, BiDi, …) are
+/// `#[spec_unmodeled(reason = …)]` waivers.
 ///
-/// Every variable is a boolean FACT about a mode, and every action sets its own
-/// variable to an exact value, which is what makes the projection from the real
-/// `TerminalModes` exact rather than a witness. Three of them abstract a
-/// multi-valued mode: `mouse_mode` is "some mouse tracking is on"
-/// (`SetMouseMode` is X10/1000/1002/1003, `ResetMouseMode` tracking-off),
-/// `sgr_mouse` is "the SGR 1006 encoding is in force" (the encodings that
-/// replace it are `ResetSgrMouseEncoding` sites), and `cursor_style` is "the
-/// cursor shape differs from the HOST's default" — `SetCursorStyle` lands on a
-/// shape other than the host's, `RestoreCursorStyle` on the host's own, and
-/// DECSCUSR and mode 12 (the blink bit of the shape) are sites of both, the
-/// bytes deciding which. Both resets restore the host-configured shape, not
-/// `CursorStyle::default()`.
+/// Every variable is a boolean fact about a mode and every action sets its own variable
+/// exactly, so the projection from `TerminalModes` is exact. Three abstract a multi-valued
+/// mode: `mouse_mode` is "some mouse tracking is on" (X10/1000/1002/1003), `sgr_mouse` is
+/// "SGR 1006 encoding is in force", and `cursor_style` is "the shape differs from the host's
+/// default" (DECSCUSR and mode 12 are sites of both its actions, the bytes deciding which).
+/// Both resets restore the host-configured shape, not `CursorStyle::default`.
 ///
-/// **Invariant `ResetRestoresDefaults`.** Immediately after either reset
-/// (`reset = 1`, a history variable every other action clears) the terminal is
-/// usable again: cursor shown in the host shape, autowrap on, no insert /
-/// origin / newline mode, no application cursor keys, no mouse capture or SGR
-/// encoding, no focus or bracketed-paste reports, and NO synchronized-output
-/// hold. `alt_screen` is deliberately outside it — DECSTR keeps the current
-/// screen, RIS leaves the alternate one. `Buggy = 1` is a DECSTR that forgets
-/// the synchronized-output hold: a program that soft-resets mid-frame then
-/// leaves the host's present-hold armed and the screen frozen. `ty` proves the
-/// invariant at `Buggy = 0` and catches that at `Buggy = 1`.
+/// `ResetRestoresDefaults`: right after either reset (`reset = 1`, a history variable every
+/// other action clears) the cursor is shown in the host shape, autowrap is on, and insert,
+/// origin and newline modes, application cursor keys, mouse capture, SGR encoding, focus and
+/// bracketed-paste reports and the synchronized-output hold are off. `alt_screen` is outside
+/// it: DECSTR keeps the current screen, RIS leaves the alternate one. `Buggy = 1` is a DECSTR
+/// that forgets the synchronized-output hold, leaving the host's present-hold armed and the
+/// screen frozen.
 ///
-/// Tier-1: `aterm-core/src/terminal/terminal_modes_conformance.rs` drives every
-/// anchored action through real `Terminal::process` bytes, projects the real
-/// `TerminalModes` with `project_modes`, validates each step against this model,
-/// and audits (per step) that the window entered the action's own anchor.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor — nested
-// `vec!`/struct literals whose aggregate-operand count exceeds the
-// VC-generation work budget, so its obligations are left Unknown
-// fail-closed regardless. No runtime logic and no panic surface beyond
-// the idiomatic allocs; the MODEL it returns is what `ty` machine-checks.
+/// Tier 1: `aterm-core/src/terminal/terminal_modes_conformance.rs` drives every anchored
+/// action through `Terminal::process`, projects with `project_modes`, validates each step
+/// against this model, and checks that each step entered the action's own anchor.
+// Skip: a spec-model data constructor whose nested literals exceed the VC-generation budget
+// (its obligations stay Unknown, fail-closed); the model it returns is what `ty` checks.
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn terminal_modes_model() -> Model {
@@ -171,97 +157,73 @@ pub fn terminal_modes_model() -> Model {
     }
 }
 
-/// Which historical defect a wake-latch model's `Buggy = 1` replays (see
-/// [`damage_to_present_model`] and [`wake_heal_evidence_model`]: one machine,
-/// held to three laws, each with the mutant that breaks it).
+/// Which defect a wake-latch model's `Buggy = 1` replays: one machine
+/// ([`damage_to_present_model`], [`wake_heal_evidence_model`]) held to three laws, each with the
+/// mutant that breaks it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WakeLatchMutant {
-    /// The shipped pre-2026-07-05 ONE-SHOT latch: no heal, no watchdog
-    /// deadline and no re-post, so a lost wake starves its session's presents.
+    /// A one-shot latch: no heal, no watchdog deadline and no re-post, so a lost wake starves
+    /// its session's presents.
     OneShot,
-    /// The pre-2026-09-29 AGE-ONLY heal: a latch older than `Expiry` is
-    /// presumed lost whether or not its event is still queued behind a long
-    /// frame — the false heal (a redraw of every window plus a duplicate wake).
+    /// An age-only heal: a latch older than `Expiry` is presumed lost even while its event is
+    /// still queued behind a long frame (a false heal).
     AgeOnly,
 }
 
-/// DAMAGE→PRESENT BOUNDED RESPONSE (the 2026-07-05 five-fps incident, proven
-/// and caught). Abstract twin of the `Wake::Output` delivery spine, with the
-/// event loop's TURN made explicit so a long frame is representable: PTY damage
-/// arrives (`Damage*`), the coalescing latch (`spawn::gated_output_wake`) posts
-/// at most one in-flight wake (`inflight`); a loop turn DRAINS the queued user
-/// events (`TurnBegin` — a wake in flight is handled: the latch clears and the
-/// damage presents) and may then stay BUSY for any number of ticks (a long
-/// frame); it ends in `about_to_wait` (`TurnEnd`), where the lost-wake WATCHDOG
-/// judges the latch, marks an armed one `seen`, and folds a `recheck` deadline
-/// for it. A wake can be LOST without a handler pass (`Lose`; bounded by
-/// `LostBudget`). Time (`Tick`) runs freely through a busy turn; an idle loop
-/// turns at once for a queued wake and at a due recheck — and ONLY a `TurnEnd`
-/// that saw the arm folds one (the house guarded-Tick encoding: time cannot
-/// pass a due turn). The loop's first turn (winit's `Init`) is running at the
-/// initial state.
+/// Damage→present bounded response: the abstract twin of the `Wake::Output` delivery spine,
+/// with the event loop's turn explicit so a long frame is representable. PTY damage arrives
+/// (`Damage*`) and the coalescing latch (`spawn::gated_output_wake`) posts at most one wake
+/// (`inflight`). A turn drains the queued user events (`TurnBegin`: a wake in flight is
+/// handled, clearing the latch and presenting the damage), may stay busy for any number of
+/// ticks, and ends in `about_to_wait` (`TurnEnd`), where the lost-wake watchdog judges the
+/// latch, marks an armed one `seen` and folds a `recheck` deadline for it. A wake can be lost
+/// without a handler pass (`Lose`, bounded by `LostBudget`). Time (`Tick`) runs freely through
+/// a busy turn; an idle loop turns at once for a queued wake and at a due recheck. The loop's
+/// first turn (winit's `Init`) is running at the initial state.
 ///
-/// A wake posted while the loop is IDLE and lost together with its wake-up is
-/// seen by no `TurnEnd`, so no recheck exists for it: it is STRANDED. The
-/// reader re-posts it (`DamageRepost`, `spawn::wake_stranded`) at the first
-/// damage after its expiry, and never re-sends a wake a turn has passed or one
-/// that may still be queued (`DamageCoalesced`).
+/// A wake posted while the loop is idle and lost with its wake-up is seen by no `TurnEnd`, so
+/// no recheck exists for it: it is stranded. The reader re-posts it (`DamageRepost`,
+/// `spawn::wake_stranded`) at the first damage after its expiry, and never re-sends a wake a
+/// turn has passed or one that may still be queued (`DamageCoalesced`).
 ///
-/// The invariant `DamageBounded` is the property the incident violated: damage
-/// waits at most `Expiry + 1` IDLE ticks for its present (`waited` counts only
-/// ticks the main thread spent idle — its own long frames are its own latency,
-/// not the latch's — and NOT a stranded wake's ticks, which end at the
-/// session's next output after the expiry: if the program falls silent, at the
-/// loop's next unrelated turn, a bound this model does not claim) — never the
-/// process-lifetime starvation the user saw. `StrandedReposted`: no damage
-/// arriving on a stranded wake past its expiry is swallowed without a re-post.
+/// `DamageBounded`: damage waits at most `Expiry + 1` idle ticks for its present. `waited`
+/// counts only idle ticks (a long frame is the main thread's own latency) and not a stranded
+/// wake's, which end at the session's next output after the expiry (if the program falls
+/// silent, at the loop's next unrelated turn, a bound this model does not claim).
+/// `StrandedReposted`: no damage arriving on a stranded wake past its expiry is swallowed
+/// without a re-post.
 ///
-/// `Buggy = 0` (committed): the watchdog heals ON EVIDENCE — the latch is
-/// still armed and a previous `TurnEnd` already saw it (`seen`: in the code,
-/// its SENT stamp is older than the previous pass's), so the drain since must
-/// have delivered it (`spawn::judge_output_wake`); the recheck it folds is one
-/// expiry after the pass that saw it. `ty` PROVES both laws (the bound tight:
-/// the worst case reaches exactly `Expiry + 1`); Tier-1-bound to the real
-/// latch and watchdog by `spawn::latch_conforms_to_damage_to_present_model`
-/// and `spawn::watchdog_conforms_to_damage_to_present_model`. `Buggy = 1`: the
-/// original one-shot latch — no heal, no recheck, no re-post — and `ty` finds
-/// Damage → Lose → TurnEnd → Tick* past the bound, the shipped defect, and a
-/// stranded wake swallowing damage past its expiry.
+/// The watchdog heals on evidence (`spawn::judge_output_wake`): the latch is still armed and a
+/// previous `TurnEnd` saw it (`seen`; in the code, its sent stamp is older than the previous
+/// pass's), so the drain since must have delivered it; the recheck it folds is one expiry
+/// after that pass. The bound is tight (the worst case reaches `Expiry + 1`). Tier 1:
+/// `spawn::latch_conforms_to_damage_to_present_model` and
+/// `spawn::watchdog_conforms_to_damage_to_present_model`. `Buggy = 1` is the one-shot latch (no
+/// heal, recheck or re-post): Damage → Lose → TurnEnd → Tick* passes the bound.
 ///
-/// Below the model's grain, stated: the model posts atomically with the arm.
-/// The code arms, posts, then re-stamps the latch SENT with a clock read after
-/// the post; an unsent arm is never judged lost nor re-posted
-/// (`spawn::judge_output_wake`, `spawn::wake_stranded`, unit-tested by
-/// `an_unsent_arm_is_never_presumed_lost`), which is what makes `seen` a
-/// property of the code's stamps and not only of this model.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// Below the model's grain: the model posts atomically with the arm, while the code arms,
+/// posts, then re-stamps the latch sent with a clock read after the post. An unsent arm is
+/// never judged lost nor re-posted (`an_unsent_arm_is_never_presumed_lost`), which makes `seen`
+/// a property of the code's stamps.
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn damage_to_present_model() -> Model {
     wake_latch_model(WakeLatchMutant::OneShot)
 }
 
-/// NO FALSE HEAL (2026-09-29): the same machine as [`damage_to_present_model`],
-/// held to the other half of the contract — the watchdog never heals a wake
-/// that is merely LATE (still queued behind the main thread's turn). Measured
-/// in the owner's live window before the fix: 163 "healed a lost output wake"
-/// WARNs at 100–783 ms, each coinciding with a slow present of the same length
-/// (`deadline=wake_heal`), at load ~150 — every one a wake still in the queue,
-/// answered with a redraw of every window and a duplicate wake on a main thread
-/// that was already behind. `falseHeal` latches a heal fired while its wake was
-/// `inflight`. PROVES `NoFalseHeal` at `Buggy = 0` (the evidence rule: a
-/// `TurnEnd` saw the arm, so the drain since delivered anything in flight),
-/// CATCHES the age-only heal at `Buggy = 1` (Damage in the first turn, a busy
-/// frame of `Expiry + 1` ticks, TurnEnd — the exact live trace).
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor.
+/// No false heal: the [`damage_to_present_model`] machine held to the other half of the
+/// contract, that the watchdog never heals a wake that is merely late (still queued behind the
+/// main thread's turn). A false heal answers with a redraw of every window and a duplicate wake
+/// on a main thread already behind. `falseHeal` latches a heal fired while its wake was
+/// `inflight`. `NoFalseHeal` holds under the evidence rule (a `TurnEnd` saw the arm, so the
+/// drain since delivered anything in flight); `Buggy = 1` is the age-only heal (damage in the
+/// first turn, a busy frame of `Expiry + 1` ticks, `TurnEnd`).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn wake_heal_evidence_model() -> Model {
     wake_latch_model(WakeLatchMutant::AgeOnly)
 }
 
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor.
 #[cfg_attr(trust_verify, trust::skip)]
 fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
     let armed = neq(var("latch"), int(0));
@@ -307,8 +269,7 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
             and_(armed.clone(), not_stranded_due),
         ),
     };
-    // Keep the OLDEST unpresented damage's clock running: pending damage
-    // arriving on pending damage does not restart `waited`.
+    // Damage arriving on pending damage does not restart `waited`: the oldest's clock runs.
     let damage = Update {
         var: "pending",
         expr: int(1),
@@ -332,9 +293,7 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
             "DamageToPresent",
             vec![
                 Invariant {
-                    // Pending damage waits at most Expiry+1 idle ticks — the
-                    // bounded response the 5 fps incident violated (its bound
-                    // was ∞).
+                    // Pending damage waits at most Expiry+1 idle ticks.
                     name: "DamageBounded",
                     kind: InvariantKind::Claim,
                     expr: le(var("waited"), add(cst("Expiry"), int(1))),
@@ -403,12 +362,10 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
                 ],
             },
             Action {
-                // Damage on an armed latch coalesces — a wake a turn has passed
-                // is the watchdog's, and one that may be queued behind a long
-                // frame must not be duplicated (the age re-send was the
-                // duplicate-wake half of the 2026-09-29 false heals) — unless
-                // it is stranded past its expiry. A swallowed stranded one is
-                // booked in `missedRepost`.
+                // Damage on an armed latch coalesces: a wake a turn has passed is the
+                // watchdog's, and one possibly queued behind a long frame must not be
+                // duplicated, unless it is stranded past its expiry. A swallowed stranded one
+                // is booked in `missedRepost`.
                 name: "DamageCoalesced",
                 guard: Some(coalesce_guard),
                 updates: vec![
@@ -432,9 +389,8 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
                 ],
             },
             Action {
-                // The in-flight wake is DROPPED without a handler pass (the
-                // incident's trigger) — while the loop runs, or while it sleeps
-                // together with its wake-up. The latch stays armed.
+                // The in-flight wake is dropped without a handler pass, while the loop runs
+                // or while it sleeps with its wake-up. The latch stays armed.
                 name: "Lose",
                 guard: Some(and_(
                     wake_queued.clone(),
@@ -446,10 +402,9 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
                 ],
             },
             Action {
-                // A loop turn begins and drains the queued user events: a wake in
-                // flight is handled (latch cleared) and its damage presented.
-                // Enabled whenever idle: any event may turn the loop. The recheck
-                // deadline is consumed; the turn's `TurnEnd` folds a new one.
+                // A turn begins (whenever idle: any event may turn the loop) and drains the
+                // queued user events: a wake in flight is handled and its damage presented.
+                // The recheck is consumed; the turn's `TurnEnd` folds a new one.
                 name: "TurnBegin",
                 guard: Some(idle.clone()),
                 updates: vec![
@@ -463,11 +418,10 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
                 ],
             },
             Action {
-                // `about_to_wait`: the watchdog judges the latch — heals (clear +
-                // repaint every window) when the heal predicate holds; otherwise
-                // an armed latch is now SEEN and folds a recheck one expiry out
-                // (`now + Expiry + 1` ticks: the code's `now + expiry` ns, never
-                // in the past).
+                // `about_to_wait`: the watchdog heals (clear + repaint every window) when the
+                // heal predicate holds; otherwise an armed latch is now seen and folds a
+                // recheck one expiry out (`now + Expiry + 1` ticks: the code's `now + expiry`
+                // ns, never in the past).
                 name: "TurnEnd",
                 guard: Some(eq(var("busy"), int(1))),
                 updates: vec![
@@ -536,23 +490,12 @@ fn wake_latch_model(mutant: WakeLatchMutant) -> Model {
     }
 }
 
-/// OBSERVATION KERNEL — EARLIEST-ARMED IDLE DEADLINE (RFC L0). The abstract twin
-/// of [`WatcherSet::next_deadline`](../../aterm_core/terminal/observe): the host
-/// arms ONE `ControlFlow::WaitUntil`, and it must equal the MINIMUM of all
-/// pending `IdleFor` deadlines so an earlier deadline is never missed (the
-/// `BellFlash::deadline` discipline). Scalar projection `<<armed, minp>>` over
-/// two deadline values (near = 1, far = 2; `4` is the unset sentinel): `ArmNear`
-/// / `ArmFar` register a deadline; `armed` must track `minp = min` of everything
-/// registered.
-///
-/// `Buggy = 0` (committed): `armed' = min(armed, v)`, so `armed = minp` always.
-/// `Buggy = 1`: keep-first (`armed` set only while unset), so arming the FAR
-/// deadline then the NEAR one leaves `armed = 2` while `minp = 1` — an earlier
-/// wake is missed. `ty` PROVES `armed = minp` (Buggy=0) and CATCHES the
-/// keep-first bug (Buggy=1 → counterexample). Two-action disjunctive `Next` with
-/// nested `if` updates (the `cursor_model` family, plus a min computation).
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
+/// Observation kernel, earliest-armed idle deadline: the abstract twin of
+/// `WatcherSet::next_deadline`. The host arms one `ControlFlow::WaitUntil`, which must equal
+/// the minimum of all pending `IdleFor` deadlines so an earlier one is never missed.
+/// Projection `<<armed, minp>>` over two deadlines (near = 1, far = 2; 4 is unset):
+/// `ArmNear`/`ArmFar` register one, and `armed` must track `minp`. `Buggy = 1` keeps the
+/// first deadline armed, so far-then-near leaves `armed = 2` while `minp = 1`.
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn idle_deadline_model() -> Model {
@@ -616,17 +559,12 @@ pub fn idle_deadline_model() -> Model {
     }
 }
 
-/// SURFACE COVERAGE — the one-dimensional abstract twin of the production GPU
-/// present viewport/scissor. A raw window surface may be wider/taller than the
-/// integer-cell renderer frame after font zoom; every present must cover the
-/// WHOLE destination and resolve the remainder with the live terminal
-/// background. Applying the law independently on x and y covers all four bands.
-///
-/// Correct (`Buggy=0`) presents through a full-surface viewport/scissor and marks
-/// a non-empty band with the live background. Mutant (`Buggy=1`) reproduces the
-/// deleted frame-sized viewport: only `frame` units are covered and the band is
-/// left stale. Tier-1 drives the genuine GPU production seam at an odd +7px
-/// destination and projects its exact pixels onto this model.
+/// Surface coverage along one axis (applied to x and y it covers all four bands): after font
+/// zoom a raw window surface may exceed the integer-cell renderer frame, and every present must
+/// cover the whole destination, filling the remainder with the live terminal background.
+/// `Buggy = 1` is a frame-sized viewport: only `frame` units covered, the band left stale.
+/// Tier 1 (`aterm-gpu/tests/present_real.rs`) drives the GPU present seam at an odd +7px
+/// destination and projects its pixels onto this model.
 pub fn surface_coverage_model() -> Model {
     aterm_spec::ty_model! {
         SurfaceCoverage {
@@ -662,14 +600,10 @@ pub fn surface_coverage_model() -> Model {
     }
 }
 
-/// Abstract completeness gate for first-present phase publication: a valid
-/// partition cannot publish until eight intervals are present. This deliberately
-/// does NOT model timestamp identity, order, or duration arithmetic: the shipping
-/// GUI's pure derivation checks those properties directly and its Tier-1 test
-/// separately carries reordered-timestamp negative controls. Here each `Step`
-/// means only "one more interval exists". `Buggy=1` admits an early publication
-/// so Tier-0 must produce a counterexample rather than accepting a vacuous happy
-/// trace.
+/// First-present phase publication: a valid partition cannot publish before all eight
+/// intervals exist. Each `Step` is "one more interval"; timestamp identity, order and duration
+/// arithmetic are the GUI derivation's, checked by its Tier-1 test with reordered-timestamp
+/// negative controls. `Buggy = 1` admits an early publication.
 pub fn startup_phase_publication_model() -> Model {
     aterm_spec::ty_model! {
         StartupPhasePublication {
@@ -694,32 +628,21 @@ pub fn startup_phase_publication_model() -> Model {
     }
 }
 
-/// PRESENT RETRY — bounded, future-only autonomous recovery after a dropped
-/// surface transaction. `remaining` is the retry fuel for the current external
-/// stimulus episode; `train` counts autonomous wakes since the last stimulus or
-/// successful present; `retry=1` is one strictly-future deadline (`2` is kept
-/// as the host negative-control value); `ready=1` means a redraw attempt may
-/// run; `parked=1` means recovery waits for a new external stimulus; and
-/// `bootstrap_available=1` is the one fresh-window permit for recovering an
-/// initial `GpuOccluded` result.
+/// Present retry: bounded, future-only autonomous recovery after a dropped surface
+/// transaction. `remaining` is the retry fuel for the current stimulus episode; `train` counts
+/// autonomous wakes since the last stimulus or present; `retry = 1` is one strictly-future
+/// deadline (`2` is the host test's negative-control value); `ready = 1` lets a redraw attempt
+/// run; `parked = 1` waits for a new external stimulus; `bootstrap_available = 1` is the one
+/// fresh-window permit to recover an initial `GpuOccluded` result.
 ///
-/// Correct (`Buggy=0`): `DropBootstrapOccluded` is enabled only for the pristine
-/// initial retry state, consumes its one-way permit, and arms one strictly-future
-/// deadline. It cannot repeat after `Wake`, and neither external stimuli nor a
-/// successful `Present` replenish the permit. Every `Wake` spends one unit of
-/// fuel and, once empty, a further `Drop` parks without a deadline. `Stimulus`
-/// begins a fresh bounded episode only when recovery is unresolved;
-/// `ForcedStimulus` represents a real resize/expose that requests a frame even
-/// from idle. `SynchronousStimulus` is the capture/internal twin: its caller
-/// presents in the same main-thread operation, so it resets unresolved retry
-/// state without creating a new OS redraw request, while preserving any request
-/// that was already outstanding. An ordinary idle input stimulus is deliberately
-/// not a transition, matching the production no-op. `Present` returns to
-/// quiescent retry state.
-/// Mutant (`Buggy=1`): wakes do not spend fuel, so the strictly-future
-/// Drop→Wake train exceeds `RetryCap`. This catches unbounded autonomous
-/// recovery independently of the separate past-deadline negative control in the
-/// Tier-1 host test.
+/// `DropBootstrapOccluded` fires only from the pristine retry state and consumes its one-way
+/// permit (neither stimuli nor a present replenish it). Every `Wake` spends one unit of fuel;
+/// once it is gone a `Drop` parks with no deadline. `Stimulus` starts a fresh episode only while
+/// recovery is unresolved; `ForcedStimulus` is a real resize/expose that requests a frame even
+/// from idle; `SynchronousStimulus` is the capture/internal twin, whose caller presents in the
+/// same main-thread operation, so it resets retry state without a new OS redraw request
+/// (keeping one already outstanding). An ordinary idle input stimulus is no transition, as in
+/// the code. `Buggy = 1`: wakes spend no fuel, so the Drop→Wake train passes `RetryCap`.
 pub fn present_retry_model() -> Model {
     aterm_spec::ty_model! {
         PresentRetry {
@@ -822,15 +745,10 @@ pub fn present_retry_model() -> Model {
     }
 }
 
-/// GPU DEVICE-LOSS ROUTING — a failed surface acquire on a latched dead device
-/// must bypass transient retry and enter CPU fallback immediately. Retrying a
-/// dead GPU repeatedly can only consume the bounded surface-retry train and
-/// leave the last frame parked forever.
-///
-/// `route=1` is ordinary surface retry and `route=2` is GPU→CPU recovery.
-/// Correct (`Buggy=0`) routes the lost observation to recovery. The historical
-/// mutant (`Buggy=1`) routes it back into retry, so `LostUsesFallback` produces
-/// a counterexample before the retry train could silently park.
+/// GPU device-loss routing: a failed surface acquire on a latched dead device bypasses
+/// transient retry and enters CPU fallback at once; retrying a dead GPU only burns the bounded
+/// retry train and leaves the last frame parked. `route = 1` is surface retry, `route = 2`
+/// GPU→CPU recovery; `Buggy = 1` routes the loss back into retry, breaking `LostUsesFallback`.
 pub fn gpu_loss_route_model() -> Model {
     aterm_spec::ty_model! {
         GpuLossRoute {
@@ -872,46 +790,16 @@ pub fn gpu_loss_route_model() -> Model {
 /// retry train is allowed to park until the separately-modelled external
 /// `PresentRetry::Stimulus` transition.
 ///
-/// Correct (`Buggy=0`) covers fresh, fuelled, and exhausted entry paths.
-/// `Buggy=1` enables eight dead negative controls, one slip of the transaction
-/// each, and each the first thing its own law sees. Three are the historical
-/// mutant's defects:
-/// * the fallback installed but the GPU recording left alive
-///   (`LossStopsGpuRecording`);
-/// * the failed-present path parks instead of arming its fresh retry
-///   (`UnexhaustedFailureOwnsRetryOrDeliveredAttempt`);
-/// * a failed-present entry that counts its frame again although the source
-///   drop already did (`OneDropCountPerFrame`).
-///
-/// Five more are one line of the shipping transaction written wrong:
-/// * the fuelled failed-present path refines its drop's accounting but keeps
-///   the source surface's reason instead of `CpuAcquire`
-///   (`FailedFallbackIsDiagnosed`);
-/// * the exhausted path treats the failure as a fresh drop and arms a retry
-///   past the fuel cap — a retry train with no end (`ExhaustedFailureIsParked`);
-/// * `PresentRetry::take_due` hands the wake over without clearing the consumed
-///   deadline, which then re-arms turn after turn (`DeliveredRetryHasNoDeadline`);
-/// * the dropped-frame success path is classified `SourceReadyRequested`
-///   without its `request_redraw`, freezing the window on the dead GPU's last
-///   frame (`ReadyCpuOwnsRedrawUntilPresent`);
-/// * the delivered retry wake is taken as the acknowledging present — the
-///   acknowledgement-on-stimulus defect `RecoveryRedraw` pins, here before the
-///   CPU target is even built (`CpuPresentWasReady`).
-///
-/// Why dead actions and not `Buggy` arms inside the entry actions: an inline
-/// arm makes its slip on EVERY firing, so at `Buggy = 1` the correct fresh
-/// retry would never exist and the wake-side slips could only fire after the
-/// entry slip had already broken a law. No separate "a CPU present completes
-/// the failure" law either. `fallback_failed` is a record only this model keeps
-/// — nothing in aterm-gui is projected onto it — and only the `Succeed*`
-/// entries and `BuildCpuAfterWake` clear it, the same steps that set the
-/// `requested` every `PresentCpu` needs; so no modelled present can land over a
-/// live record, and a law saying so would judge the model's own bookkeeping.
-/// The one path that could, a parked failure presenting after the external
-/// `PresentRetry::Stimulus`, is outside this model. The shipping reset is
-/// `PresentRetry::on_presented`, and aterm-gui's success bind
-/// (`successful_gpu_recovery_classifies_source_ready_only_after_redraw_request`)
-/// asserts it leaves the default retry state after the acknowledging present.
+/// Dead actions, not `Buggy` arms in the entry actions: an inline arm slips on every firing, so
+/// at `Buggy = 1` the correct fresh retry would never exist and the wake-side slips could fire
+/// only after the entry slip broke a law. There is no "a CPU present completes the failure"
+/// law: `fallback_failed` is this model's own record (nothing in aterm-gui projects onto it),
+/// cleared only by the `Succeed*` entries and `BuildCpuAfterWake`, the steps that set the
+/// `requested` every `PresentCpu` needs, so no modelled present lands over a live record and
+/// such a law would judge only the model's bookkeeping. The shipping reset is
+/// `PresentRetry::on_presented`, and
+/// `successful_gpu_recovery_classifies_source_ready_only_after_redraw_request` asserts it leaves
+/// the default retry state after the acknowledging present.
 pub fn gpu_loss_recovery_model() -> Model {
     aterm_spec::ty_model! {
         GpuLossRecovery {
@@ -1140,22 +1028,11 @@ pub fn gpu_loss_recovery_model() -> Model {
 /// sufficient: winit may suppress multiple requests after the host consumes a
 /// deadline, including the first CPU-fallback redraw.
 ///
-/// Correct (`Buggy=0`) retains the acknowledgement bit across every replacement
-/// request. `Buggy=1` enables two dead mutants, the two historical halves of the
-/// frozen no-echo/app-owned-input window:
-/// * `BuggyStimulusAcknowledges` clears the bit on the first stimulus, so a
-///   second suppressed edge is never replaced (`OnlyPresentAcknowledgesRecovery`);
-/// * `BuggyStimulusWithoutRedraw` reopens the gate without a `request_redraw`,
-///   the gate-open/no-redraw reset (`RecoveryStimulusRequestsRedraw`).
-///
-/// Why dead actions, not a `Buggy` arm inside `Stimulus`: one arm can make only
-/// one of the two slips, and a stimulus that both acknowledges and requests
-/// nothing would leave no suppressed edge for the first slip to be caught on.
-///
-/// "A suppressed request leaves the episode unresolved" is not a separate law.
-/// A present clears suppression, so a suppressed edge over a resolved episode
-/// needs an acknowledgement without a present first — which
-/// `OnlyPresentAcknowledgesRecovery` refuses at that step.
+/// Dead actions, not a `Buggy` arm in `Stimulus`: one arm can make only one of the slips, and a
+/// stimulus that both acknowledges and requests nothing leaves no suppressed edge to catch the
+/// first on. "A suppressed request leaves the episode unresolved" needs no law of its own: a
+/// present clears suppression, so reaching it over a resolved episode takes an acknowledgement
+/// without a present, which `OnlyPresentAcknowledgesRecovery` refuses.
 pub fn recovery_redraw_model() -> Model {
     aterm_spec::ty_model! {
         RecoveryRedraw {
@@ -1210,49 +1087,32 @@ pub fn recovery_redraw_model() -> Model {
     }
 }
 
-/// PREDICTIVE ECHO VISIBILITY — the bounded display/expiry policy shared by
-/// native and web hosts. `app_owned=1` represents an application-owned input
-/// composer (the observed Codex Kitty mode includes REPORT_EVENT_TYPES),
-/// `slow=1` means Adaptive prediction has measured a useful RTT, and
-/// `confirmed=1` is the current-line echo proof. `pending` is predictor state,
-/// while `visible` and `erased` are the user-observable pixel events.
+/// Predictive echo visibility: the bounded display/expiry policy native and web hosts share.
+/// `app_owned` is an application-owned input composer (Kitty `REPORT_EVENT_TYPES`), `slow` that
+/// Adaptive prediction measured a useful RTT, `confirmed` the current line's echo proof;
+/// `pending` is predictor state, `visible` and `erased` the pixel events a user sees.
 ///
-/// `Submit` is EVERY epoch boundary, not only the Enter key: a line terminator
-/// in any spelling (`Predictor::note_line_submit`), any other press the host
-/// could not predict (`note_unmodelled_input`), a Backspace with nothing of the
-/// predictor's own to cancel, a declined glyph, the terminal moving rows under
-/// the cursor (the `coords` generation), and the program moving the cursor off
-/// the cell the last confirmed echo left it in (a prompt printed beside it).
-/// Each ends the proof; `aterm-predict`'s
-/// `every_epoch_boundary_is_the_models_submit` binds all six to this action.
-/// (`Submit` also drops the abstract `pending`; the implementation keeps a
-/// proven line's in-flight pixels across a terminator alone, until their echo
-/// or expiry, which the model's single-guess abstraction does not separate.)
+/// `Submit` is every epoch boundary, not only Enter: a line terminator in any spelling
+/// (`Predictor::note_line_submit`), any other press the host could not predict
+/// (`note_unmodelled_input`), a Backspace with nothing of the predictor's own to cancel, a
+/// declined glyph, the terminal moving rows under the cursor (the `coords` generation), and the
+/// program moving the cursor off the cell the last confirmed echo left it in. `aterm-predict`'s
+/// `every_epoch_boundary_is_the_models_submit` binds all six to this action. (The code keeps a
+/// proven line's in-flight pixels across a lone terminator until echo or expiry, which the
+/// model's single-guess `pending` does not separate.)
 ///
-/// Correct (`Buggy=0`): an app-owned composer does not even arm speculative
-/// state; fast Adaptive links may track a guess but never paint it, so expiry
-/// is invisible. A session switch starts with no inherited slow-link estimate
-/// (`Predictor::reset_session`, exported to both web hosts as
-/// `predict_session_reset`). Mutant (`Buggy=1`) is the deleted immediate-display
-/// policy plus retained cross-session RTT: confirmation alone paints, the Codex
-/// gate is ignored, and a new pane can inherit slow eligibility. The mutant
-/// makes the fast-link blink, app-owned ghost, and RTT leak reachable.
+/// At `Buggy = 0` an app-owned composer arms nothing, a fast Adaptive link may track a guess but
+/// never paints it (so expiry is invisible), and a session switch starts with no inherited RTT
+/// estimate (`Predictor::reset_session`; `predict_session_reset` on the web hosts). `Buggy = 1`
+/// paints on confirmation alone, ignores the composer gate and keeps the RTT across sessions:
+/// the fast-link blink, the app-owned ghost and the RTT leak.
 ///
-/// HYSTERESIS (`fast_streak` / `retracted`). The gate is a LATCH, not a
-/// comparator: at `Buggy=0`, `ConfirmFast` closes it only after `Hide` decisive
-/// fast turns, never on a SINGLE sample (the implementation requires
-/// `FAST_SAMPLES_TO_HIDE` consecutive decisive fast turns, a smoothed estimate
-/// that agrees, and an EMPTY pending set). A conformance test that fires
-/// `ConfirmFast` only at an already closed latch leaves that unpinned.
-/// `fast_streak` counts the
-/// decisive fast turns (capped at `Hide`) and `retracted` marks the STEP on
-/// which the gate went 1 -> 0, because the defect is a retraction taken on thin
-/// evidence, not a steady state: `RetractOnlyOnSustainedFastEvidence` then makes
-/// the single-sample close (and any close with pixels still in flight — the
-/// blink itself) an outright counterexample. `ConfirmFastInFlight` is the same
-/// fast turn taken while type-ahead is still on glass; at `Buggy=0` it may
-/// advance the streak but never close, which is what keeps that clause of the
-/// invariant non-vacuous.
+/// The gate is a latch with hysteresis: `ConfirmFast` closes it only after `Hide` decisive fast
+/// turns with nothing pending (the code also wants the smoothed RTT to agree). `fast_streak`
+/// counts those turns (capped at `Hide`); `retracted` marks the step that closed the gate, so
+/// `RetractOnlyOnSustainedFastEvidence` makes a single-sample close, or a close with pixels in
+/// flight, a counterexample. `ConfirmFastInFlight` is a fast turn with type-ahead still on
+/// glass: it may advance the streak but never close, which keeps that clause non-vacuous.
 ///
 /// ATTRIBUTION (`owed`). Every boundary but one owes an echo the predictor no
 /// longer tracks: the terminator's own, the unmodelled key's (a key refused at
@@ -1333,10 +1193,8 @@ pub fn predictive_echo_visibility_model() -> Model {
     aterm_spec::ty_model! {
         PredictiveEchoVisibility {
             const Buggy = 0;
-            // FAST_SAMPLES_TO_HIDE: consecutive decisive fast turns required before
-            // Adaptive may stop painting. Opening takes fewer (asymmetric on
-            // purpose — closing is the destructive direction), which the abstract
-            // `ConfirmSlow` folds into one step.
+            // `FAST_SAMPLES_TO_HIDE`. Opening takes fewer samples (closing erases pixels),
+            // which `ConfirmSlow` folds into one step.
             const Hide = 3;
             var app_owned = 0;
             var slow = 0;
@@ -1622,10 +1480,8 @@ pub fn predictive_echo_visibility_model() -> Model {
                 first = 0;
                 visible = 0;
                 erased = 0;
-                // Dropping the estimate is not a RETRACTION: nothing was measured
-                // that says this link is fast, so the streak restarts at zero and
-                // the step carries no evidence obligation (`FreshSessionHasNoInheritedRtt`
-                // is what covers this direction).
+                // Dropping the estimate is no retraction (nothing says the link is fast): the
+                // streak restarts, and `FreshSessionHasNoInheritedRtt` covers this step.
                 fast_streak = 0;
                 retracted = 0;
                 // The echoes in flight belong to the PTY just left. (This is the
@@ -1655,12 +1511,8 @@ pub fn predictive_echo_visibility_model() -> Model {
                 };
             invariant FreshSessionHasNoInheritedRtt:
                 if fresh == 1 { slow == 0 } else { 1 == 1 };
-            // The gate may stop painting ONLY on sustained fast evidence with
-            // nothing in flight. Stated about the retracting STEP because that is
-            // where the damage is: a close is an erase of pixels the user is
-            // looking at, so one lucky fast turn (or any turn with type-ahead still
-            // pending) closing the gate IS the blink, whatever the steady state
-            // looks like afterwards.
+            // Stated about the closing step: a close erases pixels the user is looking at, so
+            // one lucky fast turn, or a close with type-ahead pending, is the blink.
             invariant RetractOnlyOnSustainedFastEvidence:
                 if retracted == 1 { Hide <= fast_streak && pending == 0 } else { 1 == 1 };
             // The proof is the guess's own echo, never one owed to a keystroke no
@@ -1700,39 +1552,28 @@ pub fn predictive_echo_visibility_model() -> Model {
 /// fleet listener's, `slots::Slots`; the network drive's `serve` until it was
 /// removed, 2026-10-15) keep at most `Cap` connections in flight, handshaking
 /// or relaying, and at capacity let a newcomer take the slot of one that has
-/// NOT authenticated (r13 NET-1, ruling 2026-10-10: idle sockets renewed
+/// NOT authenticated (r13 NET-1, idle sockets renewed
 /// against the handshake deadline used to hold every slot and lock token
 /// holders out). Which slot is the address policy's (`slots::pick_displaced`,
 /// unit-tested); this is the machine that policy runs on, and the law it must
 /// never break: an admitted relay is never cut.
 ///
-/// Each connection holding a slot is `pending` (its watchdog state is still
-/// `WD_RUNNING`), `authed` (its handshake claimed `WD_AUTHED`: relaying, or
-/// tearing down after a denied capability) or `cut` (the deadline claimed
-/// `WD_FIRED` or the listener `WD_EVICTED`: its socket force-closed, its
-/// threads ending). One compare-and-swap out of `WD_RUNNING` decides between
-/// the three claimants — the handshake (`Authenticate`, `HandshakeWatchdog::
-/// finish`), the watchdog's deadline (`Deadline`) and the listener
-/// (`Evict`, `Evictor::evict`) — so each connection is claimed exactly once.
-/// `Evict` is the accept loop at capacity: it claims a pending connection and
-/// then WAITS (`waiting`) for that connection's threads to end (`Release`)
-/// before the newcomer takes the slot (`Accept`), or gives up after
-/// `ACCEPT_POLL` and refuses the newcomer (`Refuse`). `Close` is a relay's or a
-/// denied connection's end. `arrivals` counts connections given a slot and
-/// `claims` the claims won on them: ghost counters for the exactly-once law.
+/// A connection holding a slot is `pending` (watchdog state `WD_RUNNING`), `authed`
+/// (`WD_AUTHED`: relaying, or tearing down after a denied capability) or `cut` (`WD_FIRED` or
+/// `WD_EVICTED`: socket force-closed, threads ending). One compare-and-swap out of `WD_RUNNING`
+/// decides between the three claimants: the handshake (`Authenticate`,
+/// `HandshakeWatchdog::finish`), the deadline (`Deadline`) and the listener (`Evict`,
+/// `Evictor::evict`). `Evict` is the accept loop at capacity: it claims a pending connection,
+/// then waits (`waiting`) for its threads to end (`Release`) before the newcomer takes the slot
+/// (`Accept`), or gives up after `ACCEPT_POLL` (`Refuse`). `Close` ends a relay or a denied
+/// connection. `arrivals` and `claims` are ghost counters for the exactly-once law.
 ///
-/// `Buggy = 1` is four defects, each caught by its own invariant alone:
-/// `Accept` takes a slot while the displaced connection still holds it (the
-/// loop returning on its claim, not on the freed slot), which
-/// `InFlightBounded` catches; `Authenticate` STORES `WD_AUTHED` over a cut
-/// connection's claim (a relay on a force-closed socket), which
-/// `ClaimExactlyOnce` catches; the watchdog force-closes a connection its
-/// handshake claimed (the close decided by the deadline alone, not by who won
-/// the claim), which `AuthedNeverCut` catches; and `Evict` STORES
-/// `WD_EVICTED` over an authenticated connection instead of a
-/// compare-and-swap, which both of the last two catch. Each mutant fires only
-/// from a state that has not slipped yet, so the `Buggy = 1` space stays
-/// finite.
+/// `Buggy = 1` is four defects, each caught by its own invariant: `Accept` takes a slot the
+/// displaced connection still holds (`InFlightBounded`); `Authenticate` stores `WD_AUTHED` over a
+/// cut connection's claim (`ClaimExactlyOnce`); the deadline force-closes a connection its
+/// handshake claimed (`AuthedNeverCut`); `Evict` stores `WD_EVICTED` over an authenticated
+/// connection instead of a compare-and-swap (both of the last two). Each mutant fires only from
+/// a state that has not slipped yet, so the `Buggy = 1` space stays finite.
 ///
 /// Tier-1: aterm-net's `slots::tests::slots_conform_to_net_slot_displacement`
 /// drives the real `Slots` and `HandshakeWatchdog` over real sockets at the
@@ -1805,9 +1646,8 @@ pub fn net_slot_displacement_model() -> Model {
     }
 }
 
-/// **ALT-SCREEN ARCHIVE POOL, CHARGED AGAINST THE PROCESS** — the retention
-/// budget belongs to the machine's memory, so it is charged against EVERY live
-/// archive at once.
+/// Alt-screen archive pool, charged against the process: the retention budget belongs to the
+/// machine's memory, so it is charged against every live archive at once.
 ///
 /// This is the same shape as `flash_limiter_window_model`: a correct theorem
 /// about ONE archive ("it never retains more than its budget") stays true no
@@ -1819,52 +1659,26 @@ pub fn net_slot_displacement_model() -> Model {
 /// So this model carries TWO archives (`a`, `b`: rows retained) and three
 /// dials:
 ///
-/// * `Instances` — how many archives are joined. `CommitB` is admitted only
-///   when `Instances > 1`, so `Instances = 1` collapses this onto the
-///   single-archive theorem.
-/// * `Local` — WHAT each archive consults when it evicts. `Local = 0`
-///   (committed) is the shipping shape: a SHARE of one pool. `Local = 1` is the
-///   pre-pool world, each archive keeping the whole `Total`.
-/// * `Buggy` — WHICH archives count toward the share. `Buggy = 0` (committed)
-///   counts an archive only while it is DRAWING on the pool — enabled AND
-///   holding rows. `Buggy = 1` is the review blocker: an archive counts as soon
-///   as it is joined, holding or not, so eight open tabs divide the pool by
-///   eight while one of them runs `vim`.
+/// `PoolBounded` is charged against the sum, over settled archives (retention inside the
+/// current allowance), because that is what the code guarantees: an archive lowers only its
+/// own retention (reaching into other terminals' mutexes from whichever thread opened a tab
+/// invites deadlock), so one that filled up while alone keeps those rows until its next
+/// commit. The bound converges rather than holding at every instant. `Local = 1` breaks it.
 ///
 /// # The two invariants have one victim each, and that is the point
 ///
-/// `PoolBounded` is charged against the SUM, because the process's memory is.
-/// It is stated over SETTLED archives — one whose retention is inside its
-/// CURRENT allowance — because that is exactly what the code guarantees and no
-/// more: an archive can only lower its OWN retention (reaching into seven other
-/// terminals' mutexes from whichever thread opened a tab is how deadlocks are
-/// written), so one that filled up while alone keeps those rows until its next
-/// commit. The bound CONVERGES rather than holding at every instant, and the
-/// antecedent is what says so. At `Local = 1` two individually-correct archives
-/// break it at every corner — multiplication alone is the defect.
-///
-/// `IdleTakesNothing` says an archive holding nothing costs the archives that
-/// do nothing: while `b` is empty, `a`'s allowance is the whole `Total`. This
-/// is the invariant `Buggy = 1` violates, and it violates it immediately —
-/// the idle tab takes its share the moment it joins. `Local` cannot damage it
-/// (a local archive's allowance is `Total` by construction), which is what
-/// makes the G5 attribution corner meaningful.
-///
-/// Sizes are the smallest that separate the cases: `Total = 4` rows with
-/// `Half = 2`, because the IR has no division. Tier-1 binding: aterm-core's
-/// `alt_archive_pool_conformance_real_archives_project_onto_model` drives the
-/// REAL `AltArchive` pair through the same commits and projects every retention
-/// onto this model.
+/// `Total = 4` rows with `Half = 2` (the IR has no division) are the smallest sizes that
+/// separate the cases. Tier 1: aterm-core's
+/// `alt_archive_pool_conformance_real_archives_project_onto_model` drives the real
+/// `AltArchive` pair through the same commits and projects every retention onto this model.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor — the MODEL it
-// returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn alt_archive_pool_model() -> Model {
     aterm_spec::ty_model! {
         AltArchivePool {
             const Buggy = 0;      // 1 = a joined-but-empty archive still takes a share;
                                   // 2 = each archive keeps its own whole budget
-            const Local = 0;      // 1 = each archive keeps its OWN whole budget
+            const Local = 0;      // 1 = each archive keeps its own whole budget
             const Instances = 2;  // archives joined to the pool
             const Total = 4;      // the pool, in rows
             const Half = 2;       // Total / 2 — the IR has no division
@@ -1872,10 +1686,9 @@ pub fn alt_archive_pool_model() -> Model {
             var b = 0;            // rows retained by archive B
             var steps = 0;        // run bound
 
-            // A commits one frame: the row goes in, then `evict` trims to what
-            // A may retain RIGHT NOW. A counts ITSELF (it is drawing on the
-            // pool), so the share is read with itself already in the divisor —
-            // a share computed without it is one share too generous.
+            // A commits one frame, then `evict` trims to what A may retain now. A counts
+            // itself (it is drawing on the pool), so the share is read with itself in the
+            // divisor.
             action CommitA when (steps <= 9) {
                 steps = steps + 1;
                 a = if (Local == 1 || Buggy == 2) {
@@ -1888,7 +1701,7 @@ pub fn alt_archive_pool_model() -> Model {
                     };
             }
 
-            // B is the SECOND archive and exists only in a multi-archive world.
+            // B exists only in a multi-archive world.
             action CommitB when (steps <= 9 && Instances > 1) {
                 steps = steps + 1;
                 b = if (Local == 1 || Buggy == 2) {
@@ -1901,18 +1714,16 @@ pub fn alt_archive_pool_model() -> Model {
                     };
             }
 
-            // B leaves the alt screen: its rows go, and with them its claim on
-            // the pool. This is what makes `IdleTakesNothing` reachable from a
-            // state where B once held something.
+            // B leaves the alt screen: its rows go, and with them its claim on the pool (so
+            // `IdleTakesNothing` is reachable after B held something).
             action WipeB when (steps <= 9 && Instances > 1) {
                 steps = steps + 1;
                 b = 0;
             }
 
-            // THE POOL IS ONE TOTAL. Charged against the sum, over SETTLED
-            // archives only (see the doc): an archive over its current
-            // allowance has not drawn since the allowance moved, and comes
-            // within it on its next frame.
+            // One total, charged against the sum over settled archives: one over its current
+            // allowance has not drawn since the allowance moved, and comes within it on its
+            // next frame.
             // Dial 2 is the `Local` corner as a mutant: each archive keeps its own whole
             // budget, so two settled archives hold twice the pool.
             invariant PoolBounded:
@@ -1926,8 +1737,7 @@ pub fn alt_archive_pool_model() -> Model {
                                 { Half } else { Total } }))
                 || (a + b <= Total);
 
-            // AN ARCHIVE HOLDING NOTHING COSTS THE ONES THAT DO NOTHING. While
-            // B is empty, A may fill the whole pool.
+            // While B is empty, A may fill the whole pool.
             invariant IdleTakesNothing:
                 (b > 0)
                 || (Total <= (if (Local == 1 || Buggy == 2) { Total }
@@ -1938,20 +1748,19 @@ pub fn alt_archive_pool_model() -> Model {
     }
 }
 
-/// **WEARING A CAT IS A JOIN, SO TWO INSTANCES CONVERGE AND NEITHER LOSES ITS
-/// PICK** — the sentence the kitty-collection merge ships in prose, checked.
+/// Wearing a cat is a join, so two instances converge and neither loses its pick.
 ///
-/// The collection is replicated: every aterm instance keeps its own copy and
-/// folds the others in. `KittyLog::merge_collectible` takes `max_ts` on the
-/// favourite stamp, which makes the merge a JOIN on a semilattice — commutative,
-/// idempotent, and order-independent. That is the whole reason a wear needs no
-/// unpin and no tombstone to be reliable, and it was asserted in a commit
-/// message with nothing behind it.
+/// Every aterm instance keeps its own copy of the kitty collection and folds the others in.
+/// `merge_collectible` takes `max_ts` on the favourite stamp, a join on a semilattice
+/// (commutative, idempotent, order-independent), which is why a wear needs no unpin and no
+/// tombstone. The model has two replicas, two collected cats, a logical clock, and both flush
+/// directions in either order. `Buggy = 1` takes the incoming value instead of the max (last
+/// writer by arrival).
 ///
-/// Two replicas, two collected cats, a logical clock, and the two flush
-/// directions in either order. `Buggy = 1` is the obvious wrong merge — TAKE the
-/// incoming value rather than the max, last-writer-by-ARRIVAL — which is what a
-/// reader reaches for when a merge looks like an assignment.
+/// `AMergeNeverLosesAPick`: `b*_hi` records each stamp's value before the action that writes
+/// it (updates read the pre-state), so `b*_hi <= b*` says a stamp never went backwards.
+/// `Buggy = 1` breaks it when a flush carrying a stale row lands on a replica that has since
+/// worn something, overwriting B's later pick with A's older one.
 ///
 /// The invariant that IS stated carries its own victim, which is what keeps a
 /// checked law honest:
@@ -1983,18 +1792,16 @@ pub fn alt_archive_pool_model() -> Model {
 /// `a_wear_reaches_the_delta_or_it_does_not_survive_a_restart` pins the other
 /// half: a wear reaches the delta this model flushes.
 #[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor — the MODEL it
-// returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn kitty_pin_merge_model() -> Model {
     aterm_spec::ty_model! {
         KittyPinMerge {
-            const Buggy = 0;  // 1 = a merge TAKES the incoming stamp, not the max
+            const Buggy = 0;  // 1 = a merge takes the incoming stamp, not the max
             var a1 = 0;       // replica A's favourite stamp for cat one
             var a2 = 0;       // replica A's favourite stamp for cat two
             var b1 = 0;       // replica B's, for cat one
             var b2 = 0;       // replica B's, for cat two
-            var b1_hi = 0;    // the greatest stamp B held for cat one BEFORE now
+            var b1_hi = 0;    // the greatest stamp B held for cat one before now
             var b2_hi = 0;
             var ab = 0;       // A's delta has reached B since the last wear
             var clock = 0;    // logical clock; each wear takes the next tick
@@ -2034,8 +1841,7 @@ pub fn kitty_pin_merge_model() -> Model {
                 a2 = if Buggy == 1 { b2 } else { (if b2 > a2 { b2 } else { a2 }) };
             }
 
-            // A STAMP NEVER GOES BACKWARDS: a merge is a join, so no pin the
-            // user made is ever silently dropped.
+            // A stamp never goes backwards, so no pin the user made is silently dropped.
             invariant AMergeNeverLosesAPick: b1_hi <= b1 && b2_hi <= b2;
         }
     }

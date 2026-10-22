@@ -1178,7 +1178,7 @@ fn the_badge_switch_quiets_chrome_without_stopping_classification() {
 /// stored, just before the screen's stamp on `status` and last on the
 /// roster's row. The task's face prints only for an agent session whose
 /// live claim THIS window's host holds — told through the host's own wake
-/// (`App::apply_harness_fact`) — or a proven self-claim holds (FOREVER LAND
+/// (`App::apply_harness_fact`) — or a proven self-claim holds (Autopilot Land
 /// §10.4: its own `landed@v1` act, told as `HarnessFact::SelfTask`), and the
 /// instant only for an agent session, where `meta` prints what is stored.
 /// NEGATIVE CONTROLS: a face told with no claim, or under another holder's,
@@ -1419,12 +1419,10 @@ fn the_status_record_and_the_roster_carry_the_pause_after_task() {
     );
 }
 
-/// `autopilot=` BESIDE `supervisor=` (the Autopilot design, 2026-10-15, §5):
-/// `-` for a session that runs no agent the harness supervises; once one
-/// does, its EFFECTIVE Autopilot — `off` with no host to supervise it, then
-/// the table's default under one, then the session's own word — on BOTH arms
-/// of the record. NEGATIVE CONTROL: the master switch off reads `off`
-/// whatever the word.
+/// `autopilot=` beside `supervisor=` (the Autopilot design, §5): `-` for a session that runs no
+/// agent the harness supervises; once one does, its effective Autopilot (`off` with no host to
+/// supervise it, then the table's default under one, then the session's own word) on both arms
+/// of the record. Negative control: the master switch off reads `off` whatever the word.
 #[test]
 fn the_status_record_carries_the_effective_autopilot_beside_supervisor() {
     let mut app = crate::App::headless_for_test();
@@ -1831,8 +1829,8 @@ fn consent_at_risk_rides_the_reasons_token_only_on_the_conjunction() {
     // `/`-rooted cwd, and a Windows protected root is `C:\Users\…`.
     #[cfg(unix)]
     {
-        // The protected roots are RESOLVED DATA from the consent module —
-        // this file writes no protected-folder literal of its own (rule B13).
+        // The protected roots are resolved data from the consent module: this file writes no
+        // protected-folder literal (the `protected-folder` guard).
         // They are the App's published mirror, the same value the record's
         // consent check reads, so a seamless test pointing the process-global
         // HOME at a scratch dir cannot make the two disagree.
@@ -2233,7 +2231,7 @@ fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
             format!(r"'/Users//o'\''neil/{store}' '--resume' 'SECRET'"),
             "claude",
         ),
-        // A quoted assignment with a space is ONE assignment, skipped.
+        // A quoted assignment with a space is one assignment, skipped.
         ("env 'FOO=a b' '/opt/my tools/codex' resume".into(), "codex"),
         // CONTROL: no space in the path; an argument with spaces.
         (

@@ -167,10 +167,9 @@ impl HandRow {
     }
 
     /// Carried across a scroll or band move (`map`: an absolute row to its new
-    /// row, `None` once off the grid or band). The row rides the content; when
-    /// the hand typed at the caret (`at_caret`) the caret's screen row is kept
-    /// beside it until the caret settles which is right. Carried off the grid,
-    /// the caret's screen row is the only candidate.
+    /// row, `None` off the grid or band). When the hand typed at the caret, the
+    /// caret's screen row is kept beside it until the caret settles which is
+    /// right; carried off the grid, it is the only candidate.
     #[inline]
     pub(super) fn carried(self, map: &impl Fn(u16) -> Option<u16>, at_caret: bool) -> Option<Self> {
         let caret_row = self.caret_row.or(at_caret.then_some(self.row));
@@ -341,19 +340,8 @@ pub(super) const ORPHAN_EXACT_KEYS_MAX: usize = 2;
 /// Fixed, press-ordered escrow candidates recovered after an unknown insert.
 pub(super) type OrphanExactPressRun = [Option<(Instant, char)>; ORPHAN_EXACT_KEYS_MAX];
 
-/// The press-credit ring: the typed-echo coalescer's ledger, one slot per keyed
-/// glyph (`(press instant, unpaid cells, exact glyph if known)`), banked by
-/// [`CursorGlow::note_typed_glyph`] and spent oldest-first by the cells a
-/// licensed typed echo lays. The question is whether a press's cells have been
-/// laid, not how old it is: a late batch is always older than its presses'
-/// observation.
-///
-/// A slot leaves the ring when its cells are laid, when an edge the press
-/// cannot explain forgets it ([`Self::forget`],
-/// [`CursorGlow::forget_typed_credits`]), when the key that erases it is
-/// pressed ([`Self::retire_newest`]), or after [`IN_FLIGHT_PATIENCE_S`]; every
-/// read is life-filtered ([`Self::within`]). A scroll or row-band move keeps
-/// the pool. Fixed-size and `Copy`: the frame path allocates nothing.
+/// One live unpaid press as the exact-run proofs collect it: `(slot, press
+/// instant, unpaid cells, exact glyph if known)`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PressCredits {
     pub(super) slots: [Option<(Instant, u8, Option<char>)>; TYPED_STAMP_DEPTH],
@@ -820,11 +808,9 @@ impl PressCredits {
     }
 
     /// Retire `cells` of the newest press: one glyph out of a press that banked
-    /// several. A committed IME run is one press priced at its summed width
-    /// ([`CursorGlow::note_typed_cells`]); a Backspace erases one glyph, so the
-    /// slot goes only when its last cell is paid. An erase wider than the slot
-    /// takes the slot and no more. A zero-cell erase (a zero-width cluster)
-    /// takes nothing, leaving the press before the run standing.
+    /// several (a committed IME run is one press priced at its summed width,
+    /// [`CursorGlow::note_typed_cells`]). The slot goes when its last cell is
+    /// paid; a zero-cell erase (a zero-width cluster) takes nothing.
     #[inline]
     pub(super) fn retire_newest_cells(&mut self, cells: u8) {
         if cells == 0 {
@@ -926,12 +912,10 @@ pub(super) struct InsertLicence {
     /// An accumulation holding a break is a multi-line body: the unknown
     /// class.
     pub(super) breaks: bool,
-    /// The row witness: the row the hand was on when the licence was armed
-    /// ([`CursorGlow::insert_row`]: the visible caret's row, unless the
-    /// anchored lane established the echo row elsewhere, else the last
-    /// licensed move's row within the chain window), `None` when nothing could
-    /// say. It is the only identity an unknown-width insert has, and keeps a
-    /// Tab's stamp off a prompt printed on another row.
+    /// The row witness: the row the hand was on when armed
+    /// ([`CursorGlow::insert_row`]), `None` when nothing could say. The only
+    /// identity an unknown-width insert has; it keeps a Tab's stamp off a prompt
+    /// printed on another row.
     pub(super) row: Option<u16>,
 }
 
@@ -1488,11 +1472,9 @@ impl CursorGlow {
         // first, so its `Move` precedes the `Erase` in v2's order. The hand
         // keeps its row.
         self.clear_typed_keeping_hand(now);
-        // The key it erases: a Backspace typed into a stall erases the newest
-        // press in flight (bytes are processed in order), so that press is
-        // retired and the rest keep waiting (`abc⌫d` echoes as three cells for
-        // `a`, `b`, `d`). Not a forget: the row is still the hand's. An IME
-        // press gives back only the erased glyph's cells when priced.
+        // A Backspace typed into a stall erases the newest press in flight
+        // (bytes are processed in order): retire it, keep the rest (`abc⌫d`
+        // echoes as three cells). Not a forget: the row is still the hand's.
         let newest = self.type_press_ring.newest();
         let newest_press = newest.and_then(|i| self.type_press_ring.slots[i]);
         match cells {
@@ -1577,10 +1559,10 @@ impl CursorGlow {
 
     /// Host key hint: one plain typed-glyph keypress (Character/Space echoes
     /// only; never Enter, Tab, navigation or modified chords). It licenses the
-    /// following move and classifies a paired one-row move whose delta exceeds
-    /// the typed advance as a typed re-anchor: a TUI input box (Claude Code's
-    /// Ink prompt) rewraps per keystroke, so the caret lands left of its
-    /// launch column without travelling (see `classify_move`).
+    /// following move and classifies a paired one-row move beyond the typed
+    /// advance as a typed re-anchor: a TUI input box (Claude Code's Ink prompt)
+    /// rewraps per keystroke, so the caret lands left of its launch column
+    /// without travelling.
     #[inline]
     pub fn note_typed(&mut self, now: Instant) {
         self.note_typed_cells(now, 1);
@@ -1597,9 +1579,7 @@ impl CursorGlow {
 
     /// [`Self::note_typed_cells`] with the glyph class spelled by the host, which
     /// Rainbow Kitty v2's hero deal needs (§5.8: a shifted capital or `!` earns
-    /// an m1; a space lays ribbon and deals no star) and an echo cannot tell.
-    /// Only seam point 2 reads the extra fields; the wrapper is otherwise
-    /// identical.
+    /// an m1; a space deals no star) and an echo cannot tell.
     #[inline]
     pub fn note_typed_glyph(
         &mut self,
@@ -1662,13 +1642,10 @@ impl CursorGlow {
         );
     }
 
-    /// Record a main-screen Enter classifier stamp. It licenses the following
-    /// move, and a fresh stamp is the bare-Enter licence for the jump arm.
-    ///
-    /// This is the Enter that hands a line to a shell (or one the host cannot
-    /// place), so the hand leaves its row ([`Self::hand_row`]); the next
-    /// licensed typed echo names the new row. An Enter into a foreground
-    /// program's composer is [`Self::note_return_keeping_hand`].
+    /// Record a main-screen Enter classifier stamp, the bare-Enter licence for
+    /// the jump arm. This Enter hands a line to a shell, so the hand leaves its
+    /// row ([`Self::hand_row`]); an Enter into a foreground program's composer is
+    /// [`Self::note_return_keeping_hand`].
     #[inline]
     pub fn note_return(&mut self, now: Instant) {
         self.note_return_keeping_hand(now);
@@ -1777,21 +1754,15 @@ impl CursorGlow {
         self.deliver_insert(at, None, width);
     }
 
-    /// Host delivery edge: an insert's bytes (file drop, ⌘V, the `paste` verb,
-    /// a Tab completion, a raw ⌃V) have provably landed on the wire (the FIFO
-    /// writer's completed write, or the dispatch instant for a synchronous
-    /// insert), `width` as priced by the host ([`InsertWidth`]). Arms the
-    /// [`InsertLicence`] with the row witness read now ([`Self::insert_row`]):
-    /// the one same-row forward echo that fits is laid as a single
-    /// [`rk::Event::Sweep`] joining the live cohort (see the insert arm in
-    /// [`Self::spawn`] and [`Self::echo_anchor_pass`]).
-    ///
-    /// A pure stamp: it supersedes nothing, survives class-changing supersedes
-    /// and yields to a fresher class at the seam; every read is Rainbow
-    /// Kitty-gated. A second delivery before the first is spent accumulates. A
-    /// matching hop refused within [`Self::INSERT_RETRO_FRESH`], at or after
-    /// `dispatched_at`, is retro-licensed ([`PendingHop`]); bytes cannot echo
-    /// before dispatch. `Cells(0)` arms nothing.
+    /// Host delivery edge: an insert's bytes (file drop, ⌘V, the `paste` verb, a
+    /// Tab completion, a raw ⌃V) have provably landed on the wire (the writer's
+    /// completed write, or the dispatch instant for a synchronous insert),
+    /// priced by the host as `width`. Arms the [`InsertLicence`] with the row
+    /// witness read now: the one same-row forward echo that fits is laid as a
+    /// single [`rk::Event::Sweep`]. A pure stamp that supersedes nothing; a
+    /// matching hop refused within [`Self::INSERT_RETRO_FRESH`], not before
+    /// `dispatched_at`, is retro-licensed ([`PendingHop`]). `Cells(0)` arms
+    /// nothing.
     #[inline]
     pub fn note_insert_delivered_from(
         &mut self,
@@ -1829,11 +1800,9 @@ impl CursorGlow {
     }
 
     /// The dispatch-time arm: a bare Tab / ⌃V written inline arms the insert
-    /// licence at dispatch, without the late-receipt claim. The retro window is
-    /// symmetric in time, so at dispatch it would admit a hop refused before
-    /// the press. A pending hop is left for a real receipt. The licence is
-    /// stamped at `at`, so a queued Tab's revoke finds it and the delivery
-    /// re-arm counts the gesture once and makes the retro claim.
+    /// licence at dispatch, without the late-receipt claim (the symmetric retro
+    /// window would admit a hop refused before the press). Stamped at `at`, so a
+    /// queued Tab's revoke finds it and the delivery re-arm makes the claim.
     #[inline]
     pub fn note_insert_armed(&mut self, at: Instant, width: InsertWidth) {
         let _ = self.arm_insert(at, at, width);
@@ -1866,24 +1835,15 @@ impl CursorGlow {
         )
     }
 
-    /// The insert's row at `now`, read once as [`InsertLicence::row`] (not the
-    /// typing row [`Self::hand_row`]):
-    ///
-    /// * a visible caret's row when it sits with the hand; it wins over the
-    ///   licensed-move memory, since a program prompt can move the caret
-    ///   without a licensed move;
-    /// * under a hidden or parked caret, the row of the last licensed move
-    ///   (typed or anchored echo, insert, rewrite) within the chain window,
-    ///   else the established echo row ([`Self::last_anchor_sweep`]);
-    /// * `None` when nothing can say.
-    ///
-    /// A caret is parked when it is visible on a row other than the anchored
-    /// lane's established echo row (a TUI that CUPs to 1;1 while echoing
-    /// through [`Self::echo_anchor_pass`]); trusting it would let a Tab spend
-    /// on a status row. A caret merely differing from the print anchor (Codex:
-    /// transcript printing above) or on the established row is never demoted.
-    /// A caret shown on a fresh row since the lane last licensed elsewhere
-    /// reads as parked until an echo names its row.
+    /// The insert's row at `now`, read once as [`InsertLicence::row`]: a visible
+    /// caret's row when it sits with the hand (a program prompt can move the
+    /// caret without a licensed move); under a hidden or parked caret, the row of
+    /// the last licensed move within the chain window, else the established echo
+    /// row ([`Self::last_anchor_sweep`]); `None` when nothing can say. A caret is
+    /// parked when visible on a row other than the established echo row (a TUI
+    /// that CUPs to 1;1 while echoing); trusting it would let a Tab spend on a
+    /// status row. A caret merely off the print anchor (Codex printing a
+    /// transcript above) is not parked.
     #[inline]
     pub(super) fn insert_row(&self, now: Instant) -> Option<u16> {
         let established = self.last_anchor_sweep.map(|(row, _)| row);
@@ -1959,26 +1919,19 @@ impl CursorGlow {
         (hop <= self.insert_reach(ins, now)).then_some(ins)
     }
 
-    /// Row identity for the insert. The stamp is only delivery correlation;
-    /// spinners and timers advance inside its window too. A row may spend the
-    /// insert when it is the row the hand was on at the arm
-    /// ([`InsertLicence::row`]), or, for a priced width only, when the advance
-    /// is the insert's whole width. An unknown-width insert (Tab, raw ⌃V,
-    /// multi-line body, bounded at [`Self::INSERT_GESTURE_CELLS`]) is spent on
-    /// the witnessed row alone: not a prompt a later Return printed, not a
-    /// ⇧Tab mode line, not an untyped row.
+    /// Row identity for the insert (the stamp is only delivery correlation;
+    /// spinners advance inside its window too): the row the hand was on at the
+    /// arm, or, for a priced width only, an advance of the insert's whole width.
+    /// An unknown-width insert is spent on the witnessed row alone.
     #[inline]
     pub(super) const fn insert_row_identity(row: u16, hop: usize, ins: InsertLicence) -> bool {
         let own_row = matches!(ins.row, Some(r) if r == row);
         own_row || (ins.known && hop >= ins.cells as usize)
     }
 
-    /// The insert's echo on the visible lane: the one predicate
-    /// `spawn_judged`'s insert arm and the hide bridge
-    /// ([`Self::hidden_bridge_source`]) share: the echo shape
-    /// ([`Self::insert_echo`]) on the insert's own row
-    /// ([`Self::insert_row_identity`]) with no fresher press class owning the
-    /// hop ([`Self::fresher_class_owns_hop`]).
+    /// The insert's echo on the visible lane, shared by `spawn_judged` and the
+    /// hide bridge: the echo shape on the insert's own row with no fresher press
+    /// class owning the hop.
     #[inline]
     pub(super) fn visible_insert_echo(
         &self,
@@ -2315,13 +2268,10 @@ impl CursorGlow {
         self.type_press_ring.cells_within(now)
     }
 
-    /// The share rule: whether `paid` cells from `credits` unpaid presses buy a
-    /// `cells`-wide typed hop: at least two presses, and at least three
-    /// quarters of the swept cells. Mostly paid, not exactly: a burst whose
-    /// ring dropped one press must still paint. The shape it refuses is one
-    /// press echoing as a multi-cell hop (`w` over a five-cell word: 1 credit
-    /// against 5). The two-press floor reads the raw ledger: one unechoed
-    /// press is indistinguishable from a stale stamp.
+    /// The share rule: `paid` cells from `credits` unpaid presses buy a
+    /// `cells`-wide typed hop with at least two presses and three quarters of the
+    /// cells paid (a burst whose ring dropped a press must still paint). It
+    /// refuses one press echoing as a multi-cell hop (`w` over a five-cell word).
     #[inline]
     pub(super) const fn share_rule(credits: usize, paid: usize, cells: usize) -> bool {
         credits >= 2 && paid * 4 >= cells * 3
@@ -2453,11 +2403,9 @@ impl CursorGlow {
             .is_some_and(|cells| credits == cells)
     }
 
-    /// The alt-screen blink discriminator: the host's repaint blink
-    /// ([`Self::note_repaint_blink`], a DECTCEM hide inside a DEC 2026
-    /// synchronized update) is younger than [`Self::BLINK_HINT_FRESH`]. It
-    /// separates a full-redraw TUI's re-anchor and coalesce from a deliberate
-    /// vim/less jump; the main screen never asks.
+    /// The alt-screen blink discriminator: a repaint blink younger than
+    /// [`Self::BLINK_HINT_FRESH`] separates a full-redraw TUI's re-anchor and
+    /// coalesce from a deliberate vim/less jump.
     #[inline]
     pub(super) fn blink_fresh(&self, now: Instant) -> bool {
         hint_fresh(self.blink_hint, now, Self::BLINK_HINT_FRESH)
@@ -2628,15 +2576,12 @@ impl CursorGlow {
         arrived.then_some(dst)
     }
 
-    /// The tight fold shape, shared by the classifier (`shape_wrap`'s first arm
-    /// in `classify_move`) and the in-flight seam
-    /// ([`Self::unpaid_typed_echo`]): down exactly one row, landing at the
-    /// pane's first or second column, from its last or second-to-last column
-    /// (a deferred-wrap echo lands at col 1; a wide glyph wraps from the
-    /// second-to-last). Returns the cells the fold lays (origin tail from `pc`
-    /// plus landing head before `cc`: 1..=3), or `None` off the shape. The tail
-    /// is 0 when the pane's last cell was already paid as the pending-wrap
-    /// print ([`Self::fold_origin_tail`], [`Self::wrap_paid_row`]).
+    /// The tight fold shape, shared by `classify_move`'s `shape_wrap` and
+    /// [`Self::unpaid_typed_echo`]: down one row, landing at the pane's first or
+    /// second column, from its last or second-to-last (a deferred-wrap echo lands
+    /// at col 1; a wide glyph wraps from the second-to-last). Returns the cells
+    /// the fold lays (1..=3; the tail is 0 when the pane's last cell was already
+    /// paid, [`Self::wrap_paid_row`]).
     #[inline]
     pub(super) const fn fold_shape(
         &self,
@@ -2683,13 +2628,10 @@ impl CursorGlow {
 
     /// The coalesced fold shape (`shape_wrap`'s second arm, shared with the
     /// in-flight seam): two or three glyphs delivered across the fold in one
-    /// observed move. Down exactly one row, landing at pane columns 1..=3
-    /// (so a plain Enter to column 0 only matches the tight arm), from within
-    /// four columns of the pane's edge, and on the alt screen only under a
-    /// fresh repaint blink (a blinkless cross-row hop there is vim's
-    /// relocation). Returns the cells laid (2..=7) or `None`. The classifier
-    /// admits it under a live typing rhythm or the in-flight licence; the seam
-    /// admits it with exact payment.
+    /// move. Down one row, landing at pane columns 1..=3 (a plain Enter to column
+    /// 0 matches only the tight arm), from within four columns of the edge, and
+    /// on the alt screen only under a fresh repaint blink (else it is vim's
+    /// relocation). Returns the cells laid (2..=7).
     #[inline]
     pub(super) fn coalesced_fold_shape(
         &self,
@@ -2844,14 +2786,11 @@ impl CursorGlow {
     }
 
     /// The typed-press supersede, [`Self::clear_typed`]'s sibling for a typed
-    /// glyph: it closes only what a glyph contradicts (the Tab / scripted
-    /// gesture and the reflow). The banked typed stamps survive, and so do the
-    /// Return, nav, quench and composer-newline one-shots: a glyph typed before
-    /// their echo lands (a slow prompt, a TUI's input latency) is type-ahead,
-    /// and their late echo must not be judged under the glyph's stamp. The
-    /// host calls this instead of `clear_typed` on the printable-glyph arm
-    /// (and ahead of `note_return` / `note_user_gesture` for Enter, Tab and
-    /// ⌃V); [`Self::note_typed_glyph`] calls it before banking its stamp.
+    /// glyph: it closes only what a glyph contradicts (the Tab / scripted gesture
+    /// and the reflow). Banked stamps and the Return, nav, quench and newline
+    /// one-shots survive: a glyph typed before their echo lands is type-ahead,
+    /// and their late echo must not be judged under the glyph's stamp. The host
+    /// calls this instead of `clear_typed` on the printable-glyph arm.
     #[inline]
     pub const fn supersede_typed_press(&mut self) {
         self.user_gesture_hint = None;

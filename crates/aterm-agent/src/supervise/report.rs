@@ -36,7 +36,6 @@ use aterm_phase::{Program, ScreenReader};
 use super::blocks::{View, view_rows};
 use super::phase::transcript_end;
 use super::run::{Ctl, CtlReply, Fail, Session};
-use super::screen::parse_text_json;
 
 /// [`ReportOpts::max_rows`]' default: the most archived rows one report reads.
 pub const DEFAULT_MAX_ROWS: usize = 8000;
@@ -347,6 +346,9 @@ pub struct Offscreen {
     pub alt: bool,
     /// More archived rows than the page held.
     pub more: bool,
+    /// The screen half caught the program's DEC 2026 frame unfinished (`frame=open`,
+    /// read under the rows' lock, as `text --json`'s `"frame":"open"`).
+    pub frame_open: bool,
     pub archived: Vec<String>,
     pub screen: Vec<String>,
 }
@@ -425,6 +427,7 @@ pub fn parse_offscreen(reply: &CtlReply) -> Result<Offscreen, OffscreenError> {
         enabled: fields.iter().all(|(k, v)| *k != "enabled" || *v != "0"),
         alt: field("alt")? == 1,
         more: optional("more")? == 1,
+        frame_open: fields.iter().any(|(k, v)| *k == "frame" && *v == "open"),
         archived: payload[..split].iter().map(|r| r.to_string()).collect(),
         screen: payload[split..].iter().map(|r| r.to_string()).collect(),
     })
@@ -816,18 +819,24 @@ impl<C: Ctl> Session<'_, C> {
         args.extend(from.as_deref());
         args.push(&max_arg);
         args.push("screen=1");
-        let r = self.call(&args)?;
-        if r.ok() {
-            return match parse_offscreen(&r) {
-                Ok(off) => Ok(Some(off)),
-                Err(OffscreenError::NoHeader) => Ok(None),
-                Err(OffscreenError::Bad(why)) => Err(Fail::Hard(format!("offscreen: {why}"))),
-            };
-        }
-        if !self.unserved(&r) && without_verb(&r) {
-            return Ok(None);
-        }
-        Err(self.fault(&r, format!("offscreen failed: {}", r.stderr.trim())))
+        // The screen half is a whole frame's (`frame=open` read again after `await frame`).
+        self.whole_frame(|s| {
+            let r = s.call(&args)?;
+            if r.ok() {
+                return match parse_offscreen(&r) {
+                    Ok(off) => {
+                        let open = off.frame_open;
+                        Ok((Some(off), open))
+                    }
+                    Err(OffscreenError::NoHeader) => Ok((None, false)),
+                    Err(OffscreenError::Bad(why)) => Err(Fail::Hard(format!("offscreen: {why}"))),
+                };
+            }
+            if !s.unserved(&r) && without_verb(&r) {
+                return Ok((None, false));
+            }
+            Err(s.fault(&r, format!("offscreen failed: {}", r.stderr.trim())))
+        })
     }
 
     /// Whether a gap lies after archived row `k` (`offscreen since=<origin>:<k>
@@ -845,14 +854,10 @@ impl<C: Ctl> Session<'_, C> {
         Ok(true)
     }
 
-    /// The whole screen (`text --json`, never `tail=`): a host without the
-    /// archive reports from it alone.
+    /// The whole screen (`text --json`, never `tail=`), a whole frame's
+    /// ([`Self::text_json`]): a host without the archive reports from it alone.
     fn full_screen(&mut self) -> Result<super::screen::Screen, Fail> {
-        let r = self.call(&["text", "--json"])?;
-        if !r.ok() {
-            return Err(self.fault(&r, format!("text --json failed: {}", r.stderr.trim())));
-        }
-        parse_text_json(&r.stdout).map_err(Fail::Hard)
+        self.text_json(&["text", "--json"])
     }
 }
 

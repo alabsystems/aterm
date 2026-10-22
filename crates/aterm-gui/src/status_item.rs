@@ -950,9 +950,8 @@ impl Herald {
         self.since.get(&session)?.held.map(|(_, at)| at)
     }
 
-    /// Fold `session`'s current escalation. `looking` is true when the
-    /// session is the focused pane of a focused window (the notification
-    /// suppression set).
+    /// Fold `session`'s current escalation. `looking`: the session is the focused pane of a
+    /// focused window.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1047,8 +1046,6 @@ impl Herald {
             // The same box re-read, and nothing owed for it.
             return quiet(self, HeraldQuiet::Same, false);
         }
-        // A notice is wanted for what is shown now (a transition, or one the
-        // limit held back earlier).
         if looking {
             // The human sees it on this tab.
             slot.owed = 0;

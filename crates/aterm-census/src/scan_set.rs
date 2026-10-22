@@ -374,7 +374,7 @@ pub fn classify_patch_target(
     Ok(PatchTargetKind::FirstParty)
 }
 
-/// One vendored or absorbed crate the census SCANS namespaced (resolved from
+/// One vendored or absorbed crate the census scans namespaced (resolved from
 /// [`reviewed_forks`] or [`ABSORBED_CRATES`] against the tree): the
 /// walker's vendored-identity-mode input.
 #[derive(Debug)]
@@ -420,9 +420,7 @@ pub struct ScanSet {
     pub unlinked: Vec<(String, String, String)>,
 }
 
-// ---------------------------------------------------------------------------
 // Minimal fail-closed TOML-subset reader
-// ---------------------------------------------------------------------------
 
 /// A parsed TOML value from the subset this workspace uses.
 #[derive(Debug, Clone)]
@@ -621,9 +619,7 @@ fn parse_doc(text: &str, file: &str) -> Result<Doc, String> {
     Ok(Doc { sections })
 }
 
-// ---------------------------------------------------------------------------
 // Manifest model
-// ---------------------------------------------------------------------------
 
 /// One dependency edge as declared.
 struct DepEdge {
@@ -1137,9 +1133,7 @@ fn normalize_rel(base: &str, rel: &str) -> Result<String, String> {
     Ok(parts.join("/"))
 }
 
-// ---------------------------------------------------------------------------
 // Root manifest: workspace dep table + patch table
-// ---------------------------------------------------------------------------
 
 /// A `[workspace.dependencies]` entry the members inherit via
 /// `workspace = true`.
@@ -1237,9 +1231,7 @@ fn load_root_tables(root: &Path) -> Result<RootTables, String> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
 // Feature resolution (the default aterm-gui build's activation, unified)
-// ---------------------------------------------------------------------------
 
 /// What one crate's active features imply.
 #[derive(Default)]
@@ -1326,9 +1318,7 @@ fn expand_features(
     Ok(act)
 }
 
-// ---------------------------------------------------------------------------
 // The closure walk
-// ---------------------------------------------------------------------------
 
 /// Per-crate unified feature state during the fixpoint.
 #[derive(Default, Clone, PartialEq)]
@@ -1786,9 +1776,7 @@ pub fn render_scan_set(set: &ScanSet) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 pub(crate) mod test_fixtures {
@@ -2246,9 +2234,7 @@ mod tests {
         assert_eq!(kind, Ok(PatchTargetKind::FirstParty));
     }
 
-    // ------------------------------------------------------------------
     // Derivation unit tests (synthetic workspaces)
-    // ------------------------------------------------------------------
 
     #[test]
     fn direct_workspace_and_dotted_path_deps_are_followed() {

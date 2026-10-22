@@ -17,7 +17,7 @@
 //! | bash  | `--rcfile` (Git Bash: `--login --posix` + `ENV`) | Loader reads `~/.bashrc` (macOS: the login profiles too; Git Bash: what a login shell reads) then ours |
 //! | fish  | `XDG_DATA_DIRS` | Vendor conf.d auto-loading |
 //! | pwsh/powershell | `-NoExit -Command` | Argv override dot-sources our `.ps1` after profiles, then lays readline's chords over PSReadLine's Windows mode (`prepare_powershell`) |
-//! | wsl   | `WSLENV` + `wsl.exe --exec` | `/p` path-translates our dir, then bash's `--rcfile` runs INSIDE the distro |
+//! | wsl   | `WSLENV` + `wsl.exe --exec` | `/p` path-translates our dir, then bash's `--rcfile` runs inside the distro |
 //! | cmd   | `PROMPT` | `$e` OSC 0 title + OSC 133 A/B + OSC 633 `Cwd=` woven around the user's prompt |
 //!
 //! # Usage

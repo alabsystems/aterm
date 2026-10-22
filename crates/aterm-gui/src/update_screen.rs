@@ -1067,8 +1067,8 @@ mod tests {
 
         let off = page(idle.clone(), 0, false, false);
         let detail = off.detail.expect("the Linux detail");
-        // First, where the three painted lines of the slot show it; main's Linux
-        // sentences follow whole.
+        // First, where the slot's three painted lines show it; the Linux sentences
+        // follow whole.
         assert!(detail.contains("`aterm update check`"), "{detail}");
         assert!(
             detail.ends_with(on.detail.as_deref().unwrap()),

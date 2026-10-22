@@ -2,9 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 of `aterm_models_update::native_update_settings_draft_carry_model`
-//! (`NativeUpdateSettingsDraftCarry`, plan P2-2): an unsaved Settings draft
-//! rides a seamless self-update instead of holding it — and, beside it, the
-//! same rule for a document whose last save failed.
+//! (`NativeUpdateSettingsDraftCarry`): an unsaved Settings draft rides a seamless
+//! self-update instead of holding it, and so does a document whose last save failed.
 //!
 //! Each schedule drives two real `App`s through the shipping code: the Settings view's
 //! input, the update preflight (`revalidate_native_update_safety`) behind its close

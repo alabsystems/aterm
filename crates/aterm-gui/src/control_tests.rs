@@ -1200,7 +1200,7 @@ fn a_reply_wire_releases_when_its_reply_is_written() {
         ControlReply::from("OK d\n").releasing_on_write(written),
     ));
     assert!(wire.wait_released(std::time::Instant::now()));
-    // CONTROL: an unreleased wire's wait ends at its deadline.
+    // Control: an unreleased wire's wait ends at its deadline.
     let (wire, _written) = ReplyWire::new();
     assert!(!wire.wait_released(std::time::Instant::now() + std::time::Duration::from_millis(20)));
 }
@@ -1972,17 +1972,11 @@ fn dribbling_ack_cannot_refresh_the_handoff_deadline() {
     dribbler.join().unwrap();
 }
 
-/// Read the guarded frame, acknowledge it and close, like the one-shot `aterm ctl`
-/// client that exits as soon as its ACK is flushed. Returns the server's outcome.
-///
-/// The close happens before the server reads, deliberately and
-/// deterministically: that ordering is the whole hazard. Darwin refuses
-/// `setsockopt(SO_RCVTIMEO)` on an AF_UNIX socket whose peer has detached,
-/// so a server that re-arms its read bound per refill finds the bound
-/// unarmable and — before this was fixed — abandoned an acknowledgement
-/// that was already sitting in its own receive queue. The caller runs
-/// alone, and the detach is asserted before the server reads
-/// ([`assert_peer_detached`]).
+/// Read the guarded frame, acknowledge it and close, like the one-shot `aterm ctl` client
+/// that exits once its ACK is flushed; returns the server's outcome. The close precedes the
+/// server's read on purpose: Darwin refuses `SO_RCVTIMEO` on an AF_UNIX socket whose peer
+/// has detached, and the server must still read the ACK already in its receive queue. The
+/// caller runs alone, and the detach is asserted ([`assert_peer_detached`]).
 fn acknowledge_then_exit(
     client: CtlStream,
     server: &CtlStream,
@@ -2789,16 +2783,11 @@ fn authenticated_readiness_preserves_slow_cadence() {
     sender.join().expect("late sender exits");
 }
 
-/// A partial request line survives the socket wait after its first chunk.
-/// The wait must resume the same frame, even across the receive backstop.
-///
-/// The line's second half is sent once the reader has TAKEN the first —
-/// the server's receive queue reads empty — so the two halves are two
-/// reads with a socket wait between them on every run. An 80 ms sleep let
-/// a reader that started late take both in one read, and the wait went
-/// unexercised. The sender polls through its own descriptor for the
-/// server's socket: a failed assert unwinds without joining it and closes
-/// `server`, whose number another test's thread may then reuse.
+/// A partial request line survives the socket wait after its first chunk, even across the
+/// receive backstop. The second half is sent once the server's receive queue reads empty, so
+/// the halves are always two reads with a wait between. The sender polls the server's socket
+/// through its own descriptor: a failed assert unwinds without joining it and closes
+/// `server`, whose number another thread may then reuse.
 #[cfg(unix)]
 #[test]
 fn authenticated_readiness_preserves_partial_line() {
@@ -2885,9 +2874,8 @@ fn authenticated_readiness_reads_carried_lines_without_waiting() {
         let _ = tx.send((first, second));
         read_authenticated_request_line(&mut reader, &mut std::io::sink())
     });
-    // The carried lines MUST be answered with no socket event at all: a
-    // hang detector, never a 2 s budget. A reader that waits on the socket
-    // parks until `after` below, so it is still named, at the minute.
+    // The carried lines must be answered with no socket event at all (a hang detector): a
+    // reader that waits on the socket parks until `after` below.
     let result = rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
     client.write_all(b"after\n").expect("the next request");
     let after = reader_thread.join().expect("reader exits");
@@ -2978,14 +2966,10 @@ fn authenticated_poll_event_drains_hangup_and_rejects_invalid_fd() {
     assert!(authenticated_poll_event(0).is_err());
 }
 
-/// The authenticated liveness tick also preserves `feed-bin` framing: a
-/// valid bounded payload may arrive in chunks separated by several kernel
-/// read timeouts without losing its already-filled prefix.
-///
-/// Each next chunk is sent once the reader has met a REAL read timeout
-/// after the bytes before it ([`TickingReads`]), so every chunk boundary
-/// is crossed by a tick on every run. 80 ms sleeps let a reader that
-/// started late find the whole payload queued and meet no tick at all.
+/// The authenticated liveness tick preserves `feed-bin` framing: a bounded payload arriving
+/// in chunks separated by kernel read timeouts keeps its filled prefix. Each chunk is sent
+/// after the reader meets a real read timeout ([`TickingReads`]), so a tick crosses every
+/// chunk boundary.
 #[test]
 fn authenticated_binary_payload_preserves_delayed_chunks() {
     use std::io::Write;
@@ -3018,10 +3002,9 @@ fn authenticated_binary_payload_preserves_delayed_chunks() {
     sender.join().expect("delayed binary sender exits");
 }
 
-/// The server end of a control socket, read through, saying what its
-/// reads have met: `(bytes delivered, a read timed out since the last of
-/// them)`. A test paces its sender on it, so a chunk follows a REAL
-/// kernel read timeout rather than a sleep that may or may not cover one.
+/// The server end of a control socket, read through, saying what its reads have met:
+/// `(bytes delivered, a read timed out since the last of them)`. A sender paces on it, so a
+/// chunk follows a real kernel read timeout.
 struct TickingReads<'a> {
     stream: &'a CtlStream,
     seen: Arc<Mutex<(usize, bool)>>,
@@ -3115,7 +3098,7 @@ fn key_and_ctrl_grammar() {
         ("ctrl+shift+a".into(), press(ch('a'), M::CTRL | M::SHIFT)),
         // Inline prefixes are additive with a trailing `mods=` token.
         ("ctrl+u".into(), Want::SameAs("u mods=ctrl")),
-        // Inline prefixes also apply to NAMED keys.
+        // Inline prefixes also apply to named keys.
         ("ctrl+up".into(), press(Key::Named(Nk::ArrowUp), M::CTRL)),
         // The literal `+` key (no recognized modifier before it) survives.
         ("+".into(), press(ch('+'), M::empty())),
@@ -3162,8 +3145,8 @@ fn key_and_ctrl_grammar() {
         // `meta` is its own bit: the inline-prefix form agrees with `mods=`.
         ("meta+x".into(), Want::SameAs("x mods=meta")),
     ];
-    // Inline modifier+character combos build the SAME (Key::Character, mods)
-    // event `parse_ctrl` does, so the encoder derives the control byte.
+    // Inline modifier+character combos build the same (Key::Character, mods) event
+    // `parse_ctrl` does, so the encoder derives the control byte.
     for c in ['u', 'c', 'a', 'd', 'l', 'w'] {
         rows.push((format!("ctrl+{c}"), press(ch(c), M::CTRL)));
         rows.push((format!("ctrl+{c}"), Want::SameAsCtrl(c.to_string())));
@@ -3200,7 +3183,7 @@ fn take_mods_grammar() {
     enum Want {
         /// `take_mods` yields exactly these mods and this body.
         Mods(M, &'static str),
-        /// `take_mods` AND `parse_key` both refuse: never an unmodified key.
+        /// `take_mods` and `parse_key` both refuse: never an unmodified key.
         Refused,
         /// `take_mods` still accepts (the refusal rows' positive control).
         Accepted,
@@ -3211,8 +3194,8 @@ fn take_mods_grammar() {
         ("up", Want::Mods(M::empty(), "up")),
         ("up mods=ctrl+shift", Want::Mods(M::CTRL | M::SHIFT, "up")),
         ("mods=cmd,alt end", Want::Mods(M::SUPER | M::ALT, "end")),
-        // `meta` and `hyper` are their own bits; alt is still ALT, and meta no
-        // longer aliases it (the inline `meta+x` form is a `key` grammar row).
+        // `meta` and `hyper` are their own bits, distinct from alt (the inline `meta+x`
+        // form is a `key` grammar row).
         ("a mods=meta", Want::Mods(M::META, "a")),
         ("a mods=hyper", Want::Mods(M::HYPER, "a")),
         ("a mods=alt", Want::Mods(M::ALT, "a")),
@@ -3260,17 +3243,10 @@ fn take_mods_grammar() {
     }
 }
 
-/// The styled `screen` frame is lossless, one row per field family; every row also
-/// checks the derived `dims` and `"seq":<content_seq>`.
-///
-/// * Every resolved decoration, including underline substyle, overline, underline
-///   colour and the renderer's resolved rendition via the bold path.
-/// * The glyph is the combining-aware grapheme (é = e+U+0301), and a cell's OSC-8
-///   hyperlink target is surfaced.
-/// * Inline images and DEC double-width/height line sizes; no selection / no image
-///   stays null / empty. The selection object and one-glyph-per-cell count are
-///   pinned in `control_query` (`styled_frame_selection_is_typed_and_side_adjusted`,
-///   `styled_frame_glyphs_are_cell_grapheme_across_a_mixed_row`).
+/// The styled `screen` frame is lossless, one row per field family (decorations, the
+/// combining-aware grapheme, OSC-8 links, inline images, DEC line sizes); every row also
+/// checks the derived `dims` and `"seq":<content_seq>`. Selection and one-glyph-per-cell are
+/// pinned in `control_query`.
 #[test]
 fn screen_styled_frame_is_lossless() {
     use aterm_core::terminal::Terminal;
@@ -3540,13 +3516,9 @@ fn oversized_image_payload_is_truncated_not_encoded() {
     );
 }
 
-/// `image read`, the headless framebuffer-free path, as exact wire replies.
-///
-/// An inline iTerm2 image (OSC 1337 `File=`) reads back as structured base64,
-/// deduplicated across its cells; the input is a hand-computed literal (PNG magic +
-/// 4 NUL bytes), so matching output checks `b64_encode` independently.
-/// `image read <r> <c>` returns the covering tile with the queried cell's tile
-/// coords; a cell with no image is `ERR none`; a screen with none is `OK 0`.
+/// `image read`, the headless framebuffer-free path, as exact wire replies. The image is a
+/// hand-computed literal (PNG magic + 4 NULs), so matching output checks `b64_encode`
+/// independently.
 #[test]
 fn image_read_replies_are_exact() {
     use aterm_core::terminal::Terminal;
@@ -3577,11 +3549,9 @@ fn image_read_replies_are_exact() {
         );
     }
 
-    // Screen mode lists distinct images ROW-MAJOR, whatever order they were
-    // placed in: `a` (2 wide) goes on row 1 FIRST, then `b` on row 0. The
-    // screen walk reads every row's placements in one pass over the extras
-    // map, whose iteration order is arbitrary, so this pins that the rows
-    // still come back in order (and `a`'s second cell is deduplicated).
+    // Screen mode lists distinct images row-major whatever order they were placed in (`a`
+    // on row 1 first, then `b` on row 0), though the extras map iterates in arbitrary
+    // order; `a`'s second cell is deduplicated.
     const A: &[u8] = b"\x1b[2;1H\x1b]1337;File=inline=1;width=2;height=1:iVBORw0KGgoAAAAA\x1b\\";
     const B: &[u8] = b"\x1b[1;1H\x1b]1337;File=inline=1;width=1;height=1:iVBORw0KGgoAAAAB\x1b\\";
     let term = Arc::new(Mutex::new(Terminal::new(3, 10)));
@@ -4003,7 +3973,7 @@ fn sibling_forward_plan_presents_instance_token_and_keeps_selector() {
         format!("TOKEN cafe0123 @{} text\n", sid.as_str())
     );
 
-    // Selector-SECOND subscribe grammar: forwarded verbatim (selector kept).
+    // Selector-second subscribe grammar: forwarded verbatim (selector kept).
     let sline = format!("subscribe @{} cells,bytes", sid.as_str());
     let splan = plan_for(&sline, Scope::Owner, &store, &dir).expect("subscribe forwards");
     assert_eq!(splan, confined);
@@ -5769,7 +5739,7 @@ fn cross_session_input_reaches_target_sink_not_self() {
     };
     let ctx: &SessionCtx = &ctx;
 
-    // `key enter` cross-session: CR reaches the TARGET sink, nothing to self.
+    // `key enter` cross-session: CR reaches the target sink, nothing to self.
     assert_eq!(
         control_input::input_reply_to_str(background(
             "key",
@@ -5804,8 +5774,8 @@ fn cross_session_input_reaches_target_sink_not_self() {
         "cross input must stamp only its resolved session"
     );
 
-    // Raw feed/send retain their direct background route but now publish an
-    // accepted-input receipt on that same resolved SessionCtx.
+    // Raw feed/send keep their direct background route and publish an accepted-input
+    // receipt on the resolved SessionCtx.
     let unlogged_before_feed = crate::unseamed_control_inputs();
     assert_eq!(
         background(
@@ -5867,8 +5837,7 @@ fn cross_session_input_reaches_target_sink_not_self() {
 #[test]
 #[cfg(unix)]
 fn cross_session_resize_targets_term_only() {
-    // A REAL pty pair so `aterm_pty::resize`'s TIOCSWINSZ actually takes effect
-    // (a plain pipe is not a tty and the ioctl would no-op).
+    // A real pty pair, so `aterm_pty::resize`'s TIOCSWINSZ takes effect.
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     let h = registered_session(0, master, b"");
     let (term, ctx) = (h.term.clone(), h.ctx.clone());
@@ -6264,7 +6233,7 @@ fn update_check_and_apply_are_owner_only_subcommands() {
     // The sub-command word decides, whatever follows it: a malformed `check` is
     // refused to an edge before it can read as a usage error.
     assert!(owner_only("check extra"));
-    // Reads stay any-scope so an in-session observer can SEE update state.
+    // Reads stay any-scope so an in-session observer can see update state.
     assert!(!owner_only(""));
     assert!(!owner_only("status"));
     assert!(!owner_only("bogus"));
@@ -6590,7 +6559,7 @@ fn front_drive_fence_requires_owner_for_overlays_and_config_write_for_native_set
         }
     }
 
-    // OWNER is ALWAYS exempt — the owner's established control path is untouched.
+    // Owner is always exempt.
     for kind in [OverlayKind::Palette, OverlayKind::Overview] {
         assert_eq!(
             front_drive_escalation(owner, input_of("key"), FrontControlSurface::Overlay(kind)),
@@ -7763,7 +7732,7 @@ fn meta_set_get_unset_roundtrip_with_unicode() {
     let (_, changed_again) = cmd_meta(&h.term, &store, 0, &h.ctx, &format!("set title {title}"));
     assert!(!changed_again, "same-value re-set is not a change");
 
-    // A STORED "-" is not the unset sentinel: it reads back escaped.
+    // A stored "-" is not the unset sentinel: it reads back escaped.
     let (_, dash) = cmd_meta(&h.term, &store, 0, &h.ctx, "set role -");
     assert!(dash);
     let (read_dash, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
@@ -8023,8 +7992,8 @@ fn meta_autopilot_is_a_closed_set_stored_as_the_modes_word_and_read_last() {
         read.contains(" autopilot=- land_at=- autopilot_by=ctl autopilot_since="),
         "{read}"
     );
-    // `land_at=` follows it (the Autopilot design, §9.3.5): a timed Cruise's
-    // instant as stored, in unix seconds — printed only, no field of its own.
+    // `land_at=` follows it: when a timed Cruise lands, in unix seconds. It is printed only,
+    // with no `meta set` field of its own.
     h.ctx.meta.lock().unwrap().autopilot = Some("cruise".into());
     h.ctx.meta.lock().unwrap().land_at = Some(1_792_249_200_000);
     let (read, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
@@ -8321,17 +8290,12 @@ fn screen_frame_read_whole(text: &str) -> bool {
 // ends its push loop on the next tick whatever copies of the client end a fork holds.
 use crate::test_socket::{hang_up, join_after_hang_up};
 
-/// A SUBSCRIBER THAT HALF-CLOSED (`printf 'subscribe …\n' | nc -U`) is gone
-/// to the protocol but still reading: when its push stream ends it reads
-/// END-OF-FILE, though a copy of the SERVER end survives — the copy any
-/// thread's fork holds until it execs (a `try_clone` here). Once the push
-/// loop has returned every shutdown it makes is made, so one drain of
-/// non-blocking reads is the verdict.
-///
-/// NEGATIVE CONTROL (run by restoring the both-ways `shutdown` both of its
-/// production callers made after it): Darwin refused it for a socket whose
-/// read half the half-close had shut (`ENOTCONN`) and shut nothing, so the
-/// subscriber read `WouldBlock`, not its end-of-file, while the copy lived.
+/// A subscriber that half-closed (`printf 'subscribe …\n' | nc -U`) still reads end-of-file
+/// when its push stream ends, though a copy of the server end survives (a `try_clone`
+/// here). Once the push loop has returned every shutdown it makes is made, so one
+/// `read_to_end` is the verdict. Negative control (by mutation): a both-ways `shutdown` in
+/// the server's teardown, which Darwin refuses (`ENOTCONN`) for a socket whose read half the
+/// half-close shut, leaves the subscriber at `WouldBlock`.
 #[test]
 fn a_half_closed_subscriber_reads_eof_when_its_stream_ends_though_a_copy_survives() {
     use std::io::Read as _;
@@ -8729,11 +8693,9 @@ fn quiet_subscription_crashes_are_each_reaped() {
             caught_up.contains(&format!("sub 0 {}\n", h.sid.as_str())),
             "cycle {cycle}: the one target is self: {caught_up:?}"
         );
-        // THE FULLY-OPEN QUIET PEER IS KEPT, at a fact: a wake asks the
-        // peer probe BEFORE it pushes, so the DELTA this change produces,
-        // read whole, is a probe that found this peer there and a loop that
-        // went on. (`!join.is_finished()` right after the catch-up asked
-        // nothing: a loop that ended at its first probe still passed it.)
+        // The fully open quiet peer is kept: a wake asks the peer probe before it pushes,
+        // so the DELTA this change produces, read whole, proves the probe found the peer
+        // and the loop went on.
         let marker = format!("live-{cycle}");
         crate::term_lock(&h.term).process(marker.as_bytes());
         h.ctx.watchers.ring_watchers();
@@ -9273,7 +9235,7 @@ fn subscribe_multiplex_two_sids_tags_each() {
     crate::term_lock(&b.term).process(b"BBB");
     a.ctx.watchers.ring_watchers();
     b.ctx.watchers.ring_watchers();
-    // Accumulate until BOTH sids' deltas (with their text) have shown up.
+    // Accumulate until both sids' deltas (with their text) have shown up.
     let seen = read_until(&client, ack, |s| s.contains("AAA") && s.contains("BBB"));
     assert!(
         seen.contains("DELTA 0 ") && seen.contains("AAA"),
@@ -10802,8 +10764,8 @@ fn binary_frames_land_exact_bytes_and_keep_the_stream_framed() {
             pty: Some(b""),
             next: None,
         },
-        // A malformed length replies `ERR usage` WITHOUT consuming any payload:
-        // the next line is whatever followed the bad request line verbatim.
+        // A malformed length replies `ERR usage` without consuming any payload: the
+        // next line is whatever followed the bad request line verbatim.
         Row {
             label: "a bad length consumes no payload",
             input: b"feed-bin notanumber\nfollowing\n".to_vec(),
@@ -11023,7 +10985,7 @@ fn cross_session_input_reports_a_dead_peer_as_write_failed() {
 }
 
 /// BACKGROUND INPUT ON THE ORDERED WRITER'S ROUTE ANSWERS FROM THE WRITE, NOT ITS
-/// ADMISSION (ATERM-KI-1014-6): on the route every Windows key, report and paste
+/// ADMISSION: on the route every Windows key, report and paste
 /// takes (`force_conpty_route_for_test`), a background `send`, `key`, `paste` and
 /// mouse report into a session whose peer is gone answer `ERR write failed`.
 /// Before, they were answered on the writer's acceptance: `OK`. CONTROL: into a
@@ -11228,7 +11190,7 @@ impl Drop for ConptyTab {
 }
 
 /// [`queued_background_input_into_a_dead_peer_is_a_failed_write`] on a real ConPTY
-/// (ATERM-KI-1014-6), where every background input takes the ordered writer's route
+/// , where every background input takes the ordered writer's route
 /// and the write is ConPTY's `WriteFile`: a background `send`, `key`, `paste` and
 /// mouse report into a tab whose program and console host are gone answer
 /// `ERR write failed`. CONTROL: into a live cmd.exe the same verbs answer `OK` and the
@@ -11420,11 +11382,8 @@ fn cross_session_paste_reports_a_dead_spill_peer_as_write_failed() {
     panic!("every one of {ATTEMPTS} runs had a stranger on the read end");
 }
 
-/// Run `write` on its own thread and return its answer, failing (instead of
-/// hanging the suite) if it has not answered within the hang detector: the
-/// verdict a control lane needs, since a write that parks parks the lane. A
-/// parked writer is left behind on failure; the caller's later peer close
-/// releases it.
+/// Run `write` on its own thread and return its answer, failing at the hang detector if it
+/// parks (a write that parks parks the lane); the caller's later peer close releases it.
 #[cfg(unix)]
 fn answered_without_parking<T: Send + 'static>(
     what: &str,
@@ -13414,9 +13373,10 @@ fn a_yielding_turn_types_only_after_the_ribbon_exhales() {
     assert_eq!(out, "ERR yield timeout momentum=0.90\n");
 }
 
-/// `await gone <re>` answers `OK gone <seq>` as soon as no visible row matches: at
-/// arm when already clear (level-triggered), else on the batch that removes the last
-/// match, woken by the producer's notify (no poll). The token names the predicate,
+/// `await gone <re>` answers `OK gone <seq>` once no visible row matches: level-triggered,
+/// and on a screen no closed DEC 2026 frame vouches for (a shell's) once the range has read
+/// clear for `GONE_SETTLE`, so the clearing paint, woken by the producer's notify, starts a
+/// settle whose end the park wakes at with no further output. The token names the predicate,
 /// distinct from `OK match`; a pattern that stays is `OK timeout`.
 #[test]
 fn await_gone_verb_latches_at_arm_when_clear_and_when_the_row_leaves() {
@@ -13503,7 +13463,7 @@ fn await_gone_refuses_a_bad_regex_and_a_row_span_off_the_grid() {
         &store,
         0,
         &h.ctx,
-        "gone interrupt rows 23 99 timeout=100",
+        "gone interrupt rows 23 99 timeout=60000",
     );
     assert!(
         out.starts_with("OK gone "),
@@ -14223,12 +14183,10 @@ fn turn_submit_verification_rows() {
             why: "no extra Enter after a `clear` that ran",
             control: None,
         },
-        // Auto degrade: the target looks like a shell prompt but the 133 stream is
-        // desynced, so no press ever produces a command start (e.g. vte.sh
-        // double-sourced clobbering PS0's `133;C`), while the echo advances
-        // `content_seq`. Auto must not blindly re-press (each Enter is real input)
-        // or report a false `submitted=0 status=timeout`; it degrades to the seq
-        // verdict. The small submit_window makes the degrade arrive fast.
+        // Auto degrade: the prompt looks like a shell's but the 133 stream is desynced
+        // (e.g. vte.sh double-sourced clobbering PS0's `133;C`), so no press starts a
+        // command; auto must neither blindly re-press nor report a false timeout, and
+        // degrades to the seq verdict.
         Row {
             label: "auto degrades when the prompt block is stale",
             seed: PROMPT.to_vec(),
@@ -14418,13 +14376,13 @@ fn lease_acquire_status_release_and_holder_exclusion() {
         "status shows holder"
     );
 
-    // A DIFFERENT holder is refused while it is live.
+    // A different holder is refused while it is live.
     let denied = cmd_lease(&h.ctx, "acquire holder=agent-b");
     assert!(
         denied.starts_with("ERR lease held holder=agent-a"),
         "{denied}"
     );
-    // The SAME holder renews (not refused).
+    // The same holder renews (not refused).
     assert!(cmd_lease(&h.ctx, "acquire holder=agent-a").starts_with("OK lease acquired"));
 
     // Wrong holder cannot release; the right holder can.
@@ -14452,7 +14410,7 @@ fn cooperative_lease_blocks_turn_but_not_raw_writes() {
 
     assert!(cmd_lease(&h.ctx, "acquire holder=agent-a ttl=60000").starts_with("OK lease"));
 
-    // A `turn` is HARD arbitration — it refuses to stomp a live cooperative hold.
+    // A `turn` is hard arbitration: it refuses to stomp a live cooperative hold.
     let paste = |_: &str| true;
     let press = |_: &str| true;
     let out = cmd_turn(
@@ -15180,16 +15138,14 @@ fn the_accept_loop_backs_off_on_descriptor_exhaustion_only() {
 /// refusal is the observable (`no-bridge=1` before, `queued=1` after), since that
 /// token is what an agent acts on.
 ///
-/// And it arms only what the instance's config names: an argv of the caller's
-/// own, with none configured or another configured, is refused and arms
-/// nothing — the Owner token every in-session client holds does not choose the
-/// process that holds `Scope::Bridge`. What aterm.toml names is the test's to
-/// say (`fabric_launch::set_command_on_disk_for_tests`), never the developer's
-/// own file.
+/// It arms only the argv the instance's config names: one of the caller's own, with none
+/// or another configured, is refused and arms nothing, since the Owner token every
+/// in-session client holds must not choose the process that holds `Scope::Bridge`. The test
+/// sets what aterm.toml names (`fabric_launch::set_command_on_disk_for_tests`) and never
+/// reads the developer's own file.
 ///
-/// The armed thread outlives the test (no stop handle); with no `BRIDGE_CONTEXT`
-/// published in a test process it serves nothing and only re-spawns `true` under
-/// the launcher's back-off.
+/// The armed thread outlives the test; with no `BRIDGE_CONTEXT` it serves nothing and only
+/// re-spawns `true` under the launcher's back-off.
 #[test]
 fn fabric_attach_arms_the_supervisor_of_a_running_instance_once_and_for_owner_only() {
     crate::fabric::with_link_reset(fabric_attach_body);
@@ -15232,8 +15188,7 @@ fn fabric_attach_body() {
         "ERR fabric no command\n",
         "no argv and no launch config"
     );
-    // An argv of the caller's choosing, with nothing configured: refused, and
-    // nothing armed.
+    // An argv of the caller's own, with nothing configured, is refused and arms nothing.
     assert_eq!(
         run(Scope::Owner, "fabric attach /usr/bin/true --fleet lab"),
         format!(
@@ -15293,7 +15248,7 @@ fn fabric_attach_body() {
     );
     assert_eq!(post(), "ERR fabric absent id=2 no-bridge=1\n");
 
-    // ATTACH, with a tiny fake bridge: a program that exits at once.
+    // Attach, with a tiny fake bridge: a program that exits at once.
     let program = ["/usr/bin/true", "/bin/true"]
         .into_iter()
         .find(|p| std::path::Path::new(p).exists())
@@ -15302,8 +15257,7 @@ fn fabric_attach_body() {
     crate::fabric_launch::set_command_on_disk_for_tests(Some(words(&format!(
         "{program} --fleet lab"
     ))));
-    // Another program than the one configured is still not the caller's to
-    // choose...
+    // A program other than the configured one is still refused...
     assert_eq!(
         run(Scope::Owner, "fabric attach /usr/bin/false --fleet lab"),
         format!(
@@ -15366,11 +15320,9 @@ fn fabric_attach_body() {
 }
 
 /// `deliver`, `outbox` and `outbox sent` are refused to every scope but the bridge
-/// connection, Owner included: `aterm-ctl @self` is Owner, so Owner access would put
-/// forging an attested `from=` within reach of one prompt injection. Drives the
-/// dispatch's decision function. `hold` is not a bridge verb; its fleet-hold rule
-/// is pinned by
-/// `the_local_owner_may_hold_its_session_and_never_a_fleet_hold_inbox_hold`.
+/// connection, Owner included: `aterm-ctl @self` is Owner, so Owner access would put forging
+/// an attested `from=` within reach of one prompt injection. `hold` is not a bridge verb
+/// (`the_local_owner_may_hold_its_session_and_never_a_fleet_hold_inbox_hold`).
 #[test]
 fn the_bridge_verbs_refuse_every_scope_but_the_bridge_inbox_hold() {
     // `deliver` marks the session bridge-governed in the process-wide link, so
@@ -15441,8 +15393,8 @@ fn the_bridge_verbs_refuse_every_scope_but_the_bridge_body() {
         "ERR no such post\n",
         "reached the handler, which is the point"
     );
-    // A SELECTOR is refused even from the bridge: `@<other> deliver <sid> …`
-    // would otherwise aim the bridge plane at a session the sid does not name.
+    // A selector is refused even from the bridge: `@<other> deliver <sid> …` would
+    // otherwise aim the bridge plane at a session the sid does not name.
     assert_eq!(
         run(
             Scope::Bridge,
@@ -15464,14 +15416,12 @@ fn the_bridge_verbs_refuse_every_scope_but_the_bridge_body() {
     }
 }
 
-/// THE BRIDGE NAMES ITS LANE AND BUILD, AND THE INSTANCE REPORTS BOTH. A
-/// bridge's `hello` is recorded for the incarnation that owns the link and
-/// answered with this instance's own lane and build; `fabric status` then
-/// prints the two builds side by side, so a bridge of another build than its
-/// instance is named rather than inferred. A `hello` from a ghost lane records
-/// nothing, malformed input is refused, and every bridge-plane line this
-/// endpoint cannot parse — here a `deliver` carrying a field from a later lane
-/// — is counted as a lane fault for the incarnation that sent it.
+/// A bridge's `hello` is recorded for the incarnation that owns the link and answered with
+/// this instance's lane and build, and `fabric status` prints both builds side by side, so
+/// a bridge of another build than its instance is named rather than inferred. A `hello`
+/// from a ghost lane records nothing, malformed input is refused, and every bridge-plane
+/// line this endpoint cannot parse (here a `deliver` carrying a field from a later lane)
+/// counts as a lane fault for the incarnation that sent it.
 #[test]
 fn a_bridges_hello_and_its_unparsed_lines_are_reported_for_its_incarnation() {
     crate::fabric::with_link_reset(a_bridges_hello_and_its_unparsed_lines_body);
@@ -15739,7 +15689,7 @@ fn the_local_owner_may_hold_its_session_and_never_a_fleet_hold_body() {
         dispatch_hold_verb(rest, selector.as_ref(), scope, &store)
     };
 
-    // OWNER: on, halted, status/inbox say so, off, lifted.
+    // Owner: on, halted, status/inbox say so, off, lifted.
     assert_eq!(
         run(Scope::Owner, &format!("hold {sid} on reason=demo")),
         "OK hold=1\n"
@@ -15772,7 +15722,7 @@ fn the_local_owner_may_hold_its_session_and_never_a_fleet_hold_body() {
         );
     }
 
-    // EDGE: refused, on and off. A SELECTOR: refused, from Owner and Bridge.
+    // Edge: refused, on and off. A selector: refused, from Owner and Bridge.
     assert_eq!(
         run(edge, &format!("hold {sid} on reason=x")),
         "ERR denied\n"
@@ -15801,8 +15751,7 @@ fn the_local_owner_may_hold_its_session_and_never_a_fleet_hold_body() {
         crate::fabric::HOLD_DENIED
     );
 
-    // BRIDGE: unchanged. Fleet by default, and the fleet hold then stands
-    // against every Owner act.
+    // Bridge: fleet by default, and the owner's `off` cannot lift the fleet hold.
     assert_eq!(
         run(
             Scope::Bridge,
@@ -15818,13 +15767,13 @@ fn the_local_owner_may_hold_its_session_and_never_a_fleet_hold_body() {
         run(Scope::Owner, &format!("hold {sid} off")),
         crate::fabric::HOLD_DENIED
     );
-    // The owner's own hold beside it: its slot, not a replacement…
+    // The owner's `on` beside it fills the owner's own slot and replaces nothing…
     assert_eq!(
         run(Scope::Owner, &format!("hold {sid} on reason=mine")),
         "OK hold=1\n"
     );
     assert_eq!(ctx.fabric.holds().origins(), "fleet,local");
-    // …and the owner's `off` lifts that and nothing else.
+    // …and its `off` lifts that slot and nothing else.
     assert_eq!(run(Scope::Owner, &format!("hold {sid} off")), "OK hold=1\n");
     assert_eq!(
         crate::fabric::halt_refusal(&ctx, "turn").as_deref(),
@@ -15835,8 +15784,8 @@ fn the_local_owner_may_hold_its_session_and_never_a_fleet_hold_body() {
         crate::fabric::touched_contains(&sid),
         "the BRIDGE's hold did make the session bridge-governed"
     );
-    // The bridge lifts; the owner can hold again; and the bridge's fleet
-    // `off` leaves that local hold standing — the owner's `off` lifts it.
+    // The bridge lifts; the owner can hold again; and the bridge's fleet `off` leaves that
+    // local hold standing, which the owner's `off` lifts.
     assert_eq!(
         run(Scope::Bridge, &format!("hold {sid} off")),
         "OK hold=0\n"
@@ -16225,12 +16174,10 @@ fn a_person_types_into_a_held_and_stalled_session() {
     aterm_pty::close_fd(slave);
 }
 
-/// The dispatch's gates on a real pty: a raw program that stopped reading holds the
-/// human's Enter; once the watch publishes it as stalled, a driver's `key down` is
-/// refused `ERR busy input-unread` (before publication it is written with a warning;
-/// see `input_stall`'s tests). A held session answers `ERR halted` first, and the
-/// refused attempt consumes no `id=` sequence: once the program reads, the same key
-/// is a first attempt that writes, and only then a duplicate.
+/// The dispatch's gates on a real pty: once the watch publishes a raw program as stalled, a
+/// driver's `key down` is refused `ERR busy input-unread`; a held session answers
+/// `ERR halted` first; and the refused attempt consumes no `id=` sequence, so once the
+/// program reads the same key writes, and only then is a duplicate.
 #[test]
 #[cfg(target_os = "macos")]
 fn the_unread_input_gate_refuses_after_the_halt_and_gives_the_id_back() {
@@ -16306,19 +16253,11 @@ fn the_unread_input_gate_refuses_after_the_halt_and_gives_the_id_back() {
     aterm_pty::close_fd(slave);
 }
 
-/// `turn` never stacks Enters behind one the program has not read: into a raw
-/// program that is not reading, a `presses=3` turn pastes, presses Enter once, sees
-/// it unread and stops (`submitted=0`, reply shape unchanged), leaving the text and
-/// one `\r` queued. Negative control: into a pipe (nothing to consult) it presses
-/// all three.
-///
-/// NOT A BLOCK (owner direction, 2026-09-29): the guard ENDS the presses,
-/// it never waits for the Enter to be read. The Enter here is never read,
-/// yet the turn answers within one submit window and its settle, far
-/// inside its budget — a program that is merely slow reads its one Enter
-/// when it gets to it. The budget is the verb's ten-minute ceiling, so a
-/// turn that waited on the unread Enter runs it out and the minute's hang
-/// detector on `dur_ms=` tells the two apart however loaded the machine.
+/// `turn` never stacks Enters behind one the program has not read: into a raw program that
+/// is not reading, a `presses=3` turn presses Enter once, sees it unread and stops
+/// (`submitted=0`), without waiting for it to be read. Negative control: into a pipe it
+/// presses all three. The budget is the verb's ten-minute ceiling, so the hang detector on
+/// `dur_ms=` tells a turn that waited apart.
 #[test]
 #[cfg(target_os = "macos")]
 fn the_unread_input_gate_lets_a_turn_press_enter_once_into_a_program_that_is_not_reading() {
@@ -16465,14 +16404,10 @@ fn an_aimed_app_verb_asks_the_app_lane_halt_question_body() {
     );
 }
 
-/// The `fabric:` lease namespace belongs to the bridge connection.
-///
-/// `Scope::Bridge` alone may acquire a `lease … holder=fabric:*`. `lease_acquire`
-/// otherwise takes any 1..=64 printable-ASCII holder, so an in-session Owner agent
-/// could show `driving=lease:fabric:<human>` in `who`, attribute its drive to that
-/// human, keep it off the bus control ledger (the bridge filters `fabric:` holders
-/// out of its lease event) and pre-empt the real mirror when the human claimed the
-/// keyboard.
+/// The `fabric:` lease namespace belongs to the bridge connection; otherwise an in-session
+/// Owner agent could pose as the human in `who`, keep its drive off the bus control ledger
+/// (the bridge filters `fabric:` holders out of its lease event) and pre-empt the real
+/// mirror.
 #[test]
 fn only_the_bridge_may_claim_the_fabric_lease_namespace() {
     // The bridge mirror's exact `acquire` shape, which the rule must keep refusing
@@ -16494,7 +16429,7 @@ fn only_the_bridge_may_claim_the_fabric_lease_namespace() {
             scope,
             "acquire ttl=1 holder=fabric:"
         ));
-        // An ordinary holder is untouched: this fences a NAMESPACE, not the verb.
+        // An ordinary holder is untouched: this fences a namespace, not the verb.
         assert!(!lease_forges_fabric_holder(scope, "acquire holder=drv-7"));
         assert!(!lease_forges_fabric_holder(scope, "acquire"));
         assert!(!lease_forges_fabric_holder(scope, "status"));
@@ -16552,7 +16487,7 @@ fn dropping_the_bridge_guard_halts_the_governed_sessions_body() {
         ctx.fabric.hold_advisory().map(|h| h.reason).as_deref(),
         Some("fabric-lost")
     );
-    // THE KNOB: the fail-closed sweep.
+    // The knob: the fail-closed sweep.
     crate::fabric::set_hold_on_bridge_lost(true);
     drop(BridgeLostGuard {
         store: store.clone(),
@@ -16782,7 +16717,7 @@ fn a_worker_frame_for_another_instance_is_refused_never_relayed() {
     }
 }
 
-// ---- A6: exactly-once at the PTY seam ---------------------------------------
+// ---- exactly-once at the PTY seam -------------------------------------------
 
 /// Drive one `feed-bin` frame through the production framing path, recording every
 /// event that reached the input seam. Returns `(reply, events)`, so "typed once" is
@@ -16854,7 +16789,7 @@ fn feed_idempotent_feed_bin_types_once_and_the_replay_says_dup() {
     assert_eq!(first, "OK 3 bytes\n");
     assert_eq!(seen.borrow().as_slice(), [b"ABC".to_vec()]);
 
-    // It restarts and replays the SAME key. Nothing is typed.
+    // It restarts and replays the same key. Nothing is typed.
     let replay = feed_bin_once(
         &active,
         &store,
@@ -16869,8 +16804,8 @@ fn feed_idempotent_feed_bin_types_once_and_the_replay_says_dup() {
         "exactly one keystroke reached the seam across the crash window"
     );
 
-    // The OTHER side of the window: a key the endpoint never saw is FRESH, so a
-    // bridge that crashed BEFORE the write loses nothing by replaying.
+    // The other side of the window: a key the endpoint never saw is fresh, so a bridge
+    // that crashed before the write loses nothing by replaying.
     let next = format!("{}:9:2", front.ctx.nonce.to_hex());
     assert_eq!(
         feed_bin_once(
@@ -16884,7 +16819,7 @@ fn feed_idempotent_feed_bin_types_once_and_the_replay_says_dup() {
     );
     assert_eq!(seen.borrow().len(), 2);
 
-    // And an UNKEYED frame is the pre-A6 wire, byte for byte.
+    // An unkeyed frame keeps the unkeyed reply, byte for byte.
     assert_eq!(
         feed_bin_once(&active, &store, "@1 feed-bin 3", b"GHI", &seen),
         "OK 3 bytes\n"
@@ -16930,16 +16865,15 @@ fn feed_idempotent_an_empty_keyed_payload_consumes_no_sequence() {
         "the same key is still a FIRST attempt — the empty frame claimed nothing"
     );
     assert_eq!(seen.borrow().as_slice(), [b"ABC".to_vec()]);
-    // An UNKEYED empty frame keeps its old answer.
+    // An unkeyed empty frame keeps the unkeyed answer.
     assert_eq!(
         feed_bin_once(&active, &store, "@1 feed-bin 0", b"", &seen),
         "OK 0 bytes\n"
     );
 }
 
-/// Owner and Bridge are distinct classes at `caller_actor` and `cmd_whoami`: the
-/// exits ledger attributes them apart (`by=ctl` / `by=bridge`). The only test that
-/// drives either function with `Scope::Bridge`.
+/// Owner and Bridge are distinct classes at `caller_actor` and `cmd_whoami`: the exits
+/// ledger attributes them apart (`by=ctl` / `by=bridge`).
 #[test]
 fn owner_and_bridge_differ_at_whoami_and_at_caller_actor() {
     let h = registered_session(0, -1, b"");
@@ -16960,27 +16894,18 @@ fn owner_and_bridge_differ_at_whoami_and_at_caller_actor() {
     );
 }
 
-/// A mark's producer is namespaced by authority, so a local driver cannot burn the
-/// bridge's sequence.
-///
-/// The key's `<producer>` is caller-typed and the `<epoch>` is public (roster
-/// `nonce=`, `$ATERM_LAUNCH_NONCE`), so an Owner connection could send
-/// `send id=<epoch>:<bridge producer>:18446744073709551615` with an empty tail,
-/// settle `Applied` with nothing typed, and pin the bridge's high-water at the top
-/// of the u64 range; every later `Bridge::feed` would answer `OK dup=1` and write
-/// nothing.
-///
-/// `Scope::Bridge` is a connection, not a token, so no token can claim in its
-/// namespace. Answering is not claiming: a local caller naming a sequence the
-/// bridge consumed is still answered `OK dup=1` and writes nothing.
-/// Only installing a high-water in the bridge's namespace is fenced.
+/// A mark's producer is namespaced by authority, so a local driver cannot burn the bridge's
+/// sequence: the `<producer>` is caller-typed and the `<epoch>` public, so an Owner could
+/// otherwise pin the bridge's high-water at `u64::MAX` with an empty `send` and make every
+/// later `Bridge::feed` a `dup=1`. Only installing a high-water in the bridge's namespace is
+/// fenced; a local caller naming a consumed bridge sequence is still answered `OK dup=1`.
 #[test]
 fn feed_idempotent_a_producer_is_namespaced_by_the_callers_authority() {
     let h = registered_session(0, -1, b"");
     let hex = h.ctx.nonce.to_hex();
     let bridge_producer = 7u64;
 
-    // T1's one verb: claim the bridge's producer at the top of the range.
+    // The attack: claim the bridge's producer at the top of the range.
     let attack = format!("{hex}:{bridge_producer}:{}", u64::MAX);
     assert_eq!(
         crate::pty_idem::guarded(&h.ctx, Scope::Owner, "send", Some(attack.as_str()), || {
@@ -16990,8 +16915,8 @@ fn feed_idempotent_a_producer_is_namespaced_by_the_callers_authority() {
         "OK\n"
     );
 
-    // The human's keystroke, arriving over the bridge under the bridge's own
-    // key. It must RUN.
+    // The human's keystroke, arriving over the bridge under the bridge's own key, must
+    // run.
     let typed = std::cell::Cell::new(0u32);
     let bridge_key = format!("{hex}:{bridge_producer}:1");
     let feed = || {
@@ -17013,8 +16938,7 @@ fn feed_idempotent_a_producer_is_namespaced_by_the_callers_authority() {
     );
     assert_eq!(typed.get(), 1, "the bytes actually reached the seam");
 
-    // And the bridge's own replay is still recognized INSIDE its own realm —
-    // the exactly-once property this module exists for is unchanged.
+    // The bridge's own replay is still recognized inside its own realm.
     assert_eq!(feed(), "OK dup=1\n");
     assert_eq!(typed.get(), 1);
 
@@ -17125,13 +17049,10 @@ fn feed_idempotent_turn_submits_once() {
     assert_eq!(presses.get(), 1, "submitted exactly once");
 }
 
-/// The in-doubt verdict: an attempt that did not answer `OK` may still have typed
-/// (`cmd_turn` types, then can fail to submit), so the sequence is kept and its
-/// outcome recorded as unknown. A replay is told so and runs nothing; `timeline`
-/// carries a row for a human.
-///
-/// `ERR busy` and `ERR denied` are decided before any byte moves, so they give the
-/// sequence back and a retry is a first attempt.
+/// The in-doubt verdict: an attempt that did not answer `OK` may still have typed, so the
+/// sequence is kept and its outcome recorded as unknown; a replay is told so and runs
+/// nothing, and `timeline` carries a row. `ERR busy` and `ERR denied` are decided before any
+/// byte moves, so they give the sequence back.
 #[test]
 fn feed_idempotent_an_unknown_outcome_is_reported_and_never_replayed() {
     let h = registered_session(0, -1, b"");
@@ -17144,7 +17065,7 @@ fn feed_idempotent_an_unknown_outcome_is_reported_and_never_replayed() {
         "ERR write failed\n".to_string()
     });
     assert_eq!(out, "ERR write failed\n");
-    // The replay is refused rather than re-typed OR reported as a duplicate.
+    // The replay is refused rather than re-typed or reported as a duplicate.
     let replay = crate::pty_idem::guarded(&h.ctx, Scope::Owner, "send", Some(key.as_str()), || {
         runs.set(runs.get() + 1);
         "ERR write failed\n".to_string()
@@ -17152,7 +17073,7 @@ fn feed_idempotent_an_unknown_outcome_is_reported_and_never_replayed() {
     assert_eq!(replay, "ERR in-doubt seq=1\n");
     assert_eq!(runs.get(), 1, "an in-doubt sequence is never replayed");
 
-    // VISIBLE: the row is on this session's timeline, with no input bytes on it.
+    // Visible: the row is on this session's timeline, with no input bytes on it.
     let timeline = h.ctx.timeline.lock().unwrap();
     let doubt: Vec<_> = timeline
         .since(None)
@@ -17214,7 +17135,7 @@ fn feed_idempotent_the_mark_is_per_producer_and_covers_everything_under_it() {
     assert_eq!(go(format!("{hex}:1:3")), "OK dup=1\n", "under the mark");
     assert_eq!(go(format!("{hex}:1:5")), "OK dup=1\n", "at the mark");
     assert_eq!(go(format!("{hex}:1:6")), "OK\n", "above the mark");
-    // A DIFFERENT producer's sequence 5 is its own first attempt.
+    // A different producer's sequence 5 is its own first attempt.
     assert_eq!(go(format!("{hex}:2:5")), "OK\n");
     assert_eq!(runs.get(), 3);
 }
@@ -17263,8 +17184,8 @@ fn unkeyed_verbs_deliver_a_leading_id_as_content() {
         "a leading id= on `paste` is delivered as literal text"
     );
 
-    // …and nothing claimed it: the same key on a keyed verb is FRESH, not
-    // `dup=1` — the paste bought no exactly-once protection.
+    // …and nothing claimed it: the same key on a keyed verb is fresh, not `dup=1`; the
+    // paste bought no exactly-once protection.
     let reply = crate::pty_idem::guarded(&h.ctx, Scope::Owner, "send", Some(&key), || {
         "OK\n".to_string()
     });
@@ -17300,7 +17221,7 @@ fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() 
         .unwrap()
         .unwrap();
 
-    // The prompt is NOT up: the guard misses, the digit never lands.
+    // The prompt is not up: the guard misses, the digit never lands.
     assert_eq!(
         control_input::cmd_key_guarded(&h.term, &h.ctx, proceed.as_ref(), "1"),
         "OK skipped\n"
@@ -17325,7 +17246,7 @@ fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() 
     );
     assert!(drain_pipe(&rx).is_empty());
 
-    // The dispatch stamps BOTH answers with the content baseline, so the
+    // The dispatch stamps both answers with the content baseline, so the
     // driver's next `await seq` is anchored whichever way the guard went.
     let seq = crate::term_lock(&h.term).content_seq();
     assert_eq!(
@@ -17337,7 +17258,7 @@ fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() 
         format!("OK seq={seq}\n")
     );
 
-    // A malformed key name is the usage line — before any lock, nothing written.
+    // A malformed key name is the usage line, before any lock; nothing written.
     assert_eq!(
         control_input::cmd_key_guarded(&h.term, &h.ctx, proceed.as_ref(), "notakey"),
         control_input::KEY_USAGE
@@ -17586,11 +17507,11 @@ fn a_guarded_key_composes_with_the_idempotency_key_and_a_skip_gives_the_sequence
         })
     };
 
-    // No prompt: skipped, nothing written — and the sequence is NOT consumed.
+    // No prompt: skipped, nothing written, and the sequence is not consumed.
     assert_eq!(attempt(), "OK skipped\n");
     assert!(drain_pipe(&rx).is_empty());
 
-    // The prompt appears; the SAME sequence retried presses (a first attempt).
+    // The prompt appears; the same sequence retried presses (a first attempt).
     crate::term_lock(&h.term).process(b"Do you want to proceed?\r\n");
     assert_eq!(
         attempt(),
@@ -17716,7 +17637,7 @@ fn a_fenced_key_never_presses_into_the_box_that_replaced_the_one_it_read() {
     );
     assert_eq!(drain_pipe(&rx), b"1");
 
-    // An identical REPAINT moves the generation but not the hash: `if-gen=`
+    // An identical repaint moves the generation but not the hash: `if-gen=`
     // is the strict fence, `if-fp=` lets a redraw of the same box through.
     crate::term_lock(&h.term).process(BOX_B);
     let (gen_c, fp_c) = stamp(&h);
@@ -17822,15 +17743,12 @@ fn a_re_entered_alternate_screen_never_passes_the_generation_fence() {
     }
 }
 
-/// The person fence (`key|send if-human=<n>`) through the real App input seam: a
-/// person's `↓` (`Source::Human`) reaches the PTY and moves the person count by one;
-/// a key or send fenced on the count read before it answers
-/// `OK skipped reason=person` (zero bytes, content seq unmoved and stamped). The
-/// person check runs first, so a stale generation too still says `reason=person`.
-/// A fenced write never moves the person count.
-///
-/// Negative controls: fenced on the current generation alone the key presses, and
-/// fenced on the count read after the person's `↓` the key and send both land.
+/// The person fence (`key|send if-human=<n>`) through the real App input seam: after a
+/// person's `↓` (`Source::Human`) a key or send fenced on the earlier count answers
+/// `OK skipped reason=person` with zero bytes. The person is asked first, so a stale
+/// generation also says `reason=person`, and a fenced write never moves the count. Negative
+/// controls: the generation fence alone presses, and a fence on the count read after the
+/// `↓` lets both land.
 #[test]
 #[cfg(unix)]
 fn a_person_fenced_write_is_refused_after_a_persons_key_through_the_app_seam() {
@@ -17940,11 +17858,10 @@ fn a_person_fenced_write_is_refused_after_a_persons_key_through_the_app_seam() {
     );
 }
 
-/// `turn … submit=guarded:<re>`: the text is typed, and Enter is pressed
-/// only while `<re>` still matches. A box that replaced the composer during
-/// the paste settle gets NO Enter, and the reply says so in the verb's
-/// Lines framing. NEGATIVE CONTROL: the same turn against a composer that
-/// stays up writes exactly one Enter.
+/// `turn … submit=guarded:<re>`: the text is typed, and Enter is pressed only while `<re>`
+/// still matches. A box that replaced the composer during the paste settle gets no Enter,
+/// and the reply says so in the verb's Lines framing. Negative control: the same turn
+/// against a composer that stays up writes exactly one Enter.
 #[test]
 #[cfg(unix)]
 fn a_guarded_turn_submit_never_presses_enter_into_a_screen_its_guard_left() {
@@ -18137,7 +18054,7 @@ fn keyed_attention_on_the_wire_is_per_owner_and_the_bare_form_still_works() {
     assert!(read().contains(" attention_owner=%2D attention_owners=2 "));
     assert_eq!(meta("unset attention"), ("OK\n".to_string(), true));
     assert!(read().contains(" attention_owner=sup "));
-    // A bare text that merely CONTAINS owner= is text.
+    // A bare text that merely contains owner= is text.
     assert_eq!(
         meta("set attention see owner=sup"),
         ("OK\n".to_string(), true)
@@ -20767,7 +20684,7 @@ fn since_log_needs_log_ep_and_a_single_target() {
 }
 
 /// THE AUTOPILOT WORD'S `meta` LINES ARE ANSWERED ONCE THE JOURNAL CARRIES
-/// THEM (ATERM-KI-1016-1, `word_journaled`): `set autopilot …` and `unset
+/// THEM (`word_journaled`): `set autopilot …` and `unset
 /// autopilot` take the wait, and so does `hold`'s `OK`; past the bound the
 /// `OK` says `journaled=0` (the word stands, no image on disk carries it). A
 /// refusal is answered as it is. NEGATIVE CONTROLS: another field's `meta`

@@ -34,11 +34,9 @@ use crate::io::{
 pub use crate::io::encode_for_disk;
 
 pub const DEFAULT_DOCUMENT_LIMIT: usize = 32 * 1024 * 1024;
-/// Saves and their proof observations never exceed the same ceiling as a
-/// document open/refresh. In particular, Manual may still open and repair a
-/// config larger than the 512-KiB semantic-admission cap, up to this ordinary
-/// document limit; only an editor buffer grown beyond the openable domain is
-/// refused at save preflight.
+/// Saves and their proof observations share the document open/refresh ceiling, so Manual
+/// can still open and repair a config above the 512 KiB semantic-admission cap; only a
+/// buffer grown past this limit is refused at save preflight.
 const MAX_ATOMIC_SAVE_BYTES: usize = DEFAULT_DOCUMENT_LIMIT;
 /// [`DEFAULT_DOCUMENT_LIMIT`] as a byte count the contracted predicates compare.
 const DOCUMENT_LIMIT_LEN: u64 = DEFAULT_DOCUMENT_LIMIT as u64;
@@ -131,13 +129,10 @@ impl DocumentGrant {
 
 /// The logical-to-physical binding captured when a writer reads a file.
 ///
-/// Ordinary documents admit no symbolic-link component. Dotfiles-managed
-/// configuration deliberately admits them, but binds every link in the logical
-/// chain (including parent-directory and final-file links) alongside the canonical
-/// physical target. The stored logical path therefore remains `…/aterm.toml`
-/// while saves replace the target file without replacing any link. Keeping those
-/// roles separate means host APIs can report the path the user opened without
-/// turning a later alias open into mutable capability state.
+/// Ordinary documents admit no symbolic-link component. Dotfiles-managed config admits
+/// them, but binds every link in the logical chain (parent-directory and final-file links)
+/// alongside the canonical physical target, so the logical path stays `…/aterm.toml` while
+/// saves replace the target file without replacing any link.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AtomicFileTarget {
     logical_path: PathBuf,
@@ -155,12 +150,10 @@ struct LogicalPathBinding {
     logical_symlinks: Vec<LogicalSymlinkBinding>,
 }
 
-/// Stable identity of one admitted symlink in a config path. `path` and
-/// `destination` catch a changed component or relative/absolute link spelling,
-/// while inode + metadata bind an unlink/recreate even when the replacement points
-/// at the same target. Unix (including macOS) supplies the inode identity; the
-/// remaining fields keep the check conservative on platforms where it is
-/// unavailable.
+/// Stable identity of one admitted symlink in a config path. `path` and `destination`
+/// catch a changed component or link spelling; inode + metadata catch an unlink/recreate
+/// that points at the same target. The inode is Unix-only; the other fields keep the check
+/// conservative elsewhere.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LogicalSymlinkBinding {
     path: PathBuf,
@@ -215,10 +208,8 @@ impl AtomicFileTarget {
             return;
         }
 
-        // Config opens should keep their user-facing dotfiles spelling primary;
-        // a later ordinary direct-path open must not displace it. Every displaced
-        // primary remains a required binding, so this never weakens an existing
-        // capability.
+        // A config open keeps its dotfiles spelling primary; a later direct-path open must
+        // not displace it. A displaced primary stays a required binding.
         if !candidate_binding.logical_symlinks.is_empty() {
             let previous = LogicalPathBinding {
                 logical_path: std::mem::replace(
@@ -270,10 +261,9 @@ pub enum AtomicCommitResult {
         /// What the step met, for a caller to word ([`SaveCause`]).
         cause: Option<SaveCause>,
     },
-    /// The atomic replacement succeeded, but a later durability, binding, or
-    /// content-proof step failed. Callers must retain their dirty state and
-    /// reconcile by re-observing the target before retrying; reporting an
-    /// ordinary pre-publication failure here would invite a blind overwrite.
+    /// The atomic replacement succeeded, but a later durability, binding or content-proof
+    /// step failed. Callers keep their dirty state and re-observe the target before
+    /// retrying; reporting this as a pre-publication failure would invite a blind overwrite.
     PublishedUnverified {
         stage: AtomicSaveStage,
         observed: Option<ObservedFileVersion>,
@@ -331,15 +321,10 @@ pub struct GrantedDocument {
     pub observed: ObservedFileVersion,
 }
 
-/// One local file ADMITTED but not yet GRANTED: the blocking half of an open
-/// (path resolution, the bounded read, UTF-8 validation), done, and carried to
-/// the grant store to be minted into a [`GrantedDocument`].
-///
-/// This is the seam that lets admission run OFF the main thread. Everything a
-/// thread needs to admit a file is in the URI; everything that must stay on the
-/// UI thread — the single process-local grant per canonical file — happens in
-/// [`DocumentGrantStore::grant_admitted`]. The value is plain owned data and
-/// crosses threads by move.
+/// One local file admitted but not yet granted: the blocking half of an open (path
+/// resolution, bounded read, UTF-8 validation) is done, so admission can run off the main
+/// thread. The single process-local grant per canonical file is minted on the UI thread by
+/// [`DocumentGrantStore::grant_admitted`]. Plain owned data; crosses threads by move.
 #[derive(Clone, Debug)]
 pub struct AdmittedDocument {
     pub(crate) canonical_uri: String,
@@ -1026,18 +1011,15 @@ impl DocumentGrantStore {
         limit: usize,
         allow_config_symlinks: bool,
     ) -> Result<GrantedDocument, DocumentHostError> {
-        // SYNCHRONOUS admission on the caller's thread. The main-thread callers
-        // that must not wait on a download go through `admit_local_file` on a
-        // worker and hand the result to `grant_admitted` (App's two-phase open);
-        // this form is for test/restore/effect callers that need the result now.
+        // Synchronous admission on the caller's thread. The App's two-phase open instead
+        // runs `admit_local_file` on a worker and hands the result to `grant_admitted`.
         let admitted = admit_local_file(uri, limit, allow_config_symlinks)?;
         self.grant_admitted(admitted, access)
     }
 
-    /// Mint or upgrade the single process-local grant for one already-admitted
-    /// file. Non-blocking: no filesystem read, only the cheap revalidation of an
-    /// existing grant's binding. UI-thread only, like every other mutation of the
-    /// store.
+    /// Mint or upgrade the single process-local grant for one already-admitted file. No
+    /// filesystem read, only revalidation of an existing grant's binding. UI-thread only,
+    /// like every mutation of the store.
     pub fn grant_admitted(
         &mut self,
         admitted: AdmittedDocument,
@@ -1300,16 +1282,11 @@ fn open_regular_read(path: &Path) -> Result<RegularReadHandle, DocumentHostError
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    // Without BACKUP_SEMANTICS, CreateFileW refuses a DIRECTORY outright with
-    // ERROR_ACCESS_DENIED, so a config path that names a directory surfaced as
-    // "Preflight: could not open …: Access is denied" instead of the
-    // `NotAFile` verdict the Unix arm gives (O_NOFOLLOW|O_NONBLOCK opens the
-    // directory, fstat classifies it) — measured 2026-09-22 by
-    // `observation_rejects_non_utf8_oversize_and_non_file_inputs` on the first
-    // Windows run. With the flag the directory handle opens and the SAME
-    // `is_file()` check below classifies it; for a regular file the flag is
-    // inert (its privilege override needs SE_BACKUP_NAME, which this process
-    // never holds). The proof still comes from the opened handle.
+    // Without BACKUP_SEMANTICS, CreateFileW refuses a directory with ERROR_ACCESS_DENIED,
+    // so a path naming a directory would fail to open instead of getting the `NotAFile`
+    // verdict the Unix arm gives. With it the directory opens and `is_file` below
+    // classifies it; for a regular file the flag is inert (its privilege override needs
+    // SE_BACKUP_NAME, which this process never holds).
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     let mut options = OpenOptions::new();
     options
@@ -1507,17 +1484,13 @@ fn resolve_atomic_target(
     {
         return Err(DocumentHostError::MalformedUri);
     }
-    // macOS commonly reports `/var/folders/...` as the process temporary root
-    // even though `/var` is a compatibility symlink. Normalize only that
-    // std-provided root before enforcing the no-symlink capability rule; this
-    // keeps test/private temporary files usable without following arbitrary
-    // caller-controlled aliases.
+    // macOS reports the temporary root as `/var/folders/...`, and `/var` is a symlink.
+    // Normalize only that std-provided root before the no-symlink rule, so temporary files
+    // stay usable without following caller-controlled aliases.
     let normalized = normalize_process_temp_root(logical_path)?;
-    // Bind the complete caller spelling before resolution, then collect it again
-    // after canonicalization. This rejects a component inserted, removed, or
-    // replaced during admission rather than silently converting it into mutable
-    // capability state. Config paths retain the exact bindings; ordinary document
-    // paths reject the first one.
+    // Bind the caller's spelling before resolution and collect it again after, so a
+    // component inserted, removed or replaced during admission is refused. Config paths
+    // keep the bindings; ordinary document paths reject the first one.
     let logical_symlinks = logical_symlink_bindings(&normalized)?;
     if !allow_config_symlinks && let Some(binding) = logical_symlinks.first() {
         return Err(DocumentHostError::SymlinkComponent {
@@ -1542,11 +1515,8 @@ fn resolve_atomic_target(
     }
     reject_symlink_components(&target_path)?;
     Ok(AtomicFileTarget {
-        // `normalized` is a validation implementation detail (notably for
-        // macOS's std-provided `/var` -> `/private/var` temporary-directory
-        // compatibility alias). Public `logical_path` consumers need the exact
-        // absolute spelling they supplied so Manual, the watcher, and Settings
-        // continue to name one configuration file consistently.
+        // `normalized` serves validation only; `logical_path` keeps the exact spelling
+        // supplied so Manual, the watcher and Settings name one config file consistently.
         logical_path: logical_path.to_path_buf(),
         target_path,
         logical_symlinks,
@@ -1570,23 +1540,12 @@ fn canonical_target_path(path: &Path) -> Result<PathBuf, DocumentHostError> {
 
 /// Rewrite the std-provided process temporary root to its canonical spelling.
 ///
-/// This is NOT cosmetic. macOS reports `$TMPDIR` as `/var/folders/…` while `/var` is a
-/// compatibility symlink to `private/var`, so *every* path under the temporary root
-/// begins with a symlink component. `resolve_atomic_target` enforces the no-symlink
-/// capability rule on the very next line, which makes this rewrite the only reason a
-/// temporary-root document is admissible at all.
-///
-/// It therefore must not degrade silently. `fs::canonicalize` is a syscall and can fail
-/// transiently — `EMFILE` on a loaded machine is the realistic one, and this crate's
-/// test binary runs ~2500 tests in one process. Swallowing that error returned the
-/// UN-normalized path, whose `/var` component the immediately-following
-/// `logical_symlink_bindings` check then rejected as
-/// [`DocumentHostError::SymlinkComponent`] — reporting a capability violation against a
-/// component the caller never wrote, for what was really an I/O failure. Worse, it is
-/// load-dependent, so it presents as an unreproducible flake rather than a bug.
-///
-/// Propagate the true cause instead. A caller that legitimately cannot canonicalize its
-/// own temporary root has an I/O problem and deserves to be told which one.
+/// macOS reports `$TMPDIR` as `/var/folders/…` while `/var` is a symlink to `private/var`,
+/// so every path under the temporary root begins with a symlink component; this rewrite is
+/// the only reason a temporary-root document passes the no-symlink rule. A failed
+/// `fs::canonicalize` (e.g. `EMFILE` under load) is propagated: returning the un-normalized
+/// path would report a [`DocumentHostError::SymlinkComponent`] for a `/var` the caller
+/// never wrote, a load-dependent misdiagnosis of an I/O failure.
 fn normalize_process_temp_root(path: &Path) -> Result<PathBuf, DocumentHostError> {
     let temporary = std::env::temp_dir();
     let Ok(suffix) = path.strip_prefix(&temporary) else {
@@ -1605,43 +1564,19 @@ fn normalize_process_temp_root(path: &Path) -> Result<PathBuf, DocumentHostError
     Ok(root.join(suffix))
 }
 
-/// Walk one absolute path component by component and hand every component that
-/// exists to `visit`, together with its `symlink_metadata`. A component that does
-/// not exist ends the walk successfully: callers are allowed to admit a suffix that
-/// Save has not authored yet, but they have still proved every component that does
-/// exist below it.
+/// Walk one absolute path component by component and hand every component that exists to
+/// `visit`, with its `symlink_metadata`. A missing component ends the walk successfully:
+/// callers may admit a suffix Save has not authored yet, having proved every component that
+/// exists. `reject_symlink_components` and `logical_symlink_bindings` share this one walk.
 ///
-/// This walk used to be written out twice — once in `reject_symlink_components` and
-/// once in `logical_symlink_bindings` — and both copies carried the same bug, which
-/// is exactly why it now lives in one place. Two homes for one walk meant a fix
-/// applied to either one alone would have left the other broken, and they are
-/// independently reachable: `normalize_process_temp_root` canonicalizes on its own,
-/// so anything under `std::env::temp_dir()` reached the second copy first.
-///
-/// `Component::Prefix` is accumulated into the path but is never stat-ed on its own,
-/// and that is the whole Windows fix. `fs::canonicalize` always returns a verbatim
-/// path on Windows, so the first component of a canonicalized path is the bare
-/// prefix `\\?\C:` — which names the volume DEVICE, not its root directory.
-/// `symlink_metadata` on it fails with ERROR_INVALID_FUNCTION (raw OS error 1), and
-/// std maps that to `ErrorKind::Uncategorized`, *not* `NotFound`, so the
-/// missing-component arm below never caught it and every canonicalized path fell
-/// straight into the hard-error arm. The user-visible damage was total rather than
-/// cosmetic: `aterm.toml` neither loaded at startup nor saved, and the app silently
-/// fell back to an empty configuration document in which several effects default ON.
-///
-/// Skipping the prefix does not weaken the guard this walk exists to enforce. A
-/// prefix is a volume or UNC designator, not a directory entry: it cannot be a
-/// symlink or a reparse point, and there is nothing about it to validate. Stat-ing
-/// it was never a check in the first place — on a NON-verbatim path the bare `C:`
-/// resolves to the *current directory on drive C:*, so the walk was quietly
-/// symlink-checking an unrelated filesystem object and reporting success on it. Both
-/// the erroring case and the wrong-object case are cured by not stat-ing it at all,
-/// which is why this skips the component rather than merely tolerating its error.
-///
-/// Everything else is stat-ed exactly as strictly as before, the root directory very
-/// much included (`\\?\C:\` stats fine, and `/` always did). Unix has no prefix
-/// component at all, so on macOS and Linux this walk is bit-for-bit the one it
-/// replaces.
+/// `Component::Prefix` is accumulated but never stat-ed. On Windows `fs::canonicalize`
+/// returns a verbatim path whose first component, `\\?\C:`, names the volume device:
+/// `symlink_metadata` on it fails with ERROR_INVALID_FUNCTION, which std maps to
+/// `Uncategorized` rather than `NotFound`, so stat-ing it would refuse every canonical path
+/// (`aterm.toml` would neither load nor save). On a non-verbatim path a bare `C:` names the
+/// drive's current directory, an unrelated object. A prefix is a volume or UNC designator,
+/// never a symlink or reparse point, so skipping it weakens nothing; the root directory and
+/// every later component are stat-ed. Unix has no prefix component.
 fn walk_path_components<F>(path: &Path, mut visit: F) -> Result<(), DocumentHostError>
 where
     F: FnMut(&Path, &fs::Metadata) -> Result<(), DocumentHostError>,
@@ -1656,15 +1591,10 @@ where
         let metadata = match fs::symlink_metadata(&prefix) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            // A root that cannot be stat-ed is not a capability failure and must not
-            // be reported as one. Windows has pseudo-roots that the metadata call
-            // simply does not accept — a device-namespace prefix such as `\\.\pipe\`
-            // is the reachable example — and std lands their failures in
-            // `Uncategorized`, precisely as it did for the bare verbatim prefix that
-            // caused this bug. Depending on `NotFound` alone to absorb them is the
-            // fragility that shipped here once already, so name the raw codes.
-            // `continue` rather than `break`: an unstattable root is not a missing
-            // root, so every real component underneath it still has to be validated.
+            // An unstattable root is not a capability failure. Windows pseudo-roots such
+            // as the device namespace `\\.\pipe\` fail with codes std maps to
+            // `Uncategorized`, so `root_stat_is_tolerable` names the raw codes. `continue`,
+            // not `break`: every real component below it still has to be validated.
             Err(error) if is_root && root_stat_is_tolerable(&error) => continue,
             Err(error) => {
                 return Err(DocumentHostError::Io {
@@ -2078,20 +2008,17 @@ fn open_write_lock(path: &Path) -> Result<File, StepFailure> {
     Ok(file)
 }
 
-/// The one serialized commit authority used by Manual document saves and every
-/// structured Settings write. A no-follow sibling advisory lock serializes
-/// cooperating processes; contention fails promptly with explicit retry
-/// guidance rather than blocking Manual, close, or Quit. The exact baseline is
-/// rechecked under that lock and again just before rename. The unique create-new
-/// temporary is synced before publication, then the containing directory and
-/// committed bytes are synced/verified.
+/// The one serialized commit authority for Manual document saves and every structured
+/// Settings write. A no-follow sibling advisory lock serializes cooperating processes;
+/// contention fails promptly with retry guidance rather than blocking Manual, close or
+/// Quit. The exact baseline is rechecked under the lock and again just before rename. The
+/// unique create-new temporary is synced before publication, then the directory is synced
+/// and the committed bytes verified.
 ///
-/// Portable filesystems do not expose compare-and-replace for an existing path.
-/// A writer that ignores the sibling lock can still race the final observation
-/// and rename. The host closes every portable window it can, rejects symlinks for
-/// ordinary documents, binds/revalidates the complete chain for config files, and
-/// never reports a post-rename failure as a clean failure, but does not claim
-/// lock-free CAS against non-cooperating programs.
+/// Portable filesystems have no compare-and-replace for an existing path, so a writer that
+/// ignores the sibling lock can still race the final observation and rename: this claims
+/// no lock-free CAS against non-cooperating programs, and never reports a post-rename
+/// failure as a clean one.
 pub fn commit_atomic_bytes(baseline: &AtomicFileBaseline, bytes: &[u8]) -> AtomicCommitResult {
     commit_atomic_bytes_with_seed(
         baseline,
@@ -2137,14 +2064,11 @@ fn write_lock_busy() -> String {
 
 /// Bounded contention budget for the sibling write lock.
 ///
-/// `flock(2)` binds to the OPEN FILE DESCRIPTION, not the process: "file descriptors
-/// duplicated through dup(2) or fork(2) do not result in multiple instances of a lock,
-/// but rather multiple references to a single lock". A peer that forks while a save
-/// holds this lock hands the child a reference the saver's own `File::drop` cannot
-/// release, so the lock stays held for the child's whole fork->exec window even with
-/// `O_CLOEXEC` set. Measured on this machine over 200 rounds: 0.27 ms mean / 1.24 ms
-/// worst idle, 0.30 ms mean / 0.59 ms worst under load. Refusing a save for a window
-/// that short is wrong.
+/// A peer's fork can keep this `flock` held past its holder's release for the child's
+/// fork->execve window ([`acquire_advisory_lock_within`]); under ordinary load that window
+/// measured 0.3 ms mean, 1.24 ms worst, so 25 ms covers it about 20x over. It stays small
+/// because the journal's event-loop take shares it, pinned at two frames or less by
+/// `native_document_journal`'s `the_event_loop_budget_stays_in_the_sibling_write_lock_class`.
 ///
 /// The budget is deliberately SMALL, for two non-optional reasons:
 ///
@@ -2174,13 +2098,9 @@ fn write_lock_busy() -> String {
 /// `native_document_journal::JournalLockPatience`.
 pub const WRITE_LOCK_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// Why a bounded advisory-lock acquisition gave up. The two arms are the only two
-/// outcomes [`acquire_advisory_lock_within`] can refuse with, and they are NOT
-/// interchangeable: `Busy` is a report about a peer and is retryable by whoever
-/// asked; `Failed` is a property of the volume or the handle and never clears by
-/// waiting. Each caller renders them in its own product vocabulary — the save path
-/// says "retry Save", the journal says "retry opening Manual" — which is the only
-/// reason this is an enum instead of a `String`.
+/// Why [`acquire_advisory_lock_within`] gave up. `Busy` is about a peer and retryable;
+/// `Failed` is a property of the volume or handle and never clears by waiting. Each caller
+/// renders them in its own words ("retry Save", "retry opening Manual").
 pub enum AdvisoryLockRefusal {
     Busy,
     Failed(std::io::Error),
@@ -2192,33 +2112,22 @@ pub enum AdvisoryLockRefusal {
 /// `debugger_access::take_change_lock` in aterm-gui — goes through this one loop
 /// with its own budget; there is no second implementation of the policy below.
 ///
-/// Riding out a refusal at all is not optional. `flock(2)` binds to the OPEN FILE
-/// DESCRIPTION, not the process: "file descriptors duplicated through dup(2) or
-/// fork(2) do not result in multiple instances of a lock, but rather multiple
-/// references to a single lock". A peer that forks while this lock is held hands the
-/// child a reference the holder's own `File::drop` cannot release, so the lock stays
-/// taken for the child's whole fork->execve window even with `O_CLOEXEC` set — and
-/// aterm forks for every shell (`aterm_pty::spawn_shell_with_pid`, a hand-rolled `forkpty`).
-/// A single-shot `try_lock` reports that residue as another owner, which is both a
-/// false diagnosis and a lost write.
+/// `flock(2)` binds to the open file description, not the process, and descriptors
+/// duplicated by `fork(2)` share one lock. A peer that forks while the lock is held hands
+/// the child a reference the holder's `File::drop` cannot release, so the lock stays taken
+/// for the child's fork->execve window even with `O_CLOEXEC`, and aterm forks for every
+/// shell. A single-shot `try_lock` would report that residue as another owner and lose the
+/// write.
 ///
-/// THE POLICY, in one place so it cannot drift:
-///
-///  * The first attempt happens BEFORE any sleep, so an uncontended caller is
-///    byte-for-byte as fast as a bare `try_lock`.
-///  * `WouldBlock` ONLY is retried. `ENOTSUP` (a volume refusing advisory locks),
-///    `EBADF` and `EINVAL` never clear by waiting, and burning the budget on them
-///    would only make a permanent refusal slow. `WouldBlock` is not spurious here:
-///    std compiles `try_lock` to `flock(fd, LOCK_EX|LOCK_NB)` on Apple and maps only
-///    EAGAIN/EWOULDBLOCK onto it, whose one documented cause is a genuine
-///    conflicting lock.
-///  * Exponential backoff to an 8 ms ceiling, each sleep clamped to what is left of
-///    the budget so the wait can never overshoot what the caller asked for. A fixed
-///    1 ms poll would spend the whole budget in wakeups for no extra resolution.
-///  * The budget is a CEILING, never a floor: `budget` is the most this can cost,
-///    and the caller — not this function — decides how much its thread can afford.
-///    A budget the clock cannot add to now (`Duration::MAX`) is no ceiling: the
-///    wait lasts until the lock is let go.
+/// - The first attempt happens before any sleep, so an uncontended caller costs a bare
+///   `try_lock`.
+/// - Only `WouldBlock` is retried: `ENOTSUP`, `EBADF` and `EINVAL` never clear by waiting.
+///   On Apple std maps only EAGAIN/EWOULDBLOCK from `flock(LOCK_EX|LOCK_NB)` onto
+///   `WouldBlock`, whose one documented cause is a conflicting lock.
+/// - Exponential backoff to an 8 ms ceiling, each sleep clamped to the remaining budget.
+/// - `budget` is a ceiling, never a floor; the caller decides what its thread can afford.
+///   A budget the clock cannot add to now (`Duration::MAX`) is no ceiling: the
+///   wait lasts until the lock is let go.
 pub fn acquire_advisory_lock_within(
     mut lock_file: File,
     budget: std::time::Duration,
@@ -2293,7 +2202,7 @@ impl HeldAdvisoryLock {
         }
     }
 
-    /// Take `lock_file`'s exclusive lock, WAITING for a holder to let go.
+    /// Take `lock_file`'s exclusive lock, waiting for a holder to let go.
     pub fn lock(lock_file: File) -> std::io::Result<Self> {
         // The ascription is the lock-order census's File evidence.
         let lock_file: std::fs::File = lock_file;
@@ -2344,47 +2253,27 @@ fn acquire_write_lock(lock_file: File) -> Result<HeldAdvisoryLock, StepFailure> 
     acquire_write_lock_within(lock_file, WRITE_LOCK_RETRY_BUDGET)
 }
 
-/// Bounded retry for the PRE-PUBLICATION phase of a commit.
+/// Bounded retry for the pre-publication phase of a commit.
 ///
-/// Everything from the first `validate_atomic_target` through the version check only
-/// READS. Six leaked fixtures of the
-/// `repeated_save_during_inflight_checkpoint_persists_the_latest_sequence` flake prove
-/// that on disk: the fixture directory's mtime still equals the previous save's rename
-/// ctime to within 0-42 ns, so this phase created nothing, renamed nothing and
-/// unlinked nothing. A `Failed` verdict carrying `AtomicSaveStage::Preflight` is
-/// therefore safe to simply attempt again — and every cause it can carry is transient
-/// by construction: a lock held by a peer save or by a `fork`ed child that has not yet
-/// `exec`ed away its inherited descriptor, a `canonicalize`/`lstat` that failed under
-/// load, an `open` that returned `EINTR`/`EIO`. On-disk forensics cannot tell those
-/// exits apart, so ride out the whole CLASS instead of guessing which one fires. A
-/// `Conflict` (a real verdict about the target) and every post-publication stage are
-/// NOT retried.
+/// Everything from the first `validate_atomic_target` through the version check leaves the
+/// target untouched (at most it creates the parent directory and the sibling lock file),
+/// so a `Failed` verdict at `AtomicSaveStage::Preflight` is safe to attempt again, and each
+/// cause it can carry is transient: a lock held by a peer save or by a forked child that
+/// has not yet exec'd, a `canonicalize`/`lstat` that failed under load, an `open` that
+/// returned `EINTR`/`EIO`. A `Conflict` and every post-publication stage are not retried.
 ///
-/// The budget dominates the hold a legitimate saver takes. That hold is two
-/// `File::sync_all` calls, which are `F_FULLFSYNC` device-cache barriers on Apple
-/// targets: measured on this machine while idle, one file barrier costs 4.43 ms mean
-/// and 17.3 ms worst against 0.114 ms for a plain `fsync`, and the six fixtures
-/// measure the whole locked section at 82.5-279.7 ms while the volume was busy.
-/// `WRITE_LOCK_RETRY_BUDGET` alone is an order of magnitude short of that.
-///
-/// THE COST, stated plainly because it is real: this is NOT reached only from the
-/// `aterm-native-document` worker. `execute_native_config_persistence` (app_native.rs)
-/// writes the same `aterm.toml` from another thread, so two saves can contend and one
-/// of them waits out this budget. (The retired Settings card's synchronous event-loop
-/// save, which made that wait a visible hitch, is gone.)
-///
-/// It is still the right trade. The budget is only consumed while a peer actually
-/// holds the lock, which is bounded by that peer's own `F_FULLFSYNC` pair (82.5-279.7
-/// ms measured), so 500 ms is roughly 2x the worst observed hold rather than an
-/// arbitrary ceiling; an uncontended save never sleeps at all and is byte-for-byte as
-/// fast as before. And the alternative is not a faster save — it is a FAILED one:
-/// `App::finish_native_document_save` turns a Preflight failure into a terminal error
-/// and drops `pending_saves`, so the user's latest edits are silently never written. A
-/// bounded hitch beats losing an edit.
+/// The budget dominates a legitimate saver's hold: two `File::sync_all` calls, which are
+/// `F_FULLFSYNC` barriers on Apple targets (4.43 ms mean, 17.3 ms worst idle each; the
+/// whole locked section measured 82.5-279.7 ms on a busy volume), so 500 ms is about twice
+/// the worst observed hold, where `WRITE_LOCK_RETRY_BUDGET` alone is an order of magnitude
+/// short. An uncontended save never sleeps. A save contending with
+/// `app_native::execute_native_config_persistence`'s `aterm.toml` write may wait out the
+/// budget; the alternative is a failed save, whose edits `App::finish_native_document_save`
+/// then never writes.
 const PREFLIGHT_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Take the write lock and prove the target is still the generation the plan was built
-/// on. Side-effect free: see [`PREFLIGHT_RETRY_BUDGET`].
+/// on. Leaves the target untouched, so it is safe to retry: see [`PREFLIGHT_RETRY_BUDGET`].
 fn lock_and_verify_target(
     baseline: &AtomicFileBaseline,
     directories: Directories,
@@ -2683,10 +2572,9 @@ fn next_temporary_seed() -> u64 {
 }
 
 fn atomic_conflict(target: &AtomicFileTarget, message: String) -> AtomicCommitResult {
-    // Prefer the file currently named by the logical path. For a deterministic
-    // link-chain swap this gives the save reducer the actual competing generation
-    // (and therefore a genuine Conflict rather than an unchanged-target failure),
-    // while publication itself remains confined to the originally bound target.
+    // Prefer the file the logical path names now: after a link-chain swap the reducer gets
+    // the competing generation (a genuine Conflict), while publication stays confined to
+    // the bound target.
     let observed = resolve_atomic_target(target.logical_path(), target.admits_config_symlinks())
         .ok()
         .and_then(|current| observe_file(current.target_path(), MAX_ATOMIC_SAVE_BYTES).ok())
@@ -2855,38 +2743,23 @@ mod tests {
         path_to_file_uri(path).unwrap()
     }
 
-    /// A well-formed URI of a file that does not exist, absolute on the host:
-    /// `/definitely/…` is not absolute on Windows, where it fails as
-    /// `NotAbsolute` before the filesystem is asked — not the arm a
-    /// missing-file check is about.
+    /// A well-formed URI of a missing file, absolute on the host (`/definitely/…` is not
+    /// absolute on Windows, where it would fail as `NotAbsolute` instead).
     const MISSING_DOC_URI: &str = if cfg!(windows) {
         "file:///C:/definitely/missing/aterm-doc.md"
     } else {
         "file:///definitely/missing/aterm-doc.md"
     };
 
-    /// Regression guard for the Windows defect that silently disabled the entire user
-    /// configuration. The component walk used to push and then stat
-    /// `Component::Prefix` on its own, and on a canonicalized path that first
-    /// component is the bare verbatim prefix `\\?\C:`, which addresses the volume
-    /// device rather than a directory. The resulting ERROR_INVALID_FUNCTION lands in
-    /// `ErrorKind::Uncategorized` rather than `NotFound`, so it slipped past the
-    /// missing-component arm and failed admission outright: `aterm.toml` could neither
-    /// be loaded at startup nor saved. `resolve_atomic_target` canonicalizes and then
-    /// feeds the result to this walk unconditionally, so nothing about the user's
-    /// machine was needed to trigger it — only Windows.
-    ///
-    /// The absence of exactly this test is how the bug shipped: every existing walk
-    /// test used a logical spelling, which on Windows never contains a prefix that
-    /// fails to stat.
+    /// The walk admits a canonicalized path, whose first component on Windows is the
+    /// verbatim prefix `\\?\C:` that must not be stat-ed (`walk_path_components`).
     #[test]
     fn component_walk_admits_a_canonicalized_path() {
         let path = unique_file("canonical-walk", b"walk\n");
         let canonical = fs::canonicalize(&path).unwrap();
         #[cfg(windows)]
         {
-            // Assert the shape the fix is about, so this cannot start passing for the
-            // uninteresting reason that it stopped seeing a verbatim path at all.
+            // The path must be verbatim, or this would pass without testing the prefix skip.
             assert!(
                 canonical.as_os_str().to_string_lossy().starts_with(r"\\?\"),
                 "expected fs::canonicalize to produce a verbatim path, got {}",
@@ -2898,22 +2771,15 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// The same walk is reachable through a second, independent door. Anything under
-    /// `std::env::temp_dir()` is rewritten by `normalize_process_temp_root`, which
-    /// canonicalizes the temporary root itself, so on Windows `logical_symlink_bindings`
-    /// is handed an already-verbatim path and used to die there — before
-    /// `reject_symlink_components` was ever reached. A fix confined to one of the two
-    /// former copies of this walk would have left every temp-rooted document broken,
-    /// this module's own fixtures included, since `unique_file` builds them from the
-    /// process temporary root.
+    /// `normalize_process_temp_root` hands the walk an already-canonical path too, so a
+    /// temp-rooted document (this module's fixtures included) must be admitted end to end.
     #[test]
     fn component_walk_admits_a_process_temporary_root_path() {
         let path = unique_file("temporary-walk", b"walk\n");
         let normalized = normalize_process_temp_root(&path).unwrap();
         assert!(logical_symlink_bindings(&normalized).unwrap().is_empty());
         reject_symlink_components(&normalized).unwrap();
-        // And once end to end, through the admission path the application actually
-        // calls, which is the sequence that reported "could not validate \\?\C:".
+        // And end to end, through the admission path the application calls.
         let contents = read_config_atomic_file(&path, 1024, false).unwrap();
         assert_eq!(contents.bytes, b"walk\n");
         let _ = fs::remove_dir_all(path.parent().unwrap());
@@ -3702,9 +3568,8 @@ mod tests {
         );
     }
 
-    /// The two halves of an open compose to exactly what `open_local` did in one
-    /// call: admission is a pure function of the URI (so a worker can run it) and
-    /// granting is the store's only mutation. Admitting twice mints one grant.
+    /// Admission then grant composes to the synchronous open: admission is a pure function
+    /// of the URI, granting is the store's only mutation, and admitting twice mints one grant.
     #[test]
     fn admission_then_grant_matches_the_synchronous_open() {
         let path = unique_file("two-phase", b"# split\n");
@@ -3854,9 +3719,8 @@ mod tests {
                 cause: None,
             } if message.contains("regular non-link")
         ));
-        // Refuses-without-BLOCKING: opening the FIFO for write parks FOREVER (no
-        // reader comes), so this is a hang detector, never a latency budget. 1 s
-        // crossed under full-suite load (cb8c0cff).
+        // Opening the FIFO for write would park forever (no reader comes), so this is a
+        // hang detector, never a latency budget.
         assert!(
             started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
             "the FIFO save lock parked the commit"
@@ -3909,7 +3773,6 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         drop(held);
 
-        // Before the retry loop this was Err("…busy…"); with it, Ok.
         assert!(waiter.join().unwrap().is_ok());
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -3936,20 +3799,16 @@ mod tests {
                 }),
             } if message.contains("busy") && message.contains("retry Save")
         ));
-        // Refuses-without-BLOCKING: a blocking `flock` on a lock nobody releases
-        // parks FOREVER, so this is a hang detector, never a latency budget; the
-        // retry budget's size is pinned by a constant, not by this clock. 1 s
-        // crossed under full-suite load (cb8c0cff).
+        // A blocking `flock` on a lock nobody releases parks forever, so this is a hang
+        // detector, never a latency budget.
         assert!(
             started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
             "the held save lock parked the commit"
         );
         assert_eq!(fs::read(&path).unwrap(), b"before");
 
-        // Released by LOCK_UN (the guard's drop), not by the close alone: a fork's
-        // copy outlives the close until its exec (measured up to 523 ms here), and
-        // the retry's preflight gives up after 500 ms (the fd-copy sweep of
-        // 2026-09-27).
+        // Released by LOCK_UN (the guard's drop), not by the close alone: a fork's copy
+        // outlives the close until its exec, which can outlast the 500 ms preflight retry.
         drop(held);
         assert!(matches!(
             commit_atomic_bytes(&contents.baseline, b"after"),
@@ -3959,12 +3818,8 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// The save lock is FREE the instant its hold drops, even while a copy of the
-    /// holder's description lives. The copy stands in for a shell another thread
-    /// forked mid-save: a forked child holds every descriptor until it execs, and a
-    /// lock released by the close alone lives on in that copy, so the next save or
-    /// `aterm.toml` write — or a refused preflight's own retry — met a lock nobody
-    /// held (the product fd-hygiene sweep of 2026-09-27). The refusals after
+    /// The save lock is free the instant its hold drops, even while a copy of the holder's
+    /// description lives (standing in for a shell forked mid-save). The refusals after
     /// acquisition drop the same guard this success path returns.
     #[test]
     fn a_released_save_lock_is_free_while_a_forked_copy_of_it_lives() {
@@ -3992,11 +3847,9 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// Every document under `$TMPDIR` on macOS begins with a symlink component
-    /// (`/var` -> `private/var`), so `normalize_process_temp_root` is the ONLY reason
-    /// such a path clears the no-symlink capability rule. Pin that it does — if the
-    /// rewrite ever stops happening, this fails with `SymlinkComponent` instead of
-    /// surfacing whatever actually went wrong.
+    /// Every document under `$TMPDIR` on macOS begins with the `/var` symlink, so this pins
+    /// that `normalize_process_temp_root` rewrites it; without the rewrite it fails with
+    /// `SymlinkComponent`.
     #[test]
     fn temporary_root_document_resolves_despite_the_var_compatibility_symlink() {
         let path = unique_file("temp-root-normalize", b"body");
@@ -4015,8 +3868,8 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// A path OUTSIDE the temporary root claims no symlink exemption, so it must pass
-    /// through the rewrite untouched rather than acquiring one.
+    /// A path outside the temporary root claims no symlink exemption, so the rewrite
+    /// leaves it untouched.
     #[test]
     fn paths_outside_the_temporary_root_are_not_rewritten() {
         let outside = PathBuf::from("/usr/share/aterm-does-not-exist/doc.md");

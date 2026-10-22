@@ -9,7 +9,6 @@ use std::process::Command;
 use super::LaneRun;
 use super::floors::golden_dir;
 
-// ---------------------------------------------------------------------------
 // SAME-BOX TREND LEDGER (E0, audit §5.6): the multi-machine floors must stay
 // generous (0.45), so a genuine same-box 2x regression passes them. This
 // ledger closes that: every green `verify perf` run appends its medians (keyed
@@ -18,7 +17,6 @@ use super::floors::golden_dir;
 // tight enough to catch a real 2x, wide enough for same-box run-to-run
 // variance, and comparing against the recent BEST so slow drift cannot
 // ratchet the floor down with it.
-// ---------------------------------------------------------------------------
 
 /// Same-box floor ratio. Engine-lane same-box variance measures well inside
 /// 15%; 0.70 leaves 2x margin over that while a genuine 2x regression (0.50)
@@ -41,7 +39,6 @@ pub(crate) struct TrendSample {
     pub inverted: bool,
 }
 
-// ---------------------------------------------------------------------------
 // MACHINE IDENTITY. The ledger is a SAME-BOX comparison, so every row has to
 // say which box measured it. A hostname fails in BOTH directions: it RENAMES
 // (forking a box's history away from itself, so the trend silently judges
@@ -79,7 +76,6 @@ pub(crate) struct TrendSample {
 //   red — rather than averaging across them. A dead trend is bad; a trend that
 //   looks alive while comparing two boxes is worse, and this is the line
 //   between them.
-// ---------------------------------------------------------------------------
 
 pub(crate) fn trend_path() -> std::path::PathBuf {
     golden_dir().join("perf-trend.tsv")

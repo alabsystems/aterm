@@ -399,7 +399,7 @@ fn said_drops_the_done_tokens_lines_as_the_result_does() {
     );
 }
 
-/// THE HARNESS'S OWN ACTS ARE NO PROMPT (FOREVER CRUISE / FOREVER LAND):
+/// THE HARNESS'S OWN ACTS ARE NO PROMPT (Autopilot Cruise / Land):
 /// Cruise's continuation (`CONTINUE_TEXT`, the default `continue_text`), its
 /// prompt at a done claim (`DONE_CHECK`), Land's instruction and nudge, and a
 /// restart's carry-on each open with the harness's mark, so the survey's

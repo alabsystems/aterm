@@ -1741,6 +1741,66 @@ fn the_top_rule_at_rest_is_the_idle_voice_label() {
     }
 }
 
+/// A NARROW PANE'S COMPOSER IS READ, WHATEVER ITS LABEL LEAVES OF THE RULE
+/// (1.4.11 at 40 columns down to 26, the lab of 2026-10-22): under 40
+/// columns the top rule's label leaves fewer than a rule's ten `─` — one at
+/// 33 columns, none at 32 — and below that it is cut with `…`; at every
+/// width the composer is the frame, idle as evidence, its caret the row the
+/// cursor parks on, and the screen Muse Code's. The idle label stands whole
+/// down to 32 columns, and cut it is no idle label. Read as no rule from 39
+/// columns down, the frame was lost there, and with it every reader of it
+/// and the window's harness (`status agent=unknown`).
+///
+/// NEGATIVE CONTROLS: a rule is still ten `─` — the same rows with the
+/// label blanked out are a frame at 40 columns alone; a `Recording` label
+/// in the idle one's place is the frame's top rule and no idle label.
+#[test]
+fn a_narrow_panes_composer_is_read_whatever_its_label_leaves() {
+    let frames = crate::prompt::fixtures::reflow_frames(IDLE_NARROW);
+    let widths: Vec<u16> = frames.iter().map(|(w, _)| *w).collect();
+    assert_eq!(widths, [40, 39, 38, 36, 34, 33, 32, 30, 26], "the sweep");
+    let (row, col) = cursor(IDLE_NARROW).expect("measured");
+    assert_eq!((row, col), (4, 2), "the caret row, two columns in");
+    for (cols, rows) in &frames {
+        let w = usize::from(*cols);
+        let top = &rows[3];
+        assert!(top.starts_with("── Voice input ("), "{w}: {top:?}");
+        assert_eq!(is_rule(top), w >= 40, "{w}: ten `─` from 40 columns");
+        assert_eq!(composer_rules(rows), Some((3, 5)), "{w}: the frame");
+        let r = read(Some("muse"), rows, None);
+        assert_eq!(r.program, Program::Muse, "{w}");
+        assert_eq!(
+            (r.phase, r.phase_authoritative),
+            (Phase::Idle, true),
+            "{w}: idle as evidence"
+        );
+        assert_eq!(r.composer, Some((row, vec![String::new()])), "{w}");
+        assert_eq!(identify(None, rows).program(), Program::Muse, "{w}");
+        assert_eq!(
+            is_idle_voice_rule(top),
+            w >= 32,
+            "{w}: the idle label whole, never cut"
+        );
+        // CONTROL: blanked, the label admits nothing, and a rule is ten `─`.
+        let blanked: String = top
+            .chars()
+            .map(|c| if c == '─' { c } else { ' ' })
+            .collect();
+        let mut bare = rows.clone();
+        bare[3] = blanked;
+        assert_eq!(
+            composer_rules(&bare).is_some(),
+            w >= 40,
+            "CONTROL {w}: an unlabelled rule of fewer than ten `─` is none"
+        );
+        // CONTROL: another voice state's label in its place.
+        let mut recording = rows.clone();
+        recording[3] = format!("── Recording {}", "─".repeat(w - 13));
+        assert_eq!(composer_rules(&recording), Some((3, 5)), "CONTROL {w}");
+        assert!(!is_idle_voice_rule(&recording[3]), "CONTROL {w}");
+    }
+}
+
 /// CARDS ALONE ABOVE THE OPEN COMPOSER ARE A SESSION AT REST (1.4.10, the lab
 /// of 2026-10-21): `/status` entered three times under the usage wall pushed
 /// the notice out of sight, the composer open and empty under the cards,

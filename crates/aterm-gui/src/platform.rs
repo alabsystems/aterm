@@ -2349,9 +2349,7 @@ mod bounded_read_tests {
         );
     }
 
-    /// The child lives ten minutes, so a read that waited for it takes ten
-    /// minutes, and the bound below is a hang detector (a minute), never a
-    /// latency budget.
+    /// The child sleeps ten minutes; the `MUST_HAPPEN` check is a hang detector, not a budget.
     #[cfg(unix)]
     #[test]
     fn the_bounded_read_kills_a_child_that_outlives_the_bound() {
@@ -3210,8 +3208,7 @@ mod vibrancy {
             }
             let n = appkit::send_usize(subs, sel!(count));
             let at: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = aterm_objc::checked_msg();
-            // `-isKindOfClass:` takes a CLASS, encoded `"#"` and not `"@"` —
-            // hence the explicit prototype rather than `send_bool_id`.
+            // `-isKindOfClass:` takes a Class (`#`), not an object, hence the explicit prototype.
             let is_kind: unsafe extern "C-unwind" fn(
                 Id,
                 Sel,

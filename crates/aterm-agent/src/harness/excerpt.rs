@@ -296,6 +296,7 @@ impl Scan {
             Some("user") => {
                 if row.get("isMeta").and_then(Value::as_bool) == Some(true)
                     || row.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+                    || row.get("queueTranscriptOnly").and_then(Value::as_bool) == Some(true)
                 {
                     return;
                 }

@@ -6,7 +6,7 @@
 //! session's task, so the successor shows what the outgoing process did.
 //!
 //! * THE END standing on the session's glass (`EndGlass`, the tab's `•`
-//!   while nobody has looked): under FOREVER LAND the one end, Land's
+//!   while nobody has looked): under Autopilot Land the one end, Land's
 //!   landing; the wall time its face moved there, and whether it was seen.
 //!   Without the carry the successor knew none of it — the loop restates the
 //!   face from "unknown", which is no end (`harness_task::is_a_task_end`) —
@@ -98,7 +98,7 @@ impl EndCarry {
     }
 
     /// READ A CARRIED ROW ([`Self::row`]), or `None` where it does not
-    /// read: `end=` missing or no kind (`landed`; FOREVER LAND has no other
+    /// read: `end=` missing or no kind (`landed`; Autopilot Land has no other
     /// end), an end with no wall time after the epoch or no `seen=0|1`, a
     /// value that is no count, a key twice. A key this build does not
     /// know is skipped (a later build may add one); a row that does not read

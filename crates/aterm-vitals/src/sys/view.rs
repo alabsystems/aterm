@@ -1942,7 +1942,6 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
     }
 }
 
-// ---------------------------------------------------------------------------
 // JSON
 
 fn as_of_json(ctx: &Ctx<'_>) -> Jv {

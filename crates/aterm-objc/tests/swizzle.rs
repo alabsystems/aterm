@@ -35,9 +35,7 @@ unsafe extern "C" {
     fn method_setImplementation(method: *const c_void, imp: *const c_void) -> *const c_void;
 }
 
-// ---------------------------------------------------------------------------
 // Probe implementations: each records that it ran and returns a distinct value.
-// ---------------------------------------------------------------------------
 
 /// Process-global counters, read only for their value: libtest is parallel, so
 /// the one test that counts calls has its own private pair below.
@@ -132,9 +130,7 @@ fn probe_value(obj: Id) -> i64 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Part 1 — the owner: the class you name is not the class you patch.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn owning_class_finds_the_definer_not_the_class_asked() {
@@ -178,9 +174,7 @@ fn owning_class_finds_the_definer_not_the_class_asked() {
     });
 }
 
-// ---------------------------------------------------------------------------
 // Part 2 — the encoding derived from the prototype.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn method_fn_derives_the_encoding_from_the_prototype() {
@@ -260,10 +254,8 @@ fn install_refuses_a_selector_nothing_implements_and_a_null_class() {
     });
 }
 
-// ---------------------------------------------------------------------------
 // Part 3 — the site: install, chain, idempotence, and the refusals that stop a
 // chain being built from someone else's implementation.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn install_replaces_publishes_the_original_and_reports_the_owner() {
@@ -397,10 +389,8 @@ fn install_refuses_when_the_row_is_already_patched_by_somebody_else() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Part 4 — one site asked about two rows, and KVO swapping an object's class
 // under the patch.
-// ---------------------------------------------------------------------------
 
 /// One site asked about a second row is refused, not answered with the first
 /// row's original. Deciding "already installed?" from the row alone would

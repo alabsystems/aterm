@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A composer line break starts a new ribbon walk at the Shift+Enter key,
-//! but its own typed stamp and a key replayed before the caret's home move
-//! cannot spend that walk. The first real echo after the home does.
+//! A composer line break starts a new ribbon walk at the Shift+Enter key, but its own typed
+//! stamp and a key replayed before the caret's home move cannot spend that walk. The first real
+//! echo after the home does.
 
 use aterm_spec::derive::Model;
 
-/// The bounded key → repaint → first-echo protocol. `Buggy = 1` replays the
-/// gap: a chord stamp or type-ahead replay spends the gate before the home,
-/// leaving the real new line on the old walk. It also shows how a plain
-/// modified key could improperly borrow the composer gate. Tier-1 drives
-/// `Ribbon` through these same actions and checks its gate and cohort.
+/// The bounded key → repaint → first-echo protocol. `Buggy = 1` lets a chord stamp or
+/// type-ahead replay spend the gate before the home, leaving the real new line on the old walk,
+/// and lets a plain modified key borrow the composer gate. Tier-1 drives `Ribbon` through these
+/// actions and checks its gate and cohort.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn rainbow_composer_newline_gate_model() -> Model {

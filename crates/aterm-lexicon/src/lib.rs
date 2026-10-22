@@ -315,11 +315,9 @@ impl FormId {
         )
     }
 
-    /// Reserve the low byte for the finite, allocation-free morphology variants
-    /// recognized by [`Lexicon::classify_token_into`]. Exact table keys use
-    /// variant zero; possessive and clitic fallbacks use a nonzero code. This
-    /// keeps `kitty`, `kitty's`, and every supported prefix form distinct without
-    /// falling back to a probabilistic token hash.
+    /// Exact table keys use variant 0 of the low byte; the possessive and clitic fallbacks of
+    /// [`Lexicon::classify_token_into`] use a nonzero code, keeping `kitty`, `kitty's` and each
+    /// prefix form distinct without a probabilistic token hash.
     #[inline]
     const fn exact(base: u64) -> Self {
         Self(base << 8)

@@ -43,9 +43,9 @@ pub const CLAIM_HELD: &str = "supervisor claim held by ";
 pub(super) fn ttl_ms(t: &crate::harness::Timings) -> u64 {
     u64::try_from(t.claim_ttl.as_millis()).unwrap_or(u64::MAX)
 }
-/// How often the claim is renewed (and, behind another holder, tried). Public
-/// because the in-GUI host's adopted-claim grace after a seamless update is
-/// counted in these steps (aterm-gui `harness_host`).
+/// How often the claim is renewed (and, behind another holder, tried). Public because the
+/// in-GUI host counts its adopted-claim grace after a seamless update in these steps
+/// (aterm-gui `harness_host`).
 pub const CLAIM_RENEW: Duration = Duration::from_secs(20);
 
 /// Where the loop stands on the session's supervisor claim.

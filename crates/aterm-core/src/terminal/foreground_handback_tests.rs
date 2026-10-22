@@ -484,10 +484,8 @@ fn foreground_handback_a_one_shot_that_armed_bracketed_paste_is_handed_back() {
     assert!(!t.modes().bracketed_paste);
 }
 
-// ---------------------------------------------------------------------------
 // The manual reset: `Terminal::manual_handback`, the engine half of the
 // `reset` control verb and Edit ▸ Reset Terminal.
-// ---------------------------------------------------------------------------
 
 /// A live zsh prompt drawn under a dead program's modes, where the only holder
 /// the reader sees is the live shell. Returns the terminal and the main

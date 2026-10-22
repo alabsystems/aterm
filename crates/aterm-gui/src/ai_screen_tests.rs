@@ -615,7 +615,7 @@ fn an_old_ai_completion_cannot_settle_a_new_policy_look() {
     assert!(app.ai_state().reading.is_some());
 }
 
-/// THE READING SAYS WHICH PATH A FACT NAMES (item A5 of the round-9 narrow
+/// THE READING SAYS WHICH PATH A FACT NAMES (item A5 of the narrow
 /// sweep): the copy on `PATH` aterm does not manage, whole — a folder with a
 /// space in it included — where the fact says it, so the page's row cuts its
 /// detail around the path rather than at the path's first space. None where

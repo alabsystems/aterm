@@ -266,6 +266,8 @@ impl TerminalHandler<'_> {
         if !self.transient.app_sync_open {
             self.transient.app_sync_open = true;
             self.transient.app_sync_dirty = false;
+            self.transient.app_sync_open_mark =
+                Some((self.grid.content_gen(), self.transient.screen_replaced));
         }
     }
 
@@ -278,11 +280,24 @@ impl TerminalHandler<'_> {
         )
     )]
     pub(super) fn disable_synchronized_output(&mut self) {
+        // The program finished a frame it drew into: until something is drawn after it,
+        // the screen is that frame (`Terminal::screen_is_closed_frame`). A stray `?2026l`
+        // with no frame of the program's open, or one that drew nothing, finishes nothing:
+        // the screen is what it was before the `?2026h`.
+        let drawn = (self.grid.content_gen(), self.transient.screen_replaced);
+        if self.transient.app_sync_open && self.transient.app_sync_open_mark != Some(drawn) {
+            self.transient.app_sync_closed = Some(super::transient_state::ClosedFrame {
+                content_gen: self.grid.content_gen(),
+                screen: self.transient.screen_replaced,
+                grid: (self.grid.rows(), self.grid.cols()),
+            });
+        }
         self.modes.synchronized_output = false;
         self.transient.sync_start = None;
         self.transient.sync_open_dirty = false;
         self.transient.app_sync_open = false;
         self.transient.app_sync_dirty = false;
+        self.transient.app_sync_open_mark = None;
         // ESU: a complete frame is ready; the host's present-hold releases on this edge
         // (`Terminal::sync_end_seq`).
         self.transient.sync_end_seq += 1;

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tiny output bursts must spend an entry budget as well as a payload budget.
-//! This is the one-byte append projection of the cast and live byte queues;
-//! variable-sized payload eviction and draining have separate real-code tests.
+//! Tiny output bursts spend an entry budget as well as a payload budget. This is the one-byte
+//! append projection of the cast and live byte queues; variable-sized eviction and draining
+//! have their own real-code tests.
 
 use aterm_spec::derive::Model;
 
-/// `Buggy=1` reproduces the payload-only bound: small bursts retain too many
-/// entries before filling it. Tier-1 also checks that each queue discloses
-/// exactly the lost prefix (`lo - 1`) after every append.
+/// `Buggy=1` bounds payload alone, so small bursts retain too many entries before filling it.
+/// Tier-1 also checks that each queue discloses exactly the lost prefix (`lo - 1`) after every
+/// append.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn output_retention_model() -> Model {

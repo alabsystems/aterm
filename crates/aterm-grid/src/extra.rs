@@ -568,14 +568,7 @@ pub fn underline_color_sgr(packed: u32) -> String {
     }
 }
 
-/// Check if a character is a Unicode combining mark.
-///
-/// Combining marks include:
-/// - Combining Diacritical Marks (U+0300-U+036F)
-/// - Combining Diacritical Marks Extended (U+1AB0-U+1AFF)
-/// - Combining Diacritical Marks Supplement (U+1DC0-U+1DFF)
-/// - Combining Diacritical Marks for Symbols (U+20D0-U+20FF)
-/// - Combining Half Marks (U+FE20-U+FE2F)
+/// Check if a character lies in one of the Unicode combining-mark blocks.
 #[cfg(any(test, debug_assertions))]
 #[must_use]
 #[inline]

@@ -177,9 +177,7 @@ fn why_not(
         .unwrap_or_else(|| panic!("{label} is a candidate"))
 }
 
-// ---------------------------------------------------------------------------
 // 1. The roster
-// ---------------------------------------------------------------------------
 
 /// [`three`] as the owner writes it, its dirs absolute on this host
 /// ([`abs`]).
@@ -241,7 +239,7 @@ fn a_roster_admits_whole_in_file_order_and_a_missing_file_is_the_empty_roster() 
     std::fs::write(&path, reference()).expect("write");
     assert_eq!(Roster::load(&path), Ok(three_here()));
 
-    // NEGATIVE CASES for the file itself: unreadable, not text, too large.
+    // Refused: unreadable, not text, too large.
     assert!(
         Roster::load(dir.path()).is_err(),
         "a directory is not a roster"
@@ -393,10 +391,8 @@ fn every_malformed_roster_is_refused_whole_and_names_the_row_and_the_reason() {
         assert!(!admissible_label(bad), "{bad}");
         assert!(label_refusal(bad).is_some(), "{bad}");
     }
-    // `help` is the one word of the grammar that is no label: the harness
-    // command reads it as its help word wherever it stands, so an account
-    // named so could be listed and never named. NEGATIVE CONTROL: a label
-    // that only begins with it is one.
+    // `help` is reserved: the harness command reads it as its help word
+    // wherever it stands. A label that only begins with it is admitted.
     assert!(!admissible_label("help"));
     assert!(label_refusal("help").is_some());
     for near in ["helper", "help-2", "h", "hel"] {
@@ -479,7 +475,7 @@ fn append_row_writes_only_what_the_next_read_admits() {
     );
     assert!(two.starts_with(one.trim_end()), "what was there is kept");
 
-    // NEGATIVE CASES, each by name, and nothing is handed back to write.
+    // Refused, each by name, with nothing handed back to write.
     let cases: [(&str, &str, Option<&str>, &str); 3] = [
         (&two, "work-2", Some(&pool), "name one dir"),
         (&two, "work-2", None, "both name no dir"),
@@ -582,9 +578,7 @@ fn enrolled_is_the_rows_in_whose_login_directory_a_login_was_made() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // 2. The state
-// ---------------------------------------------------------------------------
 
 /// A state with every field set.
 fn full_state() -> State {
@@ -727,9 +721,8 @@ fn the_state_round_trips_through_json_with_sorted_keys_and_null_for_unknown() {
             NOW + HOUR
         )
     );
-    // A FILE AN OLDER BUILD WROTE has none of those keys, and is the same
-    // schema: it loads, with no account on record as run on and the claim
-    // read as no process's and not done (it lapses by its own clock).
+    // A file without those keys is the same schema and loads: no account run
+    // on, the claim no process's and not done (it lapses by its own clock).
     // The object at `path` of a state's JSON, to edit.
     fn at<'a>(doc: &'a mut Value, path: &[&str]) -> &'a mut Map {
         path.iter()
@@ -1190,9 +1183,7 @@ fn the_transactions_keep_every_map_bounded() {
     assert_eq!(s, before);
 }
 
-// ---------------------------------------------------------------------------
 // 3. The condition
-// ---------------------------------------------------------------------------
 
 #[test]
 fn the_condition_table_in_its_order() {
@@ -1258,8 +1249,8 @@ fn the_signed_out_labels_are_the_enrolled_ones_in_roster_order() {
         signed_out(&r, &s, &all(&r), NOW),
         ["main", "work-2", "pool-a"]
     );
-    // NEGATIVE CONTROL: signed out and not enrolled is `not-enrolled`; the row
-    // with no `dir` is enrolled whatever the set holds.
+    // Signed out and not enrolled is `not-enrolled`; the row with no `dir` is
+    // enrolled whatever the set holds.
     let here: BTreeSet<String> = ["work-2".to_string()].into();
     assert_eq!(
         condition(r.row("pool-a").expect("a row"), &s, false, NOW),
@@ -1374,7 +1365,7 @@ fn a_wall_stands_until_its_instant_and_not_a_second_longer() {
             "at its instant: {w:?}"
         );
     }
-    // Two walls: the account is limited until the LAST one ends.
+    // Two walls: the account is limited until the last one ends.
     let mut s = state();
     note_wall(&mut s, "work-2", "five_hour", Some(NOW + HOUR), NOW, NOW);
     note_wall(&mut s, "work-2", "seven_day", Some(NOW + 2 * DAY), NOW, NOW);
@@ -1623,9 +1614,7 @@ fn one_wall_is_one_observation_until_it_is_found_standing_again() {
     assert_eq!(attempts(&s, "overage"), 1);
 }
 
-// ---------------------------------------------------------------------------
 // 4. Advice
-// ---------------------------------------------------------------------------
 
 #[test]
 fn rule_1_stays_for_a_session_the_roster_does_not_govern() {
@@ -2729,9 +2718,7 @@ fn a_held_sessions_wait_ends_at_the_rosters_next_opening_when_that_comes_first()
     }
 }
 
-// ---------------------------------------------------------------------------
 // 5. Transactions
-// ---------------------------------------------------------------------------
 
 /// A ROTATION is the session's alone: its row names it, the account it chose
 /// is active and not proven, and it counts toward the machine's bound.
@@ -4020,9 +4007,7 @@ fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
     assert_eq!(s.accounts["main"].limited_until(NOW), Some(NOW + 30 * MIN));
 }
 
-// ---------------------------------------------------------------------------
 // 5b. The limit reset: the claim, who may claim, and the outcome
-// ---------------------------------------------------------------------------
 
 /// A process's kernel start, as a host would hand it over. Invented.
 const START: &str = "1790000000.250000";
@@ -4724,9 +4709,7 @@ fn a_reset_is_allowed_only_on_the_machines_own_login_with_no_other_login_on_reco
     assert_eq!(ok(&all_three, "main"), Err("active-other"));
 }
 
-// ---------------------------------------------------------------------------
 // 6. The ledger row
-// ---------------------------------------------------------------------------
 
 #[test]
 fn a_ledger_row_round_trips_as_one_bounded_line() {
@@ -4897,9 +4880,7 @@ fn a_row_wakes_waiting_tabs_only_when_an_account_is_usable_sooner() {
     assert_eq!(waking.len() + quiet.len() + 1, Kind::ALL.len());
 }
 
-// ---------------------------------------------------------------------------
 // 7. The store
-// ---------------------------------------------------------------------------
 
 #[cfg(unix)]
 fn mode(path: &std::path::Path) -> u32 {
@@ -5407,9 +5388,7 @@ fn the_wake_marker_is_a_new_file_at_every_touch() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // 8. The process's login and the recorder
-// ---------------------------------------------------------------------------
 
 use crate::harness::upgrade::StandingWall;
 
@@ -6517,9 +6496,7 @@ fn several_accounts_are_listed_only_by_a_roster_that_admits_two() {
     assert!(!several_listed(Some(&path)), "a refused roster lists none");
 }
 
-// ---------------------------------------------------------------------------
 // 9. The recorder's hardening
-// ---------------------------------------------------------------------------
 
 /// A reset more than [`RESET_BELIEVED_S`] past its row is not believed: it is
 /// recorded as a wall naming none (the no-reset ladder), whoever hands it
@@ -6880,9 +6857,7 @@ fn the_recorder_waits_for_the_lock_a_bounded_time_and_says_it_is_held() {
     assert!(!Recorded::Refused("state.json: schema 2".to_string()).lock_held());
 }
 
-// ---------------------------------------------------------------------------
 // Usage credits and the vendor's warnings (accounts v2 S5)
-// ---------------------------------------------------------------------------
 
 /// The machine's own row, as a rosterless machine under `[harness]
 /// usage_notes` records it.
@@ -7583,7 +7558,7 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
 }
 
 /// A WARNING DRAWN BEFORE A RESET SAYS NOTHING AFTER IT, ON ANY TAB (the
-/// review of S5, round 4): tab B has been idle since its last answer, its
+/// review of S5): tab B has been idle since its last answer, its
 /// footer still drawing `You've used 96% of your weekly limit`, when tab A
 /// meets the weekly wall and a reset refills the week. B's loop says the
 /// unchanged warning again every [`CREDITS_RETELL_S`], and a loop started
@@ -7868,9 +7843,7 @@ fn the_lines_week_is_the_warnings_word_never_a_samples() {
     assert_eq!(full(later + 2 * MIN), line);
 }
 
-// ---------------------------------------------------------------------------
 // The usage tap's readings (design v2 §3.2)
-// ---------------------------------------------------------------------------
 
 /// A tap reading's window, `pct_x10` tenths under `reset`, refilled from
 /// the figure `refilled` where one is given.

@@ -246,6 +246,23 @@ impl Lab {
     pub(super) fn compile_in(&self, cx: &ViewCx<'_>) -> crate::native_ui::CompiledUi {
         compile_settings_view(&self.runtime, self.instance, self.view, cx)
     }
+
+    /// Every screen of the list in a `width`x`height` window, from its top
+    /// to the last one it scrolls to ([`each_screen_of`]).
+    pub(super) fn each_screen(
+        &mut self,
+        width: f32,
+        height: f32,
+        each: impl FnMut(&SettingsViewState, &crate::native_ui::CompiledUi, usize),
+    ) -> usize {
+        each_screen_of(
+            &mut self.runtime,
+            self.instance,
+            self.view,
+            &view_cx_at(width, height),
+            each,
+        )
+    }
 }
 
 pub(super) fn rect_of(compiled: &crate::native_ui::CompiledUi, key: &str) -> LogicalRect {
@@ -703,7 +720,7 @@ fn modified_display_face_is_a_toggle_per_face() {
             lab.state_mut().navigate(SettingsRoute::TextFonts);
             let mut own = std::collections::BTreeMap::new();
             for top in 0..40 {
-                lab.state_mut().page_scroll = top;
+                lab.state_mut().scroll_page_to(top);
                 let compiled = lab.compile(width, 2_400.0);
                 for font in aterm_render::DISPLAY_FACES {
                     if let Some(node) =
@@ -714,7 +731,7 @@ fn modified_display_face_is_a_toggle_per_face() {
                 }
             }
             lab.state_mut().navigate(SettingsRoute::Modified);
-            lab.state_mut().page_scroll = 0;
+            lab.state_mut().scroll_page_to(0);
             let compiled = lab.compile(width, height);
             let row = compiled
                 .semantics

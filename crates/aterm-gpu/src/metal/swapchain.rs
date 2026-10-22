@@ -467,9 +467,7 @@ impl Swapchain {
                 sel(c"setWantsExtendedDynamicRangeContent:"),
                 wants_edr.into(),
             );
-            // Both arms name their colorspace: on a live layer holding scRGB,
-            // flipping back to `Bgra8Unorm` keeps the extended space, and an SDR
-            // present tagged scRGB is misread by the compositor.
+            // Both arms name their colorspace (see the module header).
             let set_space: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) = checked_msg();
             set_space(layer.id(), sel(c"setColorspace:"), space);
             CGColorSpaceRelease(space);

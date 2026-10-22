@@ -191,8 +191,8 @@
 //!
 //! ## `doctor`
 //!
-//! `aterm fabric`'s WARNINGS, each with the fix for it ([`fix_for`]), plus the
-//! one check status does not make: whether the rendezvous file is there.
+//! `aterm fabric`'s warnings, each with its fix ([`fix_for`]), plus whether the rendezvous file
+//! is there.
 //! Every fix that re-runs `on` is spelled with the fleet this root records
 //! ([`Role::again`]).
 
@@ -263,9 +263,7 @@ fn root_seam() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-// ---------------------------------------------------------------------------
 // options
-// ---------------------------------------------------------------------------
 
 /// How the broker is kept alive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,9 +345,7 @@ pub struct OffOpts {
     pub service: Option<Service>,
 }
 
-// ---------------------------------------------------------------------------
 // paths
-// ---------------------------------------------------------------------------
 
 /// Where everything is, resolved once.
 #[derive(Debug, Clone)]
@@ -971,9 +967,7 @@ fn supervised_argv(argv: Vec<String>) -> Option<Vec<String>> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // what this root is to its fleet
-// ---------------------------------------------------------------------------
 
 /// What this root is to its fleet, read back from what `on` left: the fleet
 /// the configured `[fabric] command` names (else the rendezvous file's), with
@@ -1424,9 +1418,7 @@ pub fn argv_safe(word: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // the rendezvous file
-// ---------------------------------------------------------------------------
 
 /// What `fabric.toml` records.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1603,9 +1595,7 @@ pub fn fill_defaults(args: &[String], r: &Rendezvous) -> Vec<String> {
     out
 }
 
-// ---------------------------------------------------------------------------
 // aterm.toml's [fabric] table
-// ---------------------------------------------------------------------------
 
 /// `repr` read as a TOML key path by the parser itself, so `fabric`,
 /// `"fabric"`, `'fabric'` and ` fabric . presence ` all name what the app
@@ -1957,9 +1947,7 @@ pub fn remove_fabric_table(text: &str) -> Result<(String, Vec<String>), String> 
     Ok((joined, removed))
 }
 
-// ---------------------------------------------------------------------------
 // files, written the careful way
-// ---------------------------------------------------------------------------
 
 /// The one careful writer of a whole file and aterm.toml's
 /// ([`aterm_uds::atomic_file`]): a NEW temp beside the file, never one
@@ -2094,9 +2082,7 @@ fn mint_caps(p: &Paths, node: &str) -> Result<usize, String> {
     result
 }
 
-// ---------------------------------------------------------------------------
 // the report
-// ---------------------------------------------------------------------------
 
 /// The step lines, printed as they happen.
 pub(crate) struct Out {
@@ -3089,9 +3075,8 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
                     ),
                 );
             } else if flags_match && inst.reason == "state-locked" {
-                // A RE-RUN finds the standby the first run armed: still not an
-                // instance the proof can post through (its `post --wait`
-                // answers `ERR fabric stalled`), whichever one the caller sits in.
+                // A re-run finds the standby the first run armed: still not one the proof can
+                // post through (its `post --wait` answers `ERR fabric stalled`).
                 out.note(
                     "instance",
                     &format!("{pid} is armed with this command ({shown}); {STANDBY_NOTE}"),
@@ -3406,9 +3391,7 @@ fn prove(armed: &[Instance], out: &mut Out) -> Result<u64, String> {
     Ok(ms)
 }
 
-// ---------------------------------------------------------------------------
 // on
-// ---------------------------------------------------------------------------
 
 /// `aterm fabric on`.
 #[must_use]
@@ -3837,9 +3820,7 @@ fn done_despite(warnings: usize) -> Option<String> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // off
-// ---------------------------------------------------------------------------
 
 /// `off`'s config step: every `fabric` table removed from aterm.toml
 /// ([`remove_fabric_table`]), written as `on` writes it ([`ConfigFile`]) with
@@ -4119,9 +4100,7 @@ pub fn off(opts: &OffOpts) -> ExitCode {
     }
 }
 
-// ---------------------------------------------------------------------------
 // doctor
-// ---------------------------------------------------------------------------
 
 /// The one remedy for a broker and a client in DIFFERENT astream protocols —
 /// the probe's mismatch and the bridge's `reason=protocol` alike. Two aterm

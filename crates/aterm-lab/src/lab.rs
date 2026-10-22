@@ -2246,7 +2246,7 @@ mod tests {
     }
 
     /// `ps <tag>` AND `down <tag>` OF A LAB THAT IS DOWN NAME THAT TAG
-    /// (ATERM-KI-1016-1): each refuses with the lab `<tag>` is not up, never
+    /// : each refuses with the lab `<tag>` is not up, never
     /// the default lab's words, and `down` touches no lab. Read through the
     /// verbs themselves (`take_tag` there left the tag as an argument, and
     /// the verb acted on the default lab). PRECONDITION: neither lab is up

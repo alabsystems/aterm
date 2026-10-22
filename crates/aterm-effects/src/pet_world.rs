@@ -857,18 +857,8 @@ impl PetWorld {
                 }
                 // The class this cell would have with no caret at all.
                 self.inked[row_base + c] = others || painted;
-                // Recorded so the visibility layer can forgive a cell the
-                // LIVE CARET'S RING alone protects, without forgiving
-                // anything else. The pet is seated beside the caret BY
-                // DESIGN; deleting the cat because the caret's own keep-off
-                // margin slid under it is what v0.81.0 did on every
-                // keystroke. `blank` is whether the cell would have been
-                // `Clear` with no caret at all — the stricter
-                // `blocked_prefix` reading forgives only those, while the
-                // `protected_prefix` reading (a resident standing UNDER
-                // ordinary ink) may forgive the whole ring, because without
-                // the caret every one of these cells is `Ink` or `Clear` and
-                // that layer admits both.
+                // Record ring cells only the caret protects, so visibility can forgive them
+                // (see `CaretCell::blank`): the pet sits beside the caret by design.
                 if cursor && !others && n_caret_cells < self.caret_cells.len() {
                     self.caret_cells[n_caret_cells] = CaretCell {
                         row: r,
@@ -1283,14 +1273,10 @@ impl PetWorld {
         prefix[r1_base + c1] + prefix[r0_base + c0] - prefix[r1_base + c0] - prefix[r0_base + c1]
     }
 
-    /// The swept-body test for a resident travelling behind text, for a body
-    /// leaving the caret's escort seat.
-    ///
-    /// A swept corridor contains the body it departs from, and [`STATION_LEAD`]
-    /// seats the escort one cell past the caret, inside the caret's keep-off
-    /// ring; read strictly, the pet could never leave. So the caret does not
-    /// obstruct its escort here either, matching
-    /// [`Self::under_text_clearance_past_caret`].
+    /// The swept-body test for a resident travelling behind text. The corridor contains the
+    /// body it departs from, and the escort seat (`kitty_pet`'s `STATION_LEAD`) lies inside the
+    /// caret's ring, so the caret is forgiven here as in
+    /// [`Self::under_text_clearance_past_caret`]; read strictly, the pet could never leave.
     #[inline]
     #[must_use]
     pub fn under_text_corridor_clear_past_caret(

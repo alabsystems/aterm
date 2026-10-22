@@ -311,7 +311,7 @@ fn staging_extends_the_published_bytes_with_every_target_in_one_manifest() {
     let w = World::new("linux-stage");
     w.keyless();
     let (o, _) = ok(w.run(false));
-    // (i) both targets, one manifest, the second merge chained onto the first.
+    // Both targets, one manifest, the second merge chained onto the first.
     let clean = w.manifest_of("clean", 20);
     for t in [
         "x86_64-unknown-linux-gnu",
@@ -478,8 +478,8 @@ fn a_keyed_run_that_stops_before_the_index_leaves_the_ceremony() {
         ready.contains("If its log has no \"published atpkg-index-8\", run the ceremony below."),
         "{ready}"
     );
-    // (q2) The next keyed run finds the uploads published, nothing READY, and finishes
-    // the index they are owed.
+    // The next keyed run finds the uploads published, nothing READY, and finishes the
+    // index they are owed.
     w.fx.indexer.fail.store(false, Ordering::SeqCst);
     let (o, _) = ok(w.run(false));
     assert!(o.ready.is_empty() && o.signed.is_empty());

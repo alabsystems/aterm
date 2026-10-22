@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! REVIEWS ACROSS AIs (design §9). Batteries included (owner ruling 2026-10-16: "reviews need
+//! REVIEWS ACROSS AIs (design §9). Batteries included ("reviews need
 //! to ship on and run for what's enabled … don't disable stuff"; "inherit the current parent
 //! agent's permissions"): the change in this directory goes to every AI CLI used on this
 //! machine but the asker, each in its one-shot mode with all its capabilities, in the

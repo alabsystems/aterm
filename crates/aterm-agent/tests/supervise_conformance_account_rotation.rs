@@ -895,9 +895,7 @@ fn agrees(decided: &Decision, real: &Verdict, jobs_hold: bool) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The decider: `decide_turn_end` over a real `TurnEndState`
-// ---------------------------------------------------------------------------
 
 /// The busy work of the turn that ended at a point: real work, so no
 /// short-turn back-off stands between a plain turn end and its continuation.

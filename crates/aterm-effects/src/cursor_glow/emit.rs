@@ -793,8 +793,7 @@ impl CursorGlow {
             // Fire's core swells with the eased temperature (slim vein at a
             // smolder, a rope at full blaze), thin enough not to bury glyphs.
             GlowStyle::Fire => fire_core,
-            // FAT charged conductor (~2× the shared core): the lightning strikes
-            // fork off a thick high-voltage cable of light, not a hairline.
+            // A fat charged conductor (~2× the shared core) the strikes fork off.
             GlowStyle::Laser => (chf * 0.26).max(3.5),
             // The beam tube: a solid rod (~1/3 cell) at full power, collapsing
             // toward a hairline as it powers down (`beam_pw`).
@@ -980,8 +979,7 @@ impl CursorGlow {
         }
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
         let body_cap = LIGHT_BODY_ALPHA_CAP;
-        // The tube's girth follows the newest spark's power envelope, as on
-        // a dark ground.
+        // Beam fades with the newest spark's power envelope.
         let beam_pw = if matches!(cfg.style, GlowStyle::Beam) {
             self.sparks.last().map_or(1.0, |s| {
                 let age = now.saturating_duration_since(s.born).as_secs_f32();
@@ -1544,10 +1542,10 @@ impl CursorGlow {
         }
         // One quantized phase per frame: both backends see the identical time.
         let phase = (self.flame_phase * 1024.0) as u32;
-        // Tongues drag BEHIND rightward typing: lean/4 px at full rise.
+        // Tongues drag behind rightward typing: lean/4 px at full rise.
         let lean_q = (-(ch * 0.30 * t) * 4.0).clamp(-127.0, 127.0) as i8;
-        // EFFECTS-BOX horizontal clamp (identity-exact at head 0: the box IS the
-        // grid box, matching the historical grid-relative clamps).
+        // Effects-box horizontal clamp: the grid's columns (`head` raises only
+        // the top).
         let (fx_l, fx_r) = (geom.fx_left(), geom.fx_right());
         let chi = geom.ch as i32;
         let cwi = geom.cw as i32;
@@ -2733,12 +2731,10 @@ impl CursorGlow {
         out.truncate(Self::MAX_QUADS);
     }
 
-    /// Emit the fire meteors: each is one straight anti-aliased streak of fire
-    /// along its jump vector (a white-hot head at the landing, an orange core,
-    /// a deep-red fringe up the tail) whose tail retracts into the landing
-    /// over its life. Rasterized through the shared `comet_beam`, smooth at any
-    /// angle with CPU/GPU parity. Two passes per meteor: a wide dim aura and a
-    /// hot tapered core.
+    /// Emit the fire meteors: one straight anti-aliased streak per jump vector
+    /// (white-hot head at the landing, orange core, deep-red tail fringe) whose
+    /// tail retracts into the landing. Two `comet_beam` passes: a wide dim aura
+    /// and a hot tapered core.
     ///
     /// On a light ground additive light cannot show, so the same geometry is
     /// painted source-over ([`comet_beam_over`]) into the under-ink stream the
@@ -3152,8 +3148,8 @@ impl CursorGlow {
         // The core and the crawl spend the over-ink ledger where they reach
         // the letters beside the caret; the rim stays on the caret's own cell.
         //
-        // 1) MOLTEN CORE: a small white-hot pool riding just above centre (heat
-        //    rises), swelling and pulsing with the metal.
+        // Molten core: a small white-hot pool just above centre (heat rises),
+        // swelling and pulsing with the metal.
         let pulse = 0.85 + 0.15 * (phase * 2.3).sin();
         let core_cov = (150.0 * tn * pulse * cfg.intensity).min(255.0);
         if core_cov >= 2.0 {
@@ -3624,10 +3620,9 @@ impl CursorGlow {
             } else {
                 1.0
             };
-            // Sparkles rotate hue over the flight; embers and droplets keep the
-            // birth seed. The ramp (`style_particle_color`, shared with the
-            // settings demo) is evaluated lazily: the rainbow kitty, fire and
-            // beam arms use their own colours.
+            // Sparkles rotate hue over the flight; Fire/Water/Comet keep the
+            // birth seed. `style_particle_color` (shared with the settings demo)
+            // is evaluated lazily.
             let particle_color = || {
                 let hue = match cfg.style {
                     // Fire/Water/Comet use `hue` as a per-particle seed
@@ -3797,10 +3792,9 @@ impl CursorGlow {
                     }
                     continue;
                 }
-                // Fire: a glowing point of light flickering on a seeded phase,
-                // wafting on turbulence and shrinking as it cools. The hue seed
-                // doubles as temperature and size (pops big and white-hot,
-                // smolder motes small and deep red).
+                // Fire: a flickering point of light wafting on turbulence and
+                // shrinking as it cools; the hue seed doubles as temperature and
+                // size.
                 //
                 // On a light ground a point of light cannot show and an
                 // additive ember only lifts the letters toward the page, so an

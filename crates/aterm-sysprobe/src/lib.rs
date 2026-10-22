@@ -45,6 +45,11 @@
 //!   every one's CPU time by QoS, bytes read and live footprint, one
 //!   process's coalition, and the self-check a caller asks before it trusts
 //!   them.
+//! * [`identity`] — who a process is by the kernel's word (macOS): its
+//!   image's basename and its code signature's status, validation category,
+//!   signing identifier and team id (`csops`), and what they vouch for.
+//! * [`timeline`] — the machine's boot, last sleep and last wake and what it
+//!   woke on (macOS).
 //! * [`jobs`] — the job probe: for each job member the stuck-process engine
 //!   names, its run state and threads' states, counters (CPU, system calls,
 //!   wakeups, context switches, disk and logical bytes), terminal and its
@@ -110,6 +115,7 @@ use std::time::Instant;
 
 pub mod caps;
 pub mod coalitions;
+pub mod identity;
 pub mod iflist;
 #[cfg(target_os = "macos")]
 mod iokit;
@@ -130,6 +136,7 @@ pub mod peb;
 pub mod procargs;
 pub mod procs;
 pub mod slots;
+pub mod timeline;
 pub mod volumes;
 #[cfg(all(windows, target_pointer_width = "64"))]
 mod win;
@@ -865,9 +872,7 @@ pub(crate) fn utf8_prefix(bytes: &[u8]) -> &str {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Pure pieces the platform arms share (compiled everywhere, tested here).
-// ---------------------------------------------------------------------------
 
 /// Memory in use, MiB, as Activity Monitor's `Memory Used` counts it: app
 /// memory (internal pages less purgeable ones) plus wired plus the pages the

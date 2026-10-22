@@ -27,9 +27,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Test-only RAII observation of actual open attempts for one exact absolute
-/// path. Thread-local scope prevents parallel test cases from contaminating
-/// one another; `Rc` deliberately keeps the guard on its installing thread.
+/// Test-only RAII counter of open attempts for one exact absolute path. Thread-local so
+/// parallel tests do not see each other's opens; `Rc` keeps the guard on its thread.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub struct OpenProbeGuard {
@@ -136,8 +135,8 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
     Ok((file, metadata.len()))
 }
 
-/// Windows' reparse-point flag is the closest equivalent of `O_NOFOLLOW`.
-/// The attribute is checked on the opened handle before any byte is consumed.
+/// Windows' reparse-point flag stands in for `O_NOFOLLOW`; the attribute is checked on the
+/// opened handle before any byte is read.
 /// Backup semantics let a directory open too, so the handle check refuses it
 /// as not regular, as on unix; without it `CreateFileW` answers a directory
 /// with `ERROR_ACCESS_DENIED`, and a toy pack path naming a folder read
@@ -222,8 +221,7 @@ pub fn read_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Result<St
     })
 }
 
-/// Delimit and fold the byte count so the result is a content fingerprint,
-/// not merely the raw streaming hasher state.
+/// Delimit and fold in the byte count, so the result fingerprints content, not hasher state.
 #[inline]
 fn seal_fingerprint(mut hash: Fnv1a64, len: u64) -> u64 {
     hash.write_u8(0xff);
@@ -231,10 +229,9 @@ fn seal_fingerprint(mut hash: Fnv1a64, len: u64) -> u64 {
     hash.finish()
 }
 
-/// Fingerprint UTF-8 contents that were already admitted through
-/// [`read_bounded_regular_utf8`]. This is the in-memory twin of
-/// [`fingerprint_bounded_regular_utf8`]: hosts can parse and identify the exact
-/// same-handle bytes without reopening a pathname and introducing an ABA race.
+/// Fingerprint contents already admitted through [`read_bounded_regular_utf8`]; equal to
+/// [`fingerprint_bounded_regular_utf8`] on the same bytes, without reopening the path (no ABA
+/// race).
 #[inline]
 #[must_use]
 pub fn fingerprint_admitted_utf8(contents: &str) -> u64 {

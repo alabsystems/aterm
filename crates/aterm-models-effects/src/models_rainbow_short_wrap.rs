@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A short composer wrap needs two independent facts: the exact held caret
-//! park and a content follow whose moved ribbon cohort owns the glyph at
-//! that park's source edge. The proof belongs to that park, survives its
-//! delayed flush, and is consumed by one licensed replay. A same-end return
-//! without that proof is still a cancelled park; a follow on another row or
-//! in another cohort, or an unlicensed flush, cannot arm a short re-anchor.
+//! A short composer wrap needs two independent facts: the exact held caret park, and a content
+//! follow whose moved ribbon cohort owns the glyph at that park's source edge. The proof belongs
+//! to that park, survives its delayed flush, and is consumed by one licensed replay. A same-end
+//! return without it is still a cancelled park; a follow on another row or in another cohort, or
+//! an unlicensed flush, cannot arm a short re-anchor.
 
 use aterm_spec::derive::Model;
 
-/// The bounded held-park/content-follow handshake. `Buggy = 1` reproduces
-/// both failures the real host guards: a same-end return cancelling a proved
-/// one-cell wrap, and an unproved short park arming a ribbon relay. Tier-1 in
-/// `aterm-effects` drives the real host and checks both decisions against
-/// these actions, including false-park and unrelated-cohort negative controls.
+/// The bounded held-park/content-follow handshake. `Buggy = 1` has both failures the real host
+/// guards: a same-end return cancelling a proved one-cell wrap, and an unproved short park
+/// arming a ribbon relay. Tier-1 in `aterm-effects` drives the real host and checks both
+/// decisions against these actions, with false-park and unrelated-cohort negative controls.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn rainbow_short_wrap_park_model() -> Model {

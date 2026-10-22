@@ -292,11 +292,9 @@ impl Catalog {
             } else if crate::bundled::is_identity(trimmed)
                 && let Some((id, _)) = crate::bundled::face_for_family(trimmed)
             {
-                // A bundled IDENTITY is compiled-in (see
-                // `resolve_and_admit_in_dirs`): never a name for the filename /
-                // name-table passes to hunt for. A bundled family NAME is hunted
-                // like any other and falls back to the bundled face below only
-                // when nothing installed answers (`resolve_family_or_bundled`).
+                // A bundled identity is compiled in, never a name to hunt for. A bundled
+                // family name is hunted like any other and falls back to the bundled face below
+                // only when nothing installed answers.
                 results[index] = Some(Ok((PathBuf::from(id), FaceChoice::At(0))));
             } else {
                 let normalized = normalize_family(trimmed);

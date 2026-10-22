@@ -243,7 +243,6 @@ fn gpu_effect_shift_covers_only_absolute_streams_and_restores_exactly() {
     let mut input = RenderInput::empty();
     input.cursor_glow_add = vec![GlowQuad {
         y: 20,
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         ..GlowQuad::default()
     }];

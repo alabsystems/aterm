@@ -167,22 +167,21 @@ mod sys;
 mod unreadable;
 #[cfg(target_os = "macos")]
 mod verify;
-// The checker's supervision: the real loop, driven to each way it could stall
-// silently.
+// The checker's real loop, driven to each way it could stall silently.
 #[cfg(all(test, target_os = "macos"))]
 mod checker_supervision_tests;
 // Every platform names the copy of aterm it is running
 // (`docs/DESIGN-which-copy-runs-2026-08-27.md`); only the other-copy probe is `.app`-shaped.
 pub mod which_copy;
 
-// The FailedMark writer/reader suppression projection (proof/test builds only),
-// re-exported at the crate root so `manifest`'s `#[refines]` anchors can name it
-// as `aterm_update::…`, like `status_reconciliation_projection`.
+// Proof/test-build projections, re-exported at the crate root so the `#[refines]`
+// anchors can name them as `aterm_update::…`. This one is the FailedMark
+// writer/reader suppression.
 #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
 pub use manifest::failed_mark_suppression_projection;
 
-// The roster-freshness projection (proof and test builds only), named by the
-// `#[refines]` anchors on the swap's stage gates and the check's roster observation.
+// The roster-freshness projection, for the swap's stage gates and the check's
+// roster observation.
 #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
 pub use github::roster_freshness_projection;
 
@@ -510,16 +509,13 @@ pub fn automatic() -> bool {
 /// swapped-in binary.
 ///
 /// Inherited PTY/proof descriptors (`handoff_fds`) stay CLOEXEC for every
-/// verification helper and are exposed only to the updater's final exec image.
-/// `handoff_env` rides the same contract: authority variables the caller's
-/// prearm consumed out of the ambient environment (so no helper can see them),
-/// restored exclusively onto the final exec image — the re-exec'd successor
-/// must re-validate the inherited handoff and cannot without them. The canonical
-/// OLD rollback source and health trial are bound to `current_commit`, the
-/// compiled git commit of the running binary, preventing
-/// same-build/different-source reuse.
-///
-/// `witness` is what this launch can prove about a boot trial ([`TrialWitness`]).
+/// verification helper and are exposed only to the final exec image. `handoff_env`
+/// is the same: authority variables the caller's prearm took out of the environment
+/// (so no helper sees them), restored only onto the final exec image, whose successor
+/// needs them to re-validate the inherited handoff. The rollback source and health
+/// trial are bound to `current_commit`, the running binary's compiled git commit, so
+/// a same-build, different-source copy cannot reuse them. `witness` is what this
+/// launch can prove about a boot trial.
 ///
 /// `image` is what the boot may do to this process's image ([`ImageReplacement`]).
 /// A [`ImageReplacement::LaunchedSuccessor`] swaps nothing, and a crash-loop revert
@@ -1968,7 +1964,7 @@ pub const STRANDED_TITLE: &str = "aterm is not updating on this machine";
 
 /// The `title` [`HealthNotify`] is called with when an executable the Linux lane installed
 /// has waited over an hour for the next aterm a person starts, which finishes the update
-/// (`linux_notice::InstallWatch`; the review of ATERM-KI-1015-2, U21). It is NO FAILURE and
+/// (`linux_notice::InstallWatch`). It is NO FAILURE and
 /// names no ledger class: the install worked, and on Linux no lane starts an installed
 /// executable inside a running aterm, so this wait is how every automatic install there
 /// ends. The window shows it as a notice of its own, with the body as its sentence, and
@@ -1985,7 +1981,7 @@ pub const INSTALL_WAIT_OVER_TITLE: &str = "aterm update no longer waits for a st
 
 /// The `title` [`HealthNotify`] is called with when a crash loop ended a Linux install's
 /// trial — the build rolled back, or kept because the build before it could not come back
-/// (`linux_notice::InstallWatch`; ATERM-KI-1015-2, U21) — with the body in the record's own
+/// (`linux_notice::InstallWatch`) — with the body in the record's own
 /// words for it, naming the build that failed. EACH CRASH LOOP IS NEWS OF ITS OWN: the
 /// window says it as the install half's warning (`Couldn't install updates`, as the macOS
 /// lane says a reverted update) every time, a second before the first was answered too,

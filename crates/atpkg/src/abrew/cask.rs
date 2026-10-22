@@ -462,7 +462,7 @@ fn install_inner(
             }
             fetch::untar(&inner, &payload).map_err(extraction_error)?;
         } else if fetch::is_dmg(&file) {
-            fetch::extract_dmg(&dest, &payload).map_err(extraction_error)?;
+            fetch::extract_dmg(&dest, &payload).map_err(|e| dmg_error(&cask.token, e))?;
         } else {
             fetch::untar(&dest, &payload).map_err(extraction_error)?;
         }
@@ -732,6 +732,17 @@ fn wrapper_program(
 /// result. Nothing else about the payload changes.
 /// Classify an extraction failure for cask payloads. Container
 /// FORMATS the vetted readers do not speak (bzip2/xz magic) and zip
+/// Payload names cannot turn a disk-image vetting refusal into delegation.
+fn dmg_error(token: &str, e: fetch::DmgError) -> InstallError {
+    match e {
+        fetch::DmgError::Attach(_) => InstallError::PassThrough(format!(
+            "cask {token} container format needs Homebrew extraction"
+        )),
+        #[cfg(any(target_os = "macos", test))]
+        other => InstallError::Failed(other.to_string()),
+    }
+}
+
 /// STRUCTURES the strict central-directory reader refuses (trailing
 /// bytes after the end record, multi-disk, encryption, an unknown
 /// method — real casks ship such zips, e.g. an appended signature
@@ -741,10 +752,7 @@ fn wrapper_program(
 /// shape, not corruption. Vetting refusals (slip entries, bomb caps)
 /// render differently and stay hard failures.
 fn extraction_error(token: &str, e: String) -> InstallError {
-    if e.contains("unsupported archive")
-        || e.contains("io: zip: ")
-        || e.contains("dmg attach failed")
-    {
+    if e.contains("unsupported archive") || e.contains("io: zip: ") {
         InstallError::PassThrough(format!(
             "cask {token} container format needs Homebrew extraction"
         ))
@@ -1881,6 +1889,35 @@ mod tests {
 
     #[test]
     fn extraction_structural_refusals_delegate_vetting_refusals_fail() {
+        assert!(matches!(
+            dmg_error("x", fetch::DmgError::Attach("unsupported image".into())),
+            InstallError::PassThrough(_)
+        ));
+        for name in ["dmg attach failed", "unsupported archive", "io: zip: "] {
+            assert!(matches!(
+                dmg_error(
+                    "x",
+                    fetch::DmgError::Payload(format!(
+                        "abrew: dmg contains a nonregular entry: {name}"
+                    ))
+                ),
+                InstallError::Failed(_)
+            ));
+        }
+        assert!(matches!(
+            dmg_error("x", fetch::DmgError::Detach),
+            InstallError::Failed(_)
+        ));
+        for message in [
+            "unsupported image",
+            "dmg attach failed",
+            "cleanup not mounted",
+        ] {
+            assert!(matches!(
+                dmg_error("x", fetch::DmgError::Uncertain(message.into())),
+                InstallError::Failed(_)
+            ));
+        }
         // Zip structures the strict reader refuses (empoche ships
         // ~80KB past its end record) delegate to brew's extractor.
         assert!(matches!(

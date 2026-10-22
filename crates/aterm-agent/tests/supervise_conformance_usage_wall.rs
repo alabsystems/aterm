@@ -319,7 +319,7 @@ fn resumed() -> Vec<String> {
 }
 
 /// ANOTHER CONVERSATION'S HISTORY, `/resume`d while the wall SHOWED, its
-/// countdown armed: the measured 2.1.300 screen (W1 of ATERM-KI-1015-1) —
+/// countdown armed: the measured 2.1.300 screen (W1 of ) —
 /// its own older five-hour limit (`resets 8:48am`) and the vendor's
 /// continuation of it (`⏺ Usage limit reset · continuing automatically`, the
 /// reply under it), the countdown dropped.

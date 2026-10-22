@@ -190,9 +190,7 @@ pub(crate) fn hold_reason_words(reason: &str) -> String {
     aterm_messages::presence::hold_reason_words::<Native>(reason)
 }
 
-// ---------------------------------------------------------------------------
 // The wakes: how a change on the control thread reaches the main thread.
-// ---------------------------------------------------------------------------
 
 /// The event-loop proxy the control and bridge threads post presence wakes
 /// through. Installed once at launch (`install_proxy`); a headless test App
@@ -308,9 +306,7 @@ pub(crate) fn take_task_wakes() -> Vec<u64> {
     TASK_WAKES.with(|w| std::mem::take(&mut *w.borrow_mut()))
 }
 
-// ---------------------------------------------------------------------------
 // The classifier gate.
-// ---------------------------------------------------------------------------
 
 /// How many screen rows the agent-phase classifier reads: the composer frame
 /// and the live zone above it fit in the last 40 rows of any screen's content
@@ -824,9 +820,7 @@ fn prompt_detail(p: &aterm_phase::PromptV2) -> String {
     format!("{kind}:{verdict}")
 }
 
-// ---------------------------------------------------------------------------
 // The reset clock: placing a limit notice's reset time on this machine's clock.
-// ---------------------------------------------------------------------------
 
 /// How long until `reset` falls on this machine's clock: the figure the limited
 /// row counts down. The words are read by the supervisor's grammar
@@ -1266,8 +1260,7 @@ mod tests {
             ["question", "unknown", "idle", "busy", "unknown"],
             "both halves of the mapping are exercised"
         );
-        // The never-shown law at the classifier's own edge: a limit notice
-        // keeps only its kind and its reset, never its message.
+        // A limit notice keeps only its kind and its reset, never its message.
         let (limited, _, _) = classify(
             &aterm_phase::ClaudeReader,
             &rows(&[
@@ -1894,7 +1887,7 @@ mod tests {
         };
         assert_eq!(reset.as_deref(), Some("09:00"));
         assert_eq!(until, now.checked_add(Duration::from_secs(300)));
-        // CONTROLS: the reading is returned as it was.
+        // Controls: the reading is returned as it was.
         for (name, agent, at) in [
             ("past", wall(unreachable, None), Some(NOW_UNIX - 5)),
             ("now", wall(unreachable, None), Some(NOW_UNIX)),
@@ -2146,9 +2139,10 @@ mod tests {
         assert_eq!(local_offset_at(-11_644_473_601), None, "before 1601");
     }
 
-    /// A system timezone replacement changes the zone identity as well as
-    /// its offsets. A notice naming the former zone must not be interpreted
-    /// with the new zone's clock. Every filesystem operation is scratch-only.
+    /// Replacing the system zone changes its name as well as its offsets: a
+    /// notice naming the former zone is no figure under the new one, and one
+    /// naming the new zone is placed with its offsets. Only a scratch link is
+    /// touched.
     #[cfg(unix)]
     #[test]
     fn the_countdown_tracks_replacement_of_the_local_zone_link() {

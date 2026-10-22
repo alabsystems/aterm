@@ -266,7 +266,6 @@ fn expand_spec_unmodeled(attr: TokenStream, item: TokenStream) -> Result<TokenSt
     ))
 }
 
-// ---------------------------------------------------------------------------
 // ty_model! — the "light annotation" surface for aterm-spec's derived TLA+.
 //
 // Write a bounded state machine as near-plain Rust; expands to an
@@ -299,7 +298,6 @@ fn expand_spec_unmodeled(attr: TokenStream, item: TokenStream) -> Result<TokenSt
 // (e.g. `Buggy == 1 && active == 1`) the proves-and-catches models use. The macro
 // emits absolute `::aterm_spec::derive::*` paths, so it works in any crate
 // depending on aterm-spec (and in aterm-spec's own integration tests).
-// ---------------------------------------------------------------------------
 
 /// See module-level note above. Expands to an `::aterm_spec::derive::Model`.
 #[proc_macro]

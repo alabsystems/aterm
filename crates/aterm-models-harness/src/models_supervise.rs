@@ -10,37 +10,29 @@
 
 use aterm_spec::derive::{Liveness, Model};
 
-/// The SUPERVISOR CLAIM (aterm-agent `supervise/claim.rs`): a loop presses
-/// only while its last word from the server was that the claim is its own
-/// (`view` 1), and that word is renewed before any request once `Renew`
-/// ticks have passed — so a lease that lapsed (`Ttl` ticks without a
-/// request) and was taken by another supervisor is found out by the
-/// renewal that precedes the very next press, never after it.
+/// The supervisor claim (aterm-agent `supervise/claim.rs`): a loop presses only while its
+/// last word from the server was that the claim is its own (`view` 1), and renews it before
+/// any request once `Renew` ticks have passed, so a lease that lapsed (`Ttl` ticks without
+/// a request) and was taken by another supervisor is found out by the renewal before the
+/// next press.
 ///
-/// `held` is the server's claim (0 none, 1 this loop's, 2 another's);
-/// `view` the loop's last reading of it (1 its own, 2 another's, 3 PENDING:
-/// its last claim request was not served — asked again before the next
-/// request, pressing nothing until answered); `age` the ticks since the
-/// loop last asked. `Buggy = 1` presses without the fresh
-/// renewal and without its fence — the stale-view press — and is caught: a
-/// lapse, another's claim, then a press under it. Tier-1 (aterm-agent
-/// `run_engine_tests.rs`) drives the real `Session` over the scripted server
-/// (an `External` loop) and projects its claim state onto these variables.
-/// A host with no claim to take (`CLAIM unavailable`: a build before lane C)
-/// is outside this model: the loop acts there as it did before the claim
-/// existed.
+/// `held` is the server's claim (0 none, 1 this loop's, 2 another's); `view` the loop's
+/// last reading (1 its own, 2 another's, 3 pending: its last request was not served, so it
+/// asks again and presses nothing until answered); `age` the ticks since it last asked.
+/// `Buggy = 1` presses without the fresh renewal and without its fence, and is caught.
+/// Tier-1 (aterm-agent `supervise/run_engine_tests.rs`) drives the real `Session` over the
+/// scripted server as an `External` loop. A host with no claim (`CLAIM unavailable`) is
+/// outside this model: the loop acts without one.
 ///
-/// THE PROVEN SELF-CLAIM (the codex-alab native harness contract, §2): the
-/// server lets a proven self-claim REPLACE the window host's held claim
-/// (`ProvenReplaces`, `held` 1 → 2) while the loop still reads it as its own
-/// (`view` 1) — no renewal precedes that. Only the HOSTED loop's claim is so
-/// replaced, and it FENCES every write with its own holder
-/// (`if-supervisor=<holder>`, `fenced` 1): the server admits a fenced write
-/// only while that holder holds the claim, counted from the fence's read to
-/// the write's end, and a replacement is answered only once those writes
-/// landed (aterm-gui `session_timeline::FencedWrite`), so a fenced press
-/// under another's claim lands nothing. An external loop (`External`) does
-/// not fence and is never replaced so; it is held to the renewal.
+/// The proven self-claim (native harness contract §2): the server lets a proven self-claim
+/// replace the window host's held claim (`ProvenReplaces`, `held` 1 → 2) with no renewal
+/// first, while the loop still reads it as its own (`view` 1). Only the hosted loop's claim
+/// is replaced so, and it fences every write with its own holder (`if-supervisor=<holder>`,
+/// `fenced` 1): the server admits a fenced write only while that holder holds the claim,
+/// counted from the fence's read to the write's end, and answers a replacement only once
+/// those writes have landed (aterm-gui `session_timeline::FencedWrite`), so a fenced press
+/// under another's claim lands nothing. An `External` loop does not fence, is never
+/// replaced so, and is held to the renewal.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_claim_model() -> Model {
@@ -113,21 +105,17 @@ pub fn supervisor_claim_model() -> Model {
     }
 }
 
-/// The CHOICE ON AN UNNUMBERED DIALOG (aterm-agent `supervise/press.rs`,
-/// `press_focused`; the folder-trust dialog): the focus is moved, the screen
-/// read again, and Enter is pressed only when that read shows the focus on
-/// the chosen option AND the screen is still the one that read saw (the
-/// generation fence) — so an Enter never lands on `No, exit`.
+/// The choice on an unnumbered dialog (aterm-agent `supervise/press.rs`, `press_focused`;
+/// the folder-trust dialog): the focus is moved, the screen read again, and Enter is pressed
+/// only when that read shows the focus on the chosen option and the screen is still the one
+/// it saw (the generation fence), so an Enter never lands on `No, exit`.
 ///
-/// `focus` is where the dialog's cursor is (0 `No, exit`, 1 the chosen
-/// option); `confirmed` that the last read showed it on the chosen one;
-/// `fresh` that the screen has not moved since that read. A move may land
-/// or be lost; the screen may move (and the focus with it) at any time. A
-/// move the dialog did not take — a fresh read shows the focus where it was
-/// — is made AGAIN, at most `Tries` times (a dialog drawn before its input
-/// is live drops the key: measured live 2026-09-24; the loop's
-/// `MAX_CHANGED_PRESSES` less the first move). `Buggy = 1` presses Enter on
-/// the move alone, unread, and is caught.
+/// `focus` is the dialog's cursor (0 `No, exit`, 1 the chosen option); `confirmed` the last
+/// read showed it on the chosen one; `fresh` the screen has not moved since that read. A
+/// move may land or be lost; the screen may move (and the focus with it) at any time. A move
+/// the dialog did not take is made again, at most `Tries` times (a dialog drawn before its
+/// input is live drops the key; the loop's `MAX_CHANGED_PRESSES` less the first move).
+/// `Buggy = 1` presses Enter on the move alone, unread, and is caught.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_focus_choice_model() -> Model {
@@ -199,7 +187,7 @@ pub fn supervisor_focus_choice_model() -> Model {
 /// upgrade notice, its carry-on, and what the supervisor itself typed, by
 /// its ledger) are no task, however much the agent works on them.
 ///
-/// FOREVER CRUISE (the owner, 2026-10-19): nothing the worker says ends the
+/// Autopilot Cruise (the owner, 2026-10-19): nothing the worker says ends the
 /// task. A continuation's reply that CLAIMS DONE (`WorkedClaimsDone`: a done
 /// phrase, an idle report, the retired `ATERM-TASK-DONE` line, a `Nothing
 /// left:` defense) is an ordinary yield — a short turn of the streak's, its
@@ -381,9 +369,8 @@ pub fn supervisor_turn_end_model() -> Model {
             ) {
                 other = 1;
             }
-            // The harness's own turn — its notice or its carry-on, the
-            // upgrade's two — answered short: NO task, and no short turn of
-            // the worker's: the streak and its back-off stand.
+            // The harness's own turn (its notice or carry-on, the upgrade's two)
+            // answered short: no task, and no short turn of the worker's.
             action HarnessTurn when (
                 harness <= 1 && pending == 0 && box_up == 0 && wall == 0 && draft == 0 &&
                 other == 0
@@ -393,8 +380,8 @@ pub fn supervisor_turn_end_model() -> Model {
                 backoff = if Buggy == 1 { 1 } else { backoff };
                 tasked = if Buggy == 1 { 1 } else { tasked };
             }
-            // …answered with REAL WORK (a carry-on's answer is the worker's
-            // own work, resumed): still no task, and the streak ends.
+            // …answered with real work (a carry-on's answer is the worker's own
+            // work, resumed): still no task, and the streak ends.
             action HarnessTurnLong when (
                 harness <= 1 && pending == 0 && box_up == 0 && wall == 0 && draft == 0 &&
                 other == 0
@@ -444,7 +431,7 @@ pub fn supervisor_turn_end_model() -> Model {
             // is owed at this point, past the back-off a done claim earns
             // (a short turn of the streak's, whatever it worked). `Buggy`:
             // the task ends on it, nothing more typed until someone else's
-            // turn (the policy before FOREVER CRUISE).
+            // turn (the policy before Autopilot Cruise).
             action WorkedClaimsDone when (pending == 1) {
                 pending = 0;
                 short = if short <= Streak - 1 { short + 1 } else { short };
@@ -498,9 +485,8 @@ pub fn supervisor_turn_end_model() -> Model {
                 used = if Budget == 0 { used } else { used + 1 };
                 pending = 2;
             }
-            // The draft sent as it stands, in the act's place: a
-            // continuation's turn, or at a wall whose wait is over its
-            // retry's.
+            // The draft sent as it stands, in the act's place: a continuation's
+            // turn, or a retry at a wall whose wait is over.
             action SubmitDraft when (
                 pending == 0 && draft == 1 && (wall == 0 || wall == 2) && tasked == 1 &&
                 other == 0 && rested == 0 && held == 0 &&
@@ -547,7 +533,7 @@ pub fn supervisor_turn_end_model() -> Model {
     }
 }
 
-/// FOREVER CRUISE (aterm-agent `supervise/policy/turn_end.rs`, the owner's
+/// Autopilot Cruise (aterm-agent `supervise/policy/turn_end.rs`, the owner's
 /// direction of 2026-10-19: *"Cruise is always looking for more completeness
 /// and perfection"*). NOTHING ENDS A CRUISE TASK: no done phrase, no retired
 /// `ATERM-TASK-DONE` line, no `Nothing left:` defense, no reply to the
@@ -597,7 +583,7 @@ pub fn supervisor_turn_end_model() -> Model {
 /// `Buggy = 1` continues a claim like any point, holds a worker's defend
 /// prompt for the back-off yet answers it at once however long it keeps
 /// asking, takes the defend prompt's own done reply as the task's end (the
-/// policy before FOREVER CRUISE, whose done reply to the check ended the
+/// policy before Autopilot Cruise, whose done reply to the check ended the
 /// job), reads the claim at the busy screen and types the defend prompt into
 /// the running shell, and adds two dead actions: an old journal's `DONE …
 /// rule=finished@v1` (or a task record's `done why=marker`) taken on as the
@@ -637,7 +623,7 @@ pub fn supervisor_cruise_model() -> Model {
                 managed = 1;
             }
             // `Buggy`: an old journal's `DONE` note, or a task record's
-            // `done` from a build before FOREVER CRUISE, taken on as the end.
+            // `done` from a build before Autopilot Cruise, taken on as the end.
             action SeedOldDone when (Buggy == 1 && pending == 0 && bg == 0 && rested == 0) {
                 rested = 1;
             }
@@ -828,7 +814,7 @@ pub fn supervisor_cruise_model() -> Model {
     }
 }
 
-/// FOREVER LAND (aterm-agent `supervise/policy/turn_end.rs`, `land_policy`;
+/// Autopilot Land (aterm-agent `supervise/policy/turn_end.rs`, `land_policy`;
 /// the owner's direction of 2026-10-19: *"if landing … LAND EVERYTHING INTO
 /// … REMOTE MAIN NO EXCEPTIONS"*, *"if you need something from the user, be
 /// LOUDER ABOUT IT"*, *"but NEVER let that block"*). Under Autopilot Land the
@@ -913,7 +899,7 @@ pub fn supervisor_cruise_model() -> Model {
 ///
 /// `quiet`, `held`, `typed_landed` and `nudges` are the defects' ghosts.
 /// `Buggy = 1` lands the task on the retired token or a done phrase at a
-/// land act's yield (the policy before FOREVER LAND, whose done reply
+/// land act's yield (the policy before Autopilot Land, whose done reply
 /// ended it), over a repository with work no remote main has, and over a
 /// defense that names a need — each caught by `LandedOnlyByCleanDefense`;
 /// nudges a landed task (`NeverTypeIntoALandedTask`); takes a landed record
@@ -1437,16 +1423,13 @@ pub fn supervisor_land_liveness() -> Liveness {
     }
 }
 
-/// THE STALL'S REMEDY (aterm-agent `supervise/stall.rs`,
-/// `Session::stall_remedy`; D4 of the live E2E,
-/// `docs/AUDIT-claude-harness-2026-09-23.md`). A worker the
-/// server says is frozen is ended for its relaunch, only with nobody there
-/// and its bound passed — and ONCE an episode, never a kill of the loop's.
-/// Since the explicit restart (design of 2026-10-08) `Term` is that one act,
-/// `restart pid=<leader> if-stalled quiet=<grace>`: the server stamps the
-/// agent before it signals it and ends a survivor itself (its contract,
-/// `HarnessRestartStamp`), so the loop never sends `signal kill`; an older
-/// server that does not know the verb gets the bare `signal term`.
+/// The stall's remedy (aterm-agent `supervise/stall.rs`, `Session::stall_remedy`; D4 of
+/// `docs/AUDIT-claude-harness-2026-09-23.md`). A worker the server says is frozen is ended
+/// for its relaunch, only with nobody there and its bound passed, and once an episode; the
+/// loop never kills. `Term` is that one act, `restart pid=<leader> if-stalled quiet=<grace>`:
+/// the server stamps the agent before it signals it and ends a survivor itself
+/// (`HarnessRestartStamp`); a server that does not know the verb gets the bare
+/// `signal term`.
 ///
 /// `stalled` 0 the worker reads its input, 1 frozen (`input=stalled`), 2 a
 /// stopped job (`input=stopped`: its `signal cont` is a person's); `aged`
@@ -1560,36 +1543,24 @@ pub fn supervisor_stall_remedy_model() -> Model {
     }
 }
 
-/// A TURN END THE HOST LET GO IS DECIDED AGAIN (aterm-agent
-/// `supervise/run.rs`, `Session::host_held` and `wait_for_next`; D3 of the
-/// live E2E, `docs/AUDIT-claude-harness-2026-09-23.md`). The
-/// loop decides each point once, as it comes;
-/// the session's host (the window's worker, `IdleHost`) may own the
-/// session's turn ends meanwhile (`IdleHost::owns_turn_end`: the live
-/// upgrade's wind-down) and may take its own step at the point, in the
-/// point's act's place. Once the host owns nothing any more, the point it was
-/// left to is DECIDED AGAIN — never waited on with nobody deciding it.
+/// A turn end the host let go is decided again (aterm-agent `supervise/run.rs`:
+/// `Session::host_held`, `wait_for_next`; D3 of `docs/AUDIT-claude-harness-2026-09-23.md`).
+/// The loop decides each point once, as it comes; the session's host (`IdleHost`) may
+/// meanwhile own the turn ends (`IdleHost::owns_turn_end`: the live upgrade's wind-down)
+/// and take its own step in the point's act's place. Once the host owns nothing, the point
+/// left to it is decided again, never waited on with nobody deciding it.
 ///
-/// `point` 0 while the agent works, 1 a turn end the loop decided (its act
-/// taken, or its wait running), 2 one left to the host — decided while it
-/// owned the turn ends (`TurnEnds` under `owns`), or passed over for a step
-/// that typed nothing and ended nothing (`HostKeeps`: one that owns the turn
-/// ends after it; `HostLetsGo`: one that owns nothing, a wait past its bound
-/// or a last word) — and 3 one a host step MOVED (`HostMoves`: it typed into
-/// the agent, a notice or a carry-on, or ended it; the screen may still show
-/// the old point until the agent draws its answer, but the point is gone and
-/// the turn it started is under way); `owns` the host owns the session's
-/// turn ends (`Lapse`: switched off, or let go with no step); `stranded` the
-/// loop waited on a point left to a host that owns nothing; `stale` the loop
-/// decided a point a host step had moved (e.g. the point after a typed
-/// carry-on, decided again while the agent began its answer). `Redecide` is
-/// the loop's decision again; `LoopWaits`
-/// its wait for the screen to move. `Buggy = 1` is the loop that decides
-/// each point once and waits on it whoever owns it, and that decides again
-/// whatever a step left behind — both caught. Tier-1 (aterm-agent
-/// `supervise/run_engine_tests.rs`, `a_turn_end_the_host_let_go_is_decided_again`)
-/// drives the real loop along the model's paths and checks it continues
-/// exactly where `Redecide` is enabled.
+/// `point` 0 while the agent works, 1 a turn end the loop decided (act taken or wait
+/// running), 2 one left to the host (decided while it owned the turn ends, or passed over
+/// for a step that typed and ended nothing: `HostKeeps` still owns, `HostLetsGo` owns
+/// nothing), 3 one a host step moved (`HostMoves`: it typed into the agent or ended it; the
+/// screen may still show the old point, but its turn is under way). `owns` the host owns
+/// the turn ends (`Lapse` ends it); `stranded` the loop waited on a point left to a host
+/// that owns nothing; `stale` the loop decided a point a host step had moved. `Buggy = 1`
+/// waits on each point whoever owns it and decides again whatever a step left; both are
+/// caught. Tier-1: aterm-agent `supervise/run_engine_tests.rs`
+/// (`a_turn_end_the_host_let_go_is_decided_again`) checks the real loop continues exactly
+/// where `Redecide` is enabled.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_host_turn_end_model() -> Model {
@@ -1635,49 +1606,39 @@ pub fn supervisor_host_turn_end_model() -> Model {
     }
 }
 
-/// A PERSON'S GRACE OVER A READY ANSWER ENDS IN THE UPGRADE'S RESTART, NEVER IN
-/// THE LOOP'S CONTINUATION (aterm-agent `harness/upgrade_drive.rs`,
-/// `owns_turn_ends`, `attended_owned` and `after_attended`; the window's host
-/// `WorkerIdle::at_idle` and its `UpgradeRun` counts; the loop's
-/// `decide_turn_end` under `TurnEndReading::upgrading`). The incident: the agent
-/// answered READY 38 s after the owner typed "ok", so the upgrade's restart waited
-/// on the person (`held-back:attended`, then `wait:attended`) — owning none of the
-/// session's turn ends, and looking again on its growing ladder. The loop held off
-/// for the same person's grace, and at its lapse nobody owned the point but the
-/// loop: it typed `keep going` over the READY, 28 s before the upgrade's next look,
-/// and the upgrade then waited 5 h 50 min for an idle point of an agent that was
-/// never idle again.
+/// A person's grace over a READY answer ends in the upgrade's restart, never in the loop's
+/// continuation (aterm-agent `harness/upgrade_drive.rs`: `owns_turn_ends`,
+/// `attended_owned`, `after_attended`; the window's host `WorkerIdle::at_idle` and its
+/// `UpgradeRun` counts; the loop's `decide_turn_end` under `TurnEndReading::upgrading`).
+/// While a person's grace holds the restart back (`wait:attended`), the upgrade owns the
+/// session's turn ends; otherwise, at the grace's lapse, the loop types `keep going` over
+/// the READY before the upgrade looks again, and the agent may never be idle again.
 ///
-/// Before the READY (`point` 0) the host looks at the agent's other turn ends: an
-/// answer without READY (`HostWaitsBefore`, `wait:awaiting-ready`) or a re-ask a
-/// person at the tab holds (`HostHoldsBefore`, `wait:attended`). The READY comes
-/// with a turn of the agent's (`ReadyArrives`), and its point stands (`point` 1)
-/// until acted on (`point` 2). The host steps first at a point (`HostLooks`: the
-/// loop takes the host's step before its own decision, `looked`); a look that
-/// finds the person's grace running (`person` 1) waits `attended` and owns the
-/// turn ends while its backstop count (`count`) is within `Bound` — the backstop
-/// for a stamp that fails closed; one that finds it lapsed takes the restart
-/// (`HostActs`). The person may touch the tab again (`PersonTouches`) and the
-/// grace runs out (`GraceLapses`); the loop continues the agent (`LoopContinues`)
-/// only where nobody's grace holds and the host owns nothing. `here` is the
-/// attended looks at the READY's point — the spec's own measure of the backstop,
-/// whatever the host counts — and `over`: the loop continued over the READY while
-/// that had not run out.
+/// Before the READY (`point` 0) the host sees the agent's other turn ends: an answer
+/// without READY (`HostWaitsBefore`, `wait:awaiting-ready`) or a re-ask a person at the tab
+/// holds (`HostHoldsBefore`, `wait:attended`). The READY comes with a turn of the agent's
+/// (`ReadyArrives`) and its point stands (`point` 1) until acted on (`point` 2). The host
+/// steps first at a point (`HostLooks`, `looked`): a look that finds the person's grace
+/// running (`person` 1) waits `attended` and owns the turn ends while its backstop count
+/// (`count`, for a stamp that fails closed) is within `Bound`; one that finds it lapsed
+/// takes the restart (`HostActs`). The loop continues the agent (`LoopContinues`) only
+/// where nobody's grace holds and the host owns nothing. `here` is the attended looks at the
+/// READY's point (the spec's measure of the backstop, whatever the host counts); `over`:
+/// the loop continued over the READY while that had not run out.
 ///
-/// The host's count is the attended looks in a row at one point: any other wait
-/// starts it over, and so does the READY's own turn. Three defects, each caught
-/// on its own dial: `Buggy = 1`, an attended wait owns nothing; `Every = 1`, the
-/// backstop reads every wait in a row since the last act — the notice's
-/// `awaiting-ready` turn ends among them — so a READY after enough of them owns
-/// nothing at its first look; `Stretch = 1`, a count the READY's turn does not start over (a
-/// person who held the re-ask past the backstop left the READY to the loop).
+/// The host's count is the attended looks in a row at one point: any other wait, and the
+/// READY's own turn, start it over. Defects, each caught on its own dial: `Buggy = 1` an
+/// attended wait owns nothing; `Every = 1` the backstop reads every wait since the last act
+/// (the notice's `awaiting-ready` turn ends among them), so a READY after enough of them
+/// owns nothing at its first look; `Stretch = 1` the READY's turn does not start the count
+/// over.
 ///
-/// Tier-1: aterm-gui's `harness_host::tests::a_person_at_the_tab_leaves_the_point_to_the_upgrade_for_their_grace`
-/// drives the real worker along `HostWaitsBefore`/`HostHoldsBefore`,
-/// `ReadyArrives` (its `turn_ran`) and `HostLooks` (its `owns` projected at every
-/// look, `Bound` set to the real backstop's looks), and aterm-agent's
-/// `supervise::policy::turn_end` test `a_point_the_upgrade_owns_is_never_continued_at_the_grace_lapse`
-/// binds `LoopContinues`' guard to the real turn-end policy.
+/// Tier-1: aterm-gui
+/// `harness_host::tests::a_person_at_the_tab_leaves_the_point_to_the_upgrade_for_their_grace`
+/// drives the real worker (`owns` projected at every look, `Bound` the real backstop's
+/// looks), and aterm-agent's `supervise::policy::turn_end` test
+/// `a_point_the_upgrade_owns_is_never_continued_at_the_grace_lapse` binds `LoopContinues`'
+/// guard to the real policy.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn upgrade_attended_turn_end_model() -> Model {
@@ -1750,43 +1711,34 @@ pub fn upgrade_attended_turn_end_model() -> Model {
     }
 }
 
-/// THE LOOP'S OWN ACT, ONCE THE AGENT HAS TAKEN IT, NEVER WITHHOLDS A BREAK
-/// FROM ITS HOST (aterm-agent `supervise/run.rs`,
-/// `Session::host_steps_in_background` and the live-turn read in
-/// `await_turn_from`; `supervise/policy/turn_end.rs`,
-/// `TurnEndState::act_untaken` and `took`). The live upgrade's notice, re-ask,
-/// give-up and release reach an agent that orchestrates all day only at the
-/// BREAKS of its own background work (`IdleHost::at_background`); the loop
-/// withholds a break while an act of its own is in the way. The guard asked
-/// whether the act's POINT had been judged, and only a true idle point judges
-/// one — a break reads busy. So behind the loop's own `keep going` every break
-/// was withheld until an idle point that an always-busy agent never reaches,
-/// so the upgrade got no look for hours, every clock of it frozen.
+/// The loop's own act, once the agent has taken it, never withholds a break from its host
+/// (aterm-agent `supervise/run.rs`: `Session::host_steps_in_background` and the live-turn
+/// read in `await_turn_from`; `supervise/policy/turn_end.rs`: `TurnEndState::act_untaken`
+/// and `took`). The live upgrade reaches an agent that orchestrates all day only at the
+/// breaks of its background work (`IdleHost::at_background`); the loop withholds a break
+/// only while an act of its own is untaken. Asking instead whether the act's point was
+/// judged withholds every break behind a `keep going` until an idle point an always-busy
+/// agent never reaches, since a break reads busy.
 ///
-/// `screen` 0 an idle point, 1 a read of the agent's LIVE TURN (its spinner,
-/// its busy footer), 2 a settled break of its own background work; `act` 0
-/// none of the loop's awaited, 1 typed and not taken (no live turn read since:
-/// it may sit queued behind work the reader missed), 2 taken, its point not
-/// judged yet. `Offer` is the loop handing the break to its host, `Withhold`
-/// its refusal. Two ghosts: `stacked`, a break offered over an act the agent
-/// has not taken (the guard's purpose — no line of the host's stacked on a
-/// continuation the agent has not read); `withheld`, a break refused after the
-/// act was taken (the incident). ONE DIAL PER DEFECT, each caught alone:
-/// `Judged = 1` a guard that asks whether the act's point was judged;
-/// `Blind = 1` a guard that asks nothing of the act. `Buggy = 1` both.
+/// `screen` 0 an idle point, 1 a read of the agent's live turn (spinner, busy footer), 2 a
+/// settled break of its background work; `act` 0 none awaited, 1 typed and not taken (no
+/// live turn read since: it may sit queued behind work the reader missed), 2 taken, its
+/// point not judged yet. `Offer` hands the break to the host, `Withhold` refuses it.
+/// `stacked`: a break offered over an untaken act (the guard's purpose: no host line
+/// stacked on a continuation the agent has not read); `withheld`: a break refused after the
+/// act was taken. Dials, each caught alone (`Buggy = 1`: both): `Judged = 1` the guard asks
+/// whether the act's point was judged; `Blind = 1` it asks nothing of the act.
 ///
-/// Tier-1: aterm-agent's `supervise/run_engine_tests.rs`
-/// (`a_break_after_the_loops_own_taken_act_is_offered_to_the_host`) drives the
-/// real loop over scripted screens along the model's paths — the loop's `keep
-/// going`, a live turn or none, a settled break — and the real loop offers the
-/// break exactly where `Offer` is enabled.
+/// Tier-1: aterm-agent `supervise/run_engine_tests.rs`
+/// (`a_break_after_the_loops_own_taken_act_is_offered_to_the_host`) drives the real loop
+/// over scripted screens; it offers the break exactly where `Offer` is enabled.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_break_offer_model() -> Model {
     aterm_spec::ty_model! {
         SupervisorBreakOffer {
             const Buggy = 0;
-            const Judged = 0;     // 1: the guard asks for the act's point judged (0.98)
+            const Judged = 0;     // 1: the guard asks for the act's point judged
             const Blind = 0;      // 1: the guard asks nothing of the act
             const Acts = 2;       // run bound: the loop's acts
             var screen = 0;
@@ -1835,44 +1787,31 @@ pub fn supervisor_break_offer_model() -> Model {
     }
 }
 
-/// THE POINT THE UPGRADE ACTS AT NEXT IS OWNED THROUGH ITS SETTLE (aterm-gui
-/// `harness_host.rs`, `UpgradeRun` and `WorkerIdle::at_idle`/`at_background`;
-/// aterm-agent `harness/upgrade_drive.rs`, `owns_turn_ends` and
-/// `bounded_wait`). The restart after a READY waits out a short settle first
-/// (`wait:settling`: Claude's status and the screen quiet `QUIET_S`), and the
-/// upgrade owns the session's turn ends through it for `OWNED_SETTLE_LOOKS`
-/// looks, so the loop types nothing over the point it is about to act at. What
-/// bounds that ownership is the host's count of the waits it bounds — the
-/// settle's and the drain's — since its last ACT: an act starts it over, and a
-/// turn of the agent's never does (a self-waking agent must not renew it).
-/// The incident: six looks at a person at the tab, then three notices typed
-/// at BREAKS that never went through the count, then the READY — whose first
-/// look (`wait:settling`) read those six waits and owned nothing, and the loop
-/// typed `keep going` over the READY one second later. The READY was void, and
-/// the agent was never idle again.
+/// The point the upgrade acts at next is owned through its settle (aterm-gui
+/// `harness_host.rs`: `UpgradeRun`, `WorkerIdle::at_idle`/`at_background`; aterm-agent
+/// `harness/upgrade_drive.rs`: `owns_turn_ends`, `bounded_wait`). The restart after a READY
+/// first waits out a short settle (`wait:settling`: Claude's status and the screen quiet
+/// `QUIET_S`), and the upgrade owns the session's turn ends through it for
+/// `OWNED_SETTLE_LOOKS` looks, so the loop types nothing over the point it is about to act
+/// at. That ownership is bounded by the host's count of the settle and drain waits since
+/// its last act: an act starts it over, a turn of the agent's never does (a self-waking
+/// agent must not renew it). A notice typed at a break is an act too; if it left the count
+/// standing, a READY after enough waits would own nothing at its first look.
 ///
-/// `point` 0 before the READY, 1 the READY's point standing, 2 acted on (the
-/// restart) or taken by the loop; `noticed` a notice is out; `waits` the host's
-/// count; `looks` its looks at the READY's point; `owns` what its last look
-/// left. Before the notice, settle waits at idle points (`SettleBefore`,
-/// counted); notices at an idle point or at a break (`NoticeAtIdle`,
-/// `NoticeAtBreak`: acts); and every other wait (`OtherWait`: a person at the
-/// tab, an answer without READY, a resting round — each owns nothing, and no
-/// settle or drain of the restart's). `over`: the loop continued over the
-/// READY while its settle still had looks to run. DIALS, each caught alone:
-/// `Carry = 1` a notice typed at a break leaves the count standing;
-/// `Every = 1` every wait counts (the notice's `awaiting-ready` answers and a
-/// person's looks spend the settle's looks before the READY comes).
-/// `Buggy = 1` both.
+/// `point` 0 before the READY, 1 its point standing, 2 acted on or taken by the loop;
+/// `noticed` a notice is out; `waits` the host's count; `looks` its looks at the READY's
+/// point; `owns` what its last look left. `SettleBefore` is a counted settle wait before
+/// the notice; `NoticeAtIdle`/`NoticeAtBreak` are acts; `OtherWait` (a person at the tab,
+/// an answer without READY, a resting round) owns nothing and is no settle or drain.
+/// `over`: the loop continued over the READY while its settle still had looks to run.
+/// Dials, each caught alone (`Buggy = 1`: both): `Carry = 1` a notice at a break leaves the
+/// count standing; `Every = 1` every wait counts.
 ///
-/// Out of the model, stated: a RE-ASK whose own settle outlived its owned
-/// looks at a point the loop then took — its settle waits stand, and a READY
-/// to the notice before it owns nothing at its first look; the next re-ask, an
-/// act, starts the count over.
+/// Not modelled: a re-ask whose own settle outlived its owned looks at a point the loop then
+/// took leaves its settle waits standing, so a READY to the notice before it owns nothing
+/// at its first look; the next re-ask, an act, starts the count over.
 ///
-/// Tier-1: aterm-gui's
-/// `harness_host::tests::a_ready_after_notices_at_breaks_owns_its_settle`
-/// drives the real worker along the incident's path and the model's.
+/// Tier-1: aterm-gui `harness_host::tests::a_ready_after_notices_at_breaks_owns_its_settle`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn upgrade_settle_turn_end_model() -> Model {
@@ -1935,41 +1874,24 @@ pub fn upgrade_settle_turn_end_model() -> Model {
     }
 }
 
-/// A NOTICE ITS OWN FENCE REFUSED OWNS ITS POINT, BOUNDED (aterm-agent
-/// `harness/upgrade_drive.rs`, `refused`, `owns_turn_ends`, `after_refused`,
-/// `OWNED_REFUSED_LOOKS` and the notice's in-visit tries; aterm-gui
-/// `harness_host.rs`, `UpgradeRun`'s own count of refused looks and
-/// `UpgradeRun::worded`). The incident: after the owner's `--now`, at the one
-/// idle point the agent offered the notice was due — its gate said go — but
-/// the host's `turn` refused it three times (`if-gen=` saw the screen move:
-/// `announce-refused:changed`), each a wait that owned nothing on a climbing
-/// ladder; then the loop typed `keep going` into the point, and the agent was
-/// never idle again. Each refused look owns the session's turn ends while the refused
-/// looks since the upgrade's last act or the owner's last word are within
-/// `Bound`, and is looked at again at the first rung, so the notice is tried
-/// again at the very point it is due; past the bound the point is the loop's.
-/// A turn of the agent's never renews the count: an act — the
-/// notice typed — starts it over, and so does the owner's word.
+/// A notice its own fence refused owns its point, bounded (aterm-agent
+/// `harness/upgrade_drive.rs`: `refused`, `owns_turn_ends`, `after_refused`,
+/// `OWNED_REFUSED_LOOKS` and the notice's in-visit tries; aterm-gui `harness_host.rs`:
+/// `UpgradeRun`'s count of refused looks and `UpgradeRun::worded`). A notice due at an idle
+/// point can be refused by the host's `turn` fence (`if-gen=` saw the screen move:
+/// `announce-refused:changed`). Each refused look owns the session's turn ends while the
+/// refused looks since the upgrade's last act or the owner's last word are within `Bound`,
+/// and is looked at again at the first rung, so the notice is retried at the very point it
+/// is due; past the bound the point is the loop's. A turn of the agent's never renews the
+/// count; an act (the notice typed) or the owner's word starts it over.
 ///
-/// `point` 1 the idle point standing, 0 the agent's turn; `due` the notice is
-/// still to be typed; `count` the host's count its ownership is read by;
-/// `refusals` the refused looks since the last act or word (what the count
-/// must be); `owns` what its last look left. `Refused` is a look whose fence
-/// refused, `Types` one whose notice went (an act: `owns` 1, the notice's own
-/// claim), `SettleBefore` a look whose notice gate settled (its own bound is
-/// the settle machine's), `OwnerWord` the owner's word or a newer build (the
-/// host's activation notice: the worker looks again). `over`: the loop
-/// continued at a point whose refused notice still had owned looks to run.
-/// `Buggy = 1`: every defect below at once, caught. DIALS, each caught alone
-/// by the bounded check: `Shared = 1` settle waits and refused looks share one
-/// count (a round whose gate had settled `Bound` looks owns nothing at its
-/// first refusal); `Stale = 1` the owner's word leaves the count standing (an
-/// `Upgrade now` pressed after ninety minutes of refusals owns nothing).
-/// THE BOUND IS A PATH, NOT AN INVARIANT: `Renew = 1` (a turn of the agent's
-/// starts the count over, so every point is owned anew)
-/// keeps the invariant — it owns more, not less — and the Tier-0 test pins the
-/// bound's path instead: `Bound` refused looks, a turn, a refused look that
-/// owns nothing, where `Renew` owns it.
+/// `point` 1 the idle point standing, 0 the agent's turn; `due` the notice still to be
+/// typed; `count` the host's count; `refusals` the refused looks since the last act or word
+/// (what the count must be); `owns` what the last look left. `Refused` is a look whose fence
+/// refused; `Types` one whose notice went (an act; the notice owns the turn ends);
+/// `SettleBefore` one whose notice gate settled (its bound is the settle machine's);
+/// `OwnerWord` the owner's word or a newer build. `over`: the loop continued at a point
+/// whose refused notice still had owned looks to run.
 ///
 /// Tier-1: aterm-gui's
 /// `harness_host::tests::a_refused_notice_owns_its_point_for_its_looks` drives
@@ -2047,33 +1969,23 @@ pub fn upgrade_refused_turn_end_model() -> Model {
     }
 }
 
-/// THE QUESTION ANSWER (aterm-agent `supervise/policy/question.rs`, the
-/// rule `answer-recommended@v1`; its keys sent by `supervise/press.rs`'s
-/// `press_question` under `supervise/approval_loop.rs`'s waits): the keys
-/// the supervisor sends to answer Claude Code's question dialog — `↑` or
-/// `↓` to move the focus onto the option it chose, Enter on it, never a digit
-/// (the critique's R4) — land only on the dialog state they
-/// were decided on, although the PTY carries keys Claude Code has not read
-/// yet, a person's as well as the supervisor's own (R3c).
+/// The question answer (aterm-agent `supervise/policy/question.rs`, rule
+/// `answer-recommended@v1`; keys sent by `supervise/press.rs` `press_question` under
+/// `supervise/approval_loop.rs`'s waits): the keys the supervisor sends to answer Claude
+/// Code's question dialog (`↑`/`↓` onto the chosen option, Enter on it, never a digit) land
+/// only on the dialog state they were decided on, although the PTY carries keys Claude Code
+/// has not read yet, a person's as well as the supervisor's own.
 ///
-/// **The screen generation fence alone does not prove that** (R3): it
-/// proves the SCREEN did not change between the read a key was decided on
-/// and its write, and a key written to the PTY that Claude Code has not
-/// read yet changes nothing on the screen. So every key is split here into
-/// its WRITE (`PersonKey`, `HarnessMove`, `HarnessEnter`, `HarnessType`:
-/// appended to the PTY's queue `q1`, `q2`, oldest first — 0 none, 1 a
-/// person's key, 2 the supervisor's `↑` or `↓` (the model abstracts the
-/// direction: a move is one row toward the chosen one), `3 + t` its Enter
-/// decided on tab `t`, `4 + Tabs + t` its policy text decided on tab `t`,
-/// THE POLICY TEXT below) and its CONSUME
-/// by Claude Code (the head's effect on the dialog as it is THEN: `MoveLands`,
-/// `MoveShort`, `EnterTaken`, the person's `PersonMovesOff` … `PersonAnswers`,
-/// `KeyRefused` for a key the dialog does not take: dropped by its
-/// typeahead window, O4, or — read after the dialog closed — typed into the
-/// composer, where `↑` recalls history). What keeps a
-/// supervisor key off a state it was not decided on is two guards the loop
-/// adds to the decision (and `Buggy = 1` drops both — the fence alone, as
-/// first specified):
+/// The screen generation fence alone does not prove that: a key written but not yet read
+/// changes nothing on the screen. So each key is split into its write (`PersonKey`,
+/// `HarnessMove`, `HarnessEnter`, `HarnessType`), appended to the PTY queue `q1`, `q2`
+/// (oldest first: 0 none, 1 a person's key, 2 the supervisor's move one row toward the
+/// chosen one, `3 + t` its Enter decided on tab `t`, `4 + Tabs + t` its policy text decided
+/// on tab `t`), and its consume by Claude Code against the dialog as it is then
+/// (`MoveLands`, `MoveShort`, `EnterTaken`, the person's `PersonMovesOff` …
+/// `PersonAnswers`, and `KeyRefused`: dropped by the typeahead window, or read after the
+/// dialog closed and typed into the composer, where `↑` recalls history). Two guards keep
+/// a supervisor key off a state it was not decided on (`Buggy = 1` drops both):
 ///
 /// * **A person's quiet** (R1, `quiet`): the loop keys nothing unless the
 ///   server's per-session person stamp (`"human_ms"`) is at least
@@ -2095,51 +2007,36 @@ pub fn upgrade_refused_turn_end_model() -> Model {
 ///   bound is the proof of the next try. So its own earlier key is never
 ///   ahead of its next one either.
 ///
-/// With both, every supervisor key is written on an EMPTY queue, is the
-/// next key Claude Code reads, and meets the dialog as the read showed it —
-/// which is the whole of the four invariants: no Enter in the free-text
-/// field or on any row but the chosen one (`NoDigitInTheField`, named for
-/// the digit the first design sent: `focus` 1 is every row but the chosen
-/// one — the free-text row, the chat row, another option), none on a tab
-/// after the one it was decided on (`NeverAnswersANextTabWithAStaleKey`),
-/// none on the review's cancel (`NeverCancelsTheReview`: the tool call is
-/// rejected and the model told to STOP, S7-03), and none read after the
-/// dialog closed (`NoKeyIntoTheComposer`: `↑` recalls history into it). With
-/// the policy text (`Text = 1`) a fifth and a sixth: the text lands only in
-/// the empty field it was decided on (`OwnTextOnlyIntoItsEmptyField`), and
-/// only once on a tab (`TextNeverWrittenTwice`).
+/// With both, every supervisor key is written on an empty queue, is the next key read, and
+/// meets the dialog as the read showed it. That is the whole of the laws: no Enter in the
+/// free-text field or on any row but the chosen one (`NoDigitInTheField`, named for the
+/// digit the first design sent; `focus` 1 is every other row), none on a later tab
+/// (`NeverAnswersANextTabWithAStaleKey`), none on the review's cancel
+/// (`NeverCancelsTheReview`: the tool call is rejected and the model told to stop), none
+/// after the dialog closed (`NoKeyIntoTheComposer`). With the policy text (`Text = 1`) two
+/// more: the text lands only in the empty field it was decided on
+/// (`OwnTextOnlyIntoItsEmptyField`), and only once a tab (`TextNeverWrittenTwice`).
 ///
-/// `tab` is the dialog's tab (`0..Tabs-1` a question, `Tabs` the review,
-/// `Tabs + 1` closed; with `Review = 0` — a lone single-select question,
-/// which draws no Submit tab — the last question's answer closes it);
-/// `focus` 0 the chosen row (the recommended option; the review's `1.
-/// Submit answers`) and 1 any other; `row` the focus row's parity in the
-/// focus order, so a move shows on the next read even when it lands on
-/// another row that is not the chosen one; `typed` a person's text in the
-/// free-text row. A question tab may OPEN with the focus off the chosen row
-/// (`OpensOffChoice`, before its first read: the vendor puts it on option
-/// 1, and the recommendation may be option 2), and a multi-select's toggle
-/// is modelled as a tab of its own — an Enter on the chosen row whose
-/// consume moves on to the next choice (the next recommended option, then
-/// the button), with the focus left where it was. `fresh` is the loop's last read still the
-/// screen (the fence: every visible change clears it, and a write spends
-/// it), `seen_*` what that read showed. The decision itself (the pure
-/// `answer_question`, Tier-1 bound in its `question_tests.rs`): Enter on the
-/// chosen row, a move toward it from any other, nothing (escalated) over a
-/// person's text or once the dialog closed.
+/// `tab` is the dialog's tab (`0..Tabs-1` a question, `Tabs` the review, `Tabs + 1`
+/// closed; with `Review = 0`, a lone single-select question with no Submit tab, the last
+/// answer closes it). `focus` 0 is the chosen row (the recommended option; the review's
+/// `1. Submit answers`), 1 any other; `row` the focus row's parity, so a move shows on the
+/// next read even onto another unchosen row; `typed` a person's text in the free-text row.
+/// A question tab may open off the chosen row (`OpensOffChoice`: the vendor focuses option
+/// 1, the recommendation may be option 2). A multi-select toggle is a tab of its own: an
+/// Enter whose consume moves on to the next choice, focus left where it was. `fresh` is the
+/// loop's last read still being the screen (every visible change clears it, a write spends
+/// it); `seen_*` is what that read showed. The decision itself is the pure
+/// `answer_question` (Tier-1 in `question_tests.rs`): Enter on the chosen row, a move
+/// toward it from any other, nothing (escalated) over a person's text or once the dialog
+/// closed.
 ///
-/// **The person fence** (`PersonFence`, R3b): the loop
-/// reads the person's stamp on the read the key is decided on
-/// (`seen_quiet`), and the key names that read's person count (`key|send
-/// if-human=`), which the server checks under the same lock as the write —
-/// so a person's key written in the round trip since the read (`touched`:
-/// `PersonKey` sets it, a `Read` clears it) skips the supervisor's. At
-/// `PersonFence = 0` — a host that sends no count — the invariants are
-/// refuted.
-/// Out of the model: the fence is not atomic with the person's own write,
-/// which takes no terminal lock — a gesture counted after the server's
-/// check and written before the supervisor's write, inside that one hold,
-/// lands first.
+/// The person fence (`PersonFence`): the key names the person count of the read it was
+/// decided on (`key|send if-human=`), which the server checks under the write's lock, so a
+/// person's key written since that read (`touched`) skips the supervisor's. At 0 the laws
+/// are refuted. Not modelled: the fence is not atomic with the person's own write, which
+/// takes no terminal lock, so a gesture counted after the check and written before the
+/// supervisor's write lands first.
 ///
 /// **One ASSUMPTION, not a mechanism** — a constant at 1 here (at 0 the
 /// laws are refuted), so the model says exactly what it rests on:
@@ -2148,154 +2045,75 @@ pub fn upgrade_refused_turn_end_model() -> Model {
 ///   was read by Claude Code — taken or refused — by then; the retry rests
 ///   on it. At 0 the retry answers the next tab with a stale key.
 ///
-/// Out of the model: a person's keys are consumed within the quiet window
-/// (`QuietReturns` waits for it), the queue holds two keys (with the guards
-/// the supervisor's key is always the oldest, so nothing behind it
-/// matters), and a multi-select toggle is an Enter that does not advance —
-/// written under the same guards, so met in the state it was decided on as
-/// the advancing Enter here is. Tier-1 (aterm-agent
-/// `supervise/run_engine_tests.rs`) drives the real `Session` over the
-/// scripted server and projects each read, key and wait onto this model:
-/// every key the real loop sends must be enabled here, at the state the
-/// environment actions that explain its reads lead to.
+/// # The policy text (`Text = 1`)
 ///
-/// **THE POLICY TEXT** (`Text = 1`; the question-policy words `long-term`
-/// and `short-term`). On a tab that does not fall back (below) the
-/// supervisor chooses no option: it moves the focus onto the question's
-/// free-text row (`Type something.`), writes a fixed policy text there and
-/// presses Enter on it, so the worker decides by the policy. That is the ONE
-/// place a supervisor key may land in the free-text field. `Text = 0` is the
-/// recommended path above, and nothing of this section is reachable there:
-/// its reachable space is today's, state for state (pinned by the Tier-0
-/// tests).
+/// The question-policy words `long-term` and `short-term`: on a tab that does not fall
+/// back, the supervisor moves the focus onto the free-text row (`Type something.`), writes
+/// a fixed policy text there and presses Enter, so the worker decides by the policy. That is
+/// the one place a supervisor key may land in the field. At `Text = 0` none of this is
+/// reachable.
 ///
-/// * **Each tab runs its own route** (`fallback`). A tab the text is
-///   estimated not to fit, one with no free-text row (the preview form),
-///   and every tab of a window that cannot fence a typed answer are
-///   answered with their RECOMMENDED option instead — keyed as the
-///   recommended path keys it, its chosen row (`focus` 0) that option, no
-///   text ever written there (`HarnessType` needs a read that showed the tab
-///   not falling back). A dialog may mix such tabs with typed ones.
-///   `FitLostOnIt` / `FitLostOffIt` turn a tab to its recommended option,
-///   the focus on it or off it: before its first read or after, while the
-///   loop has written no text on it and no key of its is unread — never
-///   back, as the loop latches a tab it decided so (`fell_back`). A
-///   redraw that changes the route under a key still in flight is outside
-///   the model, as every redraw not caused by a key is (a pane resized
-///   under an unread key).
-/// * **The queue code** `4 + Tabs + t` is the text decided on tab `t` —
-///   one `send`, one queue item (`HarnessType`). Its consume is
-///   `TextLands` (read whole), `TextPartly` (its head dropped by the
-///   dialog's typeahead window, O4, leaving a suffix) or `KeyRefused`
-///   (dropped whole, or read after the dialog closed: into the composer).
-/// * **No retry, and once per tab.** A text the box did not take is handed
-///   over, never written again: a second text behind an unread first would
-///   land in a field no longer empty. `HarnessType` has no retry clause on
-///   the box as keyed — it needs `mine` 0, a read that showed the box
-///   CHANGED since its last key (which a person's move does as well as the
-///   key's own effect) — and it needs `wrote` 0: the loop remembers the
-///   text it wrote on this tab (the memory `OwnTextRemembered` names; the
-///   real loop's `QuestionMemory::typed`, by which it hands a field
-///   emptied again over as the text "gone"), so no text follows a first on
-///   one tab whatever changed after it — the law `TextNeverWrittenTwice`,
-///   refuted without the memory and by the fence alone. `HarnessType` also
-///   sets `retried` to `MaxRetry` — no try left on the box as keyed, as the
-///   real loop marks a text's pending write (main's P3 tries a KEY again
-///   after the back-off; a text never); on the box as keyed (the field
-///   focused, empty, not own) neither a move nor an Enter is enabled
-///   anyway, so that is the loop's record, not a guard the proof leans on
-///   (measured: at `retried = 0` every law still holds).
-/// * **`own`** is the field holding EXACTLY the supervisor's text, typed by
-///   it into that tab's empty, focused field (`TextLands` clean). Anything
-///   else in the field is `typed` — a person's text, their keys added to
-///   the supervisor's, a head-dropped suffix, a text landed on a field
-///   that was not empty — and hands the question over as a person's text
-///   does today (R2 d). Of those, `exact` is a person's own copy of the
-///   policy text (`PersonTypesPolicyText`) on a tab the supervisor wrote no
-///   text on: the one text no read of the field tells from the
-///   supervisor's — only its memory does. (Typed on a tab it DID write its
-///   text on, the field holds exactly its text again: `own`, by every read
-///   and by its memory, as the real ownership rule has it.) On a text tab the chosen row (`focus` 0) is the
-///   free-text row until own text is there; on a multi-select (`Multi =
-///   1`) the typed row then ticks itself and the `Submit`/`Next` button
-///   becomes the chosen row, with the focus still in the field (c3-05,
-///   c4-09 on 2.1.283: `[✔]` and the chip `☒` as the text lands).
-/// * **The laws, as they read here.** `NoDigitInTheField`: an Enter on a
-///   question tab that does not fall back is in the field unless the field
-///   holds exactly own text (over a person's text it would submit their
-///   words as the policy's, over an empty field it answers nothing), so
-///   `HarnessEnter` on such a tab needs a read that showed own text
-///   (`seen_own`); on a tab that falls back it is any row but its
-///   recommended option, as on the recommended path.
-///   `OwnTextOnlyIntoItsEmptyField` (`astray`): the text is read only on
-///   the tab it was decided on, into its focused, empty field — decided on
-///   a read that showed exactly that, and written under the same two
-///   guards as every key.
-/// * **The multi-select Enter hazard** (c3c, measured on 2.1.283): Enter
-///   while the focus is in a multi-select's field UNTICKS the typed row
-///   (`[✔]` to `[ ]`, the chip `☒` to `☐`), and the dialog then answers
-///   "did not answer". So on a multi-select the loop moves off the field
-///   (`↓` onto the button, `HarnessMove`) and presses Enter on the button
-///   only. `EnterWhereTyped = 1` (an Enter wherever own text was read) is
-///   that hazard as a dial, committed 0: at 1 it breaks
-///   `NoDigitInTheField` with no person acting at all.
-/// * **Growth upward and reflow.** The text wraps the field over more rows
-///   (c1-04: one row to three), and a dialog at the pane's foot grows
-///   UPWARD, moving the field's row (c3-04 to c3-05: two rows up); on a
-///   multi-select `↓` reflows the text by a cell or two (c3-06) without
-///   changing its one-space join. The model's box is its tab, focus row,
-///   focus parity, text and ownership, not its geometry: the real loop
-///   guards each key on the row as drawn on the read it was decided on, a
-///   changed drawing reads as a change (`fresh` 0), and a dialog cut at its
-///   head reads Unknown and is handed over.
+/// * Each tab has its own route (`fallback`). A tab the text is estimated not to fit, one
+///   with no free-text row, and every tab of a window that cannot fence a typed answer are
+///   answered with their recommended option, keyed as on the recommended path. A dialog
+///   may mix such tabs with typed ones. `FitLostOnIt`/`FitLostOffIt` turn a tab before or
+///   after its first read, while no text is written and no key is unread; never back (the
+///   loop latches `fell_back`). A redraw that changes the route under an unread key is
+///   outside the model.
+/// * The text is one `send`, one queue item (`HarnessType`). Its consume is `TextLands`
+///   (read whole), `TextPartly` (its head dropped by the typeahead window) or `KeyRefused`.
+/// * No retry, and once per tab: a second text behind an unread first would land in a
+///   field no longer empty. `HarnessType` needs `mine` 0 and `wrote` 0 (the loop's memory
+///   of its text on the tab, `OwnTextRemembered`; the real `QuestionMemory::typed`), and
+///   sets `retried` to `MaxRetry` as the real loop marks a pending text (a record only:
+///   every law holds at `retried = 0`).
+/// * `own` is the field holding exactly the supervisor's text, typed into that tab's empty
+///   focused field. Anything else is `typed` (a person's text, keys added to the
+///   supervisor's, a head-dropped suffix, a text landed in a non-empty field) and hands the
+///   question over. `exact` is a person's copy of the policy text on a tab the supervisor
+///   wrote nothing on: only the loop's memory tells it from its own. On a text tab the
+///   chosen row is the free-text row until own text is there; on a multi-select
+///   (`Multi = 1`) the typed row then ticks itself and the `Submit`/`Next` button becomes
+///   the chosen row, the focus still in the field.
+/// * `NoDigitInTheField` here: an Enter on a typed tab is in the field unless the field
+///   holds exactly own text, so `HarnessEnter` there needs `seen_own`; on a fallback tab it
+///   is any row but the recommended option. `OwnTextOnlyIntoItsEmptyField` (`astray`): the
+///   text is read only on its tab, into its focused empty field.
+/// * The multi-select Enter hazard (Claude Code 2.1.283): Enter with the focus in a
+///   multi-select's field unticks the typed row and the dialog answers "did not answer",
+///   so the loop moves `↓` onto the button and presses Enter there. `EnterWhereTyped = 1`
+///   is that hazard as a dial: it breaks `NoDigitInTheField` with no person acting.
+/// * Geometry is not modelled: the text wraps the field over more rows, a dialog at the
+///   pane's foot grows upward, and `↓` on a multi-select reflows the text. The real loop
+///   guards each key on the row as drawn on its read, a changed drawing reads as a change,
+///   and a dialog cut at its head reads Unknown and is handed over.
 ///
-/// A second ASSUMPTION at `Text = 1`, `OwnTextRemembered` (committed 1): the
-/// loop remembers the text it typed, per question, so a person's copy of
-/// the policy text is never taken for its own, and no text is written on a
-/// tab twice. At 0 (no memory: a person's exact copy reads as the loop's
-/// own, and a written text is forgotten) `NoDigitInTheField` is refuted —
-/// through a person's copy and through nothing else: a suffix, the text
-/// plus more and a person's own words are told apart by the field's
-/// byte-exact read, not by the memory — and so is `TextNeverWrittenTwice`.
-/// A lost memory (a restart, a claim handover) is therefore a stall, never
-/// an answer.
+/// A second assumption, `OwnTextRemembered` (committed 1): the loop remembers the text it
+/// typed, per question. At 0 `NoDigitInTheField` is refuted through a person's exact copy
+/// alone (a suffix, the text plus more, and a person's own words are told apart by the
+/// field's byte-exact read), and so is `TextNeverWrittenTwice`. A lost memory (a restart,
+/// a claim handover) is therefore a stall, never an answer.
 ///
-/// Out of the model for the text, and owed to the tests of the code that
-/// types it: that the one `send` is one ordered queue item (its bytes
-/// written under one lock hold, after any key queued before it); that the
-/// text carries no digit and no newline (no byte of it selects an option
-/// or submits); that the reader's one-space join of its wrapped rows gives
-/// it back exactly; the in-lock residual of `if-human=` (`PersonFence`
-/// above); the fit estimate itself (which tab falls back is the decider's,
-/// `text_fits`; the model covers every choice of it); and a dialog that
-/// mixes a single-select tab with a multi-select one (c4): `Multi` is one
-/// constant for the whole dialog, so such a dialog is bound tab form by
-/// tab form, not as one run — its typed multi-select tab and a typed
-/// single-select tab each fit a model instance, a multi-select tab that
-/// falls back fits both. Tier-1 of `Text = 1`: the decider
-/// (`policy/question_text_tests.rs`,
-/// `tier1_text_mode_decider_chooses_only_what_the_model_enables`, over
-/// typed and falling-back tabs; a blind, a memory-trusting and a
-/// multi-as-single decider as its negative controls) and the loop that
-/// types it (`supervise/run_question_text_tests.rs`,
-/// `tier1_the_policy_text_goes_only_where_the_model_allows`: each `send` its
-/// `HarnessType`, enabled where it goes, a tab too short for the text and
-/// a dialog of a typed tab and a falling-back tab bound too; a loop whose
-/// memory is seeded over a person's own copy of the text as its negative
-/// control, caught at the Enter the model forbids; and
-/// `a_persons_key_between_the_read_and_the_send_skips_the_policy_text`: a
-/// `send` the person fence skipped is the model's `PersonKey`, after which
-/// `HarnessType` is not enabled — enabled there at `PersonFence = 0`).
+/// Not modelled, owed to the code's tests: the one `send` is one ordered queue item; the
+/// text carries no digit or newline; the reader's one-space join of its wrapped rows gives
+/// it back exactly; the fit estimate (`text_fits`; every choice of it is covered); a dialog
+/// mixing single- and multi-select tabs (`Multi` is one constant, so such a dialog is bound
+/// tab form by tab form). Tier-1: the decider (`policy/question_text_tests.rs`,
+/// `tier1_text_mode_decider_chooses_only_what_the_model_enables`, with blind,
+/// memory-trusting and multi-as-single deciders as negative controls) and the loop
+/// (`supervise/run_question_text_tests.rs`,
+/// `tier1_the_policy_text_goes_only_where_the_model_allows`, with a memory seeded over a
+/// person's copy as its negative control, and
+/// `a_persons_key_between_the_read_and_the_send_skips_the_policy_text`).
 ///
-/// **The two instances** (the review of the question-lean re-port): a law
-/// no member of the `Buggy = 1` family can break at a model's committed
-/// constants is a GHOST to the workspace's non-vacuity sweep, and the two
-/// text laws are unbreakable at `Text = 0`, where no text is written. So
-/// this machine is checked as two models, each with only the laws its
-/// constants can break: this one, the policy text (`answer-long-term@v1`,
-/// `answer-short-term@v1`: `Text = 1`, a single-select dialog committed,
-/// `Multi` its dial), and [`supervisor_question_answer_model`], the
-/// recommended path, cut from it.
+/// # Two instances
+///
+/// A law no `Buggy = 1` mutant can break at a model's committed constants is a ghost to the
+/// non-vacuity sweep, and the two text laws cannot break at `Text = 0`. So this machine is
+/// checked as two models, each with only the laws its constants can break: this one, the
+/// policy text (`answer-long-term@v1`, `answer-short-term@v1`: `Text = 1`, single-select
+/// committed, `Multi` its dial), and [`supervisor_question_answer_model`], the recommended
+/// path, cut from it.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_question_text_model() -> Model {
@@ -2372,11 +2190,9 @@ pub fn supervisor_question_text_model() -> Model {
                 q2 = 0;
                 fresh = 0;
             }
-            // Their text in the free-text row: off the chosen row when the
-            // chosen row is an option; with a policy text (`Text = 1`, a tab
-            // not falling back) the free-text row IS the chosen row, and
-            // their text — even keys added to the supervisor's own — makes
-            // the field not its own.
+            // Their text in the free-text row: off the chosen row when that is an option;
+            // with a policy text on a tab not falling back the free-text row is the chosen
+            // row, and their text makes the field not own.
             action PersonTypes when (
                 q1 == 1 && tab <= Tabs - 1 && (focus == 1 || (Text == 1 && fallback == 0))
             ) {
@@ -2387,14 +2203,10 @@ pub fn supervisor_question_text_model() -> Model {
                 q2 = 0;
                 fresh = 0;
             }
-            // Their text is EXACTLY the policy text (a person's copy of it):
-            // the one text only the loop's memory tells from its own — no
-            // read of the field can (`OwnTextRemembered`). On a tab the loop
-            // wrote its text on (`wrote`), the field then holds exactly that
-            // text again, whoever typed its bytes: it IS the loop's own by
-            // every read and by its memory (the real ownership rule), and an
-            // Enter on it submits the policy text the loop wrote. On any
-            // other tab it is a person's copy (`exact`).
+            // Their text is exactly the policy text: only the loop's memory tells it from
+            // its own. On a tab the loop wrote its text on (`wrote`) the field holds that
+            // text again and is own by every read; elsewhere it is a person's copy
+            // (`exact`).
             action PersonTypesPolicyText when (
                 Text == 1 && q1 == 1 && tab <= Tabs - 1 && (focus == 1 || fallback == 0)
             ) {
@@ -2442,12 +2254,8 @@ pub fn supervisor_question_text_model() -> Model {
                 q2 = 0;
                 fresh = 0;
             }
-            // Enter answers the focused row: the tab moves on, the review
-            // submits (or, on its cancel, rejects the tool call). With a
-            // policy text, an Enter on a question tab that does not fall
-            // back is in the field unless the field holds exactly the
-            // supervisor's own text; on a tab that falls back the chosen
-            // row is its recommended option, as on the recommended path.
+            // Enter answers the focused row: the tab moves on, the review submits (or, on
+            // its cancel, rejects the tool call).
             action EnterTaken when (3 <= q1 && q1 <= 3 + Tabs && tab <= Tabs) {
                 stale = if q1 == 3 + tab { stale } else { 1 };
                 in_field = if tab <= Tabs - 1 && (
@@ -2467,12 +2275,9 @@ pub fn supervisor_question_text_model() -> Model {
                 fresh = 0;
                 opened = 1;
             }
-            // The policy text read whole. Into its own tab's EMPTY field,
-            // focused, it is the supervisor's own (`own`) — on a
-            // multi-select the row ticks itself and the Submit/Next button
-            // becomes the chosen row, the focus staying in the field.
-            // Anywhere else it is astray, and it is text no one may take
-            // for the supervisor's (`typed`).
+            // The policy text read whole. Into its own tab's empty focused field it is
+            // `own` (on a multi-select the row ticks itself and the button becomes the
+            // chosen row); anywhere else it is astray, and `typed`.
             action TextLands when (4 + Tabs <= q1 && tab <= Tabs) {
                 stale = if q1 == 4 + Tabs + tab { stale } else { 1 };
                 astray = if q1 == 4 + Tabs + tab && tab <= Tabs - 1 && focus == 0
@@ -2488,8 +2293,8 @@ pub fn supervisor_question_text_model() -> Model {
                 q2 = 0;
                 fresh = 0;
             }
-            // The typeahead window dropped its head (O4): the field holds a
-            // suffix of the text — not the supervisor's own.
+            // The typeahead window dropped its head: the field holds a suffix of
+            // the text, not the supervisor's own.
             action TextPartly when (
                 q1 == 4 + Tabs + tab && tab <= Tabs - 1 && focus == 0 &&
                 typed == 0 && own == 0
@@ -2501,14 +2306,9 @@ pub fn supervisor_question_text_model() -> Model {
                 q2 = 0;
                 fresh = 0;
             }
-            // THE TAB FALLS BACK (`Text = 1`): the text is estimated not to
-            // fit its pane (or the tab has no free-text row, or the window
-            // cannot fence a typed answer), so it is answered with its
-            // recommended option — the chosen row is that option from here
-            // on, the focus on it or off it. Only while the loop has written
-            // no text on the tab and none of its keys is unread (a redraw
-            // under a key in flight is outside the model, as any redraw is);
-            // never back (the loop latches it).
+            // The tab falls back (`Text = 1`): answered with its recommended option, the
+            // focus on it or off it. Only while the loop wrote no text on the tab and no
+            // key of its is unread; never back (the loop latches it).
             action FitLostOnIt when (
                 Text == 1 && fallback == 0 && tab <= Tabs - 1 && wrote == 0 &&
                 own == 0 && typed == 0 && q1 == 0 && q2 == 0
@@ -2525,25 +2325,18 @@ pub fn supervisor_question_text_model() -> Model {
                 focus = 1;
                 fresh = 0;
             }
-            // A question tab drawn with its focus off the chosen row (the
-            // vendor's option 1, the recommendation option 2; a toggled
-            // option, the next choice another row) — before any read of it.
+            // A question tab drawn with its focus off the chosen row (the vendor's option
+            // 1, the recommendation option 2), before any read of it.
             action OpensOffChoice when (opened == 1 && tab <= Tabs - 1) {
                 focus = 1;
                 row = 1 - row;
                 fresh = 0;
             }
-            // A key of the supervisor's the dialog does not take: dropped
-            // inside its typeahead window (O4), no effect — or, read after
-            // the dialog closed, typed into the composer (`↑` recalls
-            // history into it: `NoKeyIntoTheComposer`). ONE action, as
-            // `EnterTaken` sets `in_field`: that consume is reached only past
-            // the guards (`Buggy = 1`), so as an action of its own it was
-            // dead in the committed model — which `ty check
-            // --strict-vacuity` takes for a vacuous model unless the dead
-            // action alone is the mutant, and here the mutant is the guards'.
-            // (A key read after the close was dropped, or not, only in that
-            // same uncommitted space; the composer is where it goes.)
+            // A supervisor key the dialog does not take: dropped in its typeahead window,
+            // or, read after the dialog closed, typed into the composer. One action (as
+            // `EnterTaken` sets `in_field`): that consume is reachable only past the
+            // guards, so as its own action it would be dead in the committed model, which
+            // `ty check --strict-vacuity` rejects.
             action KeyRefused when (2 <= q1) {
                 composer = if Tabs + 1 <= tab { 1 } else { composer };
                 q1 = q2;
@@ -2583,12 +2376,10 @@ pub fn supervisor_question_text_model() -> Model {
             ) {
                 stilled = 1;
             }
-            // Enter on the chosen row. With a policy text, on a question
-            // tab that does not fall back only once the read showed the
-            // field holding the supervisor's own text: on that field, or on
-            // a multi-select's button after it. With no memory
-            // (`OwnTextRemembered = 0`) a person's exact copy of the text
-            // reads as its own.
+            // Enter on the chosen row. With a policy text, on a tab that does not fall
+            // back, only once a read showed the field holding own text (on the field, or a
+            // multi-select's button after it). Without memory a person's exact copy reads
+            // as own.
             action HarnessEnter when (
                 fresh == 1 && q2 == 0 && seen_tab <= Tabs &&
                 (seen_typed == 0 || (OwnTextRemembered == 0 && seen_exact == 1)) &&
@@ -2625,13 +2416,9 @@ pub fn supervisor_question_text_model() -> Model {
                 mine = 1;
                 fresh = 0;
             }
-            // The policy text, written into the focused free-text row the
-            // read showed empty, on a tab that does not fall back — with no
-            // retry clause on the box as keyed (`retried` is the loop's
-            // record of it, THE POLICY TEXT), and once per tab whatever
-            // changes after it: the loop remembers the text it wrote
-            // (`wrote`, the memory `OwnTextRemembered` names) — under the
-            // person fence (`touched`), as every key.
+            // The policy text, written into the focused free-text row the read showed
+            // empty on a tab that does not fall back: no retry on the box as keyed, and
+            // once per tab (`wrote`, the memory `OwnTextRemembered` names).
             action HarnessType when (
                 Text == 1 && seen_fallback == 0 && fresh == 1 && q2 == 0 &&
                 seen_tab <= Tabs - 1 &&
@@ -2665,10 +2452,8 @@ pub fn supervisor_question_text_model() -> Model {
 /// ever written, so none can fail there.
 const QUESTION_TEXT_LAWS: [&str; 2] = ["OwnTextOnlyIntoItsEmptyField", "TextNeverWrittenTwice"];
 
-/// The actions only the policy text enables: each guard needs `Text == 1`
-/// (`HarnessType`, `FitLostOnIt`, `FitLostOffIt`, `PersonTypesPolicyText`)
-/// or a text's queue code, which only `HarnessType` writes (`TextLands`,
-/// `TextPartly`) — false in every state at `Text = 0`.
+/// The actions only the policy text enables: each guard needs `Text == 1` or a queue code
+/// only `HarnessType` writes, so all are disabled at `Text = 0`.
 const QUESTION_TEXT_ACTIONS: [&str; 6] = [
     "HarnessType",
     "TextLands",
@@ -2705,49 +2490,33 @@ pub fn supervisor_question_answer_model() -> Model {
     m
 }
 
-/// THE DECLINE'S KEYSTROKES (aterm-agent `supervise/press.rs`,
-/// `Session::press_decline`; the review's F1 and F3): a Bash
-/// box's `No` amended with a reason the worker acts on — the focus moved
-/// off `1. Yes` (`↓`), Tab on the shut `No` (its input opens), the reason
-/// typed into the open, empty input, Enter on the input showing exactly the
-/// reason — each decided on a fresh read of the box.
+/// The decline's keystrokes (aterm-agent `supervise/press.rs`, `Session::press_decline`): a
+/// Bash box's `No` amended with a reason the worker acts on: the focus moved off `1. Yes`
+/// (`↓`), Tab on the shut `No` (its input opens), the reason typed into the open empty
+/// input, Enter on the input showing exactly the reason, each decided on a fresh read.
 ///
-/// Each key is split into its WRITE (`HarnessDown`, `HarnessTab`,
-/// `HarnessText`, `HarnessEnter`, and a person's `PersonKey`: appended to the
-/// PTY's queue `q1`, `q2`, oldest first — 1 `↓`, 2 Tab, 3 the reason, 4
-/// Enter, 5 a person's key) and its CONSUME by Claude Code, which meets the
-/// box as it is THEN. That is where a key decided on a stale state does its
-/// damage, and the screen generation fence cannot see it: a key written and
-/// not yet read changes nothing on the screen. Tab TOGGLES the focused
-/// option's input (measured on 2.1.282), so a second Tab behind a first not
-/// yet drawn shuts the input again; and a closed Select reads typed text as
-/// keys, so the reason's digits (`$1` in the quoted `rm -rf $S/$1`) choose
-/// an option — `1` is `1. Yes`, on a box the harness could not read.
+/// Each key is split into its write (`HarnessDown`, `HarnessTab`, `HarnessText`,
+/// `HarnessEnter`, a person's `PersonKey`: appended to the PTY queue `q1`, `q2`, oldest
+/// first; 1 `↓`, 2 Tab, 3 the reason, 4 Enter, 5 a person's key) and its consume by Claude
+/// Code, which meets the box as it is then. A key decided on a stale state does its damage
+/// there, unseen by the screen generation fence. Tab toggles the focused option's input
+/// (Claude Code 2.1.282), so a second Tab behind an undrawn first shuts it again; and a
+/// closed Select reads typed text as keys, so a digit in the reason (`$1` in
+/// `rm -rf $S/$1`) chooses an option.
 ///
 /// The guards (and `Buggy = 1` drops both, leaving the generation fence —
 /// `fresh`: no visible change since the read — as the port first shipped
 /// it):
 ///
-/// * **One keystroke in flight** (`mine`): after a write the supervisor
-///   writes nothing while a read shows the box as it was when it wrote (the
-///   same focus, input and text: `Read` keeps `mine` only then). It never
-///   writes that keystroke a second time — a keystroke not drawn after the
-///   bounded reads is handed over, never re-sent — so its own earlier key is
-///   never behind the queue's head when it writes.
-/// * **A person's quiet** (`quiet`, R1 of the question answer): nothing is
-///   written unless the server's person stamp is at least `[harness]
-///   human_grace_s` old (a host that stamps nothing is handed the box). A person's write zeroes it; it returns only once their keys are
-///   consumed.
+/// With both, every supervisor key meets the box as the read showed it:
+/// `NeverChoosesTheAllow`, `NeverAmendsTheAllow`, `NeverTheBareNo` (the shut refusal, or
+/// Enter on the empty input, stops the worker for a person), `NeverSubmitsAnotherText`,
+/// `NoKeyIntoTheComposer`. A person's own answers (`PersonAnswers`) flag nothing.
 ///
-/// With both, every supervisor key is written on an empty queue and meets
-/// the box as the read showed it — the invariants: `1. Yes` is never chosen
-/// by a supervisor key (`NeverChoosesTheAllow`) nor amended
-/// (`NeverAmendsTheAllow`), the bare `No` (the shut refusal, or Enter on the
-/// empty input: the worker stops to wait for a person) is never its answer
-/// (`NeverTheBareNo`), it never submits a text that is not its reason
-/// (`NeverSubmitsAnotherText`), and no key of its is read after the box left
-/// (`NoKeyIntoTheComposer`). A person's own answers (`PersonAnswers`) are
-/// theirs and flag nothing.
+/// The person fence (`PersonFence`): the keystroke names the person count of the read it
+/// was fenced on (`key|send if-human=`), checked under the server's lock, so a person's key
+/// written since the read (`touched`) skips the supervisor's. `PersonFence = 0` (a host that
+/// sends no count) is refuted by `aterm-spec/tests/derived_supervise.rs`.
 ///
 /// **The person fence** (`PersonFence`, R3b of the question answer): the
 /// loop reads the person's stamp on the read the keystroke
@@ -2846,8 +2615,8 @@ pub fn supervisor_decline_keys_model() -> Model {
                 q2 = 0;
                 fresh = 0;
             }
-            // Tab toggles the FOCUSED option's input: the refusal's, or —
-            // on `1. Yes` — the allow's own amend.
+            // Tab toggles the focused option's input: the refusal's, or on `1. Yes` the
+            // allow's own amend.
             action TabTaken when (q1 == 2 && gone == 0) {
                 open = if focus == 1 { 1 - open } else { open };
                 amended_yes = if focus == 0 { 1 } else { amended_yes };
@@ -2978,73 +2747,39 @@ pub fn supervisor_decline_keys_model() -> Model {
     }
 }
 
-/// THE NETWORK WALL (aterm-agent `supervise/policy/turn_end.rs`,
-/// `wall_action`'s arms for an API error that never reached the API and a
-/// reply the connection cut off; the outage of 2026-09-27, when a worker's
-/// `API Error: Can't reach the API server — check your internet or DNS
-/// (ENOTFOUND)` was typed into sixteen times in an hour, 0.5 s after each
-/// appearance): WHEN the supervisor types into such a wall, given what the
-/// session's host MEASURES of the API's reach — and nothing else it may
-/// believe.
+/// The network wall (aterm-agent `supervise/policy/turn_end.rs`, `wall_action`'s arms for
+/// an API error that never reached the API and a reply the connection cut off): when the
+/// supervisor types into such a wall, given only what the session's host measures of the
+/// API's reach.
 ///
-/// The decision, as committed: a network never reached is tried on the
-/// short ladder while its reach is not measured (`Rung1`, then `Rung2` for
-/// every try after — the real 1, 2, 5 min, clamped at the last); it is
-/// continued AT ONCE the first time the host measures the API reachable
-/// again, and each later Up act is spaced by the Up acts before it (a
-/// measure that lies, or an API that still fails, costs the ladder's own
-/// count, never a burst); while the host measures it definitely DOWN
-/// nothing is typed into it before `Hold` (the real `down_hold`, 15 min)
-/// from its appearance, and one try is made then all the same, so a wrong
-/// Down strands no one; a reply cut off is continued at once and then on
-/// the same ladder, by the tries made — and under a Down it takes the
-/// hold like an unreachable API. A try that led to real work before the
-/// wall came back (the real `progress`) ends the EPISODE: its counts start
-/// over (the six sleep cut-offs of 2026-09-26, each after 14–63 min of
-/// work, are each continued at once).
+/// The decision: an unreachable network is tried on the short ladder while its reach is
+/// unmeasured (`Rung1`, then `Rung2` for every later try: the real 1, 2, 5 min, clamped);
+/// it is continued at once the first time the host measures the API reachable again, and
+/// later Up acts are spaced by the Up acts before them (a lying measure costs the ladder's
+/// count, never a burst); while the host measures it down nothing is typed before `Hold`
+/// (the real `down_hold`, 15 min) from its appearance, and one try is made then, so a
+/// wrong Down strands no one. A reply cut off is continued at once, then on the same
+/// ladder, and under a Down takes the hold. A try that led to real work before the wall
+/// came back (the real `progress`) ends the episode and its counts start over.
 ///
-/// `net` is the world (1 the agent's route works); `verdict` the host's
-/// measure the loop reads (0 unknown — nobody measures, a custom route, a
-/// stale measure, a timeout or a TLS failure; 1 down; 2 up), which moves
-/// in EVERY direction, truthfully or not: `MeasureDown`/`MeasureUp` follow
-/// the world, `MeasureLost` forgets it, `MeasureLies` says up while the
-/// agent's route is down (a probe whose route works while the agent's does
-/// not), `MeasureWrongDown` says down while it works — so a flapping or
-/// lying probe is covered, not assumed away. `wall` is 0 while the worker
-/// works, 1 while the wall shows (a point), 2 while the supervisor's act is
-/// in flight; `cause` 0 unreachable, 1 cut off; `waited` the ticks since
-/// this appearance (one tick is one minute at Tier-1, saturating at
-/// `Hold`, the longest any verdict waits); `tries` and `ups` the episode's
-/// acts and its acts on an Up measure (the real `attempts` and `ups`,
-/// saturating where the ladder clamps). Ghosts: `quick` counts the
-/// episode's acts made at the very appearance (`waited == 0`) — the day's
-/// sixteen were all such; `dacts` the episode's acts typed while the host
-/// measured the API down, and `dticks` the ticks the episode has spent at
-/// its wall — neither read by any guard, and neither reset by an act.
+/// `net` is the world (the agent's route works); `verdict` the host's measure (0 unknown:
+/// no measure, a custom route, stale, a timeout or TLS failure; 1 down; 2 up), which moves
+/// in every direction, truthfully or not (`MeasureLies`, `MeasureWrongDown`). `wall`: 0
+/// working, 1 the wall shows, 2 an act in flight. `cause`: 0 unreachable, 1 cut off.
+/// `waited`: ticks (minutes) since this appearance, saturating at `Hold`. `tries`, `ups`:
+/// the episode's acts and its acts on an Up measure (the real `attempts` and `ups`).
+/// Ghosts read by no guard: `quick` (acts at the very appearance), `dacts` (acts while
+/// measured down), `dticks` (ticks spent at the episode's wall).
 ///
-/// The invariants, each about what the episode ACCUMULATES rather than
-/// one decision (so neither is `Act`'s guard restated: a guard-level one —
-/// "an act on a Down measure has `Hold <= waited`" — holds by construction
-/// and would prove nothing):
-/// AMeasuredOutageIsTypedIntoAtMostOnceAHold — the k-th act typed into a
-/// measured outage comes at least k holds of wall time into its episode
-/// (k up to 2, saturating), however the measure flaps, lies or is lost in
-/// between; it rests on the hold being measured from each APPEARANCE (an
-/// act restarts `waited`), which `Carry = 1` breaks — the hold's clock
-/// carried across the episode's appearances, as a decider keeping the
-/// episode's first `since` would: after one hold, every re-appearance
-/// under a Down measure is typed into at once — caught with `Act`'s guard
-/// untouched. And AtMostTwoActsAtOncePerEpisode — an episode gets at most
-/// one act at once for a reply cut off and one for the API measured back
-/// (`AtOnce`); every other act waits at least a rung. `Buggy = 1` is the
-/// supervisor of that day: it acts at once at every appearance, whatever
-/// the measure — caught typing into a measured outage at once, and acting
-/// at once a third time. Tier-1 (aterm-agent
-/// `tests/supervise_conformance_network_wall.rs`) walks every reachable
-/// state with the REAL `decide_turn_end` and `TurnEndState` in tow and
-/// checks it types exactly where `Act` is enabled, under the rule and in
-/// the words the model names, and otherwise waits until exactly the tick
-/// `Act` becomes enabled; the `Buggy` model disagrees with it.
+/// The invariants are about what an episode accumulates, not one decision (a guard-level
+/// law would hold by construction): `AMeasuredOutageIsTypedIntoAtMostOnceAHold` (the k-th
+/// act into a measured outage comes at least k holds into its episode, however the
+/// measure flaps; it rests on the hold counting from each appearance, which `Carry = 1`
+/// breaks with `Act`'s guard untouched) and `AtMostTwoActsAtOncePerEpisode` (one for a cut
+/// off reply, one for the API measured back). `Buggy = 1` acts at once at every appearance.
+/// Tier-1: aterm-agent `tests/supervise_conformance_network_wall.rs` checks the real
+/// `decide_turn_end` and `TurnEndState` type exactly where `Act` is enabled, and otherwise
+/// wait until exactly the tick it becomes enabled.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_network_wall_model() -> Model {
@@ -3180,36 +2915,26 @@ pub fn supervisor_network_wall_model() -> Model {
     }
 }
 
-/// THE RATING CARD'S `0` (aterm-agent `supervise/run.rs`, `Session::survey`, and its
-/// busy-read twin in `await_turn_from`): the harness writes a guarded `0` at a
-/// Claude Code rating card only where that `0` is taken and lands nowhere else, and
-/// removes a `0` the card dropped only when the card can no longer take it — the property
-/// the owner asked for: the person typing into the composer never receives a
-/// `0` meant for a survey, and the harness never deletes its own dismissal.
+/// The rating card's `0` (aterm-agent `supervise/run.rs`, `Session::survey`, and its
+/// busy-read twin in `await_turn_from`): the harness writes a guarded `0` at a Claude Code
+/// rating card only where it is taken and lands nowhere else, and removes a `0` the card
+/// dropped only when the card can no longer take it. A person typing never receives a `0`
+/// meant for a survey, and the harness never deletes its own dismissal.
 ///
-/// `card` is the card on the screen (0 none, 1 open and YOUNG — inside the vendor's
-/// 600 ms mount settle, which drops a digit and leaves it in the composer as text —
-/// 2 open and aged); `hand` a person's keystroke within `human_grace_s`; `draft` text
-/// typed in the composer; `boxed` an approval box up. `zero` is the `0` the harness wrote:
-/// 0 none, 1 PENDING (written, and the vendor's 400 ms debounce may still take it: a
-/// digit typed at an aged card is taken when the timer runs and ANY change to the composer
-/// before that cancels the take, a backspace included), 2 STANDING (the debounce has run
-/// and the composer still holds it: the card dropped it). `takes` is 1 while a pending `0`
-/// is going to be taken (written at an aged card, which has not left since); `owed` is the
-/// loop's memory that a `0` of its own may still be in the composer.
+/// `card`: 0 none, 1 open and young (inside the vendor's 600 ms mount settle, which drops a
+/// digit into the composer as text), 2 aged. `hand`: a person's keystroke within
+/// `human_grace_s`. `draft`: composer text. `boxed`: an approval box. `zero`: 0 none, 1
+/// pending (the vendor's 400 ms debounce may still take it, and any composer change first
+/// cancels the take), 2 standing (the card dropped it). `takes`: a pending `0` will be
+/// taken. `owed`: a `0` of ours may still be in the composer.
 ///
-/// A press is enabled only for an AGED card with nobody's hand on the session, no draft, no
-/// box and no `0` already of ours (a second would make `00`, which abandons the card and
-/// stays in the composer); the stray `0` a card dropped is backspaced only when it is
-/// STANDING — past the landing time, longer than the vendor's debounce — and is the
-/// composer's whole text with no person at the keyboard, and a backspace the server
-/// REFUSES (`halted`, `busy`, `rate`) leaves it owed. `Buggy = 1` presses whatever the state
-/// (inside the settle, under a person's hand, over a draft or a box, on a `0` already
-/// there), backspaces a pending `0` (the first prototype's flaw: it read the `0` still
-/// pending at 500 ms and deleted its own dismissal), and forgets a `0` whose backspace was
-/// refused — each caught by its invariant on its own path. Tier-1 (aterm-agent
-/// `run_engine_tests.rs`) drives the real `Session` over the scripted server and projects
-/// every `key` request onto this model.
+/// A press needs an aged card, no hand, no draft, no box and no `0` of ours already (`00`
+/// abandons the card and stays in the composer). A stray `0` is backspaced only when
+/// standing and the composer's whole text with no person at the keyboard; a refused
+/// backspace (`halted`, `busy`, `rate`) leaves it owed. `Buggy = 1` presses in any state,
+/// backspaces a pending `0`, and forgets a `0` whose backspace was refused, each caught by
+/// its own invariant. Tier-1: aterm-agent `run_engine_tests.rs` projects every `key`
+/// request of the real `Session` onto this model.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_survey_press_model() -> Model {
@@ -3303,133 +3028,51 @@ pub fn supervisor_survey_press_model() -> Model {
     }
 }
 
-/// THE USAGE WALL RESUMES (aterm-agent `supervise/policy/turn_end.rs`, the wall
-/// arm of `decide_turn_end`, over the reader's wall): a session at a usage wall
-/// is continued once its tokens are back — automatically, in bounded time,
-/// on a ladder that never gives up.
+/// The usage wall resumes (aterm-agent `supervise/policy/turn_end.rs`, the wall arm of
+/// `decide_turn_end`): a session at a usage wall is continued once its tokens are back,
+/// automatically, in bounded time, on a ladder that never gives up.
 ///
-/// `wall` 0 the worker works, 1 the wall shows (a point the loop decides),
-/// 2 an act is in flight, 3 the wall is MASKED (drawn, but read as busy: a
-/// weekly wall behind a background shell), 4 the
-/// loop has given up, 5 the wall's rows are OUT OF VIEW (scrolled off, a `/model`
-/// under them: the tab reads busy on its shell) and `mem` says the loop still
-/// remembers the wall it waits on, 6 the wall's notice LEFT AN IDLE SCREEN (Esc
-/// on the vendor's own countdown, a person's local command on a tab with no
-/// shell: idle, no wall) and the loop waits on the reset the notice named —
-/// remembered across a loop's restart by its open ledger row (`mem` again).
-/// `ran` marks a person's turn served at a left wall that the loop did not
-/// see, the wait left standing over it. `other` 1 the left wall's screen
-/// shows ANOTHER conversation's history (a person `/resume`d it): an older
-/// limit's notice with turns served under it, this limit standing. `bg` the agent's own background work. `clock` the ticks
-/// since the wall appeared (saturating); the account has its tokens back at
-/// `due` (`ResetAt`, or `Skew` ticks later). `view` 0 the reset is placed where the notice
-/// says, 1 placed in the past (a bare clock time read by the session-window
-/// rule). `tries` the acts typed at this wall (saturating), `waited` the ticks
-/// since the last one, `blind` the acts typed at this wall before the tokens
-/// came (saturating), `sitting` 1 for a wall FOUND standing with nothing on
-/// the screen to date its print.
+/// `wall`: 0 the worker works, 1 the wall shows, 2 an act in flight, 3 masked (drawn but
+/// read as busy behind a background shell), 4 given up, 5 rows out of view (the tab reads
+/// busy on its shell), 6 the notice left an idle screen (Esc on the countdown, a local
+/// command) and the loop waits on the named reset. `mem`: the loop still remembers the
+/// wall it waits on (across a restart, by its open ledger row). `ran`: a person's turn
+/// served at a left wall that the loop did not see. `other`: the screen shows another
+/// conversation's history, `/resume`d at the left wall (1) or while the wall showed with
+/// its countdown armed (2: Claude Code drops the countdown and draws an older limit with
+/// the vendor's own `Usage limit reset · continuing automatically`). `bg`: the agent's
+/// background work. `clock`: ticks since the wall; tokens are back at `due` (`ResetAt`, or
+/// `Skew` later). `view`: 0 the reset placed where the notice says, 1 in the past (a bare
+/// clock read by the session-window rule), 2 a day out (a defect). `tries`, `waited`,
+/// `blind`: acts at this wall, ticks since the last, acts before the tokens came.
+/// `sitting`: a wall found standing with nothing to date its print. `held`: an own act is
+/// inside its take window (30 s in the real policy, under a tick). `unread`: the wall's
+/// notice left before any read after the act it answered; the cancel under it
+/// (`TurnEndState::left_answer`) is the answer all the same. `credits`: usage credits carry
+/// the running turn past the limit, served with no wall drawn (`CreditsServes`).
 ///
-/// A wall found sitting is placed by the session window's rule: a bare clock
-/// more than five hours ahead reads as passed (`view = 1`), and its one try is
-/// the price the policy accepts (`NoBlindAct` allows exactly that one). The
-/// wall that ANSWERS a try (`Met`: printed again after a turn, or standing
-/// with the line held and no turn run — Claude Code queues a line typed into a
-/// standing limit) is a print the loop watched, and the reset is placed where
-/// the notice says (`view = 0`); `Buggy` keeps the guess, and the ladder types
-/// into the standing wall every rung until the reset (24 lines in one
-/// incident), caught by `NoBlindAct`. Every act waits for the reset as
-/// placed AND its rung (the real `max(reset + grace, since + rung)`).
+/// A wall found sitting is placed by the session-window rule; its one try is the price
+/// `NoBlindAct` allows. A wall that answers a try (`Met`) is a watched print, placed where
+/// the notice says. Every act waits for the reset as placed and its rung
+/// (`max(reset + grace, since + rung)`). A left notice is waited on to the same reset; a
+/// person's turn served there (at or before the reset, `LimitLiftedEarly`) ends the wait;
+/// another conversation's history, its served turns and its vendor continuation, is
+/// nothing of this limit's. No act is decided inside an own act's take window (`held`),
+/// and a wall read there is the loop's from its first reading all the same. `Hidden`,
+/// `Leaves`, `OwnAct`, `Unread` and `Credits` are dials, committed 1; each at 0 switches
+/// its world steps off.
 ///
-/// A notice that leaves an idle screen (`NoticeLeaves`, the `Leaves` dial) is
-/// waited on to the same reset, and acted on there as the wall that shows is
-/// (`Buggy`: `LeftReadAsTurnEnd`, the left limit decided as a turn's end — the
-/// continuation typed into the standing limit at once, caught by `NoBlindAct`).
-/// A person's turn there that the account serves (`PersonTurnServed`, its
-/// tokens back — at the named reset or before it, `LimitLiftedEarly`: a plan
-/// changed, usage bought) is work since the wall, and ends the wait however
-/// short it was (`Buggy`: `PersonTurnUnseen`, a turn no read saw busy read as
-/// no turn — the person's continuation held to the reset, caught by
-/// `NoWaitOverAServedTurn`). Another conversation's history on the screen
-/// (`ConversationResumed`) is no turn of this limit's, served or not
-/// (`Buggy`: `OtherLimitsTurnRead`, its older limit's served turn read as one
-/// since this limit — the wait ended and the continuation typed into the
-/// standing limit, caught by `NoBlindAct`; the review of 2026-10-14 measured
-/// it on 2.1.300). So is one `/resume`d while the wall SHOWS, its countdown
-/// armed (`ArmedConversationResumed`, `other` 2: W1 of ATERM-KI-1015-1):
-/// Claude Code drops the countdown and redraws an older limit the vendor
-/// continued by itself, whose word (`Usage limit reset · continuing
-/// automatically`) is no continuation of this limit's (`Buggy`:
-/// `OtherLimitsContinuationRead`, that word tied to no limit — the wait ended
-/// and the continue policy typed into the standing limit, caught by
-/// `NoBlindAct`; measured on 2.1.300, 2026-10-15: the stub's 429 22 minutes
-/// before the reset).
-///
-/// `held` 1: an act of the policy's OWN is inside its take window — typed, no
-/// read has seen it taken, and its point not judged yet (30 s in the real
-/// policy, under a tick: the next `Tick` ends it, as does a turn the account
-/// serves, a point with work). Both of its acts have one (the `OwnAct` dial):
-/// the continue policy's at a turn's end (`OwnActTyped`), and the wall's own
-/// retry (`Act`). No act is decided while it is (`Act` waits for the window).
-/// A wall that answers the act at once (the stub's 429, no busy read: a
-/// `WallAppears` after `OwnActTyped`, a `MetInWindow` after `Act`) is read
-/// with `held` still 1, and may leave the screen inside the window
-/// (`NoticeLeaves`). The wall is the loop's from its first reading all the
-/// same; `Buggy`: `TakeWindowDropsWall`, the wall folded in only at a point,
-/// so its notice gone by the window's end reads as the act's short turn and
-/// the continue policy types into the standing limit (round 15's run on
-/// 2.1.300, 2026-10-14), caught by `NoBlindAct`; and `RetryReadAsTaken`, the
-/// wall's answer to a retry read inside its window but not kept as the
-/// retry's answer, so the retry, its answer's notice gone by the window's
-/// end, reads as taken and the wall is forgotten — the continue policy then
-/// typed into the standing limit (round 16's review), caught by
-/// `WallRemembered`.
-///
-/// `unread` 1: the wall's notice LEFT BEFORE ANY READ after the act it
-/// answered — the limit answered at once and a person's Esc on the vendor's
-/// countdown came before the loop's first read (round 16's residual (a), the
-/// lab's `tw16after` on 2.1.300): `WallAppearsLeft` after `OwnActTyped`,
-/// `MetLeftUnread` after `Act` (the `Unread` dial: 0 switches both off). The
-/// screen the loop reads shows only the
-/// vendor's cancel under the notice (`Automatic continue cancelled`), no
-/// wall; that notice is the act's answer all the same (the real
-/// `TurnEndState::left_answer`: a notice the act was not typed over, the
-/// cancel right under it, nothing served since), and the limit is waited on
-/// to the reset it named. `Buggy`: `UnreadLeftDropped`, the cancel read as
-/// no limit, so the act's window ends on its short turn and the continue
-/// policy types into the standing limit (measured on 1afcdade3), caught by
-/// `NoBlindAct`; and `UnreadAnswerReadAsTaken`, a retry's answer gone before
-/// any read, the retry read as taken and the wall forgotten, caught by
-/// `WallRemembered`. The next tick (the window's end) clears it: past the
-/// window the left wall is the track's, as any left wall is.
-///
-/// A PERSON'S turn answered the same way (`PersonWallLeft`, round 17's
-/// residual (a)): no act of the loop's is in flight; a person's prompt at a
-/// turn's end meets the limit at once and their Esc on the countdown comes
-/// before the loop's next read. The notice is new since the loop last
-/// looked, and it is that turn's answer all the same (the real
-/// `TurnEndState::left_answer`, confirmed by a transcript row written since
-/// that look where there is one): waited on to the reset it named. Read as
-/// no limit, the continue policy's next act goes into it —
-/// `UnreadLeftDropped` again (measured on 745d63b36, the lab's `pc18b1`), caught by
-/// `NoBlindAct`.
-///
-/// ANOTHER CONVERSATION'S OLDER CANCELLED LIMIT inside the own act's window
-/// (`OlderLeftResumed`, round 17's residual (a)): a person `/resume`s, before
-/// the loop's first read after its act, a conversation whose last thing is
-/// a limit cancelled on its countdown long ago. Nothing stands (`due` now),
-/// and with no transcript nothing tells that notice from the act's own
-/// answer: the loop reads it as the answer, and nothing dates its print
-/// (`sitting`), so its bare clock is placed never more than a session window
-/// out — a reset already past is passed (`view = 1`), the one try the
-/// policy accepts. `Buggy`: `OlderLeftPlacedTomorrow`, placed on the print
-/// of the act it was taken to answer, the past clock read as TOMORROW's
-/// (`view = 2`: no act for a day while the session is free; measured on
-/// 745d63b36), caught by `NoDayWait` and the liveness claim.
-///
-/// USAGE CREDITS (the `Credits` dial, accounts v2 S5): a turn that crosses
-/// the limit is carried by credits and served, no wall drawn
-/// (`CreditsServes`, `credits` 1; lab E4). `Buggy`: `CreditsReadAsWall`,
-/// credits taken for a spend wall, caught by `NoWallOnCredits`.
+/// `Buggy` defects, each caught alone:
+/// * `NoBlindAct`: `MetKeepsTheGuess`, `WallMisplaced`, `LeftReadAsTurnEnd`,
+///   `OtherLimitsTurnRead`, `OtherLimitsContinuationRead` (another conversation's vendor
+///   continuation read as this limit's), `TakeWindowDropsWall` (a wall read in the take
+///   window folded in only at a point), `UnreadLeftDropped` (the cancel read as no limit);
+/// * `WallRemembered`: `MemoryLost`, `RetryReadAsTaken`, `UnreadAnswerReadAsTaken`;
+/// * `NoWaitOverAServedTurn`: `PersonTurnUnseen`;
+/// * `NoStuckWall`: `WallMasked`, `GivesUp`;
+/// * `NoWallOnCredits`: `CreditsReadAsWall` (a turn credits carry read as a wall);
+/// * `NoDayWait` and the liveness: `OlderLeftPlacedTomorrow` (an older cancelled limit's
+///   past clock read as tomorrow's).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_usage_wall_model() -> Model {
@@ -3496,10 +3139,9 @@ pub fn supervisor_usage_wall_model() -> Model {
                 tries = 0;
                 waited = 0;
             }
-            // A wall FOUND standing (a loop that starts at it, a relaunch that
-            // redraws the conversation without its done row): nothing dates
-            // its print, the session rule places its bare clock, and a clock
-            // more than five hours ahead reads as passed.
+            // A wall found standing (the loop starts at it, or a relaunch redraws it
+            // without its done row): nothing dates its print, and the session rule reads
+            // a bare clock more than five hours ahead as passed.
             action WallFoundSitting when (wall == 0 && held == 0 && credits == 0) {
                 wall = 1;
                 sitting = 1;
@@ -3527,10 +3169,9 @@ pub fn supervisor_usage_wall_model() -> Model {
             action WallShows when (wall == 5) {
                 wall = 1;
             }
-            // The wall's notice LEAVES AN IDLE SCREEN (the `Leaves` dial: 0
-            // switches it off): Esc on the vendor's own countdown (`Automatic
-            // continue cancelled`), a person's `/usage` or `/model` under it on
-            // a tab with no shell. The screen reads idle, no wall, no work.
+            // The wall's notice leaves an idle screen (`Leaves` dial): Esc on the vendor's
+            // countdown (`Automatic continue cancelled`), or a person's `/usage` or
+            // `/model` on a tab with no shell.
             action NoticeLeaves when (Leaves == 1 && wall == 1 && bg == 0) {
                 wall = 6;
             }
@@ -3549,32 +3190,31 @@ pub fn supervisor_usage_wall_model() -> Model {
                 sitting = 0;
                 blind = 0;
             }
-            // The account gets its tokens back BEFORE the reset the notice
-            // named (a plan changed, usage bought; the lab's `mode ok`): a
-            // turn served now is served before the reset.
+            // The account gets its tokens back before the reset the notice
+            // named (a plan changed, usage bought): a turn served now is served
+            // before the reset.
             action LimitLiftedEarly when (wall == 6 && clock <= due - 1) {
                 due = clock;
             }
-            // A person `/resume`s ANOTHER conversation at the left wall: the
-            // screen redraws its history — an older limit's notice, lifted
-            // long ago, with turns served under it — and the host hands over
-            // its transcript. Nothing of this limit's.
+            // A person `/resume`s another conversation at the left wall: the
+            // screen redraws its history (an older limit's notice, lifted long
+            // ago, with turns served under it) and the host hands over its
+            // transcript. Nothing of this limit's.
             action ConversationResumed when (Leaves == 1 && wall == 6 && other == 0) {
                 other = 1;
             }
-            // A person `/resume`s ANOTHER conversation while the wall SHOWS,
-            // the vendor's countdown armed (W1 of ATERM-KI-1015-1, 2.1.300):
-            // Claude Code drops the countdown and redraws that conversation's
-            // history — an older limit and the vendor's own continuation of
-            // it (`Usage limit reset · continuing automatically`), no `❯` row
-            // since. The screen reads idle with no wall; this limit stands.
+            // A person `/resume`s another conversation while the wall shows, the vendor's
+            // countdown armed (Claude Code 2.1.300): Claude Code drops the countdown and
+            // redraws that conversation's history, an older limit and the vendor's own
+            // continuation of it (`Usage limit reset · continuing automatically`), no `❯`
+            // row since. The screen reads idle with no wall; this limit stands.
             action ArmedConversationResumed when (
                 Leaves == 1 && wall == 1 && bg == 0 && other == 0
             ) {
                 wall = 6;
                 other = 2;
             }
-            // The limit answers the own act at once AND a person's Esc on the
+            // The limit answers the own act at once, and a person's Esc on the
             // vendor's countdown takes its notice off the screen's end before
             // the loop's first read after the act: the screen it reads shows
             // only the vendor's cancel under the notice, no wall.
@@ -3593,11 +3233,9 @@ pub fn supervisor_usage_wall_model() -> Model {
                 waited = 0;
             }
 
-            // A PERSON'S prompt at a turn's end, no act of the loop's in
-            // flight, answered at once by the limit, AND their Esc on the
-            // vendor's countdown before the loop's next read: the screen it
-            // reads shows only the cancel under the notice under the person's
-            // prompt, no wall.
+            // A person's prompt at a turn's end (no act in flight) answered at once by the
+            // limit, and their Esc on the countdown before the next read: only the cancel
+            // under the notice is read.
             action PersonWallLeft when (
                 Unread == 1 && Leaves == 1 && held == 0 && wall == 0 && bg == 0 && credits == 0
             ) {
@@ -3612,13 +3250,10 @@ pub fn supervisor_usage_wall_model() -> Model {
                 tries = 0;
                 waited = 0;
             }
-            // Inside the own act's window, before the loop's first read
-            // after it, a person `/resume`s a conversation whose last thing
-            // is an OLDER limit cancelled on its countdown: nothing stands
-            // (the tokens are here now), the screen shows a cancel under a
-            // notice, and nothing dates that notice's print. Read as the
-            // act's answer, its bare clock is placed never more than a
-            // session window out: a reset already past is passed.
+            // Inside the own act's window, before the first read, a person `/resume`s a
+            // conversation ending in an older limit cancelled on its countdown: nothing
+            // stands, and nothing dates the notice. Read as the act's answer, its bare
+            // clock is placed at most a session window out, so a past reset is passed.
             action OlderLeftResumed when (
                 Unread == 1 && Leaves == 1 && held == 1 && wall == 0 && bg == 0 && credits == 0
             ) {
@@ -3635,8 +3270,8 @@ pub fn supervisor_usage_wall_model() -> Model {
             }
 
             // Usage credits carry a turn past the limit (the `Credits` dial):
-            // it is served, at 100%, and no wall is drawn; at its end the
-            // account is as it was, the next turn's wall the world's again.
+            // it is served at 100% with no wall drawn; once it ends, the next
+            // turn's wall is the world's again.
             action CreditsServes when (
                 Credits == 1 && wall == 0 && held == 0 && credits == 0 && bg == 0
             ) {
@@ -3652,10 +3287,9 @@ pub fn supervisor_usage_wall_model() -> Model {
             action OwnActTyped when (OwnAct == 1 && wall == 0 && held == 0 && credits == 0) {
                 held = 1;
             }
-            // The first act: `Grace` past the reset the notice names (150 s and a
-            // session's share of a minute in the real policy); each
-            // one after a wall that answered again: a rung, the last for every
-            // one after it — for ever. Its take window opens with it.
+            // The first act: `Grace` past the named reset (150 s in the real policy); each
+            // after a wall that answered again waits a rung, the last forever. Its take
+            // window opens with it.
             action Act when (
                 held == 0 &&
                 (wall == 1 || ((wall == 5 || wall == 6) && mem == 1)) &&
@@ -3685,19 +3319,15 @@ pub fn supervisor_usage_wall_model() -> Model {
                 ran = 0;
                 held = 0;
             }
-            // ... the wall answers again: the next rung counts from THIS
-            // appearance (the real `since`), as a fresh try's answer is
-            // immediate but time may pass while it is in flight. The answer is
-            // a print the loop watched: the reset is placed where the notice
-            // says. A turn ran into it (its point judges the act at once), or
-            // the act's window had passed.
+            // ... the wall answers again: the next rung counts from this appearance (the
+            // real `since`). A watched print, so the reset is placed where the notice says.
             action Met when (wall == 2 && clock <= due - 1) {
                 wall = 1;
                 waited = 0;
                 view = 0;
                 held = 0;
             }
-            // ... or answers it at once, no turn run (the stub's 429), INSIDE
+            // ... or answers it at once, no turn run (the stub's 429), inside
             // the act's take window: the same print, its point not judged yet.
             action MetInWindow when (wall == 2 && held == 1 && clock <= due - 1) {
                 wall = 1;
@@ -3717,10 +3347,8 @@ pub fn supervisor_usage_wall_model() -> Model {
             }
 
             // ---- the defects (dead at the committed config) ----
-            // The wall drawn behind background work, read as busy: no point. It
-            // stays masked (the reader lifts it when the shell ends, which the
-            // world never has to do, so no lift is modelled: a defect action
-            // must be caught alone, and a lift alone could not even fire).
+            // The wall drawn behind background work, read as busy: no point. No lift is
+            // modelled (a defect action must be caught alone).
             action WallMasked when (Buggy == 1 && wall == 0 && bg == 1 && credits == 0) {
                 wall = 3;
                 sitting = 0;
@@ -3755,9 +3383,9 @@ pub fn supervisor_usage_wall_model() -> Model {
                 ran = 1;
             }
             // Another conversation's older limit, and a turn served under it,
-            // read as a turn served since THIS limit (evidence tied to no
-            // limit): the wait ends while the tokens are not back, and the
-            // continue policy types into the standing limit.
+            // read as a turn served since this limit: the wait ends while the
+            // tokens are not back, and the continue policy types into the
+            // standing limit.
             action OtherLimitsTurnRead when (Buggy == 1 && wall == 6 && other == 1 && clock <= due - 1) {
                 blind = if blind <= 1 { blind + 1 } else { blind };
                 tries = if tries <= 2 { tries + 1 } else { tries };
@@ -3767,7 +3395,7 @@ pub fn supervisor_usage_wall_model() -> Model {
                 unread = 0;
             }
             // Another conversation's older limit continued by the vendor,
-            // its word read as THIS limit's continuation (evidence tied to no
+            // its word read as this limit's continuation (evidence tied to no
             // limit): the wait ends while the tokens are not back, and the
             // continue policy types into the standing limit.
             action OtherLimitsContinuationRead when (
@@ -3844,9 +3472,8 @@ pub fn supervisor_usage_wall_model() -> Model {
             action GivesUp when (Buggy == 1 && wall == 1 && 3 <= tries) {
                 wall = 4;
             }
-            // The wall answers the act, and the loop keeps its guess: a wall
-            // standing after an act nobody took read as no print,
-            // the ladder typing into it every rung until the reset.
+            // The wall answers the act and the loop keeps its guess: the ladder types into
+            // the standing wall every rung until the reset.
             action MetKeepsTheGuess when (Buggy == 1 && wall == 2 && clock <= due - 1) {
                 wall = 1;
                 waited = 0;
@@ -3897,18 +3524,12 @@ pub fn supervisor_usage_wall_model() -> Model {
     }
 }
 
-/// THE USAGE WALL ENDS ([`supervisor_usage_wall_model`]): `[]<>(the worker works \/ the
-/// tokens are not back yet)` — on every fair behaviour, a wall whose tokens
-/// have come does not stand for good. Fairness assumed, and nothing more: the
-/// clock ticks while the Mac is awake (`Tick`), the loop acts once an act is
-/// enabled (`Act`), and the account answers a continuation once it has its
-/// tokens (`Taken`). The world is NOT fair: background work may start and
-/// never end, and a wall may come late. Broken alone by `WallMasked` (a
-/// wall drawn behind background work, read as busy, so no
-/// point ever forms), by `GivesUp` (a ladder with a last try), by
-/// `MemoryLost` and by `OlderLeftPlacedTomorrow` (an older cancelled limit
-/// nothing dated, its past clock placed a day out: no act while the tokens
-/// are here).
+/// The usage wall ends ([`supervisor_usage_wall_model`]): `[]<>(the worker works \/ the
+/// tokens are not back yet)`. Fairness assumed: `Tick` (the clock runs while the Mac is
+/// awake), `Act`, and `Taken` (the account answers a continuation once it has tokens). The
+/// world is not fair: background work may never end and a wall may come late. Broken alone
+/// by `WallMasked` (a wall behind background work read as busy), `GivesUp`, `MemoryLost`
+/// and `OlderLeftPlacedTomorrow` (an older cancelled limit's past clock placed a day out).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(supervisor_usage_wall_model)]
@@ -4168,24 +3789,19 @@ pub fn supervisor_credits_hold_liveness() -> Liveness {
     }
 }
 
-/// THE MODEL SWITCH (aterm-agent `supervise/policy/turn_end.rs`, the model
-/// bucket's arm of `decide_turn_end` and `TurnEndState::restarted`, and the
-/// host's `restart` in `supervise/turn_end_loop.rs`): a tab at a model
-/// limit is moved to the fallback model by a relaunch the host makes when the
-/// agent's own jobs allow it, and comes back to the bucket's model only at a
-/// reset the notice NAMED and that was still ahead when the switch was made
-/// — never on a guess.
+/// The model switch (aterm-agent `supervise/policy/turn_end.rs`, the model bucket's arm of
+/// `decide_turn_end` and `TurnEndState::restarted`, and the host's restart via
+/// `turn_end_loop.rs`'s `restart_agent`): a tab at a model limit moves to the fallback
+/// model by a relaunch the host makes when the agent's own jobs allow, and comes back only
+/// at a reset the notice named that was still ahead when the switch was made.
 ///
-/// `bucket` 1 the model's limit stands; `named` 1 the notice names a reset
-/// (0: an entitlement, `requires usage credits`); `on` 1 the tab is on the
-/// fallback; `back` 1 the switch owes a return at the reset
-/// (`ModelSwitch::back_at`); `jobs` 1 the agent's own background work runs
-/// (the host refuses the relaunch while it does); `clock` the ticks since the
-/// wall appeared; `probed` the wall has been acted on (the continuation typed
-/// at the reset goes FIRST, before the fallback is asked for again, and a
-/// made switch is an act too); `tries` the asks the host refused; `flips` the
-/// relaunches since the worker last did real work; `gaveup`, `held`, `badret`
-/// are the defects' marks. One tick is one minute.
+/// `bucket` the model's limit stands; `named` the notice names a reset (0: an entitlement,
+/// `requires usage credits`); `on` the tab is on the fallback; `back` the switch owes a
+/// return (`ModelSwitch::back_at`); `jobs` the agent's background work runs (the host
+/// refuses the relaunch); `clock` ticks (minutes) since the wall; `probed` the wall was
+/// acted on (the continuation at the reset goes first, and a made switch is an act too);
+/// `tries` asks the host refused; `flips` relaunches since the worker last did real work;
+/// `gaveup`, `held`, `badret` are the defects' marks.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_model_switch_model() -> Model {
@@ -4249,15 +3865,15 @@ pub fn supervisor_model_switch_model() -> Model {
             }
 
             // ---- the supervisor ----
-            // At the reset the CONTINUATION goes first: the wall may have
+            // At the reset the continuation goes first: the wall may have
             // lifted, and a switch made at that moment would be for nothing.
             action Continue when (bucket == 1 && on == 0 && named == 1 && ResetAt <= clock && probed == 0) {
                 probed = 1;
             }
-            // Ask the host for the fallback. It is made when the agent's jobs
-            // are not running and refused (`wait:changed`) while they are; the
-            // ask is repeated on the restart back-off, never given up. A
-            // switch made owes a return only at a named reset still ahead.
+            // Ask the host for the fallback: made when the agent's jobs are not running,
+            // refused (`wait:changed`) while they are, and asked again on the restart
+            // back-off, never given up. A switch owes a return only at a named reset still
+            // ahead.
             action AskFallback when (
                 bucket == 1 && on == 0 && gaveup == 0 &&
                 (named == 0 || probed == 1 || clock <= ResetAt - 1)
@@ -4270,7 +3886,7 @@ pub fn supervisor_model_switch_model() -> Model {
             }
             // The return: only at the reset the switch owes, once it has come,
             // and only when the host can make it. A return the host cannot
-            // make now is DEFERRED and holds nothing.
+            // make now is deferred and holds nothing.
             action Return when (on == 1 && back == 1 && ResetAt <= clock && jobs == 0) {
                 on = 0;
                 back = 0;
@@ -4278,9 +3894,8 @@ pub fn supervisor_model_switch_model() -> Model {
             }
 
             // ---- the defects (dead at the committed config) ----
-            // A return with none owed (`Guess` ticks after the switch: the 240
-            // relaunches in five days, 2026-09-22 to 09-27): back to a wall
-            // that stands, and the fallback asked for again.
+            // A return with none owed (`Guess` ticks after the switch): back to a wall that
+            // stands, and the fallback asked for again.
             action GuessedReturn when (Buggy == 1 && on == 1 && bucket == 1 && back == 0 && Guess <= clock) {
                 on = 0;
                 flips = if flips <= 3 { flips + 1 } else { flips };
@@ -4304,14 +3919,10 @@ pub fn supervisor_model_switch_model() -> Model {
     }
 }
 
-/// THE FALLBACK IS MADE ([`supervisor_model_switch_model`]): `[]<>(the tab is
-/// on the fallback \/ the limit lifted \/ the agent's jobs run)` — on every
-/// fair behaviour, a tab whose jobs are not holding the relaunch is moved.
-/// The jobs are the environment's and are NOT fair: they may run for ever, and
-/// then the tab stays where it is, asked again at every back-off ("if they
-/// end, it is made"). Fairness assumed: the loop asks (`AskFallback`) and, at a
-/// reset, types the continuation first (`Continue`). Broken alone by
-/// `GivesUp` (the asks stop after a few refusals).
+/// The fallback is made ([`supervisor_model_switch_model`]): `[]<>(on the fallback \/ the
+/// limit lifted \/ the agent's jobs run)`. The jobs are the environment's and not fair: if
+/// they run forever the tab stays, asked again at every back-off. Fairness assumed:
+/// `AskFallback` and `Continue`. Broken alone by `GivesUp`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(supervisor_model_switch_model)]
@@ -4329,40 +3940,26 @@ pub fn supervisor_model_switch_liveness() -> Liveness {
     }
 }
 
-/// THE SAME BOX IS ONE POINT (aterm-agent `supervise/run.rs`: the review
-/// key of a box, `point_key`, and the look that hands a point over; FIX 3:
-/// a re-alert, `CLEARED` then `ESCALATED` 7 s apart for the same box): a
-/// request standing on the screen is asked
-/// of the manager ONCE however the vendor redraws it — re-wrapped at another
-/// width, its focus moved, its auto-deny countdown ticking, the transcript
-/// reflowed above it — and EVERY request the loop looks at is asked, a
-/// second box drawn over the first with no read between included (two Edit
-/// boxes on one path, their diffs different).
+/// The same box is one point (aterm-agent `supervise/run.rs`: a box's review key,
+/// `point_key`, and the look that hands a point over). A request standing on the screen is
+/// asked of the manager once however the vendor redraws it (re-wrapped, focus moved, its
+/// auto-deny countdown ticking, the transcript reflowed above it), and every request the
+/// loop looks at is asked, including a second box drawn over the first with no read
+/// between (two Edit boxes on one path, different diffs).
 ///
-/// `req` is the request on the screen (0 none; 1 and 2 share a head — the
-/// same kind and path, the review's (a); 3 is request 2 asked AGAIN, which
-/// the worker does only after it worked); `seen` how many requests were
-/// drawn; `form` the drawing of the one up (a redraw flips it); `key` the
-/// loop's review key of what it reads; `handed` the key of the point last
-/// handed over; `live` that a read since the last look saw the worker's own
-/// busy row (a turn ran); `asks` the asks of the request up (counted to 2:
-/// one past the bound `OneAskPerRequest` states, which is all a slip needs
-/// to break it, so the mutants' space stays finite); `looked` that the loop
-/// looked at it. `Look` is the loop's look: a point already handed, with no
-/// live busy read since, is passed over; anything else is a new point,
-/// asked.
+/// `req` is the request on screen (0 none; 1 and 2 share a head, the same kind and path;
+/// 3 is request 2 asked again, which the worker does only after it worked); `seen` how
+/// many were drawn; `form` the drawing (a redraw flips it); `key` the loop's review key of
+/// what it reads; `handed` the key last handed over; `live` that a read since the last
+/// look saw the worker's busy row; `asks` the asks of the request up (counted to 2, one
+/// past the bound); `looked` that the loop looked at it. `Look` passes over a point already
+/// handed with no live busy read since, and asks anything else.
 ///
-/// `Buggy = 1` is the three slips this model must catch, together, each
-/// breaking an invariant of its own — and each has its own dial as well, so
-/// a test can turn one on alone: `Drawing` keys the DRAWING (the rows as
-/// laid out, the countdown, the rows above — the key before FIX 3: a redraw
-/// asks one request twice, `OneAskPerRequest`); `Coarse` keys the head
-/// alone (kind and path — the rejected plan: the second of two Edit boxes on
-/// one path is looked at and never asked, `EveryLookedRequestIsAsked`);
-/// `WritingWorks` takes a read that shows only output being written
-/// (`writing`: no composer, no box, no busy row, the screen never held
-/// still) for the worker's turn (the review's (c): the box redrawn through
-/// it is asked twice, `OneAskPerRequest`).
+/// `Buggy = 1` turns on three slips, each with its own dial and invariant: `Drawing` keys
+/// the drawing (a redraw asks twice, `OneAskPerRequest`); `Coarse` keys the head alone
+/// (the second of two Edit boxes on one path is never asked, `EveryLookedRequestIsAsked`);
+/// `WritingWorks` takes a read showing only output being written for the worker's turn
+/// (the box redrawn through it is asked twice).
 ///
 /// It ASSUMES the one residual no key can see: an identical request comes
 /// back only after the worker worked (`live`). Two identical requests queued
@@ -4394,8 +3991,8 @@ pub fn supervisor_box_ask_model() -> Model {
             var asks = 0;
             var looked = 0;
 
-            // The next request drawn — over the last with no read between,
-            // or after it left; the SAME request again (3) only after work.
+            // The next request drawn, over the last with no read between or
+            // after it left; the same request again (3) only after work.
             action NextBox when (seen <= 2 && (seen <= 1 || live == 1)) {
                 seen = seen + 1;
                 req = seen + 1;
@@ -4408,8 +4005,8 @@ pub fn supervisor_box_ask_model() -> Model {
                     if seen == 2 { 2 } else { seen + 1 }
                 };
             }
-            // The vendor redraws the request up: re-wrapped, its focus moved,
-            // its countdown ticked, the transcript reflowed above it.
+            // The vendor redraws the request: re-wrapped, focus moved, countdown ticked,
+            // the transcript reflowed above it.
             action Redraw when (req > 0) {
                 form = 1 - form;
                 key = if Drawing == 1 || Buggy == 1 {

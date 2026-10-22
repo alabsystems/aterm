@@ -620,7 +620,7 @@ fn a_mark_records_its_row_and_the_supervisors_attention_moves_the_rev() {
     assert_eq!((record.rev, record.attention), (5, true));
 }
 
-/// A WORKER'S NEEDS YOU ENTRY IS ITS TASK RECORD'S NEWS (FOREVER LAND: "be
+/// A WORKER'S NEEDS YOU ENTRY IS ITS TASK RECORD'S NEWS (Autopilot Land: "be
 /// LOUDER ABOUT IT ... but NEVER let that block you"): an `owner=needs` entry
 /// raises a tasked session's attention and moves its rev as the supervisor's
 /// own does, its clear lowers it, and the flag stands while either entry

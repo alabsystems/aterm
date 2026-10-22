@@ -286,9 +286,8 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     assert_transition(&model, &prompt_answered, &prompt_submitted, "SubmitPrompt");
     assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "bc");
 
-    // Bind the added goto lifecycle to genuine shipping code. A two-line
-    // buffer makes the abstract zero-based target `1` equal the real byte of
-    // line 2, so acceptance is checked as a transition rather than inferred.
+    // The goto lifecycle on shipping code: in a two-line buffer the abstract zero-based
+    // target `1` equals the real byte of line 2, so acceptance is checked as a transition.
     let mut goto_store = crate::test_document_store();
     let goto_document = goto_store.open("mem://editor-goto-conformance".into(), "\nx".into());
     let mut goto_workspace = EditorWorkspace::new();

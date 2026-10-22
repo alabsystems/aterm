@@ -62,9 +62,8 @@ aterm-hash = { workspace = true }
 libc = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
 aterm-durable = { workspace = true }
-# The shared, platform-free ownership predicate (dir_safe_for_private_write) reused
-# for the floor file's directory, so atpkg and the updater cannot drift on what
-# "private" means.
+# `fs_restricted::dir_safe_for_private_write` for the floor file's directory, shared with
+# the updater so the two agree on what "private" means.
 aterm-types = { workspace = true }
 # The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin).
 aterm-time = { workspace = true }
@@ -76,12 +75,9 @@ aterm-regex = { workspace = true }
 # THE toolchain's discovery, rustup's home, the build-cache rule, the gone-checkout rule
 # and the lease core, std only; `toolchain`, `build_cache` and `lease` re-export them.
 aterm-toolchain = { workspace = true }
-# The shared advisory file lock (flock LOCK_EX) — the SAME primitive aterm-update uses
-# for its apply/stage critical sections — serializes the high-water floor's
-# read->compare->write so a racing advance across concurrent atpkg processes cannot be
-# clobbered down (anti-rollback monotonicity, CWE-362). Brings the artifact-agnostic
-# core in as the design's shared substrate (§13). Also supplies pick_slug/is_valid_slug
-# for resolve_account() (the configurable index account, R3/§5).
+# `FileLock` (flock LOCK_EX, the primitive aterm-update's apply/stage uses) serializes the
+# high-water floor's read-compare-write, so concurrent atpkg processes cannot move it down
+# (anti-rollback, CWE-362). Also `pick_slug`/`is_valid_slug` for `resolve_account()`.
 aterm-update-core = { workspace = true }
 # Parse index.toml / pkg-*.toml only after signature verification: the parsers take
 # `&sig::VerifiedBytes` (no public constructor), so parsing unverified bytes does not
@@ -140,16 +136,12 @@ aterm-sysprobe = { workspace = true }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-atpkg = { workspace = true }
-# Test fixtures SIGN: deterministic Ed25519 manifests (Ed25519KeyPair::from_seed_unchecked
-# + .sign) and the `openpgp` RSA vectors (RsaKeyPair::sign under a committed test key).
-# Re-declaring ring here with DEFAULT features adds the rest of ring's defaults to the
-# TEST build only (feature unification across normal+dev within this leaf package); the
-# normal build keeps the minimal edge above.
+# Test fixtures sign: Ed25519 manifests (`Ed25519KeyPair::from_seed_unchecked`) and the
+# `openpgp` RSA vectors (`RsaKeyPair::sign` under a committed test key). ring's default
+# features reach the test build only; the normal build keeps the minimal edge above.
 ring = { workspace = true, features = ["default"] }
-# The tty test's pseudo-terminal, both ends close-on-exec from birth
-# (`open_pty_pair`): an `openpty(3)` pair is inheritable, and the child spawned onto
-# it kept a copy of its own master. First-party, and in the one shipped binary that
-# links atpkg already; no cycle (aterm-pty's graph names no atpkg). Tests only.
+# The tty test's pseudo-terminal (`open_pty_pair`): both ends close-on-exec from birth. An
+# `openpty(3)` pair is inheritable, so the child would keep a copy of its own master.
 aterm-pty = { workspace = true }
 # The forge cell matrix: a published triple that no forge cell compiles fails a test.
 aterm-forge = { workspace = true }

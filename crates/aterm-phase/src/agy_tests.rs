@@ -41,6 +41,13 @@ fn left(text: &str) -> bool {
     [EXITED, lab::EXIT, lab::BG_EXITED].contains(&text)
 }
 
+/// The screens no layout names agy on: the ones agy [`left`], and a frame one PTY
+/// read split mid-redraw ([`lab::SPLIT_HALF`]), its erase-below having taken the
+/// composer: a prefix of a screen, none agy drew whole.
+fn unnamed(text: &str) -> bool {
+    left(text) || text == lab::SPLIT_HALF
+}
+
 /// Every agy capture under `src/fixtures/`, by file name.
 fn captures() -> Vec<(String, String)> {
     crate::text::fixture_files()
@@ -714,7 +721,7 @@ fn claudes_and_codexs_readers_see_no_box_and_no_question_on_agy_screens() {
 /// program's NAME wins. With no name, or a runtime's, EVERY screen agy draws
 /// names it — its composer idle, busy and at a turn's end, each box, its
 /// trust box, its first run's onboarding, its survey and its sign-in wall —
-/// but the screen agy left. A screen with
+/// but the screen agy left and a frame caught half drawn ([`unnamed`]). A screen with
 /// agy's words and no frame names nothing. NEGATIVE CONTROL: the same box
 /// under `agy`.
 #[test]
@@ -727,7 +734,7 @@ fn a_shell_quoting_agy_is_not_agy() {
     }
     assert_eq!(identify(Some("agy"), &r).program(), Program::Agy);
     for (file, text) in captures() {
-        if left(&text) {
+        if unnamed(&text) {
             continue;
         }
         for name in [None, Some("node")] {
@@ -780,14 +787,14 @@ fn agy_is_named_and_busy_on_its_spinner_row() {
 /// THE SNIFF CLAIMS NO OTHER PROGRAM'S SCREEN: over every capture of Claude
 /// Code, Muse Code and Gemini CLI under `src/fixtures/`, agy's layout test says
 /// no, the screen is never identified as agy's, and agy's reader reads no
-/// box on it. The control: it says yes on agy's own (but the one agy left).
+/// box on it. The control: it says yes on agy's own (but the ones [`unnamed`]).
 #[test]
 fn the_agy_sniff_claims_no_other_programs_screen() {
     let mut swept = 0;
     for (name, text) in crate::text::fixture_files() {
         let r = screen(&text);
         if name.starts_with("agy-") {
-            assert_eq!(is_agy_screen(&r), !left(&text), "{name}");
+            assert_eq!(is_agy_screen(&r), !unnamed(&text), "{name}");
             continue;
         }
         swept += 1;
@@ -1441,6 +1448,13 @@ fn lab_readings() -> Vec<Lab> {
             sniffed: Program::Generic,
             ..lab(lab::BG_EXITED, "idle", false)
         },
+        // A frame split by a PTY read: no composer, no spinner row, no layout; its whole
+        // successor busy (`docs/measured/half-drawn-frame-2026-10-22.md`).
+        Lab {
+            sniffed: Program::Generic,
+            ..lab(lab::SPLIT_HALF, "idle", false)
+        },
+        lab(lab::SPLIT_WHOLE, "busy", true),
     ]
 }
 

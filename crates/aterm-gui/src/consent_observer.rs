@@ -133,9 +133,7 @@ const ANNOUNCED_CAP: usize = 64;
 /// the observer reports the format unrecognized.
 const FORMAT_DRIFT_LIMIT: u32 = 64;
 
-// ---------------------------------------------------------------------------
 // The three-valued availability
-// ---------------------------------------------------------------------------
 
 /// Why the observer cannot look. Every arm is a reason, never a measurement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,9 +221,7 @@ impl ObserverAvailability {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The parser: pure, and the only place a log line is understood
-// ---------------------------------------------------------------------------
 
 /// One recognized `tccd` message. `msg_id` stays raw text (`475.2921`): it is only a
 /// correlation key.
@@ -406,9 +402,7 @@ pub(crate) fn blocked_on_token(service: &str) -> String {
     format!("macos-permission:{short}")
 }
 
-// ---------------------------------------------------------------------------
 // The correlation table (pure)
-// ---------------------------------------------------------------------------
 
 /// One in-flight `tccd` request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -441,9 +435,8 @@ pub(crate) struct PendingPrompt<'a> {
     pub(crate) msg_id: &'a str,
     /// The TCC service, verbatim from the log.
     pub(crate) service: &'a str,
-    /// The process that is parked in the syscall: the `accessing=` pid when the
-    /// line carried one, else the `requesting=` pid (a self-request carries
-    /// only that). NEVER the `responsible=` pid.
+    /// The process parked in the syscall: the `accessing=` pid, else the `requesting=` pid (a
+    /// self-request carries only that). Never the `responsible=` pid.
     pub(crate) accessing_pid: i32,
     /// Which block the pid came from, so a reader can tell a direct request
     /// from a relayed one.
@@ -665,9 +658,7 @@ pub(crate) fn session_of_pid(
     None
 }
 
-// ---------------------------------------------------------------------------
 // The injected stream arm
-// ---------------------------------------------------------------------------
 
 /// One message from the streaming worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1128,9 +1119,7 @@ fn live_run_stream(sink: &StreamSink, _mode: ObserverMode) {
     ));
 }
 
-// ---------------------------------------------------------------------------
 // The instance's observer state
-// ---------------------------------------------------------------------------
 
 /// What a start attempt did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1263,13 +1252,9 @@ impl ObserverState {
         self.table.len()
     }
 
-    /// Start the stream. `mode` is `[privacy] observer` resolved by the caller
-    /// (and gated on the card's own switches for the sentinel) — this module
-    /// never reads config or environment itself.
-    ///
-    /// `poke` is the payload-free event-loop wake, abstracted exactly as the
-    /// warm-up's is so the posting discipline is unit-testable without an event
-    /// loop.
+    /// Start the stream. `mode` is `[privacy] observer` as the caller resolved it (the sentinel
+    /// is gated on the card's switches); this module reads no config or environment. `poke`
+    /// wakes the event loop.
     ///
     /// `Off` stops a stream that is running, so nothing is ever looked at
     /// under a request for nothing.
@@ -1382,9 +1367,8 @@ impl ObserverState {
         // lands after the last `try_recv` then finds it clear and pokes again
         // ([`StreamSink::poke_once`]).
         self.poked.swap(false, Ordering::AcqRel);
-        // The receiver is TAKEN for the pump and put back only if the stream is
-        // still connected, so the disconnect edge retires it exactly once and
-        // the fold below borrows `self` freely.
+        // The receiver is taken for the pump and put back only while connected, so the
+        // disconnect edge retires it once and the fold below borrows `self` freely.
         let mut queued: Vec<ObserverEvent> = Vec::new();
         let mut disconnected = false;
         if let Some(rx) = self.rx.take() {
@@ -1623,8 +1607,7 @@ impl ObserverState {
         for prompt in open {
             let pgid = pgid_of(prompt.accessing_pid);
             let Some(session) = owning_session(prompt.accessing_pid, pgid, &sessions) else {
-                // Not one of ours. Deliberately NOT marked announced: a prompt
-                // we cannot attribute is not a prompt we answered for.
+                // Not ours: left unannounced, so it pages if it later resolves to a session.
                 continue;
             };
             if self.announced.len() >= ANNOUNCED_CAP {
@@ -1904,9 +1887,7 @@ pub(crate) fn live_pgid_of(_pid: i32) -> Option<i32> {
     None
 }
 
-// ---------------------------------------------------------------------------
 // The attention path (§3.6)
-// ---------------------------------------------------------------------------
 
 /// One observed fact that may deserve the away human's attention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2072,9 +2053,7 @@ impl crate::App {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Test seams
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 impl ObserverState {
@@ -2115,9 +2094,7 @@ mod tests {
 
     use super::*;
 
-    // -----------------------------------------------------------------------
     // The parser, over recorded lines
-    // -----------------------------------------------------------------------
 
     /// `AUTHREQ_*` lines in the shapes `/usr/bin/log stream` prints (app names anonymized),
     /// keyed to one msgID. This attribution carries all three blocks: `responsible=` is the
@@ -2272,9 +2249,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Correlation
-    // -----------------------------------------------------------------------
 
     fn feed(table: &mut PendingTable, line: &str, now: Instant) {
         let event = parse_line(line).expect("recorded line parses");
@@ -2390,9 +2365,7 @@ mod tests {
         assert!(table.is_empty(), "expired");
     }
 
-    // -----------------------------------------------------------------------
     // Session attribution
-    // -----------------------------------------------------------------------
 
     #[test]
     fn owning_session_matches_the_pid_or_its_process_group_and_nothing_else() {
@@ -2443,9 +2416,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // The three-valued availability
-    // -----------------------------------------------------------------------
 
     #[test]
     fn unavailable_off_and_ok_are_three_distinct_values() {
@@ -2758,8 +2729,7 @@ mod tests {
                 .is_empty(),
             "the same dialog never pages twice"
         );
-        // …but the non-consuming read still reports it, because the session IS
-        // still blocked.
+        // The non-consuming read still reports it: the session is still blocked.
         assert_eq!(observer.verdicts(later, &sessions(), pgid).len(), 1);
 
         // A SECOND, DISTINCT dialog pages again.
@@ -3034,9 +3004,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The attention path
-    // -----------------------------------------------------------------------
 
     /// A global grant answers each session only through its observation time.
     /// Repeated refusals advance that session's fence without a new visible mark.
@@ -3115,9 +3083,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The sentinel
-    // -----------------------------------------------------------------------
 
     /// `AUTHREQ_PROMPTING` lines in the recorded field grammar (timestamps, ids and paths are not
     /// verbatim). The first is a program in a live tab (`Resp:` is aterm's window); the other two

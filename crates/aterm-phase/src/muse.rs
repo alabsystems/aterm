@@ -458,21 +458,37 @@ fn bottom_and_footer(rows: &[String]) -> Option<(usize, usize)> {
     plain_rule_width(&rows[bottom]).map(|_| (bottom, footer))
 }
 
-/// A composer's frame ([`Frame`]): the last `❯` row in column 0, a rule
-/// right above it (labelled or not), the first plain rule under it with no
-/// other rule between, and the footer under that at column 2 as the last
-/// row drawn — right under it, or under the background-work panel
-/// ([`bottom_and_footer`]). A rule between is a box's frame under a
+/// Whether `row` is the top rule of Muse Code's composer or of a box in its
+/// frame: a rule ([`is_rule`]), or the rule its label crowds below a rule's
+/// ten `─` in a pane under 40 columns. MEASURED on 1.4.11 at 26 to 40
+/// columns ([`fixtures::IDLE_NARROW`]): `── Voice input (⌥ + v to start) ─`
+/// closed by one `─` at 33 columns, the label alone at 32, cut with `…` at
+/// the row's end below that — and read as no rule, the composer was lost
+/// from 39 columns down, and with it the whole frame its readers and the
+/// window's harness read. Such a row opens with `── `, carries one of
+/// [`TOP_LABELS`], and holds none of a box's joints and sides.
+fn is_top_rule(row: &str) -> bool {
+    is_rule(row)
+        || (row.starts_with("── ")
+            && labelled(row)
+            && !row.contains(['┬', '┴', '┼', '├', '┤', '┌', '┐', '└', '┘', '│']))
+}
+
+/// A composer's frame ([`Frame`]): the last `❯` row in column 0, a top rule
+/// right above it (labelled or not, [`is_top_rule`]), the first plain rule
+/// under it with no other rule between, and the footer under that at column
+/// 2 as the last row drawn — right under it, or under the background-work
+/// panel ([`bottom_and_footer`]). A rule between is a box's frame under a
 /// message's `❯` row ([`approval_box`]). Muse Code erases its composer when
 /// it exits.
 fn any_frame(rows: &[String]) -> Option<Frame> {
     let caret = rows.iter().rposition(|r| r.starts_with('❯'))?;
     let top = caret.checked_sub(1)?;
-    if !is_rule(&rows[top]) {
+    if !is_top_rule(&rows[top]) {
         return None;
     }
     let bottom = (caret + 1..rows.len()).find(|&i| plain_rule_width(&rows[i]).is_some())?;
-    if rows[caret + 1..bottom].iter().any(|r| is_rule(r)) {
+    if rows[caret + 1..bottom].iter().any(|r| is_top_rule(r)) {
         return None;
     }
     let (under, footer) = bottom_and_footer(rows)?;
@@ -1808,9 +1824,7 @@ pub fn retrying(rows: &[String]) -> Option<Retry> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // The boxes.
-// ---------------------------------------------------------------------------
 
 /// `⟩ 1  Trust and continue` / `  2  Quit` → `(1, "Trust and continue",
 /// focused)`: the number, two blanks, the label.
@@ -2000,7 +2014,7 @@ fn approval_box(rows: &[String]) -> Option<Approval> {
     while box_option(&rows[first]).is_none() {
         first += 1;
     }
-    match (0..first).rev().find(|&i| is_rule(&rows[i])) {
+    match (0..first).rev().find(|&i| is_top_rule(&rows[i])) {
         Some(top) => {
             if !labelled(&rows[top]) || rows[top + 1..first].iter().any(|r| r.starts_with('❯')) {
                 return None;
@@ -2045,7 +2059,7 @@ fn is_wrap(row: &str) -> bool {
 fn is_edge_tail(row: &str) -> bool {
     !blank(row)
         && leading_spaces(row) == 0
-        && !is_rule(row)
+        && !is_top_rule(row)
         && !row.starts_with('❯')
         && box_option(row).is_none()
 }
@@ -2899,12 +2913,14 @@ pub fn launch_card_words<'a>(rows: &'a [String], place: &CardPlace) -> Option<[&
 
 /// Whether `row` is the composer's top rule at rest: the idle voice label
 /// (`── Voice input (⌥ + v to start) ──…`) and no other voice state
-/// (`Recording`, `Transcribing`, … are Muse Code's news, not its rest).
-/// The window's harness branding replaces this label on the glass; the
-/// grid keeps Muse Code's row for its readers.
+/// (`Recording`, `Transcribing`, … are Muse Code's news, not its rest) —
+/// in a narrow pane too, where as little as no `─` closes it
+/// ([`is_top_rule`]), but never cut: a label cut with `…` may be any
+/// state's that begins as it does. The window's harness branding replaces
+/// this label on the glass; the grid keeps Muse Code's row for its readers.
 #[must_use]
 pub fn is_idle_voice_rule(row: &str) -> bool {
-    is_rule(row) && crate::text::contains(row, const { anchor_text("muse.composer.voice") })
+    is_top_rule(row) && crate::text::contains(row, const { anchor_text("muse.composer.voice") })
 }
 
 /// The newest card of each kind over the composer (`/status`'s `MUSE CODE`
@@ -3136,6 +3152,13 @@ pub mod fixtures {
     pub const BOX_TRUST: &str = include_str!("fixtures/muse-1.4.9-R6297.1-box-trust.txt");
     /// Idle at its composer, no turn yet.
     pub const IDLE: &str = include_str!("fixtures/muse-1.4.9-R6297.1-idle.txt");
+    /// Idle at its composer in a narrow pane (1.4.11), one frame at each
+    /// width from 40 columns down to 26, each under its `## W columns` line
+    /// (`crate::prompt::fixtures::reflow_frames`): the top rule's label
+    /// closed by ten `─` at 40 columns, by one at 33, by none at 32, and cut
+    /// with `…` below that.
+    pub const IDLE_NARROW: &str =
+        include_str!("fixtures/muse-1.4.11-R6667.1-idle-narrow-26-40col.txt");
     /// A typed, unsent draft.
     pub const DRAFT: &str = include_str!("fixtures/muse-1.4.9-R6297.1-draft.txt");
     /// 2 s into a turn: the status row over the open composer.

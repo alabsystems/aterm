@@ -139,11 +139,9 @@ macro_rules! strippable_mark_ranges {
     };
 }
 
-/// A combining mark we DROP during folding (a non-spacing diacritic in a script
-/// whose base letters are written separately). Restricted to the ranges where
-/// stripping is safe: Latin, Greek, Cyrillic, Arabic harakat, Hebrew niqqud.
-/// Deliberately excludes Indic / Thai / SE-Asian spacing marks (category Mc),
-/// which are part of the syllable.
+/// A combining mark [`fold`] drops: a non-spacing diacritic in Latin, Greek, Cyrillic, Arabic
+/// (harakat) or Hebrew (niqqud), where stripping is safe. Indic, Thai and SE-Asian spacing marks
+/// (category Mc) are part of the syllable and stay.
 #[inline]
 #[must_use]
 const fn is_strippable_mark(c: char) -> bool {
@@ -175,15 +173,10 @@ macro_rules! no_space_script_ranges {
     };
 }
 
-/// True for a character that belongs to a *no-space* script (CJK ideographs,
-/// kana, Hangul, Thai, Lao, Khmer, …). Such scripts are matched by the maximal
-/// run scanner rather than the whitespace tokenizer, because they write words
-/// without separators.
-///
-/// Public (v3 §6): the sparkle-words custom-spec resolver must classify a
-/// user surface as spaced vs no-space with the SAME predicate the scanner
-/// uses (a spaced entry containing a CJK surface silently never matches, so
-/// the resolver emits it as a `cjk = true` entry instead).
+/// True for a character of a no-space script (CJK ideographs, kana, Hangul, Thai, Lao, Khmer).
+/// These scripts write words without separators, so the maximal-run scanner matches them rather
+/// than the whitespace tokenizer. Public so callers classify text with the scanner's predicate
+/// (see [`is_no_space_surface`](crate::is_no_space_surface)).
 #[inline]
 #[must_use]
 pub const fn is_no_space_script(c: char) -> bool {
@@ -226,8 +219,7 @@ macro_rules! kept_mark_ranges {
     };
 }
 
-/// A spacing/combining mark we KEEP (Indic / Thai etc.) — these are part of the
-/// token but are not stripped by `fold`.
+/// A spacing or combining mark [`fold`] keeps (Indic etc.): part of the token, never stripped.
 #[inline]
 const fn is_kept_mark(c: char) -> bool {
     // The lowest range is U+0900.
@@ -258,15 +250,10 @@ const _: () = {
     }
 };
 
-/// ASCII punctuation that signals a *code / path / URL* context rather than
-/// prose. A whole-word match immediately adjacent to one of these is suppressed
-/// (`cat.txt`, `/api/cat`, `--cat`, `cat=1`, `$cat`).
-///
-/// Public for the same reason as [`is_token_char`]: the typed-line kitty-command
-/// listener judges the context of a TYPED token (`./sit`, `sit=3`, `$play`
-/// must never move the pet), and it has to draw the code/prose line exactly
-/// where the screen scanner draws it. A re-implemented look-alike set would
-/// drift, and the two would disagree about the same word on the same row.
+/// ASCII punctuation that marks a code, path or URL context: a whole-word match adjacent to one is
+/// suppressed (`/api/cat`, `cat=1`, `$cat`). The scanner adds `-` and `.` by position (`--cat`,
+/// `cat.txt`). Public so the typed-line kitty-command listener (`./sit`, `sit=3`, `$play` never
+/// move the pet) draws the code/prose line where the screen scanner does.
 #[inline]
 #[must_use]
 pub const fn is_code_adjacent_punct(c: char) -> bool {

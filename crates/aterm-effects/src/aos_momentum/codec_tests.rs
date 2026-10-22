@@ -657,3 +657,114 @@ fn the_status_names_the_mode_code_and_build() {
         "{line}"
     );
 }
+
+/// The quad encoding as first written: nine field writes, in field order.
+fn quads_field_by_field(e: &mut Enc, quads: &[GlowQuad]) {
+    e.u64(quads.len() as u64);
+    for q in quads {
+        e.u16(q.row);
+        e.u16(q.x);
+        e.u16(q.y);
+        e.u16(q.w);
+        e.u16(q.h);
+        e.u32(q.color);
+        e.u8(q.alpha);
+        e.u32(q.color2);
+        e.u8(q.alpha2);
+    }
+}
+
+/// A quad drawn from `r`, every field over its whole range (the extremes included).
+fn random_quad(r: &mut super::test_fixtures::Rng) -> GlowQuad {
+    let mut field = |max: u64| match r.below(4) {
+        0 => 0,
+        1 => max,
+        _ => r.next() & max,
+    };
+    GlowQuad {
+        row: field(u64::from(u16::MAX)) as u16,
+        x: field(u64::from(u16::MAX)) as u16,
+        y: field(u64::from(u16::MAX)) as u16,
+        w: field(u64::from(u16::MAX)) as u16,
+        h: field(u64::from(u16::MAX)) as u16,
+        color: field(u64::from(u32::MAX)) as u32,
+        alpha: field(u64::from(u8::MAX)) as u8,
+        color2: field(u64::from(u32::MAX)) as u32,
+        alpha2: field(u64::from(u8::MAX)) as u8,
+    }
+}
+
+/// Each quad is encoded as one 20-byte write; the bytes are the nine field writes' exactly,
+/// for single quads and whole streams of random quads at every field's extremes, and a frame
+/// observation's encoding is the frame encoder's on the same quads. Non-vacuity: a quad
+/// differing in any one field encodes differently.
+#[test]
+fn one_twenty_byte_write_per_quad_appends_what_the_nine_field_writes_append() {
+    let schema = MomentumSchema::new(Instant::now());
+    let mut r = super::test_fixtures::Rng::new(0x51ab_2026_1022);
+    for n in [0usize, 1, 2, 3, 7, 64, 1337] {
+        for _ in 0..8 {
+            let out: Vec<GlowQuad> = (0..n).map(|_| random_quad(&mut r)).collect();
+            let under: Vec<GlowQuad> = (0..n / 2).map(|_| random_quad(&mut r)).collect();
+            let (mut now, mut then) = (Enc::new(), Enc::new());
+            super::encode_quads(&mut now, &out);
+            quads_field_by_field(&mut then, &out);
+            assert_eq!(now.as_bytes(), then.as_bytes(), "{n} quads");
+            assert_eq!(now.len(), 8 + super::QUAD_LEN * n);
+            for fill in [None, Some(0), Some(u32::MAX)] {
+                let frame = crate::cursor_momentum::MomentumGlowFrame {
+                    fill,
+                    hot: r.below(2) == 1,
+                    fp: r.next(),
+                };
+                let mut want = Enc::new();
+                want.u8(2);
+                want.opt(frame.fill, |e, f| e.u32(f));
+                want.bool(frame.hot);
+                want.u64(frame.fp);
+                quads_field_by_field(&mut want, &out);
+                quads_field_by_field(&mut want, &under);
+                let mut shared = Enc::new();
+                super::encode_frame(&mut shared, &frame, &out, &under);
+                assert_eq!(shared.as_bytes(), want.as_bytes(), "{n} quads, {fill:?}");
+                let obs = MomentumObservation::Frame {
+                    fill: frame.fill,
+                    hot: frame.hot,
+                    fp: frame.fp,
+                    out: out.clone(),
+                    under: under.clone(),
+                };
+                assert_eq!(encode_observation(&schema, &obs), want.as_bytes());
+                assert!(want.len() <= super::frame_room(out.len() + under.len()));
+            }
+        }
+    }
+    let q = random_quad(&mut r);
+    let base = super::quad_bytes(&q);
+    let changed = [
+        GlowQuad { row: !q.row, ..q },
+        GlowQuad { x: !q.x, ..q },
+        GlowQuad { y: !q.y, ..q },
+        GlowQuad { w: !q.w, ..q },
+        GlowQuad { h: !q.h, ..q },
+        GlowQuad {
+            color: !q.color,
+            ..q
+        },
+        GlowQuad {
+            alpha: !q.alpha,
+            ..q
+        },
+        GlowQuad {
+            color2: !q.color2,
+            ..q
+        },
+        GlowQuad {
+            alpha2: !q.alpha2,
+            ..q
+        },
+    ];
+    for c in &changed {
+        assert_ne!(super::quad_bytes(c), base, "{c:?} against {q:?}");
+    }
+}

@@ -1032,12 +1032,11 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
         "the trial stays armed"
     );
     assert!(rollback.exists(), "and the predecessor stays on disk");
-    // …and the wait is SAID where `update status` reads it, with its deadline
-    // (law L5) — read from the trial's own records…
+    // …and the wait is said where `update status` reads it, with its deadline (law L5),
+    // read from the trial's own records…
     window_trial_wait_at(&s, 11, unix_now_secs()).expect("the trial waits");
-    // …never written over what the older build's window keeps there: a headless
-    // confirmation inside the wait must not replace it with a refusal keyed to
-    // build 11, which the window would ignore.
+    // …never written over what the older build's window keeps there: a refusal keyed to
+    // build 11 would replace it, and that window would ignore it.
     let ledger = Health::read(&s.health());
     assert_eq!(
         ledger.last_apply_refusal, standing,

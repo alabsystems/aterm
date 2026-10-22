@@ -355,7 +355,7 @@ fn an_alab_command_restore_error_is_a_failed_outcome() {
     );
 }
 
-/// CODEX-OLD IS ALWAYS THE VENDOR'S BYTES (owner ruling 2026-10-20: `codex` is codex-alab
+/// CODEX-OLD IS ALWAYS THE VENDOR'S BYTES (`codex` is codex-alab
 /// where ALab builds it, upstream Codex is `codex-old`, both bundled). With `codex` on an
 /// active ALab build that its lane keeps without reading a head, the codex-old lane reads
 /// OpenAI's head and lands OpenAI's package in its own store: its shim and twin run that

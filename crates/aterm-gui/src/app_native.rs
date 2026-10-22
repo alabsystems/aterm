@@ -54,6 +54,25 @@ pub(crate) const MESSAGES_FEEDBACK_WAIT: std::time::Duration =
 #[cfg(test)]
 thread_local! {
     static NATIVE_UI_COMPILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static NATIVE_PREVIEW_INSTANT: std::cell::Cell<Option<std::time::Instant>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Hold one native-preview instant across a capture's cadence and semantic reads.
+#[cfg(test)]
+pub(crate) fn with_native_preview_instant_for_test<T>(
+    now: std::time::Instant,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<std::time::Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NATIVE_PREVIEW_INSTANT.with(|clock| clock.set(self.0));
+        }
+    }
+    let _restore = Restore(NATIVE_PREVIEW_INSTANT.with(|clock| clock.replace(Some(now))));
+    run()
 }
 
 /// Real semantic compiler entries on this test thread; warm native redraws
@@ -633,7 +652,7 @@ fn read_native_update_reconcile_facts_with(
     let observed_at = std::time::Instant::now();
     let durable = read_durable();
     let installable = durable.as_ref().and_then(|durable| durable.installable);
-    // A refusal that is a VERDICT (an unsigned or tampered bundle) is a fact: the
+    // A refusal that is a verdict (an unsigned or tampered bundle) is a fact: the
     // installed facts name no verified bundle. Only a check that did not finish is
     // the absence of an observation.
     let (installed, installed_unproven) = match read_installed() {
@@ -1325,11 +1344,11 @@ pub(crate) enum HandoffFailureLane {
     /// desk changes, or after [`CAPTURE_REFUSAL_BACKSTOP`].
     Refused,
     /// The stage waits for an update check to confirm its signer against a current
-    /// machine roster ([`crate::UpdateHandoffOutcome::StageUnconfirmed`], round
-    /// eight #503's review), whoever asked (`automatic` says who). No failure:
-    /// nothing is charged, latched or booked as one; the automatic lane holds for
-    /// the check ([`crate::AutoApplyRosterWait`]) and the outcome is a deferral,
-    /// which the ledger keeps as the standing refusal that names the wait.
+    /// machine roster ([`crate::UpdateHandoffOutcome::StageUnconfirmed`]), whoever
+    /// asked (`automatic` says who). No failure: nothing is charged, latched or
+    /// booked as one; the automatic lane holds for the check
+    /// ([`crate::AutoApplyRosterWait`]) and the outcome is a deferral, which the
+    /// ledger keeps as the standing refusal that names the wait.
     /// Unix: only [`Self::classify`] (the unix handoff's) files one.
     #[cfg(unix)]
     AwaitsRosterConfirmation { automatic: bool },
@@ -2149,6 +2168,16 @@ pub(crate) fn execute_native_config_persistence(
 }
 
 impl App {
+    pub(crate) fn native_preview_phase_ms(&self) -> u64 {
+        #[cfg(test)]
+        let now = NATIVE_PREVIEW_INSTANT
+            .with(std::cell::Cell::get)
+            .unwrap_or_else(std::time::Instant::now);
+        #[cfg(not(test))]
+        let now = std::time::Instant::now();
+        u64::try_from(now.saturating_duration_since(self.lat_epoch).as_millis()).unwrap_or(u64::MAX)
+    }
+
     /// Main-thread projection for the control socket's front-input
     /// authorization fence. Overlay identity wins (it consumes events first);
     /// otherwise native Settings, and its Harness page, are distinguished from
@@ -2542,7 +2571,7 @@ impl App {
         }
     }
 
-    /// A LINUX BUILD HELD FOR A PERSON IS ON THE BAND (ATERM-KI-1015-2, U21).
+    /// A LINUX BUILD HELD FOR A PERSON IS ON THE BAND.
     /// With automatic install off, a Linux check downloads a newer build and
     /// holds it for `aterm update apply`; the macOS apply authority takes no
     /// Linux stage (`staged_from_status`), so Settings ▸ Software Update showed
@@ -2925,8 +2954,7 @@ impl App {
             .native_runtime
             .document_id(instance)
             .and_then(|document| self.document_store.snapshot(document));
-        let animation_phase_ms =
-            u64::try_from(self.lat_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let animation_phase_ms = self.native_preview_phase_ms();
         let semantic_font = self.prepare_native_semantic_font(wid, view, animation_phase_ms);
         let tree = self
             .native_runtime
@@ -6682,14 +6710,11 @@ impl App {
             "aterm-packages-verb",
             crate::qos::Role::Background,
             move || {
-                // Same lane, store and children as the six-hourly pass. Nobody
-                // blocks on it, and a QoS role does not pass from a thread's
-                // creator (see qos.rs).
-                // atpkg records durable status in status.toml; the process result
-                // is kept separately because that status may predate a failed
-                // launch or non-zero exit. Stderr is kept: atpkg explains refusals
-                // there (commonly another process holding the store lock during a
-                // multi-GB download).
+                // Background, like the six-hour pass: nobody blocks on it, and a QoS
+                // role does not pass from a thread's creator (qos.rs).
+                // atpkg records durable status in status.toml; the process result is
+                // kept separately because that status may predate a failed launch or
+                // non-zero exit. Stderr is kept: atpkg explains refusals there.
                 let mut command = PackagesCommandOutcome::Succeeded { operation: busy };
                 let mut machine_verdict: Option<String> = None;
                 let mut machine_state: Option<atpkg::machine::MachineState> = None;
@@ -6731,11 +6756,10 @@ impl App {
                     // QoS-classed spawner: a background pass must not compete with
                     // the window for the scheduler.
                     let mut child = crate::qos::atpkg_command(&atpkg);
-                    // The check is the window's own pass: the same argv
-                    // (`--wait-lock` with the lanes' bound, `--progress-file`), the
-                    // spawner's pid and the login shell's PATH, so a window quitting
-                    // mid-check hands the child to the orphan watch, and its waiting
-                    // row streams like any pass's. Both passes lead with the private
+                    // The check is the window's own pass: the same argv (`--wait-lock`
+                    // with the lanes' bound, `--progress-file`), the spawner's pid and
+                    // the login shell's PATH, so a window quitting mid-check hands the
+                    // child to the orphan watch. Both passes lead with the private
                     // window's flag: the `atpkg` beside a dev build may lack a seam.
                     if check {
                         child
@@ -7507,26 +7531,14 @@ impl App {
         self.try_pending_native_auto_apply(true);
     }
 
-    /// THE AUTOMATIC LANE'S DEADLINES ARE CALENDAR TIME (2026-09-30). Each is a
-    /// promise to the owner: `update status` names the wall-clock time of the
-    /// latch's next retry, stand-down end or re-sample, the convergence notice
-    /// says "in 24 h" and "every 6 h", and a refused retire "tries again in N
-    /// min". Each is an `Instant`, and on macOS that is `CLOCK_UPTIME_RAW`, which
-    /// stops while the Mac sleeps: "24 h" meant a day AWAKE, several on a laptop
-    /// that sleeps at night.
-    ///
-    /// So every turn of the event loop brings them forward by the time the Mac
-    /// slept since the turn before: how far the wall clock (`wall`) ran ahead of
-    /// the monotonic one (`now`) since the two were last read
-    /// (`App::update_deadline_clock`). A wall clock stepped back counts nothing,
-    /// so no deadline ever comes later than it would have; none is brought past
-    /// `now`; and the drift of two clock reads never counts
-    /// ([`SLEEP_COUNTS_FROM`]). A wall clock stepped FORWARD reads as a sleep and
-    /// can bring a retry sooner, the trade the harness host's wall-clock look
-    /// makes too; so can a sleep that lands mid-turn, after this read, on a
-    /// deadline that turn then mints. What a deadline does once due is
-    /// unchanged, and the physical budget's replenish window stays awake time,
-    /// which can only remember the bytes longer.
+    /// Bring the automatic lane's deadlines forward by the time the Mac slept since the
+    /// last turn of the event loop. They are promises in calendar time, but each is an
+    /// `Instant`, which on macOS (`CLOCK_UPTIME_RAW`) stops during sleep. The sleep is how
+    /// far `wall` ran ahead of `now` since `App::update_deadline_clock` last read both: a
+    /// wall clock stepped back counts nothing, no deadline moves past `now`, read drift
+    /// never counts ([`SLEEP_COUNTS_FROM`]), and a wall clock stepped forward reads as a
+    /// sleep and can bring a retry sooner. The physical budget's replenish window stays
+    /// awake time, which only errs toward remembering the bytes longer.
     ///
     /// Returns the sleep it counted, for the other calendar clocks
     /// ([`Self::count_sleep_toward_messages_clock`]); `None` when none counts.

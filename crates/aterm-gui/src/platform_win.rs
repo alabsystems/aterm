@@ -353,8 +353,8 @@ fn validate_window_capture_transfer(
     Ok(())
 }
 
-/// The `HWND` behind a winit [`Window`], or `None` when there is no Win32 handle
-/// (headless / not-yet-realized). Mirrors `main.rs::window_hwnd`.
+/// The `HWND` behind a winit [`Window`], or `None` with no Win32 handle (headless or not yet
+/// realized). Mirrors `App::window_hwnd`.
 pub(crate) fn hwnd_of(window: &Window) -> Option<isize> {
     let handle = window.window_handle().ok()?;
     match handle.as_raw() {
@@ -507,19 +507,11 @@ pub(crate) fn read_chrome_lines(
         CHROME_BG_UNKNOWN => "n/a".to_string(),
         surface => format!("#{surface:06x}"),
     };
-    // H1: which CLIENT-AREA presentation path this process runs — `visual` (the
-    // DirectComposition swapchain: padding/chrome-bleed margins carry per-pixel
-    // alpha and the DWM backdrop shows through them) or `opaque` (the default
-    // HWND swapchain: the client area covers the backdrop completely, so
-    // `backdrop=` above styles ONLY the caption). Ground truth from the built
-    // GPU instance, not from config intent — so introspection can tell "the
-    // material is configured" apart from "the material can actually reach the
-    // client pixels" (the distinction the pre-H1 doc got wrong).
-    //
-    // AND, when it is opaque DESPITE a material being asked for, WHY — the
-    // qualifier in `opaque(hdr_glow)` etc. (see [`CLIENT_BACKDROP_DECLINE`]).
-    // Without it the row affirmed the shortfall without ever naming a cause, and
-    // the cause only existed as stderr text a windowed launch throws away.
+    // Which client-area presentation path this process runs: `visual` (the DirectComposition
+    // swapchain, whose padding and chrome-bleed margins carry per-pixel alpha so the DWM
+    // backdrop shows through) or `opaque` (the HWND swapchain covers the backdrop, so
+    // `backdrop=` styles only the caption). Read from the built GPU instance, not config; when
+    // opaque despite a material, the qualifier names why (see [`CLIENT_BACKDROP_DECLINE`]).
     let client = if aterm_gpu::visual_swapchain_active() {
         "visual".to_string()
     } else {
@@ -551,7 +543,7 @@ pub(crate) fn read_chrome_lines(
         "off"
     };
     // `reduce_motion` is the SPI answer, i.e. Settings ▸ Accessibility ▸ Visual
-    // effects ▸ "Animation effects" turned OFF.
+    // effects ▸ "Animation effects" turned off.
     let reduce_motion = AppRtWindows {
         probe_preferences: true,
     }
@@ -904,15 +896,10 @@ fn force_hc_chrome_env() -> bool {
     aterm_types::dev_seam!("ATERM_FORCE_HC_CHROME").is_some_and(|v| v != "0" && !v.is_empty())
 }
 
-/// Re-read High Contrast and republish the forced chrome palette; `true` when the
-/// palette MOVED (HC turned on or off, or the user switched between two HC schemes —
-/// the second of which no accessibility PREFERENCE can see, since `high_contrast`
-/// stays `true` across it).
-///
-/// Also refreshes the [`CHROME_HIGH_CONTRAST`] latch, so this is the ONE
-/// `SPI_GETHIGHCONTRAST` read shared by the palette, the caption resolver and
-/// [`AppRtWindows::native_appearance_preferences`] — they can never disagree
-/// because there is one read.
+/// Re-read High Contrast and republish the forced chrome palette; `true` when the palette moved
+/// (HC turned on or off, or a switch between two HC schemes, which no accessibility preference
+/// sees). Also refreshes [`CHROME_HIGH_CONTRAST`], so the palette, the caption resolver and
+/// [`AppRtWindows::native_appearance_preferences`] share one `SPI_GETHIGHCONTRAST` read.
 ///
 /// The OS accent colour is re-read here too ([`system_accent_read`]): every seam
 /// that settles the OS chrome palette (startup, attach, the settings hook's
@@ -1467,7 +1454,7 @@ pub(crate) fn verify_chrome_appearance(window: &Window) {
 // `crash_journal::END_SESSION_SNAPSHOT_TTL`) against a shutdown that would otherwise
 // lose EVERYTHING. A tab's standing words about typing (its Autopilot word and
 // timer, its holds) are never stale: a change is published on the loop turn that
-// made it (ATERM-KI-1016-1), so a Land, Off or hold set just before a logoff is
+// made it, so a Land, Off or hold set just before a logoff is
 // what the reopened tab carries.
 //
 // HONEST LIMITS. (1) The layout is up to ~2 s stale — a tab opened in the final
@@ -1501,7 +1488,7 @@ const WM_QUERYENDSESSION: u32 = 0x0011;
 const WM_ENDSESSION: u32 = 0x0016;
 const WM_NCDESTROY: u32 = 0x0082;
 const WM_GETOBJECT: u32 = 0x003D;
-/// `WM_SYSCOLORCHANGE` — the system palette moved (H4's input).
+/// `WM_SYSCOLORCHANGE`: the system palette (the forced HC chrome's input) moved.
 const WM_SYSCOLORCHANGE: u32 = 0x0015;
 /// `WM_SETTINGCHANGE` (a.k.a. `WM_WININICHANGE`) — an SPI-backed or shell setting
 /// moved. Broadcast, hence invisible to winit's `GetMessage` hook.

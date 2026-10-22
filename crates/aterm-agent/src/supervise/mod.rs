@@ -26,12 +26,16 @@
 //! * [`report`]: what the worker said since the manager's turn, with the rows a
 //!   fullscreen app scrolled off.
 //! * [`limit`]: when a limit notice says it resets, as a Unix time.
+//! * [`occupancy`]: what the harness measures of a session's wait on its own background work
+//!   (the hold's clock), under `[harness] occupancy`; [`facts`]: which measured episodes a
+//!   session has been told.
 
 pub mod approvals;
 pub mod background;
 pub mod blocks;
 pub mod classify;
 pub mod config;
+pub mod facts;
 pub(crate) mod fx;
 pub mod ladder;
 // The phase reader and the prompt parser live in `aterm-phase` (the server's
@@ -42,6 +46,7 @@ pub mod ledger;
 pub mod ledger_html;
 pub mod limit;
 pub mod memory;
+pub mod occupancy;
 pub mod policy;
 pub mod report;
 pub mod run;
@@ -52,7 +57,7 @@ pub mod transport;
 pub use background::{BackgroundCall, BackgroundEvidence};
 pub use blocks::View;
 pub use classify::{DEFAULT_PYTHON_ALLOW, classify_command_with};
-pub use config::{Autopilot, LandAt, SupervisorConfig};
+pub use config::{Autopilot, LandAt, Occupancy, SupervisorConfig};
 pub use journal::{Journal, read_journal};
 pub use ledger::{
     ClockAnchor, Format as LedgerFormat, LedgerHost, LedgerOpts, LedgerSource, gather, parse_since,

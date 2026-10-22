@@ -19,7 +19,7 @@
 // of 2 ms or more were that pause. The `user_event` handler had returned
 // after about 1 us, and the thread then sat off-CPU for 10.0 ms before the
 // next event was dispatched. That set the `max_turn_ms` of about 10 ms the
-// round-1 stall runs could not explain.
+// stall runs could not explain.
 //
 // WHAT. A `VecDeque` behind an `os_unfair_lock` that senders take for one
 // push. The receiver only ever try-locks it. Every holder of the lock is a
@@ -48,7 +48,7 @@
 // send costs 0.17 us here against 0.04 us, and an uncontended one 0.04 us with
 // either.
 //
-// COALESCED WAKES (2026-10-17, round-3 sweep item 39). A wake is a
+// COALESCED WAKES (2026-10-17 sweep item 39). A wake is a
 // `CFRunLoopSourceSignal` plus a `CFRunLoopWakeUp`, which sends a mach message
 // holding the run loop's own lock, the lock the main thread takes on every
 // turn. Signalled per send, a 10-tab output flood made one wake per event,

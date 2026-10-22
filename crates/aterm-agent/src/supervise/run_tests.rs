@@ -131,6 +131,24 @@ impl ServerLaunch {
     }
 }
 
+/// A scripted server: each `call` pops the next reply and records the request; screens are
+/// served in order from `screens` (the last repeats).
+///
+/// Built in: the content seq advances on every read; `await seq <n>` latches only while
+/// another screen is to come and times out on the last; a modern `key if=` is judged against
+/// the last served screen by the server's own `aterm_observe::row_matcher` (`OK seq=<n>` on a
+/// match, else `OK skipped seq=<n>`, `ERR badregex` for a bad pattern), and an older host
+/// answers it with a bare `ERR`. `await idle` answers at once; with `idle_skips_busy` it
+/// passes over the busy screens next in the script when another follows, as a spinner never
+/// holds still for the real `await idle 2000`.
+///
+/// A handoff: `by_index` answers chosen requests (by arrival order) ahead of every other
+/// rule, and from `down`'s index on every request gets `down`'s reply. From
+/// `drop_awaits_from` on every `await` is [`closed`] while reads are served. The first lost
+/// reply served restarts the content seq at `handoff_seq`, as the adopting instance counts
+/// from its own start; `restart` restarts it with no request failing. `await seq <n>` for an
+/// `n` the content has not reached never latches, as on the real server. `delay` holds a
+/// request's answer back.
 struct Mock {
     requests: Vec<String>,
     /// Replies to non-`text`, non-`key` requests, in order (missing = the
@@ -384,9 +402,9 @@ struct Mock {
     /// `OK`): a cap's refusal, a lost request. One not `OK` leaves
     /// [`Self::needs_attention`] as it was.
     needs_replies: VecDeque<CtlReply>,
-    /// Claude Code's digit rule for a rating card: a `0` pressed within
-    /// this long of the first read that served the card is DROPPED (it stays in
-    /// the composer as text). `None`: a card takes its digit at once.
+    /// Claude Code's digit rule for a rating card: a `0` pressed within this long of the
+    /// first read that served the card is dropped (it stays in the composer as text).
+    /// `None`: a card takes its digit at once.
     card_ignores_within: Option<Duration>,
     card_first_served: Option<Instant>,
     /// The `0`s a guarded press wrote inside that window.
@@ -425,6 +443,9 @@ struct Mock {
     /// count of submissions written to the session (aterm-gui's
     /// `submit_count`); a screen with none sends none, as an older host.
     submits_on: BTreeMap<usize, u64>,
+    /// The screens (by index) whose reads say they caught the program's DEC 2026 frame
+    /// unfinished (`"frame":"open"`): a redraw the server read midway.
+    open_on: std::collections::BTreeSet<usize>,
     /// `text --json`'s `"inputs"` on each screen (by index): the host's
     /// count of input writes before the rows (`None`: one in flight) and
     /// after them (aterm-gui's `input_settled`, `input_sent`); a screen with
@@ -438,9 +459,8 @@ struct Mock {
     /// [`Self::human_seq_on`] puts on the wire), so a `person` mark reads
     /// `since` once that count moved.
     launch: Option<ServerLaunch>,
-    /// This many `key` requests find a PERSON keyed just before them —
-    /// the count moved past every read so far — as the round trip
-    /// between the loop's read and its key allows.
+    /// This many `key` requests find a person keyed just before them (the count moved past
+    /// every read so far), as the round trip between the loop's read and its key allows.
     person_at_key: usize,
     /// The same as [`Self::person_at_key`], for `send`.
     person_at_send: usize,
@@ -527,11 +547,10 @@ struct Mock {
     /// The session each [`Ctl::call_at_host_of`] aimed its request at, in
     /// order (the request itself is served as [`Ctl::call`] serves it).
     aimed: Vec<String>,
-    /// `await gone` judged as the server judges it: on the screen current
-    /// during the wait (the next to be served, when the worker moved on),
-    /// only over its `rows <a> <b>`; a row still matching runs the wait out
-    /// (`OK timeout`, counted in [`Self::gone_held`]). Off: any screen
-    /// still to come latches it.
+    /// `await gone` judged as the server judges it: on the screen current during the wait
+    /// (the next to be served, when the worker moved on), only over its `rows <a> <b>`; a row
+    /// still matching runs the wait out (`OK timeout`, counted in [`Self::gone_held`]). Off:
+    /// any screen still to come latches it.
     gone_on_next: bool,
     /// How many `await gone` waits ran out under [`Self::gone_on_next`].
     gone_held: usize,
@@ -573,8 +592,8 @@ struct Mock {
     /// What the `search` header carries after its count (` incomplete
     /// rewrapping`: a search that may have left out newer rows).
     search_qualifier: &'static str,
-    /// Claude Code's `/usage` panel as a world that REACTS to the loop's
-    /// writes ([`PanelWorld`]); `None`: the script alone, as ever.
+    /// Claude Code's `/usage` panel as a world that reacts to the loop's writes
+    /// ([`PanelWorld`]); `None`: the script alone.
     panel: Option<PanelWorld>,
     /// Claude Code's limit-reset program as a world that reacts to the
     /// loop's keys ([`ResetWorld`]); `None`: the script alone.
@@ -916,9 +935,8 @@ struct ResetWorld {
     /// focus on the row's value): Claude Code 2.1.304 draws a row per kind
     /// of reset as its offers come in, while the dialog is up.
     drawn_at_arrow: Option<(usize, String)>,
-    /// A PERSON presses Enter on the confirmation's yes, at the first
-    /// read of it this long after it mounted: the claim begins with no
-    /// key of the loop's.
+    /// A person presses Enter on the confirmation's yes at the first read of it this long
+    /// after it mounted: the claim begins with no key of the loop's.
     yes_by_person_after: Option<Duration>,
     /// The screen while the vendor claims (`Resetting your limits…`
     /// under the confirmation's title, as composed).
@@ -1270,6 +1288,7 @@ impl Mock {
             human_seq: None,
             human_seq_on: BTreeMap::new(),
             submits_on: BTreeMap::new(),
+            open_on: std::collections::BTreeSet::new(),
             inputs_on: BTreeMap::new(),
             launch: None,
             person_at_key: 0,
@@ -1658,8 +1677,8 @@ impl Mock {
         self.scrollback.get_or_insert_with(Vec::new);
         self.alt_screen.get_or_insert(false);
     }
-    /// The screen the loop is on sits until a `turn` releases it
-    /// ([`Self::turn_releases`], [`Self::turn_gates`]).
+    /// The screen the loop is on sits until a `turn`, a `key` or the loop's badge releases it
+    /// ([`Self::turn_releases`], [`Self::key_releases`] and the gates).
     fn held(&self) -> bool {
         self.turn_releases
             .is_some_and(|i| self.served == i + 1 && !self.turned)
@@ -1769,8 +1788,11 @@ impl Mock {
         if let Some(n) = self.submits_on.get(&i) {
             human.push_str(&format!(",\"submits\":{n}"));
         }
-        // `dims.rows` is the PANE's height, as the server sends it: the
-        // screen's whole height, whatever slice `tail=` served.
+        if self.open_on.contains(&i) {
+            human.push_str(",\"frame\":\"open\"");
+        }
+        // `dims.rows` is the pane's height, as the server sends it, whatever slice `tail=`
+        // served.
         format!(
             "{{\"rows\":[{}],\"cursor\":{{\"row\":{cursor_row},\"col\":{composer_col},\"visible\":true,\"style\":\"block\"}},\"dims\":{{\"rows\":{},\"cols\":{}}},\"seq\":{}{generation}{human}{first}}}\n",
             rows.join(","),
@@ -3807,12 +3829,11 @@ fn auto(max_s: u64) -> SuperviseOpts {
         context_warn: 10,
         journal: None,
         ledger: None,
-        // The safe approval rules alone (an rm breaker they cannot prove
-        // is a person's, `rm_breaker_ask`), and every turn-end act limited
-        // except a usage limit's resume, which only a test that sets it
-        // reaches ([`resuming`]): these tests pin the approval loop, and a
-        // turn's end types nothing here. The captured trust dialog's folder
-        // is under a trust root, as a person names one: none is by default.
+        // The safe approval rules alone (`rm_breaker_ask`: an rm breaker they cannot prove
+        // is a person's) and every turn-end act off ([`resuming`] turns a usage limit's resume
+        // on): these tests pin the approval loop, and a turn's end types nothing here. A trust
+        // root covers the captured trust dialog's folder, as a person names one (the default
+        // has none).
         policy: SupervisorConfig {
             approve: Approve::Safe,
             trust_roots: vec!["/private/tmp/claude-502/scratch/work*".to_string()],
@@ -3871,14 +3892,9 @@ fn resuming(opts: &SuperviseOpts, rules: Option<PathBuf>) -> SuperviseOpts {
     o
 }
 
-/// A dead footer: after `/exit` and a fresh `claude` with no `clear`, the
-/// dead process's `esc to interrupt` footer stays above the new launch
-/// card. The loop reads the new session busy through `tail=40`, and the
-/// wait for the turn's footer to leave is armed over the live zone only
-/// (`rows 33 49`), so the question dialog drawn in place latches it at
-/// once. The server judges `await gone` as the real one does
-/// ([`Mock::gone_on_next`]); the only wait that runs out is the first,
-/// armed before any read, and capped ([`UNSCOPED_CAP`]).
+/// After `/exit` and a fresh `claude`, the dead process's `esc to interrupt` footer stays
+/// above the new launch card: the footer wait is armed over the live zone only (`rows 33
+/// 49`), so the dialog latches it; only the first, unscoped wait runs out ([`UNSCOPED_CAP`]).
 #[test]
 fn a_dead_footer_above_the_live_zone_holds_no_wait() {
     use aterm_phase::prompt::fixtures as f;
@@ -3933,12 +3949,9 @@ fn a_box_under_a_dead_footer_is_read_again_at_once() {
     );
 }
 
-/// A tail read is scoped to its rows even where the live zone starts at
-/// the first of them: the rows above a `tail=40` read were never seen. A
-/// 73-row pane with blank rows under the REPL: the tail is rows 33-72, the
-/// new session's zone starts at its first row, and the wait is `rows 33
-/// 72`, so the dialog drawn next latches it at once. Negative control: the
-/// turn still running when the wait is armed runs the scoped wait out.
+/// The rows above a `tail=40` read were never seen, so the wait is scoped to the tail's rows
+/// (`rows 33 72` on a 73-row pane) even where the live zone starts at its first row. Negative
+/// control: a turn still running runs it out.
 #[test]
 fn a_tail_whose_live_zone_starts_at_its_first_row_is_still_scoped() {
     use aterm_phase::prompt::fixtures as f;
@@ -3979,9 +3992,8 @@ fn a_tail_whose_live_zone_starts_at_its_first_row_is_still_scoped() {
     assert_eq!(m.gone_held, 2, "{:#?}", m.requests);
 }
 
-/// A span the grid no longer has (a resize since the read shrank it
-/// under the span's first row: `ERR bad rows`) ends the wait as a latch
-/// does, and the next read arms it again — never the loop's end.
+/// `ERR bad rows` (a resize shrank the grid under the span) ends the wait as a latch does and
+/// the next read arms it again; it never ends the loop.
 #[test]
 fn a_span_the_grid_no_longer_has_is_read_again() {
     use aterm_phase::prompt::fixtures as f;
@@ -4113,6 +4125,86 @@ fn an_idle_read_torn_mid_repaint_is_read_again_after_the_settle() {
     );
 }
 
+/// A READ STILL OPEN AFTER THE REREADS IS OUTPUT ARRIVING, never a point (R1 of the half-drawn
+/// frame review, 2026-10-22). A program that opens a new DEC 2026 frame before each read lands
+/// can leave every one of [`FRAME_REREADS`] rereads inside one, and the whole-frame read then
+/// hands back the last as it stands with the server's word that its frame was open
+/// ([`Session::whole_frame`]): the loop takes that for a redraw caught midway (`writing`) and
+/// reads again, so the reply's end decides. The screen is whole in its geometry (no tear for
+/// [`aterm_phase::ScreenReader::frame_torn`] to catch) and idle to every reader. NEGATIVE
+/// CONTROL: the same screen read whole (the server's frame closed) is the point at once.
+/// MUTANT: `writing` without `screen.frame_open` judges the open read idle.
+#[test]
+fn a_read_still_open_after_the_rereads_is_output_arriving() {
+    let footer = "  ⏵⏵ auto mode on (shift+tab to cycle)";
+    let reply = |last: usize, busy: bool| {
+        let mut r: Vec<String> = (1..=last)
+            .map(|i| format!("  - check {i} passed"))
+            .collect();
+        r.push(String::new());
+        r.extend(composer(&if busy {
+            format!("{footer} · esc to interrupt")
+        } else {
+            footer.to_string()
+        }));
+        r
+    };
+    let mid = reply(12, false);
+    assert_eq!(
+        worker_phase(&mid),
+        Phase::Idle,
+        "every reader reads it idle"
+    );
+    assert!(
+        !aterm_phase::Program::Claude.reader().frame_torn(&mid),
+        "and no tear in its frame"
+    );
+    let mut end = reply(20, false);
+    end.insert(20, "  Nothing left: the parser is committed.".to_string());
+    let reads = 1 + FRAME_REREADS as usize;
+    let run = |screens: Vec<Vec<String>>, open: bool| {
+        let mut m = Mock::new(screens);
+        m.gone_on_next = true;
+        if open {
+            m.open_on = (1..=reads).collect();
+        }
+        let mut s = session(&mut m, None);
+        let t = s.await_turn(Duration::from_secs(60)).expect("turn");
+        (t, m.requests)
+    };
+    let mut screens = vec![reply(4, true)];
+    screens.extend(std::iter::repeat_n(mid.clone(), reads));
+    screens.extend([reply(16, true), end.clone()]);
+    let (t, requests) = run(screens, true);
+    assert_eq!(
+        (t.phase, &t.screen.rows),
+        (Phase::Idle, &end),
+        "the reply's end decides, never the open read: {requests:#?}"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.starts_with("await frame"))
+            .count(),
+        FRAME_REREADS as usize,
+        "{requests:#?}"
+    );
+    // NEGATIVE CONTROL: the same screen, its frame closed, is the point.
+    let (t, requests) = run(
+        vec![reply(4, true), mid.clone(), reply(16, true), end],
+        false,
+    );
+    assert_eq!(
+        (t.phase, &t.screen.rows),
+        (Phase::Idle, &mid),
+        "{requests:#?}"
+    );
+    assert!(
+        !requests.iter().any(|r| r.starts_with("await frame")),
+        "{requests:#?}"
+    );
+}
+
 /// A transport that answers every request with one reply and records
 /// what it was sent: the session log's `act` marks, alone.
 struct MarkFake {
@@ -4135,7 +4227,7 @@ impl Ctl for MarkFake {
 /// no other verb is ever sent for one.
 #[test]
 fn a_refused_act_mark_latches_the_rest_off() {
-    let first = "@s-1 mark - act word=approve rule=read-only.classify-v4";
+    let first = "@s-1 mark - act word=approve rule=read-only.classify-v5";
     for (err, latched) in [
         ("ERR unknown verb 'mark' (help lists them)", true),
         ("ERR usage: mark <node|-> <kind> [word=<w>] …", true),
@@ -4152,7 +4244,7 @@ fn a_refused_act_mark_latches_the_rest_off() {
         };
         let mut s = Session::new(&mut fake, Some("@s-1".to_string()));
         s.act_marks
-            .queue("act word=approve rule=read-only.classify-v4".to_string());
+            .queue("act word=approve rule=read-only.classify-v5".to_string());
         s.act_marks.queue("act word=escalate".to_string());
         s.send_act_marks();
         s.act_marks.queue("act word=deny rule=write.v1".to_string());
@@ -4208,7 +4300,7 @@ fn supervise_auto_approves_reads_guarded_and_hands_over_writes() {
             "@s-9 key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "@s-9 await seq 101 timeout 20000",
             "@s-9 text --json tail=40",
-            "@s-9 mark - act word=approve rule=read-only.classify-v4",
+            "@s-9 mark - act word=approve rule=read-only.classify-v5",
             "@s-9 await idle 500 timeout 1500",
             "@s-9 text --json tail=40",
             "@s-9 status",
@@ -4375,7 +4467,7 @@ fn the_same_box_is_never_pressed_twice_on_an_unchanged_screen() {
             "key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "await seq 101 timeout 20000",
             "text --json tail=40",
-            "mark - act word=approve rule=read-only.classify-v4",
+            "mark - act word=approve rule=read-only.classify-v5",
         ],
         "{:?}",
         m.requests
@@ -4561,9 +4653,8 @@ fn memory_tape_on(
     let taped = TapedCtl::new(m, tape.fx.clone(), crate::supervise::tape::doors::CTL);
     (tape, taped)
 }
-/// [`watch_lines`] with the session set up first (the
-/// manager, a clock). Every watch test's session keeps the
-/// same fixed clock ([`TEST_NOW`]) and zone table, so a limit notice's
+/// [`watch_lines`] with the session set up first (the manager, a clock). Every watch test's
+/// session keeps the same fixed clock ([`TEST_NOW`]) and zone table, so a limit notice's
 /// reset lands where the test expects whatever the wall clock says. The
 /// run is recorded ([`taped_session`]) and its tape must read back whole —
 /// and REPLAY: from the tape alone, under the header the run's setup and
@@ -5110,7 +5201,6 @@ fn the_event_summary_joins_the_replys_wrapped_rows() {
     );
 }
 
-/// `supervise` hands a limit notice to the manager exactly like idle.
 #[test]
 fn supervise_hands_a_limit_notice_over_like_idle() {
     let mut m = Mock::new(vec![busy_screen(), limited_screen()]);
@@ -5135,11 +5225,8 @@ fn supervise_hands_a_limit_notice_over_like_idle() {
     );
 }
 
-/// The server as it is: `await idle 2000` waits straight through a short
-/// busy spell, so no read sees the worker busy between two points. A
-/// screen that moved with nothing the point is made of changed (a footer
-/// tick) prints no second EVENT; the same last row after a real turn — the
-/// manager's row and a new done row above it — is a new point.
+/// `await idle 2000` waits through a short busy spell, so no read sees it: a footer tick is no
+/// new point, the same last row after a real turn (new rows above it) is.
 #[test]
 fn a_point_is_new_when_its_transcript_moved_whatever_the_loop_saw() {
     let ticked = {
@@ -5268,9 +5355,8 @@ fn a_new_point_that_looks_like_the_last_one_is_still_reported() {
     }
 }
 
-/// A worker without Claude Code's composer — a build — whose output never
-/// held still for the idle window is still running: no review point until
-/// it pauses. The one read taken while it streamed is not handed over.
+/// A frameless worker (a build) whose output never held still for the idle window is busy:
+/// no review point until it pauses.
 #[test]
 fn a_frameless_screen_still_changing_is_busy_until_it_settles() {
     let mut m = Mock::new(vec![
@@ -5356,7 +5442,7 @@ fn nothing_happens_after_the_budget() {
     assert_eq!(m.requests.len(), 9, "nothing read after: {:?}", m.requests);
     assert_eq!(
         m.requests.last().map(String::as_str),
-        Some("mark - act word=approve rule=read-only.classify-v4")
+        Some("mark - act word=approve rule=read-only.classify-v5")
     );
 }
 
@@ -5396,11 +5482,8 @@ fn with_survey(mut r: Vec<String>) -> Vec<String> {
     r
 }
 
-/// A survey that appears on an idle screen is said ONCE, ahead of the
-/// point: `EVENT survey seq=<n> dismiss with: aterm ctl … key
-/// 'if=^●.How.is.Claude.doing' 0`. It stays open through the next turn
-/// (busy under it) and the idle point after: nothing more is said about
-/// it, and nothing is pressed.
+/// A survey on an idle screen is said once (`EVENT survey … dismiss with: …`), ahead of the
+/// point, and never pressed.
 #[test]
 fn watch_says_a_survey_once_when_it_appears() {
     let mut m = Mock::new(vec![
@@ -5846,10 +5929,8 @@ fn with_card(mut r: Vec<String>, card: &[&str]) -> Vec<String> {
     r
 }
 
-/// A person's grace holds the `0` on a busy read too, on a `status` read made
-/// for it — and says so ONCE, not on every read of a long busy spell. Another
-/// driver's hand (a drive lease) holds it the same way and is named as it is, as the
-/// idle look names it, not as a person typing.
+/// A person's grace holds the `0` on busy reads too and is said once per spell; another
+/// driver's hand (a lease) holds it the same way and is named as such.
 #[test]
 fn a_persons_grace_holds_the_0_on_busy_reads_and_says_so_once() {
     let held = |hand: &'static str, human_ms: Option<u64>| {
@@ -5892,13 +5973,10 @@ fn a_persons_grace_holds_the_0_on_busy_reads_and_says_so_once() {
     );
 }
 
-/// A card of a shape nobody has words for AND without the vendor's `(optional)` is read
-/// through (a busy worker stays busy under it) but not pressed: the loop says it as
-/// `EVENT survey … kind=unknown not pressed (…)` — with NO command to run, since the
-/// `0` was withheld on purpose and a guard it does not have would be improvised by whoever
-/// ran the line — and, unattended, tells the host (a record, and a line of the digest
-/// after an hour, never a tab mark): nothing else acts at a point with a survey open, so
-/// a worker nobody watches would stand there silently.
+/// A card with no known words and no `(optional)` is read through but not pressed: said as
+/// `EVENT survey … kind=unknown not pressed (…)` with no command to run (its reader would have
+/// to improvise a guard), and, unattended, told to the host (a record, never a tab mark), since
+/// nothing else acts while a survey is open.
 #[test]
 fn a_withheld_card_first_read_busy_is_told_at_the_idle_look_and_ended_when_it_goes() {
     let card = [
@@ -5982,9 +6060,8 @@ fn an_unknown_card_without_the_vendors_mark_is_said_and_never_pressed() {
     );
 }
 
-/// A loop that never saw the card its predecessor told (a body restart, an
-/// update: the host still holds the fact) says once that there is none, so the
-/// host can end it. Said once per loop, and never while a card is open.
+/// A loop that sees no card says so once (the host may hold one a predecessor told), never
+/// while a card is open.
 #[test]
 fn a_loop_that_sees_no_survey_tells_the_host_once() {
     let mut m = Mock::new(vec![idle_screen(), idle_screen(), idle_screen()]);
@@ -6033,10 +6110,8 @@ fn with_zero(mut r: Vec<String>) -> Vec<String> {
     r
 }
 
-/// D1 and D4 together, on the owner's screen: every kind of rating card parked over a
-/// worker that waits on a workflow (no busy footer) is dismissed on the busy read that
-/// shows it — one guarded `0`, on the card's own question row — and the worker stays
-/// busy throughout: no `EVENT idle` before or after.
+/// Every rating card over a workflow wait is dismissed on the busy read that shows it, and the
+/// worker stays busy throughout.
 #[test]
 fn every_kind_is_dismissed_over_a_workflow_wait_on_the_busy_read() {
     for (card, guard, kind) in [
@@ -6074,13 +6149,10 @@ fn every_kind_is_dismissed_over_a_workflow_wait_on_the_busy_read() {
     }
 }
 
-/// The vendor's debounce is not the harness's to guess at: against a REACTIVE card
-/// ([`Mock::card_debounce`] — it takes a `0` a debounce after it was written, and any key
-/// before that cancels the take), a timer that fires as late as the landing time allows
-/// still takes the harness's one `0`, and nothing is backspaced under it, over a worker
-/// that waits on a workflow (on an idle screen: the engine tests'
-/// `tier1_the_cards_taken_0_is_never_backspaced_under_its_debounce`). (Test scale:
-/// landing time 400 ms, debounce 40 and 220 ms; the shipped ratio is 2000 ms to 400 ms.)
+/// Against a reactive card ([`Mock::card_debounce`]), a vendor timer as late as the landing
+/// time allows still takes the one `0` and nothing is backspaced (test scale: landing 400 ms,
+/// debounce 40 and 220 ms; shipped 2000 to 400). The idle case is
+/// `tier1_the_cards_taken_0_is_never_backspaced_under_its_debounce`.
 #[test]
 fn a_late_vendor_timer_takes_the_0_inside_the_landing_time_and_is_never_backspaced() {
     for debounce_ms in [40, 220] {
@@ -6191,12 +6263,9 @@ fn a_refused_backspace_keeps_the_0_owed_until_the_server_takes_it() {
     }
 }
 
-/// A survey whose `0` did not take is TRIED AGAIN on a growing back-off
-/// (the turn-end policy acts at no point while a survey is open, so
-/// handing it over for good would silently stop the session being
-/// continued), and dismissed when a later `0` takes, with the
-/// host told from the second failure while the tries go on (no tab is marked).
-/// NEGATIVE CONTROL: `dismiss_surveys = false` never presses it.
+/// A `0` that did not take is retried on [`SURVEY_RETRY`] until one takes, never handed over
+/// for good (no turn-end act runs while a survey is open), the host told from the second
+/// failure (no tab marked). Negative control: `dismiss_surveys = false`.
 #[test]
 fn a_survey_whose_0_did_not_take_is_tried_again_until_it_goes() {
     let mut m = Mock::new(vec![
@@ -6536,11 +6605,8 @@ fn descent() -> Vec<Vec<String>> {
     ]
 }
 
-/// `EVENT context` is said once a descent — at 9%, the first reading at
-/// or below 10, and not again at 4% — as the reads come, mid-turn. The
-/// indicator gone from a framed screen is the compaction, said once,
-/// and the next descent is said again, ahead of the idle point's own
-/// line. Nothing is pressed.
+/// `EVENT context` is said once per descent (at 9%, not again at 4%); the indicator gone from
+/// a framed screen is the compaction, said once; the next descent is said again.
 #[test]
 fn watch_says_a_descent_once_and_the_compaction_once() {
     let mut m = Mock::new(descent());
@@ -7187,13 +7253,9 @@ fn fx_virtual_clock_rides_out_an_hour_long_outage() {
     );
 }
 
-/// The content seq starts over on the instance that adopts the session, so
-/// after the outage the wait past the point is on the new seq (`await seq
-/// 101` there would never latch). Nothing could be read in the outage, so
-/// the point reported before it, still showing, is reported once more: a
-/// duplicate costs the manager a look, a missed point leaves the worker
-/// waiting. The manager's turn then moves the worker, and its reply is the
-/// next EVENT.
+/// After an outage the point still showing is reported again (a duplicate costs the manager a
+/// look, a missed point leaves the worker waiting) and waited past on the adopting instance's
+/// seq, where `await seq 101` would never latch.
 #[test]
 fn after_an_outage_the_point_is_reported_again_and_waited_past_on_the_new_seq() {
     let pushed = said_idle("⏺ Pushed.");
@@ -7303,10 +7365,8 @@ fn a_connection_that_never_comes_back_ends_when_the_window_lapses() {
 
 fn never_comes_back(down: CtlReply, words: &str) {
     let mut m = Mock::new(vec![question_screen()]);
-    // 0 the first wait, 1 the read, 2 the session's `questions` word
-    // (`meta`: a priority word would answer over the switch), 3 the
-    // escalation's `status` (no manager: read before the badge, for a
-    // stall, `stall.rs`), 4 the question's attention, 5 the wait past it.
+    // 0 the first wait, 1 the read, 2 the `questions` word, 3 the escalation's `status`, 4 the
+    // question's attention, 5 the wait past it.
     m.down = Some((5, down));
     let (lines, code) = watch_quick(&mut m, Duration::from_millis(60));
     assert_eq!(
@@ -7374,13 +7434,9 @@ fn an_outage_that_keeps_coming_back_is_one_window() {
 #[test]
 fn a_later_outage_is_a_new_one_with_its_own_window() {
     let mut m = Mock::new(vec![question_screen()]);
-    // Index 4 is the question's attention; the same question handed again
-    // after a fresh reconnect is asked again (index 11: an ask per review
-    // point, after work or an outage). Each reads the `questions` word
-    // first (indices 2 and 9), then `status` for a stall with no manager
-    // to mail (3 and 10, `stall.rs`); that read shows this host measures
-    // input, so the step that runs out is probed too (14). The waits are
-    // 5, 12 and 15.
+    // The waits are 5, 12 and 15. Between them: the `questions` word (2, 9), `status` (3, 10),
+    // the attention (4, and 11: the same question asked again after the reconnect), and a
+    // stall probe of the step that ran out (14).
     m.by_index.insert(5, closed());
     m.by_index.insert(12, timeout());
     m.delay.insert(12, Duration::from_millis(400));
@@ -7421,11 +7477,8 @@ fn a_later_outage_is_a_new_one_with_its_own_window() {
 /// `--reconnect-s 0` makes a lost connection final.
 #[test]
 fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
-    // Index 2 is the session's `questions` word (a priority word would
-    // answer over the switch), 3 the escalation's `status` (no manager:
-    // read before the badge, for a stall, `stall.rs`) and 4 the
-    // question's attention (`meta set`, which the fabric would answer):
-    // the waits past the point are 5 on.
+    // 2 the `questions` word, 3 the escalation's `status`, 4 the question's attention: the
+    // waits past the point are 5 on.
     let mut m = Mock::new(vec![question_screen()]);
     m.by_index.insert(5, err("no such session"));
     let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
@@ -7910,10 +7963,8 @@ fn watch_journals_every_line_it_prints() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// `supervise --journal`: the lines it says on stderr are journaled, and
-/// so are the ones `watch` would have printed for what it decides
-/// silently — the review point's EVENT line, an approval, and the
-/// TIMEOUT or `EXIT <reason>` it ends on.
+/// `supervise --journal` records what it says on stderr and what `watch` would have printed:
+/// the review point's EVENT, an approval, the TIMEOUT or `EXIT <reason>`.
 #[test]
 fn supervise_journals_what_watch_would_have_printed() {
     let (dir, path) = journal_file("supervise");
@@ -8373,12 +8424,10 @@ fn count(m: &Mock, prefix: &str) -> usize {
     m.requests.iter().filter(|r| r.starts_with(prefix)).count()
 }
 
-// ------------------------------------------------------------------
 // The accounts probe (`docs/SPEC-claude-accounts-probe-2026-10-01.md`):
 // the host that claims one, the server it is typed into, and the Tier-1
 // projection — shared by `turn_end_loop_tests.rs` (every exit of the
 // step) and `run_engine_tests.rs` (the walk against the model).
-// ------------------------------------------------------------------
 
 /// `help key` and `help send` of a host that has every fence the
 /// probe's writes carry.
@@ -8644,14 +8693,12 @@ fn usage_probe_violations(m: &Mock, host: &ProbeHost) -> Vec<String> {
     bad
 }
 
-// ------------------------------------------------------------------
 // The limit reset (`docs/SPEC-claude-accounts-resets-2026-10-02.md`):
 // the host that gives the go, the server its keys are written to, and
 // the Tier-1 projection — shared by `reset_loop_tests.rs` (every exit
 // of the step) and `run_engine_tests.rs` (the walk against the model).
 // NOTHING OF IT HAS BEEN SEEN: the world is composed from the 2.1.304
 // bundle ([`ResetWorld`]).
-// ------------------------------------------------------------------
 
 /// The usage-limit dialog's rows as the composed fixture draws them
 /// (`aterm_phase::reset::fixtures::DIALOG_GRANT`): the grant row second.
@@ -10004,14 +10051,14 @@ mod turn_end {
 }
 
 /// The worker's NEEDS YOU on the person's screen (`needs_loop_tests.rs`;
-/// FOREVER CRUISE / FOREVER LAND, `escalate.rs`'s `sync_needs`).
+/// Autopilot Cruise / Land, `escalate.rs`'s `sync_needs`).
 mod needs_loop {
     use super::*;
     include!("needs_loop_tests.rs");
 }
 
-/// The session's Autopilot in the loop (`autopilot_loop_tests.rs`): Land's
-/// instruction, Off's park.
+/// The session's autopilot word in the loop (`autopilot_loop_tests.rs`): Land types the land
+/// instruction, Off parks the loop.
 mod autopilot_loop {
     use super::*;
     include!("autopilot_loop_tests.rs");
@@ -10031,8 +10078,7 @@ mod hold_loop {
     include!("hold_loop_tests.rs");
 }
 
-/// The wall confirmed by the transcript before it is acted on
-/// (`wall_confirm_loop_tests.rs`, H6-HARNESS-1).
+/// The wall confirmed by the transcript before it is acted on (`wall_confirm_loop_tests.rs`).
 mod wall_confirm_loop {
     use super::*;
     include!("wall_confirm_loop_tests.rs");

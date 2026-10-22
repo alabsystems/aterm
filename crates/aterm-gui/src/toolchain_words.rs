@@ -282,9 +282,7 @@ pub(crate) fn fill_permille(done: u64, total: u64) -> Option<u16> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // The markers.
-// ---------------------------------------------------------------------------
 
 /// `net-starting:` from a first-run child: the row opens before `progress.json`
 /// exists, since the extraction that follows is minutes long and gigabytes wide.
@@ -617,9 +615,7 @@ fn known_as(program: &str) -> &str {
     atpkg::vendor_direct::spec(program).map_or(program, |spec| spec.product)
 }
 
-// ---------------------------------------------------------------------------
 // The managed-current and machine-settings records.
-// ---------------------------------------------------------------------------
 
 /// [`managed_current_for`] with only frozen shells counted, for tests;
 /// `this_tab_hooked` false stands for an unknown shell.
@@ -911,9 +907,8 @@ pub(crate) fn managed_current_words_for(
         .count();
     let otherwise = standings.len() - unchecked;
     let lagging = tabs.agents_behind.total() + tabs.agents_held.total() > 0;
-    // THE TITLE IS SAID WHOLE (four agents, 2026-10-15: four `not checked` ran to 137
-    // chars and the cap cut `Muse Code 1.4.9-R6…`): with every version while that
-    // fits, else without the versions of the programs not current, else without any.
+    // The title is said whole: with every version while that fits, else without
+    // the versions of the programs not current, else without any.
     let fits = |title: &String| title.chars().count() <= TITLE_CAP;
     let title = [(true, true), (true, false), (false, false)]
         .into_iter()
@@ -952,7 +947,7 @@ pub(crate) fn managed_current_words_for(
         );
     }
     // "On its own", not "at its next turn end": the live upgrade starts at a
-    // quiet moment, and a goal-mode session's turns never end (owner, 2026-09-28).
+    // quiet moment, and a goal-mode session's turns never end.
     // Each product is said with its own count: a Codex session is behind the
     // managed codex, never Claude Code's build.
     for (product, n) in tabs.agents_behind.each() {
@@ -1089,9 +1084,7 @@ pub(crate) fn machine_setting_words(item: &str) -> (String, String) {
     )
 }
 
-// ---------------------------------------------------------------------------
 // Foreign tools: what atpkg leaves alone, as a line of the exceptions digest.
-// ---------------------------------------------------------------------------
 
 /// One thing a pass's look found that aterm leaves alone, as atpkg named it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1253,9 +1246,7 @@ pub(crate) fn c_toolchain_entry(cause: CToolchain) -> aterm_messages::exceptions
     .log_line(format!("toolchain-c {word}"))
 }
 
-// ---------------------------------------------------------------------------
 // The tailed snapshot (the terminal readings of the file).
-// ---------------------------------------------------------------------------
 
 /// What one classified `progress.json` read says. The host applies it to the row
 /// keyed [`KEY_PASS`] and decides which reads paint (`App::apply_toolchain_snapshot`):

@@ -4,7 +4,7 @@
 //! Tier-1 for `SupervisorLand` (aterm-models-harness `supervisor_land_model`):
 //! the real turn-end decider (`decide_turn_end`, with its `TurnEndState`)
 //! driven under Autopilot LAND along every reachable state of the model —
-//! FOREVER LAND: land everything into the remote main, no exceptions, and
+//! Autopilot Land: land everything into the remote main, no exceptions, and
 //! only then go quiet.
 //!
 //! The policy's `Instruction`, `Nudge`, `Answer` and `WallAct` are the
@@ -714,7 +714,7 @@ fn walk_all(
             {
                 assert_eq!(*text, nudge(&st, &real.st), "the nudge at {st:?}");
             }
-            // FOREVER LAND: never silent at a free point of a task not
+            // Autopilot Land: never silent at a free point of a task not
             // landed, not a person's and not running someone else's turn.
             if st["landed"] == 0 && st["left"] == 0 && st["other"] == 0 {
                 assert_ne!(got, Verdict::Nothing, "a silent point at {st:?}");

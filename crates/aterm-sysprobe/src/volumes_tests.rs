@@ -670,11 +670,9 @@ fn a_short_spelled_path_is_expanded_only_on_a_local_volume() {
     assert_eq!((unix.as_ref(), asked), (Path::new(short), false));
 }
 
-// ---------------------------------------------------------------------------
 // Live, on Windows: the mount and object managers, one volume's figures, and
 // file identity. Each reads only this test's own scratch files and the
 // volumes' roots.
-// ---------------------------------------------------------------------------
 
 #[cfg(windows)]
 fn system_root() -> PathBuf {

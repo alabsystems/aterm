@@ -7,7 +7,7 @@
 //! the same screen with the notice gone) and the REAL turn-end decider
 //! (`decide_turn_end`, with the real `TurnEndState` it keeps) driven along
 //! EVERY reachable state of the model, under `[harness] usage_credits` off
-//! (the default since the owner's ruling of 2026-10-19) and on.
+//! (the default since the owner's ) and on.
 //!
 //! Each model action is mirrored on the real side: a turn's end is the point
 //! `observe`d with the turn's work, the reading's reset the one the loop keeps

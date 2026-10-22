@@ -12,15 +12,14 @@
 //!
 //! Lexically, per file:
 //! * a Rust launch is an `.arg(…)`/`.args([…])` naming `"--headless"`, or an
-//!   `.args([` whose elements trustfmt broke one to a line with a
-//!   `"--headless"` among them; the file is armed when it holds at least as many
-//!   arm calls handed a `&mut` command (`launch_isolation::lifeline`,
-//!   `Lifeline::arm`, `arm_for_process`, a local `arm_lifeline`) as unwaived
-//!   launches, since a `Command` is often built in one function and armed in its
-//!   caller;
-//! * a shell launch — in a script, or a script a Rust string holds — is a
-//!   program word (`"$B"`, `$A`, `${GUI}`, a path ending in an aterm name), bare
-//!   flags, then `--headless`; it is armed when its logical line carries
+//!   `.args([` broken one element to a line with `"--headless"` among them; the
+//!   file is armed when it holds at least as many arm calls handed a `&mut`
+//!   command (`launch_isolation::lifeline`, `Lifeline::arm`, `arm_for_process`,
+//!   a local `arm_lifeline`) as unwaived launches, since a `Command` is often
+//!   built in one function and armed in its caller;
+//! * a shell launch (in a script, or a script a Rust string holds) is a program
+//!   word (`"$B"`, `$A`, `${GUI}`, a path ending in an aterm name), bare flags,
+//!   then `--headless`; it is armed when its logical line carries
 //!   `--lifeline-fd`;
 //! * a Python launch is a `"--headless"` list element; it is armed when the
 //!   three lines on either side of it name the lifeline.

@@ -161,7 +161,7 @@ fn an_explicit_node_address_never_writes_the_pin_table() {
 /// **`post to=say` reaches the `say` face — on the TOPIC, with the kind in the
 /// body.**
 ///
-/// Round 23 retired the per-kind leaf: `say/<topic>` costs one subject per
+/// retired the per-kind leaf: `say/<topic>` costs one subject per
 /// topic, where `say/<topic>/<kind>` would have cost one per topic AND kind on
 /// a budget this round has not reclaimed. Bare `to=say` is the topic `say`, so
 /// every address that worked before still does — only the subject's last

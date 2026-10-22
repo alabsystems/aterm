@@ -300,21 +300,21 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// [`Error::Remote`] when the answer is an error, [`Error::Timeout`],
-    /// [`Error::Invalid`] for a call that says it expects no reply, and the
-    /// errors of [`Connection::send`]. The deadline includes writing the call.
-    /// A timeout after a partial write closes the connection: its unfinished
-    /// frame cannot be followed by a new message. While waiting, at most 256
-    /// unrelated messages and one MiB of original wire bytes are retained;
-    /// overflow is [`Error::Unsupported`] and closes the connection. Already
-    /// retained messages remain available through [`Connection::recv`].
+    /// [`Error::Remote`] when the answer is an error, [`Error::Invalid`] for a
+    /// call that says it expects no reply, and the errors of
+    /// [`Connection::send`]. The deadline includes writing the call. Passed
+    /// before the bus took the call whole, it is [`Error::Timeout`], and after
+    /// a partial write it closes the connection: its unfinished frame cannot be
+    /// followed by a new message. Passed after, it is [`Error::NoReply`]: the
+    /// call went out, the connection is as it was, and an answer that comes
+    /// later reaches [`Connection::recv`] as any other message does. While
+    /// waiting, at most 256 unrelated messages and one MiB of original wire
+    /// bytes are retained; overflow is [`Error::Unsupported`] and closes the
+    /// connection. Already retained messages remain available through
+    /// [`Connection::recv`].
     pub fn call(&mut self, msg: Message, timeout: Duration) -> Result<Message> {
-        if !msg.expects_reply() {
-            return Err(Error::Invalid("call() of a message that expects no reply"));
-        }
         let deadline = Instant::now().checked_add(timeout);
-        let serial = self.send_until(msg, deadline)?;
-        self.wait_reply(serial, deadline)
+        self.call_until(msg, deadline, deadline)
     }
 
     /// The next message: a queued one first, else one from the socket within
@@ -409,6 +409,27 @@ impl Connection {
         let msg = Message::method_call(Some(BUS_NAME), BUS_PATH, Some(BUS_NAME), member)?;
         self.call(msg.with_body(vec![Value::from(arg)]), timeout)
             .map(drop)
+    }
+
+    /// [`Connection::call`] with a deadline for each of its phases: the bus
+    /// takes the call whole by `send_by`, and the peer answers it by
+    /// `answer_by`. Once the call went out, a deadline that passes says only
+    /// that the peer has not answered yet, which a caller must not take for a
+    /// connection to give up on, so it is [`Error::NoReply`].
+    fn call_until(
+        &mut self,
+        msg: Message,
+        send_by: Option<Instant>,
+        answer_by: Option<Instant>,
+    ) -> Result<Message> {
+        if !msg.expects_reply() {
+            return Err(Error::Invalid("call() of a message that expects no reply"));
+        }
+        let serial = self.send_until(msg, send_by)?;
+        self.wait_reply(serial, answer_by).map_err(|e| match e {
+            Error::Timeout => Error::NoReply,
+            e => e,
+        })
     }
 
     fn wait_reply(&mut self, serial: u32, deadline: Option<Instant>) -> Result<Message> {

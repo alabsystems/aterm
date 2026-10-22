@@ -658,7 +658,7 @@ fn with_no_transcript_a_wall_under_a_tools_call_is_not_acted_on() {
     }
 }
 
-/// ATERM-KI-1015-14: with no transcript (a host with none to read, or no host), a program's words behind one of Claude Code's own labels —
+/// with no transcript (a host with none to read, or no host), a program's words behind one of Claude Code's own labels —
 /// a Monitor's event row, a hook's stderr or `systemMessage` (2.1.302, measured in the lab) — are
 /// no wall: nothing typed, nothing waited for, no line (the screen read no wall). On the base the
 /// event's row and the hooks' rows under the person's turn or a hook summary were acted on
@@ -717,7 +717,7 @@ fn with_no_transcript_a_programs_words_behind_a_vendor_label_are_not_acted_on() 
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// ATERM-KI-1015-14, the review of the first pass: with no transcript, a hook's words drawn on a
+/// , the review of the first pass: with no transcript, a hook's words drawn on a
 /// row of Claude Code's own with NO label (2.1.302, measured in the lab) are no wall — a Stop
 /// hook's `stopReason` under the hook summary, and a PostToolUse hook's blocking `reason` under
 /// its `… hook returned blocking error` row. Nothing typed, nothing waited for, no line. On the
@@ -808,7 +808,7 @@ fn with_no_transcript_a_hooks_words_under_its_own_rows_are_not_acted_on() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// ATERM-KI-1015-14: with no transcript, a `statusLine` command printing `Not logged in · Run
+/// with no transcript, a `statusLine` command printing `Not logged in · Run
 /// /login` (2.1.304, measured in the lab) is no wall — its row at column 2 above the mode row is
 /// the person's script, not the notice Claude Code right-aligns there. Nothing typed, nothing
 /// waited for, no line; under a usage limit's banner the limit is what is acted on. On the base
@@ -885,7 +885,7 @@ fn with_no_transcript_a_status_lines_words_are_not_acted_on() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// ATERM-KI-1015-14: a hook's error row with NO ROW OF THE HOOK'S under it (2.1.304, measured in
+/// a hook's error row with NO ROW OF THE HOOK'S under it (2.1.304, measured in
 /// the lab): a PostToolUse hook blocking with a reason of blank space draws `⎿  PostToolUse:Bash
 /// hook returned blocking error` and nothing of its own, and Claude Code's real context wall stands
 /// right under it, where the hook's words do; a hook whose reason IS the wall's words draws the
@@ -1772,7 +1772,7 @@ fn a_notice_drawn_like_prose_the_transcript_has_not_written_is_read_again_once()
 }
 
 /// A NOTICE DRAWN LIKE PROSE AFTER A PROMPT COMMAND SENT RIGHT AFTER AN ERROR
-/// NOTICE (ATERM-KI-1016-1, limits: "a prompt command sent right after an
+/// NOTICE (limits: "a prompt command sent right after an
 /// error notice can miss a new prose-shaped notice at the first decision,
 /// costing one continuation"). A prompt command's rows (`<command-message>`,
 /// its meta prompt) are passed over, so until the notice its request met is
@@ -1921,7 +1921,7 @@ fn a_wall_whose_call_is_above_the_rows_read_is_judged_on_the_whole_screen() {
     }
 }
 
-/// ATERM-KI-1015-14: A WALL WHOSE CALL SCROLLED OFF THE SCREEN is judged with the history above
+/// A WALL WHOSE CALL SCROLLED OFF THE SCREEN is judged with the history above
 /// it. With no transcript, a gutter wall whose owner walk reaches the screen's first row is read
 /// again with the rows of the main screen's history right above it, up to the nearest row in
 /// column 0 (`search` places the screen, `line` reads each row). MEASURED on 2.1.304: a verbose
@@ -2113,7 +2113,7 @@ fn a_wall_whose_call_scrolled_off_is_judged_with_the_history_above() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// ATERM-KI-1015-14 (item 6 of the review of 87faa9bf23): A STOP HOOK'S `stopReason` TALLER THAN
+/// (item 6 of the review of 87faa9bf23): A STOP HOOK'S `stopReason` TALLER THAN
 /// THE LOOP'S TAIL is read with the rows above it ([`Session::limit_words_read_above`]). MEASURED
 /// on 2.1.304 at 144x50 in the real-Claude lab: 35 lines ending `Usage limit reached · resets
 /// 3pm` draw the summary on row 6, above the loop's 40-row tail, which the loop read as a session
@@ -3390,7 +3390,7 @@ fn a_limit_notice_is_another_conversations_where_the_tail_lacks_its_row() {
 fn a_resumed_conversations_notice_with_this_limits_clock_ends_no_wait_in_the_loop() {
     // The loop's clock at 3:15:30pm PDT, half a minute past the reset: the
     // vendor's word read before it is no word of this limit's whatever the
-    // tail says (LP-1 of ATERM-KI-1015-1), so the tail decides only from the
+    // tail says (LP-1 of ), so the tail decides only from the
     // reset on; the measured limit's rows written a minute before, naming
     // the same 3:15pm.
     let now = TEST_NOW + 6 * 3600 + 20 * 60 + 30;
@@ -3448,7 +3448,7 @@ fn a_resumed_conversations_notice_with_this_limits_clock_ends_no_wait_in_the_loo
 }
 
 /// A COLD RESTORE'S FIRST READ OF A COUNTDOWN ITS AGENT NEVER HELD IS
-/// NOBODY'S (ATERM-KI-1016-1; the loop's half of the policy's
+/// NOBODY'S (the loop's half of the policy's
 /// `a_countdown_whose_notice_was_written_before_the_agent_started_goes_on_by_nobody`).
 /// A fresh loop — no earlier read of the limit, as after a cold restore —
 /// reads the armed five-hour limit (2.1.296's screen, at 10:38am) the
@@ -3757,7 +3757,7 @@ fn replied_under_a_shell(reply: &str, fired_row: bool) -> Vec<String> {
 /// its notice drawn no more, are the worker's since the limit — a done
 /// report gets the done check, one naming an irreversible act the
 /// reversible clause, and the retired [`FINISHED`] token the check too, the
-/// task open (FOREVER CRUISE). Measured
+/// task open (Autopilot Cruise). Measured
 /// before, for every one of them: the wait stood and `keep going` went under
 /// `usage-resume@v1` into the done report. Both screen shapes (the vendor's
 /// row kept, or only the footer's notification). NEGATIVE CONTROLS: a reply
@@ -4128,8 +4128,8 @@ fn virtual_clock<C: Ctl>(s: &mut Session<'_, C>, now: i64, offset: i64) {
         now.saturating_mul(1000),
     )))));
 }
-/// A BUCKET'S CANCEL ON A SHORT PANE IS THE BUCKET'S WHERE THE TRANSCRIPT IS READ (ATERM-KI-1015-1,
-/// LP-1 (d); the second review of round 21's amendment, minor 5). The policy's `keep going` met a
+/// A BUCKET'S CANCEL ON A SHORT PANE IS THE BUCKET'S WHERE THE TRANSCRIPT IS READ (
+/// LP-1 (d); the second review of the prior amendment, minor 5). The policy's `keep going` met a
 /// Sonnet bucket under 24 h from its reset (Claude Code 2.1.302: no dialog, its own continue armed
 /// at once), and a person's Esc on the countdown came before the loop's first read. On a pane 12
 /// rows tall the bucket's own `⎿  You've hit your Sonnet limit · …` has scrolled off and the
@@ -4248,7 +4248,7 @@ fn a_buckets_cancel_on_a_short_pane_is_the_bucket_the_transcript_names() {
 }
 
 /// A BUCKET'S CANCEL UNDER CLAUDE CODE'S LIMIT DIALOG ANSWERS THE ACT, AND NOTHING IS TYPED INTO
-/// THE BUCKET (ATERM-KI-1015-1, LP-1's residual (d); review 3 of round 21's limit-edges lane: a
+/// THE BUCKET (LP-1's residual (d); review 3 of the prior limit-edges lane: a
 /// known wrong action). The policy's `keep going` met a Sonnet bucket whose reset is over 24 h away
 /// (Claude Code 2.1.302 opens its usage-limit dialog, answered `Wait here, …`, and arms its
 /// countdown), and a person's Esc on the countdown came before the loop's first read after the
@@ -4460,8 +4460,8 @@ fn decided_after_b(
         .unwrap_or_else(|e| panic!("{e:?}"))
 }
 
-/// A LIMIT'S CONTINUATION IS ITS OWN CONVERSATION'S, THOUGH NO NOTICE IS DRAWN (ATERM-KI-1015-1,
-/// LP-1: the review of round 20's W1 fix, live as `lp20w1a` on Claude Code 2.1.300:
+/// A LIMIT'S CONTINUATION IS ITS OWN CONVERSATION'S, THOUGH NO NOTICE IS DRAWN (
+/// LP-1: 's W1 fix, live as `lp20w1a` on Claude Code 2.1.300:
 /// `usage-resume@v1` typed into A). Conversation B's five-hour limit stands, its countdown armed;
 /// a person `/resume`s conversation A (the lab's 2.1.300 screen: no limit in A's history, B's
 /// countdown dropped, no notice drawn), and the host's transcript is now A's (another session id,
@@ -4638,7 +4638,7 @@ fn with_a_shell(mut rows: Vec<String>) -> Vec<String> {
     rows
 }
 
-/// A REMEMBERED LIMIT IS ITS OWN CONVERSATION'S TOO (ATERM-KI-1015-1, LP-1). Conversation B's
+/// A REMEMBERED LIMIT IS ITS OWN CONVERSATION'S TOO. Conversation B's
 /// five-hour limit armed, confirmed by B's transcript; a person `/resume`s conversation A while the
 /// agent's background shell runs, so A's screen reads busy on that work alone and the loop's
 /// memory supplies B's wall in its place. The host's transcript is A's. At B's reset nothing is
@@ -4707,7 +4707,7 @@ fn decided_at_scrolled_bucket(second: &[String], tail: &str) -> (TurnEndAction, 
 }
 
 /// A `/model` OFF A BUCKET WHOSE NOTICE THE SCREEN NO LONGER DRAWS MOVES THE SESSION OFF IT
-/// (ATERM-KI-1015-1, LP-1 (e); live as `r21lebk5` on Claude Code 2.1.302, 2026-10-16). On a pane
+/// (LP-1 (e); live as `r21lebk5` on Claude Code 2.1.302, 2026-10-16). On a pane
 /// 14 rows tall a Sonnet bucket's own notice scrolls off before the first read: the footer's
 /// generic banner is all the screen draws of it, and the session's transcript holds the turn's
 /// notice (`You've hit your Sonnet limit · resets Sep 19 at 2:42am (…)`). Then Esc on the
@@ -4827,8 +4827,8 @@ fn seeded_at_scrolled_bucket(second: &[String], tail: &str) -> TurnEndAction {
         .unwrap_or_else(|e| panic!("{e:?}"))
 }
 
-/// A `/model` OFF A BUCKET MOVES A LOOP THAT TOOK THE BUCKET'S WAIT OVER (ATERM-KI-1015-1, LP-1
-/// (e); the review of round 21's amendment, major 1). Every seamless update and fault restart
+/// A `/model` OFF A BUCKET MOVES A LOOP THAT TOOK THE BUCKET'S WAIT OVER (LP-1
+/// (e); 's amendment, major 1). Every seamless update and fault restart
 /// starts a loop that takes the wait up from its predecessor's ledger row, and keeps no notice row
 /// id of its own. On a 14-row pane the Sonnet bucket's notice is off the screen, and Esc on the
 /// countdown then `/model opus` draws `Set model to Opus 5.5 …` with no notice of the bucket; the
@@ -4882,4 +4882,71 @@ fn a_model_chosen_off_a_bucket_moves_a_loop_that_took_its_wait_over() {
             "{name}: the bucket's wait stands: {a:?}"
         );
     }
+}
+
+/// A STANDING WEEKLY LIMIT PLACED AFTER A REFUSED GENERIC BANNER MAKES THE POINT `limited` AND
+/// STANDS THROUGH A `queueTranscriptOnly` TASK NOTIFICATION (`@s-51d5e739c9b46aababed` on m15,
+/// 2026-10-22). When `/goal` pauses at a weekly limit and a background workflow finishes while
+/// paused (or orphaned tasks are summarized on resume), Claude Code appends a
+/// `"queueTranscriptOnly": true` `user` row after the closed weekly-limit notice (`turn_duration`).
+/// Even if the screen's weekly `⎿` notice has scrolled off leaving only `/goal`'s `⏺ Goal paused`
+/// row and the generic `⚠ Usage limit reached` footer banner (which `confirm_wall` refuses as a
+/// `usage-session` wall against the `usage-weekly` transcript notice, and `read_standing_limit`
+/// places as a standing `UsageWeekly` limit), `turn_end_at_point` followed by `point_as_decided`
+/// marks `point.phase` as `Phase::Limited` and waits on `usage-weekly`.
+#[test]
+fn a_standing_weekly_limit_over_a_refused_generic_banner_and_transcript_only_row_marks_the_point_limited()
+ {
+    use aterm_phase::WallKind;
+    let weekly = transcript("weekly-limit");
+    let queue_only = r#"{"parentUuid":"00000000-0000-4000-8000-000000000001","isSidechain":false,"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>wf1</task-id>\n<status>failed</status>\n<summary>Orphaned on session resume</summary>\n</task-notification>"},"uuid":"00000000-0000-4000-8000-000000000099","timestamp":"2026-10-08T16:36:00.000Z","queueTranscriptOnly":true}"#;
+    let tail = format!("{weekly}\n{queue_only}");
+    let notice_at = super::super::wall_confirm::transcript_ends_on(&tail)
+        .notice_at()
+        .expect("the weekly limit's notice row stands through queueTranscriptOnly");
+    // A screen where the weekly `⎿` row scrolled off, leaving `/goal`'s resetless pause echo and
+    // the generic footer banner naming the same reset (`Oct 11 at 9:35am`).
+    let mut rows = ended_on(&[
+        "⏺ Goal paused · usage limit reached · send a message after it resets to continue",
+    ]);
+    let footer = rows.len() - 1;
+    rows.insert(
+        footer,
+        "  ⚠ Usage limit reached · limit resets Oct 11 at 9:35am".to_string(),
+    );
+    let host = TranscriptHost::of(&[Some(tail.as_str())]);
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        policy: SupervisorConfig {
+            answer_questions: false,
+            ..SupervisorConfig::default()
+        },
+        ..auto(30)
+    };
+    let mut m = Mock::new(vec![rows.clone()]);
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.set_zone_lookup(test_zones);
+    s.set_clock(notice_at + 10, PDT);
+    let mut point = point_at(&mut s, rows, 101);
+    let action = s
+        .turn_end_at_point(&point, Some(Duration::from_secs(60)), &opts)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    s.point_as_decided(&mut point);
+    assert!(
+        matches!(&action, TurnEndAction::WaitUntil { why, .. } if why.contains("usage-weekly")),
+        "waits on usage-weekly: {action:?}"
+    );
+    assert!(
+        matches!(
+            &point.phase,
+            Phase::Limited { message, reset }
+                if message.contains("weekly limit") && reset.as_deref() == Some("Oct 11 at 9:35am")
+        ),
+        "point_as_decided promotes the standing weekly limit onto point.phase: {:?}",
+        point.phase
+    );
+    assert!(
+        s.turn_end.wall_since(WallKind::UsageWeekly).is_some(),
+        "weekly wall recorded in turn_end"
+    );
 }

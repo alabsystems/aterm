@@ -26,7 +26,7 @@ fn every_row_is_a_package_and_the_connections_follow_its_order() {
 
 #[test]
 fn every_reviewer_keeps_all_its_capabilities() {
-    // Batteries included (owner ruling 2026-10-16): no row switches a tool, a setting, a
+    // Batteries included: no row switches a tool, a setting, a
     // hook, an MCP server or a session off; the permission level is the asker's (`levels`).
     for row in ROWS {
         for flag in [

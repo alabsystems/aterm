@@ -735,8 +735,8 @@ impl Mailbox {
     /// `Closed(Aterm)` is kept — it is not a broker event.
     pub fn reset_broker_sources(&self) {
         let mut q = self.lock();
-        // The generation is what makes this total: clearing reaches only what
-        // was already pushed, not a killed reader's late push.
+        // The generation makes this total: clearing reaches only what was already pushed,
+        // not a killed reader's late push.
         for s in [Source::Fleet, Source::Inbox, Source::Say] {
             q.reset(s);
         }

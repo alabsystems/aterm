@@ -1059,10 +1059,8 @@ fn a_failed_stage_retains_one_verified_archive_and_a_digest_failure_none() {
         vec!["ay-18.tar.zst".to_string()],
         "the verified archive is retained, once"
     );
-    // A DIGEST failure keeps nothing: the bytes are wrong, and a `.part` of them would
-    // seed the next attempt — so the sibling `.part` seeded here goes with the asset. A
-    // fresh store, because a retained archive whose digest is the row's is reused
-    // before any download.
+    // A digest failure keeps nothing, its seeded `.part` included. A fresh store, because a
+    // retained archive matching the row's digest is reused before any download.
     let ddir = scratch("staging-digest");
     let dlayout = Layout {
         prefix: ddir.join("prefix"),
@@ -1132,8 +1130,7 @@ fn a_signer_refusal_reclaims_its_archive_and_binds_until_the_digests_move() {
     );
     let note = digest_refusal_note(&layout, "claude", build, &art, false)
         .expect("the first signer refusal already binds");
-    // The canonical held row ([`crate::state::held_failed`]) every surface repeats:
-    // the verdict first, then the one retry.
+    // The canonical held row ([`crate::state::held_failed`]): the verdict, then the retry.
     assert!(
         note.starts_with(crate::state::HELD_FAILED_PREFIX)
             && note.ends_with("now: aterm pkg install claude"),
@@ -1811,8 +1808,8 @@ fn a_shim_env_manifest_lays_an_exporting_shim_and_a_bad_one_is_refused() {
         env,
         "recorded beside the build for the verbs that hold no manifest"
     );
-    // The rollback verb's path re-lays the PRIOR build's shims from ITS sidecar: a
-    // newer build without the key flips live, then rolls back — the env returns.
+    // The rollback verb re-lays the prior build's shims from its sidecar: a newer build
+    // without the key flips live, then rolls back, and the env returns.
     let b19 = bare_build(&l, "ay", 19, &["ay"]);
     crate::shim_env::write_sidecar(&b19, &crate::shim_env::ShimEnv::NONE).unwrap();
     activate_build(&l, &b19).unwrap();
@@ -2300,7 +2297,7 @@ fn disk_gate_is_pure_and_fails_only_on_a_real_shortfall() {
     assert_eq!(required, 400 * mib + crate::cost::FREE_FLOOR);
     assert_eq!(available, 900 * mib);
     assert!(e.to_string().starts_with(DISK_REFUSAL_HEAD), "{e}");
-    // Query failure (None) => fail OPEN.
+    // Query failure (None): fail open.
     assert!(disk_gate(0, None).is_ok());
     // Ample space => ok.
     assert!(disk_gate(1 << 20, Some(u64::MAX)).is_ok());

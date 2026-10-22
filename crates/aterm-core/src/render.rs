@@ -3135,14 +3135,9 @@ impl RenderInput {
         !(continuation(frame_col) || continuation(frame_col + 1))
     }
 
-    /// The frame's implicit blank at viewport cell (`row`, `col`): a space in
-    /// the live default colours (OSC 10/11, their resets, DECSCNM, and on a
-    /// composed split frame the per-pane
-    /// [`default_bg_spans`](Self::default_bg_spans)), as the terminal paints an
-    /// unwritten column.
-    ///
-    /// `None` when the producer resolved no defaults ([`COLOR_UNSET`]): the
-    /// sentinel is not a colour, and masking its high byte would read as black.
+    /// The frame's implicit blank at viewport cell (`row`, `col`): a space in the live default
+    /// colours (per pane on a composed frame), as the terminal paints an unwritten column.
+    /// `None` when the producer resolved no defaults ([`COLOR_UNSET`] is not a colour).
     #[inline]
     fn implicit_blank_at(&self, row: usize, col: usize) -> Option<RenderCell> {
         let (fg, bg) = (self.default_fg, self.default_bg_at(row, col));

@@ -368,6 +368,11 @@ pub(crate) struct Opts {
     /// Off in the committed worlds; on in the sweep with write errors in
     /// every seed (sim item S7).
     pub(crate) quits: bool,
+    /// THE DOOR'S JOURNAL ([`bus::Event`]): the broker records every
+    /// connection, served request, delivery, world write and restart, and the
+    /// outcome carries it ([`Outcome::journal`]) for the differential test to
+    /// replay against astream's broker (`super::conform_broker`).
+    pub(crate) journal: bool,
 }
 
 /// The sibling's one session ([`Opts::sibling`]).
@@ -424,6 +429,7 @@ impl Opts {
             // seed quits too (`super::tests`'
             // `every_seed_with_write_errors_holds_every_law`, sim item S7).
             quits: false,
+            journal: false,
         }
     }
 
@@ -481,6 +487,8 @@ pub(crate) struct Outcome {
     /// What the model's tap followed: offsets opened, steps it was asked to
     /// explain, and the model actions that explained them.
     pub(crate) model: (u64, u64, BTreeSet<&'static str>),
+    /// The broker's journal ([`Opts::journal`]); empty in a world that keeps none.
+    pub(crate) journal: Vec<bus::Event>,
 }
 
 /// How much one run exercised, so a run that did nothing cannot pass.
@@ -705,8 +713,19 @@ impl World {
         device.tears = opts.torn_device;
         // The node is provisioned before any bridge runs (`fabric on`), durably.
         device.seed(&state_dir.join("node"), format!("{NODE}\n").as_bytes());
-        let broker = bus::Broker::new(tier, opts.table.clone());
+        // THE TABLE aterm OPENS THIS TIER WITH (`Durability::options`): none
+        // on Strict, where every batch is flushed in full anyway and a broker's
+        // `Hello` reports no rules; the world's table on the weak tiers.
+        let table = if tier == Tier::Strict {
+            Escalation::none()
+        } else {
+            opts.table.clone()
+        };
+        let broker = bus::Broker::new(tier, table);
         lock(&broker.state).mutant = opts.arm;
+        if opts.journal {
+            broker.keep_journal();
+        }
         if opts.race {
             lock(&broker.state).race = Some(bus::Race {
                 refuse_will: if opts.alias { 2 } else { 3 },
@@ -987,9 +1006,7 @@ impl World {
         }
     }
 
-    // ---------------------------------------------------------------------
     // the bridge process
-    // ---------------------------------------------------------------------
 
     /// Launch a bridge, as aterm's supervisor does.
     /// ONE COPY PER FILE, IN EACH PROCESS (sim item S7's review): of the
@@ -1130,9 +1147,7 @@ impl World {
         }
     }
 
-    // ---------------------------------------------------------------------
     // the world's own actions
-    // ---------------------------------------------------------------------
 
     fn sessions(&self) -> Vec<(u64, String)> {
         self.ep
@@ -1569,9 +1584,7 @@ impl World {
         ));
     }
 
-    // ---------------------------------------------------------------------
     // the oracle
-    // ---------------------------------------------------------------------
 
     /// The text markers of the bus's records on this node's and the person's
     /// lanes: `marker -> [(offset, subject, body)]`.
@@ -2477,6 +2490,7 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
         trace,
         stats: w.stats,
         model: (w.tap.opened, w.tap.checked, w.tap.fired.clone()),
+        journal: w.core.broker.take_journal(),
     }
 }
 

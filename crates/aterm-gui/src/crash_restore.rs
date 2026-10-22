@@ -233,9 +233,7 @@ pub(crate) fn resident_bytes() -> u64 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The fingerprint of what the engine runs under
-// ---------------------------------------------------------------------------
 
 /// The hash of the host config an engine was built or reconfigured with: FNV-1a over
 /// its `Debug` rendering, which names every field (floats included) in a fixed order,
@@ -282,9 +280,7 @@ fn scratch_engine(
     crate::spawn::new_live_terminal(rows, cols, cfg, cell_px)
 }
 
-// ---------------------------------------------------------------------------
 // The session's slot: what `status` reads
-// ---------------------------------------------------------------------------
 
 /// Which rung a keeper-recovered session landed on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -619,9 +615,7 @@ impl JournalSlot {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The writer side
-// ---------------------------------------------------------------------------
 
 /// A journal's clock, in milliseconds since it started: what the keyframe policy is
 /// handed (K1's quiet, K2's period, K3's gap), and what the history ring's ticks, the
@@ -1728,9 +1722,7 @@ impl SessionJournal {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The history ring: the journal worker (the plan's increment 5)
-// ---------------------------------------------------------------------------
 
 /// [`SessionJournal::ring_signal`]: the history grew since the worker's last tick.
 #[cfg(unix)]
@@ -2284,9 +2276,7 @@ impl SessionJournal {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The control slot (the plan's increment 7)
-// ---------------------------------------------------------------------------
 
 /// The journal worker carries a session's turn ledger into its region at most this often
 /// (ms), and only when the ledger took a record since its last carry.
@@ -2633,9 +2623,7 @@ impl TurnCountCustody {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The memory shed (the plan's increment 6)
-// ---------------------------------------------------------------------------
 
 /// A shed region replacement that failed is tried again this long after (ms): a region
 /// could not be created (descriptors or shared memory exhausted under the very pressure
@@ -3970,9 +3958,7 @@ pub(crate) const QUIET: std::time::Duration =
 #[cfg(unix)]
 const HOLD_KEYFRAMES_SEAM: &str = "ATERM_DEBUG_CRASH_JOURNAL_HOLD_KEYFRAMES";
 
-// ---------------------------------------------------------------------------
 // The restorer side
-// ---------------------------------------------------------------------------
 
 /// What a restore produced for one offered session: the checkpoint to adopt (with its
 /// repaint flag), and the report.

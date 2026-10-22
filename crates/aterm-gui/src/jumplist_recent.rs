@@ -60,9 +60,7 @@ const MAX_PATH_CHARS: usize = 1024;
 /// `%LOCALAPPDATA%\aterm`).
 pub(crate) const FILE_NAME: &str = "jumplist-recent.txt";
 
-// ---------------------------------------------------------------------------
 // The list (pure)
-// ---------------------------------------------------------------------------
 
 /// `dir` as the one spelling the list keeps, or `None` when it is not a local
 /// drive directory a jump list row could open: `X:\…` with backslashes, no
@@ -239,9 +237,7 @@ pub(crate) fn row_arguments(dir: &str) -> String {
     format!("new-window -d \"{dir}{tail}\"")
 }
 
-// ---------------------------------------------------------------------------
 // What a session ran (pure)
-// ---------------------------------------------------------------------------
 
 /// The directories commands ran in, from `blocks` NEWEST FIRST
 /// (`Terminal::all_blocks().rev()`), stopping at the first block at or below
@@ -279,9 +275,7 @@ pub(crate) fn fresh_dirs<'a>(
     (dirs, newest)
 }
 
-// ---------------------------------------------------------------------------
 // The channel to the worker
-// ---------------------------------------------------------------------------
 
 /// Notes from the UI-thread sampler to the jump list's worker thread: batches
 /// of directories, oldest first.
@@ -320,9 +314,7 @@ pub(crate) fn stop_recording() {
     RECORDING.store(false, Ordering::Release);
 }
 
-// ---------------------------------------------------------------------------
 // The sampler (UI thread)
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 struct Seen {

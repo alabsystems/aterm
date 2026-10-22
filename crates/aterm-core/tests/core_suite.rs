@@ -40,6 +40,7 @@ mod empty_param_default;
 mod fuzz_alt_screen;
 mod fuzz_process_never_panics;
 mod grid_column_agreement;
+mod half_drawn_frame;
 mod handoff_alt_screen_checkpoint;
 mod handoff_colour_and_shell_carry;
 mod handoff_parser_carry;

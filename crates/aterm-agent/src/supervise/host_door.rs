@@ -457,7 +457,7 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// orchestrator's has come since — Claude Code's own wakes (a background
     /// task's notification, its usage-limit continuation) and the harness's
     /// own turns being none; `Some(false)` where it says otherwise. Never the
-    /// retired token, never a done reply to a check (FOREVER CRUISE / FOREVER
+    /// retired token, never a done reply to a check (Autopilot Cruise / FOREVER
     /// LAND). Read at every point a turn ran and at a new loop's first point
     /// ([`TurnEndReading::finished_record`]): the turn-end policy ends nothing
     /// on it (its own reading lands a task), while the loop keys a person's

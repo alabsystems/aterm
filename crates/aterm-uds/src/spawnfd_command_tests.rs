@@ -124,9 +124,7 @@ fn write_mode(path: &Path, body: &str, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
-// ---------------------------------------------------------------------------
 // Stdio
-// ---------------------------------------------------------------------------
 
 /// **EVERY STDIO MODE ROUND-TRIPS.** A piped stdin into a piped stdout;
 /// `output()`'s defaults (stdin `/dev/null`, both outputs captured); a null
@@ -390,9 +388,7 @@ fn a_pipe_end_this_process_keeps_never_passes_for_its_closed_stdio() {
     assert!(out.contains("STAGED closed-stdio ok"), "{out}");
 }
 
-// ---------------------------------------------------------------------------
 // std's rules: programs, arguments, environments, directories, errors
-// ---------------------------------------------------------------------------
 
 /// One environment edit.
 enum Env {
@@ -802,9 +798,7 @@ fn arg0_is_the_childs_argv_zero_and_only_that() {
     assert_eq!(format!("{same:?}"), format!("{theirs_same:?}"));
 }
 
-// ---------------------------------------------------------------------------
 // Inheritance: stdio and nothing else
-// ---------------------------------------------------------------------------
 
 /// The shell a test runs: `held` or `clear` for `fd`, then ` out` on stdout,
 /// `err` on stderr, exit 3 — so one run shows the inheritance, the stdout
@@ -960,9 +954,7 @@ fn no_pair_end_reaches_a_command_child_while_another_thread_makes_pairs() {
     print!("{out}");
 }
 
-// ---------------------------------------------------------------------------
 // Signals
-// ---------------------------------------------------------------------------
 
 unsafe extern "C" {
     fn signal(sig: i32, handler: usize) -> usize;
@@ -1167,9 +1159,7 @@ fn a_child_starts_with_no_signal_blocked_and_std_s_dispositions() {
     print!("{out}");
 }
 
-// ---------------------------------------------------------------------------
 // The child handle, the process group, the session
-// ---------------------------------------------------------------------------
 
 /// **THE HANDLE REAPS ONCE AND KILLS ONLY ITS OWN.** A second `wait` answers
 /// from the first, `try_wait` after it too, and `kill` after the reap signals
@@ -1460,9 +1450,7 @@ fn a_child_leads_the_group_or_the_session_it_was_given() {
     assert_eq!(plain_pgid, ours, "unasked, the child stays in this group");
 }
 
-// ---------------------------------------------------------------------------
 // Responsibility: a disclaimed child
-// ---------------------------------------------------------------------------
 
 /// `responsibility_get_pid_responsible_for_pid(pid)`: the process macOS
 /// charges `pid`'s TCC and syspolicyd questions to. Libquarantine's SPI (no
@@ -1626,9 +1614,7 @@ fn a_disclaim_is_unsupported_off_darwin() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // exec
-// ---------------------------------------------------------------------------
 
 /// The staged half of [`a_command_exec_replaces_this_process_holding_nothing`]:
 /// hold an unflagged descriptor; fail one `exec` (Darwin: the table is left as

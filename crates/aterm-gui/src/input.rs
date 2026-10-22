@@ -2256,14 +2256,14 @@ mod tests {
             egress_bytes(&term, &wheel(WheelDir::Down, 1)),
             detent_arrows(b"\x1b[B", 1)
         );
-        // DECCKM (?1h): arrows switch to the SS3 form, proving the bytes come from
-        // the live keyboard mode, not a hardcoded CSI.
+        // DECCKM (?1h): arrows switch to the SS3 form, so the bytes come from the live
+        // keyboard mode.
         term.lock().unwrap().process(b"\x1b[?1h");
         assert_eq!(
             egress_bytes(&term, &wheel(WheelDir::Up, 1)),
             detent_arrows(b"\x1bOA", 1)
         );
-        // The wheel is consumed as a key report: the viewport must NOT scroll.
+        // The wheel is consumed as a key report: the viewport does not scroll.
         assert!(matches!(
             egress_of(&term, &wheel(WheelDir::Up, 1)),
             Egress::Reported(_)
@@ -2512,8 +2512,7 @@ mod tests {
             wheel_platform_lines(windows(WheelNotch::Lines(0)), 9, 24, true),
             0
         );
-        // The Windows default, and the whole point: one detent is THREE lines, not
-        // the one that winit's `LineDelta` literally reports.
+        // The Windows default: one detent is three lines, not winit's one `LineDelta`.
         assert_eq!(wheel_scaled_lines(1, WheelNotch::Lines(3), 24), 3);
         assert_eq!(wheel_scaled_lines(4, WheelNotch::Lines(3), 24), 12);
         // A slider at 1: one line per detent.

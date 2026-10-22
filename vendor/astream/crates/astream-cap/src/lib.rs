@@ -54,11 +54,11 @@
 //! Crypto honesty: the MAC is **HMAC-SHA256 per RFC 2104** — a standard
 //! construction, not an invented MAC — and it is not this crate's:
 //! `astream-digest` owns the workspace's one HMAC (`hmac_sha256_parts`, the const
-//! core this crate wrote and gave it) over its own SHA-256, FIPS 180-4 transcribed
-//! line by line, pinned to the FIPS vectors, and held byte-for-byte to the `sha2`
-//! crate it replaced over every length 0..=1024. The MAC is pinned there to all
-//! seven RFC 4231 cases; the tags, attach proof and producer ids this crate
-//! answered over `sha2` are pinned here as recorded answers. No cipher is built
+//! core this crate wrote and gave it) over its own SHA-256 after FIPS 180-4, each
+//! compression round checkable against the standard, pinned to the FIPS vectors, and
+//! held byte-for-byte to the `sha2` crate it replaced over every length 0..=1024. The
+//! MAC is pinned there to all seven RFC 4231 cases; the tags, attach proof and producer
+//! ids this crate answered over `sha2` are pinned here as recorded answers. No cipher is built
 //! here: encrypting the wire is
 //! `astream-aead`'s job (ring's ChaCha20-Poly1305 under an in-crate HChaCha20
 //! subkey: XChaCha20-Poly1305), wired into the broker

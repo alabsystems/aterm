@@ -673,8 +673,7 @@ mod tests {
                 "{phase:?}: one second past it is a stall, named by its phase"
             );
         }
-        // The 4.6-day silence, as the watchdog would have seen it from its first
-        // look: a thread parked in the lock wait is a stall within minutes.
+        // A thread parked in the lock wait is a stall within minutes.
         let parked = beat(CheckerPhase::LockWait, 0, LONGEST);
         assert!(matches!(
             classify(&parked, 10 * 60),

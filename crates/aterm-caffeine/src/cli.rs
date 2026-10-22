@@ -11,7 +11,8 @@
 //! `start`, `on` and `off` return at once: the mug is its own launchd job
 //! ([`crate::launchd`]), which they bootstrap or kickstart. `serve` is what that job runs: it
 //! takes the one-mug lock ([`crate::instance`]), re-executes from its bundle copy
-//! ([`crate::code`]) handing the lock over, and runs the menu-bar app.
+//! ([`crate::code`]) handing the lock over, and runs the menu-bar app. `bridge` is what a mug
+//! that restarts onto an update while on starts, to keep the Mac awake until the new mug does.
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -33,6 +34,7 @@ USAGE:
     aterm caffeine startup [on|off]
     aterm caffeine quit [own]
     aterm caffeine serve
+    aterm caffeine bridge
 
     start      Put the mug in the menu bar (its own launchd job, in this
                login); nothing when it is there. The default.
@@ -52,6 +54,8 @@ USAGE:
     quit       Turn off and take the mug out of the menu bar. `own`: only this
                build's mug and its job; another build's keeps running, on.
     serve      Run the mug in this process (what its launchd job runs).
+    bridge     Keep the Mac awake while the mug restarts onto an update of
+               aterm, until the new mug does (what a restarting mug runs).
 
 A restart of the Mac starts it off. macOS only.
 ";
@@ -81,6 +85,8 @@ pub enum Command {
     },
     /// `serve`: run the mug here.
     Serve,
+    /// `bridge`: keep the Mac awake while the mug restarts onto an update.
+    Bridge,
 }
 
 /// Parse the words after `caffeine`.
@@ -129,6 +135,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, String> {
             },
         },
         Some("serve") => Command::Serve,
+        Some("bridge") => Command::Bridge,
         Some(other) => return Err(format!("unknown command {other:?}")),
     };
     if let Some(extra) = it.next() {
@@ -250,6 +257,7 @@ fn run(command: Command, version: &str) -> ExitCode {
         Command::Startup(set) => mac::startup(set),
         Command::Quit { own } => mac::quit(own),
         Command::Serve => mac::serve(version),
+        Command::Bridge => crate::macos::bridge(),
     }
 }
 
@@ -484,8 +492,9 @@ mod mac {
         }
     }
 
-    /// How long [`quit`] waits for the mug it ended to let go of the lock: it keeps no SIGTERM
-    /// handler, so it ends at once, and this only bounds a hang.
+    /// How long [`quit`] waits for the mug it ended to let go of the lock: launchd's SIGTERM
+    /// ends a job's mug at once (its default action), and the one a hand-run mug gets from
+    /// `quit` itself quits it through its run loop within moments, so this only bounds a hang.
     const QUIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
     pub(super) fn quit(own: bool) -> ExitCode {
@@ -765,6 +774,8 @@ mod tests {
         assert_eq!(parsed("quit own"), Ok(Command::Quit { own: true }));
         assert!(parsed("quit all").is_err());
         assert_eq!(parsed("serve"), Ok(Command::Serve));
+        assert_eq!(parsed("bridge"), Ok(Command::Bridge));
+        assert!(parsed("bridge now").is_err());
     }
 
     /// `on` hands its word to `crate::model::parse_span`, whose own tests hold the table.

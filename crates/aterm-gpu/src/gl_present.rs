@@ -948,16 +948,11 @@ impl GpuRenderer {
             u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         win.last_present_encode_ns = win.last_present_work_ns;
         let live = self.gl_arm.as_ref().expect("checked above");
-        let posted = win.measure_surface_acquire(|| gs.present(&live.dev));
+        let fill = frame_live_bg(input, self.theme.bg);
+        let posted = win.measure_surface_acquire(|| gs.present(&live.dev, fill));
         posted.map_err(|e| {
             gl_arm_note(&format!("armed present: the post failed ({e})"));
-            #[cfg(not(target_arch = "wasm32"))]
-            let kind = e.kind;
-            // A WebGL canvas has no bind to refuse: every failed post keeps the
-            // validation disposition.
-            #[cfg(target_arch = "wasm32")]
-            let kind = SurfacePresentFailure::Validation;
-            kind
+            e.kind
         })?;
         self.gl_maybe_inject_loss();
         Ok(())

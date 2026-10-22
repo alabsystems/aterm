@@ -1912,7 +1912,7 @@ mod tests {
     /// Bug hunt 8: the window carries the layout's character only when the US
     /// derivation from the unshifted key would type something else — so a US
     /// press stays the event a controller builds — for a text press and, since
-    /// ATERM-KI-1015-9, a Ctrl or Alt chord.
+    /// , a Ctrl or Alt chord.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn layout_text_rides_a_press_only_when_the_layout_differs() {
@@ -2077,7 +2077,7 @@ mod tests {
         );
     }
 
-    /// A CHORD UNDER XKB'S CAPS LOCK TAKES SHIFT'S CASE (ATERM-KI-1015-9). On X11 and
+    /// A CHORD UNDER XKB'S CAPS LOCK TAKES SHIFT'S CASE. On X11 and
     /// Wayland xkb cancels Shift against Caps Lock on an alphabetic key, so Turkish Caps
     /// Lock + Alt+Shift+i arrives with the text `i`, and the chord took `i`'s default
     /// capital, ESC `I`, where Alt+Shift+i without the lock is ESC `İ`. The window reads a

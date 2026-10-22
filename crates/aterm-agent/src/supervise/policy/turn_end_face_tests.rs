@@ -6,7 +6,7 @@
 // memory moves (`TurnEndState::face_moved`), someone else's live turn
 // (`TurnEndState::took`), and the landing a loop before this one landed
 // (`TurnEndState::seed_landed`, §9.4.5). Three faces: open, landed, theirs —
-// FOREVER CRUISE has no done face, and FOREVER LAND no spent one. Included
+// Autopilot Cruise has no done face, and Autopilot Land no spent one. Included
 // from `turn_end_tests.rs` (`mod face`), so its readings and acts are in
 // scope. Each behaviour has its negative control.
 

@@ -107,8 +107,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_private_refuses_symlinked_final_component() {
-        // A symlink planted at the final name must NOT be followed (O_NOFOLLOW):
-        // the write must fail rather than clobber the link target.
+        // A symlink at the final name is not followed (O_NOFOLLOW): the write fails.
         use std::os::unix::fs::symlink;
         let dir = std::env::temp_dir().join(format!("aterm-snap-at-sym-{}", std::process::id()));
         ensure_private_dir(&dir).unwrap();

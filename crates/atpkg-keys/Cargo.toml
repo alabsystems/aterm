@@ -54,9 +54,8 @@ atpkg = { path = "../atpkg" }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-release = { workspace = true }
-# The owner→client integration test builds a real `.tar.zst` to drive the client install:
-# one raw-block zstd frame from the first-party writer (docs/AUDIT-third-party-2026-10-15.md
-# ZC.3), which atpkg's extractor decodes.
+# owner_to_client builds a real `.tar.zst` for the client install: one raw-block zstd frame
+# from the first-party writer (docs/AUDIT-third-party-2026-10-15.md ZC.3).
 aterm-zstd = { workspace = true }
 # Fixture directories removed on drop.
 aterm-tempfile = { workspace = true }

@@ -1,23 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The in-GUI supervisor host's per-session machines: the worker lifecycle
-//! (at most ONE supervisor on a session at a time, a failing one restarted
-//! for ever — badged past a budget, never turned off — a session another
-//! supervisor holds left alone until a claim is released), which exits the
-//! host hands a worker at all (a name its roster could not read while the
-//! agent still holds its tab is none; the upgrade's own restart is carried
-//! on as the upgrade's), and the relaunch of an agent that left
-//! its tab (a person's exit is theirs; any other is relaunched on a growing
-//! back-off or said to a person — never dropped).
+//! The in-GUI supervisor host's per-session machines: the restore queue and its carry across a
+//! seamless update, the relaunch a failed Commit owes, the worker lifecycle (one supervisor
+//! per session, a failing one restarted for ever), the supervisor claim across an update, which
+//! exits the host hands a worker, the relaunch on exit and how an exit is read, the upgrade's
+//! looks and ages, and the explicit restart.
 
 use aterm_spec::derive::Model;
 
-/// Two restored tabs in the host's one retry queue. A's first step waits;
-/// B still gets its first step before A can retry, even when A's due time
-/// passes during its own call. `Buggy=1` is the former nested retry loop,
-/// which ran A's second step before B's first. Tier-1 drives the real host's
-/// restored worker with these outcomes and validates each observed action.
+/// Two restored tabs in the host's one retry queue. A's first step waits; B still gets its
+/// first step before A can retry, even when A's due time passes during its own call. `Buggy=1`
+/// is a nested retry loop that runs A's second step before B's first. Tier-1 drives the real
+/// host's restored worker with these outcomes and validates each observed action.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_restored_first_attempt_model() -> Model {
@@ -43,99 +38,67 @@ pub fn harness_restored_first_attempt_model() -> Model {
     }
 }
 
-/// HARNESS WORK IN FLIGHT AT A SEAMLESS UPDATE'S COMMIT (round four of the
-/// 2026-09 update robustness work, plan item 7), for one restored agent `A` a
-/// cold restore queued ([`harness_restored_first_attempt_model`]'s queue) and
-/// one restart `R` the outgoing instance's harness left in flight in a tab
-/// whose agent it had already ended (a shell tab no worker looks at).
+/// Harness work in flight at a seamless update's Commit: one restored agent `A` a cold restore
+/// queued ([`harness_restored_first_attempt_model`]'s queue) and one restart `R` the outgoing
+/// instance left in flight in a tab whose agent it had already ended (a shell tab no worker
+/// looks at).
 ///
-/// `queued` — `A` is still owed by the outgoing instance's queue; `acting` —
-/// its step is running (it stays queued meanwhile); `typed` — a step of `A`
-/// typed its line and waits for its agent (`wait:resume`): its relaunch is
-/// in flight on the conversation's record, and every later step — here or
-/// the successor's — carries that on, never typing a second line; `ran` —
-/// an agent ran in `A`'s tab since it was queued (the world's fact, a
-/// ghost); `overtaken` — the host knows it, of an `A` that typed nothing
-/// (round twelve: kept for good once seen); `paused` — a handoff parked the
-/// readers; `captured` — what the park's pending layout carried for `A`;
-/// `capture` — how a layout reads the queue (0 live, as it is; 1 dropping
-/// it, 2 the copy the park froze: the mutants); `committed` — the successor
-/// took over (the outgoing instance and any step it was running end there);
-/// `succ` — the successor's own queue owes `A`; `resolved` — `A` was
-/// relaunched or said; `late` — a step that STARTED while parked; `over` — a
-/// relaunch of `A` that could type its line (none typed yet) stepped after
-/// an agent ran in its tab; `restart` — `R`'s record is in flight; `swept` —
-/// the successor's Commit owes `R` a carry-on step.
+/// `queued`: `A` is owed by the outgoing instance's queue; `acting`: its step runs (still
+/// queued); `typed`: a step typed its line and waits for its agent (`wait:resume`), so its
+/// relaunch is in flight on the conversation's record and every later step, here or the
+/// successor's, carries that on without typing again; `ran`: an agent ran in `A`'s tab since it
+/// was queued (a ghost); `overtaken`: the host knows it, of an `A` that typed nothing (kept once
+/// seen); `paused`: a handoff parked the readers; `captured`: what the park's pending layout
+/// carried for `A`; `capture`: how a layout reads the queue (0 live; the mutants' 1 dropping it
+/// and 2 the copy the park froze); `committed`: the successor took over (the outgoing instance
+/// and its running step end there); `succ`: the successor's queue owes `A`; `resolved`: `A` was
+/// relaunched or said; `late`: a step started while parked; `over`: a relaunch of an `A` that
+/// typed nothing stepped after an agent ran in its tab; `restart`: `R`'s record is in flight;
+/// `swept`: the successor's Commit owes `R` a carry-on step.
 ///
-/// * `StepStart`, `StepRetries`, `StepTypes`, `StepResolves` — the outgoing
-///   worker's step and its ends (a word that is not possible yet, typed
-///   nothing, keeps `A` queued; one that typed its line and waits keeps it
-///   queued, typed); no step STARTS while parked or once an agent is known
-///   to have run in the tab of an `A` that typed nothing, and the step in
-///   flight ends while parked too.
-/// * `AgentRuns` — a person (anyone) starts an agent in `A`'s tab, parked or
-///   not, during a step or between steps, and the host's roster names it —
-///   which overtakes an `A` that typed nothing, and no `A` that typed: the
-///   agent in its tab is then its own (`RestoredAttempt::typed`, an agent
-///   seen during the step that typed included); `Overtaken` — the queue
-///   takes `A` off without a step (never while parked: its worker waits on
-///   the park).
-/// * `Park` captures the pending layout from the queue AS IT IS (`A` while
-///   queued and not overtaken); `Rollback` resumes the queue.
-/// * `Commit` re-captures the layout the same way and goes ahead only where
-///   the two captures agree — a step that landed or an agent that ran in
-///   between refuses it, as activity — handing what they carry to the
-///   successor's queue and owing every restart record still in flight a
-///   carry-on.
-/// * `SuccRelaunches`, `SweepCarriesOn` — the successor's steps (each the
-///   same idempotent step the outgoing instance would have taken, so a
-///   relaunch it already typed is carried on, never typed twice).
-/// * `RestartFinishes` — the outgoing instance's own act finished `R` before
-///   the Commit.
-///
-/// A TYPED `A` CROSSES A HANDOFF UNTYPED (the review of round twelve): the
-/// successor queues what the leaf carried as a fresh attempt, so an agent
-/// its roster names in the tab — the one the outgoing instance's line
-/// started — overtakes it there, and its queue takes it off with no row.
-/// What it typed is the conversation's record in flight, which the
-/// successor's Commit sweeps on every adopted tab (`R`'s carry-on, the same
-/// step): carried on, or said in the restored agents' row. So the
-/// successor's `SuccRelaunches` here is that one step, whichever of the two
-/// takes it.
-///
-/// * `NoSilentLoss` — past the Commit `A` is resolved, the successor owes
-///   it, or an agent ran in its tab: the reopened layout's row said it
-///   resumes;
-/// * `NoStepWhileParked` — the worker takes no new step while the terminal is
-///   parked;
-/// * `NoRelaunchOverAgent` — no relaunch of `A` is stepped, here or by the
-///   successor, once an agent ran in its tab having typed nothing;
-/// * `NoStrandedRestart` — past the Commit a restart record in flight is owed
+/// * `StepStart`, `StepRetries`, `StepTypes`, `StepResolves`: the outgoing worker's step and its
+///   ends (a word not yet possible, typed nothing, keeps `A` queued; one that typed and waits
+///   keeps it queued, typed). No step starts while parked or once an agent is known to have run
+///   in the tab of an `A` that typed nothing; the step in flight ends while parked too.
+/// * `AgentRuns`: anyone starts an agent in `A`'s tab, at any time, and the roster names it. It
+///   overtakes an `A` that typed nothing, not one that typed (`RestoredAttempt::typed`).
+///   `Overtaken`: the queue takes `A` off without a step (never while parked: its worker waits
+///   on the park).
+/// * `Park` captures the pending layout from the queue as it is (`A` while queued and not
+///   overtaken); `Rollback` resumes the queue.
+/// * `Commit` re-captures the layout the same way and goes ahead only where the two captures
+///   agree (a step that landed or an agent that ran in between refuses it, as activity),
+///   handing what they carry to the successor's queue and owing every restart record in flight
 ///   a carry-on.
+/// * `SuccRelaunches`, `SweepCarriesOn`: the successor's steps, each the same idempotent step
+///   the outgoing instance would have taken, so a relaunch already typed is never typed twice.
+/// * `RestartFinishes`: the outgoing instance finished `R` before the Commit.
 ///
-/// `Buggy=1` is what shipped, each mutant caught alone: `ParkDropsQueue`
-/// (until round four the queue was the worker's local and the handoff leaf
-/// never named an agent — `NoSilentLoss`), `StepStartWhileParked` (a worker
-/// the park does not stop — `NoStepWhileParked`), `CommitWithoutSweep` (the
-/// successor resumed its host for agent tabs only — `NoStrandedRestart`),
-/// `ParkFreezes` (rounds four to ten froze the queue at the park for both
-/// captures, which then always agreed — `NoRelaunchOverAgent`: the successor
-/// typed its relaunch beside the agent a person started there the moment it
-/// gave the shell its prompt back), `StepStartOvertaken` (before round eleven
-/// the queue never asked the tab before a step — `NoRelaunchOverAgent`) and
-/// `AgentStopsForgotten` (round eleven asked whether an agent runs at the
-/// instant of a capture or a step, which a ctrl-z or its exit clears —
-/// `NoRelaunchOverAgent`). The bounded hold that keeps an AUTOMATIC update
-/// from parking while `A` is queued is the ladder's
-/// (`native_update_apply_ladder_model`'s `warmup`); this machine is what an
-/// explicit update, and one past the hold's bound, relies on. Tier-1
-/// (`aterm-gui`'s `harness_host` test
-/// `the_real_restored_carry_conforms_to_its_model`) drives the real host's
-/// queue through a park mid-step, a step that lands while parked, an agent
-/// that runs and stops in the tab, a successor's relaunch of what it carried
-/// and the Commit's sweep, and an agent in the tab of a relaunch that typed
-/// its line (still stepped, still carried), projecting each observed state
-/// onto the model's.
+/// A typed `A` crosses a handoff untyped: the successor queues what the leaf carried as a fresh
+/// attempt, so the agent the outgoing line started overtakes it there and the queue takes it
+/// off with no row. What it typed is the conversation's record in flight, which the successor's
+/// Commit sweeps on every adopted tab (`R`'s carry-on, the same step), so `SuccRelaunches` here
+/// is that one step, whichever takes it.
+///
+/// * `NoSilentLoss`: past the Commit `A` is resolved, the successor owes it, or an agent ran in
+///   its tab;
+/// * `NoStepWhileParked`: the worker takes no new step while the terminal is parked;
+/// * `NoRelaunchOverAgent`: no relaunch of `A` is stepped, here or by the successor, once an
+///   agent ran in its tab having typed nothing;
+/// * `NoStrandedRestart`: past the Commit a restart record in flight is owed a carry-on.
+///
+/// `Buggy=1`, each mutant caught alone: `ParkDropsQueue` (a handoff leaf that names no queued
+/// agent; `NoSilentLoss`), `StepStartWhileParked` (a worker the park does not stop),
+/// `CommitWithoutSweep` (a successor that resumes its host for agent tabs only;
+/// `NoStrandedRestart`), `ParkFreezes` (both captures read the queue frozen at the park and
+/// always agree, so the successor types its relaunch beside an agent a person started there;
+/// `NoRelaunchOverAgent`), `StepStartOvertaken` (a queue that never asks the tab before a step)
+/// and `AgentStopsForgotten` (asking whether an agent runs only at the instant of a capture or a
+/// step, which a ctrl-z or its exit clears). The bounded hold that keeps an automatic update
+/// from parking while `A` is queued is the ladder's (`native_update_apply_ladder_model`'s
+/// `warmup`); this machine is what an explicit update, and one past the hold's bound, relies
+/// on. Tier-1: `aterm-gui`'s `the_real_restored_carry_conforms_to_its_model` drives the real
+/// host's queue through each of these and projects every observed state onto the model's.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_restored_carry_model() -> Model {
@@ -272,143 +235,43 @@ pub fn harness_restored_carry_model() -> Model {
     }
 }
 
-/// A CRASHED AGENT'S RELAUNCH THROUGH A PARK'S COMMIT THAT FAILS (round six's
-/// F13, rounds eleven to fourteen). `aterm-gui`'s `harness_host` for ONE
-/// session: its agent, its worker, the mark a Commit leaves on the session
-/// (`Kept::commit`), the mark of an exit no worker was handed
-/// (`Kept::unwatched`), through one Commit that fails and rolls back, then
-/// the next park — or a quit.
+/// A crashed agent's relaunch through a park's Commit that fails. `aterm-gui`'s `harness_host`
+/// for one session: its agent, its worker, the mark a Commit leaves on the session
+/// (`Kept::commit`) and the mark of an exit no worker was handed (`Kept::unwatched`), through
+/// one Commit that fails and rolls back, then the next park, or a quit.
 ///
-/// `agent` — 1 runs in its tab, 0 crashed (relaunched once read); `worker` —
-/// 0 none, 1 supervising (no exit handed), 2 handed the exit (`left`) and
-/// not read it yet, 3 read it: the relaunch owed on its back-off; `stop` —
-/// that worker's stop is set: the Commit's, or a hand-over's; `handover` —
-/// a changed policy handed that worker over to a successor
-/// (`Worker::hand_over`); `commit` — 0 `No`, 1 `Stopped`, 2 `Stranded`, 3
-/// `TakenUp`; `unwatched` — a worker the Commit stopped, or one handed over,
-/// ended handed nothing, or the host read an agent back in the tab of a
-/// worker handed its exit (the agent's own worker not started yet); `phase`
-/// — 0 before the Commit, 1 the Commit holds the
-/// host (suspended: no pass hands an exit), 2 the Commit failed (the host
-/// supervises again), 3 rolled back (`relaunch_stranded`), 4 the next park,
-/// 5 its Commit went ahead; `done` — a worker relaunched the agent since its
-/// last crash; `queued` — its relaunch is on the
-/// restored queue; `stale` — an overtaken cold-restore relaunch of the same
-/// tab is still queued (an agent a person started there is the one that
-/// crashed); `captured` — what the next park's layout carries for the tab;
-/// `succ` — that Commit handed the successor the relaunch; `dropped` — it went
-/// ahead with a relaunch queued for the tab that its layout did not carry;
-/// `blind` — the exit the host's mark holds is one a worker handed it cannot
-/// decide: of an agent a landing started that nothing read, its own start
-/// having swept the record the exit before it left and the host's follow
-/// having forgotten the snapshot as it held the tab (only `SettleGone`
-/// marks one); `closed` — the host shut down (a quit) and its restored
-/// queue is closed: nothing more is queued, stepped or handed, and the quit
-/// layout carries what the queue and the sessions still owe; `down` — the
-/// host thread panicked and waits out its restart's back-off: no pass hands
-/// an exit, a mark or starts a worker (round seventeen); `seen` — what the
-/// agent's last exit left was read as it was seen: by the worker a pass
-/// handed it at once, or by the exit watch where no pass would see it soon
-/// (`Kept::exit_watch`, round seventeen); `swept` — a Claude Code started
-/// since that exit and removed the crashed agent's session record, as every
-/// Claude Code that starts removes dead agents' records (D2 of the
-/// 2026-09-26 live test); `landed` — the agent a worker's relaunch landed,
-/// that no pass has named yet, is watched by the exit watch that hands its
-/// exit itself once read (`ExitWatched::hands`; round seventeen, the review
-/// of its first cut); `qlanded` — the restored queue's step landed an agent
-/// no read has reached yet (round eighteen, the review of its first cut):
-/// its attempt stays queued, the exit's holder, until a read reaches the
-/// agent (`QueueReadsLanded`: watched as `landed`), a pass names it
-/// (`Start`), or it crashes unread — its own relaunch's exit again, the
-/// attempt owed as before (`Crash`), stepped again.
+/// Variables:
 ///
-/// * `Crash` — the agent crashes, whatever the phase (before a quit), while
-///   a worker, the host's mark or a landing's watch holds it — the agent a
-///   relaunch brought back too, which owes a relaunch again — and what it
-///   left is read as it is seen; `Sweep` — a Claude Code starts and removes
-///   the crashed agent's record; `Back` — an agent runs in the tab again (the
-///   relaunch's own, or one someone started) and the host reads it — a pass,
-///   so never while the host is down: in the tab of a worker handed its
-///   exit, and no stop since, it is the host's until its own worker starts
-///   (`Worker::back` marks it); `Settle` — that
-///   worker reads the agent back, or its relaunch landed (an agent the host
-///   read, or one at a Commit's stop, which marks it), and ends — the agent
-///   running as it reads it; `Rearm` — it reads the agent back gone again
-///   first, in its back-off or at the landing that started it (round two of
-///   the joint audit of 2026-10-01): no stop came, so the exit is its own
-///   relaunch's again, the mark taken back (a stop's is `Decide`'s).
-/// * `Hand` — the host's pass hands the exit to a worker not stopped (never
-///   while suspended, nor while the host is down); `Read` — the worker reads
-///   it, stopped or not (round twelve: `left_at_commit`): on what the exit
-///   left as it was seen, or — where nothing read it so — on the record now,
-///   which a sweep read as a graceful exit (the worker ends, nothing owed);
-///   `Relaunch` — its back-off lands, never while
-///   parked (phases 1, 2 and 4), and the worker ends, the agent it started
-///   left to the roster and watched until a pass names it (`landed`);
-///   `RelaunchUnread` — its back-off lands, but no read reaches the agent
-///   it started (round eighteen): the worker reads it again while it holds
-///   its tab and no pass names it (`harness_host::read_landed`), so it stays
-///   the exit's holder — a later read is `Relaunch`'s landing, and the
-///   agent's crash meanwhile is its own relaunch's again;
-///   `HandOver` — a changed `[harness]` policy
-///   stops a worker whose agent the pass found in the tab, for a successor
-///   the next pass starts (`Start`): its stop is set before any Commit's.
-/// * `Suspend` — the Commit's stop: every live worker stopped and marked;
-///   `Decide` — a stopped worker owing the relaunch decides on the mark,
-///   however late (round eleven): `Stopped` leaves it stranded, `TakenUp`
-///   queues it — or, the queue closed by a quit, leaves it stranded for the
-///   quit layout (round sixteen); `EndUnhanded` — a stopped worker handed
-///   nothing ends, leaving the exit to the host: one the Commit stopped
-///   (round thirteen), or one
-///   handed over (round fourteen), which the Commit's stop does not mark.
-/// * `Resume`, `Rollback` — the Commit failed: the host supervises again, then
-///   a stranded relaunch is queued and a mark not decided becomes `TakenUp`;
-///   `HandUnwatched` — a host supervising (never while suspended, nor while
-///   it is down) hands an exit no worker was handed to a worker that reads it
-///   alone: the host's mark's, or a landing's watch's once it has read the
-///   exit; `Start` — a worker for an agent in the tab (both reset the
-///   marks), and ends a queued attempt whose unread landing it names;
-///   `QueueSteps` — the queue relaunches it, the agent it landed read and
-///   watched until a pass names it (`landed`; round eighteen,
-///   `harness_host::restored_landing_look`); `QueueStepsUnread` — the
-///   queue's step lands an agent no read reaches (`qlanded`), the attempt
-///   kept; `QueueReadsLanded` — a later look of the queue reads it (never
-///   while a park pauses the queue): the attempt over, the agent watched
-///   (`landed`). None waits for the host: the queue runs on its own
-///   thread, the host down or not.
-/// * `Panic` — the host thread's loop panics (round seventeen): what it held
-///   lives on in the host thread's own memory — its workers run on, each its
-///   tab's supervisor still, held to the policy as it is (a changed one hands
-///   them over: `HandOver`), and each one's agent's exit is watched, as is an
-///   agent a carried worker's relaunch lands — and the loop starts again
-///   after its back-off, or once news cuts it short (the policy changed, a
-///   Commit failed), `Up`, its first pass reading the roster again. A panic
-///   in the restart itself is one more panic in a row, caught as the run's
-///   is (round eighteen, `harness_host::restart_host`): nothing changes
-///   here, `down` stays.
-/// * `Overtook` — the cold restore's relaunch of the tab, overtaken by the
-///   agent a person started there, still waits for its retry; `Park` — the
-///   next park captures the queue for the tab; `Commit` — its Commit
-///   re-captures it and goes ahead only where the two captures agree (a
-///   relaunch queued in between refuses it, as activity).
-/// * `Quit` — the host shuts down after the rollback told a worker not
-///   decided yet to take its relaunch up (`TakenUp`), closing the queue.
-///   The machine's quit is that one: a crash after it, and a worker in an
-///   ordinary back-off at it, are the quit layout's to carry from the agent
-///   the tab ran (the host's published snapshot), which is not modelled.
+/// * `agent`: 1 runs in its tab, 0 crashed. `worker`: 0 none, 1 supervising (no exit handed), 2
+///   handed the exit (`left`) and not read it, 3 read it, the relaunch owed on its back-off.
+///   `stop`: that worker's stop is set (the Commit's or a hand-over's). `handover`: a changed
+///   policy handed it over (`Worker::hand_over`).
+/// * `commit`: 0 `No`, 1 `Stopped`, 2 `Stranded`, 3 `TakenUp`. `unwatched`: a worker the Commit
+///   stopped, or one handed over, ended handed nothing, or the host read an agent back in the
+///   tab of a worker handed its exit.
+/// * `phase`: 0 before the Commit, 1 the Commit holds the host (suspended: no pass hands an
+///   exit), 2 the Commit failed (the host supervises again), 3 rolled back
+///   (`relaunch_stranded`), 4 the next park, 5 its Commit went ahead.
+/// * `done`: a worker relaunched the agent since its last crash; `queued`: its relaunch is on
+///   the restored queue; `stale`: an overtaken cold-restore relaunch of the same tab is still
+///   queued; `captured`: what the next park's layout carries for the tab; `succ`: that Commit
+///   handed the successor the relaunch; `dropped`: it went ahead with a relaunch queued for the
+///   tab that its layout did not carry.
+/// * `blind`: the host's mark holds an exit the worker it is handed to cannot decide (only
+///   `SettleGone` sets it). `closed`: the host shut down and its restored queue is closed; the
+///   quit layout carries what the queue and the sessions still owe. `down`: the host thread
+///   panicked and waits out its restart's back-off (no pass hands an exit or a mark, or starts
+///   a worker).
+/// * `seen`: the last exit was read as it was seen, by the worker a pass handed it at once or by
+///   the exit watch (`Kept::exit_watch`). `swept`: a Claude Code started since and removed the
+///   crashed agent's session record, as every Claude Code that starts removes dead agents'
+///   records. `landed`: the agent a relaunch landed, not yet named by a pass, is watched by the
+///   exit watch, which hands its exit itself (`ExitWatched::hands`). `qlanded`: the restored
+///   queue's step landed an agent no read has reached; its attempt stays queued, the exit's
+///   holder, until a read reaches it (`QueueReadsLanded`), a pass names it (`Start`), or it
+///   crashes unread and is stepped again.
 ///
-/// * `NoOwedRelaunchLost` — past the rollback a crashed agent is relaunched,
-///   queued, carried, or held by someone who will: a live worker, the
-///   rollback's stranded mark, the host's unwatched one or a landing's
-///   watch. Past the next
-///   Commit (phase 5) a worker or a mark still holding it is not this
-///   model's claim, whose next park carries the restored queue alone: a
-///   crash read after the Commit's re-capture is on neither layout as owed,
-///   and since round eighteen the successor takes it by watching the agent
-///   the leaf names supervised (`HostHandle::watch_handed`; pinned by
-///   `aterm-gui`'s App-level tests, not expressed here);
-/// * `NoQueuedRelaunchDropped` — no Commit goes ahead past a relaunch the
-///   queue owes the tab that its layout does not carry.
+/// Actions:
 ///
 /// `Buggy=1` is what shipped, each mutant caught alone: `DecideByPark`
 /// (round ten read a Commit's stop as `Switches::parked`, which the
@@ -475,22 +338,10 @@ pub fn harness_restored_carry_model() -> Model {
 /// defect a checker could catch (`ty --strict-vacuity`). Tier-1 (`aterm-gui`'s
 /// `harness_host` tests `the_real_commit_owed_relaunch_conforms_to_its_model`,
 /// `a_crash_after_a_hand_over_conforms_to_the_commit_owed_model`,
-/// `an_agent_back_and_gone_again_conforms_to_the_commit_owed_model` and
-/// `exit_watch::an_exit_nobody_is_handed_conforms_to_the_commit_owed_model`)
-/// drives the real host through both losses of round twelve, the control of the
-/// first (the agent alive across the failed Commit), the hand-over's loss of
-/// round thirteen with a Commit and without, and a relaunch's agent back and
-/// gone again — read in the wait, landed, and across a failed Commit — or
-/// landed in a Commit's hold and gone there, a crash swept while the host
-/// is down after a panic or while a Commit holds it (round seventeen), and an
-/// agent a relaunch landed while the host is down that crashes before it is
-/// back (the review of round seventeen's first cut), projecting each
-/// observed state onto the model's; and (round eighteen,
-/// `exit_watch::the_landings_of_round_eighteen_conform_to_the_commit_owed_model`)
-/// the rollback queue's landing whose agent crashes before a pass names
-/// it, a panic in the host's restart, a landing no read reaches whose
-/// agent crashes while the host is down, and the rollback queue's landing
-/// no read reaches, whose agent crashes unread and is stepped again.
+/// `an_agent_back_and_gone_again_conforms_to_the_commit_owed_model`, and the exit watch's
+/// `an_exit_nobody_is_handed_conforms_to_the_commit_owed_model` and
+/// `the_landings_of_round_eighteen_conform_to_the_commit_owed_model` drive the real host through
+/// these paths and project each observed state onto the model's.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_commit_owed_model() -> Model {
@@ -765,73 +616,50 @@ pub fn harness_commit_owed_model() -> Model {
     }
 }
 
-/// `aterm-gui`'s `harness_host` runs one worker per agent session. For ONE
-/// session: `wanted` is the session's published program being a supervisable
-/// agent — or, for a pass that cannot name it, its agent still holding the
-/// tab ([`harness_leave_model`]) — and the policy active; `on` that agent's
-/// own switch (`[harness.<id>] enabled`); `cur` a worker running under the
-/// current policy; `old` workers asked to stop (the program left, the policy
-/// changed, the agent switched off) whose wait has not ended yet; `faults`
-/// the SESSION's failed runs in the restart window — across its workers,
-/// kept at most `Budget + 1`; `faulted` the session badged while its worker
-/// waits to restart a supervisor that keeps failing past the budget (the
-/// worker still the session's: `cur` stays); `held` another supervisor's
-/// claim refused ours.
+/// `aterm-gui`'s `harness_host` runs one worker per agent session. For one session: `wanted` is
+/// the session's published program being a supervisable agent (or, for a pass that cannot name
+/// it, its agent still holding the tab, [`harness_leave_model`]) with the policy active; `on`
+/// that agent's own switch (`[harness.<id>] enabled`); `cur` a worker under the current policy;
+/// `old` workers asked to stop whose wait has not ended; `faults` the session's failed runs in
+/// the restart window, across its workers, kept at most `Budget + 1`; `faulted` the session
+/// badged while its worker waits to restart a supervisor failing past the budget (`cur` stays);
+/// `held` another supervisor's claim refused ours.
 ///
-/// * `Arrive`/`Leave` — the program becomes / stops being the agent. Leaving
-///   asks the worker to stop and forgets `held` (the host keeps it only for a
-///   session it still wants) — but NOT `faults`: a program flap gives a
-///   crash-looping engine no fresh budget. The badge goes with the worker
-///   that raised it, at its `Exit`.
-/// * `SwitchOff`/`SwitchOn` — the agent's switch goes off / on. Off asks the
-///   worker to stop exactly as `Leave` does — `faults` kept, `held`
-///   forgotten, the badge going at its `Exit` — while the session stays the
-///   agent's: the switch-off path is a stop, never the agent leaving
-///   ([`harness_leave_model`] hands its worker no exit). On lets `Start` run
-///   again.
-/// * `Start` — the host starts a worker for a wanted session whose agent is
-///   on, with none of its own, not held, and — the property — NO OLD WORKER
-///   STILL RUNNING: the host reaps a stopped worker before it starts the next
-///   one. It inherits the session's `faults`.
-/// * `Exit` — an old worker's wait ends and it is reaped, its badge cleared
-///   on its way out (no new worker starts before it has gone).
-/// * `Fail` — the current worker's run failed or panicked: restarted in
-///   place, ALWAYS — within `Budget` on the short pauses, past it badged
-///   while it waits for the longer one. (Until the philosophy review of
-///   2026-09-25 the next failure past the budget turned the supervisor
-///   OFF until someone edited `[harness]`: a give-up that waited on a
-///   person.)
-/// * `Restart` — the failure is told steady: `faulted` is the window's claim that
-///   the supervisor keeps failing (it was a tab badge until 2026-09-28), and it
-///   is withdrawn when a run has outlived its failure
-///   (`HostNote::SupervisorSteady`), not when the next run merely starts — a
-///   restart after the pause leaves it told. `Exit` and `Hold` withdraw it too:
-///   the worker's end steadies it.
-/// * `Age` — the oldest failure leaves the hour's window.
-/// * `Hold` — the claim was refused: the worker ends, its badge with it;
-///   `Release` — a claim was released or lapsed somewhere, so a held
-///   session may be tried again.
-/// * `Reload` — the `[harness]` policy changed: the worker is asked to stop
-///   (its successor starts under the new policy), and `faults` is forgiven.
+/// * `Arrive`/`Leave`: the program becomes or stops being the agent. Leaving asks the worker to
+///   stop and forgets `held`, but keeps `faults`: a program flap gives a crash-looping engine
+///   no fresh budget. The badge goes with its worker at `Exit`.
+/// * `SwitchOff`/`SwitchOn`: off stops the worker exactly as `Leave` does while the session
+///   stays the agent's (a stop, never the agent leaving: [`harness_leave_model`] hands its
+///   worker no exit); on lets `Start` run again.
+/// * `Start`: a worker for a wanted session whose agent is on, with none of its own, not held,
+///   and no old worker still running (the host reaps a stopped worker before starting the
+///   next). It inherits `faults`.
+/// * `Exit`: an old worker's wait ends and it is reaped, its badge cleared.
+/// * `Fail`: the current worker's run failed or panicked and restarts in place, always: within
+///   `Budget` on the short pauses, past it badged while it waits for the longer one.
+/// * `Restart`: `faulted` is withdrawn when a run outlives its failure
+///   (`HostNote::SupervisorSteady`), not when the next run merely starts. `Exit` and `Hold`
+///   withdraw it too.
+/// * `Age`: the oldest failure leaves the hour's window.
+/// * `Hold`: the claim was refused and the worker ends; `Release`: a claim was released or
+///   lapsed somewhere, so a held session may be tried again.
+/// * `Reload`: the `[harness]` policy changed: the worker is asked to stop (its successor starts
+///   under the new policy) and `faults` is forgiven.
 ///
-/// AUTOPILOT OFF (`docs/DESIGN-harness-autopilot-2026-10-15.md` §2.2; `off`
-/// the session's effective Autopilot is Off — its own word, else the table's
-/// default — an open tab whose session the harness keeps its hands off). It
-/// is not the agent's switch (`on`): the switch is `[harness.<id>]`'s, for
-/// every session of that agent, the word is one session's; both stop the
-/// worker, neither lets it go, and `Start` waits for both:
+/// Autopilot Off (`docs/DESIGN-harness-autopilot-2026-10-15.md` §2.2): `off` is the session's
+/// effective Autopilot being Off (its own word, else the table's default), an open tab the
+/// harness keeps its hands off. It is not the agent's switch `on`: the switch is
+/// `[harness.<id>]`'s and covers every session of that agent, the word is one session's. Both
+/// stop the worker and neither lets it go.
 ///
-/// * `TurnOff` — the word goes Off: the host STOPS the worker (it is `old`
-///   until its wait ends, `Exit`), never lets it go — a let-go hands the
-///   worker its agent's exit and begins the relaunch decision.
-/// * `TurnOn` — the word goes back to Cruise or Land: `Start` is the host's
-///   again, as for any wanted session.
-/// * `Crash` — the agent exits on its own while its tab stays open. Under
-///   Cruise or Land the running worker would be handed the exit; Off has no
-///   running worker, so nothing is handed and nothing relaunched. `letgo`
-///   records an exit handed to a worker WHILE the session is Off.
-/// * `Start` waits for `off == 0` too: no worker starts for an Off session,
-///   whether its agent is named again or was never stopped.
+/// * `TurnOff`: the word goes Off and the host stops the worker (`old` until `Exit`), never
+///   lets it go: a let-go hands the worker its agent's exit and begins the relaunch decision.
+/// * `TurnOn`: the word goes back to Cruise or Land, and `Start` may run again.
+/// * `Crash`: the agent exits on its own while its tab stays open. Under Cruise or Land the
+///   running worker is handed the exit; Off has no running worker, so nothing is handed or
+///   relaunched. `letgo` records an exit handed to a worker while the session is Off.
+/// * `Start` waits for `off == 0` too: no worker starts for an Off session, whether its agent
+///   is named again or was never stopped.
 ///
 /// A VENDOR CODEX (the Codex screen lane's retirement, 2026-10-16; `vendor`):
 /// `ArriveVendor` is the roster naming a Codex session with no proven
@@ -991,52 +819,39 @@ pub fn harness_worker_lifecycle_model() -> Model {
     }
 }
 
-/// ONE SESSION'S SUPERVISOR CLAIM ACROSS A SEAMLESS UPDATE (the round-four
-/// plan of the 2026-09 update robustness work, item 9): an external
-/// supervisor that held the session in the outgoing instance is never
-/// displaced by the incoming instance's own in-GUI host.
+/// One session's supervisor claim across a seamless update: an external supervisor that held
+/// the session in the outgoing instance is never displaced by the incoming instance's own
+/// in-GUI host.
 ///
-/// Before the Commit (`phase` 0, the outgoing instance): the session may be
-/// held by an external supervisor's `ttl=` lease (`ext` 1) or by a claim
-/// bound to its connection (`ext` 2), or by the outgoing instance's own host
-/// (`own`); the outgoing build may be one from before the carry (`older`),
-/// which writes no claim facts at all. `Park` draws the handoff record.
-/// `Commit` is the incoming instance's adoption as the record allows it:
-/// `server` is the claim the incoming instance shows (0 none, 1 the external
-/// holder's, 2 its own host's) — a carried lease seeded, nothing else — and
-/// `grace` the ticks its host holds the session off, which it does unless
-/// the record vouched that nobody but the outgoing host held it
+/// Before the Commit (`phase` 0, the outgoing instance) the session may be held by an external
+/// supervisor's `ttl=` lease (`ext` 1), by a claim bound to its connection (`ext` 2), or by the
+/// outgoing instance's own host (`own`); the outgoing build may predate the carry (`older`) and
+/// write no claim facts. `Park` draws the handoff record. `Commit` is the incoming instance's
+/// adoption as the record allows: `server` is the claim it shows (0 none, 1 the external
+/// holder's, 2 its own host's), only a carried lease seeded, and `grace` the ticks its host
+/// holds the session off, unless the record vouched that only the outgoing host held it
 /// (`SessionRecord::claim_grace`).
 ///
-/// After the Commit, time passes (`Tick`) while the grace runs or a live
-/// external holder owes its renewal, which reaches the incoming instance
-/// within `Renew` ticks (`ExternalRenews`: it renews its lease, or claims
-/// again after its connection's claim ended; refused if the host took the
-/// session). A carried lease may lapse before that renewal arrives (`Lapse`:
-/// a short `ttl=`, or a renewal the outgoing instance took after the park).
-/// `HostClaims` is the incoming host's worker claiming a free session once
-/// its grace is over; `took` records a claim made before a live external
-/// holder's renewal arrived — the takeover.
+/// After the Commit time passes (`Tick`) while the grace runs or a live external holder owes
+/// its renewal, which arrives within `Renew` ticks (`ExternalRenews`: a renewed lease, or a new
+/// claim after its connection's ended; refused if the host took the session). A carried lease
+/// may lapse first (`Lapse`: a short `ttl=`, or a renewal the outgoing instance took after the
+/// park). `HostClaims` is the incoming host claiming a free session once its grace is over;
+/// `took` records a claim made before a live external holder's renewal arrived.
 ///
-/// * `NoTakeover` — the incoming host never takes a session a live external
-///   supervisor held (requires `Grace` to outlast `Renew`: the real grace,
-///   `harness_host::ADOPTED_CLAIM_GRACE`, is two renewal steps and a margin);
-/// * `NoPhantomClaim` — the incoming instance never shows a claim no external
-///   supervisor made;
-/// * `NoNeedlessGrace` — a session the record vouched for is supervised at
-///   the Commit, never held off.
+/// * `NoTakeover`: the incoming host never takes a session a live external supervisor held
+///   (`Grace` must outlast `Renew`: `harness_host::ADOPTED_CLAIM_GRACE` is two renewal steps
+///   and a margin);
+/// * `NoPhantomClaim`: the incoming instance never shows a claim no external supervisor made;
+/// * `NoNeedlessGrace`: a session the record vouched for is supervised at the Commit.
 ///
-/// `Buggy=1` is three dead Commits, one per claim: `CommitUncarried` — what
-/// shipped until round four: no claim carried and no grace, so the host
-/// claimed at the Commit and the external supervisor's renewal was refused
-/// (`NoTakeover`); `CommitOwnLease` — carrying the outgoing host's own lease,
-/// which would park the incoming host behind a dead process's claim
-/// (`NoPhantomClaim`); `CommitGraceAll` — a grace on every session, holding
-/// off supervision after every update for no one (`NoNeedlessGrace`).
-/// Tier-1 (aterm-gui's `session_store` test
-/// `the_real_claim_carry_conforms_to_the_handoff_claim_model`) drives the
-/// real record projection, TOML wire, seed and grace decision through every
-/// pre-Commit configuration and checks the incoming state against `Commit`;
+/// `Buggy=1` is three dead Commits: `CommitUncarried` (no claim carried and no grace, so the
+/// host claims at the Commit and the external renewal is refused; `NoTakeover`),
+/// `CommitOwnLease` (carrying the outgoing host's own lease, parking the incoming host behind a
+/// dead process's claim; `NoPhantomClaim`), `CommitGraceAll` (a grace on every session;
+/// `NoNeedlessGrace`). Tier-1: aterm-gui's `session_store` test
+/// `the_real_claim_carry_conforms_to_the_handoff_claim_model` drives the real record
+/// projection, TOML wire, seed and grace decision through every pre-Commit configuration;
 /// `harness_host`'s grace test drives the real host's gate.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1115,94 +930,60 @@ pub fn harness_handoff_claim_model() -> Model {
     }
 }
 
-/// THE HOST HANDS A WORKER ITS AGENT'S EXIT ONLY FOR AN EXIT (2026-09-28):
-/// `aterm-gui`'s `harness_host`, for ONE supervised session whose tab lives
-/// on, under `[harness] relaunch = false` (the configuration of the test
-/// failure below). `alive` the FACT the host reads that the agent holds its
-/// tab (`Acts::holds` answering `Some(true)`): the foreground group it was
-/// named in is still the tab's, that group's leader still exists, and
-/// nothing read for it since could not host it — the hold, not the agent
-/// itself (WHAT THE MODEL LEAVES OUT, below); `named` the host's roster
-/// names it (its published program, or its reader); `ours`
-/// the worker's own upgrade step ended it, and the relaunch that step makes
-/// has not landed (the restart in flight at its exit); `stray` the tab has an
-/// upgrade restart in flight at its exit that is NOT this agent's — another
-/// process's (a person's `claude` at the prompt an earlier relaunch waited
-/// on), a relaunch's own record, or one too old to act on; `due` the host
-/// owes itself a pass (its bell rang, or a timed look is set); `handed` the
-/// host handed the worker the exit (`Worker::leave`); `decided` what the
-/// worker made of it: 1 carried on (relaunched), 2 left and said (the
-/// owner's limit); `off` the agent was switched off (`[harness.<id>]
-/// enabled = false`) before the host handed the exit.
+/// The host hands a worker its agent's exit only for an exit. `aterm-gui`'s `harness_host`, for
+/// one supervised session whose tab lives on, under `[harness] relaunch = false`. `alive`: the
+/// fact the host reads that the agent holds its tab (`Acts::holds` answering `Some(true)`: the
+/// group it was named in is still the tab's foreground, its leader exists, and nothing read for
+/// it since could not host it), the hold rather than the agent itself (see below); `named`: the
+/// roster names it (its published program, or its reader); `ours`: the worker's own upgrade
+/// step ended it and the relaunch that step makes has not landed; `stray`: the tab has an
+/// upgrade restart in flight that is not this agent's (another process's, a relaunch's own
+/// record, or one too old to act on); `due`: the host owes itself a pass (its bell rang, or a
+/// timed look is set); `handed`: the host handed the worker the exit (`Worker::leave`);
+/// `decided`: 1 carried on (relaunched), 2 left and said (the owner's limit); `off`: the agent
+/// was switched off (`[harness.<id>] enabled = false`) before the exit was handed.
 ///
-/// * `Misread` / `Reread` — the roster stops / starts naming a live agent: a
-///   name the resolver could not read replaces the good one
-///   (`set_program(None)`) while no reader identifies the agent — the failed
-///   name leaves the reader alone, and the roster names the agent by its
-///   reader alone when it can (`agent_of`) — or a runtime-named agent
-///   (`node`) loses its reader; a later read names it again. Either moves
-///   the published name or reader, which rings the host.
-/// * `Exit` — the agent ends on its own. Its foreground group moves, which
-///   rings the host only while the agent was NAMED
-///   (`SessionTimeline::note_foreground_group` rings when a name or a reader
-///   goes). An exit during a misread rings nothing HERE, the conservative
-///   case: live, a runtime-named agent's name `node` goes with its group (a
-///   ring), and a name-failed one's exit rings as the shell's name resolves
-///   (`set_program`, from none to the shell's); only when that fails too
-///   does nothing ring, and the look `Visit` sets is the backstop. A model
-///   green without those rings is no reason to drop them.
-/// * `Terminate` — the worker's upgrade step ended the agent (its SIGTERM)
-///   and the relaunch it makes waited; the step's end rings the host
-///   (`note_upgrade_act`). While the step runs the host takes nothing
-///   (`acting`), so the step is one action here.
-/// * `Stray` — a restart record in flight for the tab that is not this
-///   agent's appears (it rings nothing).
-/// * `SwitchOff` — the agent is switched off; the changed policy rings the
-///   host. The model takes it only before an exit is handed (`handed == 0`):
-///   a switch-off between `Visit` and `Decide` is outside it (WHAT THE MODEL
-///   LEAVES OUT, below).
-/// * `Visit` — a host pass, which reads the fact (`Acts::holds`) for a worker
-///   the roster does not name: an agent that still holds its tab is no exit
-///   — the worker is kept, and a short look is set, because nothing else
-///   would ring for an exit that follows; one that holds it no longer is
-///   handed the exit. A worker whose agent is switched off is stopped
-///   through the switch-off path ([`harness_worker_lifecycle_model`]'s
-///   `SwitchOff`): handed nothing, its agent live or not, and owed no look.
-/// * `Decide` — the worker handles the exit it was handed
-///   (`on_agent_left`): the upgrade's own restart in flight — asked about
-///   THE LEAVING AGENT's pid (`Acts::restarted`, `relaunch::restarted`),
-///   read once for every try — is carried, whatever `[harness] relaunch`
-///   says; its own exit is left, and said.
+/// * `Misread`/`Reread`: the roster stops or starts naming a live agent: a name the resolver
+///   could not read replaces the good one (`set_program(None)`) while no reader identifies the
+///   agent (the roster names it by its reader alone when it can, `agent_of`), or a
+///   runtime-named agent (`node`) loses its reader. Either moves the published name or reader,
+///   which rings the host.
+/// * `Exit`: the agent ends on its own. Its foreground group moves, which rings the host only
+///   while it was named (`SessionTimeline::note_foreground_group`). An exit during a misread
+///   rings nothing here, the conservative case: live, a runtime-named agent's `node` goes with
+///   its group, and a name-failed one's exit rings as the shell's name resolves
+///   (`set_program`); only when that fails too does nothing ring, and the look `Visit` sets is
+///   the backstop. Keep those rings even though the model is green without them.
+/// * `Terminate`: the worker's upgrade step ended the agent (SIGTERM) and its relaunch waited;
+///   the step's end rings the host (`note_upgrade_act`). The host takes nothing while the step
+///   runs (`acting`), so the step is one action.
+/// * `Stray`: a restart record for the tab that is not this agent's appears (no ring).
+/// * `SwitchOff`: the changed policy rings the host; taken only before an exit is handed.
+/// * `Visit`: a host pass, which reads the hold (`Acts::holds`) for a worker the roster does
+///   not name: an agent that still holds its tab is no exit, so the worker is kept and a short
+///   look set (nothing else would ring for an exit that follows); one that no longer holds it
+///   is handed the exit. A switched-off agent's worker is stopped through
+///   [`harness_worker_lifecycle_model`]'s `SwitchOff`: handed nothing and owed no look.
+/// * `Decide`: the worker handles the exit (`on_agent_left`): the upgrade's own restart in
+///   flight, asked about the leaving agent's pid (`Acts::restarted`, `relaunch::restarted`), is
+///   carried whatever `[harness] relaunch` says; its own exit is left, and said.
 ///
-/// `NoExitWhileAlive`: no worker is handed the exit of an agent that still
-/// holds its tab. `NoExitWhileOff`: nor of an agent switched off — a stop
-/// is no exit, so the agent is neither relaunched nor said. `NeverMissed`:
-/// an exit is handed, a pass is still owed, or the agent is switched off.
-/// `TheUpgradesOwnIsCarried`: an agent the upgrade ended is never left for
-/// `[harness] relaunch = false`. `OnlyTheUpgradesOwnIsCarried`: nothing else
-/// is carried on against it. The invariants restate `Visit`'s and
-/// `Decide`'s own expressions: they are non-vacuous through the `Buggy`
-/// hosts below, each caught alone, not by themselves.
+/// `NoExitWhileAlive`: no worker is handed the exit of an agent that still holds its tab.
+/// `NoExitWhileOff`: nor of an agent switched off (a stop is no exit). `NeverMissed`: an exit
+/// is handed, a pass is still owed, or the agent is switched off. `TheUpgradesOwnIsCarried`: an
+/// agent the upgrade ended is never left for `[harness] relaunch = false`.
+/// `OnlyTheUpgradesOwnIsCarried`: nothing else is carried against it. The invariants restate
+/// `Visit`'s and `Decide`'s own expressions, so they are non-vacuous only through the `Buggy`
+/// hosts.
 ///
-/// WHAT THE MODEL LEAVES OUT, so its green is not read as more. `alive` is
-/// the hold, and every state here with `alive = 1` is one where the agent
-/// runs: the model has NO state where the named group's foreground is held
-/// by something that is not the agent — a zombie leader not yet reaped, a
-/// recycled leader pid behind a foreground group that is gone, a runtime
-/// that outlived its agent in the group, an `exec` into an image no name was
-/// read for. So `NoExitWhileAlive` is about the host's reading of the hold,
-/// not about the agent, and nothing here proves the host never supervises a
-/// non-agent: the keep's ceiling (`HOLDS_KEEP_MAX`, 30 s) is what bounds
-/// such a keep — and past it the host hands the exit of even a live agent,
-/// the behaviour before the keep, which a model with no time does not show
-/// (nor a stale hold's `NeverMissed`, which a look owed for ever satisfies).
-/// A hold that cannot be read (`None`: a ConPTY has no foreground group)
-/// keeps nothing and hands a live agent's exit, the documented trade; it is
-/// `alive = 0` here, and `NoExitWhileAlive` claims no more than the host
-/// does only under that reading. The worker started again for a kept
-/// session, `still_wanted` after a failed run, another group named in a kept
-/// agent's stead, the ceiling, and the hold itself are outside the model:
-/// `aterm-gui`'s `harness_host` tests bind them
+/// Not modelled: a hold by something that is not the agent (a zombie leader not yet reaped, a
+/// recycled leader pid, a runtime that outlived its agent in the group, an `exec` no name was
+/// read for), so `NoExitWhileAlive` is about the host's reading of the hold, not the agent. The
+/// keep's ceiling (`HOLDS_KEEP_MAX`, 30 s) bounds such a keep, and past it the host hands even a
+/// live agent's exit, which a model with no time does not show. A hold that cannot be read
+/// (`None`: a ConPTY has no foreground group) keeps nothing; it is `alive = 0` here. The worker
+/// restarted for a kept session, `still_wanted`, another group named in a kept agent's stead,
+/// the ceiling and the hold itself are bound by `aterm-gui`'s `harness_host` tests
 /// (`a_kept_agent_is_looked_at_again_and_nothing_else_is_kept`,
 /// `another_group_named_in_a_kept_agents_stead_is_its_exit`,
 /// `a_kept_agent_is_followed_at_full_follows_not_at_every_bell`,
@@ -1214,42 +995,28 @@ pub fn harness_handoff_claim_model() -> Model {
 /// `Decide` is one action here, so whether such a worker still relaunches
 /// its agent is the host's to bind, and nothing binds it yet.
 ///
-/// `Buggy=1` adds five hosts, each a dead action at `Buggy=0` caught alone:
-/// the host of 32a51a716, whose pass hands the exit whenever the roster does
-/// not name the agent (`VisitUnconfirmed`: `Misread`, `VisitUnconfirmed` —
-/// `NoExitWhileAlive`); a fix of it that keeps the worker but sets no look
-/// (`VisitNoLook`: `Misread`, `VisitNoLook`, `Exit` — `NeverMissed`); the
-/// worker of 32a51a716, whose exit decision reads `[harness] relaunch` alone
-/// (`DecideLimited`: `Terminate`, `Visit`, `DecideLimited` —
-/// `TheUpgradesOwnIsCarried`; the test failure of 32a51a716, where the
-/// upgrade's own SIGTERM, both of the step's relaunch attempts waiting — the
-/// shape a forced reproduction matched line for line — read as the agent
-/// leaving and was dropped); and that fix's first cut, which read the
-/// record by tab alone (`DecideByTab`: `Stray`, `Exit`, `Visit`,
-/// `DecideByTab` — `OnlyTheUpgradesOwnIsCarried`: a person's crashed agent
-/// relaunched against the owner's limit); and the host that drops a
-/// switched-off agent from its roster, whose pass reads the agent as gone
-/// and hands its worker the exit (`VisitOffAsLeave`: `SwitchOff`,
-/// `VisitOffAsLeave` — `NoExitWhileAlive`; after an `Exit` —
-/// `NoExitWhileOff`). Tier-1, in `aterm-gui`'s `harness_host` tests:
-/// `the_real_host_conforms_to_the_leave_model` drives the real host through
-/// every path of the environment's actions but `SwitchOff`, and checks
-/// after each that what it did — kept, carried on or said — is what the
-/// model does. Only `handed` and `decided` are OBSERVED there: `alive`,
-/// `ours`, `stray` and `named` are what its driver did to a fake world,
-/// `due` is the model's, the hold is the fake's flag (not the shipping
-/// `holds`), and its negative controls fire `VisitUnconfirmed` and
-/// `DecideByTab` on MODEL state alone.
-/// `the_real_host_switch_off_conforms_to_the_leave_model` separately binds
-/// switch-off of a named or misread live agent and its later exit: `off`
-/// reads the host's live per-agent gate, its worker ends without an exit
-/// decision, and another admitted agent starts after its exit as a witness
-/// that a host pass reached the start decisions. `VisitOffAsLeave` itself
-/// remains a MODEL-state negative control, not a runtime mutation test.
-/// `a_pass_that_keeps_an_agent_owes_the_host_a_look` binds the look `Visit`
-/// keeps owed (`due`) to the instant the real host's own pass (`host_pass`)
-/// waits for — the one test that catches `VisitNoLook`, since a threaded
-/// test host is woken by other tests' bells too.
+/// `Buggy=1` adds five hosts, each a dead action caught alone: a pass that hands the exit
+/// whenever the roster does not name the agent (`VisitUnconfirmed`: `NoExitWhileAlive`); one
+/// that keeps the worker but sets no look (`VisitNoLook`: `NeverMissed`); an exit decision that
+/// reads `[harness] relaunch` alone, dropping the upgrade's own SIGTERM as the agent leaving
+/// (`DecideLimited`: `TheUpgradesOwnIsCarried`); one that reads the restart record by tab
+/// alone, relaunching a person's crashed agent against the owner's limit (`DecideByTab`:
+/// `OnlyTheUpgradesOwnIsCarried`); and a host that drops a switched-off agent from its roster
+/// and hands its worker the exit (`VisitOffAsLeave`: `NoExitWhileAlive`, or `NoExitWhileOff`
+/// after an `Exit`).
+///
+/// Tier-1: `the_real_host_conforms_to_the_leave_model` drives the real host through every path
+/// of the environment's actions but `SwitchOff` and checks after each that what it did (kept,
+/// carried on or said) is the model's. Only `handed` and `decided` are observed there; `alive`,
+/// `ours`, `stray` and `named` are what its driver did to a fake world, `due` is the model's,
+/// and its negative controls fire `VisitUnconfirmed` and `DecideByTab` on model state alone.
+/// `the_real_host_switch_off_conforms_to_the_leave_model` binds `SwitchOff` of a named or
+/// misread live agent and its later exit: `off` reads the host's live per-agent gate, the
+/// worker ends without an exit decision, and another admitted agent starting after the exit
+/// witnesses that a host pass reached the start decisions. `VisitOffAsLeave` stays a
+/// model-state negative control. `a_pass_that_keeps_an_agent_owes_the_host_a_look` binds the
+/// look `Visit` keeps owed to the instant the real `host_pass` waits for, the one test that
+/// catches `VisitNoLook`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_leave_model() -> Model {
@@ -1358,7 +1125,7 @@ pub fn harness_leave_model() -> Model {
 /// * `Crash` — the agent left with no person asking: a relaunch is due.
 /// * `Asked` — the EXPLICIT RESTART ended it (`aterm ctl restart`, the
 ///   stall's remedy; its stamp names the process): a relaunch is due, whoever
-///   typed just before, and it is no crash (LC-6 of ATERM-KI-1015-1): its
+///   typed just before, and it is no crash: its
 ///   attempts and its landing leave the crash back-off where it was. Nor is
 ///   `Restarted`.
 /// * `Lapse` — the explicit restart's stamp lapsed before its program ended:
@@ -1372,7 +1139,7 @@ pub fn harness_leave_model() -> Model {
 /// * `PersonRuns` — the person starts an agent there themselves: nothing
 ///   is due, and the relaunch's word goes — save one that asks for a
 ///   conversation (`asks`), which no agent but that conversation's answers
-///   (LC-4 of ATERM-KI-1015-1: the told command fallen into onboarding, or
+///   (the told command fallen into onboarding, or
 ///   another conversation, cleared it).
 /// * `Ask` — the host names, on the standing word (the tab's mark), the
 ///   conversation it asks a person to resume.
@@ -1420,7 +1187,7 @@ pub fn harness_leave_model() -> Model {
 /// hold left it to them (`Restarted`, `PersonReturns`), and a restart its
 /// back-off let expire fell through to the graceful exit the restart's own
 /// SIGTERM made (`Restarted`, `Ended`) — the agent the upgrade ended, never
-/// relaunched and never said. And it is the host of ATERM-KI-1015-1's LC-6
+/// relaunched and never said. And it is the host of 's LC-6
 /// (`Land` climbing the back-off for any relaunch — `NoCrashNoStreak`: a
 /// relaunch that is no crash's climbed it, so three explicit restarts made a
 /// later crash wait ten minutes) and LC-4 (`PersonRuns` clearing every word
@@ -1597,52 +1364,39 @@ pub fn harness_relaunch_on_exit_model() -> Model {
         }
     }
 }
-/// WHAT AN EXIT LEFT, READ AS IT IS SEEN (D2 of the 2026-09-26 live test):
-/// the relaunch on exit tells a crash from a graceful exit by Claude Code's
-/// own record of the agent (`sessions/<pid>.json`) — a crash cannot remove
-/// it, a graceful exit (a person's or an orchestrator's `/exit`, a `kill`)
-/// does — and that record has a SECOND writer: any Claude Code that starts
-/// removes dead processes' records (measured on 2.1.283: a SIGKILLed agent's
-/// record gone 0.79 s after the kill, as a Claude in another tab started).
-/// For ONE exit of ONE agent: `exit` 0 it runs, 1 it crashed, 2 it exited
-/// gracefully; `record` its record is on disk; `seen` the host's look at the
-/// exit (`aterm-agent`'s `relaunch::exit_record`) has decided; `kept` what
-/// that look found (1: the record survived); `decided` 0 no attempt yet, 1
-/// relaunched, 2 left as a graceful exit.
+/// What an exit left, read as it is seen: the relaunch on exit tells a crash from a graceful
+/// exit by Claude Code's own record of the agent (`sessions/<pid>.json`), which a crash cannot
+/// remove and a graceful exit (a `/exit`, a `kill`) does. That record has a second writer: any
+/// Claude Code that starts removes dead processes' records (Claude Code 2.1.283: a SIGKILLed
+/// agent's record gone 0.79 s after the kill, as a Claude in another tab started). For one exit
+/// of one agent: `exit` 0 it runs, 1 it crashed, 2 it exited gracefully; `record` its record is
+/// on disk; `seen` the host's look at the exit (`relaunch::exit_record`) has decided; `kept`
+/// what that look found (1: the record survived); `decided` 0 no attempt yet, 1 relaunched, 2
+/// left as a graceful exit.
 ///
-/// * `Crash` / `Graceful` — the agent ends. A graceful exit's record may
-///   still be on disk as the exit is seen (it removes it in its last
-///   moments: measured gone 0.02 s after the `/exit`).
-/// * `OwnRemoval` — the graceful exit removes its own record.
-/// * `Look` — the host's look decides, and its answer is KEPT: at once on a
-///   removed record, else once `EXIT_SETTLE` (a quarter second) has passed,
-///   which outlasts an exit's own removal — so a graceful exit is decided
-///   only once its removal has landed.
-/// * `Sweep` — another Claude Code starts and removes the dead agent's
-///   record: at any time after the look, the relaunch's whole back-off (1 s
-///   to ten minutes) included. (One inside the quarter second of the settle
-///   is the window this design leaves: the assumption the guard states.)
-/// * `Decide` — an attempt (`relaunch::after_exit`), after the back-off
-///   (which outlasts an exit's own removal too): relaunched iff the KEPT
+/// * `Crash`/`Graceful`: the agent ends. A graceful exit's record may still be on disk as the
+///   exit is seen (it is removed in the exit's last moments, 0.02 s after the `/exit`).
+/// * `OwnRemoval`: the graceful exit removes its own record.
+/// * `Look`: the host's look decides and its answer is kept: at once on a removed record, else
+///   once `EXIT_SETTLE` (250 ms) has passed, which outlasts an exit's own removal.
+/// * `Sweep`: another Claude Code removes the dead agent's record, at any time after the look,
+///   the relaunch's whole back-off (1 s to ten minutes) included. A sweep inside the settle is
+///   the window this design leaves.
+/// * `Decide`: an attempt (`relaunch::after_exit`) after the back-off: relaunched iff the kept
 ///   look found the record.
 ///
-/// `CrashIsRelaunched`: a crash is never left as a graceful exit.
-/// `GracefulIsLeft`: a graceful exit is never relaunched.
+/// `CrashIsRelaunched`: a crash is never left as a graceful exit. `GracefulIsLeft`: a graceful
+/// exit is never relaunched.
 ///
-/// `Buggy=1` adds two hosts, each a dead action at `Buggy=0` caught alone:
-/// the host of 57a2b7050, whose attempt reads the record as it stands then
-/// (`DecideAtAttempt`: `Crash`, `Look`, `Sweep`, `DecideAtAttempt` leaves a
-/// crash — `CrashIsRelaunched`), and the naive fix of it, whose look reads
-/// at the detection instant, before a graceful exit's own removal
-/// (`LookAtInstant`: `Graceful`, `LookAtInstant`, `OwnRemoval`, `Decide`
-/// relaunches it — `GracefulIsLeft`). Tier-1
-/// (`the_real_exit_read_conforms_to_the_model`, `aterm-agent`'s upgrade
-/// tests) replays every path of the model through the real `exit_record`,
-/// `look_at_exit` and `after_exit` over a real record of a dead process;
-/// the first witness through the real read at the attempt
-/// (`ExitRecord::Unread`); and an own removal landing inside the real
-/// look's settle, which the real look reads as `OwnRemoval` then `Look` —
-/// never as `LookAtInstant`.
+/// `Buggy=1` adds two hosts, each a dead action caught alone: an attempt that reads the record
+/// as it stands then (`DecideAtAttempt`: `Crash`, `Look`, `Sweep`, `DecideAtAttempt` leaves a
+/// crash; `CrashIsRelaunched`), and a look at the detection instant, before a graceful exit's
+/// own removal (`LookAtInstant`: `Graceful`, `LookAtInstant`, `OwnRemoval`, `Decide`
+/// relaunches it; `GracefulIsLeft`). Tier-1: `aterm-agent`'s
+/// `the_real_exit_read_conforms_to_the_model` replays every path through the real
+/// `exit_record`, `look_at_exit` and `after_exit` over a real record of a dead process, the
+/// first witness through the real read at the attempt (`ExitRecord::Unread`), and an own
+/// removal inside the real look's settle, which reads as `OwnRemoval` then `Look`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_exit_record_model() -> Model {
@@ -2899,59 +2653,43 @@ pub fn harness_gemini_exit_witness_model() -> Model {
     }
 }
 
-/// THE UPGRADE'S LOOKS AT ONE SESSION, as its worker takes them at the
-/// loop's idle points (`aterm-gui`'s `harness_host::WorkerIdle::at_idle`,
-/// over `aterm-agent`'s `upgrade_drive::due`), and ITS NOTE BEHIND
-/// (`harness_host::ask_note`, over `upgrade_drive::note_behind`), from the
-/// worker's attach at a fresh launch. For ONE session: `due` it has an
-/// upgrade to take; `readable` it can be read (the instance's socket
-/// answers, Claude Code's record of the agent is written — at a launch, a
-/// moment after the attach); `ready` it was announced to and answered
-/// READY, so its next step restarts it; `looks` a look is owed — the loop
-/// parked for the session's next idle point, or a later look set on the
-/// ladder; `done` the upgrade said its last word; `owed` its note behind is
-/// still to be taken; `noted` its upgrade state is minted, and `aged` with
-/// its age from the attach.
+/// The upgrade's looks at one session, as its worker takes them at the loop's idle points
+/// (`aterm-gui`'s `harness_host::WorkerIdle::at_idle`, over `aterm-agent`'s
+/// `upgrade_drive::due`), and its note behind (`harness_host::ask_note`, over
+/// `upgrade_drive::note_behind`), from the worker's attach at a fresh launch. For one session:
+/// `due` it has an upgrade to take; `readable` it can be read (the instance's socket answers,
+/// Claude Code's record of the agent is written, a moment after the attach at a launch);
+/// `ready` it answered READY, so its next step restarts it; `looks` a look is owed (the loop
+/// parked for the next idle point, or a later look set on the ladder); `done` the upgrade said
+/// its last word; `owed` its note behind is still to be taken; `noted` its upgrade state is
+/// minted, and `aged` with its age from the attach.
 ///
-/// * `Look` — a look that reads an upgrade to take asks the owed note first,
-///   then steps it: the notice (the READY answer folded in), then the
-///   restart and the last word. A step that finds no state mints one, its
-///   age from the step.
-/// * `NotDue` — a look that reads nothing to take lets the upgrade go (the
-///   note, read, has nothing to note).
-/// * `Unread` — a look that could not read says so (`wait:no-socket`,
-///   `wait:no-record`) and sets a later look on the ladder.
-/// * `Note` / `NoteUnread` — the owed note asked (at the attach, at the
-///   host's wakes and ladder, at an idle point): read, it mints the state
-///   with the attach's age, or finds nothing to note; unread, it stays owed.
-/// * `Lose` / `Regain` — the reads fail and come back (the lanes held and
-///   given back; the record written).
-/// * `Settle` — the upgrade stops being due by another hand (the owner's
-///   `--skip`, a person's own restart onto the build).
+/// * `Look`: a look that reads an upgrade to take asks the owed note first, then steps it (the
+///   notice with the READY answer folded in, then the restart and the last word). A step that
+///   finds no state mints one, aged from the step.
+/// * `NotDue`: a look that reads nothing to take lets the upgrade go.
+/// * `Unread`: a look that could not read says so (`wait:no-socket`, `wait:no-record`) and sets
+///   a later look on the ladder.
+/// * `Note`/`NoteUnread`: the owed note asked (at the attach, the host's wakes and ladder, an
+///   idle point): read, it mints the state with the attach's age or finds nothing to note;
+///   unread, it stays owed.
+/// * `Lose`/`Regain`: the reads fail and come back.
+/// * `Settle`: the upgrade stops being due by another hand (the owner's `--skip`, a person's
+///   own restart onto the build).
 ///
-/// `NeverDropped`: an upgrade due and not done always has a look owed — one
-/// that answered READY included (the live re-test of 155c72a28, 2026-09-26:
-/// every control lane held, the looks' `who` was refused, `due` read "not
-/// due", and four of seven sessions were let go for good — one that had
-/// answered READY to "aterm will restart this Claude Code" among them).
-/// `BehindFromTheAttach`: a state minted is behind from the attach (the same
-/// re-test's N3: the note was asked once, at the attach, before the launch's
-/// record was written, and the first step minted the state after the first
-/// busy turn, its age from then).
+/// `NeverDropped`: an upgrade due and not done always has a look owed, one that answered READY
+/// included. `BehindFromTheAttach`: a minted state is behind from the attach, not from a later
+/// first step.
 ///
-/// `Buggy=1` is the host of 155c72a28: an unreadable look owes nothing
-/// (`Regain`, `Look`, `Lose`, `Unread`: a READY'd session let go), and an
-/// unreadable note is given up (`NoteUnread`, `Regain`, `Look`). Tier-1, in
-/// two halves: `aterm-gui`'s `the_real_look_conforms_to_the_upgrade_look_model`
-/// drives the real `attach`, `WorkerIdle` and `ask_note` through every
-/// transition of the model from every reachable state, and projects the
-/// worker's park, later look and owed note onto `looks` and `owed`; and
-/// `aterm-agent`'s `the_real_classifier_conforms_to_the_upgrade_look_model`
-/// drives the real `upgrade_drive::due_among` and `no_record` over every
-/// combination of what a look reads of a tab (the record, its group, its
-/// process's ids and argv, its launch's age), projecting each onto `due` and
-/// `readable` — `readable` is every read the verdict needed — and checks the
-/// model enables the action its verdict is.
+/// `Buggy=1`: an unreadable look owes nothing (`Regain`, `Look`, `Lose`, `Unread`: a READY'd
+/// session let go), and an unreadable note is given up (`NoteUnread`, `Regain`, `Look`).
+/// Tier-1, in two halves: `aterm-gui`'s `the_real_look_conforms_to_the_upgrade_look_model`
+/// drives the real `attach`, `WorkerIdle` and `ask_note` through every transition from every
+/// reachable state, projecting the worker's park, later look and owed note onto `looks` and
+/// `owed`; `aterm-agent`'s `the_real_classifier_conforms_to_the_upgrade_look_model` drives the
+/// real `upgrade_drive::due_among` and `no_record` over every combination of what a look reads
+/// of a tab, projecting each onto `due` and `readable` (every read the verdict needed), and
+/// checks the model enables the action its verdict is.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_upgrade_look_model() -> Model {
@@ -3006,37 +2744,28 @@ pub fn harness_upgrade_look_model() -> Model {
     }
 }
 
-/// AN AGE BELONGS TO ONE PROCESS (the owner's tab of 2026-09-28, s-3e79…): a
-/// `Pending(to=2.1.283)` record minted 2026-09-25 for the 2.1.274 process
-/// outlived the owner's own restart onto 2.1.283, and when 2.1.284 came the
-/// retarget carried its three-day-old age onto a process that had run the
-/// newest build for a day — "behind for 2 days", a warn row, 11 s after the
-/// build appeared. For ONE conversation: `proc` the process that holds it
-/// (0 the one the record was minted behind, 1 after the owner's restart by
-/// hand); `rec` the record (0 none, 1 counts process 0's age, 2 process 1's);
-/// `behind` the holder runs a build older than the newest one; `aged` the
-/// record's age is past the judging bound (`STALLED_AFTER_S` today); `alarm` a
-/// judgment by that age was made (the row, the tab's mark — whatever reads it).
-/// The session starts behind, its record minted for process 0.
+/// An age belongs to one process: a record minted behind one process must not lend its age to
+/// another (after a hand restart onto the newest build and then a newer build, the new process
+/// would be judged by the old record's days). For one conversation: `proc` the process that
+/// holds it (0 the one the record was minted behind, 1 after the owner's restart by hand); `rec`
+/// the record (0 none, 1 counts process 0's age, 2 process 1's); `behind` the holder runs a
+/// build older than the newest; `aged` the record's age is past the judging bound
+/// (`STALLED_AFTER_S`); `alarm` a judgment by that age was made. The session starts behind, its
+/// record minted for process 0.
 ///
-/// * `Time` — the bound passes on the record.
-/// * `HandRestart` — the owner restarts the agent by hand onto the newest
-///   build: a new process, no longer behind; the record is the old process's.
-/// * `Visit` — the next step finds the session with nothing to move
-///   (`current`): a record for a build it now runs is closed
-///   (`forget_settled_pending`).
-/// * `NewBuild` — a newer build lands: the holder is behind, and the record —
-///   or, none standing, the one the next step mints — counts an age carried
-///   only while it counts THIS process (`St::for_target`).
-/// * `Judge` — something reads the age of a behind session's record, and
-///   raises an alarm when it is past the bound.
+/// * `Time`: the bound passes on the record.
+/// * `HandRestart`: the owner restarts the agent by hand onto the newest build: a new process,
+///   no longer behind; the record is the old process's.
+/// * `Visit`: the next step finds nothing to move (`current`) and closes a record for a build
+///   it now runs (`forget_settled_pending`).
+/// * `NewBuild`: a newer build lands; the record (or, none standing, the one the next step
+///   mints) carries its age only while it counts this process (`St::for_target`).
+/// * `Judge`: something reads a behind session's record age and alarms past the bound.
 ///
-/// `AgeIsThisProcess`: no judgment by an age that is not the holder's.
-/// `Buggy=1` is the build that shipped: the record survives the hand
-/// restart (`Visit` closes nothing), and the retarget carries whatever age
-/// stands. Tier-1: `aterm-agent`'s `the_real_age_conforms_to_the_age_model`
-/// drives the real `St::for_target`, `forget_settled_pending` and the owner's
-/// view over every reachable state.
+/// `AgeIsThisProcess`: no judgment by an age that is not the holder's. `Buggy=1`: the record
+/// survives the hand restart (`Visit` closes nothing) and the retarget carries whatever age
+/// stands. Tier-1: `aterm-agent`'s `the_real_age_conforms_to_the_age_model` drives the real
+/// `St::for_target`, `forget_settled_pending` and the owner's view over every reachable state.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_upgrade_age_model() -> Model {
@@ -3076,54 +2805,39 @@ pub fn harness_upgrade_age_model() -> Model {
     }
 }
 
-/// THE EXPLICIT RESTART (design of 2026-10-08, `docs/HANDOFF-robustness-rounds-2026-10-08.md`
-/// §4): `aterm ctl @<sid> restart [pid=<n>] [if-stalled]` — "restart this
-/// agent in place" — writes ITS RECORD BEFORE ITS SIGNAL, as every other
-/// in-place restart of the harness does (the live upgrade, the memory, model
-/// and account restarts), and the exit is recognised by LOOKUP, never by
-/// inference. Until then the stall's remedy was the one restart whose record
-/// came after its exit (round fourteen's `RemedySent`, kept in the instance's
-/// memory and spent by a new stall episode), and four review rounds each found
-/// an interleaving where the inference was wrong.
+/// The explicit restart (`docs/HANDOFF-robustness-rounds-2026-10-08.md` §4):
+/// `aterm ctl @<sid> restart [pid=<n>] [if-stalled]` writes its record before its signal, as
+/// every in-place restart of the harness does (the live upgrade, the memory, model and account
+/// restarts), and the exit is recognised by lookup, never by inference.
 ///
-/// For ONE process `P` holding one tab, and ANY NUMBER OF ACTS on it, one at
-/// a time (`restart_act::ACTING`): `alive` — `P` runs; `stamped` — a stamp
-/// naming `P` (pid and kernel start) is on disk (`<harness
-/// state>/upgrade/asked-<tab>.json`, written atomically); `inflight` — an act
-/// has stamped and not yet signalled or given up; `fresh` — that act WROTE
-/// the stamp (none naming `P` stood when it read; else it joined the one that
-/// did); `termed` — an act's `SIGTERM` was sent; `esc` — how many escalation
-/// watches run on `P` in the instance that made the act: one at most, an act
-/// that finds one running giving it its stamp's time instead of starting its
-/// own (`restart_act::watch`, ruling 19 of 2026-10-09); `committed` — a seamless
-/// update's Commit handed the session to a successor (the outgoing
-/// instance's threads, an act's request among them, end with it; the stamp,
-/// on disk, does not); `ended` — who ended `P` (0 nobody yet, 1 an act: its
-/// `TERM`, its `KILL` or the carrier's, 2 anyone else: a person's `/exit`, a
-/// crash, a shell's `kill`); `at_end` — the stamp stood when `P` ended;
-/// `read` — the exit's reader (the worker that reads it, the exit-only
-/// worker, a successor's after a Commit): 0 not yet, 1 relaunched as the
-/// act's (`ExitCause::Asked`/`Stall`, a person's keystroke before it not read
-/// as their `/exit`), 2 read by the other rules (a graceful exit is left), 3
-/// left to another supervisor that claims the session (ruling 17); `hand` —
-/// ANOTHER HAND on the session, what the act's `KILL` waits out
-/// (`restart_act::another_hand`): 0 none, 1 one the relaunch waits out too —
-/// a hold, a driver's lease or turn (`relaunch::hand_on_tab`) — and 2
-/// another supervisor's claim, which takes the exit, whether or not such a
-/// hand stands beside it: the reader asks the claim first, at every look of
-/// a carry (ruling 20 of 2026-10-14 and its review tell them apart:
-/// `relaunch::hand_on_tab` against `claimed_by_another`); `held_kill` —
-/// an act's `KILL` was sent while another hand held the session (review of
-/// 1a733ed60); `into_claim` — a relaunch was typed into a tab another
-/// supervisor claims (the relaunch line does not wait on a claim).
+/// For one process `P` holding one tab, and any number of acts on it, one at a time
+/// (`restart_act::ACTING`): `alive` `P` runs; `stamped` a stamp naming `P` (pid and kernel
+/// start) is on disk (`<harness state>/upgrade/asked-<tab>.json`, written atomically);
+/// `inflight` an act has stamped and not yet signalled or given up; `fresh` that act wrote the
+/// stamp (else it joined the one standing); `termed` an act's `SIGTERM` was sent; `esc` the
+/// escalation watches running on `P` in the instance that made the act, one at most (an act
+/// that finds one running gives it its stamp's time instead, `restart_act::watch`);
+/// `committed` a seamless update's Commit handed the session to a successor (the outgoing
+/// instance's threads end with it; the stamp on disk does not); `ended` who ended `P` (0 nobody
+/// yet, 1 an act: its `TERM`, its `KILL` or the carrier's, 2 anyone else: a person's `/exit`, a
+/// crash, a shell's `kill`); `at_end` the stamp stood when `P` ended; `read` the exit's reader
+/// (the worker, the exit-only worker, or a successor's): 0 not yet, 1 relaunched as the act's
+/// (`ExitCause::Asked`/`Stall`, a person's keystroke before it not read as their `/exit`), 2
+/// read by the other rules (a graceful exit is left), 3 left to another supervisor that claims
+/// the session, 4 left by aterm's copy of a self-claimed agent's record (`CopyLeaves`); `hand`
+/// another hand on the session, what the act's `KILL` waits out
+/// (`restart_act::another_hand`): 0 none, 1 one the relaunch waits out too (a hold, a driver's
+/// lease or turn: `relaunch::hand_on_tab`), 2 another supervisor's claim, which takes the exit
+/// whether or not such a hand stands beside it (the reader asks the claim first, at every look
+/// of a carry: `claimed_by_another`); `held_kill` an act's `KILL` was sent while another hand
+/// held the session; `into_claim` a relaunch was typed into a tab another supervisor claims
+/// (the relaunch line does not wait on a claim).
 ///
-/// * `Stamp` — an act's first half (`restart_act::begin`), while `P` leads
-///   and no other hand holds the session (its fences): the stamp written —
-///   or, one naming `P` standing, JOINED (`fresh` 0).
-/// * `Term` — its second half: the discard and `killpg(SIGTERM)`, while `P`
-///   still leads (step 1d's re-read), and the one watch on `P` started — or,
-///   one running (a joined act's), kept. `SendsNothing` — the re-read found `P`
-///   gone (or `killpg` refused): nothing sent, and the stamp the act WROTE
+/// * `Stamp`: an act's first half (`restart_act::begin`), while `P` leads and no other hand
+///   holds the session: the stamp written, or, one naming `P` standing, joined (`fresh` 0).
+/// * `Term`: its second half: the discard and `killpg(SIGTERM)` while `P` still leads (a
+///   re-read), and the one watch on `P` started or, one running, kept. `SendsNothing`: the
+///   re-read found `P` gone (or `killpg` refused): nothing sent, and a stamp the act wrote
 ///   taken back (`restart_act::take_back`); a joined one is kept.
 /// * `Hears` — `P` runs its `SIGTERM` handler and exits; a deaf `P` (its
 ///   JS thread spinning, `trap '' TERM`) never does.
@@ -3157,18 +2871,18 @@ pub fn harness_upgrade_age_model() -> Model {
 ///   claim landed included, asked at every look of the carry (the review of
 ///   ruling 20): left to it, the stamp unconsumed, `read` 3.
 ///
-/// * `SelfClaimOn` / `SelfClaimOff` — a PROVEN SELF-CLAIM (the codex-alab
-///   self-claim contract, §4; `selfclaim`): `P` itself claims the session,
-///   the kernel proving the claim is its own, while it runs and no other
-///   supervisor's claim stands (a foreign `ClaimOn` over it is refused busy,
-///   as the server refuses it); it is given back, or cleared once `P` left
-///   the front. It is no other hand: the act's `Stamp` and `KILL` go ahead
-///   under it (the stall's remedy, which `P` cannot give itself), and once
-///   `P` has ended it is NOBODY'S — `claimed_by_another` reads a proven
-///   self-claim whose process is gone as no claim, so the end is `Read` by
-///   this host's watch-only worker, never left to the dead holder (ruling
-///   17, amended 2026-10-16). `by` — the hand that took an end left to a
-///   claim (`ReadByClaim`: another supervisor's, 2).
+/// Invariants: `TheActsEndIsRelaunched` (an end an act made is relaunched whoever reads it,
+/// however many acts there were; or, read while another live supervisor claims the session,
+/// left to it, `read` 3 with `by` 2, since a proven self-claim whose process ended relaunches
+/// nothing; or left by the agent's own copy, said once, `read` 4: it recorded an orderly end
+/// or names no line that is the live process's, and no line read from a writable file is typed
+/// unless the agent ran it); `OnlyAStampedEndIsTheActs` (nothing is relaunched as the act's
+/// unless the stamp stood at its end); `TheActEndsItsProgram` (a `P` an act signalled is never
+/// left alive with nobody to end it: its thread, or after a Commit the carrier);
+/// `TheKillWaitsOutAnotherHand` (no act's `KILL` lands while another hand holds the session:
+/// the halt contract); `OneWatchPerProcess` (one watch ends `P` however many acts there were:
+/// each watch holds a kqueue, a descriptor against the window's 256);
+/// `NothingIsTypedIntoAClaim`. Liveness: [`harness_restart_stamp_liveness`].
 ///
 /// * `Copied` / `CopyRelaunches` / `CopyLeaves` — ATERM'S COPY of the
 ///   self-claimed agent's record (`copy`, read while the proven claim stood
@@ -3229,28 +2943,17 @@ pub fn harness_upgrade_age_model() -> Model {
 /// ([`harness_restart_stamp_liveness`]): a stamped `P` ends, once every
 /// other hand is released.
 ///
-/// NOT MODELLED, said: the stamp's clock. The act's watch lets a program go
-/// once its stamp no longer stands (`STALE_S`: stopped away from its tab,
-/// ruling 8, or held by another hand that outlasts it, ruling 11), and no
-/// `KILL` — the watch's or a carrier's — is ever sent for a stamp that no
-/// longer stands (ruling 12), nor in its last half minute, when its exit
-/// would be read after it went stale (ruling 16); an act that JOINS a stamp
-/// renews its time once its own `TERM` is sent, so its `KILL` has the
-/// stamp's whole life (ruling 18); and an end that comes after the stamp
-/// went stale is the program's own, its stamp looked up again at the end
-/// (ruling 17). Saying it needs a stale flag threaded through every end, a
-/// relaunch invariant weakened to admit the documented heard-after-stale
-/// residual, and a record of a `KILL` apart from the program's own end: a
-/// rework, not an action. Nor what the watch reads on disk and of the host
-/// before its `KILL`: it lets its program go once the tab's stamp no longer
-/// names it (another act's replaced it: ruling 21 of 2026-10-14), and sends
-/// it only once the host holds the snapshot the exit's reader reads it by
-/// (a successor that has not read the agent yet: ruling 22) — a second
-/// process and the reader's snapshot, which this model of one `P` read by
-/// "whichever reader" does not have; the Tier-1s
-/// `a_watch_lets_its_program_go_once_its_tabs_stamp_names_another` and
-/// `a_program_stopped_across_a_commit_is_ended_once_its_successor_read_it`
-/// pin them, and the Tier-1s
+/// Not modelled: the stamp's clock. The watch lets a program go once its stamp no longer
+/// stands (`STALE_S`: stopped away from its tab, or held by another hand that outlasts it); no
+/// `KILL` is sent for a stamp that no longer stands, nor in its last half minute; an act that
+/// joins a stamp renews its time once its own `TERM` is sent; and an end after the stamp went
+/// stale is the program's own. Saying it needs a stale flag threaded through every end, a
+/// weakened relaunch invariant and a record of a `KILL` apart from the program's own end. Nor
+/// what the watch reads before its `KILL` (it lets its program go once the tab's stamp names
+/// another, and sends it only once the host holds the snapshot the exit's reader reads it by):
+/// a second process and the reader's snapshot, which this model lacks. `aterm-gui`'s
+/// `a_watch_lets_its_program_go_once_its_tabs_stamp_names_another`,
+/// `a_program_stopped_across_a_commit_is_ended_once_its_successor_read_it`,
 /// `a_stamped_program_stopped_inside_its_grace_is_ended_once_it_leads_again`,
 /// `a_stamp_that_no_longer_stands_is_no_acts_to_finish`,
 /// `a_restart_after_its_programs_watch_let_go_gets_a_watch_of_its_own`
@@ -3535,21 +3238,15 @@ pub fn harness_restart_stamp_model() -> Model {
     }
 }
 
-/// THE RESTART ENDS ITS PROGRAM ([`harness_restart_stamp_model`]): from any
-/// state in which the stamp names a live `P`, `P` ends — `[]<>(stamped == 0 ||
-/// alive == 0)`, and `P` never comes back once it ended — under the weak
-/// fairness of the act's own steps (`Term`: its signal follows its stamp in
-/// the same request) and of another hand's release (`HandOff`: every hold,
-/// lease, turn and claim is lifted at last — one that outlasts the stamp
-/// lets the program go, ruling 11, which this model has no clock to say),
-/// and the STRONG fairness of the escalation (`Escalate`: the thread's timer
-/// fires, and its watch looks again every second while another hand holds
-/// it off) and of the carrier's finish (`CarrierFinishes`: a successor whose
-/// Commit cut the act inside its grace finishes the `KILL`, waiting a hand
-/// out the same way). Neither the program's handler (`Hears`), nor a person
-/// (`EndsOtherwise`), nor a Commit is assumed. The mutant that breaks it
-/// alone: `TermOnly`, the act with no escalation, whose deaf program
-/// survives.
+/// The restart ends its program ([`harness_restart_stamp_model`]): from any state in which the
+/// stamp names a live `P`, `P` ends (`[]<>(stamped == 0 || alive == 0)`, and an ended `P` never
+/// comes back), under weak fairness of the act's own steps (`Term`: its signal follows its stamp
+/// in the same request) and of another hand's release (`HandOff`: every hold, lease, turn and
+/// claim lifts at last; one that outlasts the stamp lets the program go, which this model has no
+/// clock to say), and strong fairness of the escalation (`Escalate`: the timer fires, and the
+/// watch looks again every second while another hand holds it off) and of the carrier's finish
+/// (`CarrierFinishes`). Neither `Hears`, nor `EndsOtherwise`, nor a Commit is assumed.
+/// `TermOnly` alone breaks it.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(harness_restart_stamp_model)]

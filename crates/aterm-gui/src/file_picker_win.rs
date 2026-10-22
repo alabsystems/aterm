@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Windows local-file picker — the `IFileOpenDialog` behind Settings ▸ Wallpaper's
+//! Windows local-file picker: the `IFileOpenDialog` behind Settings ▸ Wallpaper's
 //! "Choose Image…" and the File ▸ Open Markdown / Open File rows.
 //!
 //! Until this landed, `menu::choose_local_file` had a non-macOS arm that returned
@@ -133,9 +133,8 @@ struct IShellItem {
     vtbl: *const IShellItemVtbl,
 }
 
-/// `HRESULT_FROM_WIN32(ERROR_CANCELLED)` — what `IModalWindow::Show` returns when
-/// the user dismisses the dialog. A DECISION, not a fault: it is the whole reason
-/// [`show_dialog`] returns `Result<Option<…>>` instead of `Result<…>`.
+/// `HRESULT_FROM_WIN32(ERROR_CANCELLED)`: what `IModalWindow::Show` returns when the user
+/// dismisses the dialog.
 const HRESULT_CANCELLED: i32 = 0x8007_04C7u32 as i32;
 /// `SIGDN_FILESYSPATH`: the display-name form that is a filesystem path, which succeeds for
 /// every item under [`FOS_FORCEFILESYSTEM`].
@@ -292,11 +291,9 @@ fn choose_from<N: AsRef<str>, S: AsRef<str>>(
     prompt: &str,
     types: &[(N, S)],
 ) -> Option<PathBuf> {
-    // SAFETY: `show_dialog` is one linear pass of documented shell COM calls;
-    // every pointer it hands the shell lives for the duration of its call (the
-    // wide strings and the filter table are locals that outlive each use), every
-    // returned interface is RAII-released, and the apartment is balanced by
-    // `Apartment`'s Drop.
+    // SAFETY: `show_dialog` is one linear pass of documented shell COM calls; every pointer
+    // it hands the shell outlives the call that reads it, every returned interface is
+    // RAII-released, and the apartment is balanced by `Apartment`'s Drop.
     match unsafe { show_dialog(title, prompt, types, owner_window()) } {
         Ok(picked) => picked,
         Err((step, hr)) => {

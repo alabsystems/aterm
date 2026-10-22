@@ -44,7 +44,8 @@ source; without either, the oracle reads Cargo's registry copy, and fetches it
 first (`targo fetch --locked` of win32-oracle/) on a host that has none, since no
 aterm build downloads it. `--stock` selects the rustup toolchain. `--target-dir` (or
 ORACLE_TARGET_DIR) owns the oracle build cache; NM selects its object inspector.
-The default cache is this checkout's win32-oracle/target (`oracle-052`:
-crates/aterm-windows-sys-052/tests/oracle/target). Before each build `oracle-052`
+The default cache is this checkout's win32-oracle/target.noindex (`oracle-052`:
+crates/aterm-windows-sys-052/tests/oracle/target.noindex). The `.noindex` suffix
+keeps build intermediates out of Spotlight. Before each build `oracle-052`
 cleans its two path units, so a cache another checkout shares never answers for
 this one. See `--help` for options.

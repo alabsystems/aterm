@@ -288,13 +288,9 @@ const CUSTOM_GRAPHIC_COLLECTIONS: &[&str] = &["cats"];
 /// window exists, so it has no Settings row. Windows Terminal's `useNew`/`useExisting`
 /// also parse (`aterm_cli::WindowingBehavior::parse`): accepted, never offered.
 const WINDOWING_BEHAVIORS: &[&str] = &["new_window", "attach"];
-/// The five Manual-only scalars an operator writes by hand (two are
-/// taught by `--help` and the `--write-config` starter). They follow the
-/// `windowing_behavior` precedent: off `prefs::editable_fields`, but Manual
-/// must complete them, hover them, and flag a misspelled VALUE — calling a
-/// live key "unknown to this aterm build" was a false diagnostic (audit-2
-/// item 9). Canonical spellings here; parser aliases below, accepted but
-/// never offered.
+/// Manual-only scalars written by hand: off `prefs::editable_fields`, but Manual completes,
+/// hovers and validates them like `windowing_behavior`. Canonical spellings here; the
+/// `*_ALIASES` parse but are never offered.
 /// `font_hinting`'s retired `native` is no alias: it renders as `light` and is
 /// told so ([`retired_but_resolving`]).
 const FONT_HINTINGS: &[&str] = &["full", "light", "off"];
@@ -3479,23 +3475,53 @@ fn warn_compatibility_only_item(
     }
 }
 
-/// What `settings set|unset` answers for a key it does not write (it writes the
-/// keys Settings carries, `prefs::editable_fields`). A key the file loads but
-/// nothing reads tells its compatibility story. A key Manual knows that is
-/// written by hand (`MANUAL_SCHEMA`: `conpty`, `windowing_behavior`, a `[fleet]`
-/// key) says so and where, where it used to be called unknown though `--help`
-/// and the starter config teach it. Anything else is unknown.
-pub(crate) fn control_settings_refusal(key: &str) -> String {
+/// Why `settings set|unset` refuses a key it does not write
+/// ([`settings_refusal_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettingsRefusal {
+    /// The file loads it but nothing reads it: its compatibility story.
+    CompatibilityOnly,
+    /// A live key written by hand: where it is written.
+    HandWritten,
+    /// No reader takes it.
+    Unknown,
+}
+
+/// Why `settings set|unset` refuses `key`, a key it does not write (it writes
+/// the keys Settings carries, `prefs::editable_fields`). A key the file loads
+/// but nothing reads is compatibility only. A key Manual knows that is written
+/// by hand (`MANUAL_SCHEMA`: `conpty`, `windowing_behavior`, a `[fleet]` key)
+/// is hand-written, where it used to be called unknown though `--help` and
+/// the starter config teach it, and so is any other key a reader takes
+/// ([`reader_accepted_paths`]: a live key is never unknown), such as
+/// `harness.occupancy`, whose grant only the owner writes. Anything else is
+/// unknown.
+pub(crate) fn settings_refusal_of(key: &str) -> SettingsRefusal {
     if is_compatibility_only_key(key) {
-        return compatibility_only_message(key);
+        SettingsRefusal::CompatibilityOnly
+    } else if MANUAL_SCHEMA.iter().any(|entry| entry.key == key)
+        || reader_accepted_paths().contains(key)
+    {
+        SettingsRefusal::HandWritten
+    } else {
+        SettingsRefusal::Unknown
     }
-    if MANUAL_SCHEMA.iter().any(|entry| entry.key == key) {
-        return format!(
+}
+
+/// What `settings set|unset` answers for a key it does not write
+/// ([`settings_refusal_of`]): a compatibility-only key its story, a
+/// hand-written one where it is written, and an unknown one that it is.
+pub(crate) fn control_settings_refusal(key: &str) -> String {
+    match settings_refusal_of(key) {
+        SettingsRefusal::CompatibilityOnly => compatibility_only_message(key),
+        SettingsRefusal::HandWritten => format!(
             "{key} is set in aterm.toml by hand, not through Settings: edit the file or use \
              Manual, which completes and checks it"
-        );
+        ),
+        SettingsRefusal::Unknown => {
+            format!("unknown key {key:?} (search Settings or use Manual for the complete schema)")
+        }
     }
-    format!("unknown key {key:?} (search Settings or use Manual for the complete schema)")
 }
 
 pub(crate) fn compatibility_only_message(key: &str) -> String {
@@ -7003,6 +7029,32 @@ pub(crate) mod tests {
             control_settings_refusal("not_a_real_setting"),
             "unknown key \"not_a_real_setting\" (search Settings or use Manual for the complete \
              schema)"
+        );
+    }
+
+    /// A KEY A READER TAKES IS NEVER REFUSED AS UNKNOWN (the occupancy design's
+    /// §1.1): `harness.occupancy`, which no Manual row names and Settings
+    /// never writes, is refused as a key written by hand, as is every other
+    /// path a reader accepts that is not compatibility only. NEGATIVE CONTROL:
+    /// a key nothing takes is unknown.
+    #[test]
+    fn settings_set_never_calls_a_key_a_reader_takes_unknown() {
+        assert!(
+            !MANUAL_SCHEMA
+                .iter()
+                .any(|entry| entry.key == "harness.occupancy"),
+            "no Manual row names it"
+        );
+        assert_eq!(
+            settings_refusal_of("harness.occupancy"),
+            SettingsRefusal::HandWritten
+        );
+        for key in reader_accepted_paths() {
+            assert_ne!(settings_refusal_of(key), SettingsRefusal::Unknown, "{key}");
+        }
+        assert_eq!(
+            settings_refusal_of("not_a_real_setting"),
+            SettingsRefusal::Unknown
         );
     }
 

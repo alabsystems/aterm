@@ -491,9 +491,7 @@ fn a_row_with_no_status_goes_quiet_by_its_text() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Its own calls (`super::super::flight`)
-// ---------------------------------------------------------------------------
 
 use crate::harness::flight::{
     FileFlight, Flight, FlightFold, FlightTable, Flyer, RowKey, ToolName, combine, place,

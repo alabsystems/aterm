@@ -3786,10 +3786,8 @@ fn only_a_wanted_card_frame_asks_whether_its_window_is_on_screen() {
     host.shutdown_and_join();
 }
 
-// ---------------------------------------------------------------------------
 // The steady state's cost (owner, 2026-10-15: "the user experince must be
 // extremely smooth and zero latency!")
-// ---------------------------------------------------------------------------
 
 /// What one pass of the per-frame and per-wake paths cost: the footer's
 /// repaint key (`App::claude_footer_fp`, with the chips' and the card's
@@ -5590,11 +5588,9 @@ fn a_timer_weekday_change_moves_the_footer_key_with_its_card_words() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The flow (owner, 2026-10-19: "Make the rainbow at the banner continue to
 // shimmer and flow continuously, which is also aligned with how the claude
 // alien shimmers. emphasize aterm in the banner.")
-// ---------------------------------------------------------------------------
 
 /// A card on `glass(120)` past its intro on the test clock: decorated at
 /// `t0`, its first flow frame drawn at `t0 + at_ms`.

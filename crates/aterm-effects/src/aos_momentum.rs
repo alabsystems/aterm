@@ -574,19 +574,53 @@ fn usize_u64(v: usize) -> u64 {
     u64::try_from(v).unwrap_or(u64::MAX)
 }
 
+/// The length of one encoded quad: `row`, `x`, `y`, `w`, `h` as `u16`, then `color` (`u32`),
+/// `alpha` (`u8`), `color2` (`u32`) and `alpha2` (`u8`).
+const QUAD_LEN: usize = 20;
+
+/// The most a frame observation's encoding takes besides its quads: the tag, the optional
+/// fill (a tag and a `u32`), `hot`, `fp` and the two stream counts.
+const FRAME_HEAD_LEN: usize = 1 + 5 + 1 + 8 + 8 + 8;
+
+/// One quad's encoding: its nine fields in order, each little-endian, which is exactly what
+/// the nine field writes `e.u16(q.row)`, `e.u16(q.x)`, … `e.u8(q.alpha2)` append. Written as
+/// one 20-byte slice.
+fn quad_bytes(q: &GlowQuad) -> [u8; QUAD_LEN] {
+    let [r0, r1] = q.row.to_le_bytes();
+    let [x0, x1] = q.x.to_le_bytes();
+    let [y0, y1] = q.y.to_le_bytes();
+    let [w0, w1] = q.w.to_le_bytes();
+    let [h0, h1] = q.h.to_le_bytes();
+    let [c0, c1, c2, c3] = q.color.to_le_bytes();
+    let [d0, d1, d2, d3] = q.color2.to_le_bytes();
+    [
+        r0, r1, x0, x1, y0, y1, w0, w1, h0, h1, c0, c1, c2, c3, q.alpha, d0, d1, d2, d3, q.alpha2,
+    ]
+}
+
 fn encode_quads(e: &mut Enc, quads: &[GlowQuad]) {
     e.u64(usize_u64(quads.len()));
     for q in quads {
-        e.u16(q.row);
-        e.u16(q.x);
-        e.u16(q.y);
-        e.u16(q.w);
-        e.u16(q.h);
-        e.u32(q.color);
-        e.u8(q.alpha);
-        e.u32(q.color2);
-        e.u8(q.alpha2);
+        e.raw(&quad_bytes(q));
     }
+}
+
+/// A frame observation's encoding from the frame and the quads it appended: the one encoder
+/// of [`MomentumObservation::Frame`], which the live host also calls on the quads in its own
+/// vectors, so its chain links the bytes a replay links without building the observation.
+fn encode_frame(e: &mut Enc, frame: &MomentumGlowFrame, out: &[GlowQuad], under: &[GlowQuad]) {
+    e.u8(2);
+    e.opt(frame.fill, |e, f| e.u32(f));
+    e.bool(frame.hot);
+    e.u64(frame.fp);
+    encode_quads(e, out);
+    encode_quads(e, under);
+}
+
+/// Room for a frame observation's encoding over `quads` quads: [`FRAME_HEAD_LEN`] and
+/// [`QUAD_LEN`] each. A capacity hint; it writes nothing.
+fn frame_room(quads: usize) -> usize {
+    FRAME_HEAD_LEN.saturating_add(QUAD_LEN.saturating_mul(quads))
 }
 
 fn encode_refusal(e: &mut Enc, r: &AdmitRefusal) {
@@ -796,14 +830,16 @@ impl Schema for MomentumSchema {
                 fp,
                 out,
                 under,
-            } => {
-                e.u8(2);
-                e.opt(*fill, |e, f| e.u32(f));
-                e.bool(*hot);
-                e.u64(*fp);
-                encode_quads(e, out);
-                encode_quads(e, under);
-            }
+            } => encode_frame(
+                e,
+                &MomentumGlowFrame {
+                    fill: *fill,
+                    hot: *hot,
+                    fp: *fp,
+                },
+                out,
+                under,
+            ),
             MomentumObservation::Schedule {
                 is_active,
                 settling,
@@ -1417,6 +1453,30 @@ struct Hosted {
     clamped: u64,
     /// The latest time among the keys queued in the current pause (within the horizon).
     queued_at: Option<i128>,
+    /// The one encoder every live observation is encoded into before its chain link, cleared
+    /// for each: it keeps the room the largest recent frame took, and gives it back with the
+    /// held overlay's when a tick draws nothing (see [`Hosted::deliver`]).
+    scratch: Enc,
+}
+
+/// Makes `v` hold exactly the quads of `from`, in the room it already has when that is
+/// enough: an overlay redrawn every frame is copied without an allocation per frame. Growing,
+/// it takes at least twice its old room (one allocation, then the old room is freed first).
+/// An empty `from` gives the room back, so an overlay that holds nothing keeps nothing,
+/// as a copy of no quads (`to_vec`) would.
+fn refill(v: &mut Vec<GlowQuad>, from: &[GlowQuad]) {
+    if from.is_empty() {
+        *v = Vec::new();
+        return;
+    }
+    if v.capacity() < from.len() {
+        let room = from.len().max(v.capacity().saturating_mul(2));
+        *v = Vec::new();
+        v.reserve_exact(room);
+    } else {
+        v.clear();
+    }
+    v.extend_from_slice(from);
 }
 
 /// The hosted horizon in signed nanoseconds.
@@ -1511,6 +1571,13 @@ impl Hosted {
     /// Folds one recorded input's observation into the live chain, restarting it when the
     /// boundary has re-anchored (a new log epoch or first cursor).
     fn fold(&mut self, cursor: u64, obs: &MomentumObservation) {
+        self.link(cursor, |schema, e| schema.encode_observation(obs, e));
+    }
+
+    /// [`Hosted::fold`] of the observation `encode` writes: the chain links the bytes it
+    /// appends to the host's one encoder, cleared first, so they are exactly what a fresh
+    /// encoder would hold.
+    fn link(&mut self, cursor: u64, encode: impl FnOnce(&MomentumSchema, &mut Enc)) {
         let Some(log) = self.boundary.log() else {
             return;
         };
@@ -1525,9 +1592,9 @@ impl Hosted {
         if cursor < anchor.1 {
             return;
         }
-        let mut e = Enc::new();
-        self.boundary.schema().encode_observation(obs, &mut e);
-        self.chain.chain = chain_link(&self.chain.chain, cursor, e.as_bytes());
+        self.scratch.clear();
+        encode(self.boundary.schema(), &mut self.scratch);
+        self.chain.chain = chain_link(&self.chain.chain, cursor, self.scratch.as_bytes());
         self.chain.len = self.chain.len.saturating_add(1);
     }
 
@@ -1594,35 +1661,43 @@ impl Hosted {
         let (_, state) = self.boundary.pair_mut();
         let applied = code.apply(state, epoch, ev, out, under);
         self.boundary.advance();
-        let obs = observe(
-            &applied,
-            epoch,
-            out.get(out_from..).unwrap_or(&[]),
-            under.get(under_from..).unwrap_or(&[]),
-        );
+        let drawn = out.get(out_from..).unwrap_or(&[]);
+        let drawn_under = under.get(under_from..).unwrap_or(&[]);
+        if let (MomentumEvent::Tick { cur, geom, cfg, .. }, Applied::Frame(frame)) = (ev, applied) {
+            // A frame is linked from the quads it appended, through the encoder of the
+            // observation `observe` would build from them (`encode_frame`), and copied once,
+            // into the held overlay's own vectors: no observation is built to be taken apart.
+            self.link(first, |_, e| {
+                e.reserve(frame_room(drawn.len().saturating_add(drawn_under.len())));
+                encode_frame(e, &frame, drawn, drawn_under);
+            });
+            let (mut held_out, mut held_under) = self
+                .held
+                .take()
+                .map(|h| (h.out, h.under))
+                .unwrap_or_default();
+            refill(&mut held_out, drawn);
+            refill(&mut held_under, drawn_under);
+            if drawn.is_empty() && drawn_under.is_empty() {
+                // Nothing drawn, nothing kept: the encoder's room goes with the overlay's.
+                self.scratch = Enc::new();
+            }
+            self.held = Some(Held {
+                frame,
+                out: held_out,
+                under: held_under,
+                cur: *cur,
+                geom: *geom,
+                dark: cfg.dark_theme,
+                block: cfg.block,
+            });
+            return Some(applied);
+        }
+        let obs = observe(&applied, epoch, drawn, drawn_under);
         self.fold(first, &obs);
         match (ev, obs) {
-            (
-                MomentumEvent::Tick { cur, geom, cfg, .. },
-                MomentumObservation::Frame {
-                    fill,
-                    hot,
-                    fp,
-                    out,
-                    under,
-                },
-            ) => {
-                self.held = Some(Held {
-                    frame: MomentumGlowFrame { fill, hot, fp },
-                    out,
-                    under,
-                    cur: *cur,
-                    geom: *geom,
-                    dark: cfg.dark_theme,
-                    block: cfg.block,
-                });
-            }
             (MomentumEvent::Tick { cur, geom, cfg, .. }, _) => {
+                self.scratch = Enc::new();
                 self.held = Some(Held {
                     frame: MomentumGlowFrame::default(),
                     out: Vec::new(),
@@ -1904,6 +1979,7 @@ impl MomentumHost {
             last_query: None,
             clamped: 0,
             queued_at: None,
+            scratch: Enc::new(),
         }));
     }
 

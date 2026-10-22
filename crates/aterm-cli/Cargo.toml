@@ -25,16 +25,14 @@ aterm-render = { workspace = true }
 aterm-types = { workspace = true }
 # `aterm theme pack | install`: the community theme pack, embedded (no network).
 aterm-theme-pack = { workspace = true }
-# `aterm help rust` calls the REAL toolchain discovery (`atpkg::toolchain`) rather
-# than restating it. The one `aterm` binary links atpkg already.
+# `aterm help rust` calls `atpkg::toolchain` discovery rather than restating it.
 atpkg = { workspace = true }
 # `aterm help agh`: the manual is generated from agh's verb and exit tables.
 agh = { workspace = true }
 # `aterm doctor`'s rows are converge items (docs/DESIGN-init-system-2026-10-20.md S5);
 # `crates/aterm` composes them with atpkg's.
 aterm-converge = { workspace = true }
-# `aterm agents`: the coding-agent primer installer. Its own std-only crate so the
-# GUI (auto-prime on every session) and this CLI verb drive ONE installer.
+# `aterm agents`: the primer installer, shared with the GUI's auto-prime.
 aterm-primer = { workspace = true }
 # `aterm --version` bundle path and duplicate-install reporting (`which_copy`).
 aterm-update = { workspace = true }
@@ -85,12 +83,10 @@ workspace = true
 
 [dev-dependencies]
 aterm-tempfile = { workspace = true }
-# The tests' scratch-directory stamp: the workspace's one epoch-clock read, already
-# in the graph via aterm-types.
+# The tests' scratch-directory stamp (the workspace's one epoch-clock read).
 aterm-time = { workspace = true }
 # `aterm_spec::host::could_not_run`: a test this host cannot run (as root, no
 # zsh, no font) ends COULD NOT RUN, never a silent pass; and
 # `wait::past_text_busy`: the shim tests exec files they just wrote while sibling
 # test threads fork (Linux's ETXTBSY).
 aterm-spec = { workspace = true }
-

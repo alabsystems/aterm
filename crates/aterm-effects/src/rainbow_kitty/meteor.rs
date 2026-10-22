@@ -2266,9 +2266,7 @@ impl Meteors {
 /// launched from ([`build_stations`]): that line is printed text now.
 const WHITE_PRINTED_SHARE: f32 = 0.25;
 
-// ===========================================================================
 // The per-frame flight solution (§6.2, §6.3, §6.8, §6.11)
-// ===========================================================================
 
 /// Everything about one meteor on one frame, solved once so no two layers can
 /// read the flight at two different instants (§17.1).
@@ -2477,9 +2475,7 @@ impl Flight {
     }
 }
 
-// ===========================================================================
 // §6.5 layers 1-3 — the two train layers and the shoulder
-// ===========================================================================
 
 /// Which of the two train layers is being built (§6.5 layers 1-3). They share
 /// one station walk and differ in the stream they land in, the falloff length,
@@ -2681,9 +2677,7 @@ fn build_stations(
     }
 }
 
-// ===========================================================================
 // §6.5 layers 6-8 — the coma, the nucleus and the terminal flash
-// ===========================================================================
 
 /// Emit the coma, the nucleus and the terminal flash's radius pop. The nucleus is
 /// the brightest and smallest thing (§3.2), leading the train by
@@ -2814,9 +2808,7 @@ fn flash_scale(after_ms: f32) -> f32 {
     1.0 + over * (1.0 - smoothstep01(v))
 }
 
-// ===========================================================================
 // §6.5 layers 9 and 10 — the pin, the flash, the starburst and the sparks
-// ===========================================================================
 
 /// §6.5 layer 9: the landing pin, explicit arms plus a 2×2 nucleus
 /// ([`PIN_WAIST_PX`]). The arms whip inward; the last pixel on glass is the
@@ -3393,9 +3385,7 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
     }
 }
 
-// ===========================================================================
 // §6.5 layers 5 and 11, §6.12 — the stars this producer mints
-// ===========================================================================
 
 /// §6.5 layer 5, the shed fragments: `shed_n(cells)` m3 grains at hashed stations
 /// `s_i ∈ [0.10, 0.70]·L`, each born on the frame the head passes it (so frame 0
@@ -3550,9 +3540,7 @@ fn mint_landing(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> La
     }
 }
 
-// ===========================================================================
 // Small shared arithmetic
-// ===========================================================================
 
 /// Milliseconds from `a` to `b`, saturating at zero, so a clock that moved
 /// backwards never produces a negative age.

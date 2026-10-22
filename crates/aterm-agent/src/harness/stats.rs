@@ -72,7 +72,7 @@
 //! journal alone as [`HarnessStats::landed`]: one for each landing, at the
 //! time its first note was journaled. A landing is noted once by the loop
 //! that lands it (`DONE seq=<n> rule=land@v1 …`, a clean defense at a land
-//! act's yield, FOREVER LAND), and noted AGAIN, as the same landing, by every
+//! act's yield, Autopilot Land), and noted AGAIN, as the same landing, by every
 //! loop that restarts over it (a seamless update, a relaunch) and after the
 //! task's own wake (`policy::turn_end::WAKE_KEPT`), each with the first
 //! note's time as its `ended` ([`JournalRecord::ended`]); those

@@ -1050,6 +1050,7 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
     let support = home.join("Library/Application Support/aterm");
     write(&support.join("caffeine.state"), "mode=off\n");
     write(&support.join("caffeine.lock"), "");
+    write(&support.join("caffeine.bridge"), "4242\n");
     write(&support.join("caffeine/l.plist"), "<plist/>");
     write(
         &support.join("caffeine-code.noindex/l/1-2/aterm.app/Contents/Info.plist"),
@@ -1075,7 +1076,12 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
         std::fs::read_to_string(&log).expect("asked"),
         "help caffeine\ncaffeine startup off\ncaffeine quit\n"
     );
-    for name in ["caffeine-code.noindex", "caffeine", "caffeine.state"] {
+    for name in [
+        "caffeine-code.noindex",
+        "caffeine",
+        "caffeine.state",
+        "caffeine.bridge",
+    ] {
         assert!(!present(&support.join(name)), "{name}: {out}");
     }
     assert!(
@@ -1160,94 +1166,209 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
     }
 }
 
-/// A copy of the app no Caffeine mug said it ran from, and younger than the first-exec hang,
-/// stays through an uninstall, SKIPPED with when it may go: its mug was stopped before it said
-/// so, macOS may still be assessing its first exec, and on macOS 27.0.1 removing it then crashes
-/// `syspolicyd`. Everything else in the code directory goes: a copy a mug ran from, a half-made
-/// one, one older than the hang, a stray file, a label holding no such copy. NEGATIVE CONTROL:
-/// removing the code directory whole, as the sweep did before, fails it.
+/// Code cleanup keeps every unproven young copy and refuses the whole plan if any metadata,
+/// enumeration or entry is unknown. The shipping collector sees an error after a yielded
+/// entry too: a partial list must not license removal of unseen copies. All fixtures are
+/// ordinary owned files; this calls the cleanup itself, not an uninstall or an executable.
 #[test]
 fn an_uninstall_keeps_a_caffeine_copy_macos_may_still_be_assessing() {
+    use std::cell::Cell;
+    use std::io::{Error, ErrorKind};
+
+    fn sweep(
+        code: &Path,
+        now: std::time::SystemTime,
+        metadata: &impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+        entries: &impl Fn(&Path) -> std::io::Result<Vec<PathBuf>>,
+    ) -> (usize, usize, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let counts = {
+            let mut s = Sweep {
+                dry: false,
+                removed: 0,
+                skipped: 0,
+                kept: 0,
+                shared_kept: 0,
+                outsider: None,
+                out: &mut out,
+                err: &mut err,
+            };
+            sweep_caffeine_code_with(&mut s, code, now, metadata, entries);
+            (s.removed, s.skipped)
+        };
+        (
+            counts.0,
+            counts.1,
+            String::from_utf8(out).expect("out"),
+            String::from_utf8(err).expect("err"),
+        )
+    }
+
     let a = Account::new("caffeine-young");
-    let support = a.home().join("Library/Application Support/aterm");
-    let app = a.home().join("Applications/aterm.app");
-    bundle(&app, None);
-    exe(&app.join("Contents/MacOS/aterm"), "#!/bin/sh\nexit 0\n");
-    // Asked once first, so the system's first-exec assessment of the stand-in is behind the
-    // sweep and does not age the copies whose minutes are read below.
-    aterm_spec::wait::first_exec(&app.join("Contents/MacOS/aterm"), &["help", "caffeine"]);
-    write(&support.join("caffeine.state"), "mode=off\n");
-    write(&support.join("caffeine.lock"), "");
-    write(&support.join("caffeine/l.plist"), "<plist/>");
-    let code = support.join("caffeine-code.noindex");
+    let code = a
+        .home()
+        .join("Library/Application Support/aterm/caffeine-code.noindex");
     let plist = "aterm.app/Contents/Info.plist";
-    for copy in ["l/9-1", "l/9-2", "l/9-3.partial", "l/9-4", "l/9-6", "m/9-5"] {
+    for copy in ["a/9-0", "l/9-1", "l/9-2", "l/9-3.partial", "l/9-4", "m/9-5"] {
         write(&code.join(copy).join(plist), "<plist/>");
     }
-    // Stamped at its exec a minute of awake time ago, its directory older than the hang on
-    // the wall clock (the Mac slept since): still young.
-    if let Some(awake) = aterm_uds::process::awake_ms() {
-        write(
-            &code.join("l/9-6").join(aterm_uds::deadline::EXEC_STAMP),
-            (awake.saturating_sub(60_000)).to_string(),
-        );
-    }
-    for ran in ["l/9-2", "m/9-5"] {
+    for ran in ["a/9-0", "l/9-2", "m/9-5"] {
         write(&code.join(ran).join(aterm_uds::deadline::RAN), "");
     }
+    // A just-stamped copy remains young even when its wall-clock age is old. No comparison
+    // between wall-clock minute boundaries or minimum machine uptime is needed.
+    let stamped = aterm_uds::process::awake_ms().map(|awake| {
+        let copy = code.join("l/9-6");
+        write(&copy.join(plist), "<plist/>");
+        write(
+            &copy.join(aterm_uds::deadline::EXEC_STAMP),
+            awake.to_string(),
+        );
+        copy
+    });
     write(&code.join("stray"), "");
-    let made = std::time::SystemTime::now()
-        - aterm_uds::deadline::FIRST_EXEC_HANG
-        - std::time::Duration::from_secs(60);
-    for aged in ["l/9-4", "l/9-6"] {
-        std::fs::File::open(code.join(aged))
+    let now = std::time::SystemTime::now();
+    let made = now - aterm_uds::deadline::FIRST_EXEC_HANG - Duration::from_secs(60);
+    for aged in std::iter::once(code.join("l/9-4")).chain(stamped.iter().cloned()) {
+        std::fs::File::open(aged)
             .and_then(|dir| dir.set_modified(made))
             .expect("age the copy");
     }
+    let before = tree(&code);
+    // Fail both before reading anything and after an earlier safe-to-remove branch was
+    // inspected. No failure may turn the plan accumulated so far into deletion authority.
+    for (bad_meta, bad_list, partial) in [
+        (Some(code.clone()), None, false),
+        (Some(code.join("l")), None, false),
+        (Some(code.join("l/9-2")), None, false),
+        (None, Some(code.clone()), false),
+        (None, Some(code.join("l")), false),
+        (None, Some(code.clone()), true),
+        (None, Some(code.join("l")), true),
+    ] {
+        let refused = Cell::new(false);
+        let metadata = |path: &Path| {
+            if bad_meta.as_deref() == Some(path) {
+                refused.set(true);
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    "injected metadata refusal",
+                ));
+            }
+            std::fs::symlink_metadata(path)
+        };
+        let entries = |path: &Path| {
+            if bad_list.as_deref() == Some(path) {
+                refused.set(true);
+                if partial {
+                    let first = if path == code {
+                        code.join("a")
+                    } else {
+                        code.join("l/9-2")
+                    };
+                    return collect_caffeine_code_entries([
+                        Ok(first),
+                        Err(Error::new(ErrorKind::Interrupted, "injected entry refusal")),
+                    ]);
+                }
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    "injected enumeration refusal",
+                ));
+            }
+            caffeine_code_entries(path)
+        };
+        let (removed, skipped, out, err) = sweep(&code, now, &metadata, &entries);
+        assert!(refused.get(), "the injected refusal was reached");
+        assert_eq!((removed, skipped), (0, 1), "{out}{err}");
+        assert_eq!(tree(&code), before, "{out}{err}");
+        assert_eq!(
+            std::fs::read_to_string(code.join("l/9-1").join(plist)).expect("young stays"),
+            "<plist/>"
+        );
+    }
 
-    let (ok, out, err) = a.sweep(None, false);
-    assert!(!ok, "a kept copy is a partial result: {out}{err}");
-    // The awake minutes a copy's SKIPPED line names.
-    let minutes = |copy: &Path| -> u64 {
-        let line = err
-            .lines()
-            .find(|line| line.contains(&format!("SKIPPED {} ", copy.display())))
-            .unwrap_or_else(|| panic!("no SKIPPED line for {}: {err}", copy.display()));
-        assert!(line.contains("syspolicyd"), "{line}");
-        line.split("awake ")
-            .nth(1)
-            .and_then(|rest| rest.split(' ').next())
-            .and_then(|n| n.parse().ok())
-            .unwrap_or_else(|| panic!("no awake minutes: {line}"))
+    // A missing entry is known absence. Everything else is inspected normally: proven,
+    // partial and old copies go, while every young copy and its ancestors stay.
+    let entries = |path: &Path| {
+        let mut entries = caffeine_code_entries(path)?;
+        if path == code {
+            entries.push(code.join("already-gone"));
+        }
+        Ok(entries)
     };
-    let young = code.join("l/9-1");
-    let young_left = minutes(&young);
-    assert!((1..=10).contains(&young_left), "{err}");
-    assert_eq!(
-        std::fs::read_to_string(young.join(plist)).expect("the young copy stays"),
-        "<plist/>"
+    let (removed, skipped, out, err) = sweep(
+        &code,
+        now,
+        &|path| std::fs::symlink_metadata(path),
+        &entries,
     );
-    if aterm_uds::process::awake_ms().is_some() {
-        let slept = code.join("l/9-6");
+    assert!(
+        removed > 0,
+        "the positive control removes admitted entries: {out}{err}"
+    );
+    assert_eq!(skipped, 1 + usize::from(stamped.is_some()), "{out}{err}");
+    assert!(code.join("l/9-1").join(plist).is_file());
+    if let Some(stamped) = stamped {
         assert!(
-            slept.join(plist).is_file(),
+            stamped.join(plist).is_file(),
             "kept on the awake clock: {err}"
         );
-        // A minute less than the unstamped copy made just now, give or take the minute
-        // boundary between the two readings, not the wall clock's minute or so left.
-        let slept_left = minutes(&slept);
-        assert!(
-            slept_left < young_left && young_left - slept_left <= 2,
-            "{slept_left} vs {young_left}: {err}"
-        );
+        write(&stamped.join(aterm_uds::deadline::RAN), "");
     }
-    for gone in ["l/9-2", "l/9-3.partial", "l/9-4", "m", "stray"] {
+    for gone in ["a", "l/9-2", "l/9-3.partial", "l/9-4", "m", "stray"] {
         assert!(!present(&code.join(gone)), "{gone}: {out}");
     }
-    for gone in ["caffeine", "caffeine.state"] {
-        assert!(!present(&support.join(gone)), "{gone}: {out}");
+    // Once the remaining images have proof, the full root is removable. The production
+    // entry is used here; an absent root on the following call is a no-op, not a skip.
+    write(&code.join("l/9-1").join(aterm_uds::deadline::RAN), "");
+    for expected_removed in [1, 0] {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut s = Sweep {
+            dry: false,
+            removed: 0,
+            skipped: 0,
+            kept: 0,
+            shared_kept: 0,
+            outsider: None,
+            out: &mut out,
+            err: &mut err,
+        };
+        sweep_caffeine_code(&mut s, &code, now);
+        assert_eq!((s.removed, s.skipped), (expected_removed, 0));
+        assert!(!present(&code));
     }
-    assert!(!app.exists(), "the bundle goes: its quit succeeded: {out}");
+}
+
+/// A file gone between the sweep's look and its removal (a Caffeine bridge removes its own
+/// once `caffeine quit` has saved off) is neither removed nor SKIPPED: the uninstall still
+/// succeeds. One that cannot be removed is SKIPPED, as before. NEGATIVE CONTROL: before, the
+/// gone file was SKIPPED "cannot remove, try sudo" and the uninstall reported failure.
+#[test]
+fn a_file_gone_before_its_removal_is_not_skipped() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let gone = dir.path().join("caffeine.bridge");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut s = Sweep {
+        dry: false,
+        removed: 0,
+        skipped: 0,
+        kept: 0,
+        shared_kept: 0,
+        outsider: None,
+        out: &mut out,
+        err: &mut err,
+    };
+    s.rm(&gone, "Caffeine file");
+    assert_eq!((s.removed, s.skipped), (0, 0));
+    // A directory entry inside a file is no path at all: that one stays SKIPPED.
+    let blocked = dir.path().join("a-file");
+    write(&blocked, "");
+    s.rm(&blocked.join("inside"), "Caffeine file");
+    assert_eq!((s.removed, s.skipped), (0, 1));
+    let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
+    assert!(out.contains("gone already: Caffeine file"), "{out}");
+    assert!(!err.contains("caffeine.bridge"), "{err}");
 }
 
 /// A mug started from the store's `aterm` (the source lane: a bare build runs where it is) is

@@ -83,8 +83,8 @@ pub mod scheme_import;
 pub mod scheme_install;
 // A theme's typography (font families and type knobs) and its value readers.
 pub mod scheme_typography;
-// The signature bar (OkLCh hue, chroma and distance rows): the built-ins'
-// law test and `aterm theme check --signature` share it.
+// The signature bar the built-in themes clear: their law test and
+// `aterm theme check --signature` share it.
 pub mod scheme_signature;
 // The 256-colour palette (slots 16-255) a theme derives from its ANSI
 // colours when it opts in with `palette_generate`.
@@ -178,9 +178,7 @@ impl TerminalSize {
     }
 }
 
-// ============================================================================
 // SGR Dim (Faint) Factor
-// ============================================================================
 
 /// Default `faint_opacity`: the fraction of the foreground's contrast SGR 2
 /// (dim/faint) keeps, in log space. Faint is a blend toward the cell

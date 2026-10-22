@@ -27,20 +27,17 @@
 //! * A surface is one token: letters, digits and `_`, with `'` `’` `-` as interior joiners (the
 //!   scanner's token law). Anything else is skipped.
 //! * An unknown trick `id` skips its row.
-//! * A surface claimed twice with DIFFERENT roles keeps the first claimant
-//!   (file order, English first). The SAME role claimed again is not a
-//!   conflict: that is `siéntate` beside `sientate`, or two languages sharing
-//!   an imperative, and the claims merge.
-//! * English is never gated: it is the priority language and loads for
-//!   everyone.
-//! * MARKS-REQUIRED, exactly as the sparkle lexicon: a surface whose fold
-//!   loses diacritics into a bare-ASCII key matches only a token that itself
-//!   carries such marks, unless the bare spelling is listed too.
-//! * A single-character no-space surface (`坐`, `跳`) ALWAYS needs the
-//!   vocative, whichever list it was authored in: a lone committed ideograph
-//!   is a syllable of someone's prose far more often than a command.
-//! * A surface longer than [`TrickLexicon::MAX_SURFACE_CHARS`] is skipped: the
-//!   listener's token window could never hold it, so it would never fire.
+//! * A surface claimed under two different roles keeps the first claimant (file order, English
+//!   first). The same role claimed again (`siéntate` beside `sientate`, two languages sharing an
+//!   imperative) merges.
+//! * English is never gated; a gated English row loads anyway and is reported.
+//! * Marks-required, as in the sparkle lexicon: a surface whose fold loses diacritics into a
+//!   bare-ASCII key matches only a token that carries such marks, unless the bare spelling is
+//!   listed too.
+//! * A single-character no-space surface (`坐`, `跳`) always needs the vocative: a lone ideograph
+//!   is a syllable of prose far more often than a command.
+//! * A surface longer than [`TrickLexicon::MAX_SURFACE_CHARS`] could never fit the listener's
+//!   token window and is skipped.
 //! * `unglued` names surfaces of its OWN no-space row; anything else listed
 //!   there is recorded and ignored.
 //!

@@ -3806,6 +3806,60 @@ pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `aterm machines github login`: ask the person, at the terminal with its echo off, for a
+/// token of the `[github]` account's, and store it in the login keychain once GitHub signs it
+/// in as that account with the key scope ([`super::github::login`]). Refused without a
+/// terminal: the token is typed, never an argument or a variable.
+#[must_use]
+pub fn github_login(env: &Env<'_>) -> ExitCode {
+    let inv = match load(env) {
+        Ok(inv) => inv,
+        Err(code) => return code,
+    };
+    let Some(github) = &inv.github else {
+        errln!("aterm machines github login: machines.toml names no [github] account");
+        return ExitCode::from(2);
+    };
+    if !env.tty {
+        errln!(
+            "aterm machines github login: needs a terminal, where the token is typed with \
+             its echo off"
+        );
+        return ExitCode::from(2);
+    }
+    let prompt = format!(
+        "A GitHub token of {}'s with the {} scope (not echoed): ",
+        github.account,
+        super::github::KEY_SCOPE
+    );
+    let token = match env.sys.ask(&prompt, true) {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            errln!("aterm machines github login: no token typed; nothing was stored");
+            return ExitCode::FAILURE;
+        }
+        Err(why) => {
+            errln!("aterm machines github login: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match super::github::login(env.sys, &github.account, token) {
+        Ok(()) => {
+            outln!(
+                "stored {}'s GitHub token in the login keychain ({}); host keys register \
+                 with it from the next apply",
+                github.account,
+                super::github::TOKEN_HOST
+            );
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            errln!("aterm machines github login: {why}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `aterm machines unenroll <host> [--unreachable]` (a person decides: refused without a
 /// terminal).
 #[must_use]
@@ -4522,7 +4576,14 @@ mod tests {
     fn the_starter_baseline_and_inventory_parse() {
         let b = crate::baseline::parse(templates::DEFAULT_BASELINE).unwrap();
         assert!(b.keyboard.is_some());
-        assert_eq!(b.apps.len(), 3);
+        // Emacs and Caffeine (S16 takes them); S14 took gh out.
+        assert_eq!(
+            b.apps
+                .iter()
+                .map(|app| app.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Emacs", "Caffeine"]
+        );
         let inv: Inventory = aterm_toml::from_str(templates::INVENTORY).unwrap();
         assert_eq!(inv.schema, 1);
         assert!(inv.hosts.is_empty());
@@ -6166,14 +6227,24 @@ mod tests {
 
     // ── GitHub ──────────────────────────────────────────────────────────────────────────
 
-    const GH: &str = "/opt/homebrew/bin/gh";
     const ALICE_OLD: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIJpFPtSPTOuLIj6oqQTj8ndNDVNHFp4renP47+wxFYao";
     const ALICE_NEW: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIHv2Xf9kgkNkpV3WltnLoVx25AQOEx+mch1DHT/oZdSa";
+    /// Made up; never a real token.
+    const MACHINE_TOKEN: &str = "fixture_machine_user_token_only";
+    const KEYS_PAGE: &str = "/user/keys?per_page=100&page=1";
 
-    /// A controller whose gh holds a token for `fleetbot`.
-    fn with_gh(sys: &Fake) {
+    fn rest(status: u16, body: &str) -> Result<crate::port::GithubResponse, String> {
+        Ok(crate::port::GithubResponse {
+            status,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        })
+    }
+
+    /// A controller whose login keychain holds a token for `fleetbot` that signs in as it.
+    fn with_token(sys: &Fake) {
         sys.stat_of(
-            GH,
+            crate::items::github::CLT_GIT,
             crate::port::Stat {
                 uid: 0,
                 gid: 0,
@@ -6183,23 +6254,52 @@ mod tests {
                 len: 1,
             },
         );
-        sys.on(
-            &format!("{GH} auth token --hostname github.com --user fleetbot"),
-            Ran::ok("gho_ThisIsNotARealToken0123456789abcdef\n"), // gitleaks:allow
+        crate::git_credential::script::holds(
+            sys,
+            None,
+            super::super::github::TOKEN_HOST,
+            "fleetbot",
+            MACHINE_TOKEN,
         );
-        sys.on(
-            &format!("GH_TOKEN=\u{2026} {GH} api user --jq .login"),
-            Ran::ok("fleetbot\n"),
+        sys.on_github_rest(
+            crate::port::RestMethod::Get,
+            "/user",
+            rest(200, r#"{"login":"fleetbot"}"#),
         );
     }
 
-    fn list_keys() -> String {
-        format!("GH_TOKEN=\u{2026} {GH} api user/keys --paginate --jq '.[] | [.id, .key] | @tsv'")
+    /// The listing's next answer: the account holds `held`.
+    fn lists(sys: &Fake, held: &[(u64, &str)]) {
+        let keys: Vec<_> = held
+            .iter()
+            .map(|(id, body)| aterm_json::json!({"id": id, "key": format!("ssh-ed25519 {body}")}))
+            .collect();
+        sys.on_github_rest(
+            crate::port::RestMethod::Get,
+            KEYS_PAGE,
+            rest(200, &aterm_json::to_string(&keys).unwrap()),
+        );
+    }
+
+    fn posts(sys: &Fake, id: u64) {
+        sys.on_github_rest(
+            crate::port::RestMethod::Post,
+            "/user/keys",
+            rest(201, &format!(r#"{{"id":{id}}}"#)),
+        );
+    }
+
+    fn deletes(sys: &Fake, id: u64) {
+        sys.on_github_rest(
+            crate::port::RestMethod::Delete,
+            &format!("/user/keys/{id}"),
+            rest(204, ""),
+        );
     }
 
     fn post_key(body: &str) -> String {
         format!(
-            "GH_TOKEN=\u{2026} {GH} api --method POST user/keys -f title=aterm-machines:lab-01:alice -f 'key=ssh-ed25519 {body}' --jq .id"
+            r#"github POST /user/keys {{"title":"aterm-machines:lab-01:alice","key":"ssh-ed25519 {body}"}}"#
         )
     }
 
@@ -6213,7 +6313,7 @@ mod tests {
     fn a_users_new_key_is_registered_and_the_one_it_replaced_deleted() {
         let a = lab(1, UUID_1);
         let sys = controller(&[&a], true);
-        with_gh(&sys);
+        with_token(&sys);
         let e = env(&sys);
         let inv = inventory_of(&sys);
         let state = HostState {
@@ -6222,7 +6322,7 @@ mod tests {
             ..HostState::default()
         };
         inventory::save_state(&sys, &paths(), &a.uuid, &state).unwrap();
-        // The same key again: nothing is sent.
+        // The same key again: nothing is sent, and the keychain is not read.
         after_run(
             &e,
             &inv,
@@ -6231,30 +6331,18 @@ mod tests {
             Source::Baseline,
         );
         assert!(
-            !sys.calls().iter().any(|c| c.contains("GH_TOKEN")),
+            !sys.calls()
+                .iter()
+                .any(|c| c.starts_with("github ") || c.contains("credential fill")),
             "{:?}",
             sys.calls()
         );
         // A reset home made a new key: registered, and the old id deleted.
-        sys.on(
-            &list_keys(),
-            Ran::ok(&format!("5\tssh-ed25519 {ALICE_OLD}\n")),
-        );
-        sys.on(&post_key(ALICE_NEW), Ran::ok("9\n"));
-        sys.on(
-            &list_keys(),
-            Ran::ok(&format!(
-                "5\tssh-ed25519 {ALICE_OLD}\n9\tssh-ed25519 {ALICE_NEW}\n"
-            )),
-        );
-        sys.on(
-            &list_keys(),
-            Ran::ok(&format!("9\tssh-ed25519 {ALICE_NEW}\n")),
-        );
-        sys.on(
-            &format!("GH_TOKEN=\u{2026} {GH} api --method DELETE user/keys/5"),
-            Ran::ok(""),
-        );
+        lists(&sys, &[(5, ALICE_OLD)]);
+        posts(&sys, 9);
+        lists(&sys, &[(5, ALICE_OLD), (9, ALICE_NEW)]);
+        lists(&sys, &[(9, ALICE_NEW)]);
+        deletes(&sys, 5);
         after_run(
             &e,
             &inv,
@@ -6268,14 +6356,21 @@ mod tests {
             state.github_key_text,
             [(9, format!("ssh-ed25519 {ALICE_NEW}"))]
         );
-        assert!(sys.calls().contains(&post_key(ALICE_NEW)));
+        let calls = sys.calls();
+        assert!(calls.contains(&post_key(ALICE_NEW)), "{calls:?}");
+        assert!(calls.contains(&"github DELETE /user/keys/5".to_owned()));
+        assert!(
+            calls
+                .iter()
+                .all(|c| !c.contains(MACHINE_TOKEN) && !c.contains("/gh "))
+        );
     }
 
     #[test]
     fn a_revoked_key_is_never_registered_again_and_a_plan_registers_nothing() {
         let a = lab(1, UUID_1);
         let sys = controller(&[&a], true);
-        with_gh(&sys);
+        with_token(&sys);
         let e = env(&sys);
         let inv = inventory_of(&sys);
         let state = HostState {
@@ -6283,15 +6378,9 @@ mod tests {
             ..HostState::default()
         };
         inventory::save_state(&sys, &paths(), &a.uuid, &state).unwrap();
-        sys.on(
-            &list_keys(),
-            Ran::ok(&format!("5\tssh-ed25519 {ALICE_OLD}\n")),
-        );
-        sys.on(&list_keys(), Ran::ok(""));
-        sys.on(
-            &format!("GH_TOKEN=\u{2026} {GH} api --method DELETE user/keys/5"),
-            Ran::ok(""),
-        );
+        lists(&sys, &[(5, ALICE_OLD)]);
+        lists(&sys, &[]);
+        deletes(&sys, 5);
         assert_eq!(github_revoke(&e, "lab-01"), ExitCode::SUCCESS);
         let state = state_of(&sys, &a);
         assert!(state.github_keys.is_empty());
@@ -6316,8 +6405,8 @@ mod tests {
         );
         assert!(!sys.calls()[calls..].iter().any(|c| c.contains("POST")));
         // A key the host makes anew is registered by the next apply.
-        sys.on(&list_keys(), Ran::ok(""));
-        sys.on(&post_key(ALICE_NEW), Ran::ok("11\n"));
+        lists(&sys, &[]);
+        posts(&sys, 11);
         after_run(
             &e,
             &inv,
@@ -6326,6 +6415,71 @@ mod tests {
             Source::Baseline,
         );
         assert_eq!(state_of(&sys, &a).github_keys, [("alice".to_owned(), 11)]);
+    }
+
+    /// `github login` reads the token at the terminal with its echo off and stores it once
+    /// GitHub vouches for it. Negative controls: no terminal, and no [github] account, each
+    /// refused before anything is asked or stored.
+    #[test]
+    fn github_login_asks_at_the_terminal_and_stores_what_github_vouches_for() {
+        let a = lab(1, UUID_1);
+        for (tty, github, code) in [
+            (true, true, ExitCode::SUCCESS),
+            (false, true, ExitCode::from(2)),
+            (true, false, ExitCode::from(2)),
+        ] {
+            let sys = controller(&[&a], github);
+            sys.stat_of(
+                crate::items::github::CLT_GIT,
+                crate::port::Stat {
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o755,
+                    dir: false,
+                    symlink: false,
+                    len: 1,
+                },
+            );
+            sys.answer(Some(MACHINE_TOKEN));
+            sys.on_github_rest(
+                crate::port::RestMethod::Get,
+                "/user",
+                Ok(crate::port::GithubResponse {
+                    status: 200,
+                    headers: vec![("X-OAuth-Scopes".into(), "admin:public_key".into())],
+                    body: br#"{"login":"fleetbot"}"#.to_vec(),
+                }),
+            );
+            let approve = crate::git_credential::script::approves(&sys, None);
+            crate::git_credential::script::holds(
+                &sys,
+                None,
+                super::super::github::TOKEN_HOST,
+                "fleetbot",
+                MACHINE_TOKEN,
+            );
+            let mut e = env(&sys);
+            e.tty = tty;
+            assert_eq!(github_login(&e), code, "tty {tty}, github {github}");
+            let calls = sys.calls();
+            assert_eq!(
+                calls.contains(&approve),
+                code == ExitCode::SUCCESS,
+                "{calls:?}"
+            );
+            // The token is asked for with its echo off, once, and only where it is stored.
+            let asked: Vec<&String> = calls.iter().filter(|c| c.starts_with("ask")).collect();
+            if code == ExitCode::SUCCESS {
+                assert_eq!(asked.len(), 1, "{calls:?}");
+                assert!(asked[0].starts_with("ask secret "), "{calls:?}");
+            } else {
+                assert!(asked.is_empty(), "{calls:?}");
+            }
+            assert!(
+                calls.iter().all(|c| !c.contains(MACHINE_TOKEN)),
+                "{calls:?}"
+            );
+        }
     }
 
     /// Successful interactive keygen is followed by the existing protection query.
@@ -6413,19 +6567,36 @@ mod tests {
 
     #[test]
     fn a_starter_baseline_nobody_edited_follows_the_starter_shipped_now() {
+        // A controller set up before S14 (docs/DESIGN-init-system-2026-10-20.md): its
+        // default.toml is the starter of 326cdca677 byte for byte, the one with an [[app]] row
+        // S14 took out (these are its bytes, data only), so the starter without it would
+        // never have reached it.
+        const REMOVED_ROW: &str = "# gh's installer package carries no installer signature; its binary is checked against\n\
+             # GitHub's Team ID instead (design §8).\n[[app]]\nname = \"gh\"\nkind = \"pkg\"\n\
+             url = \"https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_macOS_universal.pkg\"\n\
+             sha256 = \"1787e65f36626245a6b3cee353a458f6ea4372008548ceb8fb5d5dfb55b006d0\"\n\
+             team_id = \"VEKTX9H2N7\"\nunsigned = true\npkg_id = \"com.github.cli\"\n\
+             binary = \"/usr/local/bin/gh\"\nversion = \"2.102.0\"\n\n";
+        let anchor = "# A per-host GitHub key for each user";
+        let earlier =
+            templates::DEFAULT_BASELINE.replace(anchor, &format!("{REMOVED_ROW}{anchor}"));
+        assert_ne!(earlier, templates::DEFAULT_BASELINE);
+        assert!(
+            templates::EARLIER_DEFAULT_BASELINES.contains(&text_sha256(&earlier).as_str()),
+            "the digest is of the starter as 326cdca677 wrote it"
+        );
         // The owner's controller, set up on 2026-10-18: its default.toml is the starter of
         // 6045a51374 byte for byte, the one without `host_name = ""`, so the rehearsal's F1
         // fix to the starter would never have reached it.
-        let earlier = templates::DEFAULT_BASELINE.replace(
+        let older = earlier.replace(
             "# host_name \"\" unsets a HostName set by hand, so `hostname`, shell prompts and \
              ssh show the\n# new Local hostname rather than the old name; a dotted name sets one \
              instead.\n",
             "",
         );
-        let earlier = earlier.replace("host_name = \"\"\n", "");
-        assert_ne!(earlier, templates::DEFAULT_BASELINE);
+        let older = older.replace("host_name = \"\"\n", "");
         assert!(
-            templates::EARLIER_DEFAULT_BASELINES.contains(&text_sha256(&earlier).as_str()),
+            templates::EARLIER_DEFAULT_BASELINES.contains(&text_sha256(&older).as_str()),
             "the digest is of the starter as 6045a51374 wrote it"
         );
         assert!(

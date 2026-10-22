@@ -642,9 +642,7 @@ pub fn typed_glyph_class(typed: Option<char>) -> u8 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Musical foundation
-// ---------------------------------------------------------------------------
 
 /// Just-intonation major pentatonic (1 9/8 5/4 3/2 5/3). Every interval is
 /// consonant against every other, so overlapping voices stay harmonious;
@@ -706,9 +704,7 @@ fn tone_feel(tone: Tone) -> f32 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The pulse: what makes the typed line a song rather than a stream of notes
-// ---------------------------------------------------------------------------
 //
 // A keystroke is a position in a fixed bar, indexed by keystroke rather than
 // clock (typing speed is the tempo):
@@ -763,9 +759,7 @@ const SONG_GHOST_FEEL: f32 = 0.62;
 /// estimate decays over.
 const PHRASE_PAUSE_S: f32 = 0.6;
 
-// ---------------------------------------------------------------------------
 // The theme: one composed tune
-// ---------------------------------------------------------------------------
 //
 // The accent lane plays a fixed theme, the held-key sing-along's verse
 // ([`CELEBRATION_PHRASE`] bars 0..3), so typing and holding are two tempos of
@@ -865,9 +859,7 @@ const CURSOR_ANCHOR_HZ: f32 = 330.0;
 /// the run's own rate limit.
 const CURSOR_SWEEP_STEP_S: f32 = 0.055;
 
-// ---------------------------------------------------------------------------
 // The gesture family: one rule for typing and the cursor motions
-// ---------------------------------------------------------------------------
 //
 // Every family gesture renders a move on the text as the same move on the
 // lattice: direction (`dir`, +1 forward, −1 backward) signs the pitch offset
@@ -1025,9 +1017,7 @@ fn gesture_bend(f: f32, dir: i8) -> (f32, f32) {
 const BONK_MINOR_SECOND: f32 = 16.0 / 15.0;
 const BONK_TRITONE: f32 = 45.0 / 32.0;
 
-// ---------------------------------------------------------------------------
 // The loudness ladder
-// ---------------------------------------------------------------------------
 //
 // Loudness is indexed by how often a gesture can repeat, not by how big it
 // looks. Every per-character gesture sits on one floor; each rarer tier is
@@ -1108,9 +1098,7 @@ const SHIFT_GLYPH_LIFT: i32 = 5;
 /// on the active table. Pitch only; entry 0 is the unrotated step.
 const SHIFT_ROTATION: [i32; 5] = [0, 2, 4, 1, 3];
 
-// ---------------------------------------------------------------------------
 // The ting: the bare Shift's voice
-// ---------------------------------------------------------------------------
 //
 // A struck, bright, ringing bell in the house struck-glass shape: a sine body
 // under a 3.01-ratio FM strike glint that dies in ~20 ms, a quiet octave
@@ -1162,9 +1150,7 @@ fn ting_octave(f: f32) -> f32 {
     fold_octave(f, SHIFT_TING_LO_HZ)
 }
 
-// ---------------------------------------------------------------------------
 // The erase poof: the deletion's own voice
-// ---------------------------------------------------------------------------
 //
 // A deletion is a different event from a keystroke, not a quieter one: two
 // band-passed noise bursts (a body and an air cap) and no tonal partial,
@@ -1289,9 +1275,7 @@ const ERASE_MIN_GAP: f32 = 0.075;
 /// The host cues once per physical press, so this only guards re-press storms
 /// (left+right, a bouncing switch).
 const SHIFT_MIN_GAP: f32 = 0.075;
-// ---------------------------------------------------------------------------
 // The space downbeat: the word boundary as the phrase's floor
-// ---------------------------------------------------------------------------
 //
 // The bass root walks the speaking palette's anchor through [`SONG_BASS`],
 // folded into one register independent of the melody's degree (a root that
@@ -1345,9 +1329,7 @@ const SPACE_BREATHE_FIFTH_LEVEL: f32 = 0.10;
 /// whitespace run), which keeps only the downbeat's breath: the run is one
 /// gesture with one bass note, but a silent key would read as dropped.
 const SPACE_RUN_BREATH_LEVEL: f32 = 0.35;
-// ---------------------------------------------------------------------------
 // The indent steps: a whitespace run's tail
-// ---------------------------------------------------------------------------
 //
 // A run gets one bass root, one step of the walk, one bar line. Every space
 // after the head also plays a step: a short soft bell one lattice degree higher
@@ -1609,9 +1591,7 @@ const CELEBRATION_KIND_GAIN: f32 = 0.6;
 /// switch is left to the sing-duck wind-down.
 const CELEBRATION_DAMP_S: f32 = 0.05;
 
-// ---------------------------------------------------------------------------
 // Per-key song axes
-// ---------------------------------------------------------------------------
 //
 // Every axis is a pure function of the gesture payload's `sig`, the bijective
 // per-character song signature (`kitty_sing::song_signature`). The synth keeps
@@ -1816,9 +1796,7 @@ fn celebration_span(phrase: &[i32; 8], i: usize, limit: usize) -> usize {
 const SING_DUCK_DEPTH: f32 = 0.65;
 const SING_DUCK_TAU: f32 = 0.40;
 
-// ---------------------------------------------------------------------------
 // Voices
-// ---------------------------------------------------------------------------
 
 /// Oscillator flavour for one partial.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -2026,9 +2004,7 @@ impl Voice {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Beds — the continuous per-style textures
-// ---------------------------------------------------------------------------
 
 /// Continuous background layer state. One bed exists; it follows the style of
 /// the most recent trail event (the energy smoothing softens a style change).
@@ -2099,9 +2075,7 @@ fn bed_kick(kind: SoundKind) -> f32 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The synth
-// ---------------------------------------------------------------------------
 
 /// See the module docs. Construct once per output stream with the stream's
 /// sample rate, [`push`](Self::push) events from the trail-spawn edge (and
@@ -4675,9 +4649,7 @@ impl TrailSynth {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Palettes — one unit per GlowStyle, registered in `palette_for`
-// ---------------------------------------------------------------------------
 
 /// One style's complete sound identity: discrete voice design, stochastic bed
 /// grains and the continuous bed texture. Implementors are stateless; all

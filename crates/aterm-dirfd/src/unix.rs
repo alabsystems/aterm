@@ -57,9 +57,7 @@ use std::os::unix::ffi::OsStrExt as _;
 
 pub use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
-// ---------------------------------------------------------------------------
 // Errno
-// ---------------------------------------------------------------------------
 
 /// A raw POSIX `errno`.
 ///
@@ -176,15 +174,13 @@ fn check(ret: libc::c_int) -> Result<()> {
     if ret < 0 { Err(Errno::last()) } else { Ok(()) }
 }
 
-// ---------------------------------------------------------------------------
 // Path arguments
-// ---------------------------------------------------------------------------
 
 /// A name handed to a `*at` syscall, or one of the `/` and `.` paths
 /// `PinnedDir`'s chain opens (`openat(CWD, "/")`, `openat(leaf, ".")`).
 ///
 /// It checks NUL only and does NOT check that a name is one component: any
-/// path passes. Ruling 2026-10-10 (FS-1): `Arg` stays able to carry those
+/// path passes. (FS-1): `Arg` stays able to carry those
 /// paths, so the one-name rule belongs to the caller. A caller taking a name
 /// from elsewhere judges it on its RAW bytes first (aterm-gui's
 /// `pinned_dir::validate_component`), never through `Path::components()`,
@@ -228,9 +224,7 @@ impl<A: AsRef<OsStr>> Arg for A {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Flags
-// ---------------------------------------------------------------------------
 
 flags! {
     /// `open(2)` flags.
@@ -339,9 +333,7 @@ pub const CWD: BorrowedFd<'static> = {
     unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) }
 };
 
-// ---------------------------------------------------------------------------
 // stat
-// ---------------------------------------------------------------------------
 
 /// The subset of `struct stat` these callers read, widened to fixed sizes so
 /// the call sites do not vary by platform. All four fields answer identity
@@ -396,9 +388,7 @@ impl FileType {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The operations
-// ---------------------------------------------------------------------------
 
 /// `openat(2)`: open `name` relative to the directory `dirfd`.
 ///
@@ -615,9 +605,7 @@ pub fn fsync<Fd: AsFd>(fd: Fd) -> Result<()> {
     check(unsafe { libc::fsync(fd.as_fd().as_raw_fd()) })
 }
 
-// ---------------------------------------------------------------------------
 // Directory reading
-// ---------------------------------------------------------------------------
 
 /// One directory entry. Owns its name, so the iterator may advance.
 #[derive(Debug, Clone)]

@@ -16,7 +16,7 @@
 //! does not `cd`: `--resume` finds a conversation under the directory it was started in, the tab's
 //! shell's directory for every launch made from that shell. It does not carry the login a
 //! relaunch chose ([`SHELL_LOGIN_CLAUSE`]). It DOES carry the Claude home its agent ran under,
-//! where that is not the tab's shell's ([`with_env`], [`home_env`]; ATERM-KI-1015-1 LC-4): a home
+//! where that is not the tab's shell's ([`with_env`], [`home_env`] LC-4): a home
 //! not carried resumes nothing — the shell's own finds no transcript of it, or meets the first-run
 //! screen — and every shorter form keeps it ([`shorter`]).
 

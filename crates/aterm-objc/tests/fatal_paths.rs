@@ -78,9 +78,7 @@ declare_class! {
     }
 }
 
-// ---------------------------------------------------------------------------
 // A panic inside framework dispatch.
-// ---------------------------------------------------------------------------
 
 /// Set in the child so it performs the panicking send instead of re-spawning.
 const PANIC_CHILD: &str = "ATERM_OBJC_PANIC_CHILD";
@@ -193,9 +191,7 @@ fn the_unwind_guard_does_not_itself_panic_when_stderr_is_gone() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // An instance Objective-C minted, caught by the ivar-written flag.
-// ---------------------------------------------------------------------------
 
 /// Set in the child so it mints an instance the way Objective-C would.
 const OBJC_MINTED_CHILD: &str = "ATERM_OBJC_MINTED_CHILD";
@@ -247,10 +243,8 @@ fn an_instance_objective_c_minted_is_caught_by_the_ivar_flag() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // A panicking `Drop` inside a block's captures: the one `extern "C"` callback
 // that once had no panic guard.
-// ---------------------------------------------------------------------------
 
 /// Set in the child so it runs the body instead of re-spawning.
 const CHILD_DISPOSE: &str = "ATERM_OBJC_BLOCK_DISPOSE_PANIC_CHILD";
@@ -312,10 +306,8 @@ fn a_panicking_drop_in_a_block_capture_aborts_by_name() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Autoreleasing with no pool: a leak, and nothing worse. `autorelease`'s
 // contract says so, and this is the arming: a child that does it and lives.
-// ---------------------------------------------------------------------------
 
 /// Set in the child so it runs the body instead of re-spawning.
 const CHILD_NO_POOL: &str = "ATERM_OBJC_AUTORELEASE_NO_POOL_CHILD";

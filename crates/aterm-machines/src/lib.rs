@@ -31,6 +31,8 @@ pub mod controller;
 pub mod engine;
 pub mod envelope;
 pub mod facts;
+pub(crate) mod git_credential;
+pub(crate) mod github_pages;
 pub mod hardware;
 pub mod init;
 pub mod init_accounts;

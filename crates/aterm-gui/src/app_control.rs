@@ -311,16 +311,9 @@ impl App {
     /// dialog a program can raise is a consent surface an agent controls. The owner's own
     /// gesture is not guarded.
     ///
-    /// `open_app` is reachable from inside a session, so the URI can come from a
-    /// program's output. Full Disk Access covers every other protected root, but file
-    /// provider domains are `NEVER_COVERED`: an open there raises
-    /// `"aterm" wants to access files managed by "iCloud Drive"` in aterm's name. A
-    /// dialog a program can raise is a consent surface an agent controls. The owner's
-    /// own gesture is not guarded; this applies to the control path only.
-    ///
-    /// Fails open: a non-`file://` URI, an unreadable home or anything unparseable
-    /// passes, since this fences one named class and is not an admission check. The
-    /// predicate is lexical apart from `canonicalize`, which raises no prompt.
+    /// Fails open (a non-`file://` URI, no `HOME`, anything unparseable): this fences one named
+    /// class and is not an admission check. Only `canonicalize` touches the disk, and it raises
+    /// no prompt.
     pub(crate) fn refuse_file_provider_open(uri: &str) -> Result<(), String> {
         Self::refuse_file_provider_open_in(uri, std::env::var_os("HOME").map(Into::into))
     }

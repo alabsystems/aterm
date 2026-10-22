@@ -65,12 +65,9 @@ aterm-keeper = { path = "../aterm-keeper" }
 # `aterm caffeine` — the menu-bar keep-awake mug. Compiles everywhere: its
 # AppKit half is `cfg(target_os = "macos")` and the verb refuses by name elsewhere.
 aterm-caffeine = { workspace = true }
-# `aterm link` — the fabric bridge — is a UNIX-ONLY dependency; see the
-# `[target.'cfg(unix)'.dependencies]` table below and the `Link` arms in
-# src/main.rs.
-# The headless update lane: `aterm update status|check` and the session-mode
-# background check/stage loop (round-11 — a terminal-only Mac used to run NONE
-# of the updater, while install.sh promised automatic updates).
+# `aterm link` (the fabric bridge) is in the unix-only table below.
+# The headless update lane: `aterm update status|check` and the session-mode background
+# check/stage loop.
 aterm-update = { path = "../aterm-update" }
 # `pkg_check` (when the session lane spawns the detached `aterm pkg update` pass, read from
 # atpkg's `<prefix>/status.toml`) and the `[update]` settings.
@@ -118,14 +115,11 @@ aterm-machines = { workspace = true }
 libc = { workspace = true }
 
 [features]
-# DEVELOPMENT SEAMS in an optimized build: every `aterm_types::dev_seam!` read (the
-# `ATPKG_REGISTRY` fetch source, the `ATERM_UPDATE_ROOT` ledger, the handoff deadlines,
-# the `ATERM_DEBUG_*` screenshot seams, …) and the development settings (`[update]`
-# owner/repo, `[packages]` prefix/account/repo links). A debug build compiles them
-# anyway; an optimized QA build asks for them with `-p aterm --features dev-seams`.
-# The release cutter NEVER enables it — `aterm-release`'s buildplan pins that — so a
-# shipped binary reads none of them (owner, 2026-09-22: "NOT ENV VARS those are for
-# development").
+# Development seams in an optimized build: every `aterm_types::dev_seam!` read (the
+# `ATPKG_REGISTRY` fetch source, the `ATERM_UPDATE_ROOT` ledger, the handoff deadlines, the
+# `ATERM_DEBUG_*` screenshot seams, …) and the development settings (`[update]` owner/repo,
+# `[packages]` prefix/account/repo links). A debug build compiles them anyway. The release
+# cutter never enables it (`aterm-release`'s buildplan pins that), so a shipped binary reads none.
 dev-seams = [
     "aterm-agent/dev-seams",
     "aterm-cli/dev-seams",
@@ -145,13 +139,10 @@ aterm-tempfile = { workspace = true }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-session = { workspace = true }
-# The front-door verb-routing test drives the binary under a REAL pty: the
-# regression it pins (`aterm ship` reaching the session parser) is invisible
-# with piped stdio, because piped stdio takes the WINDOW route instead. Its
-# pairs, and the launch tests', come from `open_pty_pair`, both ends
-# close-on-exec from birth: an `openpty(3)` pair is inheritable, and the child
-# spawned onto it kept a copy of its own master. Already in the graph through
-# aterm-gui.
+# The front-door verb-routing test drives the binary under a real pty (piped stdio takes the
+# window route instead). Its pairs, and the launch tests', come from `open_pty_pair`, both ends
+# close-on-exec from birth: an `openpty(3)` pair is inheritable, so a child would hold its own
+# master open.
 aterm-pty = { workspace = true }
 # The fleet listener's live test dials a real instance as a fleet member would
 # (`aterm_net::fleet::client_handshake`). Already in the graph through aterm-gui.

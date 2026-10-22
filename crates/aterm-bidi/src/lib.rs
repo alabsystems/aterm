@@ -847,9 +847,7 @@ fn reverse_by_levels(levels: &[u8], order: &mut [usize]) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The algorithm
-// ---------------------------------------------------------------------------
 
 /// The deepest explicit embedding level (BD2).
 const MAX_DEPTH: u8 = 125;

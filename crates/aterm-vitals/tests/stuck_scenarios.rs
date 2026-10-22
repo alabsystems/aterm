@@ -50,9 +50,7 @@ fn wire(v: &JobsView, id: &str) -> String {
         .wire()
 }
 
-// ---------------------------------------------------------------------------
 // §11.10 example rows
-// ---------------------------------------------------------------------------
 
 #[test]
 fn example_a_password_prompt_in_a_background_tab_waits_for_you() {
@@ -254,9 +252,7 @@ fn example_g_a_zombie_pile_under_a_logging_server_is_running_with_its_zombies_co
     );
 }
 
-// ---------------------------------------------------------------------------
 // §18 item 8: every scenario, every shape
-// ---------------------------------------------------------------------------
 
 #[test]
 fn every_scenario_of_the_expectation_table_reads_as_the_table_says() {
@@ -285,9 +281,7 @@ fn every_scenario_of_the_expectation_table_reads_as_the_table_says() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Laws
-// ---------------------------------------------------------------------------
 
 #[test]
 fn a_call_whose_leader_exits_leaves_an_orphan_with_findings_only() {
@@ -653,9 +647,7 @@ fn verdict_and_class_words_are_closed_and_share_only_exited() {
     assert_eq!(Class::from_word("stuck"), None);
 }
 
-// ---------------------------------------------------------------------------
 // One block, one job (§11.3)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn every_command_of_a_block_is_one_job_with_one_id() {
@@ -754,9 +746,7 @@ fn fg_makes_a_parked_job_the_next_blocks_foreground_job_again() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Naming the wait: a connection is the wait only when nothing else is
-// ---------------------------------------------------------------------------
 
 #[test]
 fn an_idle_dev_server_with_a_keep_alive_client_listens_and_never_reads_stuck() {
@@ -953,9 +943,7 @@ fn a_full_screen_program_logging_to_its_own_file_parks_demand() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The foreign-text rule (§13.3)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn a_process_name_prints_only_as_a_safe_word() {

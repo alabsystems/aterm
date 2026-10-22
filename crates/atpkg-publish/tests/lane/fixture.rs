@@ -69,7 +69,7 @@ pub fn git_at(dir: &Path, args: &[&str], day: Option<&str>) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A fresh repository on `main` with `commits` empty commits, written by ONE
+/// A fresh repository on `main` with `commits` empty commits, written by one
 /// `git fast-import` (a build number is a commit count, and pins run to the hundreds); its
 /// commits, oldest first. The history is the same bytes every time (a fixed identity and
 /// fixed dates), so each count is made once per process and laid down after.

@@ -958,8 +958,11 @@ pub(crate) struct HoverMapping {
 /// origin in the window) and of where each pane's rows and columns land among
 /// the frame's cells (the window grid, the chrome rows above it, the visible
 /// tab's split) — read lock-free, with no plan built ([`App::glass_grid`]).
-/// The harness's glass records its targets in frame cells as a frame lays
-/// them (`crate::claude_lights`) and stamps them with this; a pointer event
+/// Whatever a frame lays in frame cells for the pointer to find — the
+/// harness's glass (`crate::claude_lights`), the tab menu's card
+/// (`App::splice_tab_menu`), the Autopilot and fact menus' card
+/// (`crate::autopilot_menu`) — is stamped with this as it is laid, and
+/// answers the pointer only through [`App::laid_cell_at`]: a pointer event
 /// that comes between a re-grid (a window resize, a font zoom, a split, a
 /// strip or band that grew) and the next frame would otherwise be hit-tested
 /// against the last frame's targets at a geometry the window no longer has,
@@ -3093,17 +3096,42 @@ impl App {
         })
     }
 
+    /// THE ONE GATE for a target a frame laid in frame cells: the frame cell
+    /// under window pixel `(x, y)` on grid `laid`, the one the target was
+    /// stamped with as it was laid ([`GlassGrid`]) — `None` where nothing
+    /// was laid, or where window `wid`'s grid is no longer that one. After a
+    /// re-grid, until the next frame lays them again, the last frame's cells
+    /// are not where the window now puts them, so the pointer is told nothing
+    /// is there rather than what was: the harness's glass
+    /// (`App::glass_cell_at`), the tab menu's card ([`Self::tab_menu_probe`])
+    /// and the Autopilot and fact menus' card all ask here.
+    pub(crate) fn laid_cell_at(
+        &self,
+        wid: WindowId,
+        laid: Option<GlassGrid>,
+        x: f64,
+        y: f64,
+    ) -> Option<(usize, usize)> {
+        let laid = laid?;
+        (self.glass_grid(wid)? == laid)
+            .then(|| laid.cell_at(x, y))
+            .flatten()
+    }
+
     /// The open menu's recorded rect plus the frame cell under `(x, y)`, once the menu has
     /// been painted. The rect is the painter's, never re-derived, so a click never resolves
-    /// against a placement the glass does not show.
+    /// against a placement the glass does not show — and only on the grid the painter laid
+    /// it on ([`Self::laid_cell_at`]): between a re-grid and the frame that places the card
+    /// again, it answers nothing, as before its first paint.
     fn tab_menu_probe(
         &self,
         wid: WindowId,
         x: f64,
         y: f64,
     ) -> Option<(crate::tab_menu::MenuRect, usize, usize)> {
-        let rect = self.windows.get(&wid)?.tab_menu_rect?;
-        let (row, col) = self.frame_cell_at(wid, x, y)?;
+        let ws = self.windows.get(&wid)?;
+        let rect = ws.tab_menu_rect?;
+        let (row, col) = self.laid_cell_at(wid, ws.tab_menu_laid, x, y)?;
         Some((rect, row, col))
     }
 
@@ -6412,14 +6440,13 @@ impl App {
             // copied out of htop. The GUI-only prefix (link-open, shift-extend, the
             // click-streak FSM) runs for BOTH cases.
             if pressed && press_starts_selection(tracking, tracking_bypass_held(mods_state)) {
-                // Cmd-click (macOS) / Ctrl-click (Linux) an OSC 8 hyperlink opens it
-                // (safe schemes only) instead of starting a selection. GUI-only —
-                // never reaches the seam.
+                // Cmd-click (macOS) / Ctrl-click (elsewhere) on a link opens it (safe
+                // schemes only) instead of starting a selection; GUI-only, never the seam.
                 if link_modifier_held(mods_state) && self.open_link_under_pointer(wid) {
                     return;
                 }
-                // Shift-click extends an existing selection (GUI affordance keyed on
-                // self.mods); it returns here without reaching the seam, like today.
+                // Shift-click extends an existing selection (a GUI affordance keyed on
+                // `self.mods`) without reaching the seam.
                 // Not while Shift is the bypass itself (tracking on, no Option): that
                 // press starts a fresh selection, as xterm's does.
                 if mods_state.shift_key() && !(tracking && !option_held) {
@@ -8652,7 +8679,7 @@ mod tests {
         else {
             panic!("Settings view");
         };
-        settings.page_scroll = 1;
+        settings.scroll_page_to(1);
         app.on_cursor_moved(wid, header.0, header.1);
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
@@ -9181,7 +9208,7 @@ mod tests {
         settings.search_input = TextInputState::new("foreground".to_string());
         settings.set_search("foreground".to_string());
         // The search lists the matching field under its pinned live preview.
-        settings.page_scroll = 0;
+        settings.scroll_page_to(0);
         settings
             .legacy
             .fields
@@ -9319,7 +9346,7 @@ mod tests {
             panic!("Settings state");
         };
         // The category list's first screen holds Modified, the second route.
-        settings.page_scroll = 0;
+        settings.scroll_page_to(0);
 
         // Ordinary buttons still arm on press and activate only on a matched
         // release; no text position exists for their painted node.
@@ -9386,7 +9413,7 @@ mod tests {
             else {
                 unreachable!();
             };
-            settings.page_scroll = scroll;
+            settings.scroll_page_to(scroll);
             let compiled = presented_native_ui(&mut app, wid);
             if let Some(index) = compiled
                 .paint
@@ -13265,3 +13292,7 @@ mod bidi_selection_tests;
 #[cfg(test)]
 #[path = "app_mouse_client_frame_tests.rs"]
 mod client_frame_tests;
+
+#[cfg(test)]
+#[path = "app_mouse_menu_regrid_tests.rs"]
+mod menu_regrid_tests;

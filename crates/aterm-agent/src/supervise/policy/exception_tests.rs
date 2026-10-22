@@ -877,7 +877,7 @@ fn a_full_context_three_compacts_leave_full_is_an_exception_with_the_way_back() 
 }
 
 /// A FULL CONTEXT THAT IMAGES OR ATTACHMENTS FILL is told with the way back
-/// its own notice names (ATERM-KI-1016-1, limits: "the image notice's context
+/// its own notice names (limits: "the image notice's context
 /// wall reuses the context exception's wording (`go back a few messages`)
 /// after three `/compact`s do not help"). Claude Code's notice that an image
 /// is past the many-image size, or that images and attachments pushed the

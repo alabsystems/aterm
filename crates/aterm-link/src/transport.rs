@@ -349,37 +349,58 @@ pub fn describe(path: &str, e: &io::Error) -> String {
 }
 
 /// THE MINT SECRET READER — the one every verb that mints or guards with a
-/// secret goes through: `aterm link broker --secret-file`, `aterm link mint`,
-/// `aterm fabric mint-for` and `aterm fabric on` (its secret step and its
-/// mint). It is astream's one secret-file rule
-/// ([`astream_cap::capfile::read_secret_file`], the reader `asb`'s own
-/// `--secret-file` goes through, claim `cap.secret-file-owner-only`), so the
-/// broker that verifies and the verb that mints read a secret by the same
-/// code:
+/// secret goes through: `aterm link broker` (its `--secret-file`, or the
+/// `mint.secret` beside its socket), `aterm link mint`, `aterm fabric
+/// mint-for` and `aterm fabric on` (its secret step and its mint). It is
+/// astream's one secret-file rule for a secret kept in a directory of its own
+/// ([`astream_cap::capfile::read_secret_in`], claim
+/// `cap.secret-file-owner-only`), over the path's directory and file name, so
+/// the broker that verifies and the verb that mints read a secret by the same
+/// code, and by the rule aterm-uds holds its private files to:
 ///
-/// - OWNER-ONLY (`mode & 0o077 == 0`, 0600 or tighter), read off the OPEN
-///   file, and the bytes returned are that descriptor's — never a check of the
-///   path and then a second read of whatever the path names by then. The
-///   refusal names the `chmod` rather than fixing it silently: a key that sat
-///   readable may already have been read.
+/// - THE FILE: opened once, non-blocking (a FIFO is refused at once, never
+///   waited on) and without following a link, then judged on that open
+///   descriptor — a regular file, this user's, no access-list entry that lets
+///   anyone else in (macOS), no group/other mode bit (0600 or tighter), and
+///   exactly one link — and the bytes returned are that descriptor's, never a
+///   check of the path and then a second read of whatever the path names by
+///   then. A refusal names the `chmod` (`chmod 600`, `chmod -N`) rather than
+///   fixing it silently: a key that sat readable may already have been read.
+/// - ITS DIRECTORY: this user's, 0700 or tighter, no access-list entry that
+///   lets anyone else in, and no symlink: whoever can write it can replace the
+///   secret or give it a second name.
 /// - AT LEAST [`crate::enable::SECRET_LEN`] (astream's `SECRET_MIN`) bytes:
 ///   HMAC takes a key of any length, so a short or empty one would mint
 ///   capabilities that look well-formed and seal nothing.
 /// - EXACT BYTES: the secret is every byte the file holds, a trailing newline
 ///   included.
 ///
+/// A bare file name is read in the current directory (`./<name>`).
+///
 /// # Errors
 ///
-/// A missing file (`NotFound`, which a caller may answer with a hint); a mode
-/// with any group/other bit set (`PermissionDenied`, naming the mode and the
-/// `chmod`); an open the OS refuses, such as a `0000` file (`PermissionDenied`
-/// in the OS's own words, no `chmod` named); a short secret (`InvalidData`,
-/// naming the byte count); or any other read error with its own kind (an
-/// owner-only directory at the path opens and passes the mode, then fails to
-/// read as `IsADirectory`). Each leads with the path ([`describe`] adds
-/// nothing).
+/// A missing file or directory (`NotFound`, which a caller may answer with a
+/// hint); a mode with any group/other bit set, an access list, another owner,
+/// a symlink or a second link, on the file or its directory
+/// (`PermissionDenied`, naming what closes it); an open the OS refuses, such
+/// as a `0000` file (`PermissionDenied` in the OS's own words); anything but a
+/// regular file at the path, such as a directory or a FIFO (`InvalidInput`), or
+/// a path that names no file (`InvalidInput`); a short secret (`InvalidData`,
+/// naming the byte count); or any other read error with its own kind. Each
+/// leads with the path ([`describe`] adds nothing).
 pub fn read_mint_secret(path: &str) -> io::Result<Vec<u8>> {
-    astream_cap::capfile::read_secret_file(path)
+    let path = std::path::Path::new(path);
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: a mint secret's path names a file", path.display()),
+        ));
+    };
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => std::path::Path::new("."),
+    };
+    astream_cap::capfile::read_secret_in(dir, name)
 }
 
 #[cfg(test)]
@@ -553,55 +574,86 @@ mod tests {
         );
     }
 
-    /// A MINT SECRET IS READ BY ASTREAM'S ONE SECRET-FILE RULE: owner-only and at
-    /// least [`crate::enable::SECRET_LEN`] bytes, or refused by the kind every caller
-    /// branches on (`NotFound` takes `on`'s mint and `mint-for`'s hint), and read byte
-    /// for byte, a trailing newline included. Every refusal, a missing file's
-    /// included, leads with the path, and [`describe`], which is what the verbs
-    /// print, adds no second one.
+    /// A MINT SECRET IS READ BY ASTREAM'S ONE SECRET-FILE RULE, over its directory
+    /// and its name ([`astream_cap::capfile::read_secret_in`]): owner-only and at
+    /// least [`crate::enable::SECRET_LEN`] bytes, in a private directory, through no
+    /// link and with no second one, or refused by the kind every caller branches on
+    /// (`NotFound` takes `on`'s mint and `mint-for`'s hint), and read byte for byte,
+    /// a trailing newline included. Every refusal, a missing file's included, leads
+    /// with the path, and [`describe`], which is what the verbs print, adds no
+    /// second one.
     ///
     /// Negative controls: a group- or other-readable mode is refused even at full
-    /// length, and an OS error that names no path (one from outside astream's
+    /// length, the same secret in a directory open to others is refused though the
+    /// file passes, and an OS error that names no path (one from outside astream's
     /// readers) gets the prefix, so `describe` is not merely passing text through.
     #[test]
     fn a_mint_secret_is_owner_only_long_enough_and_read_byte_for_byte() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("atlink-mint-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch");
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let dir = scratch.path().join("root");
+        std::fs::create_dir(&dir).expect("root");
+        let mode = |path: &std::path::Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod")
+        };
+        mode(&dir, 0o700);
         let path = dir.join("mint.secret");
         let p = path.to_str().expect("utf8");
-        let chmod = |mode| {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod")
-        };
         // astream's refusals lead with the path already: `describe` prints
         // them as said, never a second `<path>: ` before them.
-        let once = |e: &io::Error| {
+        let once = |p: &str, e: &io::Error| {
             let said = describe(p, e);
             assert!(said.starts_with(p), "{said}");
             assert_eq!(said, e.to_string(), "the path is not prefixed twice");
         };
         let absent = read_mint_secret(p).expect_err("absent");
         assert_eq!(absent.kind(), io::ErrorKind::NotFound);
-        once(&absent);
+        once(p, &absent);
         let mut bytes = vec![0x5a; 31];
         bytes.push(b'\n');
         std::fs::write(&path, &bytes).expect("write");
-        for mode in [0o644, 0o640, 0o604] {
-            chmod(mode);
+        for m in [0o644, 0o640, 0o604] {
+            mode(&path, m);
             let e = read_mint_secret(p).expect_err("readable by others");
-            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{mode:o}");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{m:o}");
             assert!(e.to_string().contains("chmod 600"), "{e}");
-            once(&e);
+            once(p, &e);
         }
-        for mode in [0o600, 0o400] {
-            chmod(mode);
+        for m in [0o600, 0o400] {
+            mode(&path, m);
             assert_eq!(read_mint_secret(p).expect("owner-only, 32 bytes"), bytes);
         }
-        chmod(0o600);
+        mode(&path, 0o600);
+
+        // The directory is part of the rule: open to others, it is refused naming
+        // `chmod 700` though the file passes.
+        mode(&dir, 0o755);
+        let e = read_mint_secret(p).expect_err("a directory open to others");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains("chmod 700"), "{e}");
+        once(p, &e);
+        mode(&dir, 0o700);
+
+        // No link is followed, and the secret has no second name.
+        let linked = dir.join("linked.secret");
+        std::os::unix::fs::symlink(&path, &linked).expect("symlink");
+        let l = linked.to_str().expect("utf8");
+        let e = read_mint_secret(l).expect_err("a symlink");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        once(l, &e);
+        let second = scratch.path().join("second.secret");
+        std::fs::hard_link(&path, &second).expect("hard link");
+        let e = read_mint_secret(p).expect_err("a second link");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains("has 2 links"), "{e}");
+        once(p, &e);
+        std::fs::remove_file(&second).expect("unlink");
+        assert_eq!(read_mint_secret(p).expect("one link again"), bytes);
+
         std::fs::write(&path, [0x5a; 31]).expect("write");
         let e = read_mint_secret(p).expect_err("short");
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
-        once(&e);
+        once(p, &e);
         assert_eq!(crate::enable::SECRET_LEN, 32);
         let os = io::Error::from_raw_os_error(2);
         assert_eq!(
@@ -615,7 +667,6 @@ mod tests {
             bare.to_string(),
             "a non-OS error is kept as said"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
     /// Equal jitter: every draw lies in `[b/2, b]`, both ends reachable.
     #[test]

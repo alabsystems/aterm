@@ -1011,3 +1011,93 @@ fn the_switch_reads_on_a_tab_theme_the_instance_did_not_choose() {
         "every letter read"
     );
 }
+
+/// THE BOTTOM RULE READS ON A TAB'S OWN THEME (design §8; `session_theme`):
+/// the facts' marks and Cruise's `∞` are the instance's accent too, laid on
+/// the tab's paper. On an instance in Dracula, a Claude Code tab in Default
+/// Light with its rules drawn grey (`#999999`), the composer's bottom rule
+/// lays every mark (`◆ ⌂ ⎇`) at 3:1 or more on the tab's ground and Cruise's
+/// `∞` at 4.5:1 or more, each on the tab's own paper.
+///
+/// NEGATIVE CONTROL: the marks' mix as it was laid (the accent halfway to
+/// the rule's grey) reads under 3:1 there, and the accent itself, `∞`'s
+/// ink as it was laid, under 1.5:1.
+#[test]
+fn the_facts_and_the_chip_read_on_a_tab_theme_the_instance_did_not_choose() {
+    use aterm_effects::color_math::contrast_ratio;
+    let (mut app, wid, session, _reader, _host) = claude_pane(120);
+    let dracula = aterm_types::scheme::builtin("Dracula").expect("a built-in");
+    app.theme = aterm_render::Theme::from(&dracula);
+    app.set_session_theme(
+        session,
+        Some(crate::session_theme::SessionTheme {
+            selector: "Default Light".into(),
+            origin: crate::session_theme::SessionThemeOrigin::Ctl,
+        }),
+    );
+    let grey = "\x1b[38;2;153;153;153m";
+    let rule = "\u{2500}".repeat(120);
+    feed(
+        &app,
+        session,
+        format!(
+            "\x1b[?2004h\x1b[2J\x1b[19;1H\u{25CF} done\x1b[21;1H{grey}{rule}\x1b[39m\
+             \x1b[22;1H\u{276F} \x1b[23;1H{grey}{rule}\x1b[39m\x1b[24;1H{BYPASS}\x1b[22;3H"
+        )
+        .as_bytes(),
+    );
+    frame(&mut app, wid);
+    let paper = aterm_types::scheme::builtin("Default Light")
+        .expect("a built-in")
+        .background;
+    let ground = [paper.r, paper.g, paper.b];
+    let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+    let reads = |a: [u8; 3], b: [u8; 3]| contrast_ratio(pack(a), pack(b));
+    let row = &app.windows[&wid].input_scratch.cells[footer_row(&app, wid)];
+    let text = row_text(&app, wid, footer_row(&app, wid));
+    assert!(
+        text.contains("\u{221e}") && text.contains("Opus 5.5"),
+        "the chip and the facts are on the rule: {text:?}"
+    );
+    let marks = ['\u{25C6}', '\u{2302}', '\u{2387}'];
+    let mut seen = 0;
+    for c in row.iter().filter(|c| c.ch != ' ') {
+        if marks.contains(&c.ch) {
+            assert_eq!(c.bg, ground, "the tab's own paper is the facts' ground");
+            assert!(
+                reads(c.fg, ground) >= aterm_effects::cli_marks::ICON_CONTRAST,
+                "{:?} at {:.2}:1: {text:?}",
+                c.ch,
+                reads(c.fg, ground)
+            );
+            seen += 1;
+        } else if c.ch == '\u{221e}' {
+            assert_eq!(c.bg, ground, "the tab's own paper is the chip's ground");
+            assert!(
+                reads(c.fg, ground) >= aterm_effects::cli_marks::NAME_CONTRAST,
+                "`\u{221e}` at {:.2}:1",
+                reads(c.fg, ground)
+            );
+            seen += 1;
+        }
+    }
+    assert_eq!(
+        seen,
+        marks.len() + 1,
+        "every mark and the chip read: {text:?}"
+    );
+    let accent = crate::chrome_band::band_colors(app.theme).accent;
+    // The accent halfway to the rule's grey, per channel, as it was laid.
+    let old: [u8; 3] =
+        std::array::from_fn(|i| ((f32::from(accent[i]) + f32::from(0x99_u8)) / 2.0).round() as u8);
+    assert!(
+        reads(old, ground) < aterm_effects::cli_marks::ICON_CONTRAST,
+        "CONTROL: the old mark at {:.2}:1 on the tab's paper",
+        reads(old, ground)
+    );
+    assert!(
+        reads(accent, ground) < 1.5,
+        "CONTROL: the accent at {:.2}:1 on the tab's paper",
+        reads(accent, ground)
+    );
+}

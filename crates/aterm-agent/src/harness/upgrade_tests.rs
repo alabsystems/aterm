@@ -2504,8 +2504,8 @@ fn the_supervisors_own_turns_by_its_ledger_are_no_task() {
     assert!(transcript_tasked(&command, &ours), "a person's command");
 }
 
-/// THE HARNESS'S OWN MARKED ACTS ARE NO TASK, LEDGER OR NOT (FOREVER CRUISE
-/// / FOREVER LAND): Cruise's continuation (`CONTINUE_TEXT`, the default
+/// THE HARNESS'S OWN MARKED ACTS ARE NO TASK, LEDGER OR NOT (Autopilot Cruise
+/// / Autopilot Land): Cruise's continuation (`CONTINUE_TEXT`, the default
 /// `continue_text`), its prompt at a done claim, and Land's instruction and
 /// nudge open with the harness's mark, so a conversation whose only turns
 /// are these reads taskless with no ledger at all. NEGATIVE CONTROL: the
@@ -2561,7 +2561,7 @@ fn notification_row() -> String {
     )
 }
 
-/// A CONVERSATION ONLY A PEER DIRECTED HAS A TASK (ATERM-KI-1016-1, the done
+/// A CONVERSATION ONLY A PEER DIRECTED HAS A TASK (the done
 /// report's seventh item): Claude Code records a peer session's message
 /// `isMeta`, so [`TaskScan`] read it as no prompt, and a conversation whose
 /// only asks were a peer's read taskless to the upgrade, which restarted it
@@ -2626,7 +2626,7 @@ fn bare_user_row(extra: &str, content: &str) -> String {
     )
 }
 
-/// A RESTART'S CRUISE PROMPT LANDS NOTHING IN THE RECORD (FOREVER CRUISE): a
+/// A RESTART'S CRUISE PROMPT LANDS NOTHING IN THE RECORD (Autopilot Cruise): a
 /// relaunch into a done report types its facts and the Cruise prompt
 /// (`checking`, `continued:check`), and the worker's done answer to it is a
 /// claim again, never a finish — the record's last words claim done
@@ -2872,7 +2872,7 @@ fn a_walls_retry_delivers_the_land_act_it_cut_again_to_the_record() {
 }
 
 /// ONLY A WALL'S RETRY BY ITS LEDGER RULE DELIVERS AGAIN THE LAND ACT A WALL
-/// CUT (ATERM-KI-1016-1, the done report's tenth item): the usage resume
+/// CUT (the done report's tenth item): the usage resume
 /// types `keep going` (`usage-resume@v1`), and so does the continue policy
 /// (`continue@v1`). The record read the next plain line the loop typed after
 /// a wall in an act's turn as the retry whatever rule typed it, so a reply
@@ -2929,7 +2929,7 @@ fn only_a_walls_retry_by_its_ledger_rule_delivers_the_cut_land_act_again() {
 }
 
 /// THE VENDOR'S OWN CONTINUATION DELIVERS AGAIN THE LAND ACT A LIMIT CUT, TO
-/// THE RECORD TOO (ATERM-KI-1016-1, the Land item): Land's instruction
+/// THE RECORD TOO (the Land item): Land's instruction
 /// typed, the usage limit's row in its turn, and Claude Code's own
 /// continuation at the reset (`origin.kind` `auto-continuation`): the reply
 /// under it is the cut act's answer, as the turn-end policy reads it
@@ -2992,7 +2992,7 @@ fn the_vendors_own_continuation_delivers_the_cut_land_act_again_to_the_record() 
 }
 
 /// LAND'S ANSWER TO A QUESTION IS A LAND ACT TO THE RECORD ONCE THE LAND
-/// INSTRUCTION WAS TYPED (ATERM-KI-1016-1, the Land item): the turn-end
+/// INSTRUCTION WAS TYPED (the Land item): the turn-end
 /// policy lands a clean defense answering its `land-answer@v1` once the
 /// instruction was typed (`TurnEndState::acted`: `landing`), and the record
 /// read that answer as the harness's own line, so the defense was a first
@@ -3082,7 +3082,7 @@ fn lands_answer_after_the_instruction_is_a_land_act_to_the_record() {
 /// now: only a land act's clean defense does.
 const FINISHED_REPORT: &str = "Landed the fix and verified it on main.\n\nATERM-TASK-DONE";
 
-/// A CLEAN DEFENSE (FOREVER LAND): a `Nothing left:` line, no need and no
+/// A CLEAN DEFENSE (Autopilot Land): a `Nothing left:` line, no need and no
 /// open work beside it — what lands a task answering one of Land's acts.
 const DEFENSE: &str = "Landed the fix and verified it.\nNothing left: it is merged into the \
                        remote main branch.";
@@ -3278,7 +3278,7 @@ fn finished_holds_until_someone_asks() {
 }
 
 /// LAND'S INSTRUCTION TYPED AGAIN AFTER A `/compact` IS A LAND ACT TO THE
-/// RECORD (ATERM-KI-1016-1, done-3): where a full context cut a land act's
+/// RECORD (done-3): where a full context cut a land act's
 /// turn, the record reads the act typed again as the compaction's
 /// continuation by its words, so its clean defense lands the task —
 /// whatever the compaction's summary kept. NEGATIVE CONTROL: `keep going`
@@ -3315,7 +3315,7 @@ fn lands_instruction_typed_again_after_a_compaction_is_a_land_act_to_the_record(
 }
 
 /// LAND'S ACTS AND THE CRUISE PROMPT ARE READ BY THEIR WORDS, WHOEVER TYPED
-/// THEM (ATERM-KI-1016-1, done-2, the product's rule): a user row that opens
+/// THEM (done-2, the product's rule): a user row that opens
 /// with Land's instruction is a land act to the record whether or not the
 /// session's ledger names it, so the clean defense answering it lands the
 /// task; and a row that opens with the Cruise prompt is the prompt, so typed
@@ -3749,7 +3749,7 @@ fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
     .concat();
     assert!(finished(&rows), "a /loop wake under a new promptId");
     // A `/loop`'s wake on a build that numbers no turn is a turn of its own
-    // by its `scheduledTaskId` (ATERM-KI-1016-1: the 2.1.252 and 2.1.267
+    // by its `scheduledTaskId` (the 2.1.252 and 2.1.267
     // bundles stamp it on the wake's user row): its answer leaves the
     // landing standing. Read as part of the landing's turn, it took the
     // landing back.
@@ -3769,7 +3769,7 @@ fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
 }
 
 /// A TURN CLAUDE CODE BEGINS WITH NO `promptId` IS STILL ONE OF ITS OWN (the
-/// review of ATERM-KI-1016-1's done-5, KR-DONE-4): the scheduler's `onFire`
+/// review of 's done-5, KR-DONE-4): the scheduler's `onFire`
 /// passes no task, so the notice of a one-shot task missed while Claude Code
 /// was not running — what a relaunch's start meets — carries no
 /// `scheduledTaskId` (the 2.1.252 bundle: `if(l)l(e);else t(Pcr(e))`, and the
@@ -5789,8 +5789,7 @@ fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_clai
         Some(spent)
     );
 
-    // NEGATIVE CONTROL: A ROW OLDER THAN THE CLAIM is an earlier dialog's —
-    // the wait an earlier wall armed — and is not read…
+    // Negative control: a row older than the claim (an earlier dialog's) is not read…
     assert_eq!(read(&[dialog(before), out(before, spent)]), None);
     // …and neither is a row that names no time.
     let untimed = out(after, spent).replace(&format!(r#""timestamp":"{after}","#), "");
@@ -5962,12 +5961,10 @@ fn the_newest_answer_is_the_last_response_row() {
     assert_eq!(by("2026-09-27T14:59:59.000Z"), None);
 }
 
-/// THE REWRITE OWNS ONLY aterm's OWN `--settings` VALUE (the usage tap,
-/// `super::super::tap::is_ours`): dropped in both spellings, so a stale path
-/// or a tap switched off leaves at the next relaunch and a resume line shown
-/// to a person never carries it; a person's own `--settings` — inline or a
-/// file — is carried verbatim, in its spelling. NEGATIVE CONTROL: a near
-/// miss of the tap (a key more, another refresh) is a person's, kept.
+/// The rewrite drops only aterm's own `--settings` value (the usage tap, `tap::is_ours`), in
+/// both spellings, so a stale path or a switched-off tap leaves at the next relaunch and a
+/// resume line shown to a person never carries it; a person's own `--settings`, inline or a
+/// file, is carried verbatim. Negative control: a near miss of the tap is a person's, kept.
 #[cfg(unix)]
 #[test]
 fn the_rewrite_sheds_only_aterms_own_tap() {
@@ -6011,7 +6008,7 @@ fn the_rewrite_sheds_only_aterms_own_tap() {
 }
 
 /// THE TURN A CONVERSATION ENDS ON, BY THE PROMPT THAT OPENED IT TOO
-/// (ATERM-KI-1016-1): [`LastTurn`] names the turn by its last row's key and
+/// : [`LastTurn`] names the turn by its last row's key and
 /// by its prompt's, and a left exchange's row keyed by the prompt
 /// ([`LastTurn::key`]) is named by every reading of that turn however much
 /// of its reply the tail holds — the prompt alone, a tool's call and its
@@ -6187,7 +6184,7 @@ fn the_turn_a_conversation_ends_on_is_named_by_the_prompt_that_opened_it() {
 }
 
 /// A PERSON'S EXCHANGE AT A WALL, ITS RETRY TYPED, NAMES THE RETRY'S TURN
-/// (ATERM-KI-1016-1, [`crate::supervise::approvals::LEFT_RETRIED`]): the
+/// ([`crate::supervise::approvals::LEFT_RETRIED`]): the
 /// person's prompt met a 529, the loop typed the retry, and the retry's
 /// short answer ended (its `turn_duration`): the row names that turn, the
 /// work before the wall counted with the retry's. NEGATIVE CONTROLS: the
@@ -6237,7 +6234,7 @@ fn a_persons_exchange_retried_at_a_wall_names_the_retrys_turn() {
 }
 
 /// AN OLDER BUILD'S NOTE OF A PERSON'S EXCHANGE LEFT NAMES THE TURN NO
-/// PROMPT OPENED SINCE (ATERM-KI-1016-1, done-5,
+/// PROMPT OPENED SINCE (done-5,
 /// [`crate::supervise::approvals::LEFT_BEFORE`]): that build journals the
 /// exchange left at a time and names no turn; the conversation's last turn,
 /// opened by a prompt recorded at or before the note, is the one it left —

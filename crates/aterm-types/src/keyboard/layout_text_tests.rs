@@ -274,7 +274,7 @@ fn ctrl_on_a_non_latin_layout_sends_the_us_letters_control_byte() {
     assert_eq!(ctrl('a', CTRL, none, Some('q')), [0x01]);
 }
 
-/// ATERM-KI-1015-9: a chord on a non-US layout. `layout_text` is the layout's character at the
+/// a chord on a non-US layout. `layout_text` is the layout's character at the
 /// press's Shift level, Ctrl and Alt aside (what the window reads off the key: xkb's keysym,
 /// AppKit's `-charactersIgnoringModifiers`). Alt sends ESC and then that character, as xterm
 /// sends ESC and its `XLookupString` text and kitty ESC and the layout's shifted key; Ctrl sends

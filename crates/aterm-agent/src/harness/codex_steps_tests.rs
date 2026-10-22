@@ -826,7 +826,7 @@ const ALAB_LEGS: [(&str, &[&str]); 6] = [
 
 /// The forever-port codex-alab build the lab measured (B5c): source
 /// `089291d37`, codex-alab's `alab/forever-align`, under the lab's
-/// FOREVER CRUISE / LAND proof, so its Cruise legs take the defend prompt
+/// Autopilot Cruise / LAND proof, so its Cruise legs take the defend prompt
 /// after each done claim and its legs hold more turns than [`ALAB`]'s; its
 /// steps are written out on their own ([`FOREVER_LEGS`]).
 const FOREVER: &str = "0.164.0-dev.12672+g089291d37";

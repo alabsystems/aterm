@@ -102,9 +102,7 @@ fn reachable(m: &Model) -> BTreeSet<Key> {
     seen
 }
 
-// ---------------------------------------------------------------------------
 // Half 1: the schedule, exhaustively, on a fabricated clock.
-// ---------------------------------------------------------------------------
 
 /// A defect the schedule harness replays as a negative control.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -425,9 +423,7 @@ fn the_schedule_conformance_rejects_every_replayed_defect() {
     assert!(explore_schedule(&slow_first, Mutation::None).is_err());
 }
 
-// ---------------------------------------------------------------------------
 // Half 2: the call sites, through a real `worker_loop` and a scripted output.
-// ---------------------------------------------------------------------------
 
 /// The shipping schedule's length, compressed to milliseconds so the ladder
 /// is exercised rather than slept through.

@@ -66,9 +66,7 @@ use std::process::Command;
 
 pub use aterm_update_core::pins;
 
-// ---------------------------------------------------------------------------
 // The tier
-// ---------------------------------------------------------------------------
 
 /// Tier WINDOWS, read off the committed anchor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,9 +116,7 @@ impl fmt::Display for Tier {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The host seam
-// ---------------------------------------------------------------------------
 
 /// The result of running a tool.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -276,9 +272,7 @@ impl Host for RealHost {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Configuration: flags > environment > credentials profile
-// ---------------------------------------------------------------------------
 
 /// The signing lane — which identity signs, and through what.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,9 +432,7 @@ pub fn default_timestamp(lane: &Lane) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Finding the tools
-// ---------------------------------------------------------------------------
 
 /// Join components onto a Windows path with `\`, whatever the build host.
 ///
@@ -664,9 +656,7 @@ pub fn find_dotnet_runtime(host: &dyn Host) -> Result<DotnetRuntime, String> {
     ))
 }
 
-// ---------------------------------------------------------------------------
 // Argument shapes (pure)
-// ---------------------------------------------------------------------------
 
 /// The Trusted Signing metadata file the dlib reads (`/dmdf`).
 #[must_use]
@@ -749,9 +739,7 @@ pub fn verify_args(file: &Path) -> Vec<String> {
     ]
 }
 
-// ---------------------------------------------------------------------------
 // Reading the verdict back (pure)
-// ---------------------------------------------------------------------------
 
 /// What `signtool verify /pa /v` said about one file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -882,9 +870,7 @@ pub fn judge(tier: &Tier, report: &VerifyReport) -> Result<(), String> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The verbs
-// ---------------------------------------------------------------------------
 
 pub const USAGE: &str =
     "aterm-winsign — Authenticode signing of the shipped Windows exe (Tier WINDOWS)

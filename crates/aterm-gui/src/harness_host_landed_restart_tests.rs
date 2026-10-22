@@ -4,7 +4,7 @@
 //! A LANDED TASK KEEPS THE TIME IT LANDED ACROSS A REAL SUPERVISION RESTART
 //! (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.2.7; the post-landing
 //! check's owner-eye-4 and behaviour-5 found it of a Cruise done, which
-//! FOREVER CRUISE / FOREVER LAND retired: a landing is now the one end a loop
+//! Autopilot Cruise / Land retired: a landing is now the one end a loop
 //! seeds): the host's REAL worker runs aterm-agent's REAL hosted loop under
 //! Land (`Session::run_hosted`, the seed it reads from the journal beside the
 //! ledger, its start face and its first point) over a Claude Code screen

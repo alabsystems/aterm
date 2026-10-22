@@ -49,10 +49,8 @@ fn the_real_window_routing_conforms() {
 }
 
 fn run_conformance() {
-    // Unique per-CALL tempdir: a per-process dir would race on the shared
-    // spec/cfg/trace files with any other caller in this test binary (same
-    // `process::id()`); a monotonic counter makes each invocation's working
-    // dir distinct.
+    // A scratch dir per call, not per process: other callers in this test binary share the
+    // pid and would race on the spec, cfg and trace files.
     use std::sync::atomic::{AtomicU64, Ordering};
     static NONCE: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(

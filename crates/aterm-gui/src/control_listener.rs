@@ -876,8 +876,8 @@ impl AcceptThread {
             format!("aterm-control-accept-{generation}"),
             crate::qos::Role::Responsive,
             move || {
-                // Admission sits in front of every lane, and it holds locks the
-                // UI thread contends (see the listener thread's own floor).
+                // Admission sits in front of every lane and holds locks the UI thread
+                // contends.
                 let accept = started
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)

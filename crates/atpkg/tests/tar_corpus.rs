@@ -172,9 +172,7 @@ fn pin(expected: &str) {
     assert_eq!(format!("{got:016x}"), expected, "the pinned corpus changed");
 }
 
-// ---------------------------------------------------------------------------
 // Corpus builders
-// ---------------------------------------------------------------------------
 
 /// Write `s` at `off` in a header block, clipped at the block's end.
 fn put(h: &mut [u8; 512], off: usize, s: &[u8]) {
@@ -366,9 +364,7 @@ impl Rng {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[test]
 fn ustar_archive_is_pinned() {

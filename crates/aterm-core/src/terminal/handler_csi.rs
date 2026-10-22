@@ -221,6 +221,12 @@ impl TerminalHandler<'_> {
             }
 
             // --- Scroll ---
+            // `CSI Ps T` is SD only for a lone nonzero (or absent) parameter, as
+            // xterm's `CASE_TRACK_MOUSE` reads it: `CSI 0 T`, or more than one
+            // parameter, starts highlight mouse tracking, which aterm does not
+            // offer, so nothing scrolls. (The ECMA-48 spelling `CSI Ps ^` has no
+            // such overload.)
+            CsiHandler::ScrollDown if params.len() > 1 || params == [0] => {}
             CsiHandler::ScrollUp | CsiHandler::ScrollDown => {
                 self.cursor_state().handle_scroll(params, final_byte);
             }
@@ -647,6 +653,28 @@ impl TerminalHandler<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// xterm's `CASE_TRACK_MOUSE` (charproc.c): "A single parameter other than
+    /// zero is always scroll-down. A zero-parameter is used to reset the mouse
+    /// mode". So `CSI 0 T` and the five-parameter highlight-tracking form
+    /// scroll nothing, while `CSI T`, `CSI 1 T` and the ECMA-48 `CSI 0 ^` do.
+    /// Found by the differential VT oracle (aterm-conformance `vt_oracle`).
+    #[test]
+    fn sd_with_a_zero_or_several_parameters_is_mouse_tracking_not_a_scroll() {
+        use crate::terminal::Terminal;
+
+        let row0 = |bytes: &[u8]| {
+            let mut term = Terminal::new(3, 4);
+            term.process(bytes);
+            term.grid().row_text(0).unwrap_or_default()
+        };
+        assert_eq!(row0(b"a\x1b[0T").trim_end(), "a", "CSI 0 T");
+        assert_eq!(row0(b"a\x1b[1;2;3;4;5T").trim_end(), "a", "five params");
+        assert_eq!(row0(b"a\x1b[2;1T").trim_end(), "a", "two params");
+        assert_eq!(row0(b"a\x1b[T").trim_end(), "", "CSI T scrolls one line");
+        assert_eq!(row0(b"a\x1b[1T").trim_end(), "", "CSI 1 T");
+        assert_eq!(row0(b"a\x1b[0^").trim_end(), "", "CSI 0 ^ is plain SD");
+    }
+
     /// An invalid DECSLRM (left >= right) is a complete no-op, as in xterm and
     /// like DECSTBM: an existing valid margin region and the cursor are kept.
     #[test]

@@ -311,9 +311,7 @@ const CODEX_IDS: &[&str] = &[
     "creator_user_id",
 ];
 
-// ---------------------------------------------------------------------------
 // The ordered tree
-// ---------------------------------------------------------------------------
 
 /// A JSON value as written: objects in their order, numbers as their text.
 #[derive(Clone, Debug, PartialEq)]
@@ -639,9 +637,7 @@ impl Parser<'_> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Words, ids and times
-// ---------------------------------------------------------------------------
 
 /// A closed word: 1 to [`WORD_MAX`] bytes of `[A-Za-z0-9._:@<>+-]`, so no
 /// space, no path and no sentence.
@@ -840,9 +836,7 @@ pub fn reset_clause(text: &str, shift: i64, year: i64) -> Option<String> {
     ))
 }
 
-// ---------------------------------------------------------------------------
 // The canonical phrase of a notice (T7)
-// ---------------------------------------------------------------------------
 
 /// How the readers take a notice's words: the wall `classify_wall` names,
 /// and the three readings `wall_confirm`'s `notice_wall` adds to it.
@@ -945,9 +939,7 @@ pub fn canonical(text: &str, joins: usize, shift: i64, year: i64) -> Result<Stri
     ))
 }
 
-// ---------------------------------------------------------------------------
 // The rules
-// ---------------------------------------------------------------------------
 
 /// Where a string sits in its row.
 pub struct At<'a> {
@@ -1085,9 +1077,7 @@ impl Rules for P11 {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The reduction
-// ---------------------------------------------------------------------------
 
 /// A file reduced.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1817,9 +1807,7 @@ impl Walk<'_> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The readings (ruling U7)
-// ---------------------------------------------------------------------------
 
 /// The fingerprint and identity a reading binds its fold to: any, the same
 /// for every file read.
@@ -2609,9 +2597,7 @@ pub fn check_written(source: &str, r: &Reduction, program: Program) -> Result<()
     }
 }
 
-// ---------------------------------------------------------------------------
 // The verb
-// ---------------------------------------------------------------------------
 
 /// `reduce <transcript|rollout> --program claude|codex [--out FILE]`: the
 /// reduction to FILE (never one that exists) or to stdout, and what it did

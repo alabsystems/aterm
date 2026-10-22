@@ -310,9 +310,7 @@ pub(crate) fn await_answer(
     }
 }
 
-// ---------------------------------------------------------------------------
 // The owner-only OFF switch (design §3.1)
-// ---------------------------------------------------------------------------
 
 /// The marker file whose presence means the owner has turned the sudo relay
 /// OFF. Under the aterm state dir (`aterm_types::dirs::state_dir`), NOT in

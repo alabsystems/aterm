@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Settings at phone width and large text — the system pages first (round 9),
-//! then every page by the same rules (round 13): every word a page paints is
+//! Settings at phone width and large text — the system pages first,
+//! then every page by the same rules: every word a page paints is
 //! whole in the box it is drawn in, and every control stays inside its card
 //! and is whole on some screen, from a 22-column window (178pt) up, at 1×,
 //! 1.5× and 2× text.
@@ -105,7 +105,7 @@ pub(super) fn spilled_nodes(
 }
 
 /// A CARD OF FACTS PAINTS EVERY NAME AND VALUE WHOLE AT PHONE WIDTH AND
-/// LARGE TEXT (the round-9 narrow sweep): About's build information and font
+/// LARGE TEXT (the narrow sweep): About's build information and font
 /// credits at 22 to 42 columns, 1× and 2×, every screen — a name in its
 /// column, a value in its own, or each name over its value where the card
 /// cannot hold both side by side ([`FactColumns`]), nothing elided and
@@ -183,7 +183,7 @@ fn facts_sit_beside_their_names_until_a_word_cannot() {
     });
 }
 
-/// A STACKED SWITCH IS NEVER WIDER THAN ITS LINE (the round-9 narrow sweep):
+/// A STACKED SWITCH IS NEVER WIDER THAN ITS LINE (the narrow sweep):
 /// on the system pages that draw switch rows — Keyboard & Input, Security,
 /// Window, Software Update and Packages — at 22 and 24 columns, 1× and 2×,
 /// every switch, and the Reset its row keeps, is inside its card. A stacked
@@ -294,7 +294,7 @@ fn a_wrapped_name_fills_the_box_it_is_drawn_in() {
     });
 }
 
-/// A NARROW SLIDER SETS ITS READOUT OVER ITS TRACK (the round-9 narrow
+/// A NARROW SLIDER SETS ITS READOUT OVER ITS TRACK (the narrow
 /// sweep): a slider too narrow to keep its readout's room beside a track as
 /// wide, and tall enough for both, paints the readout flush right on a line
 /// of its own and the track under it across the whole control — at 2× text
@@ -357,7 +357,7 @@ fn a_narrow_slider_sets_its_readout_over_its_track() {
 }
 
 /// A SLIDER'S READOUT IS MEASURED IN THE FACE IT PAINTS IN, AND ENDS AT ITS
-/// EDGE (the round-14 audit): the cursor trail's "24 cells" and "0.6 cells"
+/// EDGE (the audit): the cursor trail's "24 cells" and "0.6 cells"
 /// in the 126pt control a 22-column window gives a stacked slider at 2×
 /// text, and every readout beside a wide track, stand flush right — the
 /// painted text's right edge on the readout's end — and the fit audit
@@ -426,7 +426,7 @@ fn a_slider_readout_is_measured_in_its_face_and_ends_at_its_edge() {
 }
 
 /// A RESET'S PLACE NEVER COSTS A NAME MORE THAN A LINE OF ITS OWN (the
-/// round-14 audit): on every page at 30, 38 and 42 columns, 1× and 2× text,
+/// audit): on every page at 30, 38 and 42 columns, 1× and 2× text,
 /// a stacked row's name — beside the Reset (or the place it keeps) at its
 /// label line's end — takes at most one line more than the label line
 /// alone sets it on: where it would take more, Reset has a line of its own,
@@ -504,7 +504,7 @@ fn a_reset_place_never_costs_a_name_more_than_a_line_of_its_own() {
     });
 }
 
-/// A STACKED CHOICE KEEPS ITS WORDS (the round-9 narrow sweep): a stacked
+/// A STACKED CHOICE KEEPS ITS WORDS (the narrow sweep): a stacked
 /// row's choice button paints its whole choice where it fits, else the
 /// choice without its "(default)", else either with the arrow given up, else
 /// — a colour row — the colour alone, its chip; never cut. At 22 columns the
@@ -548,7 +548,7 @@ fn a_stacked_choice_keeps_its_words() {
     });
 }
 
-/// A BUTTON KEEPS ITS WORDS IN A NARROW COLUMN (the round-9 narrow sweep):
+/// A BUTTON KEEPS ITS WORDS IN A NARROW COLUMN (the narrow sweep):
 /// Harness's four actions and About's two at 22 to 42 columns, 1× and 2×,
 /// every screen — whole on one line where the box holds them, else a short
 /// form, else on as many lines as the box needs ([`button_words`]); never
@@ -643,7 +643,7 @@ fn a_text_button_paints_its_labels_lines() {
 }
 
 /// ABOUT'S WORDMARK IS WHOLE AT EVERY SIZE AND TEXT SCALE (item A2 of the
-/// round-9 narrow sweep): the hero's "aterm", in the Display step where its
+/// narrow sweep): the hero's "aterm", in the Display step where its
 /// column holds it and scaled down to the column where it does not
 /// ([`native_ui::wordmark_typography`]) — from the 164pt window floor to a
 /// wide window, short and tall, at 1×, 1.5× and 2×. An 80 × 24 window
@@ -679,7 +679,7 @@ fn about_s_wordmark_is_whole_at_every_size() {
     });
 }
 
-/// A WARNING STAYS A WARNING AS IT GIVES UP ITS SIZE (item A4 of the round-9
+/// A WARNING STAYS A WARNING AS IT GIVES UP ITS SIZE (item A4 of the
 /// narrow sweep): Software Update's failing verdict paints in the danger
 /// colour at its own step, at the Body step in bold where that does not fit
 /// ([`StyleRef::DangerCompact`]), and on as many lines as its column needs
@@ -742,7 +742,7 @@ fn a_warning_headline_keeps_its_colour_at_every_size() {
     });
 }
 
-/// SOFTWARE UPDATE KEEPS ITS WORDS (the round-9 narrow sweep): up to date,
+/// SOFTWARE UPDATE KEEPS ITS WORDS (the narrow sweep): up to date,
 /// with an update ready and failing, at 22 to 42 columns and on a wide
 /// window, short and tall, 1× and 2× — the status card's caption, verdict,
 /// version and detail, the update action and the Messages link each whole in
@@ -784,7 +784,7 @@ fn software_update_keeps_its_words() {
     });
 }
 
-/// THE COMPACT TOOLBAR KEEPS ITS WORDS (item A3 of the round-9 narrow sweep):
+/// THE COMPACT TOOLBAR KEEPS ITS WORDS (item A3 of the narrow sweep):
 /// at every compact width from the 164pt window floor and every text size,
 /// the back button, the title and Search each paint whole words — Search's
 /// field says "Search…" or "Search"; where the bar cannot hold even that
@@ -936,7 +936,7 @@ fn says_it_is_under_way(line: &str) -> bool {
     })
 }
 
-/// A PAGE'S NAME IS WHOLE IN ITS COLUMN (the round-9 narrow sweep): every
+/// A PAGE'S NAME IS WHOLE IN ITS COLUMN (the narrow sweep): every
 /// route's heading, at the window floor to 30 columns, 1× and 2× — in the
 /// title type where it fits, else Body-bold, else Body-bold on lines. A
 /// 22-column page painted "Keyboard…" and "Software U…" at 1×.
@@ -957,7 +957,7 @@ fn a_page_name_is_whole_in_its_column() {
     });
 }
 
-/// THE PACKAGES PAGE KEEPS ITS WORDS (the round-9 narrow sweep): its
+/// THE PACKAGES PAGE KEEPS ITS WORDS (the narrow sweep): its
 /// status, verbs, captions, service line, programs and activity at 22 to 42
 /// columns and on a wide window, 1× and 2× — wrapped to the card's MEASURED
 /// column, never cut, nothing past a card — before its tool reports and with
@@ -999,7 +999,7 @@ fn the_packages_page_keeps_its_words() {
     });
 }
 
-/// MESSAGES' SMALL BUTTONS STAY ON THE PAGE (the round-9 narrow sweep): Copy
+/// MESSAGES' SMALL BUTTONS STAY ON THE PAGE (the narrow sweep): Copy
 /// All and Open Log Folder, at a phone width and 2× text, keep their words
 /// inside the column, on lines where it is narrower than one ("Open Log
 /// Folder" ran 87pt past it).
@@ -1020,7 +1020,7 @@ fn messages_small_buttons_stay_on_the_page() {
     });
 }
 
-/// HARNESS KEEPS ITS WORDS WITH SESSIONS OPEN (the round-9 narrow sweep):
+/// HARNESS KEEPS ITS WORDS WITH SESSIONS OPEN (the narrow sweep):
 /// the page with its sessions — and again with three under Land and a
 /// reading of landings (slice 4c) — at 22 to 42 columns, short and tall, 1×
 /// and 2× — every row's title, detail, setting, state and day whole on as many
@@ -1076,7 +1076,7 @@ fn harness_keeps_its_words_with_sessions_open() {
     });
 }
 
-/// A ONE-LINE SESSIONS ROW KEEPS ITS WORDS (the round-9 sweep): on the
+/// A ONE-LINE SESSIONS ROW KEEPS ITS WORDS (the sweep): on the
 /// windows an 80×24 to a 220×60 terminal gives, at 1× to 2× text, a session
 /// row whose words sit beside its five buttons wraps its title, detail and
 /// setting line to the words' column, whole, its buttons a control tall. A
@@ -1123,7 +1123,7 @@ fn a_one_line_session_row_keeps_its_words() {
     });
 }
 
-/// A PAGE'S SUBTITLE IS WHOLE IN ITS COLUMN (the round-9 sweep): every route
+/// A PAGE'S SUBTITLE IS WHOLE IN ITS COLUMN (the sweep): every route
 /// on the windows an 80×24 to a 220×60 terminal gives, 1× to 2× text, on as
 /// many lines as the form's measure needs. Harness's at 2× on a 220×60
 /// window painted "…what it did, and its settin…", 4pt over its 720pt
@@ -1146,7 +1146,7 @@ fn a_page_subtitle_is_whole_in_its_column() {
 }
 
 /// A ROW TOO NARROW FOR ITS NAME BESIDE ITS CONTROLS STACKS THEM UNDER IT,
-/// ON A WIDE PAGE TOO (the round-9 sweep; the rule a compact row keeps): at
+/// ON A WIDE PAGE TOO (the sweep; the rule a compact row keeps): at
 /// 1.5× and 2× text on the windows a 150×48 and a 220×60 terminal give, no
 /// setting row draws its name, control, segments or Reset past its row, and
 /// Harness's Question priority — three segments and Reset's place wider than
@@ -1192,7 +1192,7 @@ fn a_row_too_narrow_for_its_name_beside_its_controls_stacks_them() {
     });
 }
 
-/// SEARCH'S RESULTS AND MODIFIED KEEP THEIR WORDS (the round-9 narrow sweep,
+/// SEARCH'S RESULTS AND MODIFIED KEEP THEIR WORDS (the narrow sweep,
 /// what the narrow toolbar's Search opens): a search that finds pages and
 /// settings ("cursor"), one that finds nothing, and Modified with nothing
 /// changed, at 22 to 42 columns, short and tall, 1× to 2× — the count, every
@@ -1256,7 +1256,7 @@ fn search_results_and_modified_keep_their_words() {
     });
 }
 
-/// AN EMPTY FIELD DROPS NO WORD WHERE ITS ROW CAN GROW (the round-14
+/// AN EMPTY FIELD DROPS NO WORD WHERE ITS ROW CAN GROW (the
 /// audit): every empty text field on Appearance, Terminal and Cursor Styles
 /// (the comet's trail colours too) at 22 and 30 columns, 1×, 1.5× and 2×
 /// text, paints every word of its placeholder — less only the "(default)"
@@ -1285,7 +1285,7 @@ fn an_empty_field_drops_no_word_where_its_row_can_grow() {
                 lab.state_mut().navigate(route);
                 let mut page = 0;
                 loop {
-                    lab.state_mut().page_scroll = page;
+                    lab.state_mut().scroll_page_to(page);
                     lab.state_mut().page_reveal = None;
                     let screen = lab.compile(width, 348.0);
                     for node in &screen.paint {
@@ -1354,7 +1354,7 @@ fn an_empty_field_drops_no_word_where_its_row_can_grow() {
     });
 }
 
-/// A FIELD'S VALUE IS WHOLE WHERE ITS ROW CAN GROW (the round-14 review):
+/// A FIELD'S VALUE IS WHOLE WHERE ITS ROW CAN GROW (the review):
 /// a value wider than its field — a shell named by a hyphenated word, a
 /// shell's path — paints every letter while the field is not being edited,
 /// on the lines it takes (a path the longest of its forms two lines hold,
@@ -1530,7 +1530,7 @@ fn a_fields_chip_on_its_own_line_takes_none_of_its_words_width() {
     });
 }
 
-/// A FIELD'S HINT STANDS AT THE END OF ITS TEXT BOX (the round-14 review):
+/// A FIELD'S HINT STANDS AT THE END OF ITS TEXT BOX (the review):
 /// the "Unsaved" a colour field with a refused draft says at its end ends
 /// where the box its words have ends — at the field's end where the chip
 /// stands on a line of its own, a chip's width before it where the chip
@@ -1604,7 +1604,7 @@ fn a_fields_hint_stands_at_the_end_of_its_text_box() {
     });
 }
 
-/// A NARROW FIELD GIVES UP ITS HINT, NEVER ITS WORDS (the round-14 review):
+/// A NARROW FIELD GIVES UP ITS HINT, NEVER ITS WORDS (the review):
 /// at 2× text in a 22- or 24-column window a refused draft's field paints
 /// its value whole and no "Unsaved" beside it — the page's draft bar says
 /// the draft waits, and the field's description says it — where beside the
@@ -1642,7 +1642,7 @@ fn a_narrow_field_gives_up_its_hint_never_its_words() {
     });
 }
 
-/// THE FLEET FIELD'S WORDS KEEP IT A FIELD (the round-7 Linux lane): where
+/// THE FLEET FIELD'S WORDS KEEP IT A FIELD (the Linux lane): where
 /// Settings does not know aterm.toml's folder, the field says "ai-fleet.toml
 /// beside aterm.toml", which goes on five lines at 2× text in a 22-column
 /// window; once that was a field 229pt tall in a 222pt list, whole on no
@@ -1764,7 +1764,7 @@ fn every_music_status_line_is_whole_and_names_its_cause() {
 }
 
 /// PACKAGES' SERVICE LINE IS LAID OUT AT THE GAP IT WAS MEASURED WITH (the
-/// round-9 lab sweep): at every card text width from a phone's to a wide
+/// lab sweep): at every card text width from a phone's to a wide
 /// page's, 1× and 2× text, "Unavailable in this copy of aterm" beside or
 /// under "Background service" paints every line whole in its column. The row
 /// set its columns 12pt apart where [`FactColumns`] had measured them 10pt
@@ -1790,7 +1790,7 @@ fn the_packages_service_line_paints_its_value_in_the_column_it_was_measured_for(
     });
 }
 
-/// MESSAGES KEEPS ITS WORDS WITH A LOG (the round-9 lab sweep, which a log
+/// MESSAGES KEEPS ITS WORDS WITH A LOG (the lab sweep, which a log
 /// in it made the page's real shape): the page with entries, collapsed and
 /// with one open, at 22 to 42 columns, short and tall, 1× to 2× — scrolled
 /// through every stop — every word whole and nothing past the page; what a
@@ -2009,7 +2009,7 @@ fn a_scrolled_page_chooses_its_chrome_again_when_the_text_size_changes() {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!()
         };
-        state.page_scroll = stop;
+        state.scroll_page_to(stop);
     };
     let set_scale = |scale: f32| {
         crate::native_appearance::install_preferences(
@@ -2057,6 +2057,83 @@ fn a_scrolled_page_chooses_its_chrome_again_when_the_text_size_changes() {
         .expect("a thread")
         .join()
         .expect("the chrome is chosen again");
+}
+
+/// A PAGE'S FIRST FRAME IS ITS SECOND: every page opened, phone width to
+/// desktop, at 1× and 2× text, drawn again with nothing between, draws the
+/// same screen. The room a compact page lays its rows out for (whether a
+/// row stacks, how many lines a field's words take) was measured under the
+/// chrome the last render had left, the full chrome on a page's first
+/// render, not under the chrome the page then chose: AI CLIs at 22 columns
+/// at 2× text drew its fleet field a line taller on its second frame, and
+/// its list a stop longer.
+#[test]
+fn every_pages_first_frame_is_its_second() {
+    at_each_text_scale(&[1.0, 2.0], "first frames", |scale| {
+        let windows = SettingsRoute::ALL
+            .into_iter()
+            .flat_map(|route| {
+                NARROW_WIDTHS
+                    .into_iter()
+                    .flat_map(|width| NARROW_HEIGHTS.map(|height| (width, height)))
+                    .chain(WIDE_SIZES)
+                    .map(move |(width, height)| (route, width, height))
+            })
+            .collect::<Vec<_>>();
+        on_workers(&windows, "first frames", |&(route, width, height)| {
+            let cx = view_cx_at(width, height);
+            let (mut runtime, instance, view) = setup();
+            go_to_route(&mut runtime, instance, view, route);
+            let first = compile_settings_view(&runtime, instance, view, &cx);
+            let second = compile_settings_view(&runtime, instance, view, &cx);
+            assert!(
+                first == second,
+                "{route:?} {width}\u{d7}{height} at {scale}\u{d7}: the second frame draws \
+                 another screen: {}",
+                first_apart(&first, &second)
+            );
+        });
+    });
+}
+
+/// Where two compiles of one screen first differ, both sides whole: the
+/// first painted node apart (or the one only one of them paints), else the
+/// first hit region, semantic node, focus stop, segment group or list
+/// picture apart, else the default action or the bounds.
+fn first_apart(was: &crate::native_ui::CompiledUi, now: &crate::native_ui::CompiledUi) -> String {
+    fn apart<T: PartialEq + std::fmt::Debug>(what: &str, was: &[T], now: &[T]) -> Option<String> {
+        (0..was.len().max(now.len())).find_map(|at| {
+            let (one, two) = (was.get(at), now.get(at));
+            (one != two).then(|| {
+                format!(
+                    "{what} {at} (of {}, then {}) was {one:?}, then {two:?}",
+                    was.len(),
+                    now.len()
+                )
+            })
+        })
+    }
+    apart("painted node", &was.paint, &now.paint)
+        .or_else(|| apart("hit region", &was.hits, &now.hits))
+        .or_else(|| apart("semantic node", &was.semantics, &now.semantics))
+        .or_else(|| apart("focus stop", &was.focus_order, &now.focus_order))
+        .or_else(|| apart("segment group", &was.segment_groups, &now.segment_groups))
+        .or_else(|| apart("list picture", &was.list_pictures, &now.list_pictures))
+        .or_else(|| {
+            apart(
+                "default action",
+                std::slice::from_ref(&was.default_action),
+                std::slice::from_ref(&now.default_action),
+            )
+        })
+        .or_else(|| {
+            apart(
+                "bounds",
+                std::slice::from_ref(&was.bounds),
+                std::slice::from_ref(&now.bounds),
+            )
+        })
+        .unwrap_or_else(|| "nothing apart".to_string())
 }
 
 /// THE RETIRED `auto_update` NOTE KEEPS ITS WORDS IN A NARROW COLUMN: on the
@@ -2641,7 +2718,7 @@ fn words_cut(
     cut
 }
 
-/// EVERY PAGE KEEPS ITS WORDS AND ITS CONTROLS (round 13: the round-9 rules
+/// EVERY PAGE KEEPS ITS WORDS AND ITS CONTROLS (the rules
 /// on every page — a label wraps to its box, a word wider than its box
 /// breaks with a hyphen, a button's words wrap, a tall row is listed a part
 /// at a time): every route, every screen, at 22 to 42 columns short and tall

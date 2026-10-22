@@ -248,8 +248,9 @@ fn install_tools_env_saying(
 /// program's store tree or the program's recorded dev-link checkout ([`agent_primary`]), lay
 /// or refresh the twin `agents/<tool>` with the same target and exported environment (read
 /// off the `bin/` shim) plus the self-update block ([`crate::selfupdate`]), which the primary
-/// gets too; then [`sweep_agents_dir`]. A dev link's twin gets no block and its `bin/` shim
-/// stays as the link laid it. What already matches is left alone.
+/// gets too; then [`sweep_agents_dir`]. An admitted ALab primary also execs the stable
+/// entry, retaining its physical target line for ownership readers. A dev link gets no
+/// self-update block. What already matches is left alone.
 ///
 /// Runs once at the end of every shim-laying pass ([`install_tools_env`], flow's undo,
 /// linkmode's link/unlink, and after `cli::reconcile_aliases`'s per-program loop), never
@@ -287,20 +288,13 @@ pub fn reconcile_agents(layout: &Layout) {
         // in that path's own directory — `exec` makes the program's argv0 the path it
         // names, and codex-alab's live upgrade watches argv0's directory.
         let exec = twin_exec(layout, name, &target, primary_is);
-        // THE TWIN'S PRELUDE, rendered here, the one place the twin is laid
-        // ([`platform::twin_prelude`]): the self-update block ([`crate::selfupdate`]) —
-        // `case "$1" in update|upgrade|install)` on the program's rostered verbs, so a
-        // `claude update` typed on the managed name is answered by `atpkg __selfupdate` and
-        // never by the vendor's own updater, which installs a copy this name never runs. A twin
-        // that still carries the retired landing prelude ([`crate::landing`]) compares unequal
-        // below and is re-laid once.
-        //
-        // WHICH atpkg it hands over to is [`crate::stub::Embedder`]'s call over the one the
-        // standing twin names — or, with no twin standing, the one `bin/`
-        // names: the co-located `atpkg` of the process running this pass only when it is
-        // there and lasts at least as long as that one — a pass run from a dev build or a
-        // scratch copy re-points no twin at a path that is not there, nor at a `target/`
-        // build while the installed app's atpkg stands.
+        // The twin's prelude ([`platform::twin_prelude`]) is the self-update block: the
+        // program's rostered verbs (`claude update`, …) go to `atpkg __selfupdate`, never the
+        // vendor's updater. A twin still carrying the retired landing prelude compares
+        // unequal below and is re-laid once. It hands over to the atpkg
+        // [`crate::stub::Embedder`] picks over the one the standing twin (else `bin/`) names,
+        // so a pass run from a dev build or a scratch copy never re-points a twin away from
+        // the installed app's atpkg.
         let named = |shim: &Path| {
             crate::metadata_io::read_bounded_regular_utf8(shim, 64 * 1024)
                 .ok()
@@ -328,25 +322,29 @@ pub fn reconcile_agents(layout: &Layout) {
         // to `native` in `~/.claude.json` and installs a copy under `~/.local`. Laid only when
         // its bytes differ; the forward `exec`s `bin/` again and the re-entry guard
         // ([`crate::selfupdate::REENTRY_VAR`]) lets it through to the store build. Windows
-        // renders no block. A dev link's `bin/` shim is the link itself (`linkmode::link`),
-        // never rewritten here.
-        if !dev_link
-            && !prelude.is_empty()
-            && !twin_is_rendered(&primary, &target, &env, &prelude)
-            && let Err(e) = platform::twin_executable_to_env(&primary, &target, &env, &prelude)
-                .and_then(|file| crate::lay::write_in_publication_turn(&file, &publication))
+        // renders no block. ALab's primary also runs through the stable entry, including
+        // a dev link with no prelude, so a direct bin/ launch retains the same upgrade
+        // identity as its agents/ twin.
+        if (exec != target || (!dev_link && !prelude.is_empty()))
+            && let Err(e) =
+                primary_executable(&primary, &target, &exec, &env, &prelude).and_then(|file| {
+                    if crate::metadata_io::read_bounded_regular(&primary, platform::MAX_SHIM_BYTES)
+                        .is_ok_and(|have| have == file.body)
+                    {
+                        Ok(())
+                    } else {
+                        crate::lay::write_in_publication_turn(&file, &publication)
+                    }
+                })
         {
             eprintln!(
-                "atpkg: {name}: bin/{name} lacks the twin's prelude ({e}); runs the store \
-                 build; retried next pass"
+                "atpkg: {name}: bin/{name} could not retain its managed launch ({e}); \
+                 retried next pass"
             );
         }
         // Left alone only when it resolves where the primary does, exports the same
-        // environment, and its BYTES are what the renderer lays now ([`twin_is_rendered`]):
-        // a twin that forwards and exports right but renders differently — laid before
-        // an exec root stood for its build, by a client whose shim text differed, or by
-        // one that laid the landing prelude — would otherwise be kept forever by a
-        // predicate that reads only its target.
+        // environment, and its bytes are the current render ([`twin_is_rendered`]); a
+        // target-only check would keep a stale twin forever.
         if platform::resolve_shim(&twin).is_some_and(|t| t == exec)
             && platform::shim_env_of(&twin) == env
             && twin_is_rendered(&twin, &exec, &env, &prelude)
@@ -368,8 +366,25 @@ pub fn reconcile_agents(layout: &Layout) {
     sweep_agents(layout);
 }
 
-/// `store/<program>/exec/`: the directory holding the stable path an ALab build's twin
-/// execs ([`twin_exec`]) — `exec/<entrypoint file>`, a symlink to the file the primary runs,
+fn primary_executable(
+    shim: &Path,
+    target: &Path,
+    _exec: &Path,
+    env: &crate::shim_env::ShimEnv,
+    prelude: &str,
+) -> io::Result<crate::lay::Executable> {
+    #[cfg(unix)]
+    if _exec != target {
+        return Ok(crate::lay::Executable::new(
+            shim,
+            platform::sh_shim_content_managed(target, env, _exec, prelude),
+        ));
+    }
+    platform::twin_executable_to_env(shim, target, env, prelude)
+}
+
+/// `store/<program>/exec/`: the directory holding the stable path an ALab build's primary
+/// and twin exec ([`twin_exec`]) — `exec/<entrypoint file>`, a symlink to the selected file,
 /// re-pointed by a rename INSIDE this directory whenever an ALab store build or an ALab dev
 /// link becomes the primary. Not a build name ([`crate::store::parse_build_name`]), so no
 /// store walker reads it as a build or as debris; `uninstall` takes it with the program's
@@ -379,7 +394,7 @@ pub fn exec_dir(layout: &Layout, program: &str) -> PathBuf {
     layout.prefix.join("store").join(program).join("exec")
 }
 
-/// THE PATH AN AGENT TWIN EXECS for its primary's `target`. For every build that is not ALab's
+/// The stable launch path for an ALab primary and its agent twin. For a non-ALab build,
 /// it is `target` itself, byte for byte as before. For ALab bytes ([`crate::alab`]) — the
 /// active store build (`store/<program>/current` names it) or a dev link of an ALab package
 /// — it is `store/<program>/exec/<file>` ([`exec_dir`]), a symlink to `target` laid by an
@@ -637,7 +652,7 @@ fn sweep_agents(layout: &Layout) {
                                 && platform::resolve_shim(&layout.shim(&tool))
                                     .is_some_and(|b| b == t)
                         })
-                        // An agent program's PENDING stub stands here too,
+                        // An agent program's pending stub stands here too,
                         // until its build arrives and the twin replaces it.
                         || (crate::stub::is_pending_stub(&entry.path())
                             && !installed.contains_key(tool.as_str())))
@@ -2165,7 +2180,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// The alias policy is read off the SIGNED index entry: ALab's own (no `system`)
+    /// The alias policy is read off the signed index entry: ALab's own (no `system`)
     /// aliases; an agent program, a system-satisfiable member and an unlisted name do not.
     #[test]
     fn the_alias_policy_follows_the_index_entry() {

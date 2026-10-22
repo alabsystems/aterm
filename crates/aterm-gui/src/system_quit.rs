@@ -9,14 +9,10 @@
 //! `applicationShouldTerminate:` (`menu::terminate_is_the_systems`) and noted here; the
 //! graceful exit then fills the agents in ([`crate::restore::RestoreManifest::fill_agents`]).
 //!
-//! THE MARK BELONGS TO ONE QUIT (2026-09-28). It was a bare flag that nothing
-//! cleared, so a system quit that did NOT happen — the person answered Cancel,
-//! a document held it, or an update successor that had not taken over yet
-//! answered it cancelled — still marked the NEXT quit, a person's own ⌘Q, as
-//! the system's, and the agents they had just quit came back at the next
-//! start. The mark is now the generation of the `terminate:` it came with
-//! (`menu`'s arbiter mints it), and every cancel of that generation forgets it
-//! (`menu::cancel_native_termination`, `menu::cancel_current_native_termination`).
+//! The mark is the generation of the `terminate:` it came with (`menu`'s arbiter mints it),
+//! and every cancel of that generation forgets it (`menu::cancel_native_termination`,
+//! `menu::cancel_current_native_termination`), so a cancelled system quit never marks a
+//! later quit as the system's.
 //!
 //! THE WINDOW SYSTEM GOING AWAY IS ONE TOO (COMPOSITOR-GONE, the Linux lane,
 //! 2026-10-16). When the display connection fails under a running window (a

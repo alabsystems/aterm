@@ -17,7 +17,7 @@
 //! * its own Autopilot word is written beside its trusted folder: `land`
 //!   ([`WORKER_AUTOPILOT`]) unless the spawn says `autopilot=cruise`, so the
 //!   window harness lands all of its work on the remote main branch and the
-//!   record reads `done why=landed` at that landing (FOREVER LAND);
+//!   record reads `done why=landed` at that landing (Autopilot Land);
 //! * at the shell's FIRST prompt (OSC 133 `B`: its line editor reads), ONE
 //!   line is typed through the session's canonical egress ([`launch_worker`]):
 //!   the window harness's relaunch builder's fresh start of the agent, its
@@ -176,7 +176,7 @@ pub(crate) struct TaskOrder {
     pub(crate) autopilot: Autopilot,
 }
 
-/// A WORKER'S AUTOPILOT where its spawn names none: Land (FOREVER LAND). A
+/// A WORKER'S AUTOPILOT where its spawn names none: Land (Autopilot Land). A
 /// tasked worker's natural end is "land it", which keeps the manager's one
 /// wake at the end (`await task`, then `result`): the record reads `done
 /// why=landed` once all of its work is on the remote main branch. Cruise is
@@ -239,7 +239,7 @@ impl TaskOrder {
 /// and what becomes of its report, and where a need goes. Under Land the
 /// work ends once all of it is on the remote main branch, defended in a few
 /// lines starting `Nothing left:`, and that report is the result; under
-/// Cruise no report ends it. No retired token (FOREVER CRUISE / FOREVER
+/// Cruise no report ends it. No retired token (Autopilot Cruise / FOREVER
 /// LAND). `agent` is the spawn's `agent=` word.
 pub(crate) fn fact_line(from: &str, autopilot: Autopilot, agent: &str) -> String {
     let end = match autopilot {

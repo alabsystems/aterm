@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb]
-//! [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]`: FOREVER LAND AND FOREVER CRUISE, LIVE, on every harness
+//! [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]`: Autopilot Land and Cruise, LIVE, on every harness
 //! aterm supervises — the real Claude Code, Gemini CLI, agy and Muse Code TUIs
 //! under a private headless aterm with the harness ON (its defaults), against
 //! the stub, each conversation scripted turn by turn
@@ -1982,7 +1982,11 @@ pub fn open_defense() -> String {
     format!("{CLEAN}\nThe docs PR is still open.")
 }
 
-/// L6's reply, `lines` tall: a need near its top, the defense at its bottom.
+/// L6's reply, `lines` tall: ONE need near its top, the defense at its bottom. One
+/// `NEEDS YOU:` line names one need (the contract: one a line), and the `- check <n> passed`
+/// rows under it are the report's own list, no needs: the needs reader reads one need here
+/// (`aterm-agent`'s `policy/needs.rs`; before 2026-10-22 it read the list as 80 more,
+/// `NEEDS … count=80` and "(+79 more)").
 #[must_use]
 pub fn tall_reply(lines: usize) -> String {
     let mut s = format!("Here is the landing report.\nNEEDS YOU: {NEED}\n");
@@ -4268,7 +4272,6 @@ fn judge_off(seen: &Seen, t0: i64) -> Verdict {
     Verdict::Pass(said)
 }
 
-// ---------------------------------------------------------------------------
 // The live run.
 
 fn could_not(m: &str) -> Fail {

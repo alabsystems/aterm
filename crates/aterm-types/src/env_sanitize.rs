@@ -128,10 +128,8 @@ pub const ENV_DENY_VARS: &[&str] = &[
     // The test values of every harness and host wait: a nested aterm runs its
     // own clock, never the one its parent's test suite asked for.
     ENV_DEV_FAST_TIMERS,
-    // RETIRED CREDENTIALS STAY DENIED. Nothing reads these, but the value is a SECRET
-    // that an old install.sh told people to export (`launchctl setenv`); that export
-    // outlives the knob, and without this entry would reach every program in every
-    // tab. A token a shell should carry belongs in that shell's own rc.
+    // Retired credentials stay denied: nothing reads them, but a secret an old install.sh
+    // told people to export (`launchctl setenv`) outlives the knob and would reach every tab.
     "ATERM_UPDATE_TOKEN",
     "ATPKG_TOKEN",
     // Recursion provisioning (re-injected fresh per direct child via env_add).

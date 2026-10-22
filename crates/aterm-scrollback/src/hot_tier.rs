@@ -146,8 +146,8 @@ impl HotTier {
         base.saturating_add(lines_mem)
     }
 
-    /// See [`recompute_memory_used`](Self::recompute_memory_used) for the
-    /// cfg and saturating-fold rationale.
+    /// Recompute `budgeted_bytes` from the lines; cfg and saturation as in
+    /// [`recompute_memory_used`](Self::recompute_memory_used).
     #[cfg(test)]
     #[must_use]
     pub(crate) fn recompute_budgeted_bytes(&self) -> usize {

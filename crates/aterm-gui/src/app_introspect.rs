@@ -1788,9 +1788,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
     aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes))
 }
 
-/// Invalidate the fixed SIGUSR1 completion marker before a new attempt. Absence is
-/// success; any other removal failure means an older completed snapshot cannot be
-/// distinguished from this attempt, so the new attempt must fail closed.
+/// A snapshot's canonical path, its pinned directory, and the one-component names
+/// of its PNG, text and `.done` payloads inside that directory.
 fn clear_snapshot_completion(target: &SnapshotTarget) -> std::io::Result<()> {
     clear_snapshot_completion_with_sync(target, |dir| dir.sync())
 }
@@ -2016,7 +2015,10 @@ pub(crate) fn video_keys_reply_tokens(keys_enabled: bool, logged: usize, unlogge
     }
 }
 
-/// The same disclosure for the MID-FLIGHT `video status` line.
+/// The same disclosure for the mid-flight `video status` line, so a driver polling
+/// during a take sees that the ledger is empty because its verbs take the
+/// unobservable path while the take can still be saved. A take without `keys`
+/// says `keys=false` rather than print counts that read as a measured zero.
 ///
 /// The finalized reply arrives only when the take is over, which is too late to
 /// change how the take is driven. A driver that polls `video status` after its
@@ -2045,8 +2047,8 @@ pub(crate) fn video_empty_ledger_note(
     unlogged_other_window: u64,
 ) -> String {
     if !keys_enabled {
-        return "no keystroke ledger was recorded: this take did not pass the `keys` flag. \
-                Re-record as `video <secs> keys` (owner scope) to correlate input with frames."
+        return "no input ledger: this take did not pass the `keys` flag; record \
+                `video <secs> keys` (owner scope) to correlate input with frames."
             .to_string();
     }
     if unlogged > 0 {
@@ -2057,35 +2059,27 @@ pub(crate) fn video_empty_ledger_note(
         let mut causes = String::new();
         if control_thread > 0 {
             causes.push_str(&format!(
-                " {control_thread} of them reached a PTY on the CONTROL-THREAD path — a verb \
-                 aimed at a session that is NOT the tab on screen (`@<sid>` naming a background \
-                 tab, which is what `@self` expands to when the driving session is not front). A \
-                 BACKGROUND target has no active tab to touch, so it never enters the App input \
-                 seam and this ledger cannot timestamp it. Drive the tab that is ON \
-                 SCREEN — flagless `key`/`ctrl`/`send`/`feed`/`paste`, or an explicit `@<sid>` \
-                 naming the front tab, both of which ARE logged."
+                " {control_thread} took the control-thread path, which bypasses the ledger: a \
+                 verb aimed at a session that is not the tab on screen (`@<sid>` naming a \
+                 background tab, or `@self` sent from one). Drive the on-screen tab instead: \
+                 flagless `key`/`ctrl`/`send`/`feed`/`paste`, or `@<sid>` naming it."
             ));
         }
         if unlogged_other_window > 0 {
             causes.push_str(&format!(
-                " {unlogged_other_window} of them DID pass the App input seam but arrived on a \
-                 WINDOW this recording was not capturing (the front window changed during the \
-                 take — an `aterm ctl spawn` alone does it). No frame in frames[] can answer \
-                 those keys, so logging them would have published a key->frame latency for a key \
-                 that never touched the recorded surface. Re-record with the target window front \
-                 for the whole take."
+                " {unlogged_other_window} reached a window this take was not recording (the \
+                 front window changed mid-take), so no frame can answer them. Keep the target \
+                 window front for the whole take."
             ));
         }
         return format!(
-            "MEASUREMENT GAP, not silence: {unlogged} input attempt(s) happened during this take \
-             that this ledger could not stamp on its own frame clock, so inputs[] is empty DESPITE \
-             them.{causes}"
+            "MEASUREMENT GAP: {unlogged} input attempt(s) during this take could not be \
+             stamped on its frame clock, so inputs[] is empty despite them.{causes}"
         );
     }
-    "no input reached this instance during the take: the ledger measured zero, it did not fail \
-     to measure (unlogged_inputs is 0, so nothing took the unobservable control-thread path and \
-     nothing landed on another window either). Active-tab `key`/`ctrl`/`send`/`feed`/`paste` and \
-     hardware keys on the recorded window are all logged."
+    "measured zero: the ledger saw no input attempt during this take, and unlogged_inputs is \
+     0. Flagless `key`/`ctrl`/`send`/`feed`/`paste` aimed at the on-screen tab, and hardware \
+     keys on the recorded window, are all logged."
         .to_string()
 }
 
@@ -2675,17 +2669,13 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                     return;
                 }
             }
-            // SELF-EVALUATION: correlate each PRE-ROUTING input attempt with the
-            // first later whole-frame change. This is useful response evidence,
-            // not proof that the event reached a PTY or caused that change, and
-            // — the part that misled a week of investigation — it is a SAMPLING
-            // instrument whose readings are floored by the recorder's own
-            // capture cadence. `crate::video_key_analysis` owns the correlation
-            // and publishes that floor beside every number; see its header for
-            // what this block can and cannot say.
-            //
-            // WHOLE frame, not a fixed band: the typed line lives wherever the
-            // screen has scrolled to (the top-band v1 went blind after one scroll).
+            // Correlate each pre-routing input attempt with the first later
+            // whole-frame change. That is response evidence, not proof the event
+            // reached a PTY or caused the change, and a sampling instrument floored
+            // by the recorder's capture cadence: `crate::video_key_analysis` owns
+            // the correlation and publishes that floor beside every number.
+            // The whole frame, not a fixed band: the typed line lives wherever the
+            // screen has scrolled to.
             let mut fps = if inputs.is_empty() {
                 Vec::new()
             } else {
@@ -3276,7 +3266,7 @@ pub(crate) fn native_settings_controls_lines(
     state: &crate::native_settings::SettingsViewState,
     compiled: &crate::native_ui::CompiledUi,
 ) -> Vec<String> {
-    // A legacy `field` record exists only when the exact compiled native tree
+    // A compatibility `field` record exists only when the exact compiled native tree
     // contains a control that edits that setting: one record per config key,
     // bound by the Settings builder ([`crate::native_settings::edited_setting_key`]:
     // a row's `settings/control/<key>`, the theme card's slots and Follow
@@ -3376,13 +3366,13 @@ fn native_settings_route_not_open_controls_lines(
     let current_route = current.map_or("-", |state| state.route.path());
     let error = if let Some(state) = current {
         format!(
-            "controls {alias} targets the native Settings {} route, but the front Settings presentation is {}; use `open {alias}` first",
+            "controls {alias} needs the Settings {} route, but the front Settings tab shows {}; use `open {alias}` first",
             expected.path(),
             state.route.path(),
         )
     } else {
         format!(
-            "controls {alias} targets the native Settings {} route, which is not visible in the front window; use `open {alias}` first",
+            "controls {alias} needs the Settings {} route, which the front window is not showing; use `open {alias}` first",
             expected.path(),
         )
     };
@@ -5493,7 +5483,7 @@ impl App {
         let Ok(viewport) = self.native_ui_viewport_in_plan(wid, view, plan) else {
             return;
         };
-        let phase_ms = u64::try_from(self.lat_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let phase_ms = self.native_preview_phase_ms();
         self.invalidate_active_native_settings_preview_in(wid, phase_ms, viewport);
     }
 
@@ -5644,16 +5634,9 @@ impl App {
         Ok(frame)
     }
 
-    /// Introspect the current visible route and write PNG + semantic text.
-    ///
-    /// With a window, the PNG is the exact client destination copied beside one
-    /// successful present submission. That includes raw destination bands and
-    /// present-only GPU colour/glow passes, but does not claim OS compositor
-    /// visibility or platform titlebar/backdrop pixels. Headless has no surface
-    /// transaction, so its PNG is explicitly the semantic renderer output and may
-    /// omit present-only passes. The parallel `.txt` is projected from the same
-    /// successful-present serial when windowed. Triggered by SIGUSR1. The files
-    /// are written 0600 into the per-user 0700 control dir (see `snapshot_path`).
+    /// A snapshot's `.txt` for `route`: the terminal band, each visible native
+    /// leaf's semantic lines, or both on a heterogeneous route, then an open
+    /// palette's control lines.
     fn snapshot_visible_text(
         &self,
         wid: WindowId,
@@ -5855,9 +5838,9 @@ impl App {
                 "aterm-video-encode".to_string(),
                 crate::qos::Role::Background,
                 move || {
-                    // QoS (port of 61a6c8b62): a recording encode is cosmetic
-                    // work no keystroke waits on; it must never take P-core
-                    // time from the UI thread on a saturated machine.
+                    // Background QoS: a recording encode is cosmetic work no
+                    // keystroke waits on, so it never takes P-core time from the
+                    // UI thread on a saturated machine.
                     if let Ok(j) = vrx.recv() {
                         run_encode_job(j, None);
                     }
@@ -5905,8 +5888,8 @@ impl App {
             "aterm-png-encode".to_string(),
             crate::qos::Role::Background,
             move || {
-                // QoS (port of 61a6c8b62): screenshot encoding is off the
-                // keystroke path; the client waits on its reply, not the human.
+                // Background QoS: screenshot encoding is off the keystroke path;
+                // the client waits on its reply, not the human.
                 // Drain until every sender is gone (process teardown); a dead
                 // client's dropped reply receiver only makes send() fail, which
                 // `run_encode_job` ignores — never a worker panic. The capture
@@ -6941,11 +6924,10 @@ impl App {
         Some(line)
     }
 
-    /// Read the frontmost window's NATIVE macOS chrome — the window's `NSToolbar`
-    /// items and the application menu bar — into human-readable text lines for the
-    /// `chrome` introspection verb. Runs on the MAIN thread (the SOLE place AppKit
-    /// objects may be touched), driven by [`Wake::ReadChrome`]; the control thread
-    /// posts that and blocks on the reply.
+    /// Read the frontmost window's native macOS chrome — its `NSToolbar` items and
+    /// the application menu bar — as text lines for the `chrome` verb. Runs on the
+    /// main thread (the only place AppKit objects may be touched), driven by
+    /// [`crate::Wake::ReadChrome`]; the control thread blocks on the reply.
     ///
     /// The only introspection path that sees OS chrome (`image`/`text` render the
     /// content view only). A pure read: it only calls getters, never mutating
@@ -6957,7 +6939,7 @@ impl App {
     /// connection — in a headless process, whose display-free loop never built one
     /// ([`crate::app_menu_bar`] says what happened when it did).
     ///
-    /// Off macOS there is no native chrome, so it returns a single explanatory line.
+    /// Off macOS, the other `read_native_chrome` reports the platform-neutral menu.
     ///
     /// A front window with no native strip (a `--headless` instance's) prints
     /// the `toolbar-tabs` line its strip would show
@@ -7478,10 +7460,8 @@ impl App {
 
         use crate::appkit;
 
-        // Reach the window's NSView the SAME way `read_native_chrome` /
-        // `toolbar::install_window_toolbar` do: winit Window -> content NSView.
-        // `None` here means there is no attached OS surface — i.e. headless — so
-        // the capture has no window to photograph.
+        // Reach the NSView as `read_native_chrome` does. `None` means no attached
+        // OS surface (headless): nothing to photograph.
         let Some(os_window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) else {
             return Err("no window to capture (headless)".to_string());
         };
@@ -8571,10 +8551,9 @@ pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32
         // Not a permission failure (see the doc comment), and the message must not
         // say it is: NULL means the window is not on screen.
         return Err(
-            "window capture failed (CoreGraphics returned no image for aterm's own \
-             window — it is not on screen: minimized, on another Space, not yet \
-             painted, or zero-sized; this needs no Screen Recording grant, so do not \
-             grant one — bring the window on screen and retry)"
+            "window capture failed (the window is not on screen: minimized, on another \
+             Space, not yet painted, or zero-sized; bring it on screen and retry — no \
+             Screen Recording grant is needed)"
                 .to_string(),
         );
     }
@@ -9156,23 +9135,14 @@ fn stitch_presented_client_into_window_rgba(
 /// Multiply the current full-window result by the platform photograph's outer
 /// shape mask without borrowing stale platform colour or ordinary client alpha.
 ///
-/// AppKit's full-size content view is rectangular, while WindowServer applies an
-/// antialiased rounded outer clip. The exact presented client must replace every
-/// ordinary client pixel, but doing that naively turns the four transparent outer
-/// corners opaque. Boundary-connected non-opaque platform alpha is precisely the
-/// compositor shape mask: flood it inward through non-opaque neighbors, multiply
-/// only those current alpha values, and leave current RGB untouched. Any isolated
-/// non-opaque platform pixel in an ordinary client row is stale capture content,
-/// not outer shape, and is ignored.
-///
-/// WHAT THE PLATFORM DID NOT PHOTOGRAPH IS NOT SHAPE (day five, D27): the part of
-/// a window past the display's edge comes back fully transparent — every
-/// column of it alpha 0 — and the flood took it all, so a 2148 px window on a
-/// 2002 px-wide screen lost `Details ›` and the tab pill to transparency. A
-/// window's outer shape never has a column (or row) with no ink at all, so such
-/// a column is read as not photographed: its shape is its mirror column's
-/// (the window's rounded outline is symmetric), or opaque when that one was not
-/// photographed either ([`photographed_shape_alpha`]).
+/// WindowServer clips the rectangular full-size content view to an antialiased
+/// rounded outline, so replacing every client pixel naively turns the four
+/// transparent corners opaque. Boundary-connected non-opaque platform alpha is the
+/// compositor shape mask: flood it inward through non-opaque neighbours and
+/// multiply only those alpha values, leaving RGB untouched; an isolated non-opaque
+/// pixel in an ordinary row is stale content and is ignored. Columns and rows the
+/// platform did not photograph (past the display's edge) are not shape
+/// ([`photographed_shape_alpha`]).
 #[cfg(any(target_os = "macos", windows, test))]
 fn multiply_platform_outer_shape_alpha(
     current_rgba: &mut [u8],
@@ -9260,8 +9230,8 @@ fn multiply_platform_outer_shape_alpha(
 /// The platform shape mask with every column and row the platform did not
 /// photograph (no ink at all: past the display's edge) replaced by its mirror
 /// across the window's centre, or opaque where that is unphotographed too
-/// ([`multiply_platform_outer_shape_alpha`], day five, D27). Borrowed as-is when
-/// every column and row has ink — the common case costs one scan.
+/// ([`multiply_platform_outer_shape_alpha`]). Borrowed as-is when every column and
+/// row has ink, so the common case costs one scan.
 #[cfg(any(target_os = "macos", windows, test))]
 fn photographed_shape_alpha(
     alpha: &[u8],
@@ -9682,17 +9652,14 @@ mod dims_snapshot_tests {
         rows_out
     }
 
-    /// WHERE THE TWO LAYOUTS PART. `panes` used to print the pane tree's own
-    /// `compute_layout`, while `resize_panes` sizes every engine from the tab's
-    /// visible plan — and the two engines place panes by different rules once
-    /// a layout is squeezed (the plan honours a nested split's minimum, the
-    /// tree clamps each leaf to one cell: `pane.rs`'s module docs). Two stacked
-    /// splits in a window dragged down to six rows: after reserving title rows, the plan
-    /// gives the top pane one content row so the nested pair keeps a row each,
-    /// while the tree gives it two. Reporting the tree would therefore claim
-    /// `2x…` over an engine `dims` reads as one row. The
-    /// negative control pins that the old source really disagrees here, so
-    /// the agreement above is not vacuous.
+    /// Where the two layouts part: `resize_panes` sizes every engine from the tab's
+    /// visible plan, while the pane tree's `compute_layout` places panes by a
+    /// different rule once a layout is squeezed (the plan honours a nested split's
+    /// minimum, the tree clamps each leaf to one cell: `pane.rs`'s module docs).
+    /// Two stacked splits in a six-row window: after the title rows the plan gives
+    /// the top pane one content row so the nested pair keeps a row each, while the
+    /// tree gives it two. The negative control pins that the tree really disagrees
+    /// here, so the agreement is not vacuous.
     #[test]
     fn panes_agrees_with_the_engines_where_the_tree_layout_does_not() {
         let mut app = App::headless_for_test();
@@ -9896,7 +9863,7 @@ mod split_capture_tests {
         }
     }
 
-    /// The first capture applies the CONFIGURED pet species, in one pane and in a
+    /// The first capture applies the configured pet species, in one pane and in a
     /// split: the dog skin reaches the atlas, and the cat is the negative control.
     #[test]
     fn first_headless_capture_applies_the_configured_pet_species() {
@@ -10047,9 +10014,7 @@ mod split_capture_tests {
         );
     }
 
-    /// T7 — a composed (split) capture splices the sparkle channels. The gate
-    /// this replaces returned early on ANY multi-pane tab, so a split capture
-    /// was decoration-free no matter what the window was showing.
+    /// A composed (split) capture splices the sparkle channels.
     #[test]
     fn split_capture_splices_decorations() {
         let t0 = Instant::now();
@@ -12611,9 +12576,9 @@ mod encode_worker_tests {
             expected.height,
             overlay,
         );
-        // The outer corner is outside terminal glyphs and cards, so cursor
-        // timing cannot satisfy this comparison. The old blanket suppression
-        // returned the baseline pixel here and fails the positive control.
+        // The outer corner is outside terminal glyphs and cards, so cursor timing
+        // cannot satisfy this comparison; blanket suppression would return the
+        // baseline pixel here.
         assert_ne!(expected.pixels[0], baseline.pixels[0], "{verb}");
         assert_eq!(
             charged.pixels[0], expected.pixels[0],
@@ -14824,8 +14789,8 @@ mod encode_worker_tests {
         let input = &app.windows[&wid].input_scratch;
         assert!(!input.selection.has_selection());
         assert_eq!(input.selection_clip, None);
-        // …but the terminal leaf's highlight is STILL PAINTED. The scalar fields
-        // are the FOCUSED leaf's authority and the focused leaf is native, so
+        // …but the terminal leaf's highlight is still painted. The scalar fields
+        // are the focused leaf's authority and the focused leaf is native, so
         // they stay neutral; the per-pane list carries the live selection.
         assert_eq!(input.selections[0].bg, 0x0021_4365);
         assert!(
@@ -15028,11 +14993,11 @@ mod encode_worker_tests {
         );
     }
 
-    /// PHASE-1 LAW (reply shape): the `video` OK line may grow tokens, but ONLY
-    /// strictly before the path — the path is ALWAYS the last whitespace token
-    /// (the one shape invariant clients rely on). `dropped=` is the TOTAL loss
-    /// (ring skips + evictions), `head_truncated=` iff any frame was evicted,
-    /// and index.json carries the honest split + the requested/covered window.
+    /// Reply shape: the `video` OK line may grow tokens, but only before the path,
+    /// which is always the last whitespace token (the invariant clients rely on).
+    /// `dropped=` is the total loss (ring skips + evictions), `head_truncated=` iff
+    /// any frame was evicted, and index.json carries the split + the
+    /// requested/covered window.
     /// Each frames[] row carries its frame's content hash and changed tiles.
     #[test]
     fn video_dump_reply_keeps_path_last_and_reports_honest_coverage() {
@@ -17204,18 +17169,18 @@ mod headless_settings_preview_capture_tests {
     /// The front window's `image`, its PNG bytes, with the instance's clock
     /// `elapsed_ms` past its epoch at the capture.
     fn image_at(app: &mut App, elapsed_ms: u64) -> Vec<u8> {
-        app.lat_epoch = Instant::now()
-            .checked_sub(Duration::from_millis(elapsed_ms))
-            .expect("the clock reaches back that far");
-        let (tx, rx) = std::sync::mpsc::channel();
-        let target = control_auth::ConfinedImage::in_memory();
-        app.render_image(image_req_for_test(target, false, true, None, tx));
-        let (_, _, png) = rx
-            .recv_timeout(crate::app_introspect::WORKER_PATIENCE)
-            .expect("image worker reply")
-            .expect("headless image succeeds")
-            .value;
-        png.expect("PNG bytes")
+        let now = app.lat_epoch + Duration::from_millis(elapsed_ms);
+        crate::app_native::with_native_preview_instant_for_test(now, || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let target = control_auth::ConfinedImage::in_memory();
+            app.render_image(image_req_for_test(target, false, true, None, tx));
+            let (_, _, png) = rx
+                .recv_timeout(crate::app_introspect::WORKER_PATIENCE)
+                .expect("image worker reply")
+                .expect("headless image succeeds")
+                .value;
+            png.expect("PNG bytes")
+        })
     }
 
     /// The Settings preview the last staged frame painted.
@@ -17259,6 +17224,7 @@ mod headless_settings_preview_capture_tests {
         renderer.set_runtime_font_discovery(false);
         crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
         let mut app = App::headless_for_test();
+        app.lat_epoch = Instant::now();
         {
             // A window tall enough that the card shows its specimen's rows.
             let window = app.windows.get_mut(&WID).unwrap();
@@ -17266,7 +17232,9 @@ mod headless_settings_preview_capture_tests {
             window.rows = 50;
             window.cols = 120;
         }
-        assert!(app.open_settings_tab(SettingsRoute::CursorMotion));
+        crate::app_native::with_native_preview_instant_for_test(app.lat_epoch, || {
+            assert!(app.open_settings_tab(SettingsRoute::CursorMotion));
+        });
 
         let early_png = image_at(&mut app, 420);
         let early = drawn_preview(&app);
@@ -17282,12 +17250,7 @@ mod headless_settings_preview_capture_tests {
         );
         let late_png = image_at(&mut app, 980);
         let late = drawn_preview(&app);
-        assert!(
-            late.phase_ms >= early.phase_ms + 500,
-            "the later capture draws the later frame: {} then {}",
-            early.phase_ms,
-            late.phase_ms
-        );
+        assert_eq!((early.phase_ms, late.phase_ms), (420, 980));
         assert_ne!(early_png, late_png, "the preview moved between captures");
 
         // NEGATIVE CONTROL: an unfocused window's preview is still (motion

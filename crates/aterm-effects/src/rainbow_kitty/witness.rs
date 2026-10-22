@@ -788,21 +788,14 @@ impl Witness {
     /// a block. For every run with a resident cell on a sampled row, of its armed
     /// records (live, not released, on non-leaving cells):
     ///
-    /// * At least two armed records, and at least two (no fewer than half) are
-    ///   gone from their own row. A run whose glyphs still stand is never
-    ///   followed; a single armed glyph is too little evidence.
-    /// * On the nearest sampled row `row + dr`, `dr ∈ {−1, +1, −2, +2}`, at
-    ///   least two records are found (own unit at own column, and arrived,
-    ///   [`Seen::arrivals`]: not a twin, [`Seen::twin`], nor on an unseen
-    ///   band-carried row, [`Seen::clear`]), no fewer than half of the records
-    ///   that are neither neutral nor relaid by a wrap
-    ///   ([`Witness::follow_verdict`], [`Witness::relaid_suffix`]). An erase
-    ///   under an identical line (`$ cd ..` under `$ cd ..`, then Ctrl-U) and a
-    ///   copy that appeared beside the line and stood [`TWIN_MIN`] (fzf's
-    ///   list, a completion popup) name nothing. The found records form one
-    ///   block, a prefix or suffix of the run, never letters either side of a
-    ///   hole. The first qualifying `dr` wins; a twin row is refused and the
-    ///   search continues (`a_twin_testifies_only_about_its_own_row`).
+    /// * at least two, and no fewer than half, are gone from their own row (a
+    ///   run whose glyphs stand is never followed);
+    /// * on the nearest sampled row `row + dr` ([`FOLLOW_DRS`] order) at least
+    ///   two are found arrived ([`Seen::arrivals`]), as one block (a prefix or
+    ///   suffix of the run), and they are no fewer than half of the records
+    ///   neither neutral nor relaid by a wrap: `2·found ≥ armed − neutral −
+    ///   relaid` ([`Witness::follow_verdict`], [`Witness::relaid_suffix`]). The
+    ///   first qualifying `dr` wins; a twin row is refused and the search goes on.
     /// * Searched before those, after scrolls carried the records up `k > 2`
     ///   rows since the last walk: the row `k` below, where the text stood on
     ///   screen before the scroll ([`Witness::scroll_carry`]), under the same

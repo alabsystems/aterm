@@ -53,9 +53,8 @@ fn close_last_tab_signals_exit() {
     );
 }
 
-// Tier-1 conformance: bind the real `TabIndex` to `tab_nav_model()`. After each real
-// mutator, project `(active, count)` onto the model and check both invariants, and check
-// the real step is one of the matching action's successors.
+// Tier-1 conformance: the real `TabIndex`, projected to `(active, count)` after each
+// mutator, keeps `tab_nav_model()`'s invariants and moves only as its actions admit.
 use aterm_models_gui::tab_nav_model;
 use aterm_spec::derive::Model;
 use std::collections::BTreeMap;

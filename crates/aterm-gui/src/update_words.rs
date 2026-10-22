@@ -783,9 +783,8 @@ pub(crate) fn scrollback_lost(lines: u64, tabs: usize) -> Message {
 ///
 /// * none withheld or held: the failure row, [`scrollback_lost`];
 /// * all withheld: [`scrollback_withheld`], the new version's request;
-/// * otherwise: one count line per cause, a title that calls it a failure
-///   only when some of it was (a held pane's failed carry is), and a sentence
-///   that claims nothing about what crossed.
+/// * otherwise: one count line per cause, a title that calls it a failure only when some
+///   of it was, and a sentence that claims nothing about what crossed.
 #[cfg(any(unix, test))]
 pub(crate) fn scrollback_left_behind(
     lines: u64,
@@ -2787,8 +2786,8 @@ mod tests {
             }
         }
         assert_eq!(staged_detail(P::Automatic), INSTALLS_BY_ITSELF);
-        // Every staged sentence fits one line today (the longest is about 150
-        // chars): the split is a guard, not a layout.
+        // Every staged sentence fits one line (the longest is about 150 chars): the split
+        // is a guard, not a layout.
         for posture in every_posture() {
             assert_eq!(staged_detail_lines(Some(posture)).len(), 1, "{posture:?}");
         }

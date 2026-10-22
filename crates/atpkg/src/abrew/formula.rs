@@ -53,8 +53,9 @@ pub struct Bottle {
     pub tag: String,
     pub url: String,
     pub sha256: String,
-    /// Where the bottle was built to live: only `:any_skip_relocation`
-    /// needs no binary relocation.
+    /// Where the bottle was built to live: `:any_skip_relocation`
+    /// needs no relocation; `:any` carries placeholder paths abrew
+    /// relocates at pour on macOS.
     pub cellar: String,
 }
 
@@ -376,7 +377,11 @@ impl Formula {
 
     /// The bottle for `tags` that pours natively, or why the pour needs
     /// Homebrew's recipe: no bottle for this machine, what the formula as a
-    /// whole needs ([`Formula::pour_needs`]), or a bottle that relocates.
+    /// whole needs ([`Formula::pour_needs`]), or a bottle that relocates
+    /// some way abrew does not perform. A `:any` bottle (placeholder
+    /// paths) relocates natively on macOS, where the system Mach-O
+    /// tools stand; a bottle baked for a fixed foreign cellar still
+    /// needs Homebrew's build-prefix relocation.
     pub fn native_bottle(&self, tags: &[String]) -> Result<&Bottle, String> {
         let bottle = self
             .bottle_for(tags)
@@ -384,7 +389,9 @@ impl Formula {
         if let Some(needs) = &self.pour_needs {
             return Err(needs.clone());
         }
-        if bottle.cellar != ":any_skip_relocation" {
+        let relocatable =
+            bottle.cellar == ":any" && cfg!(target_os = "macos") && !bottle.tag.contains("linux");
+        if bottle.cellar != ":any_skip_relocation" && !relocatable {
             return Err(format!("its bottle relocates: cellar {}", bottle.cellar));
         }
         Ok(bottle)
@@ -1314,11 +1321,28 @@ mod tests {
         );
         let complete: Value = aterm_json::from_str(r#"{"name":"demo","versions":{"stable":"1"},"revision":0,"dependencies":[],"variations":{}}"#).unwrap();
         assert!(super::super::api::dependency_formula(&complete, "demo", Machine::this()).is_ok());
-        for cellar in [":any", "/opt/homebrew/Cellar", ""] {
+        for cellar in ["/opt/homebrew/Cellar", ""] {
             value = aterm_json::from_str(&format!(r#"{{"name":"demo","bottle":{{"stable":{{"files":{{"all":{{"cellar":"{cellar}"}}}}}}}}}}"#)).unwrap();
             assert_eq!(
                 native(&Formula::from_api(&value).unwrap()),
                 Err(format!("its bottle relocates: cellar {cellar}"))
+            );
+        }
+        // A `:any` (placeholder) bottle relocates natively on macOS;
+        // elsewhere it still refuses.
+        value = aterm_json::from_str(
+            r#"{"name":"demo","bottle":{"stable":{"files":{"all":{"cellar":":any"}}}}}"#,
+        )
+        .unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                native(&Formula::from_api(&value).unwrap()),
+                Ok("all".to_string())
+            );
+        } else {
+            assert_eq!(
+                native(&Formula::from_api(&value).unwrap()),
+                Err("its bottle relocates: cellar :any".to_string())
             );
         }
     }

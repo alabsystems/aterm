@@ -78,13 +78,22 @@
 //! turns it on. A PURCHASE is no part of it: nothing bought, whatever the
 //! key says.
 //!
+//! `occupancy` ([`Occupancy`]; `docs/DESIGN-harness-occupancy-2026-10-20.md` §1.1, the owner's
+//! open question 1 there) ships `observe` and is held the same way: a session's wait on its own
+//! background work is measured, journaled (`OCCUPANCY`) and booked (`fact-hold@v1`), and nothing
+//! is typed for it. `prompt` is the grant a typed fact line needs ([`Occupancy::grant`]), more
+//! power, so only the root table's `prompt` reaches it; `off` (any off spelling) is its limit
+//! and measures nothing; a switch's `true`, `yes` or `on` names no mode, so it keeps `observe`
+//! and is said. Settings writes no `occupancy`: `settings set harness.occupancy` is refused,
+//! since an agent may drive that verb and the grant is the owner's.
+//!
 //! One key says how far the harness carries a session's work: `autopilot`
 //! ([`Autopilot`]; `docs/DESIGN-harness-autopilot-2026-10-15.md` §2),
 //! `cruise` (the default: keep the work going, and nothing the agent says
-//! ends it — FOREVER CRUISE), `land` (land all of the work on the remote
+//! ends it — Autopilot Cruise), `land` (land all of the work on the remote
 //! main branch, nudged at every point until a clean `Nothing left:` defense
 //! stands over a clean repository, then nothing typed until someone's turn —
-//! FOREVER LAND) or `off` (hands off: plain Claude Code), any case, and the owner's own words for them
+//! Autopilot Land) or `off` (hands off: plain Claude Code), any case, and the owner's own words for them
 //! (`forever`/`infinity`, `wrap-up`/`wrapup`/`wrap`). Each step down
 //! takes power away, so `land` and `off` are limits and `off` (any off
 //! spelling) is the key's; a value that is none of them keeps `cruise` and
@@ -126,7 +135,7 @@ use super::memory::MemoryCeiling;
 use crate::harness::accounts::Mode;
 use crate::harness::harness_mark;
 
-/// CRUISE'S CONTINUATION, the default `continue_text` (FOREVER CRUISE): keep
+/// CRUISE'S CONTINUATION, the default `continue_text` (Autopilot Cruise): keep
 /// going, land what is in hand, and keep hunting for what would make the
 /// work more complete and more correct — never stopping to ask, a person's
 /// part put on a `NEEDS YOU:` line. Marked as the harness's own turn
@@ -178,6 +187,7 @@ pub const KEYS: &[&str] = &[
     "upgrade",
     "upgrade_ask",
     "human_grace_s",
+    "occupancy",
 ];
 
 /// The `[harness]` keys this reader retired: 0.93.0's four approval
@@ -256,7 +266,7 @@ impl Approve {
 /// The window's chip cycles it `cruise` → `land` → `off`; power runs `off` < `land` < `cruise`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Autopilot {
-    /// FOREVER CRUISE: keep the work moving toward completeness and
+    /// Autopilot Cruise: keep the work moving toward completeness and
     /// correctness, for good. Every point is answered and every free turn end
     /// gets a typed act — the continuation (`continue_text`), or, where the
     /// agent claims it is done (a done phrase, an idle report, a legacy
@@ -270,7 +280,7 @@ pub enum Autopilot {
     /// the work. The default.
     #[default]
     Cruise,
-    /// FOREVER LAND: land ALL of the work into the remote main branch, no
+    /// Autopilot Land: land ALL of the work into the remote main branch, no
     /// exceptions, then end the session cleanly. The turn-end policy types
     /// the land instruction at the episode's first point and a land nudge at
     /// every free point after it, with no bound, paced by the same back-off
@@ -329,6 +339,85 @@ impl Autopilot {
             Autopilot::Cruise => 2,
         }
     }
+}
+
+/// WHAT THE HARNESS DOES WITH WHAT IT MEASURES OF A SESSION'S WAIT (`[harness] occupancy`;
+/// `docs/DESIGN-harness-occupancy-2026-10-20.md` §1.1): how long the agent's own background
+/// work has held it, and whether it declared the wait. Power runs `off` < `observe` <
+/// `prompt`, and the default is `observe`, so `prompt` is held as `usage_credits`' `true` is:
+/// only the root table turns it on ([`SupervisorConfig::limits`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Occupancy {
+    /// Nothing measured is journaled or booked: no `OCCUPANCY` line, no `fact-*` ledger row.
+    Off,
+    /// Judged, journaled and booked (`OCCUPANCY` lines, `fact-hold@v1` rows), and nothing
+    /// typed: no line alone at a break, nothing riding a continuation. The default.
+    #[default]
+    Observe,
+    /// What `observe` does, and the grant ([`Self::grant`]) a fact line needs to be typed.
+    /// The owner's to write: no reader takes it from anywhere but the root table, and no ctl
+    /// verb writes it.
+    Prompt,
+}
+
+impl Occupancy {
+    /// Every mode, least power first.
+    pub const ALL: [Occupancy; 3] = [Occupancy::Off, Occupancy::Observe, Occupancy::Prompt];
+
+    /// The mode's word as the table spells it. Stable: [`Self::parse`] reads it back.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Occupancy::Off => "off",
+            Occupancy::Observe => "observe",
+            Occupancy::Prompt => "prompt",
+        }
+    }
+
+    /// A mode from its word ([`Self::word`]), trimmed, in any case. `None` for anything else:
+    /// a switch's `true`/`yes`/`on` names no mode, so it is never read as `prompt`
+    /// ([`SupervisorConfig::set`] keeps `observe` and says so; an off spelling is `off`).
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Occupancy::Off),
+            "observe" => Some(Occupancy::Observe),
+            "prompt" => Some(Occupancy::Prompt),
+            _ => None,
+        }
+    }
+
+    /// How much this mode does: `off` < `observe` < `prompt`.
+    fn rank(self) -> u8 {
+        match self {
+            Occupancy::Off => 0,
+            Occupancy::Observe => 1,
+            Occupancy::Prompt => 2,
+        }
+    }
+
+    /// THE ONE PREDICATE a typed fact line passes: a [`PromptGrant`] under `prompt`, and
+    /// nothing under `observe` or `off`. The grant is built here and nowhere else.
+    #[must_use]
+    pub const fn grant(self) -> Option<PromptGrant> {
+        match self {
+            Occupancy::Prompt => Some(PromptGrant { _sealed: () }),
+            Occupancy::Off | Occupancy::Observe => None,
+        }
+    }
+
+    /// Whether anything is measured into the journal and the ledger: every mode but `off`.
+    #[must_use]
+    pub const fn observes(self) -> bool {
+        !matches!(self, Occupancy::Off)
+    }
+}
+
+/// The proof a fact line may be typed: [`Occupancy::grant`] under `prompt` alone. Its one field
+/// is private, so no code outside this module can make one.
+#[derive(Debug)]
+pub struct PromptGrant {
+    _sealed: (),
 }
 
 /// How much `[harness] accounts` rotates: `off` < `wall` < `early` (a move at
@@ -445,19 +534,14 @@ pub struct SupervisorConfig {
     /// compact at 400 as recommended … without interrupting"). `None`
     /// (`"off"`): the dialog is a person's.
     pub autocompact_offer: Option<u32>,
-    /// Which sessions are rotated across the owner's listed Claude Code
-    /// accounts (`accounts.toml` beside this file, `aterm harness accounts`;
-    /// `docs/DESIGN-claude-accounts-2026-10-01.md` §3, §6): a session whose
-    /// turn ends on a usage limit is relaunched on its own conversation under
-    /// the next runnable account ([`Mode::Wall`]), and ahead of the limit too
-    /// ([`Mode::Early`], the default: at a plain turn end, off an account
-    /// another session found at its limit, or one the accounts probe's
-    /// `/usage` sample shows low; only `early` probes: `/usage` typed at an
-    /// idle turn end, the panel read and closed). [`Mode::Off`], its limit,
-    /// moves no session. Inert with no roster, so full power needs no
-    /// exception to the rule. The turn-end policy reads only whether it is off;
-    /// which account and when is the host's
-    /// (`crate::harness::accounts::advise`, `IdleHost::account_probe`).
+    /// Which sessions rotate across the owner's listed Claude Code accounts (`accounts.toml`
+    /// beside this file, `aterm harness accounts`; `docs/DESIGN-claude-accounts-2026-10-01.md`
+    /// §3, §6). [`Mode::Wall`]: a turn that ends on a usage limit is relaunched on its
+    /// conversation under the next runnable account. [`Mode::Early`] (the default) also moves
+    /// ahead of the limit, off an account another session found at its limit or one the
+    /// `/usage` probe shows low; only `early` probes. [`Mode::Off`] moves no session. Inert with
+    /// no roster. Which account and when is the host's (`crate::harness::accounts::advise`,
+    /// `IdleHost::account_probe`).
     pub accounts: Mode,
     /// Take a limit reset the plan offers at Claude Code's usage-limit
     /// dialog, ahead of [`Self::limit_wait`]'s row (`limit-reset@v1`;
@@ -495,18 +579,11 @@ pub struct SupervisorConfig {
     /// power than the other. It has no least of its own ([`Self::limit`]):
     /// which kinds is how the step spends, `limit_reset` whether.
     pub limit_reset_kinds: Vec<ResetKind>,
-    /// The usage tap (`crate::harness::tap`; the accounts design v2 §3.1,
-    /// ruling R-7): put Claude Code's own status-line setting — an inline
-    /// `--settings` whose command is `<aterm> harness tap` — on the relaunch
-    /// lines aterm types for a Claude Code on the machine's own login, so its
-    /// usage figures are read after every reply and recorded for that login.
-    /// The readings move no session. Off by default: it changes the argv a
-    /// relaunched session carries, so `true` is more power, as
-    /// [`Self::limit_reset`]'s is — [`Self::limit`] leaves it off and a
-    /// misplaced table never turns it on. Read live, independent of
-    /// [`Self::accounts`]: a line typed after an edit follows it, and a
-    /// session tapped before keeps its tap, and is recorded, until its next
-    /// relaunch.
+    /// The usage tap (`crate::harness::tap`): put Claude Code's own status-line setting (an
+    /// inline `--settings` whose command is `<aterm> harness tap`) on the relaunch lines aterm
+    /// types for a Claude Code on the machine's own login, so its usage is recorded after every
+    /// reply; the readings move no session. Off by default, as it changes the argv. Independent
+    /// of [`Self::accounts`]; a tapped session keeps its tap until its next relaunch.
     pub usage_tap: bool,
     /// On a machine that lists no Claude Code accounts, keep a record of the one account's usage
     /// as its sessions' screens say it (usage credits carrying them past a limit, the vendor's
@@ -554,7 +631,7 @@ pub struct SupervisorConfig {
     /// its lost login where a renewal already replaced it. A lost login no
     /// renewal replaced is signed in where it stands either way (`/login`
     /// once, the browser sign-in the owner's, its notice says so — the
-    /// owner's ruling of 2026-10-19). Inert with no such row. Apart from
+    /// owner's ). Inert with no such row. Apart from
     /// [`Self::accounts`], so `accounts = "off"` keeps renewal working.
     /// `false` (`"off"`, its limit): no session follows a renewal.
     pub logins: bool,
@@ -617,6 +694,10 @@ pub struct SupervisorConfig {
     /// keystroke into it — all but the folder-trust dialog of a launch the
     /// server witnessed (`approval_loop.rs`, THE LAUNCH).
     pub human_grace_s: u32,
+    /// What the harness does with a session's measured wait ([`Occupancy`]): `observe` by
+    /// default, journaled and booked and nothing typed; `off` (any off spelling) is its limit,
+    /// and `prompt` is more power, so only the root table turns it on.
+    pub occupancy: Occupancy,
     /// Safe rules a retired key switched off ([`RETIRED_KEYS`]); no key of
     /// its own sets it.
     pub withheld: Withheld,
@@ -774,6 +855,7 @@ impl Default for SupervisorConfig {
             upgrade: true,
             upgrade_ask: false,
             human_grace_s: 120,
+            occupancy: Occupancy::Observe,
             withheld: Withheld::default(),
         }
     }
@@ -855,6 +937,11 @@ impl SupervisorConfig {
             "autopilot" => match Autopilot::parse(value) {
                 Some(a) => self.autopilot = a,
                 None => return bad(self, "cruise, land or off"),
+            },
+            // A switch's `true` names no mode: it keeps `observe`, never `prompt`.
+            "occupancy" => match Occupancy::parse(value) {
+                Some(o) => self.occupancy = o,
+                None => return bad(self, "off, observe or prompt"),
             },
             // A time, or none: empty (the default's text) and an off spelling
             // offer no time. It neither limits nor grants, so a value it
@@ -1053,7 +1140,8 @@ impl SupervisorConfig {
     /// its default), no line carries the usage tap (`usage_tap = false`, its
     /// default), no record of the one account's usage is kept (`usage_notes =
     /// false`, its default), no session is carried onto usage credits
-    /// (`usage_credits = false`, its default), an agent's own switch (`codex.enabled`) is that
+    /// (`usage_credits = false`, its default), nothing of a session's wait is measured
+    /// (`occupancy = "off"`), an agent's own switch (`codex.enabled`) is that
     /// agent off. A text, `question_priority` (HOW a question is answered)
     /// and `limit_reset_kinds` (HOW a reset is chosen; `limit_reset` is
     /// whether) keep their defaults: none carries power of its own.
@@ -1099,6 +1187,7 @@ impl SupervisorConfig {
             "rm_breaker_ask" => self.rm_breaker_ask = true,
             "stall_term" => self.stall_term = false,
             "human_grace_s" => self.human_grace_s = 3600,
+            "occupancy" => self.occupancy = Occupancy::Off,
             retired if RETIRED_KEYS.contains(&retired) => {
                 let _ = self.retired(retired, true);
             }
@@ -1368,8 +1457,8 @@ impl SupervisorConfig {
 
     /// Whether `self` is `before` with power taken away and none given: some field moved, and
     /// no switch is on that was off, no agent back on, no autopilot higher, no approval looser,
-    /// no cap higher or absent, no grace or stall bound shorter, no account mode wider, no trust
-    /// root, host or fallback model new, and no text or question priority changed (neither
+    /// no cap higher or absent, no grace or stall bound shorter, no account mode wider, no
+    /// occupancy higher, no trust root, host or fallback model new, and no text or question priority changed (neither
     /// limits nor grants, so where a key may only limit, neither is taken).
     fn limits(&self, before: &Self) -> bool {
         let cap = |n: u32| if n == 0 { u32::MAX } else { n };
@@ -1417,6 +1506,7 @@ impl SupervisorConfig {
             && no_more(self.upgrade, before.upgrade)
             && no_more(!self.upgrade_ask, !before.upgrade_ask)
             && self.human_grace_s >= before.human_grace_s
+            && self.occupancy.rank() <= before.occupancy.rank()
             && (self.withheld.rm_breaker || !before.withheld.rm_breaker)
             && (self.withheld.read_outside_cwd || !before.withheld.read_outside_cwd)
     }
@@ -1425,7 +1515,7 @@ impl SupervisorConfig {
     /// effective `[harness]` table Settings ▸ Harness lists against the default's. The
     /// destructure names every field, so a field added without a key here does not build.
     #[must_use]
-    pub fn texts(&self) -> [(&'static str, String); 37] {
+    pub fn texts(&self) -> [(&'static str, String); 38] {
         let Self {
             enabled,
             // No key in [`KEYS`]: the agents' own tables ([`Self::agent_texts`];
@@ -1467,6 +1557,7 @@ impl SupervisorConfig {
             upgrade,
             upgrade_ask,
             human_grace_s,
+            occupancy,
             // No key of its own: a retired key's ([`Self::withheld_texts`];
             // `against_default` names it).
             withheld: _,
@@ -1519,6 +1610,7 @@ impl SupervisorConfig {
             ("upgrade", upgrade.to_string()),
             ("upgrade_ask", upgrade_ask.to_string()),
             ("human_grace_s", human_grace_s.to_string()),
+            ("occupancy", occupancy.word().to_string()),
         ]
     }
 
@@ -3119,13 +3211,8 @@ mod tests {
         assert_eq!(off, listed(false, vec![Full]), "admitted with the step off");
     }
 
-    /// `[harness] usage_notes` (accounts v2 S5): the record of a machine's one
-    /// account's usage and the two digest lines it makes are a new alert, so
-    /// the key SHIPS `false`; the root table's own `true` turns it on, its
-    /// `true` is the owner's own choice against the default and never a
-    /// limit, an off however spelled leaves it off, and a misplaced `true`
-    /// grants nothing. NEGATIVE CONTROLS: the root table's `true` IS read, a
-    /// misplaced `false` still limits, and no other key turns it on.
+    /// `usage_notes` ships `false` and only the root table's `true` turns it on: the owner's own
+    /// choice, never a limit; a misplaced `false` still limits, and no other key turns it on.
     #[test]
     fn usage_notes_ships_off_and_only_the_root_table_turns_it_on() {
         let full = SupervisorConfig::default();
@@ -3353,6 +3440,186 @@ mod tests {
                 "the fixture must be one the parser refuses: {text:?}"
             );
             assert_eq!(read(&text).usage_credits, want, "{text:?}");
+        }
+    }
+
+    /// `[harness] occupancy` (`docs/DESIGN-harness-occupancy-2026-10-20.md` §1.1): the key SHIPS
+    /// `observe` and only the root table's own `prompt` turns the grant on: no other key, no
+    /// limit, no misplaced table, no repeat and no switch's `true` does. An off however spelled
+    /// is `off`, its limit; a value that names no mode (`true`, `yes`, `on`, `1`) keeps
+    /// `observe` and is said. NEGATIVE CONTROLS: the root table's `prompt` IS read (so every
+    /// `observe` above it is a reading, not a dead key), only it yields a grant, and a policy at
+    /// `prompt` is limited by `observe` and by `off`.
+    #[test]
+    fn occupancy_ships_observe_and_only_the_root_table_turns_prompt_on() {
+        let full = SupervisorConfig::default();
+        assert_eq!(full.occupancy, Occupancy::Observe, "the default is observe");
+        assert!(full.occupancy.grant().is_none(), "observe grants nothing");
+        assert_eq!(read("").occupancy, Occupancy::Observe);
+        assert_eq!(read("[harness]\n").occupancy, Occupancy::Observe);
+        assert_eq!(
+            SupervisorConfig::default_shown("occupancy").as_deref(),
+            Some("observe")
+        );
+        // Only `prompt` grants, and `off` alone observes nothing.
+        for (mode, grants, observes) in [
+            (Occupancy::Off, false, false),
+            (Occupancy::Observe, false, true),
+            (Occupancy::Prompt, true, true),
+        ] {
+            assert_eq!(mode.grant().is_some(), grants, "{mode:?}");
+            assert_eq!(mode.observes(), observes, "{mode:?}");
+            assert_eq!(Occupancy::parse(mode.word()), Some(mode), "{mode:?}");
+        }
+        // No other key reaches `prompt`, written as an on, as `prompt`, or at its limit.
+        for key in KEYS.iter().filter(|k| **k != "occupancy") {
+            for value in ["true", "prompt"] {
+                let mut c = full.clone();
+                let _ = c.set(key, value);
+                assert_eq!(c.occupancy, Occupancy::Observe, "{key} = {value}");
+            }
+            let mut c = full.clone();
+            c.limit(key);
+            assert_eq!(c.occupancy, Occupancy::Observe, "{key} at its limit");
+        }
+        for key in RETIRED_KEYS {
+            for value in ["true", "false"] {
+                let c = read(&format!("[harness]\n{key} = {value}\n"));
+                assert_eq!(c.occupancy, Occupancy::Observe, "{key} = {value}");
+            }
+        }
+        // The root table's `prompt`, in any case: that field and no other.
+        let prompt = SupervisorConfig {
+            occupancy: Occupancy::Prompt,
+            ..full.clone()
+        };
+        let off = SupervisorConfig {
+            occupancy: Occupancy::Off,
+            ..full.clone()
+        };
+        for text in ["\"prompt\"", "\"Prompt\"", "\" PROMPT \""] {
+            let (c, notes) =
+                SupervisorConfig::from_aterm_toml(&format!("[harness]\noccupancy = {text}\n"));
+            assert_eq!(c, prompt, "{text}");
+            assert!(c.occupancy.grant().is_some(), "{text}");
+            assert!(notes.is_empty(), "{text}: {notes:?}");
+        }
+        // Each word, unsaid: no note.
+        for (text, want) in [("\"observe\"", &full), ("\"off\"", &off)] {
+            let (c, notes) =
+                SupervisorConfig::from_aterm_toml(&format!("[harness]\noccupancy = {text}\n"));
+            assert_eq!(&c, want, "{text}");
+            assert!(notes.is_empty(), "{text}: {notes:?}");
+        }
+        // An off spelling is the limit, and a value that is no mode keeps
+        // `observe`: each said. A switch's on is NEVER `prompt`.
+        for (text, want) in [
+            ("false", &off),
+            ("\"no\"", &off),
+            ("0", &off),
+            ("\"never\"", &off),
+            ("\"none\"", &off),
+            ("\"disabled\"", &off),
+            ("true", &full),
+            ("\"true\"", &full),
+            ("\"yes\"", &full),
+            ("\"on\"", &full),
+            ("\"On\"", &full),
+            ("1", &full),
+            ("\"sometimes\"", &full),
+            ("3", &full),
+            ("[\"prompt\"]", &full),
+        ] {
+            let (c, notes) =
+                SupervisorConfig::from_aterm_toml(&format!("[harness]\noccupancy = {text}\n"));
+            assert_eq!(&c, want, "{text}");
+            assert!(c.occupancy.grant().is_none(), "{text}");
+            assert_eq!(notes.len(), 1, "{text}: {notes:?}");
+        }
+        // `prompt` is more power: a limit takes it away and never gives it.
+        assert!(!prompt.limits(&full), "prompt is no limit of observe");
+        assert!(full.limits(&prompt), "observe limits prompt");
+        assert!(off.limits(&full) && off.limits(&prompt), "off limits both");
+        assert!(!full.limits(&off), "observe is no limit of off");
+        let mut c = prompt.clone();
+        c.limit("occupancy");
+        assert_eq!(c, off, "its limit is off");
+        assert_eq!(
+            prompt.against_default(),
+            Written {
+                limits: Vec::new(),
+                own: vec!["occupancy"],
+            }
+        );
+        assert_eq!(
+            off.against_default(),
+            Written {
+                limits: vec!["occupancy: off".to_string()],
+                own: Vec::new(),
+            }
+        );
+        assert!(
+            prompt
+                .texts()
+                .contains(&("occupancy", "prompt".to_string()))
+        );
+        assert!(full.texts().contains(&("occupancy", "observe".to_string())));
+        let mut c = full.clone();
+        c.set("occupancy", "prompt").expect("a mode");
+        assert_eq!(c, prompt);
+        // Misplaced, it never grants; it still limits.
+        let (c, notes) =
+            SupervisorConfig::from_aterm_toml("[theme]\nharness.occupancy = \"prompt\"\n");
+        assert_eq!(c, full);
+        assert!(notes[0].contains("`theme.harness.occupancy`"), "{notes:?}");
+        assert_eq!(
+            read("[harness]\noccupancy = \"prompt\"\n[theme]\nharness.occupancy = \"off\"\n")
+                .occupancy,
+            Occupancy::Off,
+            "a misplaced off limits all the same"
+        );
+        assert_eq!(
+            read("[a]\nharness.occupancy = \"prompt\"\n[harness]\noccupancy = \"observe\"\n")
+                .occupancy,
+            Occupancy::Observe,
+            "a table that sorts before `harness` grants nothing either"
+        );
+        // A file that is not TOML: the root section's first word is taken, a
+        // repeat may only limit, and another header's grants nothing.
+        const TYPO: &str = "font_px = \n";
+        for (tail, want) in [
+            ("[harness]\noccupancy = \"prompt\"\n", Occupancy::Prompt),
+            ("harness = { occupancy = \"prompt\" }\n", Occupancy::Prompt),
+            (
+                "[harness]\noccupancy = \"observe\"\noccupancy = \"prompt\"\n",
+                Occupancy::Observe,
+            ),
+            (
+                "[harness]\noccupancy = \"prompt\"\noccupancy = \"observe\"\n",
+                Occupancy::Observe,
+            ),
+            ("[harness]\noccupancy = true\n", Occupancy::Observe),
+            ("[harness]\noccupancy = false\n", Occupancy::Off),
+            (
+                "[theme]\nharness.occupancy = \"prompt\"\n",
+                Occupancy::Observe,
+            ),
+            (
+                "[[keybind]]\nharness.occupancy = \"prompt\"\n",
+                Occupancy::Observe,
+            ),
+            (
+                "[harness]\nnote = \"occupancy = prompt\"\n",
+                Occupancy::Observe,
+            ),
+            ("# harness.occupancy = \"prompt\"\n", Occupancy::Observe),
+        ] {
+            let text = format!("{TYPO}{tail}");
+            assert!(
+                aterm_toml::from_str::<aterm_toml::Value>(&text).is_err(),
+                "the fixture must be one the parser refuses: {text:?}"
+            );
+            assert_eq!(read(&text).occupancy, want, "{text:?}");
         }
     }
 
@@ -3755,8 +4022,7 @@ trust_dialog = false
             assert!(retired_still_limits(key, Some(false)), "{key}");
             assert!(!retired_still_limits(key, Some(true)), "{key}");
             assert!(!retired_still_limits(key, None), "{key}");
-            // A value that is no on or off is no setting: it changes nothing
-            // (owner, 2026-09-25).
+            // A value that is no on or off is no setting: it changes nothing.
             for text in [
                 format!("[harness]\n{key} = \"maybe\"\n"),
                 format!("[harness]\n{key} = 2.5\n"),

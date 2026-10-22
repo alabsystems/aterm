@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A seated headless session's index worker and its host handoff. The existing
-//! index cooldown model owns the cross-process HEAD bound; this model binds the
-//! worker's near/final answers to the real host claim and pass decision.
+//! A seated headless session's index worker and its host handoff. The index cooldown model
+//! owns the cross-process HEAD bound; this model binds the worker's near/final answers to the
+//! real host claim and pass decision.
 
 use aterm_spec::derive::*;
 
-/// An empty store makes no network request. One five-second park after work
-/// appears, the seated session may start its first index HEAD; an empty local
-/// look must not consume the thirty-second *completed network* cooldown.
-/// `Buggy=1` records the old behavior of stamping that cooldown on an empty
-/// look. Tier-1 drives the runner with an injected eligibility flag and clock.
+/// An empty store makes no network request. One five-second park after work appears, the
+/// seated session may start its first index HEAD; an empty local look must not consume the
+/// thirty-second completed-network cooldown, which `Buggy = 1` stamps on an empty look. Tier 1
+/// drives the runner with an injected eligibility flag and clock.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_session_index_eligibility_model() -> Model {

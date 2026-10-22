@@ -3,7 +3,8 @@
 
 //! The `text --json` reply as the supervisor reads it, by a small std-only JSON reader: the
 //! reply is one object of known shape (`{"rows":[…],"cursor":{"row":r,"col":c,…},"dims":{…},
-//! "seq":n,"gen":"e.s","human_ms":n|null}`), and this crate needs no serde stack for it.
+//! "seq":n,"gen":"e.s","human_ms":n|null,…,"frame":"open"}`), and this crate needs no serde
+//! stack for it.
 
 use aterm_types::control_verbs::ScreenGen;
 use std::time::Duration;
@@ -56,14 +57,20 @@ pub struct Screen {
     /// read again ([`crate::supervise::policy::turn_end::TurnEndReading::submits`]).
     /// `None` from a host that sends none.
     pub submits: Option<u64>,
-    /// How many input writes of any kind the session had been sent before
-    /// the rows were read (`"inputs"`' first: keys, text, pastes, raw bytes,
-    /// submitting or not, whoever sent them; never a report), counted only
-    /// where none was in flight, so every one of them had landed before the
-    /// rows. What a later read's [`Self::inputs_after`] is set against: equal,
-    /// no key reached the session between the two screens
+    /// The program's DEC 2026 frame was unfinished at the read (`"frame":"open"`, read
+    /// under the rows' lock): the rows are a prefix of a redraw a PTY burst split, a busy
+    /// row it has not reached yet missing from them. A reader of whole frames waits
+    /// (`await frame`) and reads again (the supervisor's whole-frame read). `false` from
+    /// a host that sends none, and from a frame the server's hang detector gave up on.
+    pub frame_open: bool,
+    /// How many input writes of any kind the session had attempted before
+    /// the rows (`"inputs"`' first: keys, text, pastes, raw bytes, whoever
+    /// sent them; never a report), with no active write, partial frame or
+    /// process-local spill. A later read's [`Self::inputs_after`] equal to
+    /// this excludes new attempts and known buffered input between them
     /// ([`crate::supervise::policy::turn_end::TurnEndState::redrawn_fresh`]).
-    /// `None` while a write was in flight, or from a host that sends none.
+    /// It does not acknowledge the child's processing of kernel-queued
+    /// input. `None` without settled egress or from a host that sends none.
     pub inputs_before: Option<u64>,
     /// The same count read after the rows (`"inputs"`' second): every write
     /// whose effect the rows can show is counted. `None` from a host that
@@ -238,6 +245,7 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         pane_rows: num(v.get("dims"), "rows").and_then(|r| usize::try_from(r).ok()),
         launch: v.get("launch").and_then(launch_witness),
         submits: v.get("submits").and_then(Json::as_u64),
+        frame_open: v.get("frame").and_then(Json::as_str) == Some("open"),
         inputs_before: inputs.and_then(|i| i[0].as_u64()),
         inputs_after: inputs.and_then(|i| i[1].as_u64()),
     })
@@ -688,6 +696,25 @@ mod tests {
         assert_eq!(with(""), None, "an older host");
         assert_eq!(with(r#","submits":"7""#), None);
         assert_eq!(with(r#","submits":-1"#), None);
+    }
+
+    /// `"frame":"open"` (aterm-gui's `text --json`, last in the object, only while the
+    /// program's DEC 2026 frame is unfinished) is an open frame; absent (a whole frame, or an
+    /// older host) and any other value are whole.
+    #[test]
+    fn an_open_frame_is_read_only_from_the_servers_open() {
+        let with = |tail: &str| {
+            parse_text_json(&format!(
+                r#"{{"rows":["❯"],"cursor":{{"row":0,"col":2}},"dims":{{"rows":1,"cols":2}},"seq":15,"submits":3{tail}}}"#
+            ))
+            .expect("parses")
+            .frame_open
+        };
+        assert!(with(r#","frame":"open""#));
+        assert!(!with(""), "a whole frame, or an older host");
+        assert!(!with(r#","frame":"whole""#));
+        assert!(!with(r#","frame":true"#));
+        assert!(!with(r#","frame":null"#));
     }
 
     /// `"inputs"` (aterm-gui's input writes, before and after the rows): both

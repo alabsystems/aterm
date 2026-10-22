@@ -2169,8 +2169,10 @@ Status (2026-10-16): deleted hooks.rs::rc_hook_wired_reads_the_rc_for_the_shell_
 
 Status 2026-10-17: their rows are gone, and so are the two **move-to-bench** rows of `tests/shipped_triples_have_a_compile_cell.rs`, a file deleted in fd110c6c94 (`manifest::every_published_triple_is_a_forge_cell` now checks the published triples against the forge cells).
 
+Status 2026-10-22: the row of `src/stub.rs::probe_lays_every_file_as_this_copy` is gone with the test: its consumer, a_copy_run_from_a_scratch_dir_never_re_points_a_laid_file_at_a_missing_atpkg, makes the lays in its own process (`stub::with_current_exe`), so no copy of the test binary runs.
+
 Actions, of the rows left:
-- delete: 4 tests.
+- delete: 3 tests.
 - move-to-bench: 3 tests: a cost budget and two host or OS probes.
 
 | test | action | why |
@@ -2180,7 +2182,6 @@ Actions, of the rows left:
 | src/landing.rs::the_verb_runs_the_bin_shim_as_a_child_with_its_real_code | **move-to-bench** | Windows-only integration test (cfg(all(test, windows))) that no machine of this repo runs; it checks cmd.exe's exit-code relay, a property of the OS, while the argv it would run is already landing-handover-parse. |
 | src/platform/mod.rs::a_detached_program_starts_at_utility | **move-to-bench** | Measures the OS scheduler band (`ps -o pri`) of a detached child; the code's part (the argv it builds) is platform-utility-clamp; the band itself is a kernel fact. |
 | src/seam.rs::probe_parks_in_the_view_until_killed | **delete** | Not a check: the re-exec entry point a copy of the test binary runs as a stand-in targo for reassert_leaves_a_view_a_live_build_runs_from_and_says_so (returns at once when its env var is unset). It samples nothing. |
-| src/stub.rs::probe_lays_every_file_as_this_copy | **delete** | Not a check: the re-exec entry point for a_copy_run_from_a_scratch_dir_never_re_points_a_laid_file_at_a_missing_atpkg (does nothing when its env var is unset). Goes with its consumer. |
 | tests/packages_log_lanes.rs::concurrent_appender_child | **delete** | The child half that two_processes_appending_at_once_interleave_whole_lines re-executes; it asserts nothing of its own. Make it a non-#[test] entry point, or drop it with its parent when cli-pkglog is proved. |
 
 ## 5. Implied specs that look wrong, or disagree with the code

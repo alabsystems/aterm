@@ -409,9 +409,7 @@ pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(3);
 /// The kinds a session was given as work, whose age is a warning.
 const WORK_KINDS: [&str; 2] = ["task", "ask"];
 
-// ---------------------------------------------------------------------------
 // the command line
-// ---------------------------------------------------------------------------
 
 /// What argv asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -660,9 +658,7 @@ pub fn main(args: &[String]) -> ExitCode {
     }
 }
 
-// ---------------------------------------------------------------------------
 // CONFIG: where the bridge command comes from
-// ---------------------------------------------------------------------------
 
 /// Where the bridge command was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -870,10 +866,8 @@ pub fn presence_from_config() -> crate::presence::Mode {
     )
 }
 
-/// One `[fabric]` key from the aterm.toml [`config_path`] resolves, read by
-/// `in_toml`: `default` when there is no file or no key, and ALSO — said on
-/// stderr (`fallback` names it), not fatal — when the file cannot be read or
-/// the value is wrong.
+/// One `[fabric]` key from the aterm.toml [`config_path`] resolves, read by `in_toml`;
+/// `default` when there is no file or key, or (said on stderr) when either is unusable.
 fn key_from_config<T: Copy>(
     in_toml: fn(&str) -> Result<Option<T>, String>,
     default: T,
@@ -1017,13 +1011,8 @@ fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
-/// Whether `words[i]` is the `aterm link <verb>` / `aterm-link <verb>` verb.
-///
-/// BOTH SPELLINGS: `aterm link` is the front-door verb (`aterm fabric on`
-/// writes it) and `aterm-link` its argv0 alias (the design and the test
-/// harnesses use it). The program before
-/// `link` is not checked, so a renamed or bundled binary
-/// (`…/aterm.app/Contents/MacOS/aterm link serve`) still reads.
+/// Whether `words[i]` is the verb of `aterm link <verb>` (what `aterm fabric on` writes) or
+/// `aterm-link <verb>`. The program before `link` is not checked, so a renamed binary reads.
 fn is_link_verb<S: AsRef<str>>(words: &[S], i: usize, verb: &str) -> bool {
     i >= 1
         && words[i].as_ref() == verb
@@ -1099,9 +1088,7 @@ pub(crate) fn bridge_config<S: AsRef<str>>(argv: &[S]) -> Result<Config, String>
     crate::cli::parse(&flags).map(|p| p.cfg)
 }
 
-// ---------------------------------------------------------------------------
 // the process table
-// ---------------------------------------------------------------------------
 
 /// One process, as `ps` shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1208,9 +1195,7 @@ fn launchd_label(_pid: u32) -> Option<String> {
     None
 }
 
-// ---------------------------------------------------------------------------
 // BROKER
-// ---------------------------------------------------------------------------
 
 /// What the broker probe found.
 #[derive(Debug, Clone, Default)]
@@ -1253,14 +1238,10 @@ pub struct BrokerView {
     /// broker `on` runs is — so every read is made over the faces the caps DO
     /// grant, and TRAFFIC says so.
     pub faces: Option<Vec<String>>,
-    /// Whether the broker CHECKS capabilities, MEASURED rather than read off
-    /// its argv: after the cap files attached and the head answered, the probe
-    /// attaches one grant minted under a secret no broker holds
-    /// ([`GUARD_PROBE_SECRET`]). A guarded broker refuses it (`Some(true)`); one
-    /// that acknowledges it checks nothing (`Some(false)`) — whatever its job
-    /// says, the cap-forced `<src>`, `trust=human` and per-human halts then
-    /// rest on nothing. `None` when no cap file was attached or the bus was
-    /// not read.
+    /// Whether the broker checks capabilities, measured by attaching one grant minted under
+    /// [`GUARD_PROBE_SECRET`]: `Some(true)` when it is refused; `Some(false)` when acknowledged,
+    /// so the cap-forced `<src>`, `trust=human` and per-human halts rest on nothing. `None` when
+    /// no cap was attached or the bus was not read.
     pub guarded: Option<bool>,
     /// The broker's argv0 when that path now names a different file than the image it runs:
     /// an update swapped the build and this broker predates it. A current broker exits on its
@@ -1953,9 +1934,7 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
     }
 }
 
-// ---------------------------------------------------------------------------
 // TRAFFIC
-// ---------------------------------------------------------------------------
 
 /// Every record of the fleet: `/f/<F>/>`. Not `subject::fleet_filter`, which is the fleet
 /// broadcast face (`/f/<F>/fleet/>`, halts and barriers), one subtree of this.
@@ -2353,9 +2332,7 @@ impl OverdueScan {
     }
 }
 
-// ---------------------------------------------------------------------------
 // BRIDGES and local SESSIONS, over the control socket
-// ---------------------------------------------------------------------------
 
 /// One `msg` row this report needs, without its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2710,9 +2687,7 @@ pub(crate) fn session_ids(rows: &[String]) -> impl Iterator<Item = &str> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // the report
-// ---------------------------------------------------------------------------
 
 /// One SESSIONS row: a local session, a live remote one, or both joined.
 #[derive(Debug, Clone, Default)]
@@ -3452,9 +3427,7 @@ fn warnings(
                         .map_or_else(|| "never".to_string(), |a| format!("{} ago", age(a)))
                 ));
             }
-            // OWED AND SILENT: the helper itself is wedged, holding both lanes
-            // open and answering nothing (a dead broker reads `stalled`, a dead
-            // helper `disconnected`).
+            // Owed and silent: the helper is wedged, holding both lanes open.
             (Some("stale"), _) => w.push(format!(
                 "instance {pid}'s bridge has not answered for the work it was given \
                  (fabric=stale, last ack {}): its posts queue and `post --wait` from its \
@@ -3714,9 +3687,7 @@ fn warnings(
     w
 }
 
-// ---------------------------------------------------------------------------
 // rendering
-// ---------------------------------------------------------------------------
 
 /// The local clock's offset from UTC in seconds, from `date +%z`; `None` when it
 /// cannot be run, and then every time prints in UTC and says so.
@@ -3945,9 +3916,8 @@ pub fn publish_exited(report: &Report, ghosts: &[(String, String)]) -> io::Resul
         let subject = crate::subject::session_face(&cfg.fleet, node, sid, "presence");
         let seq = state.reserve_next_sequence(inc)?;
         let (off, deduped) = conn.publish(producer_id, seq, &subject, rewritten.as_bytes())?;
-        // A DEDUPED PUBLISH IS A FAILURE: the broker answers a re-sent
-        // `(producer_id, seq)` with the original offset and appends nothing,
-        // so the row would still read `live` while this reported success.
+        // A deduped publish is a failure: the broker answers a re-sent `(producer_id, seq)`
+        // with the original offset and appends nothing, so the row still reads `live`.
         // `seq` is written without a flush (`crate::state`'s module doc), so
         // a power loss can roll it back below what the bus holds: this run
         // does not roll the incarnation past that, a bridge's attach does.
@@ -5084,9 +5054,7 @@ fn status_main(json: bool) -> ExitCode {
     aterm_uds::stdout::answer_exit("aterm fabric status", &text, code)
 }
 
-// ---------------------------------------------------------------------------
 // tail
-// ---------------------------------------------------------------------------
 
 /// One `tail` line. The widths are fixed, because a live tail cannot know the widest row to
 /// come; the principals are last so a long one only pushes what follows. With `--bodies` the
@@ -6969,7 +6937,7 @@ mod tests {
             fabric: "connected".to_string(),
             ..NodeRow::default()
         }];
-        // Another instance of THIS machine answering as another node is `local`.
+        // Another instance of this machine answering as another node is `local`.
         assert_eq!(node_where(&lonely, "n-a"), "this");
         // WHAT `remote` IS, said under NODES once a row is one: on this
         // one-machine bus a ghost of this machine, which only that node can
@@ -7525,7 +7493,7 @@ mod tests {
             "aterm link serve --fleet lab --broker /tmp/old.sock --state /s",
         ));
         one(&r, "--broker /tmp/old.sock");
-        // ...and the broker the REPORT probed says nothing about that bridge's.
+        // ...and the broker the report probed says nothing about that bridge's.
         r.broker.reachable = false;
         assert!(
             !warned(&r)
@@ -7680,7 +7648,7 @@ mod tests {
         assert_eq!(r.exited, 0, "nothing here is old enough to be a bare count");
         let w = warned(&r);
         assert!(w.iter().any(|l| l.contains("@s-ghost")), "{w:#?}");
-        // AND THE RETIRED ROW EARNS NO WARNING, though it too has `pid: None`.
+        // The retired row earns no warning, though it too has `pid: None`.
         assert!(
             !w.iter().any(|l| l.contains("@s-gone")),
             "a retired row is not advertised live and must not be warned about: {w:#?}"

@@ -118,13 +118,11 @@ impl LevelUp {
         }
     }
 
-    /// The same rim at a RE-PARK of its attempt (round eight of the update audit,
-    /// the review of leads U60 and U40): its cap counts again from `now`, as a
-    /// rim [`Self::charging_continued`] starts there would — already charged, so
-    /// nothing dips — keeping its build and motion. A rim younger than that keeps
-    /// its own instant: its cap is further off already, and its ramp runs on. A
-    /// park the launched lane admitted late after an early miss would otherwise
-    /// freeze the terminal on a cap counted from the first park.
+    /// The same rim at a re-park of its attempt: its cap counts again from `now`,
+    /// as a rim [`Self::charging_continued`] started there would (already charged,
+    /// so nothing dips), keeping its build and motion. A younger rim keeps its own
+    /// instant. Without this a late re-park would run out the cap counted from the
+    /// first park mid-freeze.
     #[cfg(any(unix, test))]
     pub(crate) fn re_anchor(&mut self, now: Instant) {
         let continued = Self::charging_continued(self.build, now, self.motion);

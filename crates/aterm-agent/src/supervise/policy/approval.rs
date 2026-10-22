@@ -103,10 +103,16 @@ use crate::supervise::classify::{
 
 /// The read-only Bash rule's id (the classifier generation it trusts, and the
 /// zsh grammar it requires: v4 refuses arithmetic, an option or a keyword after
-/// `time`, and admits a plain `$NAME`, `${NAME}` and `$(…)` under zsh).
-pub const RULE_READ_ONLY: &str = "read-only@classify-v4";
-/// The rm circuit-breaker rule's id.
-pub const RULE_RM_BREAKER: &str = "rm-breaker@v3";
+/// `time`, and admits a plain `$NAME`, `${NAME}` and `$(…)` under zsh; v5
+/// opens no comment at a `#` right after an escaped blank or newline, which
+/// both shells read as a word's, MEASURED 2026-10-22: v4 took
+/// `echo a\ #; tee x` for a read; and v5 proves no reading whose words turn
+/// on a blank the screen cannot show, [`blanks_shown`]).
+pub const RULE_READ_ONLY: &str = "read-only@classify-v5";
+/// The rm circuit-breaker rule's id. v4 proves no reading whose words turn
+/// on a blank the screen cannot show ([`blanks_shown`]), and reads the rest
+/// of the line with [`RULE_READ_ONLY`]'s v5 classifier.
+pub const RULE_RM_BREAKER: &str = "rm-breaker@v4";
 /// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`])
 /// over a command that names no rm, which every reading of proves a read by
 /// the read-only rule's own checks ([`breaker_read_only`]). Claude Code 2.1.307
@@ -116,7 +122,16 @@ pub const RULE_RM_BREAKER: &str = "rm-breaker@v3";
 /// transcript command, without removing any screen reading, and admits a
 /// plain `$NAME`, `${NAME}` and
 /// `$(…)` under zsh (`docs/measured/breaker-transcript-and-zsh-2026-10-22.md`).
-pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v2";
+/// v3 (breaker-3's `8387171413`, never on `main`) took the transcript's
+/// command in place of the screen's readings; v4 keeps every screen reading
+/// as v2 does, and adds the transcript's command only where it draws as the
+/// box's rows and as the call's own row above the box (`⏺ Bash(…)` over
+/// `Waiting…`), with tabs (to stops of eight) and East Asian wide and
+/// fullwidth characters (two cells) drawn where v2 refused them (MEASURED
+/// on 2.1.308, the note's §H and §W). v4 also proves no reading whose words
+/// turn on a blank the screen cannot show ([`blanks_shown`]), and judges by
+/// [`RULE_READ_ONLY`]'s v5 classifier.
+pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v4";
 /// The rm circuit breaker the safe rules could not prove, approved with a
 /// warning under `approve = "safe"` ([`rm_breaker_warn`]): the one-shot allow
 /// pressed, the failed proof kept as `unproven` and said as one `WARN` line.
@@ -152,7 +167,7 @@ pub const RULE_DECLINE: &str = "decline@v1";
 /// `Switch to <model>` while `[harness] model_fallback` is set
 /// ([`ApprovalCtx::model_fallback`], [`refusal_pause_switch`]).
 pub const RULE_MODEL_SWITCH: &str = "model-switch@v1";
-/// A box taller than the screen in a bypass session, DECLINED with what its
+/// A box taller than the screen in a bypass session, declined with what its
 /// foot note flags ([`tall_box`]): it never approves.
 pub const RULE_TALL_BOX: &str = "tall-box@v1";
 /// Full power: the model-switch confirmation's `Yes, switch to <m>` — the
@@ -744,7 +759,7 @@ pub struct ApprovalCtx {
     /// not read. Read by the loop only for the rm breaker's too-many box over
     /// barred rows ([`super::box_command::may_prove`]) that the screen's
     /// readings alone do not prove. [`breaker_read_only`] adds its command
-    /// only where it draws as the box's rows exactly
+    /// only where it draws as the box's rows and its call's row exactly
     /// ([`super::box_command::drawn_as`]); every screen reading is kept, since
     /// neither matching rows nor elapsed time binds this call to this box.
     pub box_command: Option<Result<BoxCommand, String>>,
@@ -1037,9 +1052,8 @@ pub(crate) fn kept_for_good(o: &Opt) -> bool {
 /// may not be pressed, whatever rule chose it — its answer is kept for every
 /// later ask ([`kept_for_good`]) or it buys something ([`buys`]). A
 /// question's options are the question rule's to judge
-/// ([`super::question`]), descriptions and all, and the grant row is the
-/// reset's own rule's ([`RULE_LIMIT_RESET`], answered for by
-/// [`never_spends`]).
+/// ([`super::question`]), and the grant row is [`RULE_LIMIT_RESET`]'s,
+/// answered for by [`never_spends`].
 fn kept_or_bought(p: &PromptV2, decision: &Decision) -> Option<String> {
     let Decision::Approve {
         rule_id, choice, ..
@@ -1483,7 +1497,7 @@ pub fn proof_would_lift(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -
 ///   with no reason, so neither the rule's specifier nor the hook's answer
 ///   can be read off it, and in auto mode the box is there only because one
 ///   of them asked (DECIDED 2026-10-15, fail-closed toward the owner's rules;
-///   ATERM-KI-1015-1 F1). The conservative over-hold remains: a transcript
+///   F1). The conservative over-hold remains: a transcript
 ///   may retain an older Edit of the same file while the current Bash call
 ///   is not written yet, and a queued Edit's childless row can stand over
 ///   that Bash box while its Waiting row is off-screen. Neither observation
@@ -2136,7 +2150,11 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
             }
         }
         // After the line's own proof: a refused line is refused on where it
-        // points, and a proven one still needs the assumed shell startup.
+        // points, and a proven one still needs the screen to show its blanks
+        // and the assumed shell startup.
+        if let Err(why) = blanks_shown(&readings) {
+            return Decision::escalate(format!("rm circuit breaker: {why}"));
+        }
         if let Err(why) = shell_models_hold(&readings, None, ctx) {
             return Decision::escalate(format!("rm circuit breaker: {why}"));
         }
@@ -2161,6 +2179,9 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         return Decision::escalate("a box in a bypass session is a vendor circuit breaker");
     }
     if let Err(why) = read_only_every_reading(&readings, &ctx.python_allow) {
+        return Decision::escalate(why);
+    }
+    if let Err(why) = blanks_shown(&readings) {
         return Decision::escalate(why);
     }
     if let Err(why) = shell_models_hold(&readings, prompt.runs_on().as_deref(), ctx) {
@@ -2282,6 +2303,20 @@ pub(crate) fn read_only_every_reading(
     Ok(())
 }
 
+/// `Ok` when no reading of a Bash box's rows ([`command_readings`]) holds a
+/// form in which the shell may read a blank the screen does not show
+/// ([`box_command::blanks_read_as_drawn`]: the screen draws a tab as the
+/// blanks to its stop and shows no blank at a row's end, so a command the
+/// shell reads otherwise draws as the same rows); `Err` names the reading and
+/// the form. Every rule that proves a Bash box from its rows needs this: a
+/// reading proves only the commands the shell reads as it.
+fn blanks_shown(readings: &[String]) -> Result<(), String> {
+    readings.iter().try_for_each(|line| {
+        box_command::blanks_read_as_drawn(line)
+            .map_err(|why| format!("not read as drawn ({}): {why}", reading_name(line)))
+    })
+}
+
 /// Why no rule approves the nested breaker ([`RmBreakerKind::NestedUnanalyzed`]),
 /// read from 2.1.307's bundle and MEASURED: the vendor draws it only for a line
 /// whose parse put a shell keyword right after an assignment or a redirect
@@ -2300,8 +2335,10 @@ const NESTED_UNPROVEN: &str = "the vendor draws this only over a shell keyword r
 /// whole command a read, by the checks [`bash`]'s read-only rule trusts and
 /// with nothing narrowed. Every reading of the box's command is judged
 /// ([`PromptV2::readings`]; a barred box's rows newline-joined too, since the
-/// screen cannot tell a wrap from a newline). A matching transcript call
-/// ([`ApprovalCtx::box_command`]) adds its reading, never removes one: an
+/// screen cannot tell a wrap from a newline), and none may turn on a blank
+/// the screen cannot show ([`blanks_shown`]). A matching transcript call
+/// ([`ApprovalCtx::box_command`], drawn as the box's rows and its call's row:
+/// [`box_command::drawn_as`]) adds its reading, never removes one: an
 /// older call can remain pending while this box's call has not reached the
 /// file, even across the settle. Drawing alike is no current-box identity.
 /// A refusal also says why a transcript call was not taken. Each
@@ -2334,8 +2371,11 @@ fn breaker_read_only(
         return refused(why);
     }
     // A stable transcript can still name an older call. Keep every screen
-    // reading, even where that call draws exactly the same rows.
+    // reading, even where that call draws exactly the same rows. The
+    // screen's readings are its text, whose blanks may not be the command's;
+    // the call's command is its own.
     let (mut readings, subject) = command_readings(prompt, rows, false);
+    let unseen = blanks_shown(&readings);
     let (from_transcript, not_taken) = match &ctx.box_command {
         Some(Ok(call)) => match box_command::drawn_as(prompt, rows, &call.command) {
             Ok(()) => {
@@ -2369,6 +2409,7 @@ fn breaker_read_only(
     }
     let runs_on = prompt.runs_on();
     let proven = read_only_every_reading(&readings, &ctx.python_allow)
+        .and(unseen)
         .and_then(|()| shell_models_hold(&readings, runs_on.as_deref(), ctx))
         .and_then(|()| plain_under_zsh(&readings, ctx))
         .and_then(|()| git_reads_clear(&readings, runs_on.as_deref(), ctx));
@@ -2716,9 +2757,8 @@ fn read_box(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         return Decision::escalate(format!("a Read of a path outside plain ASCII: {path}"));
     }
     // The view the model asked for rides inside the call (`Read(<path> · lines
-    // 1-5)`), and the screen cannot tell a path with a view from a name that
-    // ends like one (a link named `k · lines 1-5` is a file Claude Code reads):
-    // every path the text can mean is judged, and the press waits on all.
+    // 1-5)`), and the screen cannot tell it from a name that ends like one: every
+    // path the text can mean is judged.
     // Every reading's text first, then the disk: a reading that names a secret
     // says so whatever a sibling reading's folders let this user look at.
     let mut lexical = Vec::new();

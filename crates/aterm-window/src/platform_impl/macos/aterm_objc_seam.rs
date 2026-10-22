@@ -64,7 +64,6 @@
 
 use aterm_objc::Id;
 
-// ---------------------------------------------------------------------------
 // THE CROSSINGS: NONE. W12 DELETED ALL FOUR, and the compiler is what found
 // them — `cargo build -p winit` reported `objc2_ref`, `witness`, `marker` and
 // `obj_of` dead within one build of porting the last four backend files.
@@ -85,11 +84,8 @@ use aterm_objc::Id;
 // What is left here was never a crossing: two string helpers, the CONSTANTS and
 // the framework GLOBALS. The module keeps its name because it is the fork's
 // binding layer now, which is what the header calls the second kind of content.
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // STRINGS.
-// ---------------------------------------------------------------------------
 
 /// An `NSString` for `s`, +1, or `None` if Foundation refused it.
 #[must_use]
@@ -110,7 +106,6 @@ pub(super) unsafe fn nsstring_to_rust(s: Id) -> String {
     unsafe { aterm_objc::ns_string_to_rust(s) }
 }
 
-// ---------------------------------------------------------------------------
 // AppKit and Foundation CONSTANTS, at the SDK's own values.
 //
 // # Every value below is `_Static_assert`ed against the SDK on BOTH arches
@@ -150,7 +145,6 @@ pub(super) unsafe fn nsstring_to_rust(s: Id) -> String {
 // result, not an assumption — it is exactly what the tab strip's alignment
 // constant did NOT satisfy, and the only reason it can be stated here is that
 // both arms were compiled.
-// ---------------------------------------------------------------------------
 pub(super) mod consts {
     // ---- NSWindow.h, NSWindowStyleMask (NSUInteger) ----
     pub(crate) const NS_WINDOW_STYLE_MASK_TITLED: usize = 1 << 0;
@@ -274,7 +268,6 @@ pub(super) mod consts {
     pub(crate) const NS_UTF8_STRING_ENCODING: usize = 4;
 }
 
-// ---------------------------------------------------------------------------
 // The FRAMEWORK GLOBALS — the exception the `consts` note names.
 //
 // These seven are real exported symbols rather than header values, and the
@@ -306,7 +299,6 @@ pub(super) mod consts {
 //
 // They are VARIABLES, so each binding is the address of a live framework global
 // and each read is one dereference, not a call.
-// ---------------------------------------------------------------------------
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {
     /// `NSApplication.h` — the running AppKit's version, as a `double`.

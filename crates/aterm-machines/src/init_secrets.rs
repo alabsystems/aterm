@@ -6,7 +6,7 @@
 //! keeps the ALab default, `none` skips), ask for its join password (`none` skips there too),
 //! join it, and install the subscriber that keeps `~/.secrets` in sync. It runs before the
 //! GitHub step, so the token files the vault carries (`~/.secrets/gh_access_token`) exist
-//! before `gh` is authenticated.
+//! before the GitHub token is checked and stored in the login keychain.
 //!
 //! The vault is reached through one port, [`SecretsOps`]: [`LiveSecrets`] calls
 //! `aterm_secrets::client` and `aterm_secrets::service`; tests script a fake. A probe reads

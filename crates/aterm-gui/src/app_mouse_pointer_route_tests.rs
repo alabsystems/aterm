@@ -859,7 +859,7 @@ fn native_focused_beside_a_tracking_terminal() -> (App, WindowId, u64, UnixStrea
     (app, wid, terminal, wire)
 }
 
-/// ATERM-KI-1015-9: with a native page focused, a non-left press and a wheel
+/// with a native page focused, a non-left press and a wheel
 /// notch over the terminal beside it are that terminal's, at its own cell,
 /// routed by the pane under the pointer as they are between two terminals.
 /// Before, the page's pointer boundary swallowed the button and scrolled the
@@ -897,7 +897,7 @@ fn a_press_and_wheel_over_a_terminal_beside_a_focused_native_page_reach_its_prog
     assert_eq!((ws.reported_buttons, ws.held_mouse_button), (0, None));
 }
 
-/// ATERM-KI-1015-9: a reported press whose release a modal swallows still
+/// a reported press whose release a modal swallows still
 /// ends: the program that got the press is told the button went up, and the
 /// window holds no button. Before, a non-left release the palette swallowed
 /// left the button marked held, so every later motion reported a drag to the
@@ -966,7 +966,7 @@ fn page_pressed(app: &App, wid: WindowId) -> Option<crate::native_ui::UiKey> {
         .clone()
 }
 
-/// ATERM-KI-1015-9 review: while a press the terminal beside a focused native
+/// review: while a press the terminal beside a focused native
 /// page took is held, a left press on the page is the page's: it arms the
 /// control under the pointer, and the terminal's program sees no left press.
 /// The held button decides where its own drag and release go, not where a new
@@ -1005,7 +1005,7 @@ fn a_left_press_on_the_page_while_the_terminal_beside_it_holds_a_button_is_the_p
     assert_eq!((ws.reported_buttons, ws.held_mouse_button), (0, None));
 }
 
-/// ATERM-KI-1015-9 review: a drag that starts on a focused native page is the
+/// review: a drag that starts on a focused native page is the
 /// page's while its button is held, so the terminal beside it, whose program
 /// tracks every motion, is not sent hover reports as the pointer crosses into
 /// it; once the button is up, the hover is that program's again. Before, the
@@ -1044,7 +1044,7 @@ fn a_drag_from_the_page_over_the_terminal_beside_it_is_not_reported_to_its_progr
     );
 }
 
-/// ATERM-KI-1015-9 review: a left press on an empty part of the focused page
+/// review: a left press on an empty part of the focused page
 /// (no control under it, so nothing is armed) is the page's too, and so is its
 /// drag: the terminal beside it, whose program tracks every motion, is sent no
 /// hover reports while the button is held, and the hover is its program's

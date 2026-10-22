@@ -18,9 +18,7 @@
 
 use crate::effect_util::lerp_rgb;
 
-// ---------------------------------------------------------------------------
 // The arc's constants.
-// ---------------------------------------------------------------------------
 
 /// The seven names, `0x00RRGGBB`, red → violet: canonical ROYGBIV and the arc's
 /// control points, read directly by the generator. Green and blue are adjacent
@@ -62,9 +60,7 @@ const _: () = assert!(
     "the seven anchors must land on exact path slots"
 );
 
-// ---------------------------------------------------------------------------
 // The pace: how the path's 510 units are spent across the table's 510 steps.
-// ---------------------------------------------------------------------------
 
 /// The share of the pace that is hue, against OKLab distance: `0.60`.
 ///
@@ -114,9 +110,7 @@ const SPECTRUM_CROSSING_ENTRY_CAP: usize = 167;
 /// the interior names where the pace put them.
 pub const SPECTRUM_ANCHOR_AT: [usize; SPECTRUM_STOPS] = [0, 58, 130, 237, 404, 474, 510];
 
-// ---------------------------------------------------------------------------
 // The colour space: sRGB HSV for hue/chroma.
-// ---------------------------------------------------------------------------
 
 /// Cubic smoothstep `0..1`, clamping: the segment's eased coordinate. It gives
 /// the arc zero hue slope at every anchor, so the reflected sweep is C¹ at both
@@ -474,9 +468,7 @@ fn spectrum_pace_at(cum: &[(f64, [f64; 3])], cost: &impl Fn([f64; 3]) -> f64, wa
     cum[lo].0 + (cum[hi].0 - cum[lo].0) * (want - c0) / (c1 - c0)
 }
 
-// ---------------------------------------------------------------------------
 // The read
-// ---------------------------------------------------------------------------
 
 /// The one spectrum at position `t`: `0` is red, `1` is violet.
 ///

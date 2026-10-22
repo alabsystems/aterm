@@ -1163,7 +1163,8 @@ fn the_other_readers_see_no_box_and_no_question_on_gemini_screens() {
 /// own process carries) or under `gemini`, EVERY screen it draws names it —
 /// its composer idle, holding a draft, busy, retrying and at a turn's end,
 /// its menu, each box, its question, its usage-limit and trust dialogs, its
-/// error rows — but the screen it left. NEGATIVE CONTROLS: a screen with its
+/// error rows — but the screen it left and a redraw caught half drawn
+/// ([`ERASE_HALF`], no screen it drew whole). NEGATIVE CONTROLS: a screen with its
 /// words and no frame names nothing; a shell's name wins over its screen.
 #[test]
 fn a_shell_quoting_gemini_is_not_gemini() {
@@ -1176,7 +1177,7 @@ fn a_shell_quoting_gemini_is_not_gemini() {
     let mut named = 0;
     for (file, text) in captures() {
         let rows = screen(&text);
-        if text == EXIT {
+        if text == EXIT || text == ERASE_HALF {
             continue;
         }
         for name in [None, Some("node"), Some("/opt/homebrew/bin/gemini")] {
@@ -1193,7 +1194,11 @@ fn a_shell_quoting_gemini_is_not_gemini() {
         );
         named += 1;
     }
-    assert_eq!(named, captures().len() - 1, "every capture but the exit");
+    assert_eq!(
+        named,
+        captures().len() - 2,
+        "every capture but the exit and the half-drawn redraw"
+    );
     assert!(named >= 22, "the 0.46.0 captures: {named}");
     let quoted = rows(&[
         "% grep -h Thinking log.txt",
@@ -1292,14 +1297,19 @@ fn only_gemini_clis_caret_is_one_column_in() {
 /// Code, agy and Muse Code under `src/fixtures/`, Gemini CLI's layout
 /// test says no, the screen is never identified as Gemini CLI's, and Gemini
 /// CLI's reader reads no box and no composer on it. The control: it says
-/// yes on Gemini CLI's own (but the one it left).
+/// yes on Gemini CLI's own (but the one it left and the redraw caught half
+/// drawn, [`ERASE_HALF`]).
 #[test]
 fn the_gemini_sniff_claims_no_other_programs_screen() {
     let mut swept = 0;
     for (name, text) in crate::text::fixture_files() {
         let r = screen(&text);
         if name.starts_with("gemini-") {
-            assert_eq!(is_gemini_screen(&r), text != EXIT, "{name}");
+            assert_eq!(
+                is_gemini_screen(&r),
+                text != EXIT && text != ERASE_HALF,
+                "{name}"
+            );
             continue;
         }
         swept += 1;

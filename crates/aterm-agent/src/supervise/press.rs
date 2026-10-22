@@ -594,15 +594,12 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
-    /// One question key, `key [if-human=<now's person count>] if-gen=<now's
-    /// generation> if=<guard> <key>`: [`Keyed::Written`] with the server's
-    /// seq, or why not: a skip (`reason=person`, a person keyed since the
-    /// read: [`Press::Yielded`]; `reason=changed`: [`Press::Changed`]; no row
-    /// matched: [`Press::Skipped`]), or a refusal ([`Self::refused_press`]).
-    /// A key that may have been written latches the dialog's word. A read
-    /// with no count sends the key with no person fence, so the recommended
-    /// option of a dialog a text word fell back on stays answerable on such a
-    /// host (the policy text is refused there instead, [`Self::question_text`]).
+    /// One question key, `key [if-human=<count>] if-gen=<generation> if=<guard> <key>`:
+    /// [`Keyed::Written`] with the server's seq, or a skip ([`Self::written_or_not`]) or refusal
+    /// ([`Self::refused_press`]). A key that may have been written latches the dialog's word. A
+    /// read with no person count sends no person fence, so the recommended option a text word
+    /// fell back on stays answerable on such a host (the policy text is refused there,
+    /// [`Self::question_text`]).
     fn question_key(
         &mut self,
         guard: &str,

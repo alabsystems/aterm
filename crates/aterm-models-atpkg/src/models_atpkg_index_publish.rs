@@ -133,10 +133,10 @@ fn write_at(n: &Expr, code: &Expr) -> Vec<Update> {
         .collect()
 }
 
-/// THE READER: a strict walk from the verified floor `f` — HEAD `f+1`, `f+2`, … on the
-/// download host and stop at the first number that does not answer. The client's own walk
-/// may do more (look past one missing number), never less, so a channel this walk crosses
-/// is one every client crosses.
+/// The reader: a strict walk from the verified floor `f` (HEAD `f+1`, `f+2`, … on the download
+/// host, stopping at the first number that does not answer). The client's own walk may do more
+/// (look past one missing number), never less, so a channel this walk crosses every client
+/// crosses.
 fn walk_from(f: Expr) -> Expr {
     let from3 = if_(published(4), int(4), int(3));
     let from2 = if_(published(3), from3.clone(), int(2));
@@ -152,8 +152,8 @@ fn walk_from(f: Expr) -> Expr {
     )
 }
 
-/// Publishing index N is admitted: the number is the baseline's successor and the baseline
-/// is PUBLISHED (the indexer's two guards; `Buggy = 1` drops both).
+/// Publishing index N is admitted: the number is the baseline's successor and the baseline is
+/// published (the indexer's two guards; `Buggy = 1` drops both).
 fn number_admitted(p: &Publisher) -> Expr {
     or_(
         eq(cst("Buggy"), int(1)),
@@ -164,40 +164,31 @@ fn number_admitted(p: &Publisher) -> Expr {
     )
 }
 
-/// `atpkg-publish index` (the WRITER) and the client's tag walk (the READER) as ONE
-/// contract. Two publishers — the ALab lane, the Linux lane, the rustc-group publish and a
-/// hand publish all run the same indexer — each READ a baseline (the channel's newest
-/// published index), then publish `atpkg-index-<baseline + 1>`:
+/// `atpkg-publish index` (the writer) and the client's tag walk (the reader) as one contract.
+/// Two publishers (the ALab lane, the Linux lane, the rustc-group publish and a hand publish all
+/// run the same indexer) each read a baseline, the channel's newest published index, then
+/// publish `atpkg-index-<baseline + 1>`:
 ///
-/// * `Create` — the tag is absent: `gh release create` makes a draft, uploads, and
-///   publishes it (`Finish`); a run killed in between (`Die`) leaves the draft.
-/// * `Converge` — the tag holds THIS publisher's identical bytes (its own killed run): the
+/// * `Create`: the tag is absent; `gh release create` makes a draft, uploads and publishes it
+///   (`Finish`); a run killed in between (`Die`) leaves the draft.
+/// * `Converge`: the tag holds this publisher's identical bytes (its own killed run); the
 ///   missing assets are uploaded and a draft is published.
-/// * `Refuse` — anything else: another publisher's bytes under the tag (the upload is a
-///   compare-and-swap, never a clobber), a baseline that is not published, or a number that
-///   is not the baseline's successor. Nothing is written; the next run re-reads.
+/// * `Refuse`: anything else (another publisher's bytes under the tag, since the upload is a
+///   compare-and-swap, never a clobber; an unpublished baseline; a number that is not the
+///   baseline's successor). Nothing is written; the next run re-reads.
 ///
-/// A client (`Walk`) moves its verified floor to where the strict walk lands; `Seed<k>` puts
-/// a fresh store's floor on any published index, so the walk is judged from every floor.
+/// A client (`Walk`) moves its verified floor to where the strict walk lands; `Seed<k>` puts a
+/// fresh store's floor on any published index, so the walk is judged from every floor.
 ///
 /// Invariants: the published tags are ONE RUN from the first (`OneRun`), so the walk from
 /// every verified floor lands the newest published index (`WalkLandsNewest`), and no
 /// publisher ever replaces a tag another one wrote (`NoOverwrite`).
 ///
-/// `Buggy = 1` is the publish path before 2026-09-23: a baseline read that counts DRAFTS (a
-/// `gh release list` without `--exclude-drafts`, under a token that sees them), a number
-/// past the baseline's successor (the indexer only warned on one), no published-baseline
-/// check, and an upload that clobbers instead of comparing bytes. Each invariant has its
-/// own counterexample: A publishing 3 over an absent 2, or B publishing 4 on A's orphaned
-/// draft at 3, is a hole the walk from 1 cannot cross; B converging onto A's tag overwrites
-/// it.
-///
-/// Tier-1 is two halves. The writer's (`crates/atpkg-publish/tests/channel/
-/// conformance_index_publish.rs`) drives the real indexer's number and compare-and-swap
-/// decisions from every modelled publisher state against a fake channel, with every
-/// `Buggy = 1` decision refused; the reader's (`crates/atpkg/src/net/
-/// index_publish_conformance.rs`) drives the real tag walk over every reachable channel,
-/// its negative control a `Buggy = 1` hole that the real walk does not cross either.
+/// Tier 1 has two halves: the writer's (`atpkg-publish/tests/channel/conformance_index_publish.rs`)
+/// drives the real indexer's number and compare-and-swap decisions from every modeled publisher
+/// state against a fake channel, refusing every `Buggy = 1` decision; the reader's
+/// (`atpkg/src/net/index_publish_conformance.rs`) drives the real tag walk over every reachable
+/// channel, its negative control a `Buggy = 1` hole the real walk does not cross either.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
@@ -218,9 +209,8 @@ pub fn atpkg_index_publish_walk_model() -> Model {
             ),
             admitted,
         );
-        // The baseline READ: the newest published tag (Buggy: the newest release of any
-        // kind). The number is its successor (Buggy: the one after, where there is one —
-        // an INDEX_BUILD the old indexer only warned about).
+        // The baseline read: the newest published tag (Buggy: the newest release of any
+        // kind). The number is its successor (Buggy: also the one after, where there is one).
         let newest = if_(buggy(), highest(present), highest(published));
         let idle = |updates: &mut Vec<Update>| {
             for (var_name, value) in [(p.phase, 0), (p.base, 1), (p.next, 2)] {

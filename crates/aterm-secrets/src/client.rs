@@ -1049,7 +1049,7 @@ fn files_intact(paths: &Paths, state: &State) -> bool {
 
 fn missing(config: &Config) -> Error {
     Error::new(format!(
-        "the source holds no vault named {}; an admin's next command puts its copy back",
+        "the source holds no vault named {}; an admin Mac puts its copy back",
         config.name
     ))
 }
@@ -1096,7 +1096,15 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
             }
             return Ok(SyncOutcome::Unchanged { seq: state.seq });
         }
-        Fetched::Missing => return Err(missing(&config)),
+        Fetched::Missing => {
+            // A server without the vault lost its store, and the join queue with it: a machine
+            // still waiting asks again at the first pass that finds the vault back.
+            if state.membership == Stored::Pending && state.requested != 0 {
+                state.requested = 0;
+                save_state(paths, &state)?;
+            }
+            return Err(missing(&config));
+        }
         Fetched::Body(bytes) => bytes,
     };
     if config.signer.is_some()
@@ -1248,7 +1256,8 @@ fn pause_after(source: &Source, outcome: &SyncOutcome, failing: &mut Duration) -
 /// or, for an ` if-absent` entry, rewritten by a program, which the apply then leaves the
 /// machine's own), so [`materialization_ready`] says not ready until an apply. Once per
 /// source and version (`repaired`), so a program that keeps rewriting a file is not fought
-/// on every pass, and a different vault at the same sequence still gets its repair.
+/// on every pass, and a different vault at the same sequence still gets its repair; a pass
+/// that fails gives the repair back ([`subscriber_pass`]).
 fn repair_due(paths: &Paths, repaired: &mut Option<([u8; 32], u64)>) -> bool {
     let Ok(state) = load_state(paths) else {
         return false;
@@ -1283,18 +1292,7 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
             return Ok(());
         }
         let started = Instant::now();
-        let pass = config(paths).and_then(|config| {
-            let config = config
-                .ok_or_else(|| Error::new("no vault configured; waiting for aterm secrets join"))?;
-            let wait = match config.source {
-                Source::Url(_) if !repair_due(paths, &mut repaired) => {
-                    Some(Duration::from_secs(55))
-                }
-                Source::Url(_) | Source::Path(_) => None,
-            };
-            sync(paths, wait).map(|outcome| (config, outcome))
-        });
-        match pass {
+        match subscriber_pass(paths, &mut repaired) {
             Ok((config, outcome)) => {
                 backoff = Duration::from_secs(5);
                 last_error.clear();
@@ -1342,16 +1340,55 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
     }
 }
 
+/// One of the subscriber's passes: long-poll a URL for a newer version, or fetch and apply the
+/// one held when a repair is due ([`repair_due`]) or the source is a path. A repair counts as
+/// made only once its pass succeeds: one that cannot reach the server leaves it due, so the
+/// next pass that does puts the files back, rather than long-polling until a new version.
+fn subscriber_pass(
+    paths: &Paths,
+    repaired: &mut Option<([u8; 32], u64)>,
+) -> crate::Result<(Config, SyncOutcome)> {
+    let config = config(paths)?
+        .ok_or_else(|| Error::new("no vault configured; waiting for aterm secrets join"))?;
+    let before = *repaired;
+    let wait = match config.source {
+        Source::Url(_) if !repair_due(paths, repaired) => Some(Duration::from_secs(55)),
+        Source::Url(_) | Source::Path(_) => None,
+    };
+    match sync(paths, wait) {
+        Ok(outcome) => Ok((config, outcome)),
+        Err(error) => {
+            *repaired = before;
+            Err(error)
+        }
+    }
+}
+
 /// A machine still waiting for approval re-queues its request every hour (the queue keeps
-/// requests seven days), with the proof it made when the person typed the password.
+/// requests seven days), with the proof it made when the person typed the password, and at
+/// once after a request that was never queued ([`request_join`]) or that the server lost
+/// with its store ([`sync`]). The state is read under the lock with source.toml, and only
+/// while that still names `config`'s vault: a join to another vault since (its request cut
+/// off, so due at once) holds a proof made for that one, which must never reach this one's
+/// queue, where anyone may read it and test guesses at that vault's password.
 fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
-    let Ok(state) = load_state(paths) else {
+    let due = || -> crate::Result<Option<Option<String>>> {
+        let _lock = StateLock::take(paths)?;
+        if self::config(paths)?.is_none_or(|current| {
+            (&current.source, &current.name) != (&config.source, &config.name)
+        }) {
+            return Ok(None);
+        }
+        let state = load_state(paths)?;
+        Ok(
+            (state.membership == Stored::Pending && now().saturating_sub(state.requested) >= 3600)
+                .then_some(state.proof),
+        )
+    };
+    let Ok(Some(proof)) = due() else {
         return;
     };
-    if state.membership != Stored::Pending || now().saturating_sub(state.requested) < 3600 {
-        return;
-    }
-    match request_join(paths, config, state.proof.clone()) {
+    match request_join(paths, config, proof) {
         Ok(code) => log(&format!("asked to join again (code {code})")),
         Err(error) => log(&format!("join request failed: {error}")),
     }
@@ -1480,6 +1517,17 @@ fn approval_here(
         .map(|approval| (config, seq, approval)))
 }
 
+/// What this machine's approver lets in without a person, read off the version it holds as
+/// the approver reads it (the cached envelope's admin locker; no network): `None` when no
+/// vault with a join queue (a URL's; a path has none) is configured, this machine is no admin
+/// of it, or the vault approves nothing by itself. What `aterm secrets status` asks before it
+/// says whether the approver runs.
+pub fn approving_here(paths: &Paths) -> crate::Result<Option<Approval>> {
+    Ok(approval_here(paths, &mut None)?
+        .filter(|(config, _, _)| matches!(config.source, Source::Url(_)))
+        .map(|(_, _, approval)| approval))
+}
+
 /// The approver half of an admin's subscriber: while this machine is an admin of a vault with
 /// a join password or an open one, read the join queue every 2 s and approve what proves the
 /// password, or (open) what comes from a machine not in the vault. What [`auto_approve`]
@@ -1487,54 +1535,103 @@ fn approval_here(
 /// requests already judged (refused, left to a person, or approved and still queued for days)
 /// costs one GET a pass, never another admin open, key derivation or publish. A queue whose
 /// requests keep changing (a host posting new proofs) costs at most one admin open and one key
-/// derivation a pass, whatever it lists: one [`auto_approve`] judges them all.
+/// derivation a pass, whatever it lists: one [`auto_approve`] judges them all. A server that
+/// no longer holds the vault gets this admin's copy back ([`put_back_lost`]).
 fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) {
-    let mut settled = Settled::default();
-    let mut checked = None;
+    let mut approver = Approver::default();
     while !stop.load(Ordering::Relaxed) {
-        let (config, seq, approval) = match approval_here(paths, &mut checked) {
-            Ok(Some(held)) => held,
-            Ok(None) => {
-                nap(stop, Duration::from_secs(30));
-                continue;
+        let pause = approver_pass(paths, log, &mut approver);
+        nap(stop, pause);
+    }
+}
+
+/// What the approver keeps from one pass to the next.
+#[derive(Default)]
+struct Approver {
+    settled: Settled,
+    checked: Option<ApprovalCheck>,
+    /// When it last looked for a vault its server lost.
+    lost_checked: Option<Instant>,
+}
+
+/// One of the approver's passes ([`approver_loop`]): how long to wait before the next.
+fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> Duration {
+    let (config, seq, approval) = match approval_here(paths, &mut approver.checked) {
+        Ok(Some(held)) => held,
+        Ok(None) => return Duration::from_secs(30),
+        Err(_) => return Duration::from_secs(2),
+    };
+    let pending = match requests_for(&config, None) {
+        Ok(pending) => pending,
+        Err(_) => {
+            put_back_lost(paths, &config, &mut approver.lost_checked, log);
+            return Duration::from_secs(10);
+        }
+    };
+    let by = match approval {
+        Approval::Password => "by the join password",
+        Approval::Open => "as the vault is open",
+    };
+    if approver.settled.due(&config, seq, &pending, approval) {
+        let done = admin_open(paths).and_then(|admin| {
+            if admin.config != config || admin.seq != seq {
+                return Err(Error::new("the vault changed while checking approval"));
             }
-            Err(_) => {
-                nap(stop, Duration::from_secs(2));
-                continue;
+            auto_approve_opened(paths, &admin)
+        });
+        match done {
+            Ok(done) => {
+                if !done.approved.is_empty() {
+                    log(&format!("approved {} {by}", done.approved.join(", ")));
+                }
+                approver.settled.settle(done.judged);
             }
-        };
-        let pending = match requests_for(&config, None) {
-            Ok(pending) => pending,
-            Err(_) => {
-                nap(stop, Duration::from_secs(10));
-                continue;
-            }
-        };
-        let by = match approval {
-            Approval::Password => "by the join password",
-            Approval::Open => "as the vault is open",
-        };
-        if settled.due(&config, seq, &pending, approval) {
-            let done = admin_open(paths).and_then(|admin| {
-                if admin.config != config || admin.seq != seq {
-                    return Err(Error::new("the vault changed while checking approval"));
-                }
-                auto_approve_opened(paths, &admin)
-            });
-            match done {
-                Ok(done) => {
-                    if !done.approved.is_empty() {
-                        log(&format!("approved {} {by}", done.approved.join(", ")));
-                    }
-                    settled.settle(done.judged);
-                }
-                Err(error) => {
-                    log(&format!("approving {by} failed: {error}"));
-                    nap(stop, Duration::from_secs(30));
-                }
+            Err(error) => {
+                log(&format!("approving {by} failed: {error}"));
+                return Duration::from_secs(30);
             }
         }
-        nap(stop, Duration::from_secs(2));
+    }
+    Duration::from_secs(2)
+}
+
+/// How often the approver checks whether its server lost the vault, while the queue cannot
+/// be read ([`put_back_lost`]).
+const PUT_BACK_EVERY: Duration = Duration::from_secs(60);
+
+/// The approver could not read the join queue: when that is because the server answers that
+/// it holds no vault of this name (its Mac's store was lost, or the server moved to another
+/// Mac with an empty one), put this admin's cached copy back, as its next admin command
+/// would ([`admin_open`]), and say so in the log. At most once a minute (`last`), so a
+/// server that keeps refusing the copy (another `--pin` for the name) is asked no more often;
+/// a server that cannot be reached, or refuses the listing for another reason, is left as it
+/// is.
+fn put_back_lost(paths: &Paths, config: &Config, last: &mut Option<Instant>, log: &dyn Fn(&str)) {
+    if last.is_some_and(|at| at.elapsed() < PUT_BACK_EVERY) {
+        return;
+    }
+    *last = Some(Instant::now());
+    let lost = transport::fetch(&config.source, None, Duration::from_secs(30));
+    if !matches!(lost, Ok(Fetched::Missing)) {
+        return;
+    }
+    let place = |config: &Config| match &config.source {
+        Source::Url(url) => transport::describe(url),
+        Source::Path(path) => path.display().to_string(),
+    };
+    match admin_open(paths) {
+        Ok(admin) if admin.put_back => log(&format!(
+            "{} held no vault named {}: put this admin's copy back (seq {})",
+            place(&admin.config),
+            admin.config.name,
+            admin.seq
+        )),
+        Ok(_) => {}
+        Err(error) => log(&format!(
+            "{} holds no vault named {}, and putting this admin's copy back failed: {error}",
+            place(config),
+            config.name
+        )),
     }
 }
 
@@ -1752,39 +1849,57 @@ pub fn probe_default(wait: Duration) -> crate::Result<ProbeOutcome> {
 
 // ── Join ────────────────────────────────────────────────────────────────────
 
+/// Queue this machine's join request (a URL; a path has no queue) and record it. A request
+/// the server did not queue (unreachable, or refusing it for now) is recorded as never
+/// asked, with the proof the person gave, so the subscriber's next pass asks again rather
+/// than an hour on. The error returned is the request's.
 fn request_join(paths: &Paths, config: &Config, proof: Option<String>) -> crate::Result<String> {
     let identity = machine_identity(paths)?;
     let recipient = identity.recipient();
     let code = join_code(&recipient);
-    if let Source::Url(url) = &config.source {
-        let mut line = format!("{} {} {code}", recipient.to_bech32(), config.host);
-        if let Some(proof) = &proof {
-            line.push_str(&format!(" proof={proof}"));
+    let posted = match &config.source {
+        Source::Url(url) => {
+            let mut line = format!("{} {} {code}", recipient.to_bech32(), config.host);
+            if let Some(proof) = &proof {
+                line.push_str(&format!(" proof={proof}"));
+            }
+            transport::post_join(url, &line)
         }
-        transport::post_join(url, &line)?;
-    }
+        Source::Path(_) => Ok(()),
+    };
+    let queued = posted.is_ok();
+    let recorded = change_request(paths, config, |state| {
+        state.requested = if queued { now() } else { 0 };
+        state.proof = proof;
+        // A revoked machine that asks again waits like a new one, so its subscriber re-queues
+        // the request hourly.
+        if matches!(state.membership, Stored::None | Stored::Revoked) {
+            state.membership = Stored::Pending;
+        }
+    });
+    posted.and(recorded).map(|()| code)
+}
+
+/// Change, under the lock, the join request state of the vault `config` names. The state is
+/// the vault's that source.toml names now: a join to another vault since (a person's, while
+/// the subscriber asked again) reset it for that one, and it is left alone. The same vault
+/// under a pin moved since (a rotation the join's own sync followed) is still `config`'s.
+fn change_request(
+    paths: &Paths,
+    config: &Config,
+    change: impl FnOnce(&mut State),
+) -> crate::Result<()> {
     let _lock = StateLock::take(paths)?;
-    // The state is the vault's that source.toml names now: a join to another vault since
-    // this request (a person's, while the subscriber asked again) reset it for that one. The
-    // same vault under a pin moved since (a rotation the join's own sync followed) is still
-    // this request's.
     let current = self::config(paths)?;
     if current
         .as_ref()
         .is_none_or(|current| (&current.source, &current.name) != (&config.source, &config.name))
     {
-        return Ok(code);
+        return Ok(());
     }
     let mut state = load_state(paths)?;
-    state.requested = now();
-    state.proof = proof;
-    // A revoked machine that asks again waits like a new one, so its subscriber re-queues the
-    // request hourly.
-    if matches!(state.membership, Stored::None | Stored::Revoked) {
-        state.membership = Stored::Pending;
-    }
-    save_state(paths, &state)?;
-    Ok(code)
+    change(&mut state);
+    save_state(paths, &state)
 }
 
 /// The compiled-in pin for a source: the ALab key for the ALab URL.
@@ -1918,7 +2033,8 @@ pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutco
             // which lets whoever sees it test guesses at that vault's password offline: the
             // subscriber's hourly re-ask would send it to this one, and at once, from a request
             // months old. The re-ask counts from now, so it never races this join's own request
-            // either (a server refuses a change within seconds of the last).
+            // either (a server refuses a change within seconds of the last); a join that fails
+            // before its request is queued makes it due again at once.
             state.seq = 0;
             state.digest = None;
             state.membership = Stored::None;
@@ -1930,7 +2046,13 @@ pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutco
         }
         save_config(paths, &config)?;
     }
-    if let SyncOutcome::Applied { seq, report } = sync(paths, None)? {
+    // A sync cut off here (the server gone since the fetch above) leaves no request queued
+    // and none to come from this join: the subscriber's first pass that reaches the server
+    // asks.
+    let synced = sync(paths, None).inspect_err(|_| {
+        let _ = change_request(paths, &config, |state| state.requested = 0);
+    });
+    if let SyncOutcome::Applied { seq, report } = synced? {
         return Ok(JoinOutcome::Joined {
             seq,
             names: names_of(&report),
@@ -2065,6 +2187,8 @@ pub struct Admin {
     /// How many handoff pairs the version opened carried (fewer than `handoff` when this
     /// machine's copy put back links that version dropped).
     opened_pairs: usize,
+    /// Whether opening it gave the source this machine's copy back.
+    put_back: bool,
 }
 
 impl Drop for Admin {
@@ -2230,10 +2354,10 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
             "the admin locker's key does not match the envelope's signer",
         ));
     }
-    if let Some(over) = put_back {
+    if let Some(over) = &put_back {
         let _lock = configured_admin(paths, &config)?;
         match over {
-            Some(over) => transport::replace(&config.source, &bytes, &over)?,
+            Some(over) => transport::replace(&config.source, &bytes, over)?,
             None => transport::publish(&config.source, &bytes)?,
         }
     }
@@ -2244,6 +2368,7 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
         seq: envelope.seq,
         handoff,
         opened_pairs: envelope.handoff.len(),
+        put_back: put_back.is_some(),
     })
 }
 
@@ -3092,6 +3217,39 @@ mod tests {
         .expect("server starts")
     }
 
+    /// A server gone from the address of `socket`, which the test keeps: each connection is
+    /// closed unanswered, as a client finds a server that stopped, until [`Unserved::end`].
+    struct Unserved {
+        stop: std::sync::Arc<AtomicBool>,
+        addr: std::net::SocketAddr,
+        closer: std::thread::JoinHandle<()>,
+    }
+
+    impl Unserved {
+        fn at(socket: &std::net::TcpListener) -> Unserved {
+            let listener = socket.try_clone().expect("a copy of the socket");
+            let addr = listener.local_addr().expect("its address");
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let seen = std::sync::Arc::clone(&stop);
+            let closer = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    drop(stream);
+                    if seen.load(Ordering::SeqCst) {
+                        return;
+                    }
+                }
+            });
+            Unserved { stop, addr, closer }
+        }
+
+        /// Close no more: the connection this makes wakes the closer to see it.
+        fn end(self) {
+            self.stop.store(true, Ordering::SeqCst);
+            std::net::TcpStream::connect(self.addr).expect("the closer is woken");
+            self.closer.join().expect("the closer ends");
+        }
+    }
+
     /// Run `flow` on this thread as a build that retired `keys` for `current` would.
     fn retiring<T>(keys: Vec<[u8; 32]>, current: [u8; 32], flow: impl FnOnce() -> T) -> T {
         let set = |retired: Option<Retired>| {
@@ -3556,6 +3714,34 @@ mod tests {
         admin_publish(&admin, &opened, &doc).unwrap();
         std::fs::remove_file(&token).unwrap();
         assert!(repair_due(&admin, &mut repaired));
+
+        // A repair pass that cannot reach the server gives the repair back: the next pass that
+        // does puts the file back, rather than long-polling until a new version.
+        let store = root.path().join("store");
+        let socket = bound();
+        let server = serve(&store, &socket);
+        let url = format!("http://{}/v1/served", server.addr);
+        create(&admin, &url, None, Some("admin")).unwrap();
+        let opened = admin_open(&admin).unwrap();
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "token", b"inert-served")
+            .unwrap();
+        admin_publish(&admin, &opened, &doc).unwrap();
+        assert!(materialization_ready(&admin).unwrap());
+        std::fs::remove_file(&token).unwrap();
+        server.stop();
+        let gone = Unserved::at(&socket);
+        assert!(subscriber_pass(&admin, &mut repaired).is_err());
+        gone.end();
+        let server = serve(&store, &socket);
+        let (_, outcome) = subscriber_pass(&admin, &mut repaired).expect("the server is back");
+        assert!(
+            matches!(outcome, SyncOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        assert!(materialization_ready(&admin).unwrap());
+        assert_eq!(std::fs::read(&token).unwrap(), b"inert-served");
+        server.stop();
     }
 
     #[test]
@@ -4596,6 +4782,177 @@ mod tests {
         server.stop();
     }
 
+    /// A join cut off before its request is queued (the server gone once the person trusted
+    /// the vault's key, so the join's own sync fails, or while they were asked for the join
+    /// password, so its request fails) leaves the Mac waiting with nothing queued: the
+    /// subscriber's next pass asks, rather than an hour on, so an open vault does not keep it
+    /// out that long.
+    #[test]
+    fn a_join_cut_off_before_its_request_is_queued_is_asked_for_by_the_next_pass() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let store = root.path().join("store");
+        let socket = bound();
+        let server = std::cell::RefCell::new(Some(serve(&store, &socket)));
+        let url = format!("http://{}/v1/team", socket.local_addr().expect("address"));
+        let admin = Paths::for_home(&root.path().join("ma"));
+        let created = create(&admin, &url, None, Some("ma")).expect("create");
+        let gone = std::cell::RefCell::new(None);
+        let stop = || {
+            server.borrow_mut().take().expect("running").stop();
+            *gone.borrow_mut() = Some(Unserved::at(&socket));
+        };
+        // At a terminal and unpinned, the server goes as the person trusts the key; pinned, as
+        // they are asked for the join password.
+        let cut_off = |host: &str, source: String, interactive: bool| {
+            let paths = Paths::for_home(&root.path().join(host));
+            let joined = join(
+                &paths,
+                &JoinOptions {
+                    source,
+                    host: Some(host.to_string()),
+                    interactive,
+                    wait: Duration::ZERO,
+                    confirm: &|_| {
+                        stop();
+                        true
+                    },
+                    password: &|| {
+                        stop();
+                        None
+                    },
+                    requested: &|| {},
+                    say: &|_| {},
+                },
+            );
+            assert!(joined.is_err(), "{host}: {joined:?}");
+            gone.borrow_mut().take().expect("stopped").end();
+            *server.borrow_mut() = Some(serve(&store, &socket));
+            paths
+        };
+        let at_sync = cut_off("mb", url.clone(), true);
+        let at_request = cut_off("mc", format!("{url}#{}", created.signer), false);
+        for (paths, host) in [(&at_sync, "mb"), (&at_request, "mc")] {
+            assert_eq!(
+                status(paths).expect("status").membership,
+                Membership::Pending
+            );
+            let (config, _) = subscriber_pass(paths, &mut None).expect("a pass");
+            ask_again_if_due(paths, &config, &|_| {});
+            let queued: Vec<String> = requests(&admin, None)
+                .expect("requests")
+                .into_iter()
+                .map(|request| request.host)
+                .collect();
+            assert!(queued.iter().any(|queued| queued == host), "{queued:?}");
+        }
+        server.borrow_mut().take().expect("running").stop();
+    }
+
+    /// A join to another vault cut off before its request is queued makes the re-ask due at
+    /// once, with a proof made for that vault. A subscriber pass begun on the vault the Mac
+    /// left (its config read before the join) sends nothing to that one's queue, which anyone
+    /// may read: the proof would let them test guesses at the other vault's password.
+    #[test]
+    fn a_reask_begun_on_the_vault_left_never_sends_the_new_ones_proof_there() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let team_server = serve(&root.path().join("team-store"), &bound());
+        let team_url = format!("http://{}/v1/team", team_server.addr);
+        let other_socket = bound();
+        let other_server =
+            std::cell::RefCell::new(Some(serve(&root.path().join("other-store"), &other_socket)));
+        let other_url = format!(
+            "http://{}/v1/other",
+            other_socket.local_addr().expect("address")
+        );
+        let other_admin = Paths::for_home(&root.path().join("mz"));
+        let other = create(&other_admin, &other_url, None, Some("mz")).expect("create");
+        let password = admin_open(&other_admin)
+            .expect("admin opens")
+            .doc
+            .join_password()
+            .expect("create makes a join password");
+        // An admin of the team vault, its subscriber's pass under way with that vault's config.
+        let mac = Paths::for_home(&root.path().join("ma"));
+        create(&mac, &team_url, None, Some("ma")).expect("create");
+        let begun = pinned(&mac);
+        // Its person moves it to the other vault and types its password as that server goes.
+        let gone = std::cell::RefCell::new(None);
+        let moved = join(
+            &mac,
+            &JoinOptions {
+                source: format!("{other_url}#{}", other.signer),
+                host: Some("ma".to_string()),
+                interactive: false,
+                wait: Duration::ZERO,
+                confirm: &|_| false,
+                password: &|| {
+                    other_server.borrow_mut().take().expect("running").stop();
+                    *gone.borrow_mut() = Some(Unserved::at(&other_socket));
+                    Some(password.clone())
+                },
+                requested: &|| {},
+                say: &|_| {},
+            },
+        );
+        assert!(moved.is_err(), "{moved:?}");
+        let state = load_state(&mac).expect("state");
+        assert!(
+            state.proof.is_some() && state.requested == 0,
+            "due at once, with the other vault's proof"
+        );
+        ask_again_if_due(&mac, &begun, &|_| {});
+        let queued = transport::list_joins(&team_url).expect("listed");
+        assert!(queued.is_empty(), "{queued:?}");
+        gone.borrow_mut().take().expect("stopped").end();
+        team_server.stop();
+    }
+
+    /// A Mac waiting for approval whose request the server lost with its store (moved to a Mac
+    /// with an empty one) asks again at its first pass once the vault is back, not an hour on.
+    #[test]
+    fn a_request_the_server_lost_with_its_store_is_asked_again_once_the_vault_is_back() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let server = serve(&root.path().join("store"), &socket);
+        let url = format!("http://{}/v1/team", server.addr);
+        let admin = Paths::for_home(&root.path().join("ma"));
+        let created = create(&admin, &url, None, Some("ma")).expect("create");
+        let mac = Paths::for_home(&root.path().join("mb"));
+        let asked = join(
+            &mac,
+            &JoinOptions {
+                source: format!("{url}#{}", created.signer),
+                host: Some("mb".to_string()),
+                interactive: false,
+                wait: Duration::ZERO,
+                confirm: &|_| false,
+                password: &|| None,
+                requested: &|| {},
+                say: &|_| {},
+            },
+        );
+        assert!(
+            matches!(asked, Ok(JoinOutcome::Pending { .. })),
+            "{asked:?}"
+        );
+        server.stop();
+        let server = serve(&root.path().join("moved"), &socket);
+        assert!(
+            subscriber_pass(&mac, &mut None).is_err(),
+            "the vault is gone"
+        );
+        admin_open(&admin).expect("the admin puts its copy back");
+        let (config, _) = subscriber_pass(&mac, &mut None).expect("a pass");
+        ask_again_if_due(&mac, &config, &|_| {});
+        let queued: Vec<String> = requests(&admin, None)
+            .expect("requests")
+            .into_iter()
+            .map(|request| request.host)
+            .collect();
+        assert_eq!(queued, ["mb"]);
+        server.stop();
+    }
+
     /// A path checks no signature, so a version of the vault's name there that the admin does
     /// not verify, however high its seq, must not floor the admin's copy: the removed admin's
     /// old key writing on after a rotation, or a version signed by no key of the vault's.
@@ -4843,6 +5200,74 @@ mod tests {
             Approval::Password
         ));
         assert_eq!(settled.judged.len(), 1);
+    }
+
+    /// A server that lost the vault (its Mac's store gone, or the server moved to a Mac with an
+    /// empty one) answers the approver's read of the queue that it holds no such vault: the
+    /// approver puts this admin's copy back, says so, and looks again only a minute on.
+    #[test]
+    fn the_approver_puts_back_a_vault_its_server_lost() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let server = serve(&root.path().join("store"), &socket);
+        let url = format!("http://{}/v1/team", server.addr);
+        let source = Source::Url(url.clone());
+        let admin = Paths::for_home(&root.path().join("ma"));
+        create(&admin, &url, None, Some("ma")).expect("create");
+        let opened = admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "token", b"inert-token")
+            .expect("set");
+        admin_publish(&admin, &opened, &doc).expect("publish");
+        let served = || match transport::fetch(&source, None, Duration::from_secs(30)) {
+            Ok(Fetched::Body(bytes)) => Some(bytes),
+            Ok(Fetched::Missing | Fetched::NoNewer) => None,
+            Err(error) => panic!("{error}"),
+        };
+        let lines = std::sync::Mutex::new(Vec::new());
+        let log = |line: &str| lines.lock().expect("log").push(line.to_string());
+        let mut approver = Approver::default();
+        let lose = |server: crate::server::Running, store: &str| {
+            server.stop();
+            let empty = serve(&root.path().join(store), &socket);
+            assert!(served().is_none(), "the server holds no vault");
+            empty
+        };
+
+        let empty = lose(server, "empty");
+        assert_eq!(
+            approver_pass(&admin, &log, &mut approver),
+            Duration::from_secs(10)
+        );
+        let cached = std::fs::read(admin.cache_file()).expect("cache");
+        assert!(
+            served() == Some(cached.clone()),
+            "the admin's copy is served"
+        );
+        assert_eq!(
+            lines.lock().expect("log").as_slice(),
+            [format!(
+                "{} held no vault named team: put this admin's copy back (seq 2)",
+                transport::describe(&url)
+            )]
+        );
+        // The queue reads again: the approver goes on as before.
+        assert_eq!(
+            approver_pass(&admin, &log, &mut approver),
+            Duration::from_secs(2)
+        );
+
+        // Lost again within the minute: left until a minute on.
+        let again = lose(empty, "again");
+        approver_pass(&admin, &log, &mut approver);
+        assert!(served().is_none(), "not looked at again yet");
+        approver.lost_checked = approver
+            .lost_checked
+            .and_then(|at| at.checked_sub(PUT_BACK_EVERY));
+        approver_pass(&admin, &log, &mut approver);
+        assert!(served() == Some(cached), "the admin's copy is served again");
+        assert_eq!(lines.lock().expect("log").len(), 2);
+        again.stop();
     }
 }
 

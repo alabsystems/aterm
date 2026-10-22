@@ -53,9 +53,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_dirfd as mine;
 
-// ---------------------------------------------------------------------------
 // Comparable results
-// ---------------------------------------------------------------------------
 
 /// Every operation reduces to this, so comparing two runs compares everything
 /// an implementation could get wrong: the verdict, the exact errno, and any
@@ -117,9 +115,7 @@ fn mine_flags_file() -> mine::OFlags {
     mine::OFlags::RDONLY | mine::OFlags::NOFOLLOW | mine::OFlags::NONBLOCK | mine::OFlags::CLOEXEC
 }
 
-// ---------------------------------------------------------------------------
 // The scripted operations
-// ---------------------------------------------------------------------------
 
 /// One step of a script, written once and executed by both sides.
 #[derive(Debug, Clone)]
@@ -350,9 +346,7 @@ fn run_reference(root: &Path, op: &Op, ids: &mut Identities) -> Outcome {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Fixtures and snapshots
-// ---------------------------------------------------------------------------
 
 /// Build the identical starting tree both sides are driven over.
 ///
@@ -462,9 +456,7 @@ fn compare_script(label: &str, script: &[Op]) {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The scripts
-// ---------------------------------------------------------------------------
 
 /// Opens, including every way one is supposed to FAIL: a symlink under
 /// `O_NOFOLLOW`, a file opened `O_DIRECTORY`, a directory opened as a file, an
@@ -722,9 +714,7 @@ fn a_removed_directory_reads_as_empty() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The properties the callers actually depend on
-// ---------------------------------------------------------------------------
 
 /// Reading a directory must not consume the caller's descriptor.
 ///

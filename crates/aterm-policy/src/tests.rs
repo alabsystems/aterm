@@ -11,9 +11,7 @@ use super::{
     profiles, profiles::refinement::response_rank,
 };
 
-// ---------------------------------------------------------------------------
 // Refinement invariant
-// ---------------------------------------------------------------------------
 
 #[test]
 fn refinement_holds_over_all_sequences_and_origins() {
@@ -96,9 +94,7 @@ fn hardened_fails_closed_on_unknown_for_untrusted_origins() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Hardened-specific invariants
-// ---------------------------------------------------------------------------
 
 #[test]
 fn hardened_rules_only_admit_host_configfile_or_user() {
@@ -123,9 +119,7 @@ fn hardened_requires_shell_integration_nonce() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Rate-limit references resolve
-// ---------------------------------------------------------------------------
 
 #[test]
 fn every_rate_limit_ref_resolves_in_each_profile() {
@@ -148,9 +142,7 @@ fn every_rate_limit_ref_resolves_in_each_profile() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Rule-vs-default arbitration
-// ---------------------------------------------------------------------------
 
 /// A single-rule policy whose selector matches and whose origin gate is met
 /// returns exactly that rule's response — for EVERY response and EVERY
@@ -197,9 +189,7 @@ fn single_matching_rule_decides_for_every_response_and_origin_gate() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // OriginTag trust lattice
-// ---------------------------------------------------------------------------
 
 /// Every `OriginTag` variant, most- to least-trusted.
 const ALL_ORIGINS: [OriginTag; 8] = [

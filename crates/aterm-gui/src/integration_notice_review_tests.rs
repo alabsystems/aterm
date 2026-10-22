@@ -393,7 +393,7 @@ fn the_move_is_offered_only_when_the_harness_will_type_it() {
 }
 
 /// A CLAUDE CODE STARTED AS `node` HEALS WITH THE HARNESS'S MOVE (the npm
-/// ruling of 2026-10-16): the sweep asked the published program's NAME, so a
+/// ): the sweep asked the published program's NAME, so a
 /// `node` the host supervises by its screen (`harness_host::agent_of`) was
 /// offered a new tab though the live upgrade moves it in its own tab.
 /// NEGATIVE CONTROL: a `node` whose screen named no agent is offered a new tab.

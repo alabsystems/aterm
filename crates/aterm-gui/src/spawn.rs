@@ -801,10 +801,8 @@ pub(crate) struct SessionFactory {
     /// its palette reads as (DEC 2031 / DSR `CSI ?996n`) from the same
     /// `apply_config` that lands its colours.
     pub(crate) terminal_config: Option<aterm_core::config::TerminalConfig>,
-    /// Whether to inject OSC 133/633 shell integration. Each tab gets a fresh
-    /// CSPRNG nonce, authorized and required on its own engine, so one tab's
-    /// output cannot forge another's marks. False when `-e` runs a command or
-    /// integration is opted out.
+    /// Whether to inject OSC 133/633 shell integration, with a fresh nonce per
+    /// tab. False when `-e` runs a command or integration is opted out.
     pub(crate) integrate: bool,
     /// Latency epoch shared across tabs: each session's PTY reader stamps the
     /// leading edge of its output bursts (`Session::last_output_ns`) on this
@@ -2483,7 +2481,7 @@ pub(crate) fn spawn_session(
                 // spaces are not constrained (`aterm_sandbox::Limits::inherit`);
                 // Safety gets the soft caps, a guardrail its rc can raise, and
                 // Containment the same caps as hard limits, which its program
-                // cannot (`aterm_sandbox::Limits::contained`, ruling 2026-10-10).
+                // cannot (`aterm_sandbox::Limits::contained`).
                 let limits = {
                     use aterm_containment::ContainmentMode as Cm;
                     match aterm_containment::mode_or_containment() {
@@ -4508,17 +4506,13 @@ pub(crate) fn prepare_deferred_reader(
 }
 
 /// Hand a fresh reader clean shared latches, so nothing it does is governed by
-/// state the previous reader left.
-///
-/// `reader_stop`: [`park_reader`] raises it, and a reader starting with it set
-/// would exit at once.
-///
-/// `output_wake_pending`: armed by the reader, cleared by the `Wake::Output`
-/// handler. A park can leave it armed with a wake no handler will consume; the
-/// new reader would then hit [`gated_output_wake`]'s armed fast path and
-/// suppress every wake, freezing the screen until the lost-wake watchdog heals
-/// it. Cleared after the old thread is joined and before the new one spawns,
-/// so an arm is owned only by the reader that posted it.
+/// state the previous reader left: `reader_stop` ([`park_reader`] raises it; a
+/// reader starting with it set would exit at once), and `output_wake_pending`,
+/// which a park can leave armed with a wake no handler will consume, so the new
+/// reader would hit [`gated_output_wake`]'s armed fast path and suppress every
+/// wake until the watchdog healed it. Cleared after the old thread is joined
+/// and before the new one spawns, so an arm is owned only by the reader that
+/// posted it.
 ///
 /// Not `SessionCtx::update_parked`: a park ends when the new reader has caught
 /// up with what queued while none ran ([`UpdatePark`]), not at its attach, and
@@ -13512,7 +13506,7 @@ mod kitty_transfer_tests {
     }
 
     /// A `t=t` FILE OR `t=s` OBJECT THE ENGINE REFUSES IS LEFT WHERE THE PROGRAM
-    /// PUT IT (ATERM-KI-1014-6): the reader reads a medium before its hold, and
+    /// PUT IT: the reader reads a medium before its hold, and
     /// the engine refuses a raw transmission that declares no size before it
     /// asks for the bytes; before, the read had already deleted the file and
     /// unlinked the object. CONTROL: the same transmission with its size

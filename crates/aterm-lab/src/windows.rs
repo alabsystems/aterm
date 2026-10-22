@@ -394,7 +394,6 @@ fn lossy(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-// ---------------------------------------------------------------------------
 // The images
 
 /// A browser's user agent: Microsoft's download service answers a client
@@ -708,7 +707,6 @@ fn virtio_iso(l: &Layout) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
-// ---------------------------------------------------------------------------
 // The VM
 
 /// What one boot attaches.
@@ -1430,7 +1428,6 @@ fn snapshot_plan(l: &Layout) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-// ---------------------------------------------------------------------------
 // Making the VM
 
 fn secret_file(path: &Path, text: &str) -> Result<(), String> {
@@ -2007,7 +2004,6 @@ pub fn lane_lock(l: &Layout) -> Result<LaneLock, Fail> {
     LaneLock::at(&l.lock(), "windows")
 }
 
-// ---------------------------------------------------------------------------
 // The checkout's copy in the guest
 
 /// One file of the working tree: its path (forward slashes), size and
@@ -2263,7 +2259,6 @@ pub fn build_facts(repo: &Path) -> Vec<(String, String)> {
     facts
 }
 
-// ---------------------------------------------------------------------------
 // Verbs
 
 fn cmd_up(args: &[String]) -> Res {

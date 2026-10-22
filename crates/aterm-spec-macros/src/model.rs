@@ -335,9 +335,7 @@ fn ensure_empty(c: &mut Cursor, message: &str) -> Result<(), Error> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Expressions.
-// ---------------------------------------------------------------------------
 
 /// A parsed expression of the supported shapes, and the source it covers.
 struct Node {

@@ -24,9 +24,7 @@ use crate::ledger::{self, Error, Result};
 use crate::manifest_out;
 use crate::publish::{self, TagKind, gh_retry, step};
 
-// ---------------------------------------------------------------------------
 // the canonical client scan, replayed against the live API
-// ---------------------------------------------------------------------------
 
 /// One published (non-draft) release carrying a parseable manifest.
 #[derive(Debug, Clone)]
@@ -622,9 +620,7 @@ pub fn release_state(slug: &str, tag: &str) -> Result<ReleaseState> {
     classify_release_state(&release_metadata_listing(slug)?, tag)
 }
 
-// ---------------------------------------------------------------------------
 // remote-derived cut mode — pure; tests/it/resume.rs pins the table
-// ---------------------------------------------------------------------------
 
 /// The three remote-derived facts [`derive_cut_mode`] reads, gathered by the caller
 /// (network) so the decision itself is pure and table-testable.
@@ -680,9 +676,7 @@ pub fn derive_cut_mode(s: &RemoteState) -> Result<CutMode> {
     Ok(CutMode::Fresh { version })
 }
 
-// ---------------------------------------------------------------------------
 // post-publish verify
-// ---------------------------------------------------------------------------
 
 /// What the published head's signature must verify under, and against what.
 pub struct PostPublishSignature<'a> {
@@ -900,9 +894,7 @@ fn head_status(url: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-// ---------------------------------------------------------------------------
 // the standalone commands: verify / status / yank / abandon
-// ---------------------------------------------------------------------------
 
 /// `targo --unverified ship verify [vX.Y.Z]` — re-run the post-publish check anytime.
 pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {

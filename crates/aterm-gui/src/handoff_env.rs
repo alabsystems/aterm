@@ -43,10 +43,8 @@ impl HandoffName {
         Self(name)
     }
 
-    /// This name set to `value` in a CHILD's environment: a `Command`'s
-    /// `envs`, a launch request's pairs, the re-exec image's restored pairs.
-    /// The name leaves this file only bound to a value, never as a bare string
-    /// a read of this process's own environment could take.
+    /// This name set to `value` in a child's environment: a `Command`'s `envs`, a launch
+    /// request's pairs, the re-exec image's restored pairs.
     #[cfg(unix)]
     #[must_use]
     pub(crate) fn pair(self, value: impl AsRef<OsStr>) -> (OsString, OsString) {
@@ -218,11 +216,9 @@ impl HandoffEnv {
         let _ = self.take(key);
     }
 
-    /// Set `key` to `value` — the launched lane's granted descriptors landing
-    /// where the fork lane's arrive (`handoff_rendezvous::ClaimedIntake`). The
-    /// snapshot is this process's own memory: no other thread can observe it,
-    /// so unlike the `set_var` it replaces this is sound at any point. The
-    /// launched lane (`handoff_rendezvous`) is macOS's.
+    /// Set `key` to `value`: the launched lane's (macOS) granted descriptors landing where the
+    /// fork lane's arrive (`handoff_rendezvous::ClaimedIntake`). The snapshot is this
+    /// process's own memory, so unlike `set_var` this is sound at any point.
     #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(crate) fn set(&mut self, key: HandoffName, value: impl Into<OsString>) {
         let value = value.into();
@@ -287,9 +283,8 @@ pub(crate) fn through_process_env<T>(
 mod tests {
     use super::*;
 
-    /// The accessors keep the semantics of the calls they replace: `string`
-    /// refuses non-UTF-8 as `var` did, `take` is one-shot, `set` keeps the
-    /// capture order `exec_env` reports in.
+    /// The accessors mirror the env calls: `string` refuses non-UTF-8 as `var` does, `take` is
+    /// one-shot, `set` keeps the capture order `exec_env` reports in.
     #[test]
     fn accessors_mirror_the_env_calls_they_replace() {
         use crate::seamless::{ENV_COMMIT_FD, ENV_FDS, ENV_MANIFEST};

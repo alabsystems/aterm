@@ -14,12 +14,6 @@
 //! As unit tests they need no feature (the decoders are reachable
 //! crate-internally) and run in every test run, at [`ITERS`] deterministic
 //! inputs per loop.
-//!
-//! The warm-tier read path is `WarmBlock::decompress` → `decompress_lz4_bounded`
-//! → `stored_line_count` → `deserialize_lines`. `stored_line_count`'s
-//! `try_into().expect("count header")` is preceded by a `len() < 4` guard, so it
-//! is unreachable; the genuine panic-reachable surfaces are the byte decoders
-//! below, which parse fully attacker-controlled lengths and offsets.
 
 use crate::lz4;
 use crate::{Line, deserialize_lines};

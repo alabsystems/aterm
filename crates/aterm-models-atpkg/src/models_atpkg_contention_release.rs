@@ -5,13 +5,12 @@
 
 use aterm_spec::derive::*;
 
-/// One contention-park slice. A live writer keeps the lane parked; the first
-/// slice that observes its release retries the same owed pass. A bump or ready
-/// vendor answer wins that slice, and a park without a timed-out child never
-/// probes the store lock. Buggy=1 both retries while held and misses a
-/// released writer, with independent counterexamples for the two latency and
-/// resource properties. Tier-1 binds Check to the real read-only flock probe
-/// and the GUI's park-end decision.
+/// One contention-park slice. A live writer keeps the lane parked; the first slice that sees
+/// its release retries the same owed pass. A bump or ready vendor answer wins that slice, and a
+/// park without a timed-out child never probes the store lock. `Buggy = 1` retries while the
+/// lock is held, misses a released writer and lets the retry beat a higher answer. Tier 1
+/// (aterm-gui's `atpkg_contention_release_conformance`) binds `Check` to the real read-only
+/// flock probe and the GUI's park-end decision.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_contention_release_park_model() -> Model {

@@ -45,6 +45,17 @@ pub(super) struct SyncEndCaret {
     pub(super) caret: (u16, u16),
 }
 
+/// The screen at the program's last DEC 2026 close ([`TransientState::app_sync_closed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ClosedFrame {
+    /// The active grid's content generation at the close.
+    pub(super) content_gen: u64,
+    /// `screen_replaced` at the close.
+    pub(super) screen: u64,
+    /// The grid's `(rows, cols)` at the close.
+    pub(super) grid: (u16, u16),
+}
+
 /// Grouped transient terminal state. [`reset`](Self::reset) bumps `reset_generation` and
 /// `screen_replaced` and clears the rest, except the replies and reports already owed to
 /// the PTY peer (`response_buffer`, `report_buffer`) and the replies' rate limiter; the
@@ -151,6 +162,31 @@ pub(super) struct TransientState {
     /// Whether the program's open bracket (`app_sync_open`) has accepted any
     /// complete PTY action; the program-view twin of `sync_open_dirty`.
     pub(super) app_sync_dirty: bool,
+    /// When the screen's run of unfinished frames began: the `process_now` of the
+    /// first batch that ended with the program's frame unfinished
+    /// ([`Terminal::sync_frame_unfinished`](super::Terminal::sync_frame_unfinished))
+    /// since the last batch that ended with it whole, `None` after a batch that ended
+    /// whole. Written only at a batch's end (`Terminal::note_batch_end`), so a batch
+    /// that closes one frame and opens the next (`?2026l ?2026h …`) does not restart
+    /// it: a program whose every read ends inside its next frame still reaches the
+    /// one-minute hang detector a reader of whole frames waits on
+    /// ([`Terminal::frame_unfinished_at`](super::Terminal::frame_unfinished_at)).
+    pub(super) frame_unfinished_since: Option<aterm_time::Instant>,
+    /// The screen as the program's last DEC 2026 frame left it: the active grid's
+    /// content generation, the screen and the grid size at the `?2026l` that closed a
+    /// frame it drew into (the content moved since its `?2026h`). While all three still hold and no frame is
+    /// unfinished, nothing has been drawn since that close: the screen is a frame the
+    /// program finished ([`Terminal::screen_is_closed_frame`](super::Terminal::screen_is_closed_frame)).
+    pub(super) app_sync_closed: Option<ClosedFrame>,
+    /// The active grid's content generation and screen at the program's opening
+    /// `?2026h`: a close that finds them unmoved drew nothing, and finishes no frame.
+    pub(super) app_sync_open_mark: Option<(u64, u64)>,
+    /// When the screen last changed, and the mark it changed to: the `process_now` of
+    /// the last batch that ended with the active grid's content generation or screen
+    /// other than the batch before left them (`Terminal::note_batch_end`). The start
+    /// of an `await gone` settle armed on a range already clear
+    /// ([`super::Frame::drawn_at`]).
+    pub(super) drawn: Option<(aterm_time::Instant, (u64, u64))>,
     /// Logical "now" for the current batch, captured once at the top of
     /// [`Terminal::process_at`](super::Terminal::process_at). The bell rate limiter,
     /// `sync_start` and the mode-2026 timeout read it instead of the clock, so a
@@ -366,6 +402,10 @@ impl TransientState {
             sync_open_dirty: false,
             app_sync_open: false,
             app_sync_dirty: false,
+            frame_unfinished_since: None,
+            app_sync_closed: None,
+            app_sync_open_mark: None,
+            drawn: None,
             #[expect(
                 clippy::disallowed_methods,
                 reason = "a seed process_at overwrites before any reader runs"
@@ -465,6 +505,11 @@ impl TransientState {
         self.sync_open_dirty = false;
         self.app_sync_open = false;
         self.app_sync_dirty = false;
+        // `frame_unfinished_since` and `drawn` are the batch end's to write
+        // (`Terminal::note_batch_end`): a reset inside a batch that then opens a frame
+        // is still one run of unfinished reads.
+        self.app_sync_closed = None;
+        self.app_sync_open_mark = None;
         self.sgr_stack.clear();
         self.pipeline_timestamps = PipelineTimestamps::default();
         self.last_combining_was_zwj = false;

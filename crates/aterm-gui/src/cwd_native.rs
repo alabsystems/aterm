@@ -10,32 +10,8 @@
 //! Unconverted on Windows, `Command::current_dir("/C:/Users//x")` names a `C:` directory under the
 //! current drive's root.
 //!
-//! aterm-gui is that consumer, and it was not doing the job: on Windows the
-//! `/C:/Users//m6-an` string went straight to the tab strip, the tab tooltip,
-//! `aterm-ctl cwd`, `aterm-ctl meta`, the restore manifest, and the
-//! spawn-in-the-focused-pane's-directory path. Users saw a path that is not a
-//! path, and `Command::current_dir("/C:/Users//m6-an")` is a directory named
-//! `C:` under the root of the current drive — usually nonexistent.
-//!
-//! ## Why this is not fixed in `aterm-core`
-//!
-//! Considered and rejected: teaching `handle_osc_7` about drive letters behind
-//! `cfg(windows)`. That would make the ENGINE's stored cwd differ by host
-//! platform, which breaks the recorded-session / asciicast replay contract (a
-//! cast recorded on Windows must decode identically on macOS) and drags a
-//! Windows path concept into a crate that compiles to wasm. Converting once at
-//! the GUI boundary keeps the engine byte-for-byte platform-neutral and still
-//! gives every downstream consumer the right value, because they all read the
-//! cwd through [`ReportedCwd::native_working_directory`].
-//!
-//! ## Why the rewrite is `cfg(windows)`-gated
-//!
-//! On unix `/C:/foo` is a perfectly ordinary absolute path: a directory
-//! literally named `C:` at the filesystem root. `mkdir '/C:'` is legal on macOS
-//! and Linux, and a shell sitting in it reports exactly the string this module
-//! rewrites. An ungated rewrite would silently corrupt that path into `C:\foo`
-//! — a nonexistent location — so the whole transform is compiled out entirely
-//! off Windows and [`native_path`] is a provable identity there.
+//! The rewrite is compiled only on Windows: on unix `/C:/foo` is an ordinary path (`mkdir '/C:'`
+//! is legal), and rewriting it would corrupt it, so [`native_path`] is the identity there.
 //!
 //! ## A report from another machine is left as written, for every consumer
 //!
@@ -186,10 +162,8 @@ pub(crate) fn native_path_reported(path: &str, here: impl FnOnce() -> bool) -> C
             if !here() {
                 return Cow::Borrowed(path);
             }
-            // `/C:` and `/C:/` both mean the ROOT of drive C. Emitting the bare
-            // `C:` instead would be a different location entirely: on Windows a
-            // driveless-but-drive-qualified path means "the process's current
-            // directory ON that drive", so the trailing separator is load-bearing.
+            // `/C:` and `/C:/` are both the root of C; a bare `C:` would mean the
+            // process's current directory on drive C.
             let rest = &path[3..];
             let mut out = String::with_capacity(path.len().max(3));
             out.push(drive);
@@ -465,7 +439,6 @@ mod tests {
         // `/c/x` is an ordinary directory here, not an MSYS drive.
         assert_eq!(native_path("/c/x"), "/c/x");
         assert_eq!(native_path("/cygdrive/c/x"), "/cygdrive/c/x");
-        // And a network path stays byte-identical, forward slashes and all.
         assert_eq!(native_path("//server/share"), "//server/share");
         assert_eq!(native_path("/Users//x"), "/Users//x");
     }

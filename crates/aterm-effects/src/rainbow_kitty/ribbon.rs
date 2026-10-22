@@ -79,9 +79,7 @@ use super::timing::{
 };
 use super::{Cadence, Config, Ctx, Event, Frame, Licence, TypedClass, level_step_spend};
 
-// ===========================================================================
 // The budget, the walk, and the body's geometry
-// ===========================================================================
 
 /// Quads the ribbon may spend on one frame (RAINBOW-KITTY-V2.md §18: a
 /// 76-cell hot line at retina). Shed from the tail, never the head: the head
@@ -224,10 +222,8 @@ pub const SLABS_PER_CELL: usize = 3;
 /// stays an accent on the body and never the only bright part of the mark.
 const STRIP_LIFT_GAIN: f32 = 0.35;
 
-// ===========================================================================
 // The comet body, the vivid rail and the from-the-hand attack
 // (RAINBOW-KITTY-V2.md §30). `Config::ribbon_flat` turns all three off.
-// ===========================================================================
 
 /// The comet's reach below the spine at the hand, in `ch`, at full momentum:
 /// the lower lobe under the caret that the rail fills with vivid ink. It
@@ -301,9 +297,7 @@ pub const RAIL_REACH_MAX_CH: f32 = DN_TOP_CH;
 // beneath. Only the comet's bed lobe at the hand reaches lower.
 const _: () = assert!(RAIL_REACH_MAX_CH < aterm_render::SUB_CEILING);
 
-// ===========================================================================
 // The bed's one ceiling (RAINBOW-KITTY-V2.md §3.2, §3.4)
-// ===========================================================================
 
 /// The bed's byte ceiling: the source-over stream's cap. The 15 levels above it, up to the
 /// ledger's frame top ([`BODY_FRAME_TOP`]), are the baseline strip's.
@@ -423,9 +417,7 @@ pub const BED_INK_LUT_LEN: usize = 129;
 /// legibility bar.
 pub const BODY_COLD_SHARE: f32 = 0.88;
 
-// ===========================================================================
 // Life, the chain law, and the exit swoosh
-// ===========================================================================
 
 /// The host's duration knob, as a multiplier on the base cell life.
 pub const LIFE_DURATION_GAIN: f32 = 1.2;
@@ -462,9 +454,7 @@ pub const CHAIN_MARGIN: f32 = 0.10;
 /// rhythm still earns its full four-letter span.
 pub const CHAIN_LIFE_MAX: f32 = 23.0;
 
-// ===========================================================================
 // The wake: what a jump leaves behind
-// ===========================================================================
 
 /// New light a jump's corridor may lay, in cells back from the landing, so a Ctrl-A across
 /// 200 columns does not paint the whole row; band light beyond it is covered, never cut. The
@@ -717,9 +707,7 @@ pub const EXPIRY_MELT_GAMMA: f32 = 1.6;
 /// cell's light goes, so no dark column opens.
 pub const RUN_TAIL_EASE: f32 = 0.10;
 
-// ===========================================================================
 // The atoms
-// ===========================================================================
 
 /// The instant a cell's expiry is measured from: its birth or its cohort's last
 /// live typing key, whichever is later, so a mark ages only once the hand
@@ -1567,9 +1555,7 @@ impl FieldIndex {
     }
 }
 
-// ===========================================================================
 // The bed's ink
-// ===========================================================================
 
 /// The bed's one ceiling, in relative luminance: the brightest a source-over
 /// ribbon may composite and still leave `theme_fg` legible over it at
@@ -2085,9 +2071,7 @@ impl BedInkLut {
     }
 }
 
-// ===========================================================================
 // The walk (C2)
-// ===========================================================================
 
 /// The stretch of the arc the walk re-paces, in table entries: the green→blue
 /// leg only, less a guard at each of its anchors ([`CROSS_GUARD`]). Outside it
@@ -2235,9 +2219,7 @@ pub(crate) fn level_step_melt(peak: f32, u: f32, life_s: f32) -> Option<f32> {
     Some(((u_next - u) * life_s).max(0.0))
 }
 
-// ===========================================================================
 // The producer
-// ===========================================================================
 
 /// One boundary's planned sample before it becomes a [`Segment`]:
 /// `(spine, up, dn, t, cov)`, in window px / walk units / coverage levels.
@@ -7557,6 +7539,15 @@ impl Ribbon {
             if !flowing {
                 cad.tail(cell.life_s - age);
             }
+            // A finished partial retract may retain content custody until
+            // the run expires, but build gives it no field or geometry.
+            // Keep its expiry above without scheduling its spent fades.
+            if cell
+                .retract_at
+                .is_some_and(|at| since(at) >= RETRACT_FADE_S)
+            {
+                continue;
+            }
             if self.reduced {
                 // A flowing cell's life is frozen here too (`env_of`,
                 // `retire`): its end is no change on the glass.
@@ -11078,6 +11069,37 @@ mod tests {
         );
         assert_eq!(cell_15(&rib).released_at, Some(stamp));
         assert!(cell_15(&rib).leaving(), "…and leaving");
+        // Once the partial retract is dark, retaining its exact identity
+        // must not wake the host sooner than the same standing prefix
+        // without that dark cell. Read before the run's grace or expiry,
+        // with both motion policies, so an expired fade cannot hide behind
+        // the final empty-pool check or an already-brisk visible retract.
+        for reduced_motion in [false, true] {
+            let mut c = cfg(true, true);
+            c.reduced_motion = reduced_motion;
+            let mut held = rib.clone();
+            let mut absent = rib.clone();
+            absent.cells.retain(|cell| cell.released_at != Some(stamp));
+            for ms in [300, 400, 500] {
+                let now = at(stamp, ms);
+                let cx = ctx(now, &c, (2, 16), 0.9);
+                held.plan(&cx);
+                absent.plan(&cx);
+                assert_eq!(cell_15(&held).released_at, Some(stamp));
+                assert!(held.field_at(2, 15).is_none(), "custody is dark");
+                assert_eq!(held.cells.len(), absent.cells.len() + 1);
+                let expected = absent.next_change_deadline(now).expect("standing prefix");
+                assert!(
+                    expected > now + super::super::TAIL_FLOOR,
+                    "reduced={reduced_motion}, +{ms}ms: the prefix has no immediate fade"
+                );
+                assert_eq!(
+                    held.next_change_deadline(now),
+                    Some(expected),
+                    "reduced={reduced_motion}, +{ms}ms: dark custody adds no visual wake"
+                );
+            }
+        }
         // A key typed inside the melt, past the caret: it joins the cohort,
         // which now has seven cells where the release counted six.
         let key = at(last, 80);

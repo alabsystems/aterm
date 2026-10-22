@@ -155,7 +155,7 @@ fn rows() -> Vec<Row> {
             "autopilot: cruise until Sat 16:00, then land",
             "Autopilot: cruise. Lands Saturday at 16:00.",
         ),
-        // FOREVER CRUISE: Cruise takes nothing as the end, so a landing a
+        // Autopilot Cruise: Cruise takes nothing as the end, so a landing a
         // loop under Land told keeps `∞` (and, with a timer armed, the
         // timer's face): no task face shows under Cruise.
         row(
@@ -658,7 +658,7 @@ fn each_mode_phrase_holds_no_cut_mark() {
 /// longer fits in down to exactly its own width; the facts stay whole
 /// wherever a title is drawn; and every form wider than the phrase keeps `·
 /// click: `. Then the landed face's own rule at 160, 120, 110 and 90 columns
-/// (the finding's face was Cruise's `done`, retired under FOREVER CRUISE).
+/// (the finding's face was Cruise's `done`, retired under Autopilot Cruise).
 ///
 /// NEGATIVE CONTROL: the same block with the two forms taken out (their
 /// widths 0, the ladder main had) goes from v1's words straight to the

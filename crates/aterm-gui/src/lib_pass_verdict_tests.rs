@@ -473,8 +473,8 @@ fn a_timed_out_wait_parks_on_the_backoff_then_the_wedge() {
     assert_eq!(park, Duration::from_secs(3600), "the wedge: an hour");
     assert!(lane.backoff.wedged());
     one_routine_deferral(&posted);
-    // A seed at the wedge parks the same hour and tries again: nothing stands down,
-    // so the row is routine — the ledger, not the Settings ▸ Packages badge.
+    // A seed at the wedge parks the same hour and retries: a routine row, not the
+    // Settings ▸ Packages badge.
     let mut lane = busy_lane(&posted);
     lane.park_after_timed_out_wait(PassVerb::Seed, &busy);
     lane.park_after_timed_out_wait(PassVerb::Seed, &busy);

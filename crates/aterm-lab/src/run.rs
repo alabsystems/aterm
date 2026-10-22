@@ -313,7 +313,7 @@ pub fn take_tag(args: &mut Vec<String>) -> Result<String, String> {
 /// then says that lab is not up — else [`take_tag`]'s. Read by [`take_tag`],
 /// the tag of a lab already down is no run, so it was left as an argument and
 /// the verb acted on the default lab: `ps <tag>` named the default tag, and
-/// `down <tag>` took the default lab down (ATERM-KI-1016-1).
+/// `down <tag>` took the default lab down.
 ///
 /// # Errors
 /// The argument, or `$LAB_TAG`, is not a valid tag.
@@ -423,7 +423,7 @@ mod tests {
     }
 
     /// A VERB WHOSE ONE ARGUMENT IS ITS TAG TAKES A LAB THAT IS DOWN
-    /// (ATERM-KI-1016-1): `ps <tag>` and `down <tag>` of a lab with no run
+    /// : `ps <tag>` and `down <tag>` of a lab with no run
     /// directory act on that tag, never the default lab's ([`take_tag`] leaves
     /// it as an argument). An option first is no tag: the default; a tag
     /// that is not one is refused.

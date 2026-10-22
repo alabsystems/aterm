@@ -612,9 +612,12 @@ fn a_double_click_on_a_typed_menu_row_types_through_to_the_enter() {
         assert!(app.autopilot_menu.is_none(), "chosen and closed");
         assert_eq!(pty(&mut reader, 1), b"/", "the probe alone");
         if late {
-            let (w, r, _) = app.autopilot_menu_spent.expect("the card a choice closed");
+            let spent = app.autopilot_menu_spent.expect("the card a choice closed");
             let past = Duration::from_millis(u64::try_from(crate::multi_click_ms()).unwrap() + 50);
-            app.autopilot_menu_spent = Some((w, r, Instant::now() - past));
+            app.autopilot_menu_spent = Some(crate::autopilot_menu::SpentCard {
+                at: Instant::now() - past,
+                ..spent
+            });
         }
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);

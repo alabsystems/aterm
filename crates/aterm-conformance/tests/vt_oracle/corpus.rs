@@ -128,6 +128,54 @@ pub const CORPUS: &[Case] = &[
     // `reverse_line_feed_on_a_one_row_screen_*`).
     case("ri_resets_a_pending_wrap", 3, 2, b"bAz\x1bMQ"),
     case("ri_on_a_one_row_screen", 3, 1, b"b\x1bM"),
+    // --- origin mode, insert mode, SU/SD (astream b13/origin-irm-su) -------
+    // xterm CursorSet under ORIGIN: rows count from the top margin and stop
+    // at the bottom one; CHA keeps the row; `?6` homes either way.
+    case("origin_mode_addresses_from_the_top_margin", 10, 6, b"\x1b[2;4r\x1b[?6h\x1b[1;1HX\x1b[99;2HY\x1b[2dZ\x1b[5GW"),
+    case("origin_mode_reset_homes_to_the_corner", 10, 6, b"\x1b[3;5r\x1b[?6h\x1b[2;2HA\x1b[?6lB"),
+    case("decstbm_under_origin_mode_homes_to_the_top_margin", 10, 6, b"\x1b[?6h\x1b[3;5rX"),
+    case("origin_mode_home_resolves_a_pending_wrap", 3, 3, b"abc\x1b[?6hZ"),
+    // DECSC_FLAGS hold ORIGIN; an unsaved DECRC clears it (aterm's
+    // `unsaved_decrc_still_resets_origin_and_homes`).
+    case("decsc_saves_origin_mode", 10, 6, b"\x1b[2;5r\x1b[?6h\x1b[2;3H\x1b7\x1b[?6l\x1b8\x1b[1;1HX"),
+    case("unsaved_decrc_clears_origin_mode", 10, 8, b"\x1b[3;6r\x1b[?6h\x1b[2;2Hx\x1b8Z"),
+    case("decrc_under_origin_mode_stops_at_the_bottom_margin", 10, 6, b"\x1b[?6h\x1b[5;1H\x1b7\x1b[1;3r\x1b8X"),
+    case("decrc_under_origin_mode_above_the_region", 10, 6, b"\x1b[?6h\x1b[1;1H\x1b7\x1b[3;5r\x1b8X"),
+    case("ris_clears_origin_mode", 10, 6, b"\x1b[?6h\x1bc\x1b[2;4r\x1b[1;1HX"),
+    // xterm WriteText: InsertChar before the glyph.
+    case("irm_shifts_the_line_under_each_glyph", 6, 1, b"abcdef\x1b[1;2H\x1b[4hXY\x1b[4lZ"),
+    case("irm_on_a_wrapped_glyph", 3, 2, b"\x1b[2;1Hxyz\x1b[1;1Habc\x1b[4hQ"),
+    case("irm_beside_another_ansi_mode", 6, 1, b"abc\x1b[1;1H\x1b[20;4hX\x1b[4;20lY"),
+    // xterm CASE_VMOT under LINEFEED: LF, VT and FF return the carriage; IND
+    // does not.
+    case("lnm_returns_the_carriage_on_lf_vt_ff", 6, 5, b"\x1b[20hab\ncd\x0bef\x0cgh\x1bDi\x1b[20l\nj"),
+    // xterm xtermScroll/RevScroll: the region moves, the cursor and its wrap
+    // stay (aterm's `su_preserves_pending_wrap`).
+    case("su_sd_scroll_the_region", 4, 4, b"a\r\nb\r\nc\r\nd\x1b[2;3r\x1b[1;1H\x1b[S\x1b[2T"),
+    case("su_keeps_a_pending_wrap", 4, 2, b"abcd\x1b[S!"),
+    case("sd_keeps_a_pending_wrap", 4, 2, b"abcd\x1b[T!"),
+    case("su_with_a_background", 4, 3, b"a\r\nb\r\nc\x1b[44m\x1b[9S"),
+    // Regression: aterm scrolled on `CSI 0 T` and on a `T` with several
+    // parameters, which xterm's CASE_TRACK_MOUSE reads as highlight mouse
+    // tracking (aterm-core
+    // `sd_with_a_zero_or_several_parameters_is_mouse_tracking_not_a_scroll`).
+    case("sd_with_zero_or_several_parameters_scrolls_nothing", 4, 2, b"a\x1b[0T\x1b[1;2;3;4;5T\x1b[2;1T"),
+    // --- character sets (astream b13/charsets) ------------------------------
+    // xterm's DEC Special Graphics table, G0/G1 and SO/SI.
+    case("dec_graphics_box", 6, 3, b"\x1b(0lqqk\r\nx  x\r\nmqqj\x1b(B"),
+    case("dec_graphics_table_edges", 20, 2, b"\x1b(0^_`a{|}~AZ\x1b(B^_`a{|}~"),
+    case("dec_graphics_leaves_utf8_alone", 10, 2, "\x1b(0q\u{e9}\u{2500}q".as_bytes()),
+    case("g1_with_so_and_si", 10, 2, b"\x1b)0a\x0ea\x0fa"),
+    // xterm's resetCharsets: ASCII in G1 (aterm's
+    // `g1_defaults_to_ascii_so_prints_plain_text`).
+    case("so_with_nothing_designated_prints_ascii", 10, 2, b"\x0eabc\x0f"),
+    case("so_inside_a_csi_executes", 10, 2, b"\x1b)0\x1b[\x0e2Cq"),
+    // DECSC saves gsets and curgl; an unsaved DECRC and RIS reset them.
+    case("decsc_saves_the_charsets", 10, 2, b"\x1b(0\x1b7\x1b(Bq\x1b8\x1b[2Gq"),
+    case("decsc_saves_the_shift", 10, 2, b"\x1b)0\x0e\x1b7\x0fq\x1b8\x1b[2Gq"),
+    case("unsaved_decrc_resets_the_charsets", 10, 2, b"\x1b(0\x0e\x1b8q"),
+    case("ris_resets_the_charsets", 10, 2, b"\x1b(0\x1b)0\x0e\x1bcq"),
+    case("1049_saves_the_charsets", 10, 2, b"\x1b(0\x1b[?1049h\x1b(Bq\x1b[?1049lq"),
     // --- SGR ---------------------------------------------------------------
     case("sgr_attributes_and_their_resets", 10, 2, b"\x1b[1;31mA\x1b[4mB\x1b[7mC\x1b[22;24;27mD\x1b[0mE"),
     case("sgr_256_both_forms", 10, 2, b"\x1b[38;5;196mA\x1b[48;5;21mB\x1b[38:5:10mC\x1b[48:5:200mD\x1b[39;49mE"),

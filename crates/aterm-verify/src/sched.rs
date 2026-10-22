@@ -420,7 +420,6 @@ mod tests {
             "`Pure` is the ABSENCE of a contended resource: pure stages must \
              overlap each other too, not queue behind one another"
         );
-        // The side lanes start at t0, beside the test compile.
         for side in ["cells", "checkers"] {
             assert!(
                 overlaps(at(idx("compile")), at(idx(side))),

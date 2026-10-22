@@ -583,14 +583,21 @@ pub(crate) fn alab_pack_gate(
     }
 }
 
-/// [`alab_pack_gate`] with the real [`codesign_strict_check`], for a tree on disk: what the
-/// producer (`atpkg-publish pack-package`, and `atpkg-publish index` before it pins an ALab
-/// build) holds a package to, so it never signs or pins a pack this client's stage refuses.
+/// [`alab_pack_gate`] with the real [`codesign_strict_check`], for a tree on disk, then the
+/// minimum-aterm pairing's SHAPE ([`crate::alab::pairing_floor`]): what the producer
+/// (`atpkg-publish pack-package`, and `atpkg-publish index` before it pins an ALab build)
+/// holds a package to, so it never signs or pins a pack this client's stage refuses. A
+/// record whose `aterm` no client reads is refused by every client's stage
+/// ([`crate::alab::pairs_with`]), so the producer refuses it too (review of parity-4, R2).
+/// The version the record names is not judged here: the producer pins for every aterm.
 ///
 /// # Errors
 /// The gate's refusal, as a stage would report it.
 pub fn check_alab_pack(tree: &Path, exposes: &[String]) -> Result<(), StageError> {
-    alab_pack_gate(exposes, codesign_strict_check)(tree)
+    alab_pack_gate(exposes, codesign_strict_check)(tree)?;
+    crate::alab::pairing_floor(tree)
+        .map(drop)
+        .map_err(|why| StageError::Payload(format!("alab pairing: {why}")))
 }
 
 /// How [`alab_pack_gate`] names what each Mach-O must carry.
@@ -1422,7 +1429,7 @@ impl Drop for Mount {
 /// link in it that leaves the stage root ([`vet_copied_tree`]), detach. Nothing else on
 /// the image is copied and nothing on it is executed.
 ///
-/// # The modes are the stage's, not the image's (AT3, ruling 2026-10-10)
+/// # The modes are the stage's, not the image's (AT3)
 ///
 /// Until 2026-10-10 this lane kept the image's mode bits, on the reasoning that the
 /// bundle is the vendor's, signed and notarized as laid out, while the archive lanes
@@ -1494,10 +1501,8 @@ fn stage_dmg(image: &Path, dest: &Path) -> Result<(), StageError> {
         "ditto",
         &[no_acl, no_clone, app.as_os_str(), out.as_os_str()],
     )?;
-    // `ditto` laid the bundle VERBATIM, links and modes included, with nothing of ours
-    // vetting them on the way — so vet and sanitize them now, before the mount is
-    // released and long before the swap: the archive lanes' rules, applied to the
-    // finished copy.
+    // `ditto` laid the bundle verbatim, links and modes included: vet and sanitize it
+    // before the mount is released, by the archive lanes' rules.
     if let Err(e) = vet_copied_tree(dest, &out) {
         let _ = mount.detach();
         return Err(e);

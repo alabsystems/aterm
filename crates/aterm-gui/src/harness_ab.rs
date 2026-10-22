@@ -32,8 +32,8 @@
 //! crosses the midnight is split there. No "time saved" is derived (§6).
 //!
 //! **The ends** (§11.6.3, item 4): each day also counts the tasks that came
-//! down ([`AbEnds`]) — Land's landings, the one end under FOREVER CRUISE /
-//! FOREVER LAND (Cruise ends nothing, Land is never quiet) — and the time
+//! down ([`AbEnds`]) — Land's landings, the one end under Autopilot Cruise /
+//! Autopilot Land (Cruise ends nothing, Land is never quiet) — and the time
 //! from Land to landed, one log₂ sample per landing whose Land start the book
 //! saw ([`AbBook::landed`]). That start is
 //! kept per session apart from the open stretch ([`AbTask`]), so a word that
@@ -286,7 +286,7 @@ impl AbArmTotals {
 /// ([`AbBook::landed`]), and the time from Land to landed as a hold's is
 /// kept, one sample per landing whose Land start the book saw, in
 /// [`bucket`]s. (An older build also counted Cruise's dones and Land's quiet
-/// ends; FOREVER CRUISE / FOREVER LAND has neither, and their counts in an
+/// ends; Autopilot Cruise / Land has neither, and their counts in an
 /// older day file are passed over.)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct AbEnds {
@@ -1346,8 +1346,8 @@ fn land_words(week: &AbWeek) -> String {
 /// anything — Land's landings, and the median time from Land to landed with
 /// its n (`Land to landed: about 6m (5)`; `Land to landed: not enough yet
 /// (2)` under [`ENOUGH`]) — `None` with nothing to count (the row then reads
-/// `none yet`, [`ab_rows`]). No Cruise or Off side: under FOREVER CRUISE /
-/// FOREVER LAND a landing is the one end.
+/// `none yet`, [`ab_rows`]). No Cruise or Off side: under Autopilot Cruise /
+/// Autopilot Land a landing is the one end.
 #[must_use]
 pub(crate) fn ends_words(ends: &AbEnds) -> Option<String> {
     let mut parts = Vec::new();

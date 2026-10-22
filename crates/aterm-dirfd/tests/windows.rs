@@ -54,9 +54,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_dirfd::{AtFlags, Dir, Errno, FileId, Mode, OFlags, OwnedFd};
 
-// ---------------------------------------------------------------------------
 // Fixtures
-// ---------------------------------------------------------------------------
 
 /// A scratch directory on the temp volume (NTFS on every machine this runs on).
 fn scratch() -> aterm_tempfile::TempDir {
@@ -203,9 +201,7 @@ fn remove_named(root: &OwnedFd, name: &str) -> Vec<(OsString, Errno)> {
     kept
 }
 
-// ---------------------------------------------------------------------------
 // Opens, stats, listings
-// ---------------------------------------------------------------------------
 
 #[test]
 fn relative_opens_stats_and_listings_agree_with_std() {
@@ -495,9 +491,7 @@ fn a_facts_only_open_reads_any_entry_and_its_owner() {
     assert!(theirs.to_string().starts_with("S-1-5-80-"), "{theirs}");
 }
 
-// ---------------------------------------------------------------------------
 // Deletion
-// ---------------------------------------------------------------------------
 
 #[test]
 fn a_tree_with_a_read_only_file_is_deleted() {
@@ -1205,9 +1199,7 @@ fn the_legacy_classes_list_and_delete_as_the_extended_ones() {
     aterm_dirfd::seam::legacy_classes(false);
 }
 
-// ---------------------------------------------------------------------------
 // pin, and errors
-// ---------------------------------------------------------------------------
 
 #[test]
 fn pin_walks_every_spelling_of_one_directory_and_refuses_the_rest() {

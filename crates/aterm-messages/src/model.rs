@@ -548,8 +548,7 @@ impl Intent {
                 TAB_N[usize::from(*tab).min(10) % 10]
             }
             Self::AgentUpgrade { word, .. } => match word {
-                // What the press does, not when: a bare `Now` beside
-                // `Tomorrow` says neither what nor to whom (D6).
+                // What the press does, not when.
                 UpgradeWord::Now => "Upgrade",
                 // A day off in the eight cells a short form has, said as the choice
                 // it is; the answered record says until when.
@@ -2074,9 +2073,8 @@ mod tests {
                 "{intent:?}"
             );
         }
-        // aterm's own Security page beside System Settings' pane (the Developer
-        // Tools line carries both): the two capsules never read alike, in either
-        // form.
+        // The Developer Tools line carries aterm's Security page and System Settings'
+        // pane: the two capsules never read alike, in either form.
         let page = Intent::OpenSettings {
             route: "/security".into(),
         };

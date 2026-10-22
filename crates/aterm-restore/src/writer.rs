@@ -593,9 +593,7 @@ impl<S: RegionStore> JournalWriter<S> {
         zero(&self.store, at, len)
     }
 
-    // -----------------------------------------------------------------------
     // The tail
-    // -----------------------------------------------------------------------
 
     /// The most payload one BYTES record carries in this ring: [`MAX_BYTES_PAYLOAD`],
     /// or what fits beside a header in a small test ring.
@@ -923,9 +921,7 @@ impl<S: RegionStore> JournalWriter<S> {
         store_config_fp(&self.store, config_fp).map_err(WriteError::from)
     }
 
-    // -----------------------------------------------------------------------
     // Keyframes
-    // -----------------------------------------------------------------------
 
     /// Capture a keyframe and begin its write: encode it (with the writer's tail
     /// position and stream count as its `tail_from` and `stream_at`) and store its
@@ -1113,9 +1109,7 @@ impl<S: RegionStore> JournalWriter<S> {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
     // History (through this writer's own ring writer: module doc of `HistoryWriter`)
-    // -----------------------------------------------------------------------
 
     /// [`HistoryWriter::reset_ring`] over this writer's store.
     ///

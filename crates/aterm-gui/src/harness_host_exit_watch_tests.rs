@@ -705,9 +705,7 @@ fn an_exit_nobody_is_handed_conforms_to_the_commit_owed_model() {
     assert!(!buggy.check_invariant("NoOwedRelaunchLost", &lost));
 }
 
-// ---------------------------------------------------------------------------
 // Landings and exits a cold restore's queue, a Commit or a host panic leaves to nobody.
-// ---------------------------------------------------------------------------
 
 /// A cold restore's landing that crashes before a pass names it (the host down after a panic) is
 /// watched from its landing: its exit is read as it was seen and relaunched once by the
@@ -777,12 +775,9 @@ fn a_restored_agent_that_crashes_before_a_pass_names_it_is_relaunched() {
     p.host.shutdown_and_join();
 }
 
-/// What a seamless update's layout carries of tab `sid` from `parent` to
-/// its successor's Commit, through the leaf's wire
-/// ([`crate::restore::AgentRestore`], TOML) — the relaunch the parent owes
-/// the tab, and the explicit restart's cause where its act ended the agent
-/// — as the successor queues it on its restored queue
-/// (`App::hand_restored_agents`), on the adopted shell.
+/// What a seamless update carries of tab `sid` from `parent` to its successor's restored queue:
+/// the owed relaunch and the explicit restart's cause, through the leaf's TOML wire
+/// ([`crate::restore::AgentRestore`]), as `App::hand_restored_agents` queues it.
 #[cfg(target_os = "macos")]
 fn carried_across(parent: &HostHandle, sid: &str) -> Vec<RestoredAgent> {
     parent
@@ -853,8 +848,7 @@ fn an_asked_exit_carried_through_a_hold_across_a_commit_is_relaunched_once_it_li
     let (steps, looks) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let mut h = b.hooks();
     let (world, n, l) = (Arc::clone(&b), Arc::clone(&steps), Arc::clone(&looks));
-    // aterm's own end's step: its relaunch line looks at the tab as every
-    // relaunch line does (`wait:held` under a hold).
+    // aterm's own end's step: its relaunch line answers `wait:held` under a hold.
     h.acts.relaunch_restored = Arc::new(move |sid, _, _, _| {
         n.fetch_add(1, Ordering::SeqCst);
         l.fetch_add(1, Ordering::SeqCst);

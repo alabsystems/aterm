@@ -205,7 +205,7 @@ struct StrictBookFile {
 /// the older build's `DayFile`, which skips them, its other numbers whole;
 /// and a day with no end writes no `ends` at all. An older build's `done`
 /// and `quiet` counts (Cruise's dones and Land's quiet ends, neither of
-/// which FOREVER CRUISE / FOREVER LAND has) are passed over, its landings
+/// which Autopilot Cruise / Land has) are passed over, its landings
 /// read whole. NEGATIVE CONTROL: the older struct with `deny_unknown_fields`
 /// refuses the newer file.
 #[test]

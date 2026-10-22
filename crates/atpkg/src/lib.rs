@@ -197,9 +197,9 @@ pub mod select;
 /// the installed binary: `aterm pkg shell-setup` and `aterm pkg self-uninstall`.
 #[cfg(unix)]
 pub mod selfsetup;
-/// The self-update intercept (2026-09-19): `claude update|upgrade|install` and `codex
-/// update` typed on the MANAGED name are answered by the standard `aterm pkg update` —
-/// the roster, the classification and every line, pure; the verb is `cli::cmd_selfupdate`.
+/// The self-update intercept: `claude update|upgrade|install` and `codex update` typed on
+/// the managed name are answered by the standard `aterm pkg update`. Pure; the verb is
+/// `cli::cmd_selfupdate`.
 pub mod selfupdate;
 /// Recorded answers for the index, manifests and `status.toml` (the serde corpus).
 #[cfg(test)]

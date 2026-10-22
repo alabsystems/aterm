@@ -39,10 +39,8 @@ use crate::appkit::{self, MainThread};
 // The `window` verb's capture already declares these releasers.
 use crate::cg_capture::{CGColorSpaceRelease, CGImageRelease};
 
-// ---------------------------------------------------------------------------
 // CoreGraphics / CoreAnimation FFI. Opaque pointers only: nothing below is ever
 // dereferenced in Rust, it is handed straight back to CG/CA or released.
-// ---------------------------------------------------------------------------
 
 type CGColorSpaceRef = *mut c_void;
 type CGDataProviderRef = *mut c_void;
@@ -144,9 +142,7 @@ unsafe extern "C" fn release_pixel_box(_info: *mut c_void, data: *const c_void, 
     }
 }
 
-// ---------------------------------------------------------------------------
 // Owning wrappers. Every +1 reference this module takes lives in one of these.
-// ---------------------------------------------------------------------------
 
 /// A +1 `CGColorSpaceRef`, released exactly once on drop.
 struct OwnedColorSpace(CGColorSpaceRef);
@@ -163,9 +159,7 @@ impl Drop for OwnedColorSpace {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Errors
-// ---------------------------------------------------------------------------
 
 /// Why a macOS CPU present could not be set up or committed.
 ///
@@ -211,9 +205,7 @@ impl fmt::Display for MacPresentError {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The presenter
-// ---------------------------------------------------------------------------
 
 /// The geometry last pushed to our layer: the root layer's bounds plus its
 /// contents scale. Compared as raw components so a steady frame issues no
@@ -408,9 +400,7 @@ impl CpuPresenter for MacCpuPresenter {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The acquired frame
-// ---------------------------------------------------------------------------
 
 /// One acquired macOS CPU frame: `width * height` words of `0x00RRGGBB`.
 pub(crate) struct MacCpuFrame<'a> {

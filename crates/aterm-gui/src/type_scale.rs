@@ -28,8 +28,8 @@ pub(crate) enum TypeStep {
 }
 
 impl TypeStep {
-    /// The step's multiplier on the chrome base size — the ONE place a text
-    /// size factor may be written.
+    /// The step's multiplier on the chrome base size: the one place a text size factor is
+    /// written.
     pub(crate) fn factor(self) -> f32 {
         match self {
             TypeStep::Display => 1.6,

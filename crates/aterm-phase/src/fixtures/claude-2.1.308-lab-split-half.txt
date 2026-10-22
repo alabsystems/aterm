@@ -1,0 +1,51 @@
+# claude-code 2.1.308 · MEASURED 2026-10-22, `aterm-lab halfdraw scan` of the lab's cast (`aterm ctl @<sid> cast`, one event per burst of the PTY reader, which coalesces its reads) of a private headless aterm (144x50) running the real Claude Code against the lab's stub, three tabs at once, the stub's tall landing report streaming · event 372: a burst ended inside the program's DEC 2026 frame, so the grid holds the frame's prefix: the composer's bottom rule cut at 109 of 144 cells on the last row, the busy footer not yet under it (docs/measured/half-drawn-frame-2026-10-22.md)
+  - check 70 passed
+  - check 71 passed
+  - check 72 passed
+  - check 73 passed
+  - check 74 passed
+  - check 75 passed
+  - check 76 passed
+  - check 77 passed
+  - check 78 passed
+  - check 79 passed
+  - check 80 passed
+    Nothing left: the parser is committed and pushed to origin/main.
+
+✻ Worked for 5s · done 5:31 AM
+
+❯ write the landing report round 6
+
+⏺ Here is the landing report.
+  NEEDS YOU: rotate the deploy key
+
+  - check 1 passed
+  - check 2 passed
+  - check 3 passed
+  - check 4 passed
+  - check 5 passed
+  - check 6 passed
+  - check 7 passed
+  - check 8 passed
+  - check 9 passed
+  - check 10 passed
+  - check 11 passed
+  - check 12 passed
+  - check 13 passed
+  - check 14 passed
+  - check 15 passed
+  - check 16 passed
+  - check 17 passed
+  - check 18 passed
+  - check 19 passed
+  - check 20 passed
+  - check 21 passed
+  - check 22 passed
+  - check 23 passed
+  - check 24 passed
+  - check 25 passed
+  - check 26 passed
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────

@@ -817,7 +817,7 @@ impl Run<'_> {
 
     /// Type the corpus: each line's keys at a typist's cadence, then wait for
     /// its output and the next prompt. One `image` is taken mid-line on the
-    /// first plain line of round 2 (`frame-<tag>.png`).
+    /// first plain line of (`frame-<tag>.png`).
     fn type_corpus(&mut self, image: bool) -> Result<(), Halt> {
         let lines = corpus(self.rounds);
         let mut n = 0;

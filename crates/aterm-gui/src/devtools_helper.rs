@@ -78,9 +78,7 @@ use aterm_containment::consent::{
 };
 use aterm_types::MutexExt as _;
 
-// ---------------------------------------------------------------------------
 // THE QUIET MOMENT
-// ---------------------------------------------------------------------------
 
 /// How long the owner's hands must have been off the keyboard and mouse before aterm
 /// puts System Settings in front of them: a pause, not a word being typed (the
@@ -124,9 +122,7 @@ pub(crate) fn quiet(
     focused && !input_within_quiet && input_within_presence && settled && !handoff_busy
 }
 
-// ---------------------------------------------------------------------------
 // WHO MAY BRING THE PAGE UP
-// ---------------------------------------------------------------------------
 
 /// Where a hand-over came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -513,9 +509,7 @@ impl Reading {
     }
 }
 
-// ---------------------------------------------------------------------------
 // THE PANEL'S WORDS
-// ---------------------------------------------------------------------------
 
 /// The tile's caption under aterm's icon.
 pub(crate) const TILE_CAPTION: &str = "aterm";
@@ -857,9 +851,7 @@ impl Content {
     }
 }
 
-// ---------------------------------------------------------------------------
 // THE PANEL'S STATES
-// ---------------------------------------------------------------------------
 
 /// How long the panel stays up at most: ten minutes.
 pub(crate) const PANEL_FOR: Duration = Duration::from_secs(10 * 60);
@@ -1456,9 +1448,7 @@ impl Panel {
     }
 }
 
-// ---------------------------------------------------------------------------
 // LAYOUT AND PLACEMENT
-// ---------------------------------------------------------------------------
 //
 // Off macOS, outside the tests, the AppKit panel that calls the pure functions
 // below is not compiled, so each of them expects `dead_code` there. What only
@@ -1993,9 +1983,7 @@ pub(crate) const fn cover_turn(
     }
 }
 
-// ---------------------------------------------------------------------------
 // WHAT TO DRAG
-// ---------------------------------------------------------------------------
 
 /// The bundle the tile offers to drag: the running aterm's own bundle, when it is the
 /// INSTALLED copy (not a translocated or mounted image), it exists, and its bundle id is
@@ -2034,9 +2022,7 @@ fn accepted_bundle(
     (installed && root_id.is_some() && root_id == subject).then_some(root)
 }
 
-// ---------------------------------------------------------------------------
 // THE ARMS
-// ---------------------------------------------------------------------------
 
 /// What the hand-over does to the Mac and to its markers, injected like the consent
 /// probes (`consent_state::ConsentProbes`) and atpkg's own `Reach`: the window's
@@ -2391,9 +2377,7 @@ impl std::fmt::Debug for PanelEvents {
     }
 }
 
-// ---------------------------------------------------------------------------
 // THE LANE
-// ---------------------------------------------------------------------------
 
 /// What a `spctl developer-mode enable-terminal` run is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3302,9 +3286,7 @@ impl Lane {
     }
 }
 
-// ---------------------------------------------------------------------------
 // THE LIVE PANEL (macOS)
-// ---------------------------------------------------------------------------
 
 /// THE PANEL ITSELF, on AppKit: the [`DevToolsHelperArm::live`] arm.
 ///

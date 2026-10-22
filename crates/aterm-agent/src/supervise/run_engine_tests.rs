@@ -336,7 +336,7 @@ fn err_halted_parks_until_the_hold_lifts_and_the_loop_goes_on() {
     assert!(rows[0].contains("\"decision\":\"deferred\""), "{rows:?}");
     assert!(rows[1].contains("\"decision\":\"approved\""), "{rows:?}");
     assert!(
-        rows[1].contains("\"rule_id\":\"read-only@classify-v4\""),
+        rows[1].contains("\"rule_id\":\"read-only@classify-v5\""),
         "{rows:?}"
     );
     let _ = std::fs::remove_dir_all(&jdir);
@@ -488,7 +488,7 @@ fn turn_of_rows(rows: &[String]) -> Turn {
 }
 
 /// The rm breaker in a bypass session with the cwd known: every operand under a scratch root,
-/// pressed and ledgered `rm-breaker@v3`; `S=/usr`, escalated. Negative controls: the cwd
+/// pressed and ledgered `rm-breaker@v4`; `S=/usr`, escalated. Negative controls: the cwd
 /// unknown, and outside bypass.
 #[test]
 fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
@@ -512,7 +512,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
     let rows = ledger_rows(&ledger);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"rm-breaker@v3\""),
+        rows[0].contains("\"rule_id\":\"rm-breaker@v4\""),
         "{rows:?}"
     );
     assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
@@ -563,7 +563,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
 }
 
 /// THE RM BREAKER'S TOO-MANY BOX OVER A PROVEN READ IS PRESSED AND LEDGERED UNDER
-/// `breaker-read-only@v2`, in a bypass session, under the safe rules alone: Claude Code 2.1.307
+/// `breaker-read-only@v4`, in a bypass session, under the safe rules alone: Claude Code 2.1.307
 /// draws that box over any command with more than 64 command substitutions, rm or none
 /// (MEASURED). The box is the MEASURED one with its command made thirteen barred lines of `echo`
 /// and five `$(true)`; the press is guarded by its first command row, and the one ledger row is
@@ -598,7 +598,7 @@ fn the_too_many_breaker_over_a_proven_read_is_ledgered_under_its_rule() {
     let rows = ledger_rows(&ledger);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v2\""),
+        rows[0].contains("\"rule_id\":\"breaker-read-only@v4\""),
         "{rows:?}"
     );
     assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
@@ -790,7 +790,7 @@ fn a_transcript_call_cannot_approve_another_boxes_newline_reading_in_the_loop() 
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v2\""),
+        rows[0].contains("\"rule_id\":\"breaker-read-only@v4\""),
         "{rows:?}"
     );
     assert_eq!(asks, 0);
@@ -931,7 +931,7 @@ fn a_settled_transcript_cannot_remove_a_ticking_boxes_readings() {
 }
 
 /// A TOO-MANY BOX THE SCREEN ALREADY PROVES COSTS NO TRANSCRIPT READ ([`box_command::wanted`]): the
-/// box whose barred lines are each a read is pressed under `breaker-read-only@v2` with the host's
+/// box whose barred lines are each a read is pressed under `breaker-read-only@v4` with the host's
 /// transcript never asked. NEGATIVE CONTROL: the measured box, which the screen does not prove,
 /// asks it.
 #[test]
@@ -946,7 +946,7 @@ fn a_too_many_box_the_screen_proves_reads_no_transcript() {
     assert_eq!(m.presses().len(), 1, "{:?}", m.requests);
     assert!(out[0].starts_with("APPROVED seq=102 "), "{out:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v2\""),
+        rows[0].contains("\"rule_id\":\"breaker-read-only@v4\""),
         "{rows:?}"
     );
     assert_eq!(asks, 0, "a proven box asks the transcript nothing");
@@ -2786,7 +2786,7 @@ fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
 }
 
 /// THE LIMIT MENU'S PRESS A RESTART'S LEASE REFUSES IS RETRIED, NOTHING TYPED
-/// MEANWHILE (ATERM-KI-1016-1 limits-4; the lab's L7 at `703c753df4`, six
+/// MEANWHILE (limits-4; the lab's L7 at `703c753df4`, six
 /// refusals in about 16 s): right after a crash restore under a limit, the
 /// relaunch holds the tab (`lease … hard`) until the relaunched agent's
 /// first idle, and the restored loop's Enter on the wait row meets `ERR busy
@@ -3050,8 +3050,8 @@ const EDIT_ID: &str = "toolu_labe2ce2e002e831eb0";
 const EDIT_STAR_HOOK_PENDING: &str =
     include_str!("fixtures/claude-2.1.300-transcript-box-edit-star-hook-pending.jsonl");
 /// A PreToolUse hook on every tool that only logs: what held every `Edit
-/// file` box before the screen named its call (ATERM-KI-1015-1 F1's
-/// over-hold, ATERM-KI-1016-1).
+/// file` box before the screen named its call (F1's
+/// over-hold).
 const STAR_HOOK: &str =
     r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"exit 0"}]}]}}"#;
 /// The Edit tool's own box (2.1.295): `⏺ Update(notes.txt)`, no child row.
@@ -4532,7 +4532,7 @@ fn a_limit_episode_is_told_to_the_host_and_waited_out_over_its_turn_ends() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A LIMIT EPISODE CLOSES AT A REPLY NO READ SAW BUSY (ATERM-KI-1016-1,
+/// A LIMIT EPISODE CLOSES AT A REPLY NO READ SAW BUSY (
 /// limits: "a limit episode closes at a read that sees the worker busy. A
 /// reply too quick for any read … leaves it open: the host's steps … wait
 /// for the reset plus `LIMIT_GRACE_S` (1 h), for good where no reset is
@@ -5694,7 +5694,7 @@ fn a_limit_only_the_transcript_shows_withholds_the_hosts_step() {
 }
 
 /// A TRANSCRIPT LIMIT ROW THAT NAMES NO RESET HOLDS THE HOST'S STEP FOR GOOD
-/// (ATERM-KI-1016-1 limits-2; the manual's "never returned from on a guess"):
+/// (limits-2; the manual's "never returned from on a guess"):
 /// a model bucket's row (`seven_day_sonnet`, `resetsAt` null) written two
 /// days before the look withholds the relaunch's carry-on still — no reset
 /// is guessed for it (a session window's five hours, a week) — until the
@@ -8041,7 +8041,7 @@ fn the_host_tells_a_carry_on_from_a_notice_and_only_the_carry_on_is_checked() {
 }
 
 /// WHICH TURN THE HOST TYPED AT A BREAK OF BACKGROUND WORK reaches the policy from the
-/// host's own word ([`IdleHost::at_background`]'s kind; ATERM-KI-1016-1, the done
+/// host's own word ([`IdleHost::at_background`]'s kind, the done
 /// report's fourth item): the release a give-up owes (`released:<why>`, the worker's work
 /// resumed) answered with real work that says done is a done report, and the loop's next
 /// act is the done check, as at an idle point; the notice's answer is no done report, and
@@ -13405,7 +13405,7 @@ fn a_give_ups_release_goes_before_the_policys_continuation() {
 }
 
 /// A GIVE-UP'S RELEASE GATED BY THE SETTLE AT ITS POINT IS STILL TYPED BEFORE
-/// THE POLICY'S CONTINUATION (ATERM-KI-1016-1, the GUI host): at a fresh turn
+/// THE POLICY'S CONTINUATION (the GUI host): at a fresh turn
 /// end the release's gate (the notice's) waits for the screen to go quiet,
 /// so the give-up's follow-up says `wait:release:settling`. That word owned
 /// nothing, and wanted no point: the policy typed `keep going` at the point,
@@ -14415,7 +14415,7 @@ fn a_word_that_moved_between_follow_ups_does_not_start_their_count_again() {
 }
 
 /// A WORD THAT ONLY EVER MOVES THE SESSION AT AN UNCHANGED POINT IS PASSED
-/// OVER AT THE COUNT (ATERM-KI-1016-1): a step that moved the session spends
+/// OVER AT THE COUNT: a step that moved the session spends
 /// none of the point's follow-ups (F1-R9-L1), so where every step there says
 /// it moved (`adopted` again and again: the relaunch its record holds in
 /// flight, found once more) while the screen shows the very same point, the

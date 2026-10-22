@@ -3,11 +3,10 @@
 
 //! Process-wide native-document truth for Markdown and editor views.
 //!
-//! One [`Document`] owns one canonical [`aterm_buffer::Surface`].  Views retain only a
-//! stable [`DocumentId`] and immutable [`DocumentSnapshot`] projections, so a Markdown
-//! preview and an editor can never race private text copies.  All mutations enter through
-//! [`DocumentStore::transact`], are OCC-guarded by [`Seq`], and publish exactly one new
-//! sequence for an atomic multi-selection edit.
+//! One [`Document`] owns one canonical [`aterm_buffer::Surface`]. Views hold only a
+//! [`DocumentId`] and immutable [`DocumentSnapshot`]s, so no view keeps a private text copy.
+//! Every mutation goes through [`DocumentStore::transact`], OCC-guarded by [`Seq`], and an
+//! atomic multi-selection edit publishes exactly one new sequence.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
@@ -115,9 +114,8 @@ struct Document {
     projection: Arc<str>,
     revision: u64,
     checkpoint_seq: Seq,
-    /// Every attached controller's published document sequence. Publication happens in
-    /// the same synchronous mutation lane as the canonical Surface commit, before the
-    /// caller can route another input event.
+    /// Each attached view's published sequence, updated in the same synchronous lane as the
+    /// Surface commit, before another input event can be routed.
     views: BTreeMap<DocumentViewId, Seq>,
     phase: DocumentPhase,
 }
@@ -149,8 +147,7 @@ pub struct DocumentStore {
     next_id: u64,
     documents: BTreeMap<DocumentId, Document>,
     by_uri: BTreeMap<String, DocumentId>,
-    /// The buffer-write capability every Surface edit presents, granted by the
-    /// launcher's one `aterm_cap::Authority` in `main_entry`. Production reads
+    /// The buffer-write cap every Surface edit presents, granted in `warm_prologue`. Reads
     /// go through the cached projection, so the store holds no read cap.
     write: WriteCap,
 }
@@ -184,8 +181,7 @@ impl DocumentStore {
         let nonzero = NonZeroU64::new(raw).expect("document ids start at one");
         let id = DocumentId(nonzero);
         let mut surface = Surface::new();
-        // Surface owns the original String allocation; the flat Arc projection
-        // is the separate immutable cache shared by every document snapshot.
+        // Surface owns the String; the Arc projection is the shared immutable snapshot cache.
         let projection: Arc<str> = Arc::from(text.as_str());
         surface.apply(&self.write, SurfaceEdit::AppendLine(text));
         let head = surface.seq();
@@ -214,9 +210,8 @@ impl DocumentStore {
         self.documents.get(&id).map(|d| d.canonical_uri.as_str())
     }
 
-    /// Roll back a failed host initialization before any controller observes the
-    /// document. Once a view is attached, normal close/durability rules own
-    /// removal and this seam fails closed.
+    /// Roll back a failed host initialization before any view attaches. With a view attached,
+    /// the close/durability rules own removal and this fails closed (`CloseNotReady`).
     pub fn remove_if_unattached(&mut self, id: DocumentId) -> Result<(), DocumentError> {
         let document = self
             .documents
@@ -291,10 +286,8 @@ impl DocumentStore {
         self.documents.get(&id).map(|d| d.views.len())
     }
 
-    /// Stable document identities currently owned by the process.  Shutdown uses
-    /// this store-owned enumeration instead of reconstructing ownership from the
-    /// visible tab tree: even a suspended document must participate in a clean-quit
-    /// durability barrier.
+    /// Every document the process owns. Shutdown's clean-quit durability barrier uses this,
+    /// not the tab tree, so suspended documents are included.
     pub fn document_ids(&self) -> Vec<DocumentId> {
         self.documents.keys().copied().collect()
     }
@@ -371,9 +364,8 @@ impl DocumentStore {
         let Ok(next_text) = document.text.replace_many(&rope_edits) else {
             return DocumentTxnOutcome::Rejected(DocumentError::InvalidRange);
         };
-        // Flatten once for Surface, then publish a separate immutable projection
-        // allocation shared by every read snapshot. Keeping the frozen Surface
-        // Edit(String) API costs this one copy at the ownership boundary.
+        // Surface's `Edit(String)` API costs one flat copy; the read projection is a
+        // separate shared allocation.
         let next = next_text.to_flat_string();
         let next_projection: Arc<str> = Arc::from(next.as_str());
         let deltas = edits
@@ -551,11 +543,9 @@ impl DocumentStore {
         Ok(())
     }
 
-    /// Idempotent central teardown seam for one view edge.  A caller that reaches
-    /// this without first satisfying the final-dirty durability barrier fails
-    /// closed: the canonical reference remains installed and `CloseNotReady` is
-    /// returned.  Tab/window teardown calls this even after a batch detach, hence
-    /// an already-absent view is a successful no-op.
+    /// Idempotent teardown of one view edge. Without the final-dirty durability barrier met
+    /// it fails closed (`CloseNotReady`, reference kept); an already-absent view is an
+    /// `Ok(false)` no-op, since tab/window teardown calls this after a batch detach too.
     pub fn detach_view_if_ready(
         &mut self,
         id: DocumentId,
@@ -572,11 +562,9 @@ impl DocumentStore {
         Ok(true)
     }
 
-    /// Atomically detach all document leaves in one already-prepared close plan.
-    /// The first pass obtains a Ready verdict for *every* document without
-    /// removing anything; only then does the infallible mutation pass run.  This
-    /// is the concrete multi-document form of `NativeClosePlan`'s
-    /// `document_ready / other_leaf_ready` gate.
+    /// Atomically detach every document leaf in one close plan: a Ready verdict for every
+    /// document first, removing nothing, then the infallible removal pass (the
+    /// multi-document form of `NativeClosePlan`'s `document_ready`/`other_leaf_ready` gate).
     pub fn commit_detach_batch(
         &mut self,
         closing: &[(DocumentId, Vec<DocumentViewId>)],
@@ -590,8 +578,7 @@ impl DocumentStore {
             }
         }
 
-        // Every key/view was validated above and no intervening mutation is
-        // possible through `&mut self`, so this second pass cannot partially fail.
+        // Every key and view was validated above under `&mut self`: this pass cannot fail.
         for (document, views) in closing {
             let state = self
                 .documents
@@ -626,12 +613,11 @@ impl DocumentStore {
     }
 }
 
-/// Test-only mint: a test process that handles no untrusted input is its own
-/// trusted launcher.
+/// Test-only mint.
 #[cfg(test)]
 fn test_authority() -> aterm_cap::Authority {
-    // SAFETY: see above — the `root_authority` contract is "trusted launcher,
-    // before untrusted input", which a unit test satisfies.
+    // SAFETY: `root_authority` requires a trusted launcher before untrusted input; a unit
+    // test is one.
     unsafe { aterm_cap::Authority::root_authority() }
 }
 
@@ -838,9 +824,7 @@ mod tests {
         store.commit_detach(id, &[view]).unwrap();
     }
 
-    /// A durable acknowledgement never names a sequence the document has not
-    /// reached: the refusal `NativeSaveIntentLatch` relies on instead of stating
-    /// `durable <= head` as a law of its own.
+    /// An ack past head is refused: `NativeSaveIntentLatch` relies on this for `durable <= head`.
     #[test]
     fn checkpoint_ack_past_head_is_refused_without_moving_the_checkpoint() {
         let (mut store, id) = open();

@@ -177,9 +177,7 @@ pub struct AtermGpuTerminal {
     bold_font: Option<std::sync::Arc<Vec<u8>>>,
     // Host-injected symbol fallback face (`set_symbol_font`).
     symbol_font: Option<std::sync::Arc<Vec<u8>>>,
-    // Host-selected text shaping (ligatures + OpenType `font_features`), applied
-    // to the CPU and live GPU faces and re-applied by `init` so a setting chosen
-    // before init survives the face rebuild.
+    // Host-selected text shaping (ligatures, OpenType `font_features`).
     text_shaping: aterm_render::TextShapingConfig,
     // Per-frame engine snapshot, refilled in place (damaged rows only when the
     // continuity proof holds).
@@ -276,9 +274,8 @@ struct GpuDisplayRowCache {
 }
 
 /// Keep the engine's implicit cells and OSC 110/111/112/117 reset baselines
-/// aligned with the renderer theme. Sparse row tails and live selection colours
-/// come from `Terminal`, so changing only the CPU/GPU renderer theme would be
-/// overwritten on the next frame refill.
+/// aligned with the renderer theme: frame refills take sparse row tails and
+/// selection colours from `Terminal`, so a renderer-only theme change is lost.
 ///
 /// The baseline moves through [`Terminal::rebase_colors`], so a program's OSC
 /// 10/11/12/17 colours survive a host theme change, as they survive a native
@@ -1275,8 +1272,7 @@ impl AtermGpuTerminal {
         self.gpu.is_some()
     }
 
-    /// The acquired GPU adapter name + backend, once initialized (else empty).
-    /// Lets the host log which GPU/backend WebGL handed us.
+    /// The acquired GPU adapter name and backend once initialized, else empty.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn adapter_info(&self) -> String {
         match self.gpu.as_ref() {
@@ -1567,10 +1563,8 @@ fn classify(s: &str) -> u8 {
     3
 }
 
-// ---------------------------------------------------------------------------
 // WebGL init + present, wasm32 only. Native callers drive aterm-gpu directly
 // via `GpuRenderer::new` and a window surface.
-// ---------------------------------------------------------------------------
 #[cfg(target_arch = "wasm32")]
 #[export]
 impl AtermGpuTerminal {

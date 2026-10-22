@@ -625,8 +625,6 @@ mod glx {
     pub(crate) const GLX_RGBA_BIT: c_int = 0x1;
     /// `GLX_ARB_multisample`.
     pub(crate) const GLX_SAMPLE_BUFFERS: c_int = 100_000;
-    pub(crate) const GLX_WIDTH: c_int = 0x801D;
-    pub(crate) const GLX_HEIGHT: c_int = 0x801E;
     pub(crate) const GLX_PBUFFER_HEIGHT: c_int = 0x8040;
     pub(crate) const GLX_PBUFFER_WIDTH: c_int = 0x8041;
     /// `GLX_ARB_create_context` and `GLX_ARB_create_context_profile`.
@@ -679,20 +677,31 @@ mod glx {
                 fn(XDisplay, GLXFBConfig, *const c_int) -> GLXDrawable;
             destroy_pbuffer = "glXDestroyPbuffer": fn(XDisplay, GLXDrawable);
             swap_buffers = "glXSwapBuffers": fn(XDisplay, GLXDrawable);
-            query_drawable = "glXQueryDrawable": fn(XDisplay, GLXDrawable, c_int, *mut c_uint);
         }
     }
 
     fn_table! {
         /// The libX11 calls GLX needs beside it: freeing the config list
-        /// `glXChooseFBConfig` returns, naming the screen's default visual, and
-        /// asking whether a compositing manager runs (`_NET_WM_CM_S<n>`).
+        /// `glXChooseFBConfig` returns, naming the screen's default visual,
+        /// asking whether a compositing manager runs (`_NET_WM_CM_S<n>`), and
+        /// a window's size.
         pub(crate) struct XlibFns {
             free = "XFree": fn(*mut c_void) -> c_int;
             default_visual = "XDefaultVisual": fn(XDisplay, c_int) -> *mut c_void;
             visual_id_from_visual = "XVisualIDFromVisual": fn(*mut c_void) -> c_ulong;
             intern_atom = "XInternAtom": fn(XDisplay, *const c_char, c_int) -> c_ulong;
             get_selection_owner = "XGetSelectionOwner": fn(XDisplay, c_ulong) -> c_ulong;
+            get_geometry = "XGetGeometry": fn(
+                XDisplay,
+                c_ulong,
+                *mut c_ulong,
+                *mut c_int,
+                *mut c_int,
+                *mut c_uint,
+                *mut c_uint,
+                *mut c_uint,
+                *mut c_uint,
+            ) -> c_int;
         }
     }
 

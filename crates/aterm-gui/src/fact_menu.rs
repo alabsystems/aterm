@@ -675,6 +675,7 @@ impl App {
             cancels: None,
             highlight,
             rect: None,
+            laid: None,
             generation: 0,
             rest: PointerRest::at_open(px),
         });

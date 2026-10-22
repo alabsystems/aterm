@@ -226,9 +226,7 @@ pub const OWNER_POLL_SECS: u64 = 600;
 /// The disk the cut's universal build needs (`gates::MIN_FREE_DISK_GIB`).
 const CUT_GIB: u64 = crate::gates::MIN_FREE_DISK_GIB;
 
-// ---------------------------------------------------------------------------
 // the steps
-// ---------------------------------------------------------------------------
 
 /// One step of the release, in plan order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -346,9 +344,7 @@ impl Refusal {
     }
 }
 
-// ---------------------------------------------------------------------------
 // options
-// ---------------------------------------------------------------------------
 
 /// The Linux declaration a cut requires: `--mac-only`, or `--linux-artifacts DIR` with
 /// its targets (triples) and workers. Journaled, so a bare re-run resumes with it.
@@ -467,9 +463,7 @@ impl ReleaseOptions {
     }
 }
 
-// ---------------------------------------------------------------------------
 // the journal
-// ---------------------------------------------------------------------------
 
 /// This clone's release: what a re-run resumes with.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -644,9 +638,7 @@ pub fn release_dir(git: &dyn crate::ledger::GitRunner) -> Result<PathBuf, String
     Ok(PathBuf::from(out.stdout_utf8().trim()).join(RELEASE_DIR))
 }
 
-// ---------------------------------------------------------------------------
 // one run per clone
-// ---------------------------------------------------------------------------
 
 /// The live run's claim: `pid`, `started` (that pid's start time, as `ps -o lstart=`
 /// prints it) and `logs`, created exclusively. Removed when the run ends; an `exec`
@@ -775,9 +767,7 @@ impl RunClaim {
     }
 }
 
-// ---------------------------------------------------------------------------
 // measured step times
-// ---------------------------------------------------------------------------
 
 /// `<state>/steps.tsv`: `epoch\tversion\tstep\tsecs`, a line per step that ran.
 /// The estimate of a step is the median of this machine's last five runs of it.
@@ -818,9 +808,7 @@ fn short(sha: &str) -> &str {
     sha.get(..9).unwrap_or(sha)
 }
 
-// ---------------------------------------------------------------------------
 // what the backend answers
-// ---------------------------------------------------------------------------
 
 /// The release's one prover: the physical store build every child is handed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1148,9 +1136,7 @@ pub trait Backend {
     fn latest(&mut self) -> Result<String, String>;
 }
 
-// ---------------------------------------------------------------------------
 // the run
-// ---------------------------------------------------------------------------
 
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]

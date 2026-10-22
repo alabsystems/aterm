@@ -62,8 +62,8 @@ pub use windowing::{
     window_verb_usage,
 };
 
-/// `--help` text: synopsis, description, OPTIONS, ENVIRONMENT, EXAMPLES, scoped
-/// to the transparent passthrough.
+/// `--help`'s title. [`help_text`] assembles the rest: USAGE, OPTIONS,
+/// SUBCOMMANDS, VERBS, TOOLCHAIN and EXAMPLES.
 const HELP_TITLE: &str = "aterm — a transparent, introspecting terminal\n";
 /// What a plain `aterm` session runs, per platform, for `--help` ([`HELP_SESSION_LINE`]) and
 /// `aterm help aterm`. Windows reads no `$SHELL` or aterm.toml: it spawns `aterm-pty`'s
@@ -98,18 +98,19 @@ const HELP_SESSION_LINE: &str = concat!(
 );
 const HELP_HEAD: &str = concat!(
     "\n",
-    "`aterm ctl` reads and drives the window (`aterm --window`; `--headless` runs\n",
-    "it with no window); a plain `aterm` shell session serves no control socket.\n",
+    "`aterm ctl` reads and drives the window (`aterm --window`, or `--headless`\n",
+    "for no window); a plain `aterm` shell session serves no control socket.\n",
     "\n",
     "USAGE:\n",
     "    aterm [OPTIONS]           Start an interactive shell session (the default\n",
-    "                              with a TTY; a no-TTY launch opens the window).\n",
-    "    aterm --window [args]     Open the GPU window explicitly; --session forces\n",
-    "                              the shell session (e.g. for piped/CI runs).\n",
-    "    aterm help [topic]        The manual — what aterm is and how to drive it, plus every\n",
-    "                              tool (trust/clean/ty/ay/ny/nn). In an aterm window's tab it\n",
-    "                              prints the agent operating brief. START HERE.\n",
-    "    aterm <verb> [args]       A platform verb (see VERBS) or a toolchain tool (see TOOLCHAIN).\n",
+    "                              with a TTY; with no TTY, aterm opens the window).\n",
+    "    aterm --window [args]     Open the GPU window (`aterm --window --help` lists\n",
+    "                              its flags); --session forces the shell session,\n",
+    "                              e.g. for piped or CI runs.\n",
+    "    aterm help [topic]        The manual: what aterm is, how to drive it, and\n",
+    "                              every tool. Inside an aterm tab it prints the\n",
+    "                              agent operating brief. Start here.\n",
+    "    aterm <verb> [args]       A verb (see VERBS) or a tool (see TOOLCHAIN).\n",
     "    aterm <SUBCOMMAND>        Print diagnostics and exit (see SUBCOMMANDS).\n",
     "\n",
     "OPTIONS:\n",
@@ -118,20 +119,17 @@ const HELP_HEAD: &str = concat!(
     "                              containment (= --sandbox). The last\n",
     "                              flag wins; an invalid value fails closed to\n",
     "                              containment.\n",
-    "        --sandbox             Shorthand for --containment containment (the macOS\n",
-    "                              sandbox: no network; no debugger attach; writes\n",
-    "                              only to temp dirs and shell history; no access to\n",
-    "                              credential stores or private data; no mach\n",
-    "                              service lookup but user and group queries, so\n",
-    "                              open, osascript, pbcopy and the keychain do\n",
-    "                              nothing; refused where no OS sandbox exists).\n",
-    "        --no-sandbox          Shorthand for --containment user (no OS sandbox;\n",
-    "                              full network/credential access — the default).\n",
-    "        --no-reroute          Restore the upstream Rust names (cargo, rustc, …) in\n",
-    "                              this session; see `aterm help reroute`.\n",
+    "        --sandbox             Shorthand for --containment containment, the\n",
+    "                              macOS sandbox: no network, writes only to temp\n",
+    "                              dirs and shell history, no credential stores or\n",
+    "                              mach services (`aterm explain-config` has the\n",
+    "                              rest). Refused off macOS.\n",
+    "        --no-sandbox          Shorthand for --containment user (the default).\n",
+    "        --no-reroute          Restore the upstream names (cargo, rustc, z3, …)\n",
+    "                              for this launch; see `aterm help reroute`.\n",
     "    -q, --quiet               Hide the session's startup line.\n",
-    "        --verbose             Print a one-line session summary (bytes passed\n",
-    "                              through) to stderr on exit.\n",
+    "        --verbose             On exit, print to stderr how many bytes of output\n",
+    "                              passed through.\n",
     "    -h, --help                Print this help and exit.\n",
     "    -V, --version             Print the version and exit.\n",
     "\n",
@@ -148,7 +146,8 @@ const HELP_HEAD: &str = concat!(
     "    list-themes               List the built-in and custom themes (the same as\n",
     "                              `aterm theme list`).\n",
     "    list-kitty-commands       List the words the cursor cat obeys, by language.\n",
-    "    exceptions [--all]        What needs a look but not now, and what was filed.\n",
+    "    exceptions [--all]        List what needs a look later and the newest ten\n",
+    "                              filed entries (--all: every filed entry).\n",
     "\n",
 );
 
@@ -387,18 +386,18 @@ impl Verb {
     pub const fn blurb(self) -> &'static [&'static str] {
         match self {
             Verb::Ctl => &[
-                "Read and drive an aterm window's sessions: read the screen,",
-                "send keys, run a turn, subscribe to events, capture a frame.",
+                "Read and drive the sessions of an aterm window:",
+                "screen, keys, turns, events and frames.",
             ],
             Verb::Conn => &[
-                "See & wire SESSION CONNECTIONS: which sessions pull or",
-                "push each other (ls | add | set | rm | spawn | show | map).",
+                "Wire which sessions pull from or push to each",
+                "other (ls | add | set | rm | spawn | show | map).",
             ],
             Verb::ResourceRun => &[
                 "Run an exact command with authenticated per-tab resource ownership.",
                 "--session @self --job label -- program [args]; optional --ai label.",
             ],
-            Verb::Pkg => &["Install / update / verify the toolchain (the package manager)."],
+            Verb::Pkg => &["Install, update and verify the toolchain."],
             Verb::Agh => {
                 &["GitHub reads as the routed identity: JSON out, typed exits (agh help)."]
             }
@@ -408,9 +407,10 @@ impl Verb {
                 "`allow drive --from <node>` lets that node drive this machine",
                 "with `aterm ctl --host <h> …` (`aterm help workers`).",
             ],
-            Verb::Link => {
-                &["The fabric bridge: carry inbox/post between this instance and the bus."]
-            }
+            Verb::Link => &[
+                "The fabric bridge: carries inbox and post",
+                "traffic between this instance and the bus.",
+            ],
             Verb::Fabric => &[
                 "The fabric: mail between sessions and people (status | tail |",
                 "on | off | doctor | mint-for | halt | inbox | post); `status`",
@@ -422,19 +422,21 @@ impl Verb {
                 "`aterm ctl`'s.",
             ],
             Verb::Ship => &[
-                "Publish aterm: provision a signing machine, cut and release",
-                "a build. Needs a source checkout.",
+                "Publish aterm: provision a signing machine, cut",
+                "and release a build. Needs a source checkout.",
             ],
-            Verb::Update => &["Report or check for an update (status | check | identity)."],
+            Verb::Update => &[
+                "Report or check for an update, or print this",
+                "build's identity (status | check | identity).",
+            ],
             Verb::Agents => &[
-                "Keep the aterm primer in coding agents' context files (status |",
-                "install | remove | primer); `agents_auto_prime = false` stops",
-                "the window re-installing it.",
+                "Keep the aterm primer in coding agents' context",
+                "files (status | install | remove | primer).",
             ],
             Verb::Ai => &[
-                "This machine's AI CLIs (claude, codex, agy, muse): one working",
-                "login each (doctor | login), and reviews one AI asks of another",
-                "(review). `aterm ai` alone is the doctor, read-only.",
+                "This machine's AI CLIs (claude, codex, agy, muse):",
+                "one working login each (doctor | login), and",
+                "reviews one AI asks of another (review).",
             ],
             Verb::Machines => &[
                 "Configure and manage a lab of Macs over SSH from this one (init |",
@@ -456,17 +458,18 @@ impl Verb {
                 "live Claude Code onto a newer build. The window supervises.",
             ],
             Verb::Keeper => &[
-                "The PTY keeper: hold every terminal's master so a crashed",
-                "window's shells live on (start | stop | status | serve). macOS, opt-in.",
+                "The PTY keeper holds every terminal's master, so",
+                "a crashed window's shells live on (start | stop |",
+                "status | serve). macOS only, opt-in.",
             ],
             Verb::Caffeine => &[
                 "The menu-bar keep-awake mug: a click keeps this Mac awake,",
                 "a right click picks 1, 8, 24 h or forever (on | off | status). macOS.",
             ],
             Verb::Theme => &[
-                "List every theme (list); write and test your own (new, check,",
-                "export, schema); convert another terminal's theme (kitty, Ghostty,",
-                "Alacritty, iTerm2, Windows Terminal, base16) into it (import).",
+                "Colour themes (list | new | check | export |",
+                "schema | import); import converts kitty, Ghostty,",
+                "Alacritty, iTerm2, Windows Terminal and base16.",
             ],
             Verb::Edit => &[
                 "amacs, aterm's editor: open a file in a fresh Editor tab",
@@ -474,18 +477,18 @@ impl Verb {
                 "the same command, for $EDITOR).",
             ],
             Verb::NewTab => &[
-                "Open a terminal tab. Where it opens is the",
-                "`windowing_behavior` config key: a new window",
-                "(the default) or a tab in the running aterm.",
+                "Open a tab: a new window by default, or a tab in",
+                "the running aterm when windowing_behavior is",
+                "\"attach\".",
             ],
             Verb::NewWindow => &[
-                "Open a NEW window, always — never routed into a",
-                "running instance whatever windowing_behavior says.",
+                "Open a new window, never a tab in the running",
+                "aterm, whatever windowing_behavior says.",
             ],
             Verb::SplitPane => &[
-                "Split the focused pane — a new window by default",
-                "(`windowing_behavior`). -V side by side (default),",
-                "-H stacked.",
+                "Split the focused pane (-V side by side, the",
+                "default; -H stacked); a new window unless",
+                "windowing_behavior is \"attach\".",
             ],
         }
     }
@@ -538,14 +541,15 @@ fn help_text() -> String {
 const HELP_TAIL: &str = concat!(
     "\n",
     "TOOLCHAIN (`aterm help pkg` has the manual):\n",
-    "    aterm <tool> [args]       Run an installed tool from the managed store (never\n",
-    "                              $PATH), e.g. `aterm ay`, `aterm ty`, `aterm trustc`;\n",
+    "    aterm <tool> [args]       Run a tool from the managed store (never $PATH),\n",
+    "                              e.g. `aterm ay`, `aterm ty`, `aterm trustc`;\n",
     "                              `aterm pkg install <program>` adds one.\n",
     "\n",
     "EXAMPLES:\n",
     "    aterm                              Start an interactive shell.\n",
     "    aterm --sandbox                    The same shell under the macOS sandbox.\n",
     "    aterm --containment safety         Capped limits, no OS sandbox.\n",
+    "    aterm doctor --read-only           Check this machine; change nothing.\n",
 );
 
 /// Diagnostic subcommands: `aterm <name>` prints introspection and exits without spawning a
@@ -554,29 +558,32 @@ const HELP_TAIL: &str = concat!(
 pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     (
         "show-config",
-        "Print this session's shell, TERM, size and containment default.",
+        "Print the version, shell, TERM, size and default containment mode as key=value lines.",
     ),
     (
         "explain-config",
-        "Explain how aterm resolves its configuration.",
+        "Print where aterm.toml is, how the containment mode is chosen, and the platform's own keys.",
     ),
     (
         "doctor",
         "Check the shell, macOS access (and whether macOS checks each new program aterm starts), running instances, the fabric's broker (does it answer, what tier it serves, is its log poisoned), past crashes and the packages (`aterm pkg doctor`'s view), and fix what aterm can (the shell integration, the installed commands and their ~/.local/bin links, the reroute stubs, the rustup link, exec roots and stale copies of aterm to the Trash; the Developer Tools pane opened for you); --read-only fixes nothing; --json prints every row in the one report schema; --only <id,...> narrows to those items, families or layers; exits 0 only when all selected checks are satisfied or not applicable; unresolved plans, manual steps, blocked or deferred work, unknown state and failed changes exit 1; the shell is always checked. On macOS the fleet settings profile is settings-only: --check checks it, --apply backs it up and applies it, --restore restores the backup (--json: its fleet report; drift exits 1). See `aterm help doctor`.",
     ),
-    ("list-fonts", "List available font families (one per line)."),
-    ("show-face", "Show a font family's file and cell metrics."),
+    ("list-fonts", "List available font families, one per line."),
+    (
+        "show-face",
+        "Show a font family's file and cell metrics as key=value lines.",
+    ),
     (
         "list-themes",
-        "List the built-in themes and the themes folder's, each with its appearance, pair and status (`aterm theme list`).",
+        "List the built-in themes and the themes folder's (`aterm theme list`).",
     ),
     (
         "list-kitty-commands",
-        "List the words the cursor cat obeys when typed, language by language.",
+        "List the words the cursor cat obeys when typed, by language.",
     ),
     (
         "exceptions",
-        "List what needs a look but not now, and what was filed (--all: every filed entry in the newest MiB of the log).",
+        "List what needs a look later and the newest ten filed entries; --all lists every filed entry in the log's newest MiB.",
     ),
 ];
 
@@ -646,30 +653,27 @@ fn show_config_report() -> String {
     out
 }
 
-/// `aterm explain-config` — explain how aterm resolves its configuration:
-/// where aterm.toml is on this machine and what beats it, then the containment
-/// precedence and modes (least → most capability). Read-only.
+/// `aterm explain-config` — where aterm.toml is on this machine and what beats
+/// it, how the containment mode is chosen, the modes (least → most capability),
+/// then the platform's own keys. Read-only.
 fn explain_config_report() -> String {
     let mut out = String::new();
     out.push_str("aterm configuration resolution\n\n");
     out.push_str(&config_path_paragraph());
-    out.push_str("Containment mode precedence (most-specific wins):\n");
     out.push_str(
-        "  1. --containment <mode> / --sandbox / --no-sandbox (CLI flag; the last wins)\n",
-    );
-    out.push_str("  2. default: user\n");
-    out.push_str(
-        "  A malformed value fails CLOSED to the most restrictive mode (containment).\n\n",
+        "Containment mode: the last of --containment <mode>, --sandbox and --no-sandbox\n\
+         on the command line, else user. No aterm.toml key or environment variable\n\
+         sets it. A malformed value fails closed to containment.\n\n",
     );
     out.push_str("Containment modes (least → most capability):\n");
     out.push_str(
-        "  containment  No network; no debugger attach; writes only to temp dirs and shell\n\
-         \x20              history; no access to credential stores or private data; no\n\
-         \x20              mach service lookup but user and group queries, so open,\n\
-         \x20              osascript, pbcopy and the keychain do nothing (macOS; refused\n\
-         \x20              elsewhere).\n",
+        "  containment  The OS sandbox (macOS; refused elsewhere): no network or debugger\n\
+         \x20              attach; writes only to temp dirs and shell history; no credential\n\
+         \x20              stores or private data; no mach service lookups but user and\n\
+         \x20              group queries, so open, osascript, pbcopy and the keychain do\n\
+         \x20              nothing. Safety's caps, as hard limits.\n",
     );
-    out.push_str("  safety       Capped limits, no OS sandbox.\n");
+    out.push_str("  safety       Soft resource caps (binding on Windows), no OS sandbox.\n");
     out.push_str("  user         No sandbox, no extra limits (the default).\n\n");
     out.push_str("No environment variable selects the containment mode.\n");
     #[cfg(windows)]
@@ -4931,8 +4935,7 @@ mod tests {
     }
 
     /// `explain-config` names this machine's resolved aterm.toml first, on
-    /// every platform, and never claims no environment variable matters
-    /// (XDG_CONFIG_HOME moves the file it names).
+    /// every platform.
     #[test]
     fn explain_config_names_the_resolved_config_path() {
         let r = explain_config_report();

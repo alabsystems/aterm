@@ -1158,8 +1158,8 @@ fn display_command(app: &Path) -> Command {
 
 /// What one ended [`display_command`] run (`what`) on `app` printed, or its refusal.
 fn display_from(what: &str, app: &Path, out: &std::process::Output) -> Result<String, String> {
-    // A run that ended on a MOMENT — a signal, or a file it could not read just then —
-    // reached no verdict, and its output is no evidence of a missing TeamIdentifier.
+    // A run that ended on a moment (a signal, or a file it could not read just then) reached
+    // no verdict, and its output is no evidence of a missing TeamIdentifier.
     if !out.status.success() {
         let ended = aterm_update_core::codesign::CodesignError::Refused {
             code: out.status.code(),
@@ -1329,9 +1329,7 @@ mod tests {
             Duration::from_millis(300),
         )
         .expect_err("a helper past its limit is a failure");
-        // A limit run out is the machine's moment, not a verdict on the image:
-        // the stage path retries it instead of booking
-        // a backoff against a healthy build.
+        // A limit run out is the machine's moment, not a verdict on the image.
         assert!(crate::is_passing_refusal(&error), "{error}");
         let out = output_within(
             Command::new("/bin/echo").arg("hi"),
@@ -2037,9 +2035,9 @@ mod tests {
         );
         assert!(crate::is_passing_refusal(&wait), "{wait}");
 
-        // The team-id helper, through the real `codesign -d` on a bundle it cannot
-        // read: the run ends on a moment, not on the missing line it then prints.
-        // `codesign -d` of Apple's `/bin/ls` waits on trustd.
+        // The team-id helper, through the real `codesign -d` on a bundle it cannot read: the
+        // run ends on a moment, not on the missing line it prints. `codesign -d` of Apple's
+        // `/bin/ls` waits on trustd.
         aterm_uds::deadline::require_trust_service();
         use std::os::unix::fs::PermissionsExt as _;
         let root = aterm_tempfile::Builder::new()

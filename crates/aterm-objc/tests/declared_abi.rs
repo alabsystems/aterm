@@ -58,9 +58,7 @@ fn encoding_of(cls: ClassPtr, name: &'static CStr) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Arity 4..6, and the struct sizes that straddle the `_stret` boundary.
-// ---------------------------------------------------------------------------
 
 /// 16 bytes — the last size that comes back in registers on x86_64.
 #[repr(C)]
@@ -255,9 +253,7 @@ fn sixteen_and_seventeen_byte_returns_both_round_trip() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The encoding, read by Foundation itself.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn nsinvocation_reads_our_arity_and_types_and_invokes_correctly() {
@@ -337,10 +333,8 @@ fn nsinvocation_reads_our_arity_and_types_and_invokes_correctly() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Registration under a race, and the fourteen-colon arity wall, declared AND
 // sent.
-// ---------------------------------------------------------------------------
 
 declare_class! {
     /// No methods at all, and a zero-sized ivar — the degenerate expansion,
@@ -438,13 +432,11 @@ fn a_fourteen_argument_method_is_sendable_from_rust_not_just_declarable() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // One encoding letter per pointer-shaped runtime type. `Id`, `ClassPtr`,
 // `ProtocolPtr` and `Sel` are distinct types with their own `Encode` impls: a
 // shared `*mut c_void` alias would register KVO's `context:` as an object (`@`)
 // and `Class` as `@` where clang emits `#`. `*const c_void`, once encoded as
 // `:` (a selector), is `^v` too, and a block argument (`BlockPtr`) is `@?`.
-// ---------------------------------------------------------------------------
 
 declare_class! {
     /// One method per pointer-shaped type, so the four letters are read out of
@@ -546,9 +538,7 @@ fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // `BOOL *` as Foundation compiled it.
-// ---------------------------------------------------------------------------
 
 /// `BOOL *`'s encoding, asked of the runtime: argument 3 of
 /// `-[NSFileManager fileExistsAtPath:isDirectory:]` is its `BOOL *isDirectory`,

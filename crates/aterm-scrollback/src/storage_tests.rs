@@ -50,9 +50,7 @@ fn get_line_returns_borrowed_for_hot_tier() {
     assert_eq!(newest.to_string(), "line-5");
 }
 
-// =========================================================================
 // Streaming-iterator parity oracles
-// =========================================================================
 
 fn streaming_parity_line(i: u16) -> Line {
     use std::sync::Arc;
@@ -163,12 +161,10 @@ fn streaming_iter_skips_corrupt_block_with_same_totals() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Dense walk (`ScrollbackStorage::dense_from`) against the per-line oracle.
 // Product readers key every line by its absolute row, so the dense walk yields
 // exactly one item per logical line: `Some` wherever `get_line` answers a line,
 // `None` wherever it errors or answers nothing.
-// ---------------------------------------------------------------------------
 
 /// The per-line oracle: what `get_line(i)` answers for every `i` from `start`,
 /// with a read failure folded to `None` — exactly how the product readers

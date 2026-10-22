@@ -41,9 +41,7 @@ pub const MIN_TRACK: usize = 512;
 /// Return addresses captured per site.
 pub const FRAMES: usize = 16;
 
-// ---------------------------------------------------------------------------
 // Win32
-// ---------------------------------------------------------------------------
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -122,9 +120,7 @@ pub fn private_bytes_kb() -> u64 {
     (c.pagefile_usage / 1024) as u64
 }
 
-// ---------------------------------------------------------------------------
 // The allocator shim
-// ---------------------------------------------------------------------------
 
 static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
 static PEAK_BYTES: AtomicI64 = AtomicI64::new(0);
@@ -318,9 +314,7 @@ pub fn mark(label: &str) {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Symbolization (dbghelp)
-// ---------------------------------------------------------------------------
 
 #[link(name = "dbghelp")]
 unsafe extern "system" {

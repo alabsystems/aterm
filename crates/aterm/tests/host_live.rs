@@ -458,9 +458,7 @@ fn timeline_since(inst: &Instance, after: u64) -> Vec<(u64, String, String)> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
 // The fake worker and its screens.
-// ---------------------------------------------------------------------------
 
 /// A fixture without its provenance line.
 fn body(fixture: &str) -> String {
@@ -1313,7 +1311,7 @@ fn the_host_answers_every_box_by_default() {
     escalated_and_quiet(&inst, "k4", "claude question");
 }
 
-/// THE OWNER RULING OF 2026-09-25, end to end in a real headless aterm:
+/// THE , end to end in a real headless aterm:
 /// only an explicit setting stops the harness answering. A `[harness]` table
 /// carrying a misspelled key, a key a newer aterm might add, and `approve` and
 /// `enabled` values no reading makes sense of — the last two of which were
@@ -1631,11 +1629,9 @@ fn a_policy_text_the_dialog_does_not_take_is_written_once_and_handed_over() {
 #[test]
 fn the_host_answers_what_the_policy_proves_safe() {
     let inst = boot("a", "");
-    // A read-only Bash box: the session is published as Claude Code, the host
-    // attaches and presses `1`. Both are the server's own timeline records,
-    // read once the press has landed: `program=claude` and the host's claim
-    // live only until the host answers and the fake exits, and sampling each
-    // through an `aterm ctl status` spawn could miss both (76dff586e's shape).
+    // A read-only Bash box: published as an agent, claimed by the host, answered `1`. The
+    // publish and the claim are read from the timeline once the press has landed: both last
+    // only until the fake exits, so a sampled `status` could miss them.
     let mark = timeline_since(&inst, 0).last().map_or(0, |e| e.0);
     run_fake(&inst, "k1", &["read.txt"]);
     keys_until(&inst, "k1", &["1"], HANG);
@@ -1702,7 +1698,6 @@ fn the_host_answers_what_the_policy_proves_safe() {
 /// one tab, one after another, the seven runs waited out each in turn.
 #[test]
 fn the_host_dismisses_every_kind_of_rating_card_and_reads_a_busy_worker_busy_under_any_card() {
-    // A tag of its own: two tests booting under one tag share a scratch world.
     let inst = boot("z", "");
     let cards = [
         ("k1", "card-long.txt"),
@@ -1770,10 +1765,8 @@ fn the_host_dismisses_every_kind_of_rating_card_and_reads_a_busy_worker_busy_und
 /// loaded machine, where the late start came from the load.
 #[test]
 fn the_host_hands_over_what_it_cannot_prove_and_types_nothing() {
-    // `rm_breaker_ask = true`: since 4be9d668d (the owner's "informative and
-    // concise warnings for the AI, not extra blockers", 2026-09-29) the
-    // default approves an unproven rm breaker with a WARN line; the knob
-    // restores the hand-over this test is about.
+    // `rm_breaker_ask = true`: by default an unproven rm breaker is approved with a WARN
+    // line; the knob restores the hand-over this test is about.
     let inst = boot("e", "approve = \"safe\"\nrm_breaker_ask = true\n");
     // The same breaker over /usr: escalated, naming the command.
     run_fake_looked(&inst, "k1", &["start.late", "bypass.look", "rm-usr.txt"]);
@@ -1998,24 +1991,20 @@ fn autopilot_off_keeps_the_hosts_hands_off_until_the_session_opts_in() {
     assert_eq!(field(&meta(&inst), "autopilot"), Some("cruise"));
 }
 
-// ---------------------------------------------------------------------------
 // Relaunch on exit.
-// ---------------------------------------------------------------------------
 
 /// The conversation the relaunch fake registers when nothing resumes it.
 const CONVERSATION: &str = "0badf00d-1111-2222-3333-444455556666";
 
-/// Replace the world's fake with one that registers itself as Claude Code
-/// does (`~/.claude/sessions/<pid>.json`: its conversation — the one it was
-/// resumed on, else [`CONVERSATION`] — its kernel start as Claude renders it,
-/// idle) and keeps that conversation's transcript under `projects/` (one
-/// with none is never resumed: Claude Code refuses it, so the relaunch starts
-/// afresh), logs its argv to `launches.log`, draws an idle composer — on the
-/// alternate screen with focus reports on and the cursor on its caret row, as
-/// Claude Code's fullscreen renderer does, so a crash is handed back to a clean
-/// shell prompt — and dies
-/// by SIGKILL once `die` exists (a crash: its record stays behind). It
-/// answers `--version` as the managed twin is asked.
+/// Replace the world's fake with one that registers itself as Claude Code does
+/// (`~/.claude/sessions/<pid>.json`: its conversation, the resumed one or else
+/// [`CONVERSATION`], its kernel start as Claude renders it, idle) and keeps that
+/// conversation's transcript under `projects/` (Claude Code refuses to resume one with none,
+/// and the relaunch would start afresh). It logs its argv to `launches.log`, draws an idle
+/// composer on the alternate screen with focus reports on and the cursor on its caret row, as
+/// Claude Code's fullscreen renderer does (so a crash is handed back to a clean shell
+/// prompt), dies by SIGKILL once `die` exists (its record left behind), and answers
+/// `--version` as the managed twin is asked.
 ///
 /// IT TAKES WHAT IS TYPED INTO IT as Claude Code's composer does: a burst of
 /// text is drawn as the long paste it is (`[Pasted text #1]` on the caret
@@ -2222,9 +2211,7 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The live upgrade, a step of the worker.
-// ---------------------------------------------------------------------------
 
 /// Stage the upgrade fake reporting `version` as `agents/claude.<version>` beside the managed
 /// twin, its first exec paid ([`place_fake`]), and return its path; [`install`] and [`land`]
@@ -2267,8 +2254,8 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
 /// before a crashed agent's relaunch onto a build no probe proved, before a
 /// move onto one with a failure noted, and once before the upgrade's own
 /// first move onto a build never run here:
-/// `aterm_agent::harness::upgrade_build_start`, LC-5 of ATERM-KI-1015-1 and
-/// ATERM-KI-1016-1) is
+/// `aterm_agent::harness::upgrade_build_start`, LC-5 of and
+/// ) is
 /// answered as Claude Code answers it — a usage printed and exit 0, nothing
 /// registered, no transcript touched — and logged to `probes.log`
 /// ([`probes`]), never to `launches.log`: it starts no agent.
@@ -2403,31 +2390,23 @@ fn land(inst: &Instance, staged: &Path) {
     .expect("the activation notice");
 }
 
-/// How long the live upgrade has to take a step, at most relaunching the
-/// agent on the new build — its announcement, the agent's READY, its end and
-/// its relaunch — from the notice (or the prompt the step waits on), or from
-/// the host's latest look that could not read that build ([`version_waits`],
-/// [`upgrade_until`]).
+/// How long the live upgrade has to take a step (at most: announce, READY, end, relaunch),
+/// from the notice or the prompt it waits on, or from the host's latest look that could not
+/// read the build ([`upgrade_until`]).
 #[cfg(target_os = "macos")]
 const UPGRADE_WITHIN: Duration = Duration::from_secs(150);
 
-/// How far those looks may carry the deadline. The version cache asks a
-/// build that did not answer again two minutes later, and the host looks
-/// at least once a minute meanwhile, so a build that answers its second
-/// probe is upgraded to within [`UPGRADE_WITHIN`] of a look five minutes
-/// after the notice at the latest; this bounds a product that looks for ever.
+/// How far [`version_waits`] looks may carry the deadline: the version cache asks an
+/// unanswered build again two minutes later and the host looks at least once a minute, so a
+/// build that answers its second probe is upgraded within [`UPGRADE_WITHIN`] of a look at
+/// most five minutes after the notice. This bounds a product that looks forever.
 #[cfg(target_os = "macos")]
 const UPGRADE_CEILING: Duration = Duration::from_secs(10 * 60);
 
-/// How many looks the loop journaled (`<sid>.journal.jsonl`; a host's step
-/// is a journal line, never a log line) as `upgrade step=wait:no-version`:
-/// a build the session could move to did not answer its `--version` within
-/// the product's bound (`aterm_agent::harness::upgrade_drive`'s
-/// `VERSION_WAIT`), so the look decided nothing and the host looks again on
-/// its own short ladder until the version cache asks again
-/// (`UNREAD_VERSION`) — the product's own retry, which a fixed deadline
-/// cannot know. [`place_fake`] keeps the fakes' probes inside the bound; this
-/// is what a probe that still missed it is waited by.
+/// How many looks the loop journaled as `upgrade step=wait:no-version`: a build the session
+/// could move to did not answer `--version` within `upgrade_drive`'s `VERSION_WAIT`, so the
+/// look decided nothing and is taken again once the version cache asks again
+/// (`VERSION_RETRY_FIRST`). [`place_fake`] keeps the fakes' probes inside the bound.
 #[cfg(target_os = "macos")]
 fn version_waits(inst: &Instance) -> usize {
     journal(inst).matches("step=wait:no-version").count()
@@ -2521,10 +2500,8 @@ fn upgrade_until<T>(
 #[cfg(target_os = "macos")] // atpkg::activation_notice is macOS-only
 #[test]
 fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
-    // `upgrade_ask = true`: since 0b689dfe3 (the owner's "never interrupt an
-    // agent that is working", 2026-09-29) the default moves an idle session
-    // with nothing typed; the knob restores the notice, READY and carry-on
-    // flow this test pins.
+    // `upgrade_ask = true`: the default moves an idle session with nothing typed; this test
+    // pins the notice, READY and carry-on flow.
     let inst = boot_upgrade(
         "v",
         "relaunch = false\nupgrade_ask = true\n",
@@ -2601,7 +2578,7 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
         || harness_lines(&inst),
         |l| l.contains("harness: an activation notice — "),
     );
-    // ATERM-KI-1016-1 LC-5, live: the upgrade's own first move onto a build
+    // LC-5, live: the upgrade's own first move onto a build
     // never run here probes it once (`<build> --help`), right before the
     // move, so a build that fails at its first start ends no working agent
     // (`upgrade_build_start`; the handoff's "A build that failed to start").
@@ -2959,9 +2936,7 @@ fn wall_level(tag: &str, harness: &str, stop: bool) {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The harness tape of a hosted run.
-// ---------------------------------------------------------------------------
 
 /// Every file under `dir` with its bytes, and every directory (named with a
 /// trailing `/`, no bytes), sorted by path. Links are not followed.

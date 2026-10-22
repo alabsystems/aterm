@@ -218,9 +218,8 @@ pub struct Roots {
     /// shares its source's serial, never its GUID — and with none read
     /// nothing is on the measured volume. Unread elsewhere.
     pub volume: Option<super::target::VolumeGuid>,
-    /// The system's mount points ([`mount_points`]): never entered, never
-    /// even `stat`ed — a stalled network mount answers a `stat` of its root
-    /// by blocking, and a blocked look holds the disk watch until restart.
+    /// The system's mount points ([`mount_points`]): never entered or even `stat`ed, since a
+    /// stalled network mount blocks a `stat` of its root and would hold the disk watch.
     pub mounts: Vec<PathBuf>,
     /// Leave `$HOME`'s children and their worktrees unwalked: a pass handed
     /// no session but an agent's demand reaches that agent's own checkout
@@ -389,17 +388,13 @@ fn worktree_repo(cwd: &str) -> Option<&str> {
 }
 
 impl RunningClaude {
-    /// May it hold a session of the project folder `project` (its temp
-    /// directory's `<project>`)? Claude Code names that folder after the
-    /// directory it was LAUNCHED in, resolved ([`project_name`]; measured
-    /// with Claude Code 2.1.287 against its working directory as the kernel
-    /// holds it, which is that directory), and it changes into its own
-    /// worktree mid-session (`<repo>/.claude/worktrees/<name>`), while the
-    /// session keeps its folder: so a working directory names its own
-    /// project and, inside such a worktree, every project at or under the
-    /// repository. A working directory not read, or not ASCII (the name is
-    /// written from its NFC form, one `-` per UTF-16 unit, which the
-    /// kernel's spelling need not share), may hold any.
+    /// Whether it may hold a session of project folder `project` (its temp directory's
+    /// `<project>`). Claude Code names that folder after the resolved directory it was
+    /// launched in ([`project_name`]) and may move into its own worktree
+    /// (`<repo>/.claude/worktrees/<name>`) mid-session while the session keeps its folder, so
+    /// a working directory names its own project and, inside such a worktree, every project
+    /// at or under the repository. An unread or non-ASCII working directory (the name is
+    /// written from its NFC form, one `-` per UTF-16 unit) may hold any.
     ///
     /// On Windows the kernel's working directory (the PEB's) keeps a
     /// trailing separator Claude Code's own (`process.cwd()`) drops, a
@@ -816,9 +811,8 @@ fn census_of(
             continue;
         }
         let dir = own_dir(&exec, cwd.as_deref(), home);
-        // One whose own directory is not read here may be a Claude Code the
-        // kernel does not name one (a copy renamed) keeping its registry
-        // there: it keeps its project, as one no registry pins does.
+        // A process whose Claude Code directory is not read may be a renamed Claude Code
+        // keeping its registry there: it keeps its project, like an unpinned one.
         let claude = claude_code(exe.as_ref(), &exec, scratch);
         if claude || dir == OwnDir::Unread {
             let profile = home.filter(|_| claude).and_then(|user| {
@@ -2146,9 +2140,7 @@ impl Walk {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Owners
-// ---------------------------------------------------------------------------
 
 /// What a removal of a gone owner's build directory checks again first
 /// ([`still_gone`]).
@@ -2629,12 +2621,10 @@ pub fn owns(owner: &Owner, path: &Path) -> Result<(), String> {
     }
 }
 
-/// Is an unreadable process one of the platform's own services — an
-/// executable on the system's own tree, which builds nothing and runs no
-/// test? Measured 2026-10-01: macOS refuses a same-uid reader the working
-/// directory or descriptors of `lsd`, `UserEventAgent`, `routined` and
-/// other agents under `/usr/libexec` and `/System`, always; counting them
-/// would keep every directory forever.
+/// Whether an unreadable process is a platform service: an executable on the system's own
+/// tree, which builds nothing and runs no test. macOS always refuses a same-uid reader the
+/// working directory and descriptors of agents under `/usr/libexec` and `/System`; counting
+/// them would keep every directory forever.
 ///
 /// Windows (measured 2026-10-19: of 89 same-user processes, these three and
 /// no other refused a reader, always): ONLY an image that is exactly

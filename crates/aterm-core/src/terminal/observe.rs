@@ -19,6 +19,25 @@
 //! 2. Deterministic idle: `IdleFor` latches at the computed deadline (`activity_at + dur`), not
 //!    the observation instant, so live and replay latch the same [`Satisfaction`]
 //!    (`idle_deadline_model`).
+//! 3. Whole frames only: the row predicates (`RowMatches`, `RowsClear`) never read the rows of a
+//!    frame the program has not finished. A program that brackets its redraws in DEC 2026
+//!    (synchronized output) and has one open, written into, leaves a prefix of that frame on the
+//!    grid when a burst of the PTY reader ends inside it: Claude Code 2.1.308 and agy 1.4.0 do (the lab's casts,
+//!    `docs/measured/half-drawn-frame-2026-10-22.md`), and a busy footer the frame has not
+//!    reached yet reads gone. The scan a batch inside such a frame owes is held until the first
+//!    batch that leaves the frame whole (its `?2026l`, which may carry no content), or until the
+//!    run of batches ending inside frames has lasted [`FRAME_HANG`] (a hang detector: a program
+//!    that never closes its frame, or whose every read ends inside its next one, cannot freeze a
+//!    wait, [`WatcherSet::next_deadline`] wakes it there). `FrameWhole` (`await frame`) waits for
+//!    exactly that.
+//! 4. Gone only on a settled screen: `RowsClear` (`await gone`) latches at once only on a screen
+//!    that is a frame the program closed with nothing drawn since
+//!    ([`Frame::closed`](Frame::closed)). Any other screen may be a redraw the PTY's reads split
+//!    with no bracket to say so (Gemini CLI 0.46.0 clears and redraws its whole screen per
+//!    frame, and a read that ends partway shows no spinner), so there the range must read clear
+//!    at every scan for [`GONE_SETTLE`], measured from the batch that first showed it clear (from
+//!    the screen's last change, [`Frame::drawn_at`], for one clear at arm), and latches at that
+//!    computed deadline, however late it is observed.
 //!
 //! The kernel only observes: it never mutates the surface and is never checkpointed, so it
 //! cannot affect replay. Its clock is the injected
@@ -28,6 +47,65 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aterm_time::Instant;
+
+/// How long a reader of whole frames waits on a program's unfinished DEC 2026 frame before it
+/// reads the frame as it stands ([`super::Terminal::frame_unfinished_at`]): a hang detector for a
+/// program that opened a frame and never closed it, never a latency budget. Counted from the
+/// first batch of a run that ended inside a frame, not from each frame's first write, so a
+/// program whose every read ends inside its next frame reaches it too. A live program closes
+/// its frame within milliseconds (the measured splits close 0.1 to 1.3 ms after they open).
+pub const FRAME_HANG: Duration = Duration::from_secs(60);
+
+/// How long a range must read clear before `RowsClear` (`await gone`) latches on a screen
+/// that is not a frame the program closed (module doc, property 4): a redraw the PTY's reads
+/// split, with no DEC 2026 bracket to say so, is finished by a later read, inside it. MEASURED
+/// (`docs/measured/half-drawn-frame-2026-10-22.md`): Gemini CLI 0.46.0, three tabs at once in
+/// the lab, finishes a split redraw a median 3 ms after its first part, but under that load the
+/// rest of one came as late as 385 ms (929 split redraws, 11 of them past 100 ms, which a
+/// 100 ms settle latched on: 6 false `gone`s in 33 replies). A second is that tail with a margin
+/// of more than two and a half; a closed frame (Claude Code's, agy's) latches with no settle.
+pub const GONE_SETTLE: Duration = Duration::from_secs(1);
+
+/// Whether the program's frame is whole at one observation pass, and when its hang
+/// detector fires if it is not ([`WatcherSet::observe_screen`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Frame {
+    /// No row predicate may read the rows when `false` (module doc, property 3).
+    pub whole: bool,
+    /// The unfinished frame's hang detector ([`FRAME_HANG`] past the first batch of the
+    /// run that ended inside a frame); `None` on a whole frame.
+    pub hang: Option<Instant>,
+    /// The screen is a frame the program closed with nothing drawn since
+    /// ([`super::Terminal::screen_is_closed_frame`]): whole by the program's own word, so
+    /// `RowsClear` latches on it at once (module doc, property 4).
+    pub closed: bool,
+    /// When the screen last changed ([`super::Terminal::drawn_at`]): a range clear at arm
+    /// has been clear since then, and its [`GONE_SETTLE`] runs from there. `None`: from the
+    /// pass's own instant.
+    pub drawn_at: Option<Instant>,
+}
+
+impl Frame {
+    /// A frame the program closed: whole, and believed at once.
+    pub const CLOSED: Self = Self {
+        whole: true,
+        hang: None,
+        closed: true,
+        drawn_at: None,
+    };
+
+    /// A whole frame no bracket vouches for (a program that brackets nothing, or output
+    /// after its last close), drawn at `drawn_at`: `RowsClear` settles on it.
+    #[must_use]
+    pub const fn unbracketed(drawn_at: Option<Instant>) -> Self {
+        Self {
+            whole: true,
+            hang: None,
+            closed: false,
+            drawn_at,
+        }
+    }
+}
 
 /// A handle to one armed watcher, unique within a [`WatcherSet`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -193,6 +271,11 @@ pub enum WatcherSpec {
         /// Which visible rows to scan.
         rows: RowRange,
     },
+    /// Latch when the program's frame is whole: no DEC 2026 frame it opened and wrote into is
+    /// still open, or the open one's hang detector ([`FRAME_HANG`]) fired (`await frame`). What a
+    /// reader that found a frame unfinished (`text --json`'s `"frame":"open"`) waits on before it
+    /// reads again. Level-triggered: a whole frame at arm latches at arm.
+    FrameWhole,
 }
 
 impl WatcherSpec {
@@ -227,7 +310,16 @@ impl WatcherSpec {
             WatcherSpec::RowMatches { .. }
                 | WatcherSpec::RowsClear { .. }
                 | WatcherSpec::SeqAdvanced { .. }
+                | WatcherSpec::FrameWhole
         )
+    }
+
+    /// Whether the predicate waits on a whole frame, so an unfinished frame's hang detector is
+    /// a deadline it is woken at ([`WatcherSet::next_deadline`]): `FrameWhole`, and a row
+    /// predicate whose scan an unfinished frame held ([`Watcher::deferred`]).
+    #[inline]
+    const fn waits_on_frame(&self, deferred: bool) -> bool {
+        matches!(self, WatcherSpec::FrameWhole) || (deferred && self.is_row())
     }
 }
 
@@ -237,7 +329,8 @@ pub struct Satisfaction {
     /// The `content_seq` in force when the predicate became true.
     pub seq: u64,
     /// The instant the predicate became true: the processed-batch instant for
-    /// `SeqAdvanced`/`BlockComplete`/`RowMatches`/`RowsClear`, the computed
+    /// `SeqAdvanced`/`BlockComplete`/`RowMatches`/`RowsClear`/`FrameWhole` (the expiry
+    /// instant where an unfinished frame's hang detector made the frame whole), the computed
     /// deadline for `IdleFor`/`MomentumBelow`.
     pub at: Instant,
 }
@@ -327,6 +420,15 @@ struct Watcher {
     /// already-matching row (or already-clear range) latches at arm. Cleared after the first
     /// `observe_screen`.
     fresh: bool,
+    /// A row scan this watcher was owed (an advance, or `fresh`) was held because the program's
+    /// frame was unfinished (module doc, property 3): it is owed at the first whole batch, which
+    /// may carry no content (a lone `?2026l`), or at the frame's hang detector.
+    deferred: bool,
+    /// `RowsClear` on a screen no closed frame vouches for: since when every scan has read
+    /// the range clear (module doc, property 4). It latches at this plus [`GONE_SETTLE`];
+    /// a scan that reads a row in range not clear, or a batch whose scan an unfinished
+    /// frame held, clears it. `None` for the other specs.
+    clear_since: Option<Instant>,
     /// Which grid this watcher was armed against: `SeqAdvanced`'s `after` is per grid, so
     /// crossing a buffer swap latches; otherwise `await seq` would starve on the alt screen and
     /// fire spuriously on 1049 exit.
@@ -334,6 +436,43 @@ struct Watcher {
     /// Which screen generation this watcher was armed in
     /// ([`ActivityClock::epoch`]); crossing an epoch step latches too.
     armed_epoch: u64,
+}
+
+impl Watcher {
+    /// When a settling `RowsClear` latches: [`GONE_SETTLE`] past `clear_since`
+    /// (an unrepresentable instant reads as `clear_since`, fail open).
+    #[inline]
+    fn settled_at(&self) -> Option<Instant> {
+        self.clear_since
+            .map(|since| since.checked_add(GONE_SETTLE).unwrap_or(since))
+    }
+}
+
+/// One whole-frame scan of a `RowsClear` (module doc, property 4) that found its range
+/// `clear` or not: whether it latches at this scan, and `clear_since` after it. A frame the program closed is
+/// whole by its own word and latches at once; any other clear scan starts or continues the
+/// settle, since this scan or, at arm (`at_arm`: nothing drawn since the arm) since the screen
+/// last changed, and latches once it has lasted [`GONE_SETTLE`].
+fn rows_clear_scan(
+    clear: bool,
+    at_arm: bool,
+    frame: Frame,
+    now: Instant,
+    clear_since: &mut Option<Instant>,
+) -> bool {
+    if !clear {
+        *clear_since = None;
+        return false;
+    }
+    if frame.closed {
+        return true;
+    }
+    let since = *clear_since.get_or_insert(if at_arm {
+        frame.drawn_at.map_or(now, |d| d.min(now))
+    } else {
+        now
+    });
+    since.checked_add(GONE_SETTLE).is_none_or(|due| due <= now)
 }
 
 /// A bounded set of armed watchers plus the activity clock, held in
@@ -344,6 +483,9 @@ pub struct WatcherSet {
     clock: ActivityClock,
     next_id: u64,
     cap: usize,
+    /// The unfinished frame's hang detector as the last observation saw it
+    /// ([`super::Terminal::frame_hang_deadline`]); `None` when that frame was whole.
+    frame_hang: Option<Instant>,
 }
 
 /// Default capacity — bounds adversarial arming.
@@ -366,6 +508,7 @@ impl WatcherSet {
             clock: ActivityClock::default(),
             next_id: 0,
             cap: cap.max(1),
+            frame_hang: None,
         }
     }
 
@@ -397,15 +540,16 @@ impl WatcherSet {
 
     /// The inclusive `(first, last)` visible rows a row scan reads this batch on a
     /// grid of `rows` rows: the hull of the on-grid ranges of every un-latched row
-    /// watcher that is fresh or sees content advance, exactly the watchers
-    /// [`observe_screen`](Self::observe_screen) scans. `None` when none of them
-    /// covers a row, so the scan reads nothing. The engine collects row text only
-    /// inside the hull: every row a scanning watcher reads lies in it.
+    /// watcher that is fresh, sees content advance or is owed a scan an unfinished
+    /// frame held, exactly the watchers [`observe_screen`](Self::observe_screen)
+    /// scans on a whole frame. `None` when none of them covers a row, so the scan
+    /// reads nothing. The engine collects row text only inside the hull: every row
+    /// a scanning watcher reads lies in it.
     #[must_use]
     pub fn row_scan_hull(&self, advanced: bool, rows: usize) -> Option<(usize, usize)> {
         self.watchers
             .iter()
-            .filter(|w| w.latched.is_none() && (advanced || w.fresh))
+            .filter(|w| w.latched.is_none() && (advanced || w.fresh || w.deferred))
             .filter_map(|w| w.spec.row_range()?.on_grid(rows))
             .reduce(|(lo, hi), (first, last)| (lo.min(first), hi.max(last)))
     }
@@ -439,6 +583,8 @@ impl WatcherSet {
             deadline,
             latched: None,
             fresh,
+            deferred: false,
+            clear_since: None,
             // The clock's grid identity is the arming grid: `Terminal::watch`
             // seeds it (`seed_screen`) immediately before arming.
             armed_alt: self.clock.alt,
@@ -497,7 +643,10 @@ impl WatcherSet {
             .any(|w| w.latched.is_none() && matches!(w.spec, WatcherSpec::BlockComplete))
     }
 
-    /// The soonest pending `IdleFor` / `MomentumBelow` deadline, which the
+    /// The soonest pending `IdleFor` / `MomentumBelow` deadline, a settling
+    /// `RowsClear`'s ([`GONE_SETTLE`] past its `clear_since`), and the
+    /// unfinished frame's hang detector where a watcher waits on a whole frame
+    /// ([`WatcherSpec::FrameWhole`], a row scan the frame held), which the
     /// arming `await`/`ready` verb uses to bound its `Subscription::wait` park.
     /// `None` when no un-latched deadline watcher is armed.
     #[inline]
@@ -506,8 +655,30 @@ impl WatcherSet {
         self.watchers
             .iter()
             .filter(|w| w.latched.is_none())
-            .filter_map(|w| w.deadline)
+            .filter_map(|w| {
+                let hang = self
+                    .frame_hang
+                    .filter(|_| w.spec.waits_on_frame(w.deferred));
+                [w.deadline, w.settled_at(), hang]
+                    .into_iter()
+                    .flatten()
+                    .min()
+            })
             .min()
+    }
+
+    /// Whether an unfinished frame's hang detector has fired by `now` with a
+    /// watcher still waiting on a whole frame: the host's expiry pass then runs
+    /// the observation again ([`super::Terminal::watch_expire`]), and that pass
+    /// reads the frame as it stands.
+    #[inline]
+    #[must_use]
+    pub fn frame_hang_due(&self, now: Instant) -> bool {
+        self.frame_hang.is_some_and(|hang| now >= hang)
+            && self
+                .watchers
+                .iter()
+                .any(|w| w.latched.is_none() && w.spec.waits_on_frame(w.deferred))
     }
 
     /// [`observe_screen`](Self::observe_screen) on the main grid at the current generation.
@@ -520,7 +691,15 @@ impl WatcherSet {
         rows: &[Option<String>],
     ) -> bool {
         let epoch = self.clock.epoch;
-        self.observe_screen(content_seq, false, epoch, newest_block_complete, now, rows)
+        self.observe_screen(
+            content_seq,
+            false,
+            epoch,
+            newest_block_complete,
+            now,
+            rows,
+            Frame::CLOSED,
+        )
     }
 
     /// The seam call, run by `observe_at` after every batch (and at arm for a level-triggered
@@ -530,7 +709,15 @@ impl WatcherSet {
     /// (`ActivityClock::epoch`). `rows[idx]` is visible-row text for the row predicates; the
     /// caller collects it only inside [`row_scan_hull`](Self::row_scan_hull) (`None` outside,
     /// `rows` still one entry per grid row), and an empty `rows` is never read as a clear
-    /// surface. Returns `true` if anything latched.
+    /// surface. `frame` says whether the program's frame is whole at this pass: on an
+    /// unfinished one no row predicate reads `rows` (module doc, property 3), and the
+    /// scan each was owed is held for the first whole pass. Returns `true` if anything
+    /// latched.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one batch's facts, each read by the engine under its own borrow; a struct \
+                  would only rename them at the one seam that passes them"
+    )]
     pub fn observe_screen(
         &mut self,
         content_seq: u64,
@@ -539,7 +726,11 @@ impl WatcherSet {
         newest_block_complete: bool,
         now: Instant,
         rows: &[Option<String>],
+        frame: Frame,
     ) -> bool {
+        self.frame_hang = frame.hang;
+        // The seq a settle that ran out before this batch was in force at.
+        let seq_before = self.clock.last_seq;
         let advanced = self.is_advance(content_seq, alt, epoch);
         if advanced {
             self.clock.last_seq = content_seq;
@@ -547,6 +738,11 @@ impl WatcherSet {
             self.clock.epoch = epoch;
             self.clock.last_at = Some(now);
         }
+        // A latch at this batch.
+        let here = Satisfaction {
+            seq: content_seq,
+            at: now,
+        };
         let mut latched_any = false;
         for w in &mut self.watchers {
             if w.latched.is_some() {
@@ -556,15 +752,14 @@ impl WatcherSet {
             // the field writes after the match (disjoint-borrow safe).
             let mut new_latch: Option<Satisfaction> = None;
             let mut new_deadline: Option<Instant> = None;
+            let mut deferred = w.deferred;
+            let mut clear_since = w.clear_since;
             match &w.spec {
                 WatcherSpec::SeqAdvanced { after } => {
                     // `after` is per grid: compare only within the same grid and
                     // generation; crossing a swap latches on the identity change.
                     if alt != w.armed_alt || epoch != w.armed_epoch || content_seq > *after {
-                        new_latch = Some(Satisfaction {
-                            seq: content_seq,
-                            at: now,
-                        });
+                        new_latch = Some(here);
                     }
                 }
                 WatcherSpec::IdleFor { dur } => {
@@ -574,46 +769,66 @@ impl WatcherSet {
                 }
                 WatcherSpec::BlockComplete => {
                     if newest_block_complete {
-                        new_latch = Some(Satisfaction {
-                            seq: content_seq,
-                            at: now,
-                        });
+                        new_latch = Some(here);
                     }
                 }
                 // Content activity is not this predicate's business: the
                 // deadline was fixed at arm and fires from `expire` alone.
                 WatcherSpec::MomentumBelow { .. } => {}
+                // Dirty-row gate: scan only on advance, a fresh arm, or a scan an unfinished
+                // frame held; and never inside an unfinished frame, whose rows are a prefix
+                // of a redraw (module doc, property 3): the scan is held for a whole one.
+                WatcherSpec::RowMatches { .. } | WatcherSpec::RowsClear { .. } if !frame.whole => {
+                    if advanced || w.fresh {
+                        deferred = true;
+                        // What the frame drew is unread: no evidence the range stayed clear.
+                        clear_since = None;
+                    }
+                }
                 WatcherSpec::RowMatches {
                     matcher,
                     rows: range,
                 } => {
-                    // Dirty-row gate: scan only on advance or a fresh arm.
-                    if (advanced || w.fresh) && any_row_matches(rows, &**matcher, *range) {
-                        new_latch = Some(Satisfaction {
-                            seq: content_seq,
-                            at: now,
-                        });
+                    if (advanced || w.fresh || w.deferred)
+                        && any_row_matches(rows, &**matcher, *range)
+                    {
+                        new_latch = Some(here);
                     }
+                    deferred = false;
                 }
                 WatcherSpec::RowsClear {
                     matcher,
                     rows: range,
                 } => {
-                    // Latch only when every row in range is shown not to match, on a batch with
-                    // rows collected and a range meeting at least one: scanning nothing, or a
-                    // row the matcher could not decide, is not evidence of a clear surface.
-                    if (advanced || w.fresh)
-                        && range.covers_any(rows.len())
-                        && every_row_clear(rows, &**matcher, *range)
-                    {
+                    if let Some(due) = w.settled_at().filter(|&due| due <= now) {
+                        // The range read clear for GONE_SETTLE before this batch: it latched
+                        // then, at the computed deadline, whatever this batch drew (property 1).
                         new_latch = Some(Satisfaction {
-                            seq: content_seq,
-                            at: now,
+                            seq: seq_before,
+                            at: due,
                         });
+                    } else if advanced || w.fresh || w.deferred {
+                        // Clear only when every row in range is shown not to match, on a batch
+                        // with rows collected and a range meeting at least one: scanning
+                        // nothing, or a row the matcher could not decide, is not evidence of a
+                        // clear surface.
+                        let clear = range.covers_any(rows.len())
+                            && every_row_clear(rows, &**matcher, *range);
+                        let at_arm = w.fresh && !advanced;
+                        new_latch = rows_clear_scan(clear, at_arm, frame, now, &mut clear_since)
+                            .then_some(here);
+                    }
+                    deferred = false;
+                }
+                WatcherSpec::FrameWhole => {
+                    if frame.whole {
+                        new_latch = Some(here);
                     }
                 }
             }
             w.fresh = false;
+            w.deferred = deferred;
+            w.clear_since = clear_since;
             if let Some(d) = new_deadline {
                 w.deadline = Some(d);
             }
@@ -637,12 +852,17 @@ impl WatcherSet {
             if let WatcherSpec::IdleFor { dur } = w.spec {
                 w.deadline = Some(now + dur);
             }
+            // A settling `RowsClear` too: the screen it read clear may be stale.
+            if w.clear_since.is_some() {
+                w.clear_since = Some(now);
+            }
         }
     }
 
     /// The idle-fire call, run when the host's `WaitUntil` wake reaches `now`
     /// (and once at a replay target). Latches every un-latched `IdleFor` /
-    /// `MomentumBelow` whose deadline has passed with `at = deadline`, so the
+    /// `MomentumBelow` whose deadline has passed, and every `RowsClear` whose
+    /// range has read clear for [`GONE_SETTLE`], with `at = deadline`, so the
     /// result does not depend on when the host woke. Returns `true` if anything
     /// latched.
     pub fn expire(&mut self, now: Instant) -> bool {
@@ -650,6 +870,14 @@ impl WatcherSet {
         let mut latched_any = false;
         for w in &mut self.watchers {
             if w.latched.is_some() {
+                continue;
+            }
+            if let Some(due) = w.settled_at().filter(|&due| due <= now) {
+                w.latched = Some(Satisfaction {
+                    seq: last_seq,
+                    at: due,
+                });
+                latched_any = true;
                 continue;
             }
             if matches!(
@@ -676,10 +904,19 @@ impl super::Terminal {
     /// [`process_at`](super::Terminal::process_at) after `post_process` (and
     /// from [`watch`](Self::watch) at arm) with the injected clock. Read-only on
     /// the surface.
-    pub(super) fn observe_at(&mut self, now: Instant) {
+    pub(super) fn observe_at(&mut self, now: Instant) -> bool {
         if !self.watchers.has_armed() {
-            return;
+            return false;
         }
+        // A frame the program has not finished is no frame to read rows from (module doc,
+        // property 3); past its hang detector it is read as it stands.
+        let hang = self.frame_hang_deadline().filter(|&hang| now < hang);
+        let frame = Frame {
+            whole: hang.is_none(),
+            hang,
+            closed: self.screen_is_closed_frame(),
+            drawn_at: self.drawn_at(),
+        };
         let seq = self.content_seq();
         // `content_seq` is per grid: a 1049 swap makes the raw counter incomparable.
         let alt = self.is_alternate_screen();
@@ -703,7 +940,12 @@ impl super::Terminal {
         // The live screen's rows, as `text` serves them: a person scrolled back must not make
         // a live box look gone, nor an old copy of it in history look live.
         let rows = self.rows() as usize;
-        if let Some((lo, hi)) = self.watchers.row_scan_hull(advanced, rows) {
+        let hull = if frame.whole {
+            self.watchers.row_scan_hull(advanced, rows)
+        } else {
+            None
+        };
+        if let Some((lo, hi)) = hull {
             let mut scratch = std::mem::take(&mut self.row_text_scratch);
             scratch.resize_with(rows, || None);
             for (i, slot) in scratch.iter_mut().enumerate() {
@@ -714,13 +956,21 @@ impl super::Terminal {
                 let mut s = slot.take().unwrap_or_default();
                 *slot = self.live_row_text_into(i, &mut s).then_some(s);
             }
-            self.watchers
-                .observe_screen(seq, alt, epoch, newest_complete, now, &scratch);
+            let latched = self.watchers.observe_screen(
+                seq,
+                alt,
+                epoch,
+                newest_complete,
+                now,
+                &scratch,
+                frame,
+            );
             self.row_text_scratch = scratch;
+            latched
         } else {
-            // Gate closed: no row text needed this batch.
+            // Gate closed (or the frame unfinished): no row text needed this batch.
             self.watchers
-                .observe_screen(seq, alt, epoch, newest_complete, now, &[]);
+                .observe_screen(seq, alt, epoch, newest_complete, now, &[], frame)
         }
     }
 
@@ -741,7 +991,7 @@ impl super::Terminal {
         if arm_eval {
             // The baseline was just seeded, so this pass sees `advanced == false` and stamps no
             // activity; `SeqAdvanced` latches on `content_seq > after` regardless.
-            self.observe_at(now);
+            let _ = self.observe_at(now);
         }
         Some(id)
     }
@@ -792,10 +1042,15 @@ impl super::Terminal {
         self.watchers.next_deadline()
     }
 
-    /// Host-driven deadline firing ([`WatcherSet::expire`]).
+    /// Host-driven deadline firing ([`WatcherSet::expire`]), and the unfinished
+    /// frame's hang detector ([`WatcherSet::frame_hang_due`]): once it fires, the
+    /// observation runs again at `now`, which reads the frame as it stands, so a
+    /// program that never closes its frame cannot hold a wait on a whole one.
     #[inline]
     pub fn watch_expire(&mut self, now: Instant) -> bool {
-        self.watchers.expire(now)
+        let expired = self.watchers.expire(now);
+        let hung = self.watchers.frame_hang_due(now) && self.observe_at(now);
+        expired || hung
     }
 
     /// Idle hold: while the host consumes none of this terminal's output,
@@ -906,6 +1161,10 @@ mod tests {
         assert!(
             WatcherSpec::SeqAdvanced { after: 7 }.needs_arm_eval(),
             "SeqAdvanced is level-triggered; arming must not wait for the next batch"
+        );
+        assert!(
+            WatcherSpec::FrameWhole.needs_arm_eval(),
+            "FrameWhole is level-triggered: a whole frame at arm latches at arm"
         );
         // Edge/deadline-triggered.
         assert!(
@@ -1130,10 +1389,18 @@ mod tests {
                 .unwrap();
             let seq = w.arm(WatcherSpec::SeqAdvanced { after: 15 }, base).unwrap();
             // The arm-time scan (box A on screen).
-            w.observe_screen(15, true, 1, false, base, &[Some("ls".to_string())]);
+            w.observe_screen(
+                15,
+                true,
+                1,
+                false,
+                base,
+                &[Some("ls".to_string())],
+                Frame::CLOSED,
+            );
             assert!(w.poll(rows).is_none() && w.poll(seq).is_none());
             assert_eq!(w.is_advance(15, true, epoch), moves, "epoch {epoch}");
-            w.observe_screen(15, true, epoch, false, base, &box_b);
+            w.observe_screen(15, true, epoch, false, base, &box_b, Frame::CLOSED);
             assert_eq!(w.poll(rows).is_some(), moves, "row watcher, epoch {epoch}");
             assert_eq!(w.poll(seq).is_some(), moves, "seq watcher, epoch {epoch}");
             assert_eq!(w.seen_epoch(), epoch);
@@ -1226,6 +1493,56 @@ mod tests {
         assert!(
             w.poll(covering).is_none(),
             "the same match inside rows 0..=1 holds that watcher pending"
+        );
+    }
+
+    /// `RowsClear` on a screen no closed frame vouches for (module doc, property 4): the range
+    /// must read clear at every scan for GONE_SETTLE, measured from the first clear scan; a
+    /// scan showing the row again cancels it; the host's expiry latches at the computed
+    /// deadline; `restart_idle` (the reader parked for an update) restarts it. NEGATIVE
+    /// CONTROL: on a closed frame the same scan latches at once.
+    #[test]
+    fn rows_clear_settles_on_a_screen_no_closed_frame_vouches_for() {
+        let base = t0();
+        let ms = |n| base + Duration::from_millis(n);
+        let busy = [Some("esc to interrupt".to_string())];
+        let clear = [Some("Done.".to_string())];
+        let unb = |n| Frame::unbracketed(Some(ms(n)));
+        let mut w = WatcherSet::default();
+        let id = w.arm(rows_clear(RowRange::All), base).unwrap();
+        w.observe_screen(1, false, 0, false, ms(0), &busy, unb(0));
+        w.observe_screen(2, false, 0, false, ms(10), &clear, unb(10));
+        assert!(w.poll(id).is_none());
+        assert_eq!(w.next_deadline(), Some(ms(10) + GONE_SETTLE));
+        // Still clear at a later scan: the settle runs from the first.
+        w.observe_screen(3, false, 0, false, ms(50), &clear, unb(50));
+        assert_eq!(w.next_deadline(), Some(ms(10) + GONE_SETTLE));
+        // The row back cancels it.
+        w.observe_screen(4, false, 0, false, ms(60), &busy, unb(60));
+        assert_eq!(w.next_deadline(), None);
+        assert!(!w.expire(ms(10) + GONE_SETTLE));
+        w.observe_screen(5, false, 0, false, ms(200), &clear, unb(200));
+        // Parked: unseen time is not quiet time.
+        w.restart_idle(ms(250));
+        assert_eq!(w.next_deadline(), Some(ms(250) + GONE_SETTLE));
+        assert!(!w.expire(ms(200) + GONE_SETTLE));
+        assert!(w.expire(ms(250) + GONE_SETTLE));
+        assert_eq!(
+            w.poll(id),
+            Some(Satisfaction {
+                seq: 5,
+                at: ms(250) + GONE_SETTLE
+            })
+        );
+        // NEGATIVE CONTROL: a closed frame is believed at once.
+        let closed = w.arm(rows_clear(RowRange::All), ms(300)).unwrap();
+        w.observe_screen(6, false, 0, false, ms(300), &clear, Frame::CLOSED);
+        assert_eq!(
+            w.poll(closed),
+            Some(Satisfaction {
+                seq: 6,
+                at: ms(300)
+            })
         );
     }
 
@@ -1473,10 +1790,11 @@ mod tests {
     }
 
     /// Watchers on disjoint spans latch at the same seqs whether the scan reads only their
-    /// hull or, with an extra `All` watcher armed, every row.
+    /// hull or, with an extra `All` watcher armed, every row. The batches are a second apart,
+    /// and each is followed by the host's expiry pass `GONE_SETTLE` after it.
     #[test]
     fn disjoint_spans_latch_exactly_as_a_full_scan() {
-        use crate::terminal::Terminal;
+        use crate::terminal::{ClockReading, Terminal};
 
         // Row 5 is busy before the arm; row 23 shows READY outside every range.
         const SETUP: &[u8] = b"\x1b[6;1Hbusy\x1b[24;1HREADY";
@@ -1490,8 +1808,12 @@ mod tests {
         ];
         let run = |full_scan: bool| {
             let now = t0();
+            let at = |i: u64| ClockReading {
+                monotonic: now + Duration::from_secs(i),
+                wall_ms: None,
+            };
             let mut term = Terminal::new(24, 40);
-            term.process(SETUP);
+            term.process_at(SETUP, at(0));
             if full_scan {
                 term.watch_rows(Arc::new(Contains("never shown")), RowRange::All, now)
                     .expect("arm the full-scan watcher");
@@ -1516,8 +1838,9 @@ mod tests {
             .map(|id| id.expect("arm"));
             let mut latches = Vec::new();
             let mut read_last_row = false;
-            for batch in CORPUS {
-                term.process(batch);
+            for (i, batch) in (1..).zip(CORPUS) {
+                term.process_at(batch, at(i));
+                term.watch_expire(at(i).monotonic + GONE_SETTLE);
                 read_last_row |= term.row_text_scratch.get(23).is_some_and(Option::is_some);
                 latches.push(ids.map(|id| term.watch_poll(id).map(|s| s.seq)));
             }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Row-damage overshoot differential (ATERM-KI-1020-1's closing test).
+//! Row-damage overshoot differential ('s closing test).
 //!
 //! Some glyphs ink above their own cell: accented capitals (`ÉÁÑÅÊÍ`) at px 13,
 //! 14, 17 and 18 (and their fire halo at every px). `row_scale` clips glyph

@@ -71,8 +71,8 @@ pub const SMOKE_CONFIG: &str = "cursor_trail_style = \"rainbow kitty pet\"\ncurs
 /// which one burst cannot tell from healthy.
 const CURSOR_EFFECT_LATE_MAX: u64 = 4;
 /// …and as a share of the owner's arms, so a burst that armed little cannot pass
-/// on the absolute bound alone: more than one late arm in fifty (2 %) is a
-/// regression once more than one arm was late.
+/// on the absolute bound alone: more than one late arm in fifty fails once more
+/// than one arm was late.
 const CURSOR_EFFECT_LATE_SHARE_DEN: u64 = 50;
 
 /// The `cursor_effect` owner's `arms/past` out of a `metrics` reply's
@@ -423,9 +423,7 @@ fn or_no_reply(got: &str) -> &str {
     if got.is_empty() { "<no reply>" } else { got }
 }
 
-// ---------------------------------------------------------------------------
 // GUI TYPING-PACING SMOKE
-// ---------------------------------------------------------------------------
 pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
     if let Some(reason) = gui_smoke_unavailable(ctx) {
         r.skip(reason);

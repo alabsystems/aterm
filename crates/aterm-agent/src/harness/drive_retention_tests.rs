@@ -77,7 +77,7 @@ fn live() -> Option<BTreeSet<String>> {
 }
 
 /// THE DRIVE DIRECTORY KEEPS ITS BUDGET AND EVERY TAB SOMETHING NAMES (relaunch-10 of
-/// ATERM-KI-1016-1, the review's KR-5): over the budget, the oldest groups nothing names go,
+/// , the review's KR-5): over the budget, the oldest groups nothing names go,
 /// oldest first, until the groups are within it — never a named tab, an earlier tab a kept tab's
 /// note names, a group written this week, a name that is no tab's group, or a directory.
 /// NEGATIVE CONTROLS: unnamed, the live tab and the tab its note named go first; with no note,

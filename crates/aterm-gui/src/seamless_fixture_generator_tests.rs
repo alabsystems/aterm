@@ -265,10 +265,9 @@ struct FxSession {
     /// Its timeline ([`fx_timeline`]): its session log rides the control
     /// carry and the record, and its epoch the layout leaf.
     timeline: Arc<Mutex<crate::session_timeline::SessionTimeline>>,
-    /// The rung this release's ladder carries this session at: `Full` for every
-    /// honest desk, `StrippedLinks` for a screen holding a line record over
-    /// the wire's per-record cap. The capture asserts it, and that the
-    /// self-check (`settle_wire_carries`) lowers nothing.
+    /// The rung this release's ladder carries this session at: `Full` for every honest desk,
+    /// `StrippedLinks` for a screen holding a line record over the wire's per-record cap. The
+    /// capture asserts it, and that the self-check (`settle_wire_carries`) lowers nothing.
     rung: CarryRung,
     /// How many of the lines the `.hist` sidecar carries for import (its first `take`) lose their
     /// links to the export: `0` on every desk but the one for that shape. The writer asserts it.
@@ -454,7 +453,7 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         agent: None,
         supervised: None,
         lost: None,
-        // Since v0.100.0: a pane kept open after its command exited.
+        // A pane kept open after its command exited.
         held: false,
         holds: Vec::new(),
     }))
@@ -1081,9 +1080,8 @@ fn fx_capture(
         )
         .map_or(u64::MAX, |bytes| capture_budget.saturating_add(bytes));
         heads.push(crate::handoff_history::capture_head(id, &guard));
-        // Since v0.100.0 every session's control carry travels (round seven,
-        // finding 24): a rung that does not keep the screen it describes goes
-        // without the DIFFER'S STATE only (`CarryRung::keeps_differ_state`).
+        // Since v0.100.0 every session's control carry travels; a rung that does not keep the
+        // screen it describes goes without the differ's state only.
         // It holds the session's log too (`capture_parked_screens` hands the
         // session's timeline), as since the session log's phase 2A.
         let mut source = handoff_carry::capture_head(
@@ -1473,7 +1471,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         // named by the writer (`write_outgoing_with_held`); the exit
         // ledger's last row id, so the successor counts on above it; and the
         // bridge `fabric attach` armed beyond the configured one, if any.
-        // Since v0.108.0 (ATERM-KI-1015-2's U10) the rows drawn beside the
+        // Since v0.108.0 ('s U10) the rows drawn beside the
         // records: the fleet needs already told, the bus mirror's closed
         // sessions and whether a bridge served it, and the machine's names.
         held: Vec::new(),
@@ -3662,10 +3660,9 @@ fn fx_held_pane_desk() -> FxDesk {
         next_turn_id: None,
         fabric_attached: Vec::new(),
         drawn: FxDrawn::default(),
-        // Since v0.101.0 each held pane's scrollback and control carry cross
-        // too, and whether the person had seen its failure: `make` sits in the
-        // tab in front, beside the focused shell, so its failure was seen; vim
-        // was killed in the tab behind it.
+        // Since v0.101.0 each held pane's scrollback and control carry cross too, and whether
+        // the person had seen its failure: `make` sits beside the focused shell in the front tab,
+        // so its failure was seen; vim was killed in the tab behind.
         held: vec![
             FxHeld {
                 local_id: 2,
@@ -3868,7 +3865,7 @@ fn fx_mailbox() -> FxMailbox {
     })
 }
 
-/// A WORKER CLAUDE CODE ADOPTED ACROSS AN EARLIER UPDATE (ATERM-KI-1015-2's
+/// A WORKER CLAUDE CODE ADOPTED ACROSS AN EARLIER UPDATE ('s
 /// U10), at `rows`x`cols`: its ledger came carried with the floor its
 /// sender's ring had shed harness records below (`ControlCarry::ledger`),
 /// holding the manager's turn 41; since then the window harness pressed
@@ -3963,7 +3960,7 @@ fn fx_agent(
 }
 
 /// THE STATE A SESSION, ITS WINDOW AND ITS DESK CARRY BESIDE THE SCREENS
-/// (v0.108.0 on; ATERM-KI-1015-2's U10): every field the producer writes
+/// (v0.108.0 on's U10): every field the producer writes
 /// only for a session someone supervises, escalates, halts, subscribes or
 /// tasks, a window someone zoomed, warned or posted to, and a desk with a
 /// bridge `fabric attach` armed — the shapes no other desk carries, each
@@ -4517,7 +4514,7 @@ fn fx_carried_state_desk() -> FxDesk {
     desk
 }
 
-/// A HELD PANE'S SCROLLBACK LEFT BEHIND, AND WHY (v0.108.0 on; ATERM-KI-1015-2's
+/// A HELD PANE'S SCROLLBACK LEFT BEHIND, AND WHY (v0.108.0 on's
 /// U10): a shell beside a `make` that failed and was kept open, with its build
 /// log in its scrollback. Under `held-withheld`'s successor policy, which
 /// carries no scrollback, the pane's lines are left behind as the policy's
@@ -4626,7 +4623,7 @@ fn fx_two_drawers(flavour: u8) -> Terminal {
 }
 
 /// THE ENGINE STATE A CARRIED SCREEN HOLDS BEYOND ITS CELLS (v0.108.0 on;
-/// ATERM-KI-1015-2's U10), one session for each shape no other desk carries,
+/// 's U10), one session for each shape no other desk carries,
 /// each its own tab:
 ///
 /// * the parser stopped inside every kind of sequence its carry holds: an ssh
@@ -4800,7 +4797,7 @@ fn fx_engine_state_desk() -> FxDesk {
     }
 }
 
-/// A DESK PAST THE LAYOUT'S WINDOW CAP (v0.108.0 on; ATERM-KI-1015-2's U10): a
+/// A DESK PAST THE LAYOUT'S WINDOW CAP (v0.108.0 on's U10): a
 /// shell in front, and behind it a document in each of [`MAX_WINDOWS`] windows
 /// — the config open in the Editor with two selections, notes read in Markdown,
 /// one with a passage selected — so the capture folds the last window's tab
@@ -4883,7 +4880,7 @@ fn fx_fold_desk() -> FxDesk {
 }
 
 /// EVERY VARIANT A CARRIED ENUM TAKES THAT NO OTHER DESK DOES (v0.108.0 on;
-/// ATERM-KI-1015-2's U10), each as a program or the host sets it:
+/// 's U10), each as a program or the host sets it:
 ///
 /// * a demo of DEC's national sets, whose screen, main-screen DECSC slot and
 ///   alternate-screen DECSC slot each hold four of them in G0-G3, with GL

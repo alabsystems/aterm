@@ -1323,10 +1323,8 @@ fn await_machine(
     }
 }
 
-// ---------------------------------------------------------------------------
 // The stuck engine's agent pieces beside `sys` (design §19 P2a): `status job=
 // job_quiet_ms=`, the `brief` jobs line and `EVENT <local> job …`.
-// ---------------------------------------------------------------------------
 
 /// The timeline row a job's moved verdict is recorded as; `subscribe …
 /// events` pushes it as `EVENT <local> job …` (`subscribe::timeline_wire_kind`).

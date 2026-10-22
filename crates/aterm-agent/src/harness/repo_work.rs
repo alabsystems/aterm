@@ -5,7 +5,7 @@
 //! the turn-end policy's repository suffix on Cruise's done check and Land's
 //! nudge (`supervise::policy::turn_end::repo_work_suffix`), and behind
 //! Land's fourth landing condition: no defense lands a task over a finding
-//! (FOREVER LAND: all of the work in the remote main branch, no exceptions).
+//! (Autopilot Land: all of the work in the remote main branch, no exceptions).
 //!
 //! [`probe`] runs in the host, never in the pure policy: `git` through
 //! `aterm_uds::spawnfd::command`, each call bounded by what is left of one

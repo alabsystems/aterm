@@ -25,6 +25,7 @@ use aterm_core::terminal::{
     SearchVerdict, Terminal, UnderlineStyle, WrapFrame,
 };
 use aterm_search::MAX_SEARCH_MATCHES;
+use aterm_session::sink::SinkWriter;
 use aterm_window::event_loop::EventLoopProxy;
 
 use super::{
@@ -265,8 +266,8 @@ pub(crate) fn frame_rows_reply(
     out
 }
 
-/// `text` -> `OK <nrows>\n` then each visible row (trailing spaces trimmed). The
-/// bare form of [`cmd_text_opt`], kept for the callers that read the whole grid.
+/// `text` -> `OK <nrows>\n` then each visible row (trailing spaces trimmed): the
+/// bare form of [`cmd_text_opt`], which the fidelity tests read the whole grid by.
 ///
 /// FIDELITY (I-1): each row is extracted through the engine's combining-aware
 /// `get_line_text` — the SAME path `selection_to_string`/`copy` and the
@@ -357,6 +358,11 @@ pub(crate) fn rows_hash(t: &Terminal, first: usize, last: usize) -> Option<u64> 
 /// the stamp. COST of a build, measured 2026-09-20 on a 60x200 grid: 61.6 us,
 /// of which 55.3 us renders the rows and ~6 us is the hash; a reader of an
 /// unchanged screen pays neither.
+/// The whole visible screen as text: every row [`visible_row`] renders, each
+/// followed by a newline, untrimmed — the one construction of the screen
+/// [`screen_hash`] folds and `turn` serves. `cmd_text_opt` keeps its own loop
+/// because it serves a row span (`tail=`, `rows=`); that the whole-grid span
+/// agrees with this is pinned by `screen_stamp_matches_the_text_verbs_rows`.
 pub(crate) fn screen_text(t: &Terminal) -> String {
     let mut screen = String::with_capacity(t.rows() as usize * (t.cols() as usize + 1));
     for r in 0..t.rows() as usize {
@@ -432,17 +438,15 @@ pub(crate) fn cmd_cursor(term: &Arc<Mutex<Terminal>>) -> String {
 /// single space-free token (decode it the same way as `cwd`/`cmdline`). It is
 /// the SAME text the `text`/`search`/selection paths and the renderer's
 /// `combining`/`clusters` frame lanes produce, so a single-cell read of `é`
-/// (`e`+U+0301) or a ZWJ family (👨‍👩‍👧) is FAITHFUL — not the base codepoint
-/// alone (FIDELITY I-1; this REPLACES the previous `char as u32` codepoint
-/// field, which silently dropped combining marks / emoji clusters). A blank or
-/// wide-continuation cell yields an empty token (`%20`-free → ``). `<fg>`/`<bg>`
-/// are the fully-resolved `RRGGBB` colors the renderer would paint; `<attrs>` is
+/// (`e`+U+0301) or a ZWJ family (👨‍👩‍👧) is faithful. A blank or
+/// wide-continuation cell yields an empty token. `<fg>`/`<bg>`
+/// are the fully-resolved `rrggbb` colors the renderer would paint; `<attrs>` is
 /// a comma-separated list (or `none`) of the cell's active text attributes —
 /// `bold,dim,italic,underline,blink,inverse,strike,hidden` — followed by the
 /// width marker `wide` (the lead cell of a double-width glyph) or `wide_cont`
 /// (its blank right-half spacer) when the cell is one; the marker joins the
-/// list, replacing a bare `none`, so a parser's vocabulary is ten tokens
-/// (pinned by `cell_attrs_carry_the_width_markers`).
+/// list, replacing a bare `none` (pinned by `cell_attrs_carry_the_width_markers`).
+/// `link=` is the cell's percent-encoded OSC 8 target, only when it has one.
 ///
 /// `cell abs=<n> <c>` reads the cell of ABSOLUTE row `n` (B-2's one coordinate
 /// space, `line`'s and `search`'s): a history row, materialized as a
@@ -972,6 +976,9 @@ pub(crate) fn offscreen_args(rest: &str) -> Result<OffscreenArgs, String> {
 /// * `screen=1` appends the current screen rows (the `text` rows) under that same lock and
 ///   closes the header with `screen_rows=<m>`; `<n>` counts every line, so the archived rows
 ///   are the first `n - m`.
+///   `frame=open` before `screen_rows=` says the program's DEC 2026 frame was unfinished at
+///   the read ([`Terminal::frame_unfinished_at`], as `text --json`'s `"frame":"open"`): the
+///   screen rows are a prefix of a redraw, to read again after `await frame`.
 ///
 /// The archive's rows are cloned out as `Arc<str>` under the terminal lock (one
 /// refcount bump each) and the reply is formatted AFTER the lock is released: a
@@ -1005,10 +1012,22 @@ pub(crate) fn cmd_offscreen(term: &Arc<Mutex<Terminal>>, frame: &FrameSlot, rest
             None => aterm_core::terminal::AltArchiveQuery::oldest(since, page),
         };
         let read = archive.read(query);
-        let screen = args.screen.then(|| look.text(&t));
+        let screen = args.screen.then(|| {
+            (
+                look.text(&t),
+                t.frame_unfinished_at(std::time::Instant::now()),
+            )
+        });
         (read, t.is_alternate_screen(), t.content_seq(), screen)
     };
-    format_offscreen_reply(&read, alt, seq, screen.as_deref())
+    let frame_open = screen.as_ref().is_some_and(|(_, open)| *open);
+    format_offscreen_reply(
+        &read,
+        alt,
+        seq,
+        screen.as_ref().map(|(text, _)| &**text),
+        frame_open,
+    )
 }
 
 /// Frame an `offscreen` read (see [`cmd_offscreen`]); runs with no lock held.
@@ -1017,6 +1036,7 @@ fn format_offscreen_reply(
     alt: bool,
     seq: u64,
     screen: Option<&ScreenText>,
+    frame_open: bool,
 ) -> String {
     use std::fmt::Write as _;
     let screen_rows = screen.map_or(0, ScreenText::row_count);
@@ -1052,6 +1072,9 @@ fn format_offscreen_reply(
     if read.more {
         out.push_str(" more=1");
     }
+    if frame_open {
+        out.push_str(" frame=open");
+    }
     if let Some(screen) = screen {
         let _ = write!(out, " screen_rows={}", screen.row_count());
     }
@@ -1072,12 +1095,10 @@ fn format_offscreen_reply(
 /// `line <n>` -> `OK <text>\n` for the line at MONOTONIC ABSOLUTE row `n`, or
 /// `ERR out of range\n` / `ERR evicted\n` / `ERR unreadable\n`.
 ///
-/// COORDINATE SPACE (B-2): `n` is an ABSOLUTE row — the same space `blocks` and
-/// `search` report — NOT a 0-based history index. This is the ONE documented
-/// read coordinate: `blocks` gives output/command/prompt rows as absolute
-/// numbers and `search` returns absolute match rows, and BOTH are fed straight
-/// to `line`/`text` with the conversion done HERE at the read site. The mapping
-/// (identical to the engine's `text_range`):
+/// COORDINATE SPACE: `n` is an ABSOLUTE row — the space `blocks` (output,
+/// command and prompt rows) and `search` (match rows) report — NOT a 0-based
+/// history index, so either feeds `line` directly and the conversion is done HERE.
+/// The mapping (identical to the engine's `text_range`):
 ///   `hist = n - grid.oldest_absolute_row()`
 ///   `hist <  scrollback_lines`        → scrollback history line `hist`
 ///   `hist >= scrollback_lines`        → visible row `hist - scrollback_lines`
@@ -1110,7 +1131,8 @@ pub(crate) fn cmd_line(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
 
 /// `search <pat…> [case] [regex]` -> `OK <count>[ incomplete[ capped][ rewrapping][ long-line][ moving][ older]]\n`
 /// then `<abs_row> <col> <len>` per match. The header ends with
-/// `screen_first=<abs_row>`, the live screen's first row in the searched frame.
+/// `screen_first=<abs_row>`, the live screen's first row in the searched frame;
+/// an empty pattern is `OK 0 screen_first=<abs_row>`.
 ///
 /// SEARCH-1: backed by the engine's real `TerminalSearch`, indexing BOTH the
 /// SCROLLBACK (one dense walk, [`Terminal::read_search_rows`]) AND the visible rows
@@ -1141,7 +1163,7 @@ pub(crate) fn cmd_line(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
 /// searches for "case"); a literal that itself ENDS in ` case`/` regex` needs
 /// the regex form (e.g. `worst\s+case regex`).
 ///
-/// INCOMPLETE (DL-2): when the list is not exhaustive the header carries a
+/// INCOMPLETE: when the list is not exhaustive the header carries a
 /// trailing ` incomplete` token, so a client never trusts a short list silently,
 /// followed by every cause that applies, in this order (see
 /// [`search_incomplete_marker`]): ` capped` when the list stopped at
@@ -1163,7 +1185,7 @@ pub(crate) fn cmd_line(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
 /// when output scrolls a line into history, so every listed row still names
 /// its line.
 ///
-/// LOCKING (P1.0c): the O(scrollback) index build NEVER runs under the Terminal
+/// LOCKING: the O(scrollback) index build NEVER runs under the Terminal
 /// mutex — a rebuild while the shell is streaming output would stall the PTY
 /// reader's `process()` and the frame path for the full build time. Instead the
 /// line texts are SNAPSHOTTED out of the grid in bounded chunks (the lock is
@@ -1271,7 +1293,7 @@ fn search_reply(
 /// applies is "older history was not searched when no cause follows
 /// ` incomplete`, or when ` older` does".
 ///
-/// Ruling 2026-10-11 (R15 content-2 review): the header named ONE cause, and the
+/// (R15 content-2 review): the header named ONE cause, and the
 /// first one won, so a depth cap under a cut-short line (`long-line`), a full
 /// list (`capped`) or a rewrap went unsaid, and an agent reading the verb help
 /// concluded the older history had been searched. Every cause is now named; the
@@ -1734,7 +1756,7 @@ pub(crate) fn cmd_custody(term: &Arc<Mutex<Terminal>>) -> String {
 }
 
 /// `modes` -> `OK <n>\n` then `n` `key=value` lines, one per introspected mode —
-/// fourteen today, in this order, and the count is in the header so a client
+/// fourteen, in this order, and the count is in the header so a client
 /// streams the body (the `text`/`search` shape): `alt_screen`, `cursor_visible`,
 /// `app_cursor_keys` (DECCKM), `app_keypad` (DECPAM), `bracketed_paste` (2004),
 /// `mouse_mode` (`none|normal|button|any|x10`), `mouse_encoding`
@@ -1946,7 +1968,7 @@ pub(crate) fn cmd_devtools(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
         Err(usage) => return usage.to_string(),
     };
     if !cfg!(target_os = "macos") {
-        return "ERR unsupported: the Developer Tools list is macOS's\n".to_string();
+        return "ERR unsupported: the Developer Tools list exists only on macOS\n".to_string();
     }
     match control_media::call_main(proxy, |reply| Wake::DevToolsHandOverAsked { now, reply }) {
         Ok(outcome) => devtools_reply(outcome),
@@ -1955,6 +1977,7 @@ pub(crate) fn cmd_devtools(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
 }
 
 /// `title` -> `OK <window title>\n` (the OSC 0/2 title; empty if unset).
+/// `title` -> `OK <window title>\n` (the OSC 0/2 window title; empty if unset).
 pub(crate) fn cmd_title(term: &Arc<Mutex<Terminal>>) -> String {
     let t = term_lock(term);
     format!("OK {}\n", t.title())
@@ -2113,7 +2136,7 @@ pub(crate) fn cmd_text_json_looked(
         ctx.human_input.unkeyed_ms(now_us),
         human_seq,
         Some(&ctx.launch),
-        Some(&ctx.output_echo),
+        Some((&ctx.output_echo, &ctx.sink)),
     )
 }
 
@@ -2132,14 +2155,19 @@ thread_local! {
 /// is how long the host has served a session no person keyed, written
 /// `"unkeyed_ms":N` only beside a `"human_ms":null`: a never that says since
 /// when. `submits`, the session's input writes, gives `"submits":N` after
-/// everything else ([`crate::app_input::OutputEchoTracker::submits`]), read
+/// inputs and before an optional frame marker ([`crate::app_input::OutputEchoTracker::submits`]), read
 /// once the screen's hold is released, and `"inputs":[B,A]` before it: every
-/// input write, submitting or not, counted before the rows where none was in
-/// flight (`B`, `null` while one was,
+/// input write, submitting or not, counted before the rows with no active
+/// write, partial frame or buffered spill (`B`, `null` without that proof,
 /// [`crate::app_input::OutputEchoTracker::input_settled`]) and after them
-/// (`A`), so a later read's `A` equal to an earlier read's `B` says no key
-/// reached the session between the two screens; `None` (a test's read of a
-/// bare terminal) writes neither.
+/// (`A`). Equal counts exclude new input attempts and previously buffered
+/// bytes, not a child's delayed handling of kernel-queued input. `None`
+/// (a test's read of a bare terminal) writes neither. `"frame":"open"` comes last, and only when
+/// the program's DEC 2026 frame is unfinished at the read
+/// ([`Terminal::frame_unfinished_at`], read under the rows' lock): the rows
+/// are a prefix of a redraw, and a reader of whole frames waits (`await
+/// frame`) and reads again (`docs/measured/half-drawn-frame-2026-10-22.md`).
+/// Absent, the frame is whole.
 #[allow(
     clippy::too_many_arguments,
     reason = "the session's facts read beside one screen, each from its own leaf; a struct \
@@ -2153,21 +2181,36 @@ pub(crate) fn cmd_text_json_read(
     unkeyed_ms: Option<u64>,
     human_seq: u64,
     launch: Option<&crate::launch_witness::LaunchWitness>,
-    submits: Option<&crate::app_input::OutputEchoTracker>,
+    input: Option<(&crate::app_input::OutputEchoTracker, &SinkWriter)>,
 ) -> String {
     // GATHER under ONE lock hold, SERIALIZE with the lock released — the shape the
-    // styled frame already uses. Every field is read inside the single hold, so the
-    // reply still describes one instant; the escaping and JSON assembly are pure
-    // string work over owned data, and doing them under the mutex made the PTY
-    // reader's `process()` and the frame snapshot queue behind a screen read.
+    // styled frame uses. Every field is read inside the single hold, so the reply
+    // describes one instant, and the PTY reader and frame snapshot never queue
+    // behind the escaping.
     // Logical rows are the session's published text (built only when the screen
     // changed since the last build); `order=display` reads its own rows and maps.
-    // THE SESSION'S INPUT WRITES BEFORE THE SCREEN, where none is in flight
-    // ([`crate::app_input::OutputEchoTracker::input_settled`]): every write it
-    // counts has landed before the rows are read.
-    let inputs_before = submits.map(crate::app_input::OutputEchoTracker::input_settled);
+    // No active write, partial frame or process-local spill at this count
+    // ([`crate::app_input::OutputEchoTracker::input_settled`]). The sink
+    // fence ends here, before frame/terminal locks. This is transport settlement,
+    // never acknowledgment that the child processed a key.
+    let inputs_before = input.map(|(tracker, sink)| tracker.input_settled(sink));
     let mut look = frame.look_frame();
-    let (text, display_rows, maps, c, vis, style, rows, cols, seq, generation, first, end, launch) = {
+    let (
+        text,
+        display_rows,
+        maps,
+        c,
+        vis,
+        style,
+        rows,
+        cols,
+        seq,
+        generation,
+        first,
+        end,
+        launch,
+        frame_open,
+    ) = {
         let t = term_lock(term);
         #[cfg(test)]
         WHILE_ROWS_READ.with(|hook| {
@@ -2202,22 +2245,20 @@ pub(crate) fn cmd_text_json_read(
             end,
             // The launch lock is a leaf, taken after the terminal's.
             launch.map_or_else(|| "null".to_string(), |w| w.json(human_seq)),
+            t.frame_unfinished_at(std::time::Instant::now()),
         )
     };
     // THE SUBMISSION COUNT AFTER THE SCREEN ([`crate::submit_count`]): every
     // submission whose answer the rows show is counted by now — and every
     // input write whose effect the rows show.
-    let inputs_after = submits.map(crate::app_input::OutputEchoTracker::input_sent);
-    let submits = submits.map(crate::app_input::OutputEchoTracker::submits);
+    let inputs_after = input.map(|(tracker, _)| tracker.input_sent());
+    let submits = input.map(|(tracker, _)| tracker.submits());
     let rows_text: Vec<&str> = match &text {
         Some(text) => (first..end).map(|r| text.row(r)).collect(),
         None => display_rows.iter().map(String::as_str).collect(),
     };
-    // ONE buffer, written straight through. The retired shape allocated a quoting
-    // `format!` + a `json_escape` per row, then copied the WHOLE payload three more
-    // times (the `join`, the outer `format!`, and `json_ok`'s own `format!`).
-    // Byte-identical: `json_escape` is `json_escape_into` into a fresh String, and
-    // `json_ok` is exactly this `"OK 1\n"` prefix + `"\n"` suffix.
+    // ONE buffer, written straight through: `json_ok`'s exact `"OK 1\n"` prefix
+    // and `"\n"` suffix, with each row escaped in place by `json_escape_into`.
     let selected = rows_text.len();
     let sent = if args.trim {
         trimmed_len(rows_text.iter().copied())
@@ -2286,6 +2327,9 @@ pub(crate) fn cmd_text_json_read(
         }
         if let Some(n) = submits {
             let _ = write!(out, ",\"submits\":{n}");
+        }
+        if frame_open {
+            out.push_str(",\"frame\":\"open\"");
         }
         out.push('}');
     }
@@ -3072,12 +3116,12 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         absolute_row_revision: _, // OMITTED: host-consumed absolute-row coordinate-space revision, not visible-cell content
         history_renumber_epoch: _, // OMITTED: host-consumed wholesale-renumber epoch (its twin), not visible-cell content
         holder: _, // OMITTED: host-consumed holder fence (which rows a card may be decorated on), not visible-cell content
-        scroll_frac_px: _, // OMITTED: M1b sub-row present translate, display-only (not cell content)
-        grid_top_row: _,   // OMITTED: M1b grid/chrome partition, display-only
-        grid_bot_row: _,   // OMITTED: M1b grid/chrome partition, display-only
-        apron_row: _, // OMITTED: M1b incoming-row apron — the present translate's strip source, display-only
+        scroll_frac_px: _, // OMITTED: sub-row present translate, display-only
+        grid_top_row: _, // OMITTED: grid/chrome partition, display-only
+        grid_bot_row: _, // OMITTED: grid/chrome partition, display-only
+        apron_row: _, // OMITTED: incoming-row apron, the present translate's strip source
         apron_stamp: _, // OMITTED: the apron's extraction stamp, display-only bookkeeping
-        fx_clip: _,   // OMITTED: focused-pane present-time post-fx clip box, display-only
+        fx_clip: _, // OMITTED: focused-pane present-time post-fx clip box, display-only
         selection: _, // frame "selection" kind + projected geometry
         selection_clip: _, // OMITTED: host-only split composition bounds; engine styled frames have none
         selection_bg: _, // frame "selection_bg" (OSC 17 fixed RGB, else the "default" policy token)
@@ -4475,7 +4519,7 @@ mod tests {
     /// A row written before the switch keeps the cells it was drawn in
     /// (`apply_config` reflows nothing) and find reads those cells, so the
     /// fresh answer is where the grid paints `foo`: after two one-cell arrows.
-    /// (Ruling 2026-10-11, r15 content-5: until find read the grid's cells it
+    /// (r15 content-5: until find read the grid's cells it
     /// re-measured such a row under the new policy and put `foo` two cells
     /// right of where it is drawn; this test pinned that as its precondition.)
     #[test]
@@ -5279,8 +5323,8 @@ mod tests {
         assert_eq!(walked.answer, Err(super::SearchOptionsError::ScanCutShort));
     }
 
-    /// A mistyped argument is refused, never answered with the summary: `metrics
-    /// rest` used to read as a successful reset while zeroing nothing.
+    /// A mistyped argument is refused, never answered with the summary, so
+    /// `metrics rest` cannot read as a successful reset while zeroing nothing.
     #[test]
     fn metrics_refuses_an_unknown_argument_and_resets_nothing() {
         crate::metrics::record_offscreen_raster(1_000_000);
@@ -6072,19 +6116,29 @@ mod trim_tests {
     /// and `unkeyed_ms`: written by the session's own input writes, a
     /// control client's and a person's alike, and only an Enter over
     /// something composed moves it. `"inputs"` before it counts every input
-    /// write, submitting or not, before the rows (where none is in flight)
-    /// and after them: a write in flight at the read is `null` before, so no
-    /// later screen can show its effect over a count that holds it, and a
-    /// write that lands while the rows are read is counted after them, never
-    /// before. NEGATIVE CONTROL: once it is over, the count before the rows
-    /// holds it again. A read with no session writes neither.
+    /// write, submitting or not, before and after the rows. Active writes,
+    /// a held frame or accepted-but-buffered spill make the first count
+    /// `null`. Once delivered to the owned peer and the frame hold released,
+    /// the same count is admitted. A write begun while the rows are read
+    /// appears only after them. These are transport observations, not child
+    /// acknowledgment. A read with no session writes neither.
     #[cfg(unix)]
     #[test]
     fn text_json_ends_with_the_sessions_submission_count() {
         use crate::input::{EgressMode, InputEvent};
         use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+        use std::io::Read as _;
         let term = term_with(24, &numbered(22));
         let tracker = std::sync::Arc::new(crate::app_input::OutputEchoTracker::default());
+        let (mut peer, master) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .expect("hang detector");
+        master.set_nonblocking(true).expect("nonblocking master");
+        let sink = aterm_session::sink::SinkWriter::new_owned(master.into());
+        sink.note_master_nonblocking(true);
+        // Arm the real drainer explicitly below, after the held-fence
+        // assertions. No worker races the buffered-input negative control.
+        sink.install_spill_arranger(|| {});
         let read = |args: TextArgs| {
             super::cmd_text_json_read(
                 &term,
@@ -6094,7 +6148,7 @@ mod trim_tests {
                 Some(5_000),
                 0,
                 None,
-                Some(&*tracker),
+                Some((&*tracker, &sink)),
             )
         };
         let before = read(args("tail=5 trim"));
@@ -6105,10 +6159,6 @@ mod trim_tests {
             ),
             "{before}"
         );
-        let mut pipe = [0; 2];
-        // SAFETY: pipe writes two fresh descriptors on success.
-        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
-        let sink = aterm_session::sink::SinkWriter::new(pipe[1]);
         let modes = crate::mode_mirror_of(&term);
         let enter = InputEvent::Key {
             key: Key::Named(NamedKey::Enter),
@@ -6164,14 +6214,42 @@ mod trim_tests {
             "the write was made inside the read"
         );
         assert!(during.contains(",\"inputs\":[4,5],"), "{during}");
+        // An empty spill is not enough while a frame fence is held.
+        let fence = sink.try_fence_egress().expect("egress initially settled");
+        let held = read(TextArgs::default());
+        assert!(held.contains(",\"inputs\":[null,5],"), "{held}");
+        // Accepted, but NOT delivered: a non-submitting clear key queues
+        // behind the held frame after the tracked write itself has ended.
+        let receipt = write(&InputEvent::KeySequence(vec![0x1b]));
+        assert!(receipt.fully_accepted_nonempty() && !receipt.is_direct());
+        assert_eq!(sink.spilled_bytes(), 1, "the clear key is still buffered");
+        let buffered = read(TextArgs::default());
+        assert!(buffered.contains(",\"inputs\":[null,6],"), "{buffered}");
+        assert!(buffered.ends_with(",\"submits\":1}\n"), "{buffered}");
+        drop(fence);
+        sink.arrange_pending_drainer();
+        let expected = b"\rkeep going\r\x1b";
+        let mut delivered = vec![0; expected.len()];
+        peer.read_exact(&mut delivered)
+            .expect("the owned peer receives the bytes");
+        assert_eq!(delivered.as_slice(), expected);
+        assert!(
+            aterm_spec::wait::within(
+                aterm_spec::wait::MUST_HAPPEN,
+                std::time::Duration::from_millis(2),
+                || tracker.input_settled(&sink).filter(|&n| n == 6),
+            )
+            .is_some(),
+            "the drainer releases its final frame hold"
+        );
+        let drained = read(TextArgs::default());
+        assert!(drained.contains(",\"inputs\":[6,6],"), "{drained}");
         // A read with no session's tracker (the test spelling) writes none.
         let bare = cmd_text_json_opt(&term, TextArgs::default());
         assert!(
             !bare.contains("submits") && !bare.contains("inputs"),
             "{bare}"
         );
-        // SAFETY: the read end is this test's own, closed once.
-        unsafe { libc::close(pipe[0]) };
     }
 
     /// The shared framer: `OK <n>[ <verdict>][ trimmed=<k>][ first=<row>]` + rows, so the count
@@ -6726,9 +6804,41 @@ mod offscreen_tests {
         assert_eq!((n, field(&f, "screen_rows")), (m, m as u64));
     }
 
+    /// `screen=1` read while the program's DEC 2026 frame is unfinished says `frame=open`
+    /// (read under the rows' lock, as `text --json`'s `"frame":"open"`): the screen half is a
+    /// prefix of a redraw. NEGATIVE CONTROLS: the frame closed, and a read with no screen half,
+    /// say nothing of it; past the hang detector the screen is read as it stands.
+    #[test]
+    fn offscreen_screen_says_when_the_frame_is_open() {
+        let term = scrolled(10);
+        term.lock()
+            .unwrap()
+            .process(b"\x1b[?2026h\x1b[2;1Hrow half-dra");
+        let (_, f, _) = parse(&cmd_offscreen(&term, "since=9 screen=1"));
+        assert_eq!(f.get("frame").map(String::as_str), Some("open"), "{f:?}");
+        let (_, f, _) = parse(&cmd_offscreen(&term, "since=9"));
+        assert!(!f.contains_key("frame"), "no screen half: {f:?}");
+        term.lock().unwrap().process(b"wn\x1b[K\x1b[?2026l");
+        let (_, f, _) = parse(&cmd_offscreen(&term, "since=9 screen=1"));
+        assert!(!f.contains_key("frame"), "closed: {f:?}");
+        let begun = std::time::Instant::now()
+            .checked_sub(aterm_core::terminal::FRAME_HANG + std::time::Duration::from_secs(1))
+            .expect("an instant a minute back");
+        term.lock().unwrap().process_at(
+            b"\x1b[?2026h\x1b[3;1Hhung",
+            aterm_core::terminal::ClockReading {
+                monotonic: begun,
+                wall_ms: None,
+            },
+        );
+        assert!(term.lock().unwrap().sync_frame_unfinished());
+        let (_, f, _) = parse(&cmd_offscreen(&term, "since=9 screen=1"));
+        assert!(!f.contains_key("frame"), "past its hang detector: {f:?}");
+    }
+
     // `offscreen`'s wire contract as a client uses it: paging with `since=<last>`,
     // an archive that is off, the re-shown rows under a pinned header, and the
-    // row text itself (review of round 7).
+    // row text itself .
 
     /// The documented paging loop. `OFFSCREEN_DEFAULT_MAX`'s doc says "`more=1`
     /// marks a page with rows left over, and `since=<last>` reads the next"; the
@@ -7602,5 +7712,47 @@ mod screen_conditional {
         }
         let term = Arc::new(Mutex::new(Terminal::new(2, 8)));
         assert_eq!(cmd_screen_styled_json(&term, "trim"), SCREEN_USAGE);
+    }
+
+    /// `"frame":"open"` ends a `text --json` reply only while the program's DEC 2026 frame is
+    /// unfinished: written into and not closed. NEGATIVE CONTROLS: no bracket, a bracket with
+    /// nothing written in it, and the bracket closed.
+    #[test]
+    fn text_json_says_open_only_inside_an_unfinished_frame() {
+        let term = Arc::new(Mutex::new(Terminal::new(4, 40)));
+        term.lock().unwrap().process(b"busy\r\n");
+        let read = || {
+            super::cmd_text_json_read(
+                &term,
+                &crate::frame_memo::FrameSlot::default(),
+                super::TextArgs::default(),
+                None,
+                None,
+                0,
+                None,
+                None,
+            )
+        };
+        assert!(!read().contains("\"frame\""), "no bracket");
+        term.lock().unwrap().process(b"\x1b[?2026h");
+        assert!(!read().contains("\"frame\""), "nothing written in it");
+        term.lock().unwrap().process(b"\x1b[2;1Hhalf");
+        assert!(read().ends_with(",\"frame\":\"open\"}\n"), "{}", read());
+        term.lock().unwrap().process(b"\x1b[?2026l");
+        assert!(!read().contains("\"frame\""), "closed");
+        // Past its hang detector a frame is read as it stands: the run of reads ending inside
+        // unfinished frames began a minute and a second ago.
+        let begun = std::time::Instant::now()
+            .checked_sub(aterm_core::terminal::FRAME_HANG + std::time::Duration::from_secs(1))
+            .expect("an instant a minute back");
+        term.lock().unwrap().process_at(
+            b"\x1b[?2026h\x1b[3;1Hhung",
+            aterm_core::terminal::ClockReading {
+                monotonic: begun,
+                wall_ms: None,
+            },
+        );
+        assert!(term.lock().unwrap().sync_frame_unfinished());
+        assert!(!read().contains("\"frame\""), "past its hang detector");
     }
 }

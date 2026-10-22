@@ -703,9 +703,7 @@ fn end_line(act: Act, was: Phase, machine: &RepaintNudge) -> Option<String> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The App's half.
-// ---------------------------------------------------------------------------
 
 /// The production world: the `App`'s sessions.
 pub(crate) struct AppWorld<'a> {

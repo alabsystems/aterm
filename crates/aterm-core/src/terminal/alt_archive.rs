@@ -413,8 +413,6 @@ struct Scratch {
 /// converges rather than holding at every instant: if sessions fill in turn and
 /// go idle, session `k` holds `total / k` and the sum is `total * H_n`; one frame
 /// per session brings it back inside `total`.
-/// Only archives holding rows count as live, so tabs not running a fullscreen
-/// app do not shrink the share of the one that is.
 #[derive(Debug)]
 pub struct AltArchiveBudget {
     total: usize,

@@ -446,6 +446,28 @@ fn config_names(dir: &Path, m: &Machine<'_>, names: fn(&str) -> bool) -> bool {
         })
 }
 
+/// Whether a cargo config a build in `m.cwd` reads holds a line `names` holds that is not a
+/// comment: `.cargo/config.toml` or `.cargo/config` in the working directory or an ancestor,
+/// then in `CARGO_HOME`, else `$HOME/.cargo`. A file that exists and cannot be read counts,
+/// and so does an unknown working directory, so a caller that backs off on a yes fails safe.
+#[must_use]
+pub fn configs_name(m: &Machine<'_>, names: fn(&str) -> bool) -> bool {
+    let Some(cwd) = m.cwd else {
+        return true;
+    };
+    if cwd
+        .ancestors()
+        .any(|d| config_names(&d.join(".cargo"), m, names))
+    {
+        return true;
+    }
+    let cargo_home = (m.env)("CARGO_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| m.home.map(|h| h.join(".cargo")));
+    cargo_home.is_some_and(|h| config_names(&h, m, names))
+}
+
 /// THE FALLBACK: the `--config` value that keeps the intermediates of a build a tool
 /// pinned to `target` (deps, incremental, fingerprints, build scripts) in
 /// `<target>/build.noindex` ([`TARGET_BUILD_LEAF`]), out of Spotlight, while cargo still
@@ -461,22 +483,10 @@ fn config_names(dir: &Path, m: &Machine<'_>, names: fn(&str) -> bool) -> bool {
 /// read as a template ([`config_value`]'s refusals).
 #[must_use]
 pub fn target_build_dir(target: &Path, m: &Machine<'_>) -> Option<String> {
-    if !target.is_absolute() || (m.env)("CARGO_BUILD_BUILD_DIR").is_some() {
-        return None;
-    }
-    let names_build_dir = |line: &str| line.contains("build-dir");
-    let cwd = m.cwd?;
-    if cwd
-        .ancestors()
-        .any(|d| config_names(&d.join(".cargo"), m, names_build_dir))
+    if !target.is_absolute()
+        || (m.env)("CARGO_BUILD_BUILD_DIR").is_some()
+        || configs_name(m, |line| line.contains("build-dir"))
     {
-        return None;
-    }
-    let cargo_home = (m.env)("CARGO_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| m.home.map(|h| h.join(".cargo")));
-    if cargo_home.is_some_and(|h| config_names(&h, m, names_build_dir)) {
         return None;
     }
     let dir = target.join(TARGET_BUILD_LEAF);

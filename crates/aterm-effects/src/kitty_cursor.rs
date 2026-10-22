@@ -2047,8 +2047,7 @@ mod tests {
             hz <= bound,
             "the exit wink flashes at {hz} Hz (bound {bound})"
         );
-        // Anti-vacuity: `EXIT_STAR_SCINT = 0` would pass by deleting the wink.
-        // Compile-time, because both operands are constants.
+        // Anti-vacuity: a zero `EXIT_STAR_SCINT` would pass by deleting the wink.
         const { assert!(EXIT_STAR_SCINT > 0.0, "the wink still glints") };
     }
 

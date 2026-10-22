@@ -195,8 +195,8 @@ aterm-effects = { workspace = true }
 # The `aos` verb's refusals, witness and trace decode (the momentum glow's Aos
 # boundary). Not a new edge in the BUILD graph: `aterm-effects` above links it.
 aterm-aos = { workspace = true }
-# The mosh-style predictive-echo state machine (extracted so the web embedders
-# share it); aliased at the crate root so `crate::predict::*` reads unchanged.
+# The predictive-echo state machine (shared with the web embedders), aliased as
+# `crate::predict`.
 aterm-predict = { workspace = true }
 # The ONE timing value: the production lengths of the fabric's fence and
 # notice waits and the harness host's cadences, or their millisecond test values
@@ -229,12 +229,9 @@ aterm-gui-tabs = { workspace = true }
 # bridge link), extracted below this crate and re-exported as
 # `crate::fabric`; it reaches a session and the registry through two traits.
 aterm-gui-fabric = { workspace = true }
-# The unified message engine (docs/DESIGN-unified-messages-2026-09-21.md): the
-# message model, the glass policy, the single-row width law, the tagged log
-# ring and its line codec. Lives in its own crate for the same reason
-# `aterm-predict` does — it is host-agnostic (aterm-time only; no fs, threads or
-# cells), so the native GUI paints the layouts it emits and appends the lines
-# it drains, and the engine stays unit-testable without a window or a clock.
+# The unified message engine (docs/DESIGN-unified-messages-2026-09-21.md): message
+# model, glass policy, single-row width law, tagged log ring. Host-agnostic, so it
+# tests without a window or a clock.
 aterm-messages = { workspace = true }
 # In-process readers of another process (`process_cwd` for the Claude Code
 # footer and session queries) and of the machine's memory (the agent memory
@@ -285,8 +282,7 @@ aterm-hash = { workspace = true }
 aterm-types = { workspace = true }
 # Settings ▸ Themes ▸ Community: the community theme pack, embedded.
 aterm-theme-pack = { workspace = true }
-# The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin), already in
-# the graph via aterm-types.
+# The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin).
 aterm-time = { workspace = true }
 # The winit-to-engine key map, one shared table.
 aterm-winit-keymap = { workspace = true }
@@ -297,10 +293,9 @@ aterm-winit-keymap = { workspace = true }
 # off recompiled aterm-policy and every crate above it, aterm-core first (P4).
 # aterm-policy's and aterm-core's own closures still carry no proc macro (PM-1).
 aterm-policy = { workspace = true, features = ["toml"] }
-# Silent in-app self-update: checks the release channel, verifies the notarized +
-# Team-ID-pinned DMG, and stages it for the in-session apply lane (the next-launch
-# swap is only the fallback). Inert in a plain build (no pinned Team ID) and a
-# no-op outside an installed .app.
+# In-app self-update: checks the release channel, verifies the notarized, Team-ID-pinned
+# DMG and stages it for the in-session apply lane (the next-launch swap is the fallback).
+# Inert without a pinned Team ID and outside an installed .app.
 aterm-update = { workspace = true }
 # The updater's shared core (handoff policy, pins, settings, the package-check schedule,
 # the URL-safe slug predicate atpkg also uses), so this crate grows no second copy.
@@ -315,12 +310,7 @@ aterm-window = { workspace = true }
 # Config file parsing. Both crates are ALREADY in this binary's tree (via the
 # engine's config + policy crates), so this adds bindings, not weight.
 serde = { workspace = true, features = ["derive"] }
-# Seamless-update screen carry: the checkpoint meta rides the TOML manifest as a
-# JSON string (TOML cannot represent its `None` fields). Same workspace version
-# aterm-update already uses.
-# First-party JSON (crates/aterm-json): the serde Deserializer/Serializer plus the
-# untyped `Value` and `json!`. Replaces `serde_json` and the `zmij` float formatter
-# behind it.
+# First-party JSON: serde (de)serializer, untyped `Value`, `json!`.
 aterm-json = { workspace = true }
 # SHA-256 for the seamless/config-completion proof digests and the
 # control-socket token digest. First-party; no third-party crypto in this binary.
@@ -386,9 +376,8 @@ aterm-provenance = { workspace = true }
 # and the harness tests' stand-in programs (`stand_in`).
 aterm-tempfile = { workspace = true }
 
-# Tier-1 conformance: bind the real `App` window lifecycle to the ty-proven
-# `window_routing_model()`. Same model that is Tier-0 `ty check`ed in
-# aterm-spec, so the spec the conformance test writes cannot drift from it.
+# Binds the real `App` window lifecycle to aterm-spec's `window_routing_model()`, the
+# model `ty check` proves.
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-atpkg = { workspace = true }

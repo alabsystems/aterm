@@ -876,15 +876,12 @@ fn download_resume_args<'a>(
     stall: StallBound,
 ) -> Vec<&'a str> {
     let mut args: Vec<&str> = vec![
-        // `-s`: without it curl writes its PROGRESS METER to stderr, which this lane
-        // captures into the failure message, burying the cause. `-S` keeps real
-        // errors, the pairing `download_bytes_args` uses.
+        // `-s`: no progress meter in the captured stderr; `-S` keeps real errors.
         "-fsSL",
         // https-only redirects, as in `download_bytes_args`.
         "--proto-redir",
         "=https",
-        // Bound the CONNECT, not the transfer — a black-holed TCP/TLS setup must
-        // still fail fast.
+        // Bound the connect, so a black-holed TCP/TLS setup fails fast.
         "--connect-timeout",
         "30",
         // A stall is under 4 KiB/s for `stall` — this, not the wall clock, is what tells a
@@ -905,9 +902,7 @@ fn download_resume_args<'a>(
         "Accept: application/octet-stream",
         "-o",
         dest,
-        // The `--` guard before the server-controlled asset URL is appended by
-        // `curl_argv` (see `download_bytes_args`); `require_https_url` rejects
-        // non-https schemes.
+        // `curl_argv` appends `--` before the URL.
     ];
     if let Some(offset) = offset {
         // An explicit offset, not `-C -`, which would have curl size the local file itself:
@@ -1195,7 +1190,7 @@ fn download_to_resumable_with(
             existing
         };
         let began = *call_began.get_or_insert(existing);
-        // Both must outlive the argv, which borrows them as `&str`.
+        // Both outlive the argv, which borrows them.
         let cap = plan.remaining_cap.to_string();
         // The wall clock derives from the full cap, not the remainder (it is a backstop
         // against a trickle), recomputed so a fresh retry gets a full budget.
@@ -2090,7 +2085,6 @@ mod tests {
         assert_eq!(value_of("--connect-timeout"), "30");
         assert_eq!(value_of("--speed-limit"), "4096");
         assert_eq!(value_of("--speed-time"), StallBound::Quick.secs());
-        // The size cap and the sink are untouched by the timing change.
         assert_eq!(value_of("--max-filesize"), cap);
         assert_eq!(value_of("-o"), "/tmp/aterm.dmg.part");
         // Callers never place `--` themselves; `curl_argv` appends it.
@@ -2237,8 +2231,7 @@ mod tests {
         }
     }
 
-    /// Conditional requests exist ONLY on the vendor lane: no GitHub lane's option list
-    /// carries an `If-None-Match`.
+    /// Only the vendor lane carries an `If-None-Match`.
     #[test]
     fn only_the_vendor_lane_asks_conditionally() {
         let cap = "1024";
@@ -3606,7 +3599,7 @@ mod tests {
         assert_eq!(pinned[redir + 1], "=https");
         // The release lane carries no `--proto`.
         assert!(!plain.contains(&"--proto"), "{plain:?}");
-        // Resume flags ride behind the pin exactly as before.
+        // Resume flags ride behind the pin.
         let resumed =
             download_resume_args_https_only("60", "600", "/s/claude.part", Some("40"), quick);
         assert_eq!(resumed.len(), pinned.len() + 2);

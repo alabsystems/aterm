@@ -463,7 +463,7 @@ fn cmd_stub_name_safe(name: &str) -> bool {
 pub(crate) fn co_located_atpkg_path() -> PathBuf {
     // `EXE_SUFFIX`: on Windows the file is `atpkg.exe`.
     let atpkg = format!("atpkg{}", std::env::consts::EXE_SUFFIX);
-    let path = std::env::current_exe()
+    let path = running_exe()
         .and_then(std::fs::canonicalize)
         .ok()
         .and_then(|exe| exe.parent().map(|d| d.join(&atpkg)))
@@ -473,6 +473,38 @@ pub(crate) fn co_located_atpkg_path() -> PathBuf {
     } else {
         path
     }
+}
+
+/// The path this process runs from (`current_exe`), which [`co_located_atpkg_path`] reads —
+/// or, inside a test, the one [`with_current_exe`] stood this thread at.
+fn running_exe() -> io::Result<PathBuf> {
+    #[cfg(all(test, unix))]
+    {
+        if let Some(exe) = CURRENT_EXE.with(|e| e.borrow().clone()) {
+            return Ok(exe);
+        }
+    }
+    std::env::current_exe()
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static CURRENT_EXE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `exe` as the path this process runs from on this thread
+/// ([`running_exe`]): every lay `f` makes offers the `atpkg` beside `exe`, as a copy of
+/// aterm placed there would, with no copy placed or run. Nested scopes restore the outer
+/// one. Test-only.
+#[cfg(all(test, unix))]
+pub(crate) fn with_current_exe<R>(exe: &Path, f: impl FnOnce() -> R) -> R {
+    let prior = CURRENT_EXE.with(|e| e.replace(Some(exe.to_path_buf())));
+    let out = f();
+    CURRENT_EXE.with(|e| {
+        *e.borrow_mut() = prior;
+    });
+    out
 }
 
 /// Whether `path` is an atpkg a laid file can hand over to: an executable regular file,
@@ -2005,80 +2037,40 @@ mod tests {
         assert_eq!(sh_named_atpkg("MY_ATPKG='/x'\n", "ATPKG"), None);
     }
 
-    // ── which atpkg a laid file names, at the real process edge ─────────────────────
+    // ── which atpkg a laid file names, wherever the laying process runs from ────────
 
-    /// The env that turns [`probe_lays_every_file_as_this_copy`] on: the prefix it lays over.
-    #[cfg(unix)]
-    const LAY_AS_COPY_ENV: &str = "ATPKG_STUB_LAY_AS_COPY_PREFIX";
-    /// That probe's name, as `--exact` wants it.
-    #[cfg(unix)]
-    const LAY_AS_COPY_PROBE: &str = "stub::tests::probe_lays_every_file_as_this_copy";
-
-    /// The copy's whole job: the three lays that run at every launch, session spawn and
-    /// pass (the reroute stubs, the pending stubs, the `agents/` twins) over the prefix it
-    /// is handed, as the binary it is. With the env unset it does nothing.
-    #[cfg(unix)]
-    #[test]
-    fn probe_lays_every_file_as_this_copy() {
-        let Some(prefix) = std::env::var_os(LAY_AS_COPY_ENV) else {
-            return;
-        };
-        let l = Layout {
-            prefix: std::path::PathBuf::from(prefix),
-        };
-        crate::reroute::lay(&l).expect("the reroute lay");
-        lay_adoption_stubs(&l, &crate::config::PackagesConfig::default());
-        crate::activate::reconcile_agents(&l);
-    }
-
-    /// Place a copy of this test binary at `exe` (with the `atpkg` alias beside it when
-    /// `alias`, as every bundle and install.sh's store carry) and run
-    /// [`probe_lays_every_file_as_this_copy`] from there over `l`.
+    /// Make the three lays that run at every launch, session spawn and pass (the reroute
+    /// stubs, the pending stubs, the `agents/` twins) over `l` as a process running from
+    /// `exe` makes them ([`with_current_exe`]), with a stand-in placed at `exe` (and the
+    /// `atpkg` alias beside it when `alias`, as every bundle and install.sh's store carry)
+    /// if none is there yet.
     ///
-    /// A copy already at `exe` is removed first, never written over: macOS keeps a binary's
-    /// code-signature state with the file it ran from, and a file written over after it ran
-    /// can be SIGKILLed at its next exec (5 of 200 runs copied over; 0 of 200 removed
-    /// first).
-    ///
-    /// The copy is a hard link where the file system takes one: this binary under the new
-    /// name, which the copy's lays see as theirs (`current_exe` is the path it ran from).
-    /// Only names are ever removed here, never the file written, so the link cannot touch
-    /// the running binary. A byte copy is a new file, and macOS held each first exec of one
-    /// 0.34-0.45 s (two runs, both paths); a link's first exec took 4-6 ms. Where no link
-    /// can be made (another volume), it is copied.
+    /// The stand-in is a script nothing runs: all a lay reads of the process is the path it
+    /// runs from. A copy of this test binary placed at `exe` and run there was SIGKILLed at
+    /// its exec, before it wrote a byte, in one of three loaded `verify --all` runs (0 of
+    /// 260 runs alone), so none is placed or run.
     #[cfg(unix)]
-    fn lay_as_copy_at(exe: &Path, alias: bool, l: &Layout) {
+    fn lay_as_run_from(exe: &Path, alias: bool, l: &Layout) {
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        match std::fs::remove_file(exe) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => panic!("remove the previous copy at {}: {e}", exe.display()),
-        }
-        let this = std::env::current_exe().unwrap();
-        if std::fs::hard_link(&this, exe).is_err() {
-            std::fs::copy(&this, exe).expect("copy this test binary");
+        if !exe.is_file() {
+            std::fs::write(exe, "#!/bin/sh\nexit 0\n").unwrap();
             std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        if alias {
-            let _ = std::fs::remove_file(exe.with_file_name("atpkg"));
-            std::os::unix::fs::symlink(exe.file_name().unwrap(), exe.with_file_name("atpkg"))
-                .unwrap();
+        let atpkg = exe.with_file_name("atpkg");
+        if alias && std::fs::symlink_metadata(&atpkg).is_err() {
+            std::os::unix::fs::symlink(exe.file_name().unwrap(), &atpkg).unwrap();
         }
-        // Just copied: past the `ETXTBSY` a sibling test's fork can hold it in.
-        let out = aterm_spec::wait::past_text_busy(|| {
-            std::process::Command::new(exe)
-                .args(["--exact", "--nocapture", LAY_AS_COPY_PROBE])
-                .env(LAY_AS_COPY_ENV, &l.prefix)
-                .stdin(std::process::Stdio::null())
-                .output()
-        })
-        .expect("run the copy");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "the copy at {} did not run the probe: {out:?}",
-            exe.display()
-        );
+        with_current_exe(exe, || {
+            assert_eq!(
+                co_located_atpkg_path(),
+                atpkg,
+                "PRECONDITION: the lays offer the atpkg beside {}",
+                exe.display()
+            );
+            crate::reroute::lay(l).expect("the reroute lay");
+            lay_adoption_stubs(l, &crate::config::PackagesConfig::default());
+            crate::activate::reconcile_agents(l);
+        });
     }
 
     /// Every `(file, atpkg it names)` under `prefix`'s three laid directories: the value of
@@ -2141,20 +2133,17 @@ mod tests {
         }
     }
 
-    /// A copy of this test binary in a scratch `bin/` with no `atpkg` beside it runs the
-    /// three real lays over a prefix whose every file names the installed app's live atpkg:
-    /// nothing is re-pointed at the scratch directory. Negative control: when the installed
-    /// app moves (old atpkg gone, the alias beside its new path), every file is re-laid
-    /// naming the new path, and a fresh prefix names it too.
+    /// The three real lays, made as a copy of aterm run from a scratch `bin/` with no
+    /// `atpkg` beside it makes them ([`lay_as_run_from`]), over a prefix whose every file
+    /// names the installed app's live atpkg: nothing is re-pointed at the scratch directory.
+    /// Negative control: when the installed app moves (old atpkg gone, the alias beside its
+    /// new path), every file is re-laid naming the new path, and a fresh prefix names it too.
     #[cfg(unix)]
     #[test]
     fn a_copy_run_from_a_scratch_dir_never_re_points_a_laid_file_at_a_missing_atpkg() {
-        if std::env::var_os(LAY_AS_COPY_ENV).is_some() {
-            return;
-        }
-        // Removed however the test ends: no copies of this binary left in the temp dir.
+        // Removed however the test ends.
         let scratch = aterm_tempfile::Builder::new()
-            .prefix("atpkg-lay-as-copy-")
+            .prefix("atpkg-lay-as-run-from-")
             .tempdir()
             .unwrap();
         // Canonical, as the lay spells an atpkg path: `current_exe` resolved.
@@ -2210,7 +2199,7 @@ mod tests {
 
         // The scratch copy: `<scratch>/bin/aterm`, nothing beside it.
         let scratch = root.join("scratch/bin/aterm");
-        lay_as_copy_at(&scratch, false, &l);
+        lay_as_run_from(&scratch, false, &l);
         let after = atpkg_named_under(&l.prefix);
         let scratch_dir = scratch.parent().unwrap().to_string_lossy().into_owned();
         let leaked: Vec<_> = after
@@ -2231,7 +2220,7 @@ mod tests {
         // its new path), and every file follows it.
         std::fs::remove_file(&installed).unwrap();
         let moved = root.join("Moved/aterm.app/Contents/MacOS/aterm");
-        lay_as_copy_at(&moved, true, &l);
+        lay_as_run_from(&moved, true, &l);
         let moved_atpkg = sh_single_quote(&moved.with_file_name("atpkg").to_string_lossy());
         let relaid = atpkg_named_under(&l.prefix);
         assert_eq!(relaid.len(), before.len(), "{relaid:#?}");
@@ -2243,7 +2232,7 @@ mod tests {
         let fresh = Layout {
             prefix: root.join("fresh"),
         };
-        lay_as_copy_at(&moved, true, &fresh);
+        lay_as_run_from(&moved, true, &fresh);
         let laid = atpkg_named_under(&fresh.prefix);
         assert!(
             laid.iter()

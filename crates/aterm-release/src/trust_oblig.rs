@@ -103,9 +103,7 @@ impl Obligation {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The record, `<spec>.log.oblig.tsv`
-// ---------------------------------------------------------------------------
 
 /// One check's obligations, as the lane recorded them beside its log —
 /// tab-separated lines:
@@ -277,9 +275,7 @@ fn valid_status(s: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // The reduction: report.ndjson -> the record ([`write_record`])
-// ---------------------------------------------------------------------------
 
 /// One line of `report.ndjson`, only what the record keeps: serde skips the
 /// rest (the proof and transport evidence are most of each line) unread into

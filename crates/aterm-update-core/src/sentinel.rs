@@ -100,7 +100,7 @@ impl Sentinel {
     /// or unreadable marker, which `read_state` answers as no trial at all. The boot lane
     /// keeps that answer (a corrupt file counts no launch and forces no revert); a
     /// confirmation must not, or a healthy build that reached its checkpoint is told its
-    /// trial is done while the trial stays on disk (ATERM-KI-1015-2, U55).
+    /// trial is done while the trial stays on disk.
     ///
     /// Only a regular file: a directory or a link at the path is no marker any writer
     /// made, and no confirmation could remove it, so counted as one it ran the recovery

@@ -17,7 +17,7 @@
 //! ([`starts_with`]). The owner is told ONCE per build (`upgrade_status`'s
 //! `build-fails` fault, keyed by the build), never by a stop per agent the
 //! build was retried into. The one agent moved onto it first is not left
-//! down (LC-5 of ATERM-KI-1016-1): a Claude Code restart plans, beside its
+//! down (LC-5 of ): a Claude Code restart plans, beside its
 //! line onto the build, the line back onto the program its process ran
 //! ([`St::roll_back`]), and a relaunch that ends without registering the
 //! conversation is stopped `no-resume` (the failure noted as above) and
@@ -30,7 +30,7 @@
 //! (`upgrade_status`'s `build-fails` fault).
 //!
 //! A CRASHED AGENT IS MOVED ONLY ONTO A BUILD PROVED TO START ([`proved`],
-//! LC-5 of ATERM-KI-1015-1): the relaunch on exit — a crash is also an
+//! LC-5 of ): the relaunch on exit — a crash is also an
 //! upgrade (`relaunch::relaunch_target`) — took the newest build the session
 //! may move to whether or not anything had ever started on it, and a build
 //! presented seconds before the crash, broken at its entry point, left the
@@ -51,7 +51,7 @@
 //! ([`Note::blind`] comes only of a failure after a probe passed since a
 //! failure).
 //!
-//! THE UPGRADE'S OWN FIRST MOVE ONTO A BUILD IS PROBED TOO (ATERM-KI-1016-1's
+//! THE UPGRADE'S OWN FIRST MOVE ONTO A BUILD IS PROBED TOO ('s
 //! LC-5): the move ends a working agent at a quiet moment, and a build broken
 //! at its entry point ended that agent before its noted failure held the
 //! rest. So a build no probe has run on is probed once before the first move
@@ -524,7 +524,7 @@ fn gate(
     });
     // No failure noted (or every one taken back): the upgrade's move needs
     // no proof, but the build is PROBED ONCE before the first agent is staked
-    // on it (ATERM-KI-1016-1's LC-5: a build broken at its entry point ended
+    // on it ('s LC-5: a build broken at its entry point ended
     // the one working agent its first move ended, before its noted failure
     // held the rest). What that probe finds holds the move only where it ran
     // the build and saw it exit with a failure — the build's fact, for every

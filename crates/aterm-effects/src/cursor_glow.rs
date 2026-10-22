@@ -376,11 +376,9 @@ pub struct CursorGlow {
     /// This tick observed a different print sequence. A retained endpoint alone
     /// cannot hold a later cursor-only jump as a distant footer park.
     print_in_tick: bool,
-    /// The echo anchor's glyph (host-fed, [`Self::observe_print_anchor_glyph`]):
-    /// the terminal's content at the print run's last cell, in the row probe's
-    /// per-column convention, sampled under the anchor's lock. `None` when the
-    /// host gave no glyph; the visible-parked glyph gate in
-    /// [`Self::echo_anchor_pass`] then reads only the caret row's probes.
+    /// The terminal's glyph at the print run's last cell
+    /// ([`Self::observe_print_anchor_glyph`]), sampled under the anchor's lock;
+    /// `None` leaves the parked-glyph gate to the caret row's probes.
     print_anchor_glyph: Option<char>,
     /// DECTCEM hides the caret handed over this frame
     /// ([`Self::observe_caret_drawn`]); only the single-pane window hands a
@@ -685,9 +683,8 @@ pub struct CursorGlow {
     /// col)`, its faded tail cells included: the extent a jump's bed wedge
     /// reaches back over ([`bed::BedShape::leap_path`]). Pooled.
     leap_spans: Vec<(Instant, u16, u16, u16)>,
-    /// Reused by [`Self::emit_water`] for the deduplicated curved wake spine
-    /// and its analytically derived falling beads. Keeping this resident makes
-    /// the fluid path allocation-free after its first growth.
+    /// Reused by [`Self::emit_water`] for the deduplicated wake spine and its
+    /// falling beads, so the fluid path allocates nothing after first growth.
     water_samples: Vec<WaterSample>,
     /// Fixed-size open-address owner table for [`Self::emit_water`], and for
     /// the light rails of the beam family ([`Self::emit_comet`]), which never
@@ -848,12 +845,10 @@ pub struct CursorGlow {
     /// park is flushed and that echo stays dark, as it did when the check
     /// waited for the next frame.
     scroll_rows: u16,
-    /// The rows the host was asked for this frame (what [`Self::ribbon_rows`]
-    /// last handed out, and how many), so the follow pass counts as withheld
-    /// only rows asked for and not delivered ([`rk::Engine::follow_rows`]).
-    /// Recomputing at the tick could differ, since the waiting key that named
-    /// arming rows ([`rk::Engine::ribbon_rows_for`]) may be spent. A `Cell`
-    /// because a `&self` query writes it; taken by every tick.
+    /// The rows [`Self::ribbon_rows`] last handed out, so the follow pass counts
+    /// as withheld only rows asked for and not delivered (recomputing could
+    /// differ once the waiting key is spent). A `Cell` because a `&self` query
+    /// writes it; taken by every tick.
     witness_asked: std::cell::Cell<([u16; RIBBON_LIST_ROWS], usize)>,
     /// The caret seam v2 handed back on the last engaged tick (§7.1); the
     /// host reads it through [`Self::caret_flare_at`] / [`Self::caret_paint`]
@@ -1443,8 +1438,7 @@ impl CursorGlow {
     /// The most steam puffs one deletion echo releases at full quench (two at
     /// the first delete, one more as the quench builds).
     const STEAM_ECHO_PUFFS_MAX: usize = 3;
-    /// The cursor metal smokes above this temperature (the brief's "heats up
-    /// over use and starts smoking").
+    /// The cursor metal smokes above this temperature.
     const SMOKE_TEMP: f32 = 0.35;
 
     /// Phaser constant-distance streak: within a rhythm the band's life is this
@@ -1793,12 +1787,9 @@ impl CursorGlow {
         }
     }
 
-    /// Host repaint blink: the focused terminal's `repaint_blink_epoch`
-    /// advanced (the app hid the cursor inside a DEC-2026 synchronized update,
-    /// Claude Code's per-keystroke redraw). Arms a short classifier
-    /// ([`Self::BLINK_HINT_FRESH`]) selecting re-anchor morphology for an
-    /// admitted typed/delete candidate on the alt screen. Never admits movement
-    /// or gates bytes.
+    /// Host repaint blink: the focused terminal's `repaint_blink_epoch` advanced
+    /// (a cursor hide inside a DEC-2026 synchronized update, Claude Code's
+    /// per-keystroke redraw). Arms [`Self::blink_hint`]; never admits movement.
     #[inline]
     pub fn note_repaint_blink(&mut self, now: Instant) {
         self.unsettle();
@@ -1834,9 +1825,9 @@ impl CursorGlow {
         self.v2.set_pane_rows(pane_rows);
     }
 
-    /// Stamp the focused pane's exact columns in the coordinate space handed
-    /// to [`Self::tick`]. This is morphology only: [`Self::move_licensed`]
-    /// remains the sole authority to mint light.
+    /// Stamp the focused pane's rows (`first_row`, `rows`) in the coordinate
+    /// space handed to [`Self::tick`], for v2's band floor. Morphology only:
+    /// [`Self::move_licensed`] remains the sole authority to mint light.
     #[inline]
     pub fn note_pane_columns(&mut self, first_col: u16, cols: usize) {
         self.pane_columns = u16::try_from(cols)
@@ -1870,12 +1861,9 @@ impl CursorGlow {
             || (self.v2.engaged() && self.torn_lay.is_some())
     }
 
-    /// The forge ember is live while the metal is visibly hot or while the
-    /// display temperature it chases is still above the visibility threshold
-    /// (the heating arc is a pending visible change). Read by both wake
-    /// predicates so they cannot drift. Fire-gated: every style integrates
-    /// `disp_t`, but only Fire has a metal; `last_style` is the style of the
-    /// tick that produced this state.
+    /// The forge ember is live while the metal is visibly hot or the display
+    /// temperature it chases is above the threshold. Fire-gated: only Fire has
+    /// a metal, though every style integrates `disp_t`.
     #[inline]
     fn ember_live(&self) -> bool {
         self.cursor_temp > Self::FORGE_MIN_TEMP
@@ -1883,11 +1871,8 @@ impl CursorGlow {
                 && self.disp_t > Self::FORGE_MIN_TEMP)
     }
 
-    /// The pending poof wake: the earlier of the kill licence or the
-    /// plain-Backspace classifier that still needs detector service. Both need
-    /// a detector tick (a kill via its row-diff/fallback licence, a Backspace
-    /// via an exact confirmed span), so scheduling seams read this one
-    /// accessor.
+    /// The pending poof wake: the earlier of the kill licence and the
+    /// plain-Backspace classifier, both of which need a detector tick.
     #[inline]
     fn poof_hint_pending(&self) -> Option<Instant> {
         match (self.kill_hint, self.bs_poof_hint) {
@@ -1896,11 +1881,9 @@ impl CursorGlow {
         }
     }
 
-    /// The erase is already on glass: this frame's probe shows the caret's row
-    /// shorter than the row stamped at the erase key ([`Self::bs_baseline`]).
-    /// The kill fallback's early release from [`Self::POOF_FALLBACK_GRACE`];
-    /// a plain Backspace shares it. A `None` baseline (no probe at the key) is
-    /// no witness either way, so the fallback keeps its timed grace.
+    /// The erase is on glass: this frame's probe shows the caret's row shorter
+    /// than at the erase key ([`Self::bs_baseline`]), releasing the fallback's
+    /// [`Self::POOF_FALLBACK_GRACE`] early. No baseline is no witness.
     #[inline]
     fn poof_erase_witnessed(&self) -> bool {
         match (self.bs_baseline, self.row_cur_meta) {
@@ -2330,8 +2313,6 @@ impl CursorGlow {
                 self.forget_typed_credits(now);
             }
         }
-        // The witness's samples are this frame's and no other's: taken here,
-        // so a tick that returns dark below cannot leave them for the next.
         let witness_n = std::mem::take(&mut self.witness_rows_n);
         let (asked, asked_n) = self.witness_asked.take();
         // The seam's gate (`RAINBOW-KITTY-V2.md` §17.2): v2 owns the frame
@@ -2343,11 +2324,10 @@ impl CursorGlow {
             // so a re-engage seats afresh instead of holding a stale hue.
             self.v2_stop = None;
         }
-        // Master switch off or degenerate geometry: full zero. A momentary
-        // unfocus arrives as `intensity <= 0` instead and is handled after the
-        // lazy cooling below, so earned forge momentum merely cools and resumes
-        // on refocus. A grid with no rows or columns is degenerate too (an
-        // empty effects box would give `clamp_to_glass` `min > max`).
+        // Master switch off or degenerate geometry (an empty effects box would
+        // give `clamp_to_glass` `min > max`): full zero, crossfades included. A
+        // momentary unfocus arrives as `intensity <= 0` instead, handled after
+        // the lazy cooling.
         if !valid_canvas {
             // Full zero includes any in-flight crossfade. The master switch (and
             // serious mode, via `enabled`) closes the key seam; a degenerate
@@ -2419,9 +2399,8 @@ impl CursorGlow {
             self.last = cur;
             self.last_visible = cur.map(|c| (c, now));
             self.hide_bridge_shown = None;
-            // The classic wake sounds (the phaser's `pew`) and its key seam
-            // obeys the common law. It mints no echo cues, so the key-time click
-            // is its only sound; the timbre snapshot uses the same config.
+            // The classic wake mints no echo cues: the key-time click is its
+            // only sound, under the common seam law.
             self.store_key_timbre(cfg);
             self.settle_key_seam(cfg, cfg.intensity > 0.0);
             // A light ground's wake is ink under the letters and a veil
@@ -2600,15 +2579,8 @@ impl CursorGlow {
         self.heat_at = Some(now);
         // The forge fill reads its band of the ramp for this page.
         self.refresh_forge_band(cfg);
-        // The key-time click's timbre inputs, written by every tick past the
-        // master switch (the degenerate-grid return and the classic wake store
-        // them through [`Self::store_key_timbre`] too), including ticks about to
-        // return dark for motion or performance reasons. Both
-        // [`Self::settle_key_seam`] calls below sit under this store, so the
-        // seam never opens on a stale snapshot. `heat_gain` and `heat_tau` are
-        // pure functions of `cfg` that ignore `intensity`, so the ramp shadow
-        // cannot move them; sited right after the lazy decay so a cue reads a
-        // coherent thermal snapshot.
+        // Stored by every tick past the master switch, before either
+        // `settle_key_seam`, so the seam never opens on a stale timbre.
         self.store_key_timbre(cfg);
 
         // Zero amplitude (unfocused, motion-reduced, or a real 0): emit and

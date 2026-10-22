@@ -583,13 +583,10 @@ fn authorize_by_roster(
         .map_err(|e| Transport(format!("fetch {ROSTER_SIG_ASSET}: {e}")))?;
     let appcast_sig = download(&candidate.release.assets[signature_index].url, 4096)
         .map_err(|e| Transport(format!("fetch appcast signature: {e}")))?;
-    // A detached Ed25519 signature is exactly 64 bytes. A body of any other length is
-    // not a signature that failed: it is something else answering the asset GET with a
-    // 2xx (a TLS-inspecting proxy's block page, a captive portal), which `curl -f` calls
-    // success. Nothing has been judged, so it is the transport arm — still a refusal,
-    // and a retry or another network can clear it. Booked as `Refused` it read as a
-    // stale trust anchor and told the person to reinstall, which changes nothing behind
-    // the same proxy. A 64-byte signature that does not verify stays a verdict.
+    // A body that is not 64 bytes is no failed signature but something else answering
+    // with a 2xx (a TLS-inspecting proxy's block page, a captive portal): transport, which
+    // a retry or another network can clear, where `Refused` would advise a reinstall. A
+    // 64-byte signature that does not verify stays a verdict.
     // Each is judged where it is used: the roster's here, before the roster is verified;
     // the appcast's only once the roster's observation below has landed, so a malformed
     // appcast signature cannot suppress the floor ratchet or the revocations.
@@ -1457,9 +1454,7 @@ fn asset_failure_class() -> &'static str {
 const APPCAST_ASSET: &str = crate::dev_channel::APPCAST_ASSET;
 const APPCAST_SIG_ASSET: &str = "aterm-appcast.toml.sig";
 
-// ---------------------------------------------------------------------------------
 // The check
-// ---------------------------------------------------------------------------------
 
 /// The injected pointer transport, `url → (status, Location)`:
 /// [`aterm_update_core::head_no_redirect`] in production, a counting fake in tests.
@@ -2032,8 +2027,7 @@ fn observe_floor_and_withdraw_at(
 /// (`revoked_at`, `None`: not yet), whether its marker and bundle are on disk, and whether a
 /// lane installed it and how late (`swapped`: `None` not yet, `Some(late)` once).
 ///
-/// Compiled only for proof/test builds. Every input is an OBSERVATION of the real
-/// staging root and of the real gate's answer, never a second copy of either rule.
+/// Proof/test builds only. Every input is an observation of the real staging root and gate.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[must_use]
@@ -2097,8 +2091,7 @@ fn check_and_stage_inner(
         return Ok(None);
     };
     let staging = Staging::resolve().ok_or("could not resolve Updates dir")?;
-    // The pointer transport, INJECTED rather than called directly, so the request cost
-    // is measurable in a test.
+    // Injected through `acquire` so a test can count the requests.
     let mut head = aterm_update_core::head_no_redirect;
     let world = CheckWorld {
         installed_parent: installed.app_root.parent(),
@@ -2124,8 +2117,8 @@ fn check_and_stage_in(
         master_pubkeys,
         team,
     } = world;
-    // Recursive copy cleanup runs in this checker worker. Both staging and
-    // cross-volume apply leave isolated attempts on their destination volume.
+    // Reap abandoned copy attempts, which staging and cross-volume apply leave on their
+    // destination volume.
     install::reap_abandoned_copy_attempts(&staging.staged_dir());
     if let Some(parent) = installed_parent {
         install::reap_abandoned_copy_attempts(parent);
@@ -2202,11 +2195,8 @@ fn check_and_stage_in(
         return Ok(None);
     }
     fetched.refuse_unbound_or_revoked(source, &floor, &web_tag);
-    // ATTRIBUTION, recorded where a human will find it later: the updater's own status
-    // file, beside the release it describes. The owner's requirement is "I can track
-    // which computer does what", and for the client half this is the record. It is
-    // written before the staging decision because knowing WHO signed the release a
-    // machine saw is useful whether or not that machine went on to install it.
+    // Attribution goes to the status file before the staging decision: who signed a
+    // release this machine saw matters whether or not it installs it.
     if let Some(who) = &fetched.attribution {
         crate::status::record(
             &staging,

@@ -351,8 +351,8 @@ pub(crate) struct PaletteLive {
     /// fleet (Read the Fleet, Fleet Machines), a window (Overview), and why
     /// Summarize cannot start, `None` when it can.
     pub agents: crate::menu::AgentsLive,
-    /// A strictly-newer `(build, version)` is STAGED (the `App.relaunch` nudge): the
-    /// Version section shows the one-click "↑ Install aterm v<staged> now" row.
+    /// A strictly newer `(build, version)` is staged (`App.relaunch`): the Version section
+    /// shows the one-click "↑ Install aterm v<staged> now" row.
     pub staged: Option<(u64, String)>,
     /// The apply lane's standing failure for that staged build (`App::apply_trouble_for`):
     /// it replaces the row's "now" with the attempt count, the cause, and whether the
@@ -1581,11 +1581,10 @@ pub(crate) fn fuzzy_subsequence(needle: &str, haystack: impl Iterator<Item = cha
     true
 }
 
-/// Paint the command palette as an opaque floating [`DrawPrim`] card: a
-/// centred title, a pinned query row with a shown/total count, then one row per filtered
-/// command with the accelerator right-aligned, a checkmark for `checked`, dim text for
-/// disabled, and the cursor row washed + ringed. PURE: composes from Panel / Stroke / Text,
-/// so it is captured WYSIWYG and renders identically on CPU + GPU.
+/// Paint the command palette as an opaque floating [`DrawPrim`] card: a centred title, a
+/// pinned query row with a shown/total count, then one row per filtered command with the
+/// accelerator right-aligned, a checkmark for `checked`, dim text for disabled, and the
+/// cursor row washed and ringed. Pure Panel / Stroke / Text, so CPU and GPU render alike.
 ///
 /// The words are set in [`PALETTE_FACE`] and measured in it ([`face_w`]); a Fluent
 /// palette ([`PALETTE_FLUENT`]) also aligns the section chips in one column, marks an

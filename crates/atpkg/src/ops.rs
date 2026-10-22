@@ -28,40 +28,28 @@ pub fn which(layout: &Layout, tool: &str) -> Option<PathBuf> {
     crate::platform::resolve_shim(&layout.shim(&ToolName::new(tool)?))
 }
 
-/// The file to EXEC for `tool`, for the verbs that run a tool without going through its
-/// shim — `atpkg run <tool>` (hence `aterm <tool>`) and the upstream-name reroute
-/// (`clippy` → `tippy`): [`which`]'s store target, or its clone under the build's exec
-/// root when [`crate::compat::route_for_shim`] finds one standing for this shim.
-///
-/// Those two verbs exec the store path directly, so the guard line a routed shim carries
-/// never runs for them (nor its exports — they export [`exec_env`] instead), and on a
-/// trust build whose `bin/rustc` is a separate copy of `trustc` (bundles
-/// 8571/8589/8590/8595) `aterm tippy` and the `clippy` reroute stopped at tippy's
-/// "rustc-compatible sibling … is not the selected Trust compiler" while the shim beside
-/// them linted. The answer is the one the shim's guard gives, decided by the
-/// same `stat`s. [`which`] itself is unchanged — every reader that asks where a tool
-/// LIVES (gc, doctor, `atpkg which`) keeps reading the store.
+/// The file to exec for `tool` on the verbs that run it without its shim (`atpkg run
+/// <tool>`, hence `aterm <tool>`, and the upstream-name reroute, `clippy` → `tippy`):
+/// [`which`]'s store target, or its clone under the build's exec root when
+/// [`crate::compat::route_for_shim`] finds one for this shim. Those verbs skip the routed
+/// shim's guard line, so this gives the answer the guard would (on a trust build whose
+/// `bin/rustc` is a separate copy of `trustc`, tippy's sibling check otherwise fails). [`which`]
+/// is unchanged: gc, doctor and `atpkg which` read the store.
 fn exec_path(layout: &Layout, tool: &str) -> Option<PathBuf> {
     let shim = layout.shim(&ToolName::new(tool)?);
     let target = crate::platform::resolve_shim(&shim)?;
     Some(crate::compat::route_for_shim(&shim, &target).unwrap_or(target))
 }
 
-/// The environment to EXPORT for `tool` on those same verbs — [`exec_path`]'s other half,
-/// because the shim they skip does two things before its `exec`, and `exec_path` took over
-/// only the first (design S7): what the build `bin/<tool>` resolves into DECLARES (its
-/// `<build>.shim-env` sidecar, [`crate::shim_env::read_sidecar`] — the environment a shim
-/// laid now would carry, and the one the pass re-asserts on a shim that lost it,
-/// [`crate::activate::reassert_shim_env`]), or, for a build that declares none, what the
-/// shim as laid exports (the add-only rule: an absent sidecar is no evidence the shim's
-/// exports should go). [`crate::shim_env::ShimEnv::NONE`] for a name with no shim.
-///
-/// Until 2026-09-23 these verbs exported nothing, so `aterm claude` — the way to the
-/// managed copy from any terminal — ran Claude Code with its own updater on while
-/// `bin/claude` beside it ran with it off (audit 2026-09-23). The declaration comes
-/// first, not the shim as laid, because a shim a pre-2026-09-23 `repair` laid plain has
-/// nothing to copy. Every value passed [`crate::shim_env::ShimEnv::admit`] on the way in,
-/// so no entry here can name `PATH`, the loader's variables or a runtime's.
+/// The environment to export for `tool` on those same verbs, since the shim they skip also
+/// exports before its `exec`: what the build `bin/<tool>` resolves into declares (its
+/// `<build>.shim-env` sidecar, [`crate::shim_env::read_sidecar`], which the pass re-asserts
+/// on a shim that lost it, [`crate::activate::reassert_shim_env`]), or, for a build that
+/// declares none, what the shim as laid exports (add-only: an absent sidecar is no evidence
+/// the exports should go). [`crate::shim_env::ShimEnv::NONE`] for a name with no shim. The
+/// declaration comes first because a shim laid plain has nothing to copy. Every value passed
+/// [`crate::shim_env::ShimEnv::admit`], so none names `PATH`, the loader's variables or a
+/// runtime's.
 fn exec_env(layout: &Layout, tool: &str) -> crate::shim_env::ShimEnv {
     let Some(name) = ToolName::new(tool) else {
         return crate::shim_env::ShimEnv::NONE;
@@ -168,14 +156,11 @@ pub(crate) fn program_build_of_target(target: &Path) -> Option<(String, u64)> {
 /// Parse `(program, build)` out of a path that must lie inside `prefix`'s store
 /// (`<prefix>/store/<program>/<build>[/…]`); `None` for anything else.
 ///
-/// The ANCHORED counterpart of [`program_build_of_target`], and the one every predicate that
-/// DELETES must use. `program_build_of_target` searches for the first component named
-/// `store`, which is right for a target already known to be ours and wrong as a containment
-/// test: `/Users//x/src/store/ay/18/bin/ay` — a dev checkout, outside the prefix entirely —
-/// parses as `("ay", 18)` there. Stripping `<prefix>/store` instead means only paths that
-/// really are inside this managed store can answer, and `..` is rejected for free (a
-/// `ParentDir` component is not `Normal`, so a lexical escape cannot masquerade as a program
-/// name). A trailing path (`/bin/<tool>`) is allowed, because a shim target has one.
+/// The anchored counterpart of [`program_build_of_target`], and the one every deleting
+/// predicate must use: that one finds the first component named `store`, so
+/// `/Users//x/src/store/ay/18/bin/ay` (a dev checkout) parses as `("ay", 18)`. Stripping
+/// `<prefix>/store` admits only paths inside this store, and `..` fails for free (a
+/// `ParentDir` component is not `Normal`).
 /// Public for the image classifier (`crate::image`), which anchors a running process's
 /// executable the same way.
 #[must_use]

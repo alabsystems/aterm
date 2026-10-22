@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One session's process-name requests on the GUI's single resolver worker.
-//! The real queue is bound in `aterm-gui::session_program` tests.
+//! One session's process-name requests on the GUI's single resolver worker. The real queue is
+//! bound in `aterm-gui::session_program` tests.
 
 use aterm_spec::derive::*;
 
-/// A session owns one latest job and at most one channel token. A newer
-/// foreground group replaces a queued/in-flight request; after an old lookup
-/// finishes, the latest job is queued once. Restart requeues a job retained
-/// when the worker panicked. `Buggy=1` sends every replacement to the old
-/// unbounded channel, making duplicate tokens reachable.
+/// A session owns one latest job and at most one channel token. A newer foreground group
+/// replaces a queued/in-flight request; after an earlier lookup finishes, the latest job is
+/// queued once. Restart requeues a job retained when the worker panicked. `Buggy=1` sends every
+/// replacement down an unbounded channel, making duplicate tokens reachable.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn program_resolver_queue_model() -> Model {
@@ -87,16 +86,14 @@ pub fn program_resolver_queue_model() -> Model {
     }
 }
 
-/// One Claude footer resolver watch. Group 1 is the old foreground process,
-/// group 2 its replacement. A stop for group 1 removes only that watch; a
-/// session stop (retire or status-off) removes either. `IdleRead` is enabled
-/// exactly while a watch exists. `Buggy=1` makes the old-group stop erase the
-/// replacement, the stale-stop race the GUI's scheduler must refuse, and makes
-/// the session stop leave its watch behind — the dormant-refresh class a
-/// retired or status-off session read through (`DormantWatchCannotRead`). Both
-/// mutants are branches of LIVE actions, not an action only `Buggy` enables:
-/// `ty --strict-vacuity` credits a dead action only when it alone supplies its
-/// counterexample, and here the stale-stop branch would supply one too.
+/// One Claude footer resolver watch. Group 1 is the earlier foreground process, group 2 its
+/// replacement. A stop for group 1 removes only that watch; a session stop (retire or
+/// status-off) removes either. `IdleRead` is enabled exactly while a watch exists. `Buggy=1`
+/// makes the old-group stop erase the replacement (the stale-stop race the GUI's scheduler
+/// refuses) and the session stop leave its watch behind, so a retired or status-off session
+/// keeps reading (`DormantWatchCannotRead`). Both mutants are branches of live actions, not an
+/// action only `Buggy` enables: `ty --strict-vacuity` credits a dead action only when it alone
+/// supplies its counterexample, and here the stale-stop branch would supply one too.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn claude_footer_watch_model() -> Model {
@@ -123,8 +120,7 @@ pub fn claude_footer_watch_model() -> Model {
             }
             action StopSession when (asked_old == 1 && retired == 0) {
                 retired = 1;
-                // Buggy=1: the dormant-refresh class (`b916d37ff`) — the stop
-                // leaves its watch behind, so a retired session keeps reading.
+                // Buggy=1: the stop leaves its watch behind, so a retired session keeps reading.
                 watch = if Buggy == 1 { watch } else { 0 };
             }
             action IdleRead when (watch > 0 && retired == 0) {
@@ -143,89 +139,69 @@ pub fn claude_footer_watch_model() -> Model {
     }
 }
 
-/// WHICH MODEL the Claude Code footer names (`aterm_agent::harness::footer`,
-/// owner 2026-09-28: "I need to see the current model selection in the footer
-/// of aterm"). `runs` is the model the process runs now. `seen` is the newest
-/// model statement since the floor, in the current session, that the reader
-/// can see: 0 none, 1 an answer, 2 a readable choice (`Set model to `Opus
-/// 5.5``), 3 an unreadable one (a `/model` row with no result the build
-/// parses). `flag` is the process's own `--model` naming model 1, `card` the
-/// model its launch card names (0 none), taken at its worst: naming the
-/// starting model even after a choice (the inline renderer draws it once; the
-/// fullscreen one redraws it with the new model, measured 2026-09-28).
-/// `Read` is the host's resolver: the newest statement since the floor, else
-/// what the process carried, else the flag, else the card, else nothing —
-/// never an unreadable choice's predecessor. `Flood` appends a row larger than
-/// the reader's tail window (the owner's 530 KiB image prompt); the reader's
-/// carry keeps what it had seen.
+/// Which model the Claude Code footer names (`aterm_agent::harness::footer`). `runs` is the
+/// model the process runs now. `seen` is the newest model statement since the floor, in the
+/// current session, that the reader can see: 0 none, 1 an answer, 2 a readable choice
+/// (``Set model to `Opus 5.5` ``), 3 an unreadable one (a `/model` row with no result the build
+/// parses). `flag` is the process's own `--model` naming model 1; `card` the model its launch
+/// card names (0 none), taken at its worst: naming the starting model even after a choice (the
+/// inline renderer draws it once; the fullscreen one redraws it with the new model). `Read` is
+/// the host's resolver: the newest statement since the floor, else what the process carried,
+/// else the flag, else the card, else nothing, never an unreadable choice's predecessor.
+/// `Flood` appends a row larger than the reader's tail window (a large image prompt); the
+/// reader's carry keeps what it had seen.
 ///
-/// THE LAUNCH (`launched = 0`, before the reader's first sight of the
-/// process): `Flag` gives it `--model` 1; `LaunchResume` launches it onto
-/// conversation A with `--resume` — A's rows sit above the floor, and it last
-/// answered with `Pred` — and Claude RESTORES `Pred` at launch unless the
-/// flag pinned the model (2.1.284: every launch resume runs the in-REPL
-/// restore); `DrawCard` draws the launch card, naming the model it starts on.
-/// Without `LaunchResume` the process starts on model 1 in a session of its
-/// own. The first `Read` is the reader's first sight.
+/// The launch (`launched = 0`, before the reader's first sight of the process): `Flag` gives it
+/// `--model` 1; `LaunchResume` launches it onto conversation A with `--resume` (A's rows sit
+/// above the floor, and it last answered with `Pred`), and Claude restores `Pred` at launch
+/// unless the flag pinned the model, since every launch resume runs the in-REPL restore;
+/// `DrawCard` draws the launch card, naming the model it starts on. Without `LaunchResume` the
+/// process starts on model 1 in a session of its own. The first `Read` is the reader's first
+/// sight.
 ///
-/// `Clear` is `/clear`: the SAME process takes a new session id — the
-/// registry's `sessionId` rewritten under the same pid, kernel start and
-/// `startedAt` — whose transcript has said nothing, while the process runs on
-/// what it ran. `carry` is the newest statement the process made in a session
-/// it left (0 none, else as `seen`); `Read` takes it where the current session
-/// says nothing, before the flag and the card. `known` is whether the reader
-/// has read the current session at all (it reads at its first sight of the
-/// process, and every refresh after): the reader re-reads the session it LEFT
-/// at the switch, so it needs to have seen that session once, not every
-/// statement in it — the environment assumption is at most one switch
-/// between two refreshes.
+/// `Clear` is `/clear`: the same process takes a new session id (the registry's `sessionId`
+/// rewritten under the same pid, kernel start and `startedAt`) whose transcript has said
+/// nothing, while the process runs on what it ran. `carry` is the newest statement the process
+/// made in a session it left (0 none, else as `seen`); `Read` takes it where the current session
+/// says nothing, before the flag and the card. `known` is whether the reader has read the
+/// current session at all (it reads at its first sight of the process and every refresh after):
+/// the reader re-reads the session it left at the switch, so it needs to have seen that session
+/// once, not every statement in it. The environment assumes at most one switch between two
+/// refreshes.
 ///
-/// `Resume` is an in-REPL `/resume` into the next conversation — A (`Pred`'s),
-/// then B, which last answered with `Other`; a process launched onto A goes
-/// on to B — the same switch, into a conversation with
-/// rows from before the floor, and Claude RESTORES its model unless the
-/// process is `pinned` — by the flag or a choice (1), or by an earlier
-/// RESTORE (2): Claude restores by setting the very main-loop override its
-/// next restore returns early on, and no switch clears it (2.1.284 `Cbe` →
-/// `overrideMainLoopModel`). A restore therefore PINS, and every later
-/// `Resume` keeps the model. `resumed` counts the conversations taken up
-/// (the launch's included); `restored` says how the newest switch went — 1
-/// it restored, 2 only a restore's pin kept the model, 0 otherwise — and
-/// `Read` shows the restored model where it restored, the carry where it
-/// kept. No `Clear` follows a `Resume`: a `Clear` out of a resumed
-/// conversation is the same switch as any `Clear`, and it keeps the space the
-/// Tier-1 bind walks small.
+/// `Resume` is an in-REPL `/resume` into the next conversation: A (`Pred`'s), then B, which last
+/// answered with `Other`; a process launched onto A goes on to B. It is the same switch, into a
+/// conversation with rows from before the floor, and Claude restores its model unless the
+/// process is `pinned`: by the flag or a choice (1), or by an earlier restore (2). Claude
+/// restores by setting the main-loop override (`overrideMainLoopModel`) its next restore returns
+/// early on, and no switch clears it, so a restore pins and every later `Resume` keeps the
+/// model. `resumed` counts the conversations taken up (the launch's included); `restored` says
+/// how the newest switch went (1 it restored, 2 only a restore's pin kept the model, 0
+/// otherwise), and `Read` shows the restored model where it restored, the carry where it kept.
+/// No `Clear` follows a `Resume`: that `Clear` is the same switch as any other, and leaving it
+/// out keeps the Tier-1 walk small.
 ///
-/// `ResumeLate` is the first in-REPL `/resume` taken instead into D — a
-/// conversation ANOTHER process began and answered with `Pred` after this
-/// one started, before the reader last saw this one in the session it
-/// leaves (`late`; the `/resume` picker lists the newest first). It is a
-/// resume like any: Claude restores `Pred` unless pinned, and the restore
-/// pins. Its rows from before the switch are D's, never this process's
-/// statements, so the reader tells the switch from a `Clear` by WHEN it came
-/// — after the reader last saw the process in the session it left — not by
-/// the floor, which D's rows are all above. A later `Resume` goes on to B.
-/// It needs no card: after a resume the carry, the flag or the restore
-/// decides.
+/// `ResumeLate` is a first in-REPL `/resume` taken instead into D, a conversation another
+/// process began and answered with `Pred` after this one started, before the reader last saw
+/// this one in the session it leaves (`late`; the `/resume` picker lists the newest first).
+/// Claude restores `Pred` unless pinned, and the restore pins. D's rows from before the switch
+/// are never this process's statements, so the reader tells the switch from a `Clear` by when
+/// it came (after the reader last saw the process in the session it left), not by the floor,
+/// which D's rows are all above. A later `Resume` goes on to B. It needs no card: after a resume
+/// the carry, the flag or the restore decides.
 ///
-/// `Buggy=1`, each a branch of a live action: `Read` shows nothing after a
-/// readable choice (the pre-2026-09-28 reader, which voided the model at
-/// every `/model` until the next answer — `ChoiceShownAtOnce`); reads the
-/// resumed conversation's own rows from above the floor as the process's (a
-/// reader without the floor, which names `Pred` under a `--model` — and the
-/// reader of the second 2026-09-28 round, which took a restore for no pin and
-/// so restored `Other` at the second resume — `ShownIsTheRunningModel`);
-/// after a `Clear` reads only the new session's empty transcript, falling to
-/// the flag, the card or nothing (the reader that kept nothing of the process
-/// — `ClearKeepsTheModel`, and `ShownIsTheRunningModel` when the flag names the
-/// starting model); where Claude restored, reads the switch as a `Clear` — the
-/// process's carried answer, else its card, else nothing (the reader of the
-/// first 2026-09-28 round — `ResumeNamesTheRestoredModel`); `Flood` forgets
-/// what was seen (no carry), so the starting model stands in for a choice
-/// (`ShownIsTheRunningModel`). The reader that judges a switch by the floor
-/// alone is the same two mutants on D: under a pin it reads D's own answer
-/// as the process's (`Pred`), and unpinned it misses the restore's pin and
-/// restores `Other` at the next resume.
+/// `Buggy=1`, each a branch of a live action: `Read` shows nothing after a readable choice,
+/// voiding the model at every `/model` until the next answer (`ChoiceShownAtOnce`); reads the
+/// resumed conversation's own rows from above the floor as the process's, naming `Pred` under a
+/// `--model`, and takes a restore for no pin, restoring `Other` at the second resume
+/// (`ShownIsTheRunningModel`); after a `Clear` reads only the new session's empty transcript,
+/// falling to the flag, the card or nothing (`ClearKeepsTheModel`, and `ShownIsTheRunningModel`
+/// when the flag names the starting model); where Claude restored, reads the switch as a
+/// `Clear`: the carried answer, else the card, else nothing (`ResumeNamesTheRestoredModel`);
+/// `Flood` forgets what was seen, so the starting model stands in for a choice
+/// (`ShownIsTheRunningModel`). A reader that judges a switch by the floor alone is the same two
+/// mutants on D: under a pin it reads D's own answer as the process's (`Pred`), and unpinned it
+/// misses the restore's pin and restores `Other` at the next resume.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn claude_footer_model_model() -> Model {
@@ -257,8 +233,7 @@ pub fn claude_footer_model_model() -> Model {
             }
             action LaunchResume when (launched == 0 && resumed == 0 && card == 0) {
                 resumed = 1;
-                // Claude restores the conversation's model unless pinned —
-                // and the restore pins it.
+                // Claude restores the conversation's model unless pinned, and the restore pins.
                 runs = if flag == 1 { 1 } else { Pred };
                 pinned = if flag == 1 { 1 } else { 2 };
                 restored = if flag == 1 { 0 } else { 1 };
@@ -291,8 +266,8 @@ pub fn claude_footer_model_model() -> Model {
                 synced = 0;
             }
             action Flood when (seen > 0) {
-                // Buggy=1: no carry — the huge row pushes the statement out
-                // of the reader's window and it is forgotten.
+                // Buggy=1: no carry; the huge row pushes the statement out of the reader's
+                // window and it is forgotten.
                 seen = if Buggy == 1 { 0 } else { seen };
                 synced = 0;
             }
@@ -332,15 +307,14 @@ pub fn claude_footer_model_model() -> Model {
             }
             action Read when (synced == 0) {
                 shown = if seen == 1 || seen == 2 {
-                    // Buggy=1: the old reader voided a readable choice.
+                    // Buggy=1 voids a readable choice.
                     if Buggy == 1 && seen == 2 { 0 } else { runs }
                 } else if seen == 3 {
                     0
                 } else if Buggy == 1 && resumed > 0 && (restored == 0 || restored == 2) {
-                    // Buggy=1: the resumed conversation's own model — the
-                    // floorless reader's under a pin (and the floor-only
-                    // judge's in D), and the reader that took a restore for
-                    // no pin at the second resume (or missed D's).
+                    // Buggy=1: the resumed conversation's own model, read without the floor
+                    // under a pin (or by the floor alone in D), or taking a restore for no pin
+                    // at the second resume (or missing D's).
                     if resumed == 2 { Other } else { Pred }
                 } else if restored == 1 {
                     // The conversation's own model, which Claude restored.

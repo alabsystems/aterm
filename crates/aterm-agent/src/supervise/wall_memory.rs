@@ -61,10 +61,8 @@ pub(super) const MEMORY_TTL: Duration = Duration::from_secs(24 * 3600);
 /// it, the worker worked, another wall replaced it.
 const WALL_LEFT: &str = "the wall left the screen or the worker worked";
 
-/// How long a screen may read busy on the agent's own background work alone,
-/// with the agent's OWN title saying idle, before the loop says so in its
-/// journal ([`Session::stuck_busy_note`]). The ladder's unit: its second rung
-/// is three of these and its third six.
+/// How long a screen may read busy on the agent's own background work alone, under the agent's
+/// own idle title, before the loop journals it ([`Session::stuck_busy_note`]): the ladder's unit.
 pub(super) const STUCK_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// How many times shorter than [`STUCK_AFTER`] the dialog flavour's unit is

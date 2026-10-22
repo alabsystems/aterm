@@ -10,23 +10,21 @@ repository.workspace = true
 description = "aterm — signature-pinned in-app updater: stages verified releases and hands the live session to the new build in place."
 
 [features]
-# Development seams in an optimized build — forwarded to the crate that reads them
-# (`aterm-update-core`: ATERM_UPDATE_ROOT, the `[update]` repoint). The release cutter
-# never enables this; aterm-release's buildplan pins that.
+# Forwards `aterm-update-core`'s dev seams (ATERM_UPDATE_ROOT, the `[update]` repoint);
+# aterm-release's buildplan keeps it out of release builds.
 dev-seams = ["aterm-update-core/dev-seams"]
 
 [dependencies]
 # The manifest (aterm-appcast.toml) and the `ready.toml` staging marker.
 aterm-toml = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-# The Linux lane's compiled binary identity crosses as JSON
-# (`binary_identity_json`, and the candidate's identity probe in `linux.rs`).
+# The Linux lane's binary identity crosses as JSON.
 aterm-json = { workspace = true }
 # renamex_np(RENAME_SWAP) for the atomic bundle swap.
 libc = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
 aterm-durable = { workspace = true }
-# The shared RFC3339 civil-calendar math (`aterm_types::rfc3339`).
+# `aterm_types::rfc3339`.
 aterm-types = { workspace = true }
 # `aterm_time::unix_secs`, the workspace's one epoch-clock read.
 aterm-time = { workspace = true }
@@ -59,8 +57,7 @@ astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 # install.sh's tests build atpkg's shim from its own block (`build_cache::shim_block`),
 # so the shim writer and the installer's reader answer to one contract.
 atpkg = { workspace = true }
-# Signing side (Ed25519KeyPair::from_seed_unchecked + .sign) for the roster-chain
-# fixtures; the verifying side is `aterm_update_core::roster`'s.
+# Signs the roster-chain fixtures; verification is `aterm_update_core::roster`'s.
 ring = { workspace = true, features = ["default"] }
 # Tier-1 conformance tests bind the updater reducers to their derived models.
 aterm-spec = { workspace = true }

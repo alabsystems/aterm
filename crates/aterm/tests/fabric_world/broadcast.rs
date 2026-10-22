@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **BROADCAST: one record on the log, however many sessions read
-//! it, and nobody reads one they did not ask for.**
-//!
-//! §6 states the shape in one line — "derived from subscription, one log record
-//! per broadcast" — and every test here is over the real binaries, because the
-//! two halves that make the sentence true live in different processes: the
-//! endpoint holds the opt-in (`topic add`) and the bridge holds the one
-//! subscription that fans it in.
+//! Broadcast (`say:` topics): one record on the log however many sessions read it, and
+//! nobody reads one they did not ask for. Over the real binaries: the endpoint holds the
+//! opt-in (`topic add`) and the bridge holds the one subscription that fans it in.
 
 use crate::harness;
 
@@ -16,9 +11,8 @@ use aterm_models_session::{broadcast_cursor_checkpoint_model, broadcast_head_sub
 use aterm_spec::interp;
 use harness::{FLEET, World, say_records, topic_rows, until};
 
-/// Add a topic and wait for the bridge to hold it — the set lives in aterm and
-/// the bridge learns it from the push (or its one read of a new session), so
-/// "added" and "in effect" are two moments.
+/// `topic add` and wait until the bridge has persisted the topic: the endpoint holds the set
+/// and the bridge learns it from a push, so "added" and "in effect" are two moments.
 fn subscribe(w: &World, sid: &str, spec: &str) {
     let reply = w.verb(&format!("@{sid} topic add {spec}"));
     assert!(reply.ok(), "topic add {spec}: {}", reply.header());
@@ -40,21 +34,9 @@ fn persisted_topic_cursor(w: &World, sid: &str, topic: &str) -> Option<u64> {
     })
 }
 
-/// **ONE RECORD, N DELIVERIES — and none at all to a session that never asked.**
-///
-/// This is the whole contract in one test. A per-recipient fan-OUT would have
-/// been far easier to write (the addressed lane already exists, and a broadcast
-/// could have been N posts) and it is exactly what §6 forbids: the cost of a
-/// shout would then scale with the size of its audience, on an append-forever
-/// log, at the sender's choosing. So the assertion is not "everyone got it" —
-/// it is "everyone got it AND the log grew by exactly one".
-///
-/// THE SENDER IS NOT A RECIPIENT. `s_send` publishes the record and is not
-/// subscribed, so it receives nothing: delivery is keyed on the receiver's own
-/// `topic add` set and on nothing else, which is what makes a fleet-wide shout
-/// unable to put a word in front of an agent that did not want it. The same
-/// session subscribing later DOES hear its own next broadcast — the rule is
-/// "nobody by default", not "anybody but the sender".
+/// One `say` record reaches every subscriber and the log grows by exactly one (§6: no
+/// per-recipient fan-out). The sender is not subscribed and receives nothing; once it
+/// subscribes it hears its own next broadcast.
 #[test]
 fn one_record_reaches_every_subscriber_and_nobody_else() {
     let w = World::boot("r23fan", &[]);
@@ -87,8 +69,8 @@ fn one_record_reaches_every_subscriber_and_nobody_else() {
         assert_eq!(rows.len(), 1, "exactly one row per subscriber: {rows:?}");
         assert!(rows[0].contains("kind=note"), "{}", rows[0]);
     }
-    // THE LOG GREW BY EXACTLY ONE. Measured after both deliveries landed, so a
-    // fan-OUT would already have written its second record.
+    // Measured after both deliveries landed, so a fan-out would already have written its
+    // second record.
     let after = say_records(&w);
     assert_eq!(
         after.len(),
@@ -96,14 +78,12 @@ fn one_record_reaches_every_subscriber_and_nobody_else() {
         "one broadcast is one record, whatever the audience: {after:?}"
     );
 
-    // THE SENDER ASKED FOR NOTHING AND GOT NOTHING.
     assert!(
         topic_rows(&w, &s_send, "r23.fan").is_empty(),
         "the publisher is not a subscriber by virtue of publishing: {:?}",
         w.inbox(&s_send)
     );
 
-    // …AND HEARS ITS OWN NEXT ONE ONCE IT ASKS.
     subscribe(&w, &s_send, "r23.fan");
     let posted = w.verb(&format!("@{s_send} post to=say:r23.fan kind=note r23own"));
     assert!(posted.ok(), "{}", posted.header());
@@ -114,22 +94,16 @@ fn one_record_reaches_every_subscriber_and_nobody_else() {
     assert_eq!(mine.len(), 1, "{mine:?}");
 }
 
-/// **A LATE SUBSCRIBER READS THE BACKLOG; `since=head` DOES NOT.**
-///
-/// `head` is the default because the surprising answer is the dangerous one: an
-/// agent that says `topic add build.failed` and is handed six months of build
-/// failures has had its context filled by a stranger's history. `@<off>` is the
-/// deliberate opposite — a session joining a conversation that has already
-/// started — and the offset is the broker's own, the same correlation id every
-/// `msg` row already carries, so "from where I stopped reading" is expressible.
+/// A late subscriber with `since=@<off>` (a broker offset, as every `msg` row carries)
+/// replays the backlog; `since=head`, the default, takes only new records, so a subscriber
+/// is not handed the topic's history unasked.
 #[test]
 fn a_late_subscriber_replays_and_head_takes_only_new() {
     let w = World::boot("r23late", &[]);
     w.wait_ready();
     let (s_a, s_b) = w.two_sessions();
 
-    // Published BEFORE anybody asked for the topic: no session on this node
-    // holds it, so nothing is delivered and nothing is owed.
+    // Published before any session holds the topic: nothing is delivered or owed.
     let posted = w.verb(&format!("@{s_a} post to=say:r23.late kind=note r23backlog"));
     assert!(posted.ok(), "{}", posted.header());
     let (off, _, body) = until("the backlog record to land", || {
@@ -142,10 +116,8 @@ fn a_late_subscriber_replays_and_head_takes_only_new() {
     subscribe(&w, &s_a, &format!("r23.late since=@{off}"));
     subscribe(&w, &s_b, "r23.late since=head");
 
-    // The bus accepted the backlog before this add, but its lower-priority
-    // broadcast reader need not have drained the record yet. The persisted
-    // cursor is the resolution itself: it must already be past the backlog,
-    // even if a `say` record is still waiting in the bridge's mailbox.
+    // The say reader need not have drained the backlog yet; the persisted cursor is the
+    // head resolution itself and must already be past it.
     let resolved = std::fs::read_to_string(w.state.join(format!("topics/{s_b}")))
         .expect("the head subscription has a persisted cursor");
     let head_cursor = resolved
@@ -177,10 +149,8 @@ fn a_late_subscriber_replays_and_head_takes_only_new() {
         "the old stale-head decision must be caught"
     );
 
-    // A NEW RECORD WHILE THE BACKLOG IS STILL OWED. This is not decoration: a
-    // cursor that is BEHIND the live face must not be advanced past a record
-    // the subscription hands over, or the live one silently cancels the
-    // backlog the late subscriber asked for. `s_a` must end with BOTH.
+    // A new record while the backlog is still owed must not advance the behind cursor past
+    // it, or the live record cancels the backlog: `s_a` must end with both.
     let posted = w.verb(&format!("@{s_a} post to=say:r23.late kind=note r23fresh"));
     assert!(posted.ok(), "{}", posted.header());
 
@@ -195,8 +165,8 @@ fn a_late_subscriber_replays_and_head_takes_only_new() {
         "the replay and the live record both landed: {both:?}"
     );
 
-    // AND THE `head` SUBSCRIBER TOOK ONLY THE NEW ONE — asserted after its own
-    // delivery has landed, so the negative is not merely "not yet".
+    // The head subscriber took only the new one, asserted after its delivery landed so the
+    // negative is not merely "not yet".
     let fresh = until("the new broadcast to reach the head subscriber", || {
         let rows = topic_rows(&w, &s_b, "r23.late");
         (!rows.is_empty()).then_some(rows)
@@ -215,12 +185,8 @@ fn a_late_subscriber_replays_and_head_takes_only_new() {
     assert!(!old.check_invariant("HeadSkipsEarlierRecord", &stale));
 }
 
-/// **A BROADCAST IS DATA, WHATEVER IT SAYS IT IS.**
-///
-/// The body below is a line that would be a HALT if anything read it as one —
-/// and a broadcast is the widest reach in the fabric, so it is the worst place
-/// for a body to be mistaken for a verb. It arrives as text in a ring, the
-/// session's hold is still off, and the screen never saw a keystroke.
+/// A broadcast body that reads like a verb (`hold=1`) arrives as ring text: the session's
+/// hold stays off and the screen never sees it.
 #[test]
 fn a_broadcast_body_is_data_not_a_verb() {
     let w = World::boot("r23data", &[]);
@@ -256,16 +222,9 @@ fn a_broadcast_body_is_data_not_a_verb() {
     );
 }
 
-/// **A `task` FROM A PRINCIPAL THE NODE DOES NOT ACCEPT IS A `note`, on the
-/// broadcast lane exactly as on the addressed one.**
-///
-/// §8.4's demotion is the rule that keeps "a stranger can reach me" from
-/// meaning "a stranger can task me", and the kind now rides INSIDE the body of
-/// a broadcast rather than in its subject — a body field is the sender's word,
-/// which is precisely the class of claim that rule exists to bound. The
-/// classification is the same function the addressed path uses
-/// (`classify_delivery`), so this is a test that the broadcast path did not
-/// grow a second, weaker one.
+/// A broadcast `task` or `control` from a principal the node does not accept arrives as
+/// `kind=note demoted=<k>` (§8.4), through the same `classify_delivery` the addressed lane
+/// uses: on this lane the kind rides in the body, the sender's own word.
 #[test]
 fn a_broadcast_task_is_demoted_unless_the_sender_is_accepted() {
     let w = World::boot("r23kind", &[]);
@@ -288,9 +247,8 @@ fn a_broadcast_task_is_demoted_unless_the_sender_is_accepted() {
         b"v=1 t=1 kind=task from=s-person text=r23human",
     )
     .expect("publish as a human");
-    // The OTHER member of the set, so the test is about the set and not about
-    // one word in it (`DEMOTE_UNLESS_ACCEPTED = ["task", "control"]`; `ask` and
-    // `answer` are deliberately not in it, and this asserts neither).
+    // `control`, the other member of `DEMOTE_UNLESS_ACCEPTED`, so the test covers the set
+    // and not one word in it.
     god.publish(
         7_202,
         3,
@@ -329,23 +287,11 @@ fn a_broadcast_task_is_demoted_unless_the_sender_is_accepted() {
     );
 }
 
-/// **THE OPT-IN AND ITS CURSOR SURVIVE THE BRIDGE.**
-///
-/// A topic set that lived only in the bridge's memory would be re-read from
-/// `topic ls` after a restart and its `since=head` resolved AGAIN — against the
-/// new head — so every broadcast published while the bridge was down would be
-/// silently swallowed, and the session that asked for the topic would have no
-/// way to know it had missed one. The set is aterm's; the CURSOR is the
-/// bridge's, and the cursor is what is persisted.
-///
-/// THE ASSERTION IS THE CURSOR ITSELF, not a delivery, because the delivery
-/// alone cannot tell the two behaviours apart without racing the supervisor:
-/// the replacement bridge is brought up in milliseconds, and a record published
-/// into that window may arrive live. The cursor is exact. It is read after the
-/// replacement has attached — which is the moment a re-resolving bridge would
-/// have overwritten it — and the live head is read beside it, so
-/// "not fast-forwarded" is a real distinction and not an accident of an idle
-/// bus.
+/// A restarted bridge resumes a topic from its persisted cursor instead of re-resolving
+/// `since=head`, so nothing published while it was down is lost. The assertion is the cursor
+/// itself, read after the replacement attached and beside the live head: a delivery alone
+/// cannot tell the two apart, since a record published into the restart window may arrive
+/// live.
 #[test]
 fn a_restarted_bridge_resumes_the_topic_where_it_stopped() {
     let w = World::boot("r23boot", &[]);
@@ -353,8 +299,7 @@ fn a_restarted_bridge_resumes_the_topic_where_it_stopped() {
     let (s_a, s_b) = w.two_sessions();
     subscribe(&w, &s_b, "r23.boot");
 
-    // One delivery first, so the cursor is a POSITION rather than the floor it
-    // started at.
+    // One delivery first, so the cursor is a position rather than its starting floor.
     let posted = w.verb(&format!("@{s_a} post to=say:r23.boot kind=note r23first"));
     assert!(posted.ok(), "{}", posted.header());
     let first = until("the first broadcast", || {
@@ -369,18 +314,16 @@ fn a_restarted_bridge_resumes_the_topic_where_it_stopped() {
             .trim()
             .to_string()
     };
-    // THE ROW AND THE CURSOR ARE TWO MOMENTS: the endpoint holds the row as
-    // soon as `deliver` answers, and the bridge persists the cursor just after.
-    // The assertion is still exact — one past the record — it just waits for it
-    // rather than racing the write.
+    // The endpoint holds the row once `deliver` answers and the bridge persists the cursor
+    // just after, so wait for it to reach exactly one past the record.
     until("the cursor to move past the delivered record", || {
         (cursor(&w) == format!("r23.boot {}", first + 1)).then_some(())
     });
 
     let pid = w.bridge_pid();
     harness::kill(pid, 9);
-    // INTO THE WINDOW: published while the supervisor is bringing a replacement
-    // up. Whether it is read live or replayed, it must arrive.
+    // Published while the supervisor brings a replacement up: live or replayed, it must
+    // arrive.
     let mut god = w.god();
     god.publish(
         7_300,
@@ -404,9 +347,8 @@ fn a_restarted_bridge_resumes_the_topic_where_it_stopped() {
             .then_some(())
     });
 
-    // THE CURSOR WAS NOT RE-RESOLVED. The head has moved well past it — the
-    // attach alone republishes presence — so a bridge that re-read `since=head`
-    // would be holding a much larger number here.
+    // Not re-resolved: the attach alone republishes presence, so the head is well past the
+    // cursor and a bridge that re-read `since=head` would hold a much larger number.
     let head = {
         let (_, (_, head)) = god
             .fetch(0, &format!("/f/{FLEET}/>"), 0)
@@ -434,11 +376,10 @@ fn a_restarted_bridge_resumes_the_topic_where_it_stopped() {
     );
 }
 
-/// An unrelated live broadcast may leave the quiet topic's durable cursor
-/// behind its in-memory frontier. A crash must replay that irrelevant stretch
-/// and still deliver a matching record published across the restart; the first
-/// matching delivery then commits its cursor immediately, and the next live
-/// matching record must arrive exactly once.
+/// An unrelated live broadcast may leave a quiet topic's durable cursor behind its in-memory
+/// frontier. A crash replays that stretch and still delivers a matching record published
+/// across the restart; each matching delivery commits its cursor at once, and the next live
+/// match arrives exactly once.
 #[test]
 fn an_irrelevant_checkpoint_gap_replays_safely_and_live_delivery_stays_durable() {
     let w = World::boot("r23checkpoint", &[]);
@@ -447,9 +388,8 @@ fn an_irrelevant_checkpoint_gap_replays_safely_and_live_delivery_stays_durable()
     subscribe(&w, &s_a, "r23.noisy");
     subscribe(&w, &s_b, "r23.quiet");
 
-    // Tier-1 conformance: project the real file and delivered rows onto the
-    // derived cursor machine. Its clock counts say records rather than global
-    // broker offsets, which include unrelated presence and control records.
+    // Conformance: project the real file and rows onto the derived cursor machine, whose
+    // clock counts say records, not broker offsets (those include presence and control).
     let model = broadcast_cursor_checkpoint_model();
     let mut state = model.init_state();
     let old = interp::with_buggy(&model, 1);
@@ -468,9 +408,8 @@ fn an_irrelevant_checkpoint_gap_replays_safely_and_live_delivery_stays_durable()
             .find_map(|part| part.strip_prefix("off="))
             .and_then(|part| part.parse::<u64>().ok())
             .expect("noisy delivery's offset");
-        // The bridge writes this new opt-in only after it has completed the
-        // current say handler. That gives a deterministic barrier for the
-        // quiet cursor's checkpoint decision, not a timing guess.
+        // The bridge persists this new opt-in only after finishing the current say
+        // handler: a deterministic barrier for the quiet cursor's checkpoint decision.
         subscribe(&w, &s_a, &format!("r23.barrier{i}"));
         assert!(model.fire("Irrelevant", &mut state));
         assert!(old.fire("Irrelevant", &mut buggy));
@@ -667,12 +606,8 @@ fn a_live_record_does_not_cancel_a_backlog_still_owed() {
     );
 }
 
-/// **A DELIVERY THE ATERM LANE NEVER ANSWERED IS NOT WRITTEN DOWN.**
-///
-/// `bridge_oversize`'s twin for the broadcast lane: with the verb lane cut
-/// before the first `deliver`, the cursor stays where it was and the
-/// replacement bridge
-/// delivers the record.
+/// The broadcast twin of `bridge_oversize`'s lost-lane test: with the verb lane cut before
+/// the first `deliver`, the cursor stays put and the replacement bridge delivers the record.
 #[test]
 fn a_broadcast_the_lane_never_took_is_redelivered_by_the_replacement() {
     let w = World::boot_with(
@@ -709,14 +644,9 @@ fn a_broadcast_the_lane_never_took_is_redelivered_by_the_replacement() {
     assert!(row.contains("from=s-peer@n-far"), "{row}");
 }
 
-/// **`drop` THEN `add since=@<off>` INSIDE ONE ROSTER ROUND TAKES EFFECT.**
-///
-/// The documented way to ask for a different starting point. It was a silent
-/// no-op when both happened between two samples: the name survived, the old
-/// cursor was kept, the new `since=` never read. The endpoint now pushes each
-/// change on the event lane, so the drop and the re-add are two events in
-/// order and the bridge reads the second's `since=` — with no roster round in
-/// between, which is also the proof the push is what acts.
+/// `topic drop` then `topic add since=@<off>` back to back, with no roster round between,
+/// replays from the new offset: the endpoint pushes each change on the event lane in order,
+/// and the bridge reads the second's `since=`.
 #[test]
 fn drop_then_add_in_one_round_replays_from_the_new_offset() {
     let w = World::boot("r23readd", &[]);
@@ -731,7 +661,6 @@ fn drop_then_add_in_one_round_replays_from_the_new_offset() {
     });
     subscribe(&w, &s_b, "r23.readd since=head");
 
-    // BACK TO BACK, no roster round between.
     let dropped = w.verb(&format!("@{s_b} topic drop r23.readd"));
     assert!(
         dropped.header().contains("dropped=1"),
@@ -750,11 +679,9 @@ fn drop_then_add_in_one_round_replays_from_the_new_offset() {
     assert_eq!(rows.len(), 1, "{rows:?}");
 }
 
-/// **A BROADCAST THE QUOTA REFUSES COUNTS IN THE RECIPIENT'S `dropped=`.**
-///
-/// One sender, a hundred shouts: 64 rows land and the 65th is `ERR quota`.
-/// Nothing goes back to the bus — the sender did not choose this recipient —
-/// so the recipient is the only party who can be told, and it is.
+/// One sender, a hundred broadcasts: 64 rows land and the rest are `ERR quota`, counted in
+/// the recipient's `dropped=`. Nothing goes back to the bus: the sender did not choose this
+/// recipient.
 #[test]
 fn a_quota_refused_broadcast_is_counted_as_dropped() {
     let w = World::boot("r23quota", &[]);
@@ -781,7 +708,7 @@ fn a_quota_refused_broadcast_is_counted_as_dropped() {
             .then_some(header)
     });
     assert!(header.contains("dropped=36"), "{header}");
-    // AND THE BUS HOLDS EXACTLY THE HUNDRED: no refusal record per subscriber.
+    // The bus holds exactly the hundred: no refusal record per subscriber.
     let on_bus = say_records(&w)
         .iter()
         .filter(|(_, s, _)| s.ends_with("/say/r23.quota"))

@@ -288,8 +288,8 @@ impl Terminal {
 
     /// Drain up to `max_lines` of the primary-content grid's staged backlog into
     /// its tiered store, returning the lines still staged. The caller holds the
-    /// terminal lock; the worker drives this per batch to keep each hold short.
-    /// See [`Grid::drain_lazy_bounded`](aterm_grid::Grid::drain_lazy_bounded).
+    /// terminal lock; batches keep each hold short. See
+    /// [`Grid::drain_lazy_bounded`](aterm_grid::Grid::drain_lazy_bounded).
     #[inline]
     pub fn drain_lazy_bounded(&mut self, max_lines: usize) -> usize {
         let target = if self.modes.alternate_screen {
@@ -314,11 +314,10 @@ impl Terminal {
     }
 
     /// One bounded drain opportunity for a host polling mid-flood (the
-    /// compression worker's trickle, a wasm host's per-frame drain), on the same
-    /// backlog as [`drain_lazy_bounded`](Self::drain_lazy_bounded). Skipped while
-    /// the flood path is cutting that backlog and a batch arrived since the last
-    /// opportunity, so one flood leaves one marker and a slow tail still gets
-    /// promoted. See [`Grid::trickle_lazy_bounded`](aterm_grid::Grid::trickle_lazy_bounded).
+    /// compression worker's trickle, a wasm host's per-frame drain), on the
+    /// [`drain_lazy_bounded`](Self::drain_lazy_bounded) backlog; see
+    /// [`Grid::trickle_lazy_bounded`](aterm_grid::Grid::trickle_lazy_bounded)
+    /// for when it skips.
     #[inline]
     pub fn trickle_lazy_bounded(&mut self, max_lines: usize) -> usize {
         let target = if self.modes.alternate_screen {

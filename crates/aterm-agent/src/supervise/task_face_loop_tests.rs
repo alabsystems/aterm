@@ -409,7 +409,7 @@ fn a_cruise_done_claim_tells_no_end_and_a_persons_exchange_is_theirs() {
     let _ = RULE_LEFT;
 }
 
-/// FOREVER LAND IN THE LOOP: the instruction and three nudges answered with
+/// Autopilot Land IN THE LOOP: the instruction and three nudges answered with
 /// work, and a fourth nudge typed — told nothing past `open` (no spent face:
 /// the landing goes on). NEGATIVE CONTROL: the third nudge's clean defense
 /// is told `landed`, nothing more is typed, and someone else's live turn
@@ -824,7 +824,7 @@ fn a_landings_point_said_again_is_read_by_its_words_never_its_seq() {
 }
 
 /// ONLY A LANDING IS READ BACK AS AN END (`ended_before`, §10.2.7 under
-/// FOREVER CRUISE / FOREVER LAND): the last note of a task's end is the
+/// Autopilot Cruise / Land): the last note of a task's end is the
 /// land's `DONE`, nothing typed or judged came after it — the landing, its
 /// point's mark with it, and the last of several notes is the one read.
 /// NEGATIVE CONTROLS: an older build's done notes (`rule=finished@v1`, the
@@ -937,7 +937,7 @@ fn only_a_landing_is_read_back_and_an_older_builds_done_seeds_nothing() {
     );
 }
 
-/// AN OLDER BUILD'S CRUISE DONE IS NEVER RESTATED (FOREVER CRUISE: nothing
+/// AN OLDER BUILD'S CRUISE DONE IS NEVER RESTATED (Autopilot Cruise: nothing
 /// ends a Cruise task, and an old journal's `DONE … rule=finished@v1` reads
 /// as nothing ended): a loop started over that note, under Cruise or as the
 /// session's Off lifts under Land, is told `open` at its start, never
@@ -1942,7 +1942,7 @@ impl std::io::Write for ReaderGone {
 
 /// THE FIRST LOOP OF A TASK THAT ENDS, under Land, over the ledger and
 /// journal at `ledger`: the job's progress, Land's instruction the policy
-/// types there, then `last`, its answer (FOREVER LAND: the one end is a
+/// types there, then `last`, its answer (Autopilot Land: the one end is a
 /// landing; Cruise never ends). With `take`, the host takes the end's point
 /// and stops the loop there ([`EndTaker`]); else no host step comes. The
 /// faces told, the turns typed, the lines said.
@@ -2086,7 +2086,7 @@ fn follow_landing(ledger: &Path, tag: &str, follower: &'static str, lifted: bool
 /// A LANDING THE HOST'S STEP TOOK IS NOTED, AND A LOOP THAT FOLLOWS READS IT
 /// AS THE FIRST LOOP DID (the claim of 2026-10-20 against main's `look()`:
 /// the end's point journaled, its `DONE …` note owed to the point's act,
-/// which the host's step there skips). Under FOREVER LAND the one end is a
+/// which the host's step there skips). Under Autopilot Land the one end is a
 /// landing: the host's step takes the very point the task lands at — the
 /// clean defense answering Land's instruction — and the loop is stopped as
 /// it steps. The journal still says the landing right after its point's
@@ -2330,7 +2330,7 @@ fn relaunched(
 }
 
 /// A RELAUNCHED TASK LANDED UNDER LAND GETS NO CARRY-ON (the Autopilot
-/// design's §9.4.8; FOREVER LAND: only Land's landing is done): a restart
+/// design's §9.4.8; Autopilot Land: only Land's landing is done): a restart
 /// of the same session whose landing is seeded (its journal's `DONE …
 /// rule=land@v1`) is told done under Land at its first point; the host
 /// types nothing (`HOST … carry-on step=done:said-done`), its reply reads

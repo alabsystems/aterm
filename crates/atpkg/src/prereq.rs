@@ -342,11 +342,10 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
     }
 }
 
-/// Create `dir` — never an existing path (an existing name is a refusal, not a
-/// hijack) — readable by this user only.
+/// Create `dir`, readable by this user only; an existing path is an error, never reused.
 pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
-    // One builder per cfg arm: a shared `let mut` that only the unix arm mutates is an
-    // `unused_mut` on every other target, which a `-D warnings` lint there refuses.
+    // One builder per cfg arm: a shared `let mut` mutated only on unix is `unused_mut`
+    // elsewhere.
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;

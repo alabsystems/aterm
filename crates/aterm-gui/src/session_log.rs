@@ -2435,9 +2435,7 @@ impl SessionLog {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The instance-wide cap on session log memory (design §5.1, phase 2A).
-// ---------------------------------------------------------------------------
 
 /// THE INSTANCE CAP: every session log's estimated heap together
 /// (`aterm_slog::Log::footprint`, about three times what its ring's encoded
@@ -2660,9 +2658,7 @@ impl crate::App {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The settle wakes the event loop owes.
-// ---------------------------------------------------------------------------
 
 /// The settle wakes the event loop owes, by session: one entry per session
 /// whose turn tracker has a pending settle. Empty on an idle machine, so the
@@ -2830,9 +2826,7 @@ impl crate::App {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The `log` and `brief` verbs' reading of a log.
-// ---------------------------------------------------------------------------
 
 /// The `log` verb's usage line.
 pub(crate) const LOG_USAGE: &str = "ERR usage: log [<node>] [lvl=session|run|turn|step] [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [class=turn] [tier=content] [--json]\n";

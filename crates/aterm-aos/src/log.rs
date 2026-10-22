@@ -545,9 +545,10 @@ impl<S: Schema> EventLog<S> {
         b.part(&to.to_le_bytes());
         let mut e = Enc::new();
         for i in inputs {
+            // One encoder for the whole trace: each input is a new encoding in its room.
+            e.clear();
             schema.encode_input(i, &mut e);
             b.part(e.as_bytes());
-            e = Enc::with_capacity(e.len());
         }
         b.finish()
     }

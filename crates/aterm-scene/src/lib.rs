@@ -14,9 +14,7 @@ pub mod vector;
 pub use atlas::Tile;
 pub use vector::{PathCmd, PathSeg, PathTransform, fill_path, fill_path_fixed, parse_path};
 
-// =====================================================================================
 // Frame-rate-independent math shared by the scenes.
-// =====================================================================================
 
 /// Clamp `v` into `[lo, hi]`. `lo <= hi` is the caller's contract; if violated the
 /// result is `lo` (we clamp high first, then low), which is still finite and bounded.

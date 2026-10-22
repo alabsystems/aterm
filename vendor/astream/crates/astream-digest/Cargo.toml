@@ -1,6 +1,6 @@
 [package]
 name = "astream-digest"
-description = "astream SHA-256 and the one HMAC-SHA256/HKDF-SHA256 over it: FIPS 180-4 and RFC 2104/5869 transcribed line by line, zero dependencies, forbid(unsafe). The one hash and MAC under astream-cap's capabilities, attach proofs and producer ids, astream-aead's handshake and identity session keys, and astream-evidence's output pins; plus a constant-time slice compare."
+description = "astream SHA-256 and the one HMAC-SHA256/HKDF-SHA256 over it: FIPS 180-4 with each compression round checkable against the standard, RFC 2104/5869 transcribed line by line, zero dependencies, forbid(unsafe). The one hash and MAC under astream-cap's capabilities, attach proofs and producer ids, astream-aead's handshake and identity session keys, and astream-evidence's output pins; plus a constant-time slice compare."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,9 @@ rust-version.workspace = true
 # packages (digest, block-buffer, crypto-common, generic-array, typenum,
 # cpufeatures; 48,869 lines with sha2) into every graph that capabilities reach,
 # for one streaming hash. astream hashes grants, nonces and test output, not bulk
-# traffic, so the reference algorithm is the whole requirement.
+# traffic, so the reference algorithm is the whole requirement. Its one bulk user is
+# aterm's Aos observation chain, which the same algorithm serves by compressing whole
+# blocks straight from the input (src/lib.rs).
 #
 # It was held to sha2 by a differential while sha2 was a dev-dependency here;
 # tests/lengths_and_splits.rs keeps the answers sha2 gave, not sha2.

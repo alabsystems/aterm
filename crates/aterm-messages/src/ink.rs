@@ -1780,7 +1780,8 @@ mod tests {
         0.299 * f32::from(c[0]) + 0.587 * f32::from(c[1]) + 0.114 * f32::from(c[2]) > 150.0
     }
 
-    /// The pre-fix floor: the anchor chosen by the surface's luma alone.
+    /// A floor whose anchor the surface's luma alone picks: the foil for the
+    /// mid-grey negative control.
     fn luma_anchored_floor(c: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
         let anchor = if luma_is_light(bg) {
             [0, 0, 0]

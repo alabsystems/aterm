@@ -2,56 +2,42 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Emit every registered `ty_model!` model as a Trust `FiniteModel.ScalarModel`
-//! (Clean source), one file per model, for Trust's kernel-evaluated checker
-//! (`Trust.FiniteModelCheck`: `safetyVerdict`, `reachRows`).
+//! Emits every registered `ty_model!` model as a Trust `ScalarModel` (Clean source), one file
+//! per model, for Trust's kernel-evaluated checker (`safetyVerdict`, `reachRows`):
 //!
 //! ```text
 //! targo --unverified run -p aterm-models --example emit_clean_models -- <out-dir>
 //! ```
 //!
-//! Each file states what this crate's own interpreter found, as theorems the
-//! Clean kernel decides by evaluation: the model is safe, it has exactly the
-//! reachable-state count `interp::bmc` reports, and each `mutantK`, the model
-//! at a `Buggy = K` dial it declares, breaks an invariant. A model has one
-//! mutant per dial that breaks an invariant here; a dial that breaks only
-//! liveness (safe here) is listed, not emitted. `manifest.tsv` lists every
-//! model: emitted with its mutants' dials, or why it has no faithful scalar
-//! counterpart.
-//! `islands/` holds the same models as bare declarations behind `import
-//! Trust.Protocol`, written with its short names (`machine`, `act`, `"x" ≔ v
-//! "x" ⊞ n 1`, …) — the text of a `clean { }` island, and the input of Trust's
-//! corpus test (`TRUST_MODEL_CORPUS`), which runs them through the compiler's
-//! own check. `progress/` does the same for the liveness obligations.
+//! Each file states as theorems the kernel decides by evaluation what this crate's interpreter
+//! found: the model is safe, has the reachable-state count `interp::bmc` reports, and each
+//! `mutantK` (the model at a `Buggy = K` dial that breaks an invariant here) is caught. A dial
+//! that breaks only liveness is listed, not emitted. `manifest.tsv` lists every model: emitted
+//! with its mutants' dials, or why it has no faithful scalar counterpart. `islands/` holds the
+//! same models as bare declarations in `Trust.Protocol`'s short names (the text of a
+//! `clean { }` island, the input of Trust's `TRUST_MODEL_CORPUS` test); `progress/` holds the
+//! liveness obligations.
 //!
-//! INTEGERS VERSUS NATURALS. A `ty_model!` model is over the integers; Trust's
-//! `ScalarModel` is over the naturals, where `a - b` stops at zero. So the
-//! idiom `x <= y - 1` (this DSL's `x < y`) is TRUE at `x = y = 0` there and
-//! false here. Two steps make the translation faithful:
+//! Integers versus naturals: a `ty_model!` model is over the integers, `ScalarModel` over the
+//! naturals, where `a - b` stops at zero (so `x <= y - 1`, this DSL's `x < y`, holds at
+//! `x = y = 0` there). Two steps make the translation faithful:
 //!
-//! 1. every comparison is TRANSPOSED: subtrahends move across as addends
-//!    (`x <= y - 1` becomes `x + 1 <= y`), an equivalence over the integers
-//!    that leaves no subtraction directly under a comparison;
-//! 2. the model is emitted only if no remaining subtraction underflows on a
-//!    reachable state (taken `if` branches only), checked by exploring it with
-//!    this crate's integer interpreter. Then every expression evaluates to the
-//!    same value under both readings on every reachable state, so the two
-//!    machines have the same runs.
+//! 1. every comparison is transposed: subtrahends move across as addends (`x <= y - 1` becomes
+//!    `x + 1 <= y`), leaving no subtraction directly under a comparison;
+//! 2. the model is emitted only if no remaining subtraction underflows on a reachable state
+//!    (taken `if` branches only), so every expression has the same value under both readings
+//!    and the two machines have the same runs.
 //!
-//! NONDETERMINISM. An update `x' \\in lo..hi` ([`Expr::InRange`]) has no scalar
-//! counterpart, so its action is split first: one deterministic action per
-//! choice `k`, guarded by `lo + k <= hi` and setting `x = lo + k`, for every
-//! `k` up to the widest range the action meets on a reachable state. The
-//! split model has the same transitions, and this crate's interpreter is
-//! asked to confirm it has the same reachable-state count.
+//! Nondeterminism: an update `x' \in lo..hi` ([`Expr::InRange`]) has no scalar counterpart, so
+//! its action is split into one deterministic action per choice `k` (guard `lo + k <= hi`,
+//! update `x = lo + k`) up to the widest range the action meets on a reachable state;
+//! `interp::bmc` must find the same reachable-state count for the split model.
 //!
-//! PROGRESS. `progress/` holds every registered liveness obligation as
-//! `ScalarProgress` claims (`[]<> goal` under the obligation's fairness), named
-//! for what this crate's own audit found: `holds` (no fair run leaves the goal
-//! for good), `fails_without_<Action>` (the obligation with one fairness
-//! assumption dropped: each is load-bearing) and `fails_mutant_<Action>` (the
-//! obligation over the model with that one mutant added to the `Buggy = 1`
-//! baseline). `progress.tsv` lists them with the design's state count.
+//! Progress: `progress/` holds each liveness obligation as `ScalarProgress` claims (`[]<> goal`
+//! under its fairness), named for what this crate's audit found: `holds`,
+//! `fails_without_<Action>` (one fairness assumption dropped) and `fails_mutant_<Action>` (that
+//! mutant added to the `Buggy = 1` baseline). `progress.tsv` lists them with the design's state
+//! count.
 
 use std::fmt::Write as _;
 
@@ -317,8 +303,8 @@ fn reachable(m: &Model, limit: usize) -> Option<Vec<BTreeMap<&'static str, i64>>
     Some(order)
 }
 
-/// The module docs' NONDETERMINISM step: `m` with every `InRange` update split
-/// into one deterministic action per choice.
+/// The module docs' nondeterminism step: `m` with every `InRange` update split into one
+/// deterministic action per choice.
 fn determinized(m: &Model) -> Result<Model, String> {
     const MAX_CHOICES: usize = 4096;
     let ranged = |action: &Action| {
@@ -661,7 +647,7 @@ fn main() {
     std::fs::create_dir_all(format!("{out}/islands")).expect("create the output directory");
     let mut manifest = String::from("index\tname\tstates\tmutants\tstatus\tother dials\n");
     for (index, model) in aterm_spec::xref::model_registry().iter().enumerate() {
-        // Emit first: the interpreter refuses a function-valued model outright.
+        // Spell the model before `bmc`: the interpreter refuses a function-valued model.
         let original = model;
         let model = &match determinized(original) {
             Ok(split) => transposed(&split),

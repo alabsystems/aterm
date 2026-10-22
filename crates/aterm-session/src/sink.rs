@@ -1053,7 +1053,6 @@ impl SinkWriter {
     ///   * `owns_fd`: the sink owns the fd (built via `new_owned`).
     ///
     /// The Arc strong count (the model's `clones`) is not observable from `&self`.
-    /// `owned_fd_stays_open_until_last_clone_drops` evaluates this on real state.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn project_fd_state(&self) -> (bool, bool) {
@@ -1304,7 +1303,7 @@ impl SinkWriter {
             (epoch, flushed.saturating_add(unsent))
         };
         self.shared.drained.notify_all();
-        // Marked AFTER the flush, so every byte counted after the mark was
+        // Marked after the flush, so every byte counted after the mark was
         // accepted into the emptied queue ([`Self::read_since_discard`]).
         self.shared
             .ledger
@@ -1655,9 +1654,9 @@ impl SinkWriter {
         DrivenInputWatch(Arc::clone(&self.driven_input))
     }
 
-    /// Reserve one non-empty DRIVEN input attempt (a key, a paste, a report, a
-    /// control verb's bytes): it moves [`Self::driven_input`] as well as the
-    /// input epoch ([`Self::reserve_attempt`]).
+    /// Reserve one non-empty driven input attempt (a key, a paste, a report, a
+    /// control verb's bytes): it moves [`Self::driven_input`] as well as the input
+    /// epoch ([`Self::reserve_attempt`]).
     fn reserve_input_attempt(&self) {
         self.driven_input.fetch_add(1, Ordering::AcqRel);
         self.reserve_attempt();
@@ -1987,12 +1986,10 @@ impl SinkWriter {
         // that lock (`aterm_pty::settle_input`; a reply, inside `as_reply`,
         // settles nothing). A no-op off Windows.
         aterm_pty::settle_input(self.master);
-        // FIFO with any SPILLED bytes: while the wedged-tty spill buffer is
-        // non-empty this frame must queue BEHIND it (a direct write would overtake
-        // spilled keystrokes), under the SPILL_CAP wait so a paste into a wedged
-        // foreground applies real backpressure to its (expendable) thread. Checked
-        // BEFORE the fd lock: while draining, the drainer may sit parked in a
-        // blocking write HOLDING the fd lock, and waiting on it here would park
+        // FIFO with spilled bytes: while the spill is non-empty this frame queues
+        // behind it, under the SPILL_CAP wait, so a paste into a wedged foreground
+        // backpressures its own (expendable) thread. Checked before the fd lock: a
+        // drainer may hold it parked in a blocking write, and waiting there would park
         // this caller behind the wedge instead of behind the cap.
         if !self.shared.spill_is_empty() {
             match self
@@ -2401,8 +2398,7 @@ impl SinkWriter {
         //     very keys, so one byte per check is the only parking-free unit. Frames
         //     here are at most `NONPARK_MAX` (almost always ~20 bytes or fewer).
         //
-        // Either way the SPILL decision is identical: a refused (or short) write
-        // hands the tail to the drainer below.
+        // Either way a refused or short write spills the tail below.
         let whole_frame = self.shared.master_nonblocking.load(Ordering::Relaxed);
         let mut off = 0;
         while off < bytes.len() {
@@ -3442,10 +3438,8 @@ impl Shared {
                     // undischargeable overflow obligation. Behavior-identical
                     // on every real return.
                     n if n > 0 => off = off.saturating_add(n),
-                    // Peer closed / hard error: the session is dead — drop the
-                    // spill (a blocking write would have reported Ok(0)/Err once;
-                    // these bytes were already accepted-for-delivery). Or a
-                    // discard dropped this chunk: told apart below.
+                    // Peer closed or hard error (the session is dead: drop the
+                    // spill), or a discard dropped this chunk; told apart below.
                     _ => {
                         dead = true;
                         break;
@@ -4431,7 +4425,7 @@ mod p04_direct_receipt_and_deferred_drainer_tests {
             "pending ⇒ the poke is renewed"
         );
         drop(held);
-        // Nothing drains until the WORKER arranges the drainer…
+        // Nothing drains until the worker arranges the drainer…
         assert_eq!(sink.try_egress_drained_to_kernel(), Some(false));
         // …which is the worker-side half.
         sink.arrange_pending_drainer();
@@ -4816,7 +4810,7 @@ mod metered_body_tests {
     /// comes back to the body, which writes it with no stop to drop it. RED
     /// with the twin handing the write no flag: a stop inside a blocked write
     /// is not seen until it returns, and the rest of its slice goes through
-    /// (KNOWN_ISSUES ATERM-KI-1014-6, until 2026-10-19).
+    /// .
     #[test]
     fn a_stop_reaches_the_windows_write_and_the_paste_ends_closed() {
         // `é` straddles the first slice boundary: its lead byte is the

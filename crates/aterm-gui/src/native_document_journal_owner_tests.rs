@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The owner identity on a draft journal and the launch sweep
-//! (ATERM-KI-1015-12): a process's lease, the owner set on each image, and a
+//! : a process's lease, the owner set on each image, and a
 //! sweep that takes only a clean journal nobody holds.
 
 use super::super::{DraftJournalHost, encode_journal};

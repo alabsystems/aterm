@@ -172,14 +172,10 @@ impl TerminalFacts {
 /// mode while the program is still writing; the mode level misses the second case, so the input
 /// is the program's account.
 ///
-/// A hidden cursor on a blank row is no caret either: Claude Code's question
-/// dialog leaves its hidden cursor at column 0 of the blank bottom row on its
-/// last option, where there is no glyph to arrive at. A shown cursor on a blank
-/// row (a fresh prompt, an empty editor line) passes, as does a hidden one
-/// beside a styled blank (a self-drawn caret). A shown caret passes on an
-/// unfinished frame, and a hidden one on a finished frame (including a bracket
-/// closed and reopened with nothing written). [`hidden_caret_withheld`] reads
-/// both cases under the same lock as the caret.
+/// A hidden cursor on a blank row is no caret either (Claude Code's question dialog parks it at
+/// column 0 of the blank bottom row); a shown one there passes, as does a hidden one beside a
+/// styled blank (a self-drawn caret). [`hidden_caret_withheld`] reads both cases under the
+/// caret's lock.
 #[inline]
 #[must_use]
 pub const fn motion_caret(
@@ -194,12 +190,9 @@ pub const fn motion_caret(
     }
 }
 
-/// Whether a hidden caret on `term` is withheld from the motion engines
-/// ([`motion_caret`]'s third input): the frame is unfinished
-/// ([`Terminal::sync_frame_unfinished`]), or no cell of the cursor's row draws
-/// anything (`draws_ink`). A styled blank (a TUI's inverse-space caret, a
-/// coloured line) counts as something. Read under the same lock as the caret;
-/// the row is walked only while the cursor is hidden.
+/// Whether a hidden caret on `term` is withheld from the motion engines ([`motion_caret`]'s
+/// third input): the frame is unfinished, or no cell of the cursor's row draws ink (a styled
+/// blank counts as ink). The row is walked only while the cursor is hidden.
 #[inline]
 #[must_use]
 pub fn hidden_caret_withheld(term: &Terminal) -> bool {

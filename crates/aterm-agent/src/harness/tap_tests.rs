@@ -64,11 +64,8 @@ fn tap(stdin: &[u8], vars: &TapVars, dir: Option<&Path>) -> (std::process::ExitC
     (code, String::from_utf8(out).expect("utf-8"))
 }
 
-/// THE VALUE IS aterm's TAP BYTE FOR BYTE, and only that value is ours: the
-/// round trip holds for an admissible path, and every near miss — a key more,
-/// another command, an argument after `tap`, a relative path, a path with a
-/// space or a quote — is another's, carried verbatim. NEGATIVE CONTROL: the
-/// same value with its refresh changed is not ours.
+/// The settings value round-trips for an admissible path, and every near miss (a key more,
+/// another command, an argument after `tap`, a relative path, a space or a quote) is not ours.
 #[cfg(unix)]
 #[test]
 fn the_tap_value_is_exact_and_only_it_is_ours() {

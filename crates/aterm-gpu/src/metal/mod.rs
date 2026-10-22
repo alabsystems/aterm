@@ -159,10 +159,8 @@ mod tests {
     use super::test_support::{plain_calayer, sublayer_count};
     use super::{ffi, shaders};
 
-    // -----------------------------------------------------------------
     // CPU parity: the shipped MSL field functions, as compute kernels
     // concatenated onto `cell.metal`, against `aterm_render`.
-    // -----------------------------------------------------------------
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -452,10 +450,8 @@ mod tests {
         assert!(checked > 30_000, "halo sweep unexpectedly small: {checked}");
     }
 
-    // -----------------------------------------------------------------
     // Pipeline state. Metal's defaults (write mask ALL, nearest filtering)
     // make a dropped setter silent, so every check is a readback.
-    // -----------------------------------------------------------------
 
     /// The 32-byte `Probe` uniform in `shaders/state_probe.metal`: `float4`
     /// colour at 0, `float2` destination size at 16, `float2` pad at 24.
@@ -839,9 +835,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // Blit differential: the Metal blit must match the wgpu blit byte for byte.
-    // -----------------------------------------------------------------------
 
     use aterm_core::terminal::Terminal;
     #[cfg(wgpu_arm)]

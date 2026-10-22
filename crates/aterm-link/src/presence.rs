@@ -229,9 +229,8 @@ pub struct Slot {
     /// only `detail=` and `phase=`, and no row is published off it. Cleared on a `GAP` (a
     /// `meta` push may have been coalesced away), so the next round re-reads.
     pub sampled: bool,
-    /// The tokens on the bus — [`Fields::tokens`] for the mode the row was
-    /// published in — and when. Tokens, not fields: a row is owed only when
-    /// the ROW would differ, and a `minimal` row carries `attention=` alone.
+    /// The tokens on the bus ([`Fields::tokens`] in the mode the row was published in) and
+    /// when. Tokens, not fields: a row is owed only when the row would differ.
     /// A row SENT and not yet answered counts ([`Slot::mark_published`]).
     published: Option<(String, Instant)>,
     /// The newest row the broker ANSWERED as landed: what `published` falls

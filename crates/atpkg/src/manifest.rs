@@ -883,7 +883,7 @@ pin = {{ trust = 7100, nn = 108 }}
         );
     }
 
-    // R4: a private-config repo (never named in the index) is unreachable BY CONSTRUCTION.
+    // R4: a repo the index never names (a private-config repo) is unreachable.
     #[test]
     fn unlisted_repo_is_unreachable() {
         let idx = parse_index(&verified(&full_index())).unwrap();
@@ -923,8 +923,7 @@ pin = {{ trust = 7100, nn = 108 }}
         );
     }
 
-    /// The `https` row keys parse as signed data (all `serde(default)`, so a row without
-    /// them — every existing manifest — is unchanged), `links` is a map, and a row with no
+    /// The `https` row keys parse (all `serde(default)`), `links` is a map, and a row with no
     /// `protocol` is `github-release`.
     #[test]
     fn parses_https_protocol_artifact_keys() {
@@ -992,10 +991,10 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
         let m = parse_pkg(&verified(&with)).expect("a valid shim_env parses");
         assert_eq!(m.shim_env, vec!["DISABLE_AUTOUPDATER=1".to_string()]);
         assert_eq!(m.shim_env().spelled(), "DISABLE_AUTOUPDATER=1");
-        // Absent: no environment, exactly as every manifest published before the key.
+        // Absent: no environment.
         let without = parse_pkg(&verified(&format!("{head}{row}"))).unwrap();
         assert!(without.shim_env.is_empty() && without.shim_env().is_empty());
-        // Refused, each by name, as ShimEnv — the publisher's verify-pkg spells the fix.
+        // Each refused by name as `ShimEnv`.
         // A control byte inside the TOML string (the string escape carries it through the
         // parser) is refused the same way.
         for list in [
@@ -1013,7 +1012,7 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
                 other => panic!("{list}: expected Reject::ShimEnv, got {other:?}"),
             }
         }
-        // The wrong TYPE is the parser's own refusal, as for any key.
+        // The wrong type is the parser's own refusal, as for any key.
         let body = format!("{head}shim_env = \"DISABLE_AUTOUPDATER=1\"\n{row}");
         assert_eq!(parse_pkg(&verified(&body)).unwrap_err(), Reject::Malformed);
     }

@@ -188,7 +188,7 @@ impl Lane {
     fn what(self) -> &'static str {
         match self {
             Lane::Throughput => "Terminal::process MB/s over a ~32 MiB mixed VT workload",
-            Lane::Pathological => "per-corpus MB/s under hostile input (floors per corpus)",
+            Lane::Pathological => "Terminal::process MB/s per hostile-input corpus",
             Lane::ScrollScrub => "scrollback scrub read-path rates over a 100k-line tiered fill",
             Lane::Search => "search index build, cached query and retained memory",
             Lane::Restore => "serialize -> fresh engine -> replay rate",
@@ -728,13 +728,13 @@ fn list() -> String {
     for kind in [Kind::Floor, Kind::Arena, Kind::Measured] {
         s.push_str(match kind {
             Kind::Floor => {
-                "FLOOR lanes (the default set; judged against crates/aterm-verify/perf/golden, \
-                 then the same-box trend, which a green run appends to)\n"
+                "FLOOR lanes (the default; judged against crates/aterm-verify/perf/golden, \
+                 then the same-box trend)\n"
             }
             Kind::Arena => {
-                "ARENA lanes (only when named; real windows, minutes; measured, not judged: \
-                 cat, scroll and vte write a docs/measured/arena entry, start and compare \
-                 print a summary, and JSON with --json-out)\n"
+                "ARENA lanes (only when named; real windows, minutes; measured, never judged: \
+                 cat, scroll and vte write a docs/measured/arena entry, start and compare print \
+                 a summary)\n"
             }
             Kind::Measured => {
                 "MEASURED lanes (only when named; headless, real processes, minutes; measured, \

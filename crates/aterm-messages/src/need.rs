@@ -143,9 +143,7 @@ pub const RESTATE_QUIET: Duration = Duration::from_mins(10);
 /// long, unless its key changes.
 pub const STANDING_QUIET: Duration = Duration::from_hours(24);
 
-// ---------------------------------------------------------------------------
 // Words
-// ---------------------------------------------------------------------------
 
 /// Stems a reason may not lean on: it says why a person is needed, not that something
 /// is pending.
@@ -310,9 +308,7 @@ impl From<StandingWhy> for Why {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The one action
-// ---------------------------------------------------------------------------
 
 /// A button that moves the outcome. Only whitelisted constructors exist: none for `Not
 /// today`, `Skip version`, `Not now`, `Details`, `Show tab` or `Open log`, since a snooze,
@@ -439,9 +435,7 @@ impl Then {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Spans, fingerprints, horizons
-// ---------------------------------------------------------------------------
 
 /// How long a transient ask stays: a named span, never a number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -586,9 +580,7 @@ impl Horizon {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The asks
-// ---------------------------------------------------------------------------
 
 /// The seal on a persistent hold ([`Hold::Standing`], [`Hold::Ask`]): no public
 /// constructor, so only this crate mints it, from an [`Ask`] or the carry decoder. A
@@ -906,9 +898,7 @@ fn hours_words(d: Duration) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The class
-// ---------------------------------------------------------------------------
 
 /// The closed list of transient rows that ask nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

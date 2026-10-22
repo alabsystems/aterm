@@ -263,14 +263,11 @@ pub(crate) fn published() -> Option<SocketIdentity> {
         .clone()
 }
 
-/// Move the published witness onto the socket the supervised listener just
-/// renamed over its OWN endpoint (`control_listener::rebind_socket`). The token
-/// file is untouched by a rebind, so only the socket vnode changes — and only
-/// when the witness being replaced names `previous` (the vnode that rebind
-/// replaced): a witness for anything else is left exactly as it was. The new
-/// witness must still verify against the files ([`SocketIdentity::matches_current`]),
-/// or nothing is published and a later handoff fails closed rather than
-/// trusting a stale inode. Returns whether the witness moved.
+/// Move the published witness onto the socket the supervised listener just renamed over its
+/// own endpoint (`control_listener::rebind_socket`), only when the witness names `previous`
+/// (the replaced vnode). The token file is untouched, so only the socket vnode changes; the
+/// moved witness must still pass [`SocketIdentity::matches_current`] or nothing moves and a
+/// later handoff fails closed. Returns whether the witness moved.
 #[cfg(unix)]
 pub(crate) fn republish_rebound(plan: &SocketPlan, previous: (u64, u64)) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -307,17 +304,15 @@ fn bind_command_identity(
     command: &mut aterm_uds::spawnfd::StdCommand,
     identity: Option<&SocketIdentity>,
 ) {
-    // LaunchServices accepts merge-only environment additions. Removing a key
-    // would force the fork fallback, so an explicit empty value clears inherited
-    // authority while preserving the outgoing transport's process identity.
+    // LaunchServices accepts only environment additions (removing a key forces the fork
+    // fallback), so an explicit empty value clears inherited authority.
     command.envs([ENV_IDENTITY.pair("")]);
     if let Some(wire) = identity.and_then(SocketIdentity::encode) {
         command.envs([ENV_IDENTITY.pair(wire)]);
     }
 }
 
-/// [`consume_incoming_from`] over the process environment: the env-shaped entry
-/// point this module's suite drives (`handoff_env::through_process_env`).
+/// [`consume_incoming_from`] over the process environment, for this module's tests.
 #[cfg(all(test, unix))]
 pub(crate) fn consume_incoming() -> Result<Option<SocketIdentity>, String> {
     crate::handoff_env::through_process_env(&[ENV_IDENTITY], consume_incoming_from)

@@ -977,9 +977,7 @@ fn the_ring_writer_stands_apart_from_the_journal_writer() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The control slot (increment 7)
-// ---------------------------------------------------------------------------
 
 /// A small layout with a control slot of `ctl_cap` bytes between the tail and the ring
 /// (`Geometry::custom` packs none).

@@ -163,9 +163,7 @@ const MAX_CONTRIBUTIONS: usize = (HORIZON_S / BUCKET_S) as usize + 1;
 /// How much one read call asks the kernel for.
 const READ_CHUNK: usize = 64 * 1024;
 
-// ---------------------------------------------------------------------------
 // The price table — read from its file, handed in, never built in
-// ---------------------------------------------------------------------------
 
 /// Dollars per million tokens in each token class. `input` and `output`
 /// always have a price; a cache class the vendor's page lists none for is
@@ -448,9 +446,7 @@ fn is_day(text: &str) -> bool {
         })
 }
 
-// ---------------------------------------------------------------------------
 // What is counted
-// ---------------------------------------------------------------------------
 
 /// One served message as a fold yields it: when it was served, its model, its
 /// tokens, and whether the table cannot price it exactly.
@@ -669,9 +665,7 @@ fn family_of(model: &str) -> Option<String> {
     super::upgrade_models::family_version(model).map(|(family, _)| family)
 }
 
-// ---------------------------------------------------------------------------
 // The cursor of one transcript
-// ---------------------------------------------------------------------------
 
 /// How far one transcript has been folded.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -869,9 +863,7 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
-// ---------------------------------------------------------------------------
 // The spend of one home
-// ---------------------------------------------------------------------------
 
 /// How much one fold may do: bytes read, and a deadline.
 #[derive(Debug, Clone, Copy)]
@@ -1563,9 +1555,7 @@ fn walk(projects: &Path, since: i64, limits: &Limits) -> Walk {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Windows
-// ---------------------------------------------------------------------------
 
 /// A span of time to sum: buckets that START in `[from, to)`, or, `whole`,
 /// that lie wholly inside it (so nothing after `to` is counted).

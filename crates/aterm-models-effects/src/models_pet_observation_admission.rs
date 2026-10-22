@@ -5,23 +5,19 @@
 
 use aterm_spec::derive::Model;
 
-/// A missing observation and a failed observation carry different authority.
-/// Legacy hosts that never supplied a world can keep moving. While the host
-/// admits console presentation, a supplied but incoherent world must freeze
-/// existing locomotion and must not commission new motion. Coherence recovery
-/// restores normal admission. Paths without console custody are not frozen by
-/// this rule; their host withholds the caret instead.
+/// A missing observation and a failed observation carry different authority. A host that never
+/// supplied a world keeps moving. While the host admits console presentation, a supplied but
+/// incoherent world freezes existing locomotion and commissions no new motion; coherence restores
+/// normal admission. Paths without console custody are not frozen by this rule; their host
+/// withholds the caret instead.
 ///
-/// The host has admitted presentation throughout this model; host-level
-/// suppression is a separate policy. `legacy` projects
-/// `PetBrain::console_legacy_motion_pending`; `moved` records a changed body
-/// position during the current tick, at FIXED pane geometry.
-/// These are nondeterministic motion outcomes, not a model of the trajectory,
-/// animation clock, protection policy, or the timers/input bookkeeping which
-/// must continue while movement is suspended. Observation alone moves nothing.
-/// Tier-1 binds the suspended transition to real Terminal/PetBrain frames.
-/// `Buggy=1` restores the old fallthrough into legacy locomotion on a failed
-/// observation, catching both newly commissioned and already active motion.
+/// The host admits presentation throughout; host-level suppression is a separate policy.
+/// `legacy` projects `PetBrain::console_legacy_motion_pending`; `moved` records a changed body
+/// position during the current tick, at fixed pane geometry. Motion outcomes are
+/// nondeterministic: the trajectory, animation clock, protection policy and the timers/input
+/// bookkeeping that continue while movement is suspended are out of the model. Tier-1 binds the
+/// suspended transition to real Terminal/PetBrain frames. `Buggy=1` falls through into legacy
+/// locomotion on a failed observation, catching both newly commissioned and active motion.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn console_observation_admission_model() -> Model {

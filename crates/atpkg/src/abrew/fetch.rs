@@ -319,7 +319,12 @@ pub(super) fn is_dmg(name: &str) -> bool {
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn copy_mounted_tree(src_root: &Path, dir: &Path) -> Result<(), String> {
     use crate::install::{MAX_ENTRIES, UNSIGNED_SIZE_CAP};
-    std::fs::create_dir_all(dir).map_err(|e| format!("abrew: {e}"))?;
+    // The stage and every entry are exclusive: a case-sensitive image may
+    // contain names that alias on the destination filesystem. Reusing an
+    // earlier symlink as a directory would invalidate the lexical link check.
+    std::fs::create_dir(dir).map_err(|e| format!("abrew: {e}"))?;
+    crate::platform::set_mode(dir, crate::extract::safe_mode(0, true))
+        .map_err(|e| format!("abrew: {e}"))?;
     let mut entries: u64 = 0;
     let mut bytes: u64 = 0;
     let mut stack: Vec<std::path::PathBuf> = vec![std::path::PathBuf::new()];
@@ -336,10 +341,9 @@ fn copy_mounted_tree(src_root: &Path, dir: &Path) -> Result<(), String> {
             let rel_path = rel.join(entry.file_name());
             let dst = dir.join(&rel_path);
             if kind.is_dir() {
-                std::fs::create_dir_all(&dst).map_err(|e| format!("abrew: {e}"))?;
-                if let Ok(meta) = entry.metadata() {
-                    let _ = std::fs::set_permissions(&dst, meta.permissions());
-                }
+                std::fs::create_dir(&dst).map_err(|e| format!("abrew: {e}"))?;
+                crate::platform::set_mode(&dst, crate::extract::safe_mode(0, true))
+                    .map_err(|e| format!("abrew: {e}"))?;
                 stack.push(rel_path);
             } else if kind.is_symlink() {
                 let target = std::fs::read_link(entry.path()).map_err(|e| format!("abrew: {e}"))?;
@@ -351,14 +355,29 @@ fn copy_mounted_tree(src_root: &Path, dir: &Path) -> Result<(), String> {
                 }
             } else if kind.is_file() {
                 let meta = entry.metadata().map_err(|e| format!("abrew: {e}"))?;
-                bytes = bytes.saturating_add(meta.len());
+                let remaining = UNSIGNED_SIZE_CAP.saturating_sub(bytes);
+                if meta.len() > remaining {
+                    return Err("abrew: dmg size limit exceeded".to_string());
+                }
+                let source = std::fs::File::open(entry.path())
+                    .map_err(|e| format!("abrew: cannot read payload: {e}"))?;
+                let mut dest = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&dst)
+                    .map_err(|e| format!("abrew: cannot stage payload: {e}"))?;
+                let copied =
+                    std::io::copy(&mut source.take(remaining.saturating_add(1)), &mut dest)
+                        .map_err(|e| format!("abrew: cannot stage payload: {e}"))?;
+                bytes = bytes.saturating_add(copied);
                 if bytes > UNSIGNED_SIZE_CAP {
                     return Err("abrew: dmg size limit exceeded".to_string());
                 }
-                std::fs::copy(entry.path(), &dst)
-                    .map_err(|e| format!("abrew: cannot stage payload: {e}"))?;
-                std::fs::set_permissions(&dst, meta.permissions())
-                    .map_err(|e| format!("abrew: {e}"))?;
+                crate::platform::set_mode_on(
+                    &dest,
+                    crate::extract::safe_mode(crate::platform::permission_mode(&meta), false),
+                )
+                .map_err(|e| format!("abrew: {e}"))?;
             } else {
                 return Err(format!(
                     "abrew: dmg contains a nonregular entry: {}",
@@ -370,69 +389,263 @@ fn copy_mounted_tree(src_root: &Path, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Detach backstop: a mounted image must never outlive the copy,
-/// even on a panic path.
+/// A disk-image failure's origin, independent of payload names in its text.
+#[derive(Debug)]
+pub(super) enum DmgError {
+    Attach(String),
+    #[cfg(any(target_os = "macos", test))]
+    Payload(String),
+    #[cfg(any(target_os = "macos", test))]
+    Detach,
+    #[cfg(any(target_os = "macos", test))]
+    Uncertain(String),
+}
+
+impl std::fmt::Display for DmgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Attach(message) => write!(f, "abrew: dmg attach failed: {message}"),
+            #[cfg(any(target_os = "macos", test))]
+            Self::Payload(message) => f.write_str(message),
+            #[cfg(any(target_os = "macos", test))]
+            Self::Detach => f.write_str("abrew: dmg detach failed"),
+            #[cfg(any(target_os = "macos", test))]
+            Self::Uncertain(message) => f.write_str(message),
+        }
+    }
+}
+
+// An image's verification and mount may take substantially longer than a small
+// tool probe. Detach has no payload to process. These bound helper waits, not
+// filesystem copies, spawn itself, or work in macOS's disk-image service.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const DMG_ATTACH_LIMIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const DMG_DETACH_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(target_os = "macos")]
-struct MountGuard(std::path::PathBuf);
+const DMG_REAP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Retention is the default even if a backstop panics. Only confirmed cleanup
+/// takes the TempDir out of this wrapper and permits its recursive deletion.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+struct RetainedImage(Option<aterm_tempfile::TempDir>);
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+impl Drop for RetainedImage {
+    fn drop(&mut self) {
+        if let Some(root) = self.0.take() {
+            let _ = root.keep();
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+#[derive(Clone, Copy)]
+enum DmgStep {
+    Attach,
+    Detach,
+    ForceDetach,
+}
+
+/// Own the image actually passed to attach, as well as its mountpoint. A cache
+/// eviction or a caller's TempDir drop cannot remove an uncertain helper's input.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+struct MountGuard<'a, F>
+where
+    F: FnMut(
+        &mut aterm_uds::spawnfd::Command,
+        std::time::Duration,
+    ) -> Result<Output, aterm_uds::deadline::RunError>,
+{
+    root: RetainedImage,
+    image: std::path::PathBuf,
+    point: std::path::PathBuf,
+    run: &'a mut F,
+    needs_detach: bool,
+    uncertain: Option<&'static str>,
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+impl<F> MountGuard<'_, F>
+where
+    F: FnMut(
+        &mut aterm_uds::spawnfd::Command,
+        std::time::Duration,
+    ) -> Result<Output, aterm_uds::deadline::RunError>,
+{
+    fn helper(&mut self, step: DmgStep) -> Result<Output, aterm_uds::deadline::RunError> {
+        // Arm before command construction or the runner: unwinding is not a
+        // completed helper, and outputs_until's error is not a reap certificate.
+        let was_uncertain = self.uncertain;
+        self.uncertain = Some("helper completion was not observed");
+        let mut cmd = aterm_uds::spawnfd::command("/usr/bin/hdiutil");
+        let within = match step {
+            DmgStep::Attach => {
+                cmd.args([
+                    "attach",
+                    "-readonly",
+                    "-nobrowse",
+                    "-noautoopen",
+                    "-mountpoint",
+                ])
+                .arg(&self.point)
+                .arg(&self.image);
+                DMG_ATTACH_LIMIT
+            }
+            DmgStep::Detach | DmgStep::ForceDetach => {
+                cmd.arg("detach");
+                if matches!(step, DmgStep::ForceDetach) {
+                    cmd.arg("-force");
+                }
+                cmd.arg("-quiet").arg(&self.point);
+                DMG_DETACH_LIMIT
+            }
+        };
+        let answer = (self.run)(&mut cmd, within);
+        self.uncertain = was_uncertain.or_else(|| {
+            answer
+                .is_err()
+                .then_some("helper completion was not observed")
+        });
+        answer
+    }
+
+    fn cleanup(&mut self) -> bool {
+        if self.uncertain.is_some() {
+            // A late attach can follow a successful detach. Another helper
+            // cannot turn that unknown operation into permission to delete.
+            return false;
+        }
+        if !self.needs_detach {
+            return true;
+        }
+        if self
+            .helper(DmgStep::ForceDetach)
+            .is_ok_and(|out| out.status.success())
+        {
+            self.needs_detach = false;
+            true
+        } else {
+            // No second cleanup attempt in Drop and no delegation while the
+            // mount's cleanup is unconfirmed, even after a completed refusal.
+            if self.uncertain.is_none() {
+                self.uncertain = Some("resource cleanup was not confirmed");
+            }
+            false
+        }
+    }
+
+    fn finish(mut self, result: Result<(), DmgError>) -> Result<(), DmgError> {
+        if self.cleanup() {
+            return result;
+        }
+        let prior = result.err().map_or_else(String::new, |e| format!("{e}; "));
+        let why = self
+            .uncertain
+            .unwrap_or("resource cleanup was not confirmed");
+        Err(DmgError::Uncertain(format!(
+            "{prior}abrew: dmg {why}; retained image and mountpoint in {}",
+            self.image.parent().unwrap_or(&self.image).display()
+        )))
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+impl<F> Drop for MountGuard<'_, F>
+where
+    F: FnMut(
+        &mut aterm_uds::spawnfd::Command,
+        std::time::Duration,
+    ) -> Result<Output, aterm_uds::deadline::RunError>,
+{
+    fn drop(&mut self) {
+        if self.cleanup() {
+            drop(self.root.0.take());
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
-impl Drop for MountGuard {
-    fn drop(&mut self) {
-        let _ = aterm_uds::spawnfd::command("/usr/bin/hdiutil")
-            .args(["detach", "-force", "-quiet"])
-            .arg(&self.0)
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .output();
-    }
+fn run_dmg_helper(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    within: std::time::Duration,
+) -> Result<Output, aterm_uds::deadline::RunError> {
+    // Unix's poll-based runner starts no reader threads, caps both output
+    // tails, and bounds its SIGKILL/reap reserve. An error remains unknown:
+    // a child may be handed to the reaper, and OS services are not its group.
+    aterm_uds::deadline::outputs_until(
+        &mut [cmd],
+        std::time::Instant::now() + within,
+        DMG_REAP_LIMIT,
+    )
+    .pop()
+    .unwrap_or(Err(aterm_uds::deadline::RunError::TimedOut))
 }
 
 /// Extract a disk image by mounting it read-only and copying the
 /// payload out under the bounded, vetted copy above. No license is
 /// ever agreed to (stdin is /dev/null: an image that demands one
-/// fails the attach and delegates), nothing on the image runs, and
-/// the image is always detached. Attach failures read
-/// "dmg attach failed" so the caller can delegate them; copy
-/// vetting failures are hard errors.
+/// fails the attach), and nothing on the image runs. Detach
+/// is bounded on every known exit. Unknown helpers retain their actual image
+/// input and mount root; they never delegate or race another cleanup helper.
+/// Once attach starts, only completed refusals with completed cleanup delegate.
 #[cfg(target_os = "macos")]
-pub(super) fn extract_dmg(dmg: &Path, dir: &Path) -> Result<(), String> {
-    let mount = aterm_tempfile::tempdir().map_err(|e| format!("abrew: dmg attach failed: {e}"))?;
-    let out = aterm_uds::spawnfd::command("/usr/bin/hdiutil")
-        .args([
-            "attach",
-            "-readonly",
-            "-nobrowse",
-            "-noautoopen",
-            "-mountpoint",
-        ])
-        .arg(mount.path())
-        .arg(dmg)
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .output()
-        .map_err(|e| format!("abrew: dmg attach failed: {e}"))?;
+pub(super) fn extract_dmg(dmg: &Path, dir: &Path) -> Result<(), DmgError> {
+    let root = aterm_tempfile::tempdir().map_err(|e| DmgError::Attach(e.to_string()))?;
+    extract_dmg_with(dmg, dir, root, run_dmg_helper)
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn extract_dmg_with<F>(
+    dmg: &Path,
+    dir: &Path,
+    root: aterm_tempfile::TempDir,
+    mut run: F,
+) -> Result<(), DmgError>
+where
+    F: FnMut(
+        &mut aterm_uds::spawnfd::Command,
+        std::time::Duration,
+    ) -> Result<Output, aterm_uds::deadline::RunError>,
+{
+    let image = root.path().join("image.dmg");
+    copy_regular(dmg, &image).map_err(DmgError::Attach)?;
+    let mount_path = root.path().join("mount");
+    std::fs::create_dir(&mount_path).map_err(|e| DmgError::Attach(e.to_string()))?;
+    let mut guard = MountGuard {
+        root: RetainedImage(Some(root)),
+        image,
+        point: mount_path.clone(),
+        run: &mut run,
+        needs_detach: true,
+        uncertain: None,
+    };
+    let out = match guard.helper(DmgStep::Attach) {
+        Ok(out) => out,
+        Err(e) => return guard.finish(Err(DmgError::Attach(e.to_string()))),
+    };
     if !out.status.success() {
-        return Err(format!(
-            "abrew: dmg attach failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return guard.finish(Err(DmgError::Attach(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        )));
     }
-    let guard = MountGuard(mount.path().to_path_buf());
-    let copied = copy_mounted_tree(mount.path(), dir);
-    let detached = aterm_uds::spawnfd::command("/usr/bin/hdiutil")
-        .args(["detach", "-quiet"])
-        .arg(mount.path())
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .output();
-    drop(guard);
-    copied?;
-    match detached {
-        Ok(o) if o.status.success() => Ok(()),
-        _ => Err("abrew: dmg detach failed".to_string()),
+    let copied = copy_mounted_tree(&mount_path, dir).map_err(DmgError::Payload);
+    let detached = guard.helper(DmgStep::Detach);
+    let detached = detached.is_ok_and(|out| out.status.success());
+    if detached {
+        guard.needs_detach = false;
     }
+    let result = copied.and(if detached {
+        Ok(())
+    } else {
+        Err(DmgError::Detach)
+    });
+    guard.finish(result)
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(super) fn extract_dmg(_dmg: &Path, _dir: &Path) -> Result<(), String> {
-    Err("abrew: dmg attach failed: disk images need macOS".to_string())
+pub(super) fn extract_dmg(_dmg: &Path, _dir: &Path) -> Result<(), DmgError> {
+    Err(DmgError::Attach("disk images need macOS".to_string()))
 }
 
 /// Extract through atpkg's entry-by-entry path and symlink admission. The
@@ -587,11 +800,28 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mounted_tree_copy_skips_escaping_alias_and_keeps_in_root_links() {
+        use std::os::unix::fs::PermissionsExt as _;
         let tmp = aterm_tempfile::tempdir().unwrap();
         let src = tmp.path().join("mnt");
         let dst = tmp.path().join("out");
         std::fs::create_dir_all(src.join("Demo.app/Contents")).unwrap();
         std::fs::write(src.join("Demo.app/Contents/Info.plist"), b"plist").unwrap();
+        std::fs::write(src.join("Demo.app/Contents/tool"), b"executable payload").unwrap();
+        std::fs::set_permissions(
+            src.join("Demo.app/Contents/Info.plist"),
+            std::fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            src.join("Demo.app/Contents/tool"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            src.join("Demo.app/Contents"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
         super::super::prefix::symlink_dir(Path::new("/Applications"), &src.join("Applications"))
             .unwrap();
         super::super::prefix::symlink_file(
@@ -599,7 +829,29 @@ mod tests {
             &src.join("alias"),
         )
         .unwrap();
-        copy_mounted_tree(&src, &dst).unwrap();
+        let copied = copy_mounted_tree(&src, &dst);
+        std::fs::set_permissions(
+            src.join("Demo.app/Contents"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        copied.unwrap();
+        for (path, mode) in [
+            ("", 0o755),
+            ("Demo.app/Contents", 0o755),
+            ("Demo.app/Contents/Info.plist", 0o644),
+            ("Demo.app/Contents/tool", 0o755),
+        ] {
+            assert_eq!(
+                std::fs::metadata(dst.join(path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                mode,
+                "{path} uses the staged tree's safe mode"
+            );
+        }
         assert_eq!(
             std::fs::read(dst.join("Demo.app/Contents/Info.plist")).unwrap(),
             b"plist"
@@ -611,6 +863,153 @@ mod tests {
         assert_eq!(std::fs::read(dst.join("alias")).unwrap(), b"plist");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dmg_helpers_retain_uncertain_inputs_until_cleanup_is_confirmed() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        fn answer(code: i32) -> Output {
+            Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: Vec::new(),
+                stderr: b"unsupported image".to_vec(),
+            }
+        }
+
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let original = tmp.path().join("caller.dmg");
+        for scenario in [
+            "copied",
+            "refused",
+            "attach-unknown",
+            "detach-unknown",
+            "backstop-unknown",
+            "backstop-refused",
+            "detach-refused",
+            "attach-panic",
+        ] {
+            std::fs::write(&original, b"owned image bytes").unwrap();
+            let out = tmp.path().join(scenario);
+            // The outer guard owns every retained ordinary-file root even
+            // if an assertion unwinds. This injected runner never mounts or
+            // starts a real helper, so its roots can safely be reclaimed.
+            let scratch = aterm_tempfile::TempDir::new_in(tmp.path()).unwrap();
+            let root = scratch.path().to_path_buf();
+            let mut calls = Vec::new();
+            // Only the helper boundary is injected. The production command,
+            // guard, private image copy and mounted-tree copier run unchanged.
+            let mut run = |cmd: &mut aterm_uds::spawnfd::Command, _within| {
+                assert_eq!(cmd.get_program(), "/usr/bin/hdiutil");
+                let args: Vec<_> = cmd.get_args().map(std::ffi::OsStr::to_os_string).collect();
+                if args[0] == "attach" {
+                    let point = std::path::PathBuf::from(&args[5]);
+                    let image = std::path::PathBuf::from(&args[6]);
+                    assert_ne!(image, original, "the caller's path is never attached");
+                    assert_eq!(image.parent(), point.parent());
+                    assert_eq!(std::fs::read(&image).unwrap(), b"owned image bytes");
+                    assert_eq!(point.parent(), Some(root.as_path()));
+                    calls.push("attach");
+                    // The helper's actual input survives a caller cleaning up
+                    // its own image while attach is still in progress.
+                    std::fs::remove_file(&original).unwrap();
+                    assert_eq!(std::fs::read(&image).unwrap(), b"owned image bytes");
+                    if scenario == "attach-panic" {
+                        panic!("injected helper unwind");
+                    }
+                    if scenario == "attach-unknown" {
+                        return Err(aterm_uds::deadline::RunError::TimedOut);
+                    }
+                    if matches!(
+                        scenario,
+                        "refused" | "backstop-unknown" | "backstop-refused"
+                    ) {
+                        return Ok(answer(1));
+                    }
+                    std::fs::create_dir_all(point.join("Demo.app/Contents")).unwrap();
+                    std::fs::write(point.join("Demo.app/Contents/tool"), b"payload").unwrap();
+                    return Ok(answer(0));
+                }
+                assert_eq!(args[0], "detach");
+                let forced = args.iter().any(|arg| arg == "-force");
+                calls.push(if forced { "force" } else { "detach" });
+                assert!(root.join("image.dmg").is_file());
+                if (forced && scenario == "backstop-unknown")
+                    || (!forced && scenario == "detach-unknown")
+                {
+                    return Err(aterm_uds::deadline::RunError::TimedOut);
+                }
+                Ok(answer(i32::from(
+                    (forced && scenario == "backstop-refused")
+                        || (!forced && scenario == "detach-refused"),
+                )))
+            };
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                extract_dmg_with(&original, &out, scratch, &mut run)
+            }));
+            if scenario == "attach-panic" {
+                assert!(result.is_err());
+                assert_eq!(calls, ["attach"], "no late detach after an unknown helper");
+            } else {
+                let result = result.expect("only the injected panic unwinds");
+                match scenario {
+                    "copied" => {
+                        result.unwrap();
+                        assert_eq!(calls, ["attach", "detach"]);
+                    }
+                    "refused" => {
+                        assert!(matches!(result, Err(DmgError::Attach(_))));
+                        assert_eq!(calls, ["attach", "force"]);
+                        assert!(!out.exists(), "an attach refusal copies nothing");
+                    }
+                    "detach-refused" => {
+                        assert!(matches!(result, Err(DmgError::Detach)));
+                        assert_eq!(calls, ["attach", "detach", "force"]);
+                    }
+                    _ => {
+                        assert!(matches!(result, Err(DmgError::Uncertain(_))));
+                        assert_eq!(
+                            calls,
+                            if scenario == "attach-unknown" {
+                                vec!["attach"]
+                            } else if scenario == "detach-unknown" {
+                                vec!["attach", "detach"]
+                            } else {
+                                vec!["attach", "force"]
+                            },
+                            "unknown cleanup is never retried in Drop"
+                        );
+                    }
+                }
+            }
+            let retained = matches!(
+                scenario,
+                "attach-unknown"
+                    | "detach-unknown"
+                    | "backstop-unknown"
+                    | "backstop-refused"
+                    | "attach-panic"
+            );
+            assert_eq!(root.exists(), retained, "{scenario}");
+            if retained {
+                assert_eq!(
+                    std::fs::read(root.join("image.dmg")).unwrap(),
+                    b"owned image bytes"
+                );
+                assert!(root.join("mount").is_dir());
+                // This boundary ran no process and mounted nothing. Only its
+                // own exclusive ordinary-file fixture is removed after proof.
+                std::fs::remove_dir_all(&root).unwrap();
+            }
+            if matches!(scenario, "copied" | "detach-refused" | "detach-unknown") {
+                assert_eq!(
+                    std::fs::read(out.join("Demo.app/Contents/tool")).unwrap(),
+                    b"payload"
+                );
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn dmg_mount_copy_detaches_and_stages_app() {
@@ -618,24 +1017,37 @@ mod tests {
         let src = tmp.path().join("image");
         std::fs::create_dir_all(src.join("Demo.app/Contents/MacOS")).unwrap();
         std::fs::write(src.join("Demo.app/Contents/MacOS/demo"), b"bin").unwrap();
-        let made = aterm_uds::spawnfd::command("/usr/bin/hdiutil")
-            .args(["create", "-quiet", "-srcfolder"])
-            .arg(&src)
+        // An HFS image `makehybrid` writes directly: `extract_dmg` attaches,
+        // copies and detaches it as it does a cask's UDIF image, and it is made
+        // in 0.02 s and attached in 0.12 s, where `create -srcfolder` took 4.0 s
+        // and its attach 2.4 s (14.4 s for this test beside the rest of `--lib`).
+        let mut make = aterm_uds::spawnfd::command("/usr/bin/hdiutil");
+        make.args(["makehybrid", "-quiet", "-hfs", "-o"])
             .arg(tmp.path().join("demo.dmg"))
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .output()
-            .unwrap();
-        assert!(made.status.success(), "hdiutil create fixture");
+            .arg(&src)
+            .stdin(aterm_uds::spawnfd::Stdio::null());
+        let mut retained = RetainedImage(Some(tmp));
+        let made = run_dmg_helper(&mut make, std::time::Duration::from_secs(60)).unwrap();
+        let tmp = retained.0.take().unwrap();
+        assert!(
+            made.status.success(),
+            "hdiutil makehybrid fixture: {made:?}"
+        );
         let out = tmp.path().join("payload");
         extract_dmg(&tmp.path().join("demo.dmg"), &out).unwrap();
         assert_eq!(
             std::fs::read(out.join("Demo.app/Contents/MacOS/demo")).unwrap(),
             b"bin"
         );
-        // A garbage image fails the attach (delegable), never copies.
+        // A garbage image never copies. Delegation also needs confirmed
+        // cleanup: a refusal whose cleanup is unknown remains a hard error.
         std::fs::write(tmp.path().join("junk.dmg"), b"not an image").unwrap();
         let err = extract_dmg(&tmp.path().join("junk.dmg"), &tmp.path().join("nope")).unwrap_err();
-        assert!(err.contains("dmg attach failed"), "{err}");
+        assert!(
+            matches!(err, DmgError::Attach(_) | DmgError::Uncertain(_)),
+            "{err}"
+        );
+        assert!(!tmp.path().join("nope").exists());
     }
 
     #[test]

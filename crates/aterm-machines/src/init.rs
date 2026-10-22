@@ -31,8 +31,9 @@ pub const USAGE: &str = "aterm init [--plan | --check] [--json] [--only <item,..
     and reads back each setting; safe to run again.\n\
     Joins the secrets vault (aterm help secrets): the ALab vault when it answers\n\
     on this network (asking only for its join password), else the one you name.\n\
-    Optional ~/.config/aterm/init.toml [github] config authenticates gh and clones\n\
-    all accessible owned repositories into your home; see aterm help init.\n\
+    Optional ~/.config/aterm/init.toml [github] config keeps its GitHub token in\n\
+    the login keychain and clones all accessible owned repositories into your\n\
+    home; see aterm help init.\n\
     Run as the logged-in user, without sudo. Account sign-out may need\n\
     Accessibility and Automation permission for aterm in System Settings.\n\
 \n\

@@ -15,6 +15,11 @@ fn main() {
     {
         std::process::exit(aterm_verify::testrun::record_main(&raw[1..]));
     }
+    // Cargo's doc driver during the doctests: the stage names the real one in
+    // the environment and this binary as `RUSTDOC` (`aterm_verify::docdriver`).
+    if std::env::var_os(aterm_verify::docdriver::DRIVER_ENV).is_some() {
+        std::process::exit(aterm_verify::docdriver::main(&raw));
+    }
     let args: Vec<String> = raw
         .iter()
         .map(|a| a.to_string_lossy().into_owned())

@@ -524,7 +524,7 @@ fn the_end_of_a_scrolled_page_fills_its_screen() {
             let Some(plan) = lab.state().scroll_plan() else {
                 continue;
             };
-            lab.state_mut().page_scroll = plan.limit();
+            lab.state_mut().scroll_page_to(plan.limit());
             lab.state_mut().page_reveal = None;
             let compiled = lab.compile(width, height);
             let (plan, shown) = lab.state().scroll_shown().expect("a list");
@@ -1012,7 +1012,7 @@ fn the_draft_bar_is_one_row_where_its_words_fit_beside_its_buttons() {
     assert!(painted.ends_with("or discard it."), "{painted}");
 }
 
-/// A FONT ROW'S VALUE IS WHOLE ON EVERY FORM OF ITS ROW (the round-14
+/// A FONT ROW'S VALUE IS WHOLE ON EVERY FORM OF ITS ROW (the
 /// audit): with the terminal's report of the faces it draws in ("SF Mono
 /// Light Italic", "Apple Color Emoji") and a long saved family, Text &
 /// Fonts at a short compact window (738x180), a tall one (738x420), a
@@ -1069,7 +1069,7 @@ fn a_font_rows_value_is_whole_on_every_form_of_its_row() {
                 assert!(lab.state_mut().replace_drawn_faces(Some(drawn.clone())));
                 let mut page = 0;
                 loop {
-                    lab.state_mut().page_scroll = page;
+                    lab.state_mut().scroll_page_to(page);
                     lab.state_mut().page_reveal = None;
                     let screen = lab.compile(width, height);
                     let context = format!(
@@ -1121,7 +1121,7 @@ fn a_font_rows_value_is_whole_on_every_form_of_its_row() {
 }
 
 /// A REFUSED DRAFT'S SENTENCE IS READ WHOLE UNDER ITS BAR'S BUTTONS (the
-/// round-14 audit): from the 164pt window floor up to where the sentence
+/// audit): from the 164pt window floor up to where the sentence
 /// fits beside its buttons, 1× and 2× text, the unsaved-draft bar sets its
 /// words over its buttons on the lines they take — every word on a line,
 /// none cut — its words' box holding its lines and its buttons under them.
@@ -1213,7 +1213,7 @@ fn a_refused_drafts_sentence_is_read_whole_under_its_buttons() {
     });
 }
 
-/// A STATUS BAR'S STACKED BUTTONS KEEP THEIR WORDS (the round-14 review):
+/// A STATUS BAR'S STACKED BUTTONS KEEP THEIR WORDS (the review):
 /// where a bar's buttons go one under another — the unsaved-draft dock
 /// beside the compact toolbar's back button at 2× text in a 22- or
 /// 24-column window — each paints its whole words, on lines where one line
@@ -1264,7 +1264,7 @@ fn a_status_bars_stacked_buttons_keep_their_words() {
 }
 
 /// A DOCKED STATUS'S ACTIONS UNDER ITS WORDS STAND ACROSS THE TOOLBAR (the
-/// round-14 review): where the compact toolbar's dock lays a refused
+/// review): where the compact toolbar's dock lays a refused
 /// draft's Review and Discard under its words (2× text in a 22-column
 /// window), they take the toolbar's whole width, under its leading button
 /// too, each word whole on one line, and the page keeps the room the
@@ -1459,7 +1459,7 @@ fn the_tab_color_page_does_not_offer_to_open_itself() {
         let mut lab = Lab::new("");
         lab.state_mut().navigate(SettingsRoute::TabColor);
         // The list's last screen, where the hex row is.
-        lab.state_mut().page_scroll = 1_000;
+        lab.state_mut().scroll_page_to(1_000);
         let compiled = lab.compile(width, height);
         assert!(
             compiled.paint.iter().any(|node| node.key.as_str()
@@ -1993,7 +1993,7 @@ fn no_list_top_slices_a_line_in_a_short_window() {
                 let _ = lab.compile(width, height);
                 let limit = lab.state().scroll_plan().map_or(0, |plan| plan.limit());
                 for top in [0, limit] {
-                    lab.state_mut().page_scroll = top;
+                    lab.state_mut().scroll_page_to(top);
                     lab.state_mut().page_reveal = None;
                     let _ = lab.compile(width, height);
                     // The rail's place, a part of a row past its top.
@@ -2111,20 +2111,15 @@ fn list_edge_sweep(scale: f32) {
         for (width, height) in LIST_SIZES {
             let mut lab = Lab::new("");
             lab.state_mut().navigate(route);
-            let _ = lab.compile(width, height);
-            let limit = lab.state().scroll_plan().map_or(0, |plan| plan.limit());
-            for top in 0..=limit {
-                lab.state_mut().page_scroll = top;
-                lab.state_mut().page_reveal = None;
-                let compiled = lab.compile(width, height);
-                let Some((plan, shown)) = lab.state().scroll_shown() else {
-                    continue;
+            lab.each_screen(width, height, |state, compiled, top| {
+                let Some((plan, shown)) = state.scroll_shown() else {
+                    return;
                 };
-                let Some((list, room)) = compiled_list(&compiled, &plan) else {
-                    continue;
+                let Some((list, room)) = compiled_list(compiled, &plan) else {
+                    return;
                 };
                 let context = format!("{route:?} {width}×{height} at {scale}× screen {top}");
-                assert_list_tops(&compiled, list.y + room, &context);
+                assert_list_tops(compiled, list.y + room, &context);
                 let failures = compiled.fit_failures();
                 assert!(failures.is_empty(), "{context}: {failures:#?}");
                 // A press on the picture of a control in the strip scrolls
@@ -2250,7 +2245,7 @@ fn list_edge_sweep(scale: f32) {
                     "{context}: the screen ends on a band of blank: drawn to {drawn_to}, room to {}",
                     list.y + room
                 );
-            }
+            });
         }
     }
 }
@@ -5288,7 +5283,10 @@ fn a_one_line_rows_name_keeps_its_floor_on_every_page() {
 /// after it that is listed — at 2× and back at 1×, with the keyboard off the
 /// list (on the search field, on the sidebar row that opened the page) as
 /// with none, whether or not the scroll settled on the 2× screen before the
-/// change back (a 2× screen past the 1× list's last kept its place too). On
+/// change back (a 2× screen past the 1× list's last kept its place too), and
+/// the next frame at either size, nothing between, draws the same screen:
+/// Home at 1564x180 drew its 2× screen from the stop it was at, and the next
+/// frame from the stop after, where the scroll it was asked for stood. On
 /// a list's last screen, which starts where the list's end puts it, the
 /// stop is on the screen whole. At 80×24 and 102×29, and at the short
 /// windows 60×20, 102×12, 80×16 and 220×12, where what a screen starts with
@@ -5378,7 +5376,7 @@ fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
                     lab.state_mut().navigate(route);
                     lab.state_mut().common.last_focus = focus.map(UiKey::new);
                     let _ = lab.compile(width, height);
-                    lab.state_mut().page_scroll = top;
+                    lab.state_mut().scroll_page_to(top);
                     lab.state_mut().page_reveal = None;
                     let _ = lab.compile(width, height);
                     let (one, shown, _, _) = place(&lab);
@@ -5388,7 +5386,15 @@ fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
                          settled {settled}"
                     );
                     set_scale(2.0);
-                    let _ = lab.compile(width, height);
+                    let at_two = lab.compile(width, height);
+                    if lab.compile(width, height) != at_two {
+                        faults
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(format!(
+                                "{context}: at 2× the next frame draws another screen"
+                            ));
+                    }
                     if settled {
                         lab.state_mut().settle_page_scroll();
                     }
@@ -5405,7 +5411,15 @@ fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
                     }
                     moved.fetch_add(usize::from(shown_two.start != at), Relaxed);
                     set_scale(1.0);
-                    let _ = lab.compile(width, height);
+                    let back = lab.compile(width, height);
+                    if lab.compile(width, height) != back {
+                        faults
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(format!(
+                                "{context}: back at 1× the next frame draws another screen"
+                            ));
+                    }
                     let (_, shown_back, last, _) = place(&lab);
                     // A list at its top stays there.
                     let want = if top_two == 0 {
@@ -5413,10 +5427,7 @@ fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
                     } else {
                         kept(&two, shown_two.start, &one)
                     };
-                    // Unsettled, the scroll still counts the 1× stops,
-                    // and back at 1× may stand where it was.
-                    let stayed = !settled && shown_back.start == at;
-                    if !keeps(&shown_back, last, want) && !stayed {
+                    if !keeps(&shown_back, last, want) {
                         faults
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5505,7 +5516,7 @@ fn a_text_size_change_keeps_a_screen_that_starts_with_what_it_lists_otherwise() 
                 .expect("1× lists it"),
             None => plan.len(),
         };
-        lab.state_mut().page_scroll = top;
+        lab.state_mut().scroll_page_to(top);
         lab.state_mut().page_reveal = None;
         let _ = lab.compile(width, height);
         let (one, shown) = lab.state().scroll_shown().expect("a list");
@@ -5549,20 +5560,13 @@ fn every_screen_of_every_page_paints_no_cut_or_overlapping_mark() {
                 for (width, height) in [(584.0, 348.0), (738.0, 418.0), (1_074.0, 684.0)] {
                     let mut lab = Lab::new(source);
                     lab.state_mut().navigate(route);
-                    let _ = lab.compile(width, height);
-                    let limit = lab.state().scroll_plan().map_or(0, |plan| plan.limit());
-                    for top in 0..=limit {
-                        lab.state_mut().page_scroll = top;
-                        lab.state_mut().page_reveal = None;
-                        let compiled = lab.compile(width, height);
-                        screens += 1;
-                        let room_bottom = lab
-                            .state()
+                    screens += lab.each_screen(width, height, |state, compiled, top| {
+                        let room_bottom = state
                             .scroll_plan()
-                            .and_then(|plan| compiled_list(&compiled, &plan))
+                            .and_then(|plan| compiled_list(compiled, &plan))
                             .map_or(height, |(list, room)| list.y + room);
                         assert_list_tops(
-                            &compiled,
+                            compiled,
                             room_bottom,
                             &format!("{route:?} {width}×{height} {theme} at {scale}× screen {top}"),
                         );
@@ -5572,7 +5576,7 @@ fn every_screen_of_every_page_paints_no_cut_or_overlapping_mark() {
                                 "{route:?} {width}×{height} {theme} screen {top}: {found:#?}"
                             ));
                         }
-                    }
+                    });
                 }
             }
         }
@@ -5982,6 +5986,140 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
     });
 }
 
+/// A CONTROL THE WHEEL LEFT CUT STAYS WHERE IT WAS DRAWN: the control the
+/// keyboard is on is kept in view where the last screen showed it whole and
+/// something since cut it (a status that came), but one the last screen drew
+/// cut is drawn so again until an event moves the list. Home at 444x292 at
+/// 2× text, the keyboard on Follow system light/dark under a refused write's
+/// status: the wheel down the list and back drew the switch cut by the
+/// room's edge, 8pt of it under a short status and all of it under a long
+/// path's, and the next frame, with nothing between, drew it whole, 8pt
+/// higher or back in view. CONTROL: the status that came kept the same
+/// switch whole.
+#[test]
+fn a_control_the_wheel_left_cut_stays_where_it_was_drawn() {
+    at_each_text_scale(&[2.0], "a control the wheel left cut", |_| {
+        let (width, height) = (444.0, 292.0);
+        let switch = UiKey::new(THEME_MODE_ACTION);
+        let drawn = |compiled: &crate::native_ui::CompiledUi| {
+            compiled
+                .paint
+                .iter()
+                .find(|node| node.key == switch)
+                .map(|node| {
+                    (node.clip.y - node.rect.y).abs() < 0.5
+                        && (node.clip.height - node.rect.height).abs() < 0.5
+                })
+        };
+        for (status, message, cut) in [
+            (
+                "a short status",
+                "~/.config/aterm isn\u{2019}t writable \u{b7} check its permissions",
+                Some(false),
+            ),
+            (
+                "a long path's status",
+                "/Volumes/Shared Drive/Users//someone/dotfiles/config/aterm \
+                 isn\u{2019}t writable \u{b7} check its permissions",
+                None,
+            ),
+        ] {
+            let mut lab = Lab::new("");
+            lab.state_mut().navigate(SettingsRoute::Home);
+            let _ = lab.compile(width, height);
+            lab.dispatch(AppEvent::FocusChanged(Some(switch.clone())));
+            let _ = lab.compile(width, height);
+            let (_, operation) = lab
+                .invoke(THEME_MODE_ACTION, None)
+                .expect("the switch writes");
+            lab.dispatch(AppEvent::ConfigPatchFinished {
+                operation,
+                outcome: ConfigPatchOutcome::Rejected {
+                    message: message.to_string(),
+                },
+            });
+            assert_eq!(
+                drawn(&lab.compile(width, height)),
+                Some(true),
+                "the control under {status}: the status that came keeps the switch whole"
+            );
+            lab.dispatch(AppEvent::ScrollLines(3));
+            let _ = lab.compile(width, height);
+            lab.dispatch(AppEvent::ScrollLines(-3));
+            let back = lab.compile(width, height);
+            assert_eq!(
+                drawn(&back),
+                cut,
+                "under {status} the wheel back up draws the switch cut by the room's edge"
+            );
+            assert!(
+                lab.compile(width, height) == back,
+                "under {status} the next frame draws the screen the wheel left"
+            );
+        }
+    });
+}
+
+/// A STATUS NEVER COVERS WHAT THE PERSON IS ON, THOUGH THE WHEEL LEFT IT CUT
+/// (#92): the switch the wheel left cut stays so only while nothing comes;
+/// a bar that comes over it keeps it in view. Home at 300x292 at 2× text,
+/// the keyboard on Follow system light/dark, the switch pressed (its write
+/// out, the switch whole at y 164), the wheel down the list and back (the
+/// switch cut at y 174, 54 of its 64pt showing), then the write refused
+/// under a long path's status: the switch was not painted at all, the
+/// refusal over the control just pressed. It is drawn whole, and the next
+/// frame draws the same screen.
+#[test]
+fn a_status_that_comes_over_a_control_the_wheel_left_cut_keeps_it_in_view() {
+    at_each_text_scale(&[2.0], "a status over a cut control", |_| {
+        let (width, height) = (300.0, 292.0);
+        let switch = UiKey::new(THEME_MODE_ACTION);
+        let painted = |compiled: &crate::native_ui::CompiledUi| {
+            compiled
+                .paint
+                .iter()
+                .find(|node| node.key == switch)
+                .map(|node| (node.rect, node.clip))
+        };
+        let mut lab = Lab::new("");
+        lab.state_mut().navigate(SettingsRoute::Home);
+        let _ = lab.compile(width, height);
+        lab.dispatch(AppEvent::FocusChanged(Some(switch.clone())));
+        let _ = lab.compile(width, height);
+        let (_, operation) = lab
+            .invoke(THEME_MODE_ACTION, None)
+            .expect("the switch writes");
+        let _ = lab.compile(width, height);
+        lab.dispatch(AppEvent::ScrollLines(1));
+        let _ = lab.compile(width, height);
+        lab.dispatch(AppEvent::ScrollLines(-1));
+        let cut = painted(&lab.compile(width, height));
+        assert!(
+            cut.is_some_and(|(rect, clip)| clip.height < rect.height - 0.5),
+            "the wheel leaves the switch cut: {cut:?}"
+        );
+        lab.dispatch(AppEvent::ConfigPatchFinished {
+            operation,
+            outcome: ConfigPatchOutcome::Rejected {
+                message: "/Volumes/Shared Drive/Users//someone/dotfiles/config/aterm \
+                          isn\u{2019}t writable \u{b7} check its permissions"
+                    .to_string(),
+            },
+        });
+        let after = lab.compile(width, height);
+        let now = painted(&after);
+        assert!(
+            now.is_some_and(|(rect, clip)| (clip.y - rect.y).abs() < 0.5
+                && (clip.height - rect.height).abs() < 0.5),
+            "the refusal's status keeps the switch whole: {cut:?} to {now:?}"
+        );
+        assert!(
+            lab.compile(width, height) == after,
+            "the next frame draws the screen the status left"
+        );
+    });
+}
+
 /// A STATUS'S BAR TAKES THE PAGE'S BOTTOM INSET BEFORE ITS LIST (#92): at
 /// 220x12 at 2× text, Sound's Music effects switch pressed, its one-line
 /// saved status (64pt, Undo beside it) took all it needs from the list's
@@ -6226,7 +6364,7 @@ fn a_status_path_wraps_at_its_folders() {
     });
 }
 
-/// THE KEYBOARD ON A STATUS BAR READS ITS WORDS (the round-14 review): at
+/// THE KEYBOARD ON A STATUS BAR READS ITS WORDS (the review): at
 /// 22x24 at 2× text, where a status takes more lines than its bar shows
 /// over the switch just pressed — the switch's own, and a save that failed,
 /// which offers no Undo — the words' box is the keyboard's next stop after
@@ -6329,7 +6467,7 @@ fn the_keyboard_on_a_status_bar_reads_its_words() {
     });
 }
 
-/// A SAVE THAT FAILED IS READ WHOLE IN A SHORT BAR (the round-14 audit):
+/// A SAVE THAT FAILED IS READ WHOLE IN A SHORT BAR (the audit):
 /// at 22x24 at 2× text a save failure that names the folder to fix, set on
 /// more lines than the bar holds over the switch just pressed, keeps every
 /// word — which change was not saved, the folder, and what to do — on a
@@ -6606,20 +6744,17 @@ fn a_control_the_rooms_edge_cuts_is_a_picture_from_its_top() {
         for (width, height) in [(584.0, 348.0), (738.0, 418.0)] {
             let mut lab = Lab::new("");
             lab.state_mut().navigate(route);
-            let _ = lab.compile(width, height);
-            let limit = lab.state().scroll_plan().map_or(0, |plan| plan.limit());
-            for top in 0..limit {
-                lab.state_mut().page_scroll = top;
-                lab.state_mut().page_reveal = None;
-                let compiled = lab.compile(width, height);
-                let Some((plan, _)) = lab.state().scroll_shown() else {
-                    continue;
+            lab.each_screen(width, height, |state, compiled, top| {
+                // The screens before the last.
+                let Some((plan, _)) = state.scroll_shown().filter(|(plan, _)| top < plan.limit())
+                else {
+                    return;
                 };
                 if plan.foot() == scroll::ListFoot::Whole {
-                    continue;
+                    return;
                 }
-                let Some((list, room)) = compiled_list(&compiled, &plan) else {
-                    continue;
+                let Some((list, room)) = compiled_list(compiled, &plan) else {
+                    return;
                 };
                 let edge = list.y + room;
                 for node in compiled.paint.iter().filter(|node| {
@@ -6645,7 +6780,7 @@ fn a_control_the_rooms_edge_cuts_is_a_picture_from_its_top() {
                         ));
                     }
                 }
-            }
+            });
         }
     }
     assert!(
@@ -6674,12 +6809,7 @@ fn a_cut_control_is_drawn_with_its_name_or_not_at_all() {
         for (width, height) in [(584.0, 348.0), (738.0, 418.0), (1_074.0, 684.0)] {
             let mut lab = Lab::new("");
             lab.state_mut().navigate(route);
-            let _ = lab.compile(width, height);
-            let limit = lab.state().scroll_plan().map_or(0, |plan| plan.limit());
-            for top in 0..=limit {
-                lab.state_mut().page_scroll = top;
-                lab.state_mut().page_reveal = None;
-                let compiled = lab.compile(width, height);
+            lab.each_screen(width, height, |_, compiled, top| {
                 let context = format!("{route:?} {width}×{height} screen {top}");
                 for node in compiled
                     .paint
@@ -6725,7 +6855,7 @@ fn a_cut_control_is_drawn_with_its_name_or_not_at_all() {
                         ));
                     }
                 }
-            }
+            });
         }
     }
     assert!(
@@ -6757,7 +6887,7 @@ fn a_kept_caption_heads_a_row_on_every_last_screen() {
             lab.state_mut().navigate(route);
             let _ = lab.compile(width, height);
             let limit = lab.state().scroll_plan().map_or(0, |plan| plan.limit());
-            lab.state_mut().page_scroll = limit;
+            lab.state_mut().scroll_page_to(limit);
             lab.state_mut().page_reveal = None;
             let compiled = lab.compile(width, height);
             for under in compiled

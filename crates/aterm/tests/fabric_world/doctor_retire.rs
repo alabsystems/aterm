@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **The doctor retires a ghost WITH THE BRIDGE UP, through it.**
+//! `fabric doctor --retire-ghosts` with the bridge up: the retirement goes through it.
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
@@ -75,7 +75,7 @@ fn the_doctor_retires_a_ghost_through_a_live_bridge() {
         .then_some(())
     });
 
-    // DRY FIRST: named, nothing published, and the note says a bridge would do it.
+    // Dry first: named, nothing published, and the note says a bridge would do it.
     let dry = doctor(&w, &["--retire-ghosts"]);
     assert!(dry.contains(ghost), "{dry}");
     assert_eq!(
@@ -116,7 +116,7 @@ fn the_doctor_retires_a_ghost_through_a_live_bridge() {
             .then_some(())
     });
 
-    // A HOSTED SID IS REFUSED AT THE DOOR, and nothing reaches the bus.
+    // A hosted sid is refused at the door, and nothing reaches the bus.
     let refused = w.verb(&format!("fabric retire {a}"));
     assert_eq!(refused.header(), format!("ERR hosted {a}"));
     assert_eq!(
@@ -128,11 +128,9 @@ fn the_doctor_retires_a_ghost_through_a_live_bridge() {
     );
 }
 
-/// **A SIBLING INSTANCE'S LIVE SESSION IS NOT A GHOST, WHATEVER THE SNAPSHOT
-/// SAID.** The door `fabric retire` comes through is one instance's store;
-/// the ghost list is the node's. Two instances on one node — A with the
-/// bridge, B without — and a snapshot taken before B (re)adopted its session
-/// would name it a ghost; A's door passes it, and A's bridge must refuse it
+/// A sibling instance's live session is not a ghost, whatever a stale snapshot said.
+/// `fabric retire`'s door is one instance's store and the ghost list is the node's: with A
+/// holding the bridge and B not, A's door passes B's session and A's bridge refuses it
 /// against the node's hosted set, read at publish time.
 #[test]
 fn the_bridge_refuses_to_retire_a_session_a_sibling_instance_hosts() {
@@ -149,7 +147,7 @@ fn the_bridge_refuses_to_retire_a_session_a_sibling_instance_hosts() {
             .nth(1)
             .map(str::to_string)
     });
-    // Its presence row, LIVE on this node, as a stale snapshot would leave it.
+    // Its presence row, live on this node, as a stale snapshot would leave it.
     let subject = format!("/f/{FLEET}/pub/{}/{x}/presence", w.node);
     w.god()
         .publish(

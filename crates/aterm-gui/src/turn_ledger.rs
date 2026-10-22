@@ -75,8 +75,8 @@ pub(crate) struct TurnRecord {
     /// boundary. Shared, so a reader copying records out of the ledger lock
     /// bumps a refcount instead of copying the text.
     pub text: Arc<str>,
-    /// FNV-1a/64 of the settled screen text — deterministic across processes, so
-    /// a replay/eval harness can diff a re-driven turn's screen against this.
+    /// FNV-1a/64 of the settled screen text: deterministic across processes, so a replay can
+    /// diff a re-driven turn's screen against it.
     pub screen_hash: u64,
     /// The engine `content_seq` at settle (matches the `turn` reply's `seq=`).
     pub seq: u64,
@@ -86,10 +86,8 @@ pub(crate) struct TurnRecord {
     pub arch: ArchMark,
     /// Who typed the turn ([`TurnBy`]): `history` prints it as `by=<word>`.
     pub by: TurnBy,
-    /// The record came from an EARLIER aterm process, carried to this one by
-    /// a self-update handoff: `history` prints `carried=1`, and its
-    /// `started_ms` and `seq` are that process's clock and content counter
-    /// (neither is comparable with this process's).
+    /// Carried from an earlier aterm process by a self-update handoff (`history` prints
+    /// `carried=1`): its `started_ms` and `seq` are that process's clock and counter.
     pub carried: bool,
 }
 
@@ -235,13 +233,9 @@ pub(crate) struct TurnLedger {
     /// `since-turn=` below it is told, as for a record evicted from the
     /// front. A handoff carries it (`handoff_carry`'s sidecar). 0: none.
     shed_below: u64,
-    /// Turn ids below this may have named records of this session that the
-    /// ledger never got: a self-update handoff could not carry the ledger
-    /// whole (no sidecar, a bad one, a lock another thread kept, records shed
-    /// to fit, a turn still open at the export). [`TurnLedger::low_id`]
-    /// reports it while it is above every held record's id, so a resumed
-    /// `since-turn=` below it is told, as for evicted records.
-    /// 0: none.
+    /// Turn ids below this may have named records the ledger never got: a self-update handoff
+    /// could not carry it whole (no sidecar, a bad one, a lock held elsewhere, records shed to
+    /// fit, a turn open at the export). 0: none.
     unheld_below: u64,
     /// Turn ids begun on this session whose record has not landed ([`TurnLedger::begin`] …
     /// [`TurnLedger::record`] / [`TurnLedger::abandon`]); [`TurnLedger::carry_floor`] keeps a
@@ -349,15 +343,11 @@ impl TurnLedger {
         self.open.retain(|&open| open != id);
     }
 
-    /// Record a finished turn that began as `rec.id`, and return the id it is
-    /// recorded under — the one its reply prints. That is `rec.id`, unless a
-    /// LATER turn already recorded (a `lease release force` preempted this
-    /// one, and the turn that took the slot settled first): then it is
-    /// re-numbered with `mint`, the process's turn-id mint, so the ids stay
-    /// strictly rising in the order records land. [`TurnLedger::since`] seeks
-    /// by id, the `events` digest streams by id watermark, and a handoff
-    /// carries only a rising run — a record landing under its old, lower id
-    /// was one no subscriber was ever sent (round seven, finding 43).
+    /// Record a finished turn that began as `rec.id`; returns the id it is recorded under (the
+    /// one its reply prints). If a later turn already recorded (a `lease release force`
+    /// preempted this one), it is re-numbered with `mint`, so ids rise strictly in landing
+    /// order: [`TurnLedger::since`] seeks by id, the `events` digest streams by id watermark,
+    /// and a handoff carries only a rising run.
     ///
     /// It wakes the session's watchers for a record
     /// ([`crate::session_watch::Watchers::ring_record`]): the record is the
@@ -571,8 +561,7 @@ pub(crate) fn clamp_text(s: &str) -> Arc<str> {
     Arc::from(&s[..end])
 }
 
-/// Milliseconds since the process epoch (a lazily-pinned monotonic `Instant`).
-/// Monotonic and cheap; used for turn `started_ms`/`dur_ms`, not wall-clock.
+/// Milliseconds since a lazily pinned process epoch (monotonic, not wall-clock).
 /// The one process clock, shared with the fabric's mail rows.
 #[cfg(not(test))]
 pub(crate) use aterm_gui_timing::now_ms;

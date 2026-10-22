@@ -414,8 +414,7 @@ impl CursorPreviewSpec {
             presentation,
             theme.cursor,
             theme_bg_is_dark(theme.bg),
-            // The preview HAS a theme in scope and no Terminal, so there is
-            // nothing to fold: no OSC 10/11 and no DECSCNM on this path.
+            // No Terminal here, so no OSC 10/11 or DECSCNM to fold.
             theme.fg & 0x00FF_FFFF,
             theme.bg & 0x00FF_FFFF,
             head_dx,
@@ -1036,8 +1035,8 @@ pub(crate) struct SettingsPreviewSpec {
     pub(crate) appearance: AppearancePreviewSpec,
     pub(crate) typography: TypographyPreviewSpec,
     pub(crate) post_fx: CursorPostFxSpec,
-    /// Exact visual field currently authoring the demo and its normalized
-    /// uncommitted value. Introspection serializes this literally as `key=value`.
+    /// The field being edited and its normalized uncommitted value; introspection
+    /// serializes them literally as `key=value`.
     pub(crate) focused_key: String,
     pub(crate) focused_value: String,
     /// The focused setting's own name, for the badge and the spoken summary.
@@ -1642,10 +1641,8 @@ impl SettingsPreviewSpec {
             // A name no resolver found, in the words its row uses.
             "Not found"
         } else if status.contains("unavailable") || status.contains("fallback active") {
-            // Keep the authored family/axis identity visible inside the bounded
-            // capsule. The surrounding specimen already demonstrates the
-            // current fallback face; repeating that fact here used the width
-            // budget that belongs to the candidate the user is editing.
+            // The capsule names the authored family/axis; the specimen around it
+            // already shows the fallback face.
             "Unavailable"
         } else if self.prepared_font.snapshot.pending
             || status.contains("loading")
@@ -4164,12 +4161,9 @@ fn paint_window_theme_sample(
         });
     }
 
-    // The semantic terminal specimen remains the primary renderer proof, but a
-    // freshly opened Settings tab may need one asynchronous font-preparation
-    // turn before glyphs land. Keep the small Top card useful on that first
-    // frame with a renderer-native monospace label and literal ANSI swatches.
-    // These use the candidate palette and therefore cannot collapse into the
-    // blank background-only sample the old 132pt card produced.
+    // A freshly opened Settings tab may need one asynchronous font-preparation turn before
+    // the specimen's glyphs land; until then a renderer-native mono label and the
+    // candidate's ANSI swatches keep the small card from painting background only.
     if terminal.height >= 42.0 && !spec.prepared_font.is_ready() {
         let sample_size = TypeStep::Caption.px(11.5);
         prims.push(text_prim(
@@ -4397,11 +4391,9 @@ fn build_terminal_specimen_input_grid(
         // The floor a tab holds the theme's own colours to, so the sample
         // shows the colours a tab does.
         indexed_minimum_contrast: spec.appearance.indexed_minimum_contrast,
-        // The blink lives IN the style (`CursorStyle` names shape + blink, and
-        // the renderer arms its blink clock off the `Blinking*` variants), so
-        // the preview folds `spec.cursor.blink` into the shape. Setting the
-        // sibling `cursor_blink` alone left the preview steady while the
-        // settings pane said the cursor blinks.
+        // The blink lives in the style (the renderer arms its blink clock off the
+        // `Blinking*` variants), so `spec.cursor.blink` folds into the shape; the sibling
+        // `cursor_blink` alone leaves the cursor steady.
         cursor_style: match spec.cursor.style {
             PreviewCursorStyle::Bar => CursorStyle::SteadyBar,
             PreviewCursorStyle::Block => CursorStyle::SteadyBlock,
@@ -5599,8 +5591,8 @@ fn paint_pause_glyph(
 /// The least height a preview card is drawn at ([`preview_node`]).
 const PREVIEW_NODE_LEAST: f32 = 96.0;
 
-/// Canonical construction helper for Settings workbenches. The returned node is
-/// a single semantic object with stable bounds regardless of visual settings.
+/// Build a Settings preview node: one semantic object with stable bounds regardless of
+/// visual settings.
 /// A looping cursor preview is also its own Pause/Play control
 /// ([`SettingsPreviewSpec::pause_action`]): activating the card (pointer,
 /// Space/Return, or the accessibility Click) invokes [`PREVIEW_PAUSE_ACTION`].
@@ -8277,9 +8269,8 @@ mod tests {
 
     #[test]
     fn color_specimen_shows_fewer_whole_rows_never_cut_ones() {
-        // Install and capture the same prepared renderer source a live native
-        // Settings view receives. The fallback label belongs only to the
-        // unavailable first frame and must not paint over a real specimen.
+        // The prepared renderer source a live native Settings view receives. The fallback
+        // label belongs only to the unprepared first frame, never over a real specimen.
         let _ = compiled(SettingsPreviewSpec::appearance(14.0));
         let prepared = crate::tray_raster::prepare_semantic_font(
             &crate::widget::SemanticFontCandidate::default(),
@@ -9957,9 +9948,7 @@ mod tests {
     fn a_ready_font_has_no_status_pill_and_a_loading_one_does_not_repeat_its_name() {
         let mut spec = SettingsPreviewSpec::typography(14.0)
             .with_focus(crate::prefs::EDIT_FONT_FAMILY, "default");
-        // This is the exact settled status emitted for the host candidate by
-        // `SemanticFontResolution::Host`.  Keep the presentation assertion in
-        // this module, beside the classifier that owns the warning capsule.
+        // The settled status `SemanticFontResolution::Host` emits for the host candidate.
         // The header badge already names the font; the glyphs are the proof.
         spec.font_status = "committed renderer font cascade ready".to_string();
         assert_eq!(spec.font_candidate_pill(), None);

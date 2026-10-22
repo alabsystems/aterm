@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-//! `aterm-wasm` — the in-page rendering substrate that replaces `@xterm/xterm`'s
-//! rendering in the Electron renderer.
-//!
-//! Architecture (see docs/rust-migration): the daemon keeps the PTY and streams
-//! bytes to the renderer; here, in the renderer process, the aterm engine
-//! (`aterm-core`) parses those bytes into its grid and the pure-Rust CPU
-//! rasterizer (`aterm-render`) turns the grid into an RGBA framebuffer that JS
-//! blits to a `<canvas>`. No GPU/winit/DOM dependency — everything compiles to
-//! `wasm32-unknown-unknown`. Fonts are injected as bytes (fetched in JS) so there
-//! is no `std::fs` font discovery.
+//! `aterm-wasm`: the in-page renderer for the Electron renderer process, replacing
+//! `@xterm/xterm`'s rendering. The daemon keeps the PTY and streams bytes here; the
+//! engine (`aterm-core`) parses them into its grid and the pure-Rust CPU rasterizer
+//! (`aterm-render`) turns the grid into an RGBA framebuffer that JS blits to a
+//! `<canvas>`. Everything compiles to `wasm32-unknown-unknown`; fonts arrive as bytes
+//! from JS, with no filesystem discovery.
 //!
 //! Construction, resize, zoom, chrome and rendering return errors for frames over
 //! the renderer's 256 MiB per-frame limit. The browser ABI throws those strings;
@@ -19,9 +15,8 @@
 //! setters can change geometry independently; render refuses an oversized result
 //! until the host corrects it, retaining the last exported pixels.
 
-// What JS sees is marked `#[export]` (aterm-wasm-abi, which replaces
-// wasm-bindgen: docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.7), and
-// `verify glue` writes the module's JS glue from it.
+// What JS sees is marked `#[export]` (aterm-wasm-abi), and `verify glue` writes the
+// module's JS glue from it.
 #[cfg(target_arch = "wasm32")]
 use aterm_wasm_abi::export;
 
@@ -66,7 +61,6 @@ use aterm_core::terminal::{BlockText, ClipboardAccess, CursorStyle, MouseMode, R
 use aterm_effects::pipeline::EffectsPipeline;
 use aterm_render::{RenderInput, Renderer, SpillBand, Theme, WindowCpu};
 
-// ---------------------------------------------------------------------------
 // Cooperative width-reflow offload. This process is single-threaded
 // (wasm32-unknown-unknown, no atomics), so there is no worker for the O(history)
 // scrollback rewrap. `resize` detaches the tiered history in O(1)
@@ -75,7 +69,6 @@ use aterm_render::{RenderInput, Renderer, SpillBand, Theme, WindowCpu};
 // or the safety nets below. Each pump rewraps at most the budget of history lines,
 // carving at logical-line boundaries so any step schedule matches the one-shot rewrap,
 // and no single event-loop task grows with session history.
-// ---------------------------------------------------------------------------
 
 /// Histories up to this many lines are rewrapped inline by `resize`, matching
 /// aterm-gui's `INLINE_REFLOW_MAX_LINES`.
@@ -189,10 +182,8 @@ pub struct AtermTerminal {
     // `Terminal::logical_row_into` refills these in place instead. The cursor
     // row a run's first keypress hands the predictor lives here too.
     pub(crate) pred_row_scratch: predict_api::PredRows,
-    // Chrome-band spill rasterizer (the cross-pane window-space effects
-    // export): refreshed per `render`, read back via the `spill_*` bindings.
-    // Identity at 0/0 chrome — empty buffer, zero per-frame work. pub(crate)
-    // so in-crate tests reach the buffer without raw-pointer reads.
+    // Chrome-band spill rasterizer (the cross-pane window-space effects export),
+    // refreshed per `render` and read via the `spill_*` bindings; empty at 0/0 chrome.
     pub(crate) spill: SpillBand,
     // A deferred width-change scrollback rewrap (see the module constants): `Some`
     // while the tiered history is detached awaiting pumps; dropped with the engine.
@@ -354,8 +345,7 @@ impl AtermTerminal {
     /// repaint, the effects' and band's theme-derived inks, and the renderer.
     pub(crate) fn install_renderer_theme(&mut self, parts: aterm_types::scheme::ThemeParts) {
         let aterm_types::scheme::ThemeParts { fg, bg, cursor, .. } = parts;
-        // Theme is appearance-only (selection band / idle cursor / padding / default
-        // cells) — not tracked by the row-diff — so force one full repaint next frame.
+        // Appearance-only, invisible to the row diff: force one full repaint.
         self.force_full_repaint = true;
         // Glow/trail colours passed as `None` follow the theme cursor.
         self.theme_cursor = cursor & 0x00FF_FFFF;
@@ -363,9 +353,8 @@ impl AtermTerminal {
         self.theme_bg = bg & 0x00FF_FFFF;
         self.effects
             .set_matrix_rain_theme(self.theme_bg, self.theme_fg, self.theme_cursor);
-        // The pet's frozen contrast sample is keyed to the theme it was taken
-        // against; a new theme retires it (the native palette-authority edge)
-        // while the cat's behaviour, position and breed carry on.
+        // The pet's frozen contrast sample belongs to the old theme: retire it, keeping
+        // the cat's behaviour, position and breed.
         self.effects.invalidate_companion_colors();
         // The band's inks derive from the theme.
         self.band.set_theme(fg, bg, cursor);
@@ -777,17 +766,11 @@ impl AtermTerminal {
 
     /// Resize the grid (after the host recomputes cols/rows for the canvas).
     ///
-    /// The visible grid and the bounded in-memory ring resize SYNCHRONOUSLY
-    /// (O(viewport + ring)). A width change with a deep tiered history does
-    /// NOT rewrap that history here: it is detached in O(1)
-    /// (`resize_offloading_scrollback`, the same audited boundary the native
-    /// app uses) and rewrapped in LATER, budget-bounded host tasks — see
-    /// [`Self::pump_reflow`].
-    /// Small histories (≤ `INLINE_REFLOW_MAX_LINES`) rewrap inline: bounded,
-    /// imperceptible, mirroring the native inline bound. This keeps the
-    /// synchronous cost of a resize independent of session history — the
-    /// browser-tab analog of the native L0 whole-Mac-freeze fix, on a loop
-    /// with no worker thread to offload to.
+    /// The visible grid and the in-memory ring resize synchronously. A width change
+    /// with a deep tiered history detaches it in O(1) (`resize_offloading_scrollback`)
+    /// and rewraps it in later, budget-bounded host tasks ([`Self::pump_reflow`]);
+    /// histories up to `INLINE_REFLOW_MAX_LINES` rewrap inline. A resize's synchronous
+    /// cost is thus independent of session history, on a loop with no worker thread.
     /// Dimensions clamp to the engine's bounds; an oversized physical frame is
     /// refused before grid changes, reflow, prediction or presentation state moves.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), String> {
@@ -866,9 +849,7 @@ impl AtermTerminal {
         self.rgba
             .try_reserve_exact(bytes.saturating_sub(self.rgba.len()))
             .map_err(|e| format!("cannot reserve RGBA framebuffer: {e}"))?;
-        // Deferred-reflow safety net #1: a host that never calls `pump_reflow`
-        // still re-attaches its rewrapped history within the grace window (the
-        // countdown gives an updated host's idle-scheduled pump time to win).
+        // Safety net #1 for hosts that never call `pump_reflow`.
         self.pump_reflow_on_render_tick();
         // Frame-boundary scrollback maintenance: apply a pending global-budget share,
         // then promote one bounded staged batch into the LZ4 store (never on ingest).
@@ -909,20 +890,12 @@ impl AtermTerminal {
         // the fallible packed-frame reservation succeeds; a refusal must leave
         // the previous pixels available and the forced repaint still pending.
         let mut fresh_win = self.force_full_repaint.then(WindowCpu::new);
-        // E8 + DMG-1: refill the kept scratch in place (the gpu-web/native
-        // kept-scratch pattern), re-resolving only the damaged rows when the
-        // continuity proof holds; the effects/stamp passes below re-fill the
-        // host-owned overlay channels, so a reused scratch never carries a
-        // previous frame's state. The refill also CONSUMES the damage session
-        // (WF-1): the NEXT net-new grid change opens a fresh session and
-        // advances the epoch the frame gate compares. aterm-render never reads
-        // the tracker (it diffs snapshots), and this render loop is the
-        // engine's only damage consumer here.
-        // THE BAND'S UN-SPLICE (DMG-1): take last frame's band rows off the
-        // kept scratch, so the refill below may re-resolve only the damaged
-        // rows under a band instead of refilling every row. Refused (nothing
-        // changed) when nothing was prepended or anything else touched it — the
-        // refill then takes its full arm, which is always sound.
+        // Refill the kept scratch in place, re-resolving only damaged rows when the
+        // continuity proof holds; later passes refill the host-owned overlay channels.
+        // The refill consumes the damage session, so the next grid change advances the
+        // epoch the gate compares. Take last frame's band rows off the scratch first so
+        // the refill can stay scoped under a band; if that is refused, the refill takes
+        // its full arm, which is always sound.
         let _ = self.band.undo(&mut self.frame_scratch, self.rows);
         self.refill_frame_scratch();
         // Fill the overlay channels for the host-advanced instant; with every effect off
@@ -1369,10 +1342,8 @@ impl AtermTerminal {
     pub fn new_from_system(rows: u16, cols: u16, px: f32) -> Option<AtermTerminal> {
         let renderer = Renderer::from_system(px, Theme::default())?;
         let (rows, cols) = frame_geometry_api::checked_grid_size(&renderer, rows, cols, 0).ok()?;
-        // Same clamp-sync as `new`: store the grid's CLAMPED dims, never the raw
-        // args, so the framebuffer can't be sized past the 1..=4096 grid bound.
-        // Same tiered-store attachment as `new` (audit E1) so tests/benches
-        // measure the shipped engine shape.
+        // Same clamp-sync and tiered store as `new`, so tests and benches measure the
+        // shipped engine shape.
         let mut term = scrollback_tiers_api::tiered_terminal(rows, cols);
         let budget_share = scrollback_tiers_api::register_budget_share(&term);
         let theme = Theme::default();
@@ -1913,9 +1884,8 @@ mod tests {
 
     #[test]
     fn set_theme_repaints_an_idle_pane_to_the_new_background() {
-        // With the persistent cache, an appearance-only change (no cell moved) would
-        // be skipped by the row-diff — set_theme must force a full repaint so the
-        // background actually re-themes on an otherwise-idle frame (CPU finding #7).
+        // An appearance-only change moves no cell, so `set_theme` must force a full
+        // repaint for the background to re-theme on an otherwise idle frame.
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         // Clear, then park the cursor in the far corner so the sampled centre cell
         // is pure background (no glyph, no cursor).
@@ -2032,11 +2002,8 @@ mod tests {
 
     #[test]
     fn display_row_cache_distinguishes_main_and_alt_screen() {
-        // P4 regression: the single-slot display_row_cache backing cell_text /
-        // cell_is_wide keyed (content_gen, display_offset, row) with NO
-        // alt-screen bit. The main and alt grids keep INDEPENDENT content_gen
-        // counters, so a main<->alt swap landing on a coinciding
-        // content_gen+offset+row served one buffer's cell for the other.
+        // The main and alt grids keep independent content_gen counters, so the display
+        // row cache's key carries an alt-screen bit.
         let mut t = crate::system_font_terminal(5, 20, 16.0);
         // MAIN: push content_gen well above a freshly-entered alt buffer's, then
         // park a distinct glyph at (0,0) and prime the per-row cache by reading it.
@@ -2554,7 +2521,7 @@ mod tests {
         );
     }
 
-    // --- The resident pet through the binding (design 2026-08-30, Phase 1) --
+    // --- The resident pet through the binding ---------------------------------
 
     /// Drive the pet onto the glass through the binding alone (the naming glow style,
     /// the seed, witnessed keystrokes at 33 ms) until `cursor_pet_alpha` goes positive.
@@ -2562,8 +2529,7 @@ mod tests {
     fn wake_the_pet(t: &mut AtermTerminal, seed: u64) -> Option<u32> {
         t.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
         t.set_cursor_pet(true, seed);
-        // Seed the just-enabled engines' cursor anchor (apply is the anchor
-        // authority) so the first witness below has an owner to check against.
+        // Seed the cursor anchor so the first witness has an owner to check against.
         t.render().expect("renderable frame");
         for frame in 0..240u32 {
             if frame % 6 == 0 {
@@ -2918,17 +2884,14 @@ mod tests {
 
     #[test]
     fn never_pumped_host_completes_via_the_render_grace_net() {
-        // SAFETY ARGUMENT UNDER TEST: a host that never calls `pump_reflow`
-        // (an un-updated embedder) must still get its history back — after
-        // the grace window `render` pumps ONE bounded step per frame, so the
-        // job CONVERGES across frames (never the whole rewrap in one frame).
+        // A host that never calls `pump_reflow` still gets its history back: after the
+        // grace window `render` steps the job once per frame until it converges.
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
         let before = t.term.grid().scrollback_lines();
         t.resize(24, 40).expect("admitted geometry");
         assert!(t.reflow_pending());
-        // Grace window: the deferred job must NOT run on the first frames (an
-        // updated host's idle pump gets its chance to win the race)…
+        // The job does not run inside the grace window…
         t.render().expect("renderable frame");
         assert!(t.reflow_pending(), "no pump inside the grace window");
         // …then one budgeted step per frame: a couple dozen frames past the grace.
@@ -2957,12 +2920,8 @@ mod tests {
 
     #[test]
     fn never_pumped_host_streaming_output_converges_via_the_backlog_net() {
-        // SAFETY ARGUMENT UNDER TEST: a host that neither pumps NOR renders
-        // (hidden tab) but keeps feeding PTY output stages scroll-off in the
-        // lazy buffer while detached — past the cap, EVERY `process` call
-        // advances the job one bounded step, so the window closes after
-        // finitely many calls (amortized convergence; no single unbounded
-        // catch-up task).
+        // A host that neither pumps nor renders (hidden tab) but keeps feeding output:
+        // past the backlog cap every `process` call steps the job, so it converges.
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
         t.resize(24, 40).expect("admitted geometry");
@@ -3133,7 +3092,7 @@ mod tests {
         assert!(!t.last_render_skipped(), "first render must draw");
         let baseline = t.rgba();
 
-        // SKIP side: settled frame -> gated, zero bands, bytes retained.
+        // Skip: a settled frame takes the gate, zero bands, bytes retained.
         t.render().expect("renderable frame");
         assert!(t.last_render_skipped(), "settled frame must take the gate");
         assert_eq!(t.present_band_count(), 0, "gated frame exports zero bands");
@@ -3146,7 +3105,7 @@ mod tests {
         t.render().expect("renderable frame");
         assert!(!t.last_render_skipped(), "an echo frame must draw");
 
-        // REOPEN side 2: renderer-held blink phase (no grid damage).
+        // Reopen 2: renderer-held blink phase (no grid damage).
         t.render().expect("renderable frame");
         assert!(t.last_render_skipped(), "re-settled before blink");
         t.set_cursor_blink_phase(false);
@@ -3255,7 +3214,7 @@ mod tests {
             "and the selection really did change"
         );
 
-        // ---- Pixel invisibility: the gate must never change the picture ----
+        // ---- The gate never changes the picture ----------------------------
         let mut fresh = crate::system_font_terminal(8, 40, 14.0);
         for _ in 0..20 {
             fresh.process(b"a line of selectable text\r\n");

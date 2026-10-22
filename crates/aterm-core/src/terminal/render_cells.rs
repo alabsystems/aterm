@@ -1132,8 +1132,7 @@ impl Terminal {
             return Some(Cause::BidiVisual);
         }
         let grid = self.grid();
-        // Same conversion the fill stamps, so the comparison can never differ
-        // by conversion policy alone.
+        // Same conversion the fill stamps.
         let base_y = i64::try_from(grid.base_y()).unwrap_or(i64::MAX);
         if scratch.terminal_id == 0 {
             return Some(Cause::ScratchUnstamped);

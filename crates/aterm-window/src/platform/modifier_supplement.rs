@@ -33,7 +33,7 @@ pub trait KeyEventExtModifierSupplement {
     ///
     /// On X11 and Wayland xkb resolves Shift and Lock together, and an alphabetic key's type
     /// cancels one against the other: Turkish Caps Lock + Shift+i types `i`, where Shift
-    /// alone types `İ`. So there the press is read again without the lock (ATERM-KI-1015-9).
+    /// alone types `İ`. So there the press is read again without the lock.
     /// Elsewhere this is [`KeyEvent::text`].
     fn text_ignoring_lock(&self) -> Option<&str>;
 }

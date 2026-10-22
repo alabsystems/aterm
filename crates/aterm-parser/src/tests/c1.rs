@@ -13,7 +13,6 @@ fn parse_c1_csi() {
     let mut parser = Parser::with_c1_controls();
     let mut sink = RecordingSink::default();
 
-    // 8-bit CSI (0x9B) followed by params
     parser.advance_fast(b"\x9b31m", &mut sink);
 
     assert_eq!(sink.csi_dispatches.len(), 1);
@@ -25,7 +24,6 @@ fn parse_c1_osc() {
     let mut parser = Parser::with_c1_controls();
     let mut sink = RecordingSink::default();
 
-    // 8-bit OSC (0x9D) followed by data
     parser.advance_fast(b"\x9d0;Title\x07", &mut sink);
 
     assert_eq!(sink.osc_dispatches.len(), 1);
@@ -61,9 +59,7 @@ fn osc_string_c1_st_byte_is_data_not_terminator() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // 0x9C is treated as data in OscString state (not ST terminator).
-    // Required for UTF-8 correctness: 0x9C is a valid continuation byte
-    // in CJK characters (e.g., 本 = E6 9C AC). Terminate with BEL. (#3745)
+    // With C1 controls off, 0x9C in an OSC is data (a UTF-8 continuation byte).
     parser.advance_fast(b"\x1b]0;Title\x9cX\x07", &mut sink);
 
     assert_eq!(sink.osc_dispatches.len(), 1);
@@ -82,8 +78,6 @@ fn c1_disabled_by_default() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // 8-bit CSI (0x9B) should NOT be interpreted as CSI when C1 disabled
-    // Instead: 0x9B -> replacement char, "31m" -> printed as regular chars
     parser.advance_fast(b"\x9b31m", &mut sink);
 
     assert_eq!(sink.csi_dispatches.len(), 0);
@@ -201,7 +195,6 @@ fn parse_c1_osc_with_c1_st() {
     let mut parser = Parser::with_c1_controls();
     let mut sink = RecordingSink::default();
 
-    // C1 OSC (0x9D) + data + C1 ST (0x9C)
     parser.advance_fast(b"\x9d0;Title\x9c", &mut sink);
 
     assert_eq!(sink.osc_dispatches.len(), 1);
@@ -220,14 +213,7 @@ fn c1_disabled_blocks_injection_in_csi_param_state() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // Start a CSI sequence, then inject C1 CSI (0x9B) mid-params.
-    // Without the fix, 0x9B would start a new CSI sequence.
-    // With the fix, 0x9B is silently dropped.
-    //
-    // "\x1b[1" puts parser in CsiParam state, then 0x9B arrives.
-    // After 0x9B is dropped, "31m" continues as params+final for the
-    // original CSI, producing CSI 1;31 m (a valid SGR sequence with
-    // params adjusted by the state machine).
+    // 0x9B is dropped, so "31m" continues the first CSI: `CSI 131 m`.
     parser.advance_fast(b"\x1b[1\x9b31m", &mut sink);
 
     assert_eq!(
@@ -243,9 +229,6 @@ fn c1_disabled_blocks_injection_in_escape_state() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // Put parser into Escape state with ESC, then send 0x9B.
-    // Without fix: 0x9B transitions to CsiEntry (new sequence).
-    // With fix: 0x9B is dropped in Escape state.
     parser.advance_fast(b"\x1b\x9b31m", &mut sink);
 
     assert_eq!(
@@ -261,8 +244,6 @@ fn c1_disabled_blocks_dcs_osc_injection_mid_sequence() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // Start a CSI, inject C1 DCS (0x90) and C1 OSC (0x9D).
-    // Both should be dropped, not start new DCS/OSC sequences.
     parser.advance_fast(b"\x1b[1\x90q", &mut sink);
     assert_eq!(
         sink.dcs_hooks.len(),

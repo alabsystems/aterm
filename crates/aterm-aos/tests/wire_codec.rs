@@ -274,3 +274,33 @@ fn every_byte_flip_of_an_identity_is_refused_or_decodes_to_another_identity() {
         }
     }
 }
+
+/// One value written field by field into an encoder, so the same writes can go to a fresh
+/// encoder and to a reused one.
+fn write_value(e: &mut Enc, n: u64) {
+    e.u8(u8::try_from(n % 251).unwrap_or(0));
+    e.u64(n.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    e.bytes(&vec![0x5a; usize::try_from(n % 97).unwrap_or(0)]);
+    e.opt(n.checked_sub(3), |e, v| {
+        e.u32(u32::try_from(v % 7).unwrap_or(0))
+    });
+}
+
+/// An encoder reused across values (as the replay, the trace digest and the live host reuse
+/// one) holds after `clear` exactly what a fresh encoder holds after the same writes,
+/// whether the value before it was longer or shorter, and `reserve` writes nothing.
+#[test]
+fn a_cleared_encoder_writes_what_a_fresh_encoder_writes() {
+    let mut reused = Enc::new();
+    for n in [40u64, 0, 96, 1, 95, 3, 200, 2] {
+        reused.clear();
+        assert!(reused.is_empty());
+        reused.reserve(usize::try_from(n).unwrap_or(0));
+        assert!(reused.is_empty(), "reserve wrote nothing");
+        write_value(&mut reused, n);
+        let mut fresh = Enc::new();
+        write_value(&mut fresh, n);
+        assert_eq!(reused.as_bytes(), fresh.as_bytes(), "value {n}");
+        assert_eq!(reused.clone().finish(), fresh.finish(), "value {n}");
+    }
+}

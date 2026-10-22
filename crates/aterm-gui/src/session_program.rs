@@ -640,11 +640,9 @@ impl ProgramResolver {
         self.log_wake = wake.clone();
     }
 
-    /// The status subsystem is off: queued work no longer has a consumer.
-    /// An in-flight syscall can finish, but cancellation before publication
-    /// prevents its result, footer read, and completion wake. A publication
-    /// already committed before this call may still post its wake afterward;
-    /// the cleared status observer ignores that retired session.
+    /// The status subsystem is off: cancel all queued work. An in-flight read may finish but
+    /// cannot publish; a publication committed before this call may still post its wake, which
+    /// the cleared status observer ignores.
     pub(crate) fn clear_pending(&mut self) {
         self.pending
             .lock()
@@ -671,10 +669,7 @@ impl ProgramResolver {
             "aterm-program-id",
             crate::qos::Role::Responsive,
             move || {
-                // A process lookup never holds the pending-map lock. The
-                // short publication section takes pending, then the leaf
-                // timeline lock, so cancellation cannot split its validity
-                // check from the write.
+                // Lookups run without the pending lock (lock order: `publish_if_current`).
                 run_worker(rx, pending, lookup, completion);
             },
         ) {

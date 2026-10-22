@@ -97,7 +97,7 @@ pub fn get_modifierless_char(scancode: u16) -> Key {
     Key::Character(SmolStr::new(chars))
 }
 
-/// LOCAL PATCH (aterm), 2026-10-20 (ATERM-KI-1015-9): what a keyboard layout's key types, as
+/// LOCAL PATCH (aterm), 2026-10-20: what a keyboard layout's key types, as
 /// `UCKeyTranslate` answers with dead keys off, so a dead key answers its own accent (German
 /// Option+N is `~`): one character, `None` for nothing or more.
 pub(crate) trait LayoutKeys {

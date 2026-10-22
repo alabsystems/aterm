@@ -34,10 +34,7 @@ fn glass_window(app: &mut App, session: u64, cols: u16, pad: usize, extra: usize
     wid
 }
 
-// -----------------------------------------------------------------------
-// The web band's golden: this host's band, frame by frame, for the web
-// module to be held to.
-// -----------------------------------------------------------------------
+// The web band's golden: this host's band, frame by frame, for the web module.
 
 /// The golden the web module's `the_web_band_is_the_native_golden` reads.
 const WEB_GOLDEN: &str = concat!(

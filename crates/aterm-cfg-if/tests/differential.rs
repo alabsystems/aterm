@@ -69,7 +69,6 @@
 // well-known cfg keys. The allows below cover the scaffolding, not the subject.
 #![allow(dead_code)]
 
-// ---------------------------------------------------------------------------
 // ONE chain in, two answers out.
 //
 // The chain is written ONCE, at the `case!` call site, and spliced into the
@@ -80,7 +79,6 @@
 // Passing the arms through this wrapper as `tt` is also, for free, coverage of
 // shape 12 from the census — `half`'s `binary16/arch.rs:19` invokes `cfg_if!`
 // from inside its own `macro_rules!` with fragments substituted into the arms.
-// ---------------------------------------------------------------------------
 macro_rules! case {
     (
         $name:ident ;
@@ -179,7 +177,6 @@ fn real_macro_matches_rustc_on_every_chain() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // THE MULTI-ITEM LEAK (upstream issue #90).
 //
 // A NON-selected arm holding two items, and a selected `else` holding one.
@@ -191,7 +188,6 @@ fn real_macro_matches_rustc_on_every_chain() {
 // the module also defines its OWN `leaked()`. If the macro had emitted one, the
 // module would have two and would not compile. The module compiles AND
 // `leaked()` returns the module's own value, so the macro emitted nothing.
-// ---------------------------------------------------------------------------
 mod leak_correct {
     cfg_if::cfg_if! {
         if #[cfg(any())] {
@@ -216,9 +212,7 @@ fn a_dead_arm_contributes_none_of_its_items() {
     assert_eq!(leak_correct::selected(), 2);
 }
 
-// ---------------------------------------------------------------------------
 // EMPTY EXPANSION, in the position that makes it matter.
-// ---------------------------------------------------------------------------
 
 /// `nix-0.29.0/src/sys/socket/addr.rs:584` in miniature: a `cfg_if!` whose arms
 /// all fail, in statement position, followed by the function's real value. An
@@ -268,7 +262,6 @@ fn tail_expression_produces_the_selected_arms_value() {
     assert_eq!(tail_value(), expected);
 }
 
-// ---------------------------------------------------------------------------
 // RECURSION DEPTH.
 //
 // `getrandom-0.3.4/src/backends.rs:10` is 27 else-if arms plus an else and sets
@@ -277,7 +270,6 @@ fn tail_expression_produces_the_selected_arms_value() {
 // except there, and would fail with an error pointing at getrandom's lib.rs
 // rather than at the macro. 40 arms here, with no `recursion_limit` attribute on
 // this file, so the margin is measured rather than assumed.
-// ---------------------------------------------------------------------------
 fn deep_chain() -> u32 {
     cfg_if::cfg_if! {
         if #[cfg(any())] { 1 }

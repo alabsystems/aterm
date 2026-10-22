@@ -669,8 +669,7 @@ impl Compiled {
     /// [`Compiled::successors`] written into `rows` (replacing what it held) one after
     /// another, each `s.len()` values long; returns how many. A walk passes the same buffer
     /// for every step, so a step allocates nothing once it has grown.
-    // Skip: the cartesian product's Vec bookkeeping, same class as
-    // `successors_in`, whose algorithm this is.
+    // Skip: the cartesian product's Vec bookkeeping, as in `successors_in`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn successors_into(&self, a: usize, s: &[i64], rows: &mut Vec<i64>) -> usize {
         with_slots(self.slots, |locals| {

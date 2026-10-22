@@ -84,7 +84,7 @@ pub(crate) struct Evicted {
     pub(crate) already_lost: usize,
 }
 
-/// Cold tier: LZ4 compressed pages (in-memory).
+/// Cold tier: LZ4 compressed pages in memory.
 ///
 /// Uses cumulative line counts for O(log P) page lookup and caches the
 /// last decompressed page to avoid redundant decompression.
@@ -521,10 +521,7 @@ impl ColdTier {
                 // Bounded by the lines in memory, like `pop_front_batch`'s sum.
                 already_lost = already_lost.saturating_add(logical);
             }
-            // `bytes_freed` sums the lengths of live `compressed`
-            // allocations (bounded by self.bytes_used) and `pages_to_evict`
-            // counts pages (bounded by self.pages.len()); both fit in usize,
-            // so saturating_add never saturates and is behavior-identical.
+            // Saturating: bounded by `bytes_used` and the page count; exact.
             bytes_freed = bytes_freed.saturating_add(page.compressed.len());
             pages_to_evict = pages_to_evict.saturating_add(1);
         }

@@ -129,7 +129,7 @@ fn read_admitted(path: &Path, max: usize, admit: Admit) -> crate::Result<Option<
             }
         }
     }
-    let mut bytes = Vec::new();
+    let mut bytes = read_buffer(meta.len(), max);
     let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
     crate::secret::read_to_end_wiping_on_error(file.take(limit), &mut bytes)
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
@@ -141,6 +141,16 @@ fn read_admitted(path: &Path, max: usize, admit: Admit) -> crate::Result<Option<
         )));
     }
     Ok(Some(bytes))
+}
+
+/// A buffer sized once for reading a file of `len` bytes (its `fstat` size) under a cap of
+/// `max`. `read_to_end` through a `Take` has no size hint, so into an empty buffer it grows
+/// from 32 bytes, freeing each block it outgrew, with what it had read, unwiped. One byte past
+/// the file lets it see the end without growing; only a file that grows between the `fstat`
+/// and the read still grows it.
+fn read_buffer(len: u64, max: usize) -> Vec<u8> {
+    let len = usize::try_from(len).unwrap_or(usize::MAX).min(max);
+    Vec::with_capacity(len.saturating_add(1))
 }
 
 /// Read a private file: a regular file this user owns with no group/other bits, at most
@@ -328,7 +338,7 @@ pub fn wipe_and_remove(path: &Path) -> crate::Result<()> {
 /// the exception: it loses its name and keeps its bytes.
 pub fn wipe_if(path: &Path, max: usize, ours: impl FnOnce(&[u8]) -> bool) -> crate::Result<bool> {
     wipe(path, |file| {
-        let mut bytes = Vec::new();
+        let mut bytes = read_buffer(file.metadata().map_or(0, |meta| meta.len()), max);
         let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
         // Unreadable: nothing shows it is what `ours` wants.
         if crate::secret::read_to_end_wiping_on_error(file.take(limit), &mut bytes).is_err() {
@@ -469,6 +479,17 @@ mod tests {
                 .expect("ok")
                 .is_none()
         );
+    }
+
+    /// A read fills one buffer sized from the file's length, a byte over so it sees the end
+    /// without growing: a buffer that grew freed each block it outgrew, unwiped.
+    #[test]
+    fn a_read_fills_one_buffer_sized_from_the_files_length() {
+        let root = scratch();
+        let path = root.path().join("value");
+        write_atomic(&path, &[7u8; 1000], 0o600).expect("write");
+        let bytes = read_owned(&path, 4096).expect("read").expect("there");
+        assert_eq!((bytes.len(), bytes.capacity()), (1000, 1001));
     }
 
     #[test]

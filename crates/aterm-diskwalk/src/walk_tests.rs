@@ -18,9 +18,7 @@ fn p(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-// ---------------------------------------------------------------------------
 // Scratch trees
-// ---------------------------------------------------------------------------
 
 /// A policy for walking scratch trees under the temp folder: the live mount
 /// table (read without asking any file system) and a home the tree is not in.

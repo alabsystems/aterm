@@ -98,6 +98,55 @@ fn an_expired_reply_deadline_preserves_the_unread_stream() {
     assert_eq!(reply.reply_serial, Some(9));
 }
 
+/// The next whole message the bus's end of a pair reads.
+fn heard(bus: &mut CtlStream) -> Message {
+    let mut buf = Vec::new();
+    loop {
+        if let Some(n) = message::frame_len(&buf).unwrap()
+            && n <= buf.len()
+        {
+            return Message::decode(&buf[..n]).unwrap();
+        }
+        let mut chunk = [0u8; 4096];
+        let n = bus.read(&mut chunk).unwrap();
+        assert_ne!(n, 0, "the connection hung up");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+#[test]
+fn a_call_answered_after_its_deadline_leaves_the_connection_as_it_was() {
+    let (ours, mut bus) = CtlStream::pair().unwrap();
+    bus.set_read_timeout(Some(HANG)).unwrap();
+    let mut conn = connected(ours);
+    let ping = || Message::method_call(Some(":1.9"), "/private", None, "Ping").unwrap();
+    // What `call` runs, each phase given its own deadline (`call` gives both
+    // its one): the call goes out whole (no deadline to send by), and the
+    // answer's deadline has passed, whatever the machine's speed.
+    let expired = Instant::now().checked_sub(Duration::from_secs(1));
+    let outcome = conn.call_until(ping(), None, expired);
+    assert!(matches!(outcome, Err(Error::NoReply)), "{outcome:?}");
+    let sent = heard(&mut bus);
+    assert_eq!(
+        (sent.member.as_deref(), sent.serial),
+        (Some("Ping"), 2),
+        "the call went out whole"
+    );
+    bus.write_all(&bytes([answer(2), answer(3)])).unwrap();
+    let late = conn.recv(Some(HANG)).unwrap().unwrap();
+    assert_eq!(
+        (late.kind, late.reply_serial),
+        (Kind::MethodReturn, Some(2)),
+        "the late answer is handed over as any other message"
+    );
+    let next = conn.call(ping(), HANG).unwrap();
+    assert_eq!(
+        next.reply_serial,
+        Some(3),
+        "and the connection carries the next call"
+    );
+}
+
 #[test]
 fn a_reply_before_its_deadline_preserves_unrelated_messages_in_order() {
     let (mut conn, _peer) = sending(bytes([signal(2, "first"), signal(3, "second"), answer(9)]));

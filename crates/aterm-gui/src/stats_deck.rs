@@ -392,7 +392,6 @@ pub(crate) struct DeckInput<'a> {
     pub(crate) locale: Locale,
 }
 
-// ---------------------------------------------------------------------
 // THE HEAT TABLE (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §3, §4, §6, §9,
 // §10, §11.1–§11.2): the rows' words are read once from the snapshot
 // ([`DeckWords`]), then laid on the planner's columns for the deck's width

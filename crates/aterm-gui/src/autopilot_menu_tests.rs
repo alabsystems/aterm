@@ -2242,6 +2242,7 @@ fn a_readers_cancel_identity_tracks_its_exact_timer_when_the_face_stays() {
             cancels: f.armed_at_ms,
             highlight: Some(1),
             rect: Some(rect),
+            laid: None,
             generation: 0,
             rest: PointerRest::at_open(None),
         };
@@ -3315,4 +3316,261 @@ fn fx_occluders_compose_over_the_autopilot_menu_the_question_and_the_caption() {
     });
     assert_chrome_cuts_the_light(&mut app, wid, &[menu, banner, caption]);
     app.on_cursor_left(wid);
+}
+
+/// A font zoom to `size` px: the zoom's own transaction, its renderer
+/// rebuild elided (a headless window has none, nor an OS window to re-fit),
+/// so the window's cells grow and its grid keeps its rows and columns — and
+/// Claude's screen, and the chip at the open menu's anchor.
+fn zoom(app: &mut App, size: f32) {
+    assert!(app.set_font_size_with(size, |_| true), "zoomed to {size}");
+}
+
+/// The word choosing row `i` of `rows` writes, where it is an enabled mode
+/// choice (`Cruise`, `Land now`, `Off`).
+fn mode_word(rows: &[MenuRow], i: usize) -> Option<&'static str> {
+    match rows.get(i)? {
+        MenuRow::Item {
+            act: MenuAct::Mode(mode),
+            enabled: true,
+            ..
+        } => Some(mode.word()),
+        _ => None,
+    }
+}
+
+/// The menu open from the chip as a pointer opens it (no row lit) and
+/// painted, and the first zoom step from the window's font that puts, under
+/// the pixel of one mode choice of the painted card — as the grid it was
+/// laid on shows it — another mode choice's cell of that card: the zoom's
+/// size, the choice the pixel shows, the choice the zoomed grid puts under
+/// it, and the pixel. The zoom undone.
+fn open_where_a_zoom_moves_a_choice(
+    app: &mut App,
+    wid: WindowId,
+    session: u64,
+) -> (f32, usize, usize, (f64, f64)) {
+    frame(app, wid);
+    let chip = chip_cell(app, wid, session);
+    app.open_autopilot_menu(wid, session, chip, false);
+    frame(app, wid);
+    let rect = rect_of(app).expect("painted");
+    let rows = app.autopilot_menu.as_ref().expect("open").rows.clone();
+    let cells: Vec<(usize, (f64, f64))> = (0..rows.len())
+        .filter(|&i| mode_word(&rows, i).is_some())
+        .map(|i| (i, row_px(app, wid, i).0))
+        .collect();
+    let base = app.font_size;
+    let found = (1..=16u8)
+        .find_map(|step| {
+            let size = base + f32::from(step);
+            zoom(app, size);
+            let found = cells.iter().find_map(|&(i, (x, y))| {
+                let (row, col) = app.frame_cell_at(wid, x, y)?;
+                let j =
+                    item_at(rect, &rows, row, col).filter(|&j| mode_word(&rows, j).is_some())?;
+                (j != i).then_some((size, i, j, (x, y)))
+            });
+            zoom(app, base);
+            found
+        })
+        .expect("a zoom puts another mode choice under one's pixel");
+    assert_eq!(
+        app.autopilot_menu.as_ref().and_then(|m| m.laid),
+        app.glass_grid(wid),
+        "the zoom undone: the grid the card was laid on"
+    );
+    found
+}
+
+/// The open menu's lit row.
+fn lit(app: &App) -> Option<usize> {
+    app.autopilot_menu.as_ref().and_then(|m| m.highlight)
+}
+
+/// A RE-GRID LEAVES THE AUTOPILOT MENU'S LAST RECT ANSWERING NOTHING: the
+/// menu open from its chip and painted, the pointer resting on a mode
+/// choice. A font zoom re-grids the window — its cells grow — and puts
+/// another mode choice's cell of the last frame's rect under that pixel.
+/// Before the next frame a motion there finds nothing on the card (the
+/// choice it rested on stays lit, as off the card), and a press there closes
+/// the menu having chosen nothing, as a press before its first paint does.
+/// A fact's menu is the same card, with the same rect and stamp.
+///
+/// NEGATIVE CONTROL: the last frame's rect stamped as the zoomed grid's (no
+/// stamp, as before), the same motion lights the other choice and the press
+/// chooses it: the word the pointer never rested on is written.
+#[test]
+fn a_regrid_leaves_the_autopilot_menus_last_rect_answering_nothing() {
+    for forged in [true, false] {
+        let (mut app, wid, session, host) = claude_app();
+        let _host = MenuTestHost(host);
+        let (size, was, now, (x, y)) = open_where_a_zoom_moves_a_choice(&mut app, wid, session);
+        let rows = app.autopilot_menu.as_ref().expect("open").rows.clone();
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            lit(&app),
+            Some(was),
+            "on the grid it was laid on, its choice"
+        );
+        let before = pair(&app, session);
+        zoom(&mut app, size);
+        let laid = app.autopilot_menu.as_ref().and_then(|m| m.laid);
+        assert_ne!(app.glass_grid(wid), laid, "the zoom re-grids the window");
+        if forged {
+            app.autopilot_menu.as_mut().expect("open").laid = app.glass_grid(wid);
+        }
+        app.on_cursor_moved(wid, x, y);
+        if forged {
+            assert_eq!(
+                lit(&app),
+                Some(now),
+                "CONTROL: unstamped, another choice lit"
+            );
+        } else {
+            assert_eq!(
+                lit(&app),
+                Some(was),
+                "nothing lit from a rect laid on another grid"
+            );
+        }
+        click(&mut app, wid, (x, y), Press::Bare);
+        assert!(
+            app.autopilot_menu.is_none(),
+            "forged={forged}: the press closes it"
+        );
+        if forged {
+            assert_eq!(
+                pair(&app, session).0.as_deref(),
+                mode_word(&rows, now),
+                "CONTROL: the choice the pointer never rested on is chosen"
+            );
+            assert_ne!(pair(&app, session), before, "CONTROL");
+        } else {
+            assert_eq!(pair(&app, session), before, "nothing is chosen");
+        }
+    }
+}
+
+/// THE RE-GRID'S FRAME LAYS THE CARD AGAIN, AND ITS ROWS MOVED UNDER A STILL
+/// POINTER (lifecycle-1): the menu open and painted, the pointer resting on
+/// a mode choice; a font zoom puts another choice under that pixel with no
+/// motion. The re-grid closes nothing — the chip still stands at the menu's
+/// anchor, so the next frame lays the card again, at the same cells, on the
+/// zoomed grid. The pointer saw none of the rows now under it: a press there
+/// chooses nothing and lights the choice now under it, and the next press
+/// takes that choice.
+///
+/// NEGATIVE CONTROL: a pointer that moved after the frame laid the card
+/// again presses at once.
+///
+/// RED before the fix: the card laid again at the same rect did not count as
+/// arrived, and the first press chose the choice the pointer never rested on.
+#[test]
+fn a_card_laid_again_on_a_new_grid_takes_no_press_it_did_not_see() {
+    for moved in [false, true] {
+        let (mut app, wid, session, host) = claude_app();
+        let _host = MenuTestHost(host);
+        let (size, was, now, (x, y)) = open_where_a_zoom_moves_a_choice(&mut app, wid, session);
+        let rows = app.autopilot_menu.as_ref().expect("open").rows.clone();
+        let rect = rect_of(&app).expect("painted");
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(lit(&app), Some(was));
+        let before = pair(&app, session);
+        zoom(&mut app, size);
+        frame(&mut app, wid);
+        assert_eq!(rect_of(&app), Some(rect), "laid again at the same cells");
+        assert_eq!(
+            app.autopilot_menu.as_ref().and_then(|m| m.laid),
+            app.glass_grid(wid),
+            "on the zoomed grid"
+        );
+        let (row, col) = app.frame_cell_at(wid, x, y).expect("on the frame");
+        assert_eq!(
+            item_at(rect, &rows, row, col),
+            Some(now),
+            "another choice under the pixel"
+        );
+        if moved {
+            let (cx, cy) = app.frame_cell_centre(wid, (row, col));
+            app.on_cursor_moved(wid, cx, cy + 1.0);
+            app.on_cursor_moved(wid, x, y);
+        }
+        click(&mut app, wid, (x, y), Press::Bare);
+        if moved {
+            assert!(app.autopilot_menu.is_none(), "CONTROL: chosen at once");
+            assert_eq!(
+                pair(&app, session).0.as_deref(),
+                mode_word(&rows, now),
+                "CONTROL"
+            );
+            continue;
+        }
+        assert!(
+            app.autopilot_menu.is_some(),
+            "the press the rows moved under is refused"
+        );
+        assert_eq!(pair(&app, session), before, "nothing is chosen");
+        assert_eq!(
+            lit(&app),
+            Some(now),
+            "the choice now under the pointer is lit"
+        );
+        click(&mut app, wid, (x, y), Press::Bare);
+        assert!(app.autopilot_menu.is_none(), "the next press takes it");
+        assert_eq!(pair(&app, session).0.as_deref(), mode_word(&rows, now));
+    }
+}
+
+/// A DOUBLE-CLICK'S SECOND PRESS IS JUDGED WHERE THE CARD WAS LAID: a press
+/// on a mode choice chooses it and closes the card; a font zoom then
+/// re-grids the window before the double-click's second press at the same
+/// pixel, which the zoomed grid puts off the card's rect. Judged on the grid
+/// the card was laid on, the press fell on the card, and is spent there.
+///
+/// NEGATIVE CONTROL: a second press that moved off the card — on the grid it
+/// was laid on — is not spent.
+///
+/// RED before the fix: the press was judged on the zoomed grid, off the
+/// card, and passed on to what the card covered.
+#[test]
+fn a_regrid_between_a_double_clicks_presses_moves_no_pixel_of_it() {
+    for on_card in [true, false] {
+        let (mut app, wid, session, host) = claude_app();
+        let _host = MenuTestHost(host);
+        frame(&mut app, wid);
+        let chip = chip_cell(&app, wid, session);
+        app.open_autopilot_menu(wid, session, chip, false);
+        frame(&mut app, wid);
+        let rect = rect_of(&app).expect("painted");
+        let rows = app.autopilot_menu.as_ref().expect("open").rows.clone();
+        let i = (0..rows.len())
+            .find(|&i| mode_word(&rows, i).is_some())
+            .expect("a mode choice");
+        let ((x, y), _) = row_px(&app, wid, i);
+        let off = app.frame_cell_centre(wid, (0, 0));
+        assert!(!rect.contains(0, 0), "the corner is off the card");
+        app.on_cursor_moved(wid, x, y);
+        click(&mut app, wid, (x, y), Press::Bare);
+        assert!(app.autopilot_menu.is_none(), "chosen and closed");
+        assert!(
+            app.autopilot_menu_spent.is_some(),
+            "the card a choice closed"
+        );
+        let doubled = app.font_size * 2.0;
+        zoom(&mut app, doubled);
+        assert!(
+            app.frame_cell_at(wid, x, y)
+                .is_none_or(|(row, col)| !rect.contains(row, col)),
+            "the zoomed grid puts the pixel off the card's rect"
+        );
+        if !on_card {
+            app.on_cursor_moved(wid, off.0, off.1);
+        }
+        assert_eq!(
+            app.spends_menu_follow_up(wid),
+            on_card,
+            "on_card={on_card}: spent only where it fell on the card as laid"
+        );
+    }
 }

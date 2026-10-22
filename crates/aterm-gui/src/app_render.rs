@@ -5059,14 +5059,11 @@ fn active_pane_edge_ink(theme: Theme) -> [u8; 3] {
     ]
 }
 
-/// One divider cell carrying the active pane's edge stripe: the seam cell with
-/// a one-eighth block element filling the sliver touching the pane.
-///
-/// The four glyphs (U+2580–259F, synthesized by `procedural.rs`) are anchored
-/// to the edge they name and all keep the seam as background and the ink as
-/// foreground, so `minimum_contrast` treats all four sides alike. Cells are
-/// about twice as tall as wide, so top/bottom stripes are about twice as thick
-/// as left/right; an eighth is the finest block fraction.
+/// One divider cell carrying the active pane's edge stripe: the seam cell with a
+/// block element filling the sliver touching the pane (an eighth for the top and
+/// bottom runs, a half for the sides). The glyphs (U+2580–259F, synthesized by
+/// `procedural.rs`) keep the seam as background and the ink as foreground, so
+/// `minimum_contrast` treats all four sides alike.
 pub(crate) fn active_pane_edge_cell(
     p: impl Into<crate::chrome_band::ChromePalette>,
     edge: ActivePaneEdge,
@@ -18393,10 +18390,6 @@ impl App {
         let theme = self.theme;
         // The pane dividers draw the seam token on the terminal background.
         let grid = self.chrome_palette(ChromeSurface::Grid);
-        // Read the aurora config and cell geometry before the `ws` borrow (they map
-        // the focused cursor cell to grid-interior pixels). The motion policy gates
-        // amplitude as on the single-pane path: reduced (config, OS flag,
-        // unfocused window) means intensity 0, with the same `motion_focus` pin.
         let raw_focused = self.windows.get(&wid)?.focused;
         // The same typed-wake fold as single-pane (`cursor_fx_focus`): typing into
         // an unfocused window keeps its earned trail/kitty light.
@@ -21867,9 +21860,8 @@ impl App {
             pad_top.hash(&mut h);
             head.hash(&mut h); // the dy anchor moves with the chrome headroom
             strip_dy.hash(&mut h); // …and with the strip's rows where it clears them
-            // …and the PALETTE it paints from: a live OSC-11 background or a
-            // `window_theme` flip moves the pill's tones, and a resident raster
-            // keyed on geometry alone would sit out both.
+            // …and the palette: a live OSC-11 background or a `window_theme`
+            // flip moves the pill's tones.
             palette.hash(&mut h);
             h.finish()
         };
@@ -22399,6 +22391,9 @@ impl App {
         let theme = palette.theme;
         let ((cw, ch), pad) = (self.win_cell_size(wid), self.win_pad(wid));
         let grid_top = self.win_pad_top(wid) + self.win_head(wid);
+        // The grid this paint lays the card on: its rect answers the pointer
+        // on it alone (`App::laid_cell_at`).
+        let laid = self.glass_grid(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -22451,6 +22446,7 @@ impl App {
         crate::claude_card::cut_out(&mut ws.claude_card, &mut ws.input_scratch, rect, cw, pad);
         scrub_overlay_card(&mut ws.input_scratch, rect, (cw, ch), (pad, grid_top));
         ws.tab_menu_rect = Some(rect);
+        ws.tab_menu_laid = laid;
         // Pin the card out of the smooth-scroll band (clamped so the band never
         // inverts), or output behind the menu would glide the card with the grid.
         if ws.input_scratch.grid_top_row < ws.input_scratch.grid_bot_row {

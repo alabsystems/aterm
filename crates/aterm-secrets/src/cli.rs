@@ -12,7 +12,8 @@ use std::process::ExitCode;
 pub const USAGE: &str = "\
 aterm secrets: one credentials file for every machine (aterm help secrets).
 
-  aterm secrets [status]                 where this machine's vault is and what it holds
+  aterm secrets [status]                 where this machine's vault is, what it holds, and
+                                         (an admin) whether the approver runs
   aterm secrets join [<url>|<path>]      join a vault (Enter-equivalent: the ALab default)
         [--name <host>] [--password-stdin] [--no-agent] [--no-wait]
   aterm secrets sync                     fetch and apply the latest version now
@@ -21,6 +22,8 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
   aterm secrets get <name>               print one value to stdout
 admin (a machine in [admins]):
   aterm secrets create <url>|<path> [--import <dir>] [--name <host>]
+        [--no-agent]                     (installs the subscriber too: its approver lets
+                                         in a machine that types the join password)
   aterm secrets edit                     the vault text in $EDITOR; saving publishes it
   aterm secrets set <name> [--for <host|code>...] [--file <path>]
         [--if-absent [--with <name> | --no-with]] [--fleet-reads-anchors]
@@ -28,8 +31,11 @@ admin (a machine in [admins]):
                                          only where that if-absent entry is not the machine's own;
                                          set again, an entry keeps its anchor unless --no-with)
   aterm secrets unset <name> [--for <host|code>...]
-  aterm secrets password [show|set|new|open|off]   the join password a joining machine
+  aterm secrets password [show|set|new|open|off] [--no-agent]
+                                                   the join password a joining machine
                                          types, or open: every machine that asks is let in
+                                         (by this Mac's subscriber, which set, new and
+                                         open install where it does not run)
   aterm secrets requests                 machines asking to join
   aterm secrets approve <code>... | --all | <age1...> --name <host>
   aterm secrets revoke <host|code> [--drop-sections]
@@ -107,6 +113,7 @@ enum Command {
         source: String,
         import: Option<String>,
         name: Option<String>,
+        agent: bool,
     },
     Edit,
     Set {
@@ -119,7 +126,10 @@ enum Command {
         name: String,
         hosts: Vec<String>,
     },
-    Password(Password),
+    Password {
+        action: Password,
+        agent: bool,
+    },
     Requests,
     Approve {
         which: Vec<String>,
@@ -383,12 +393,13 @@ fn parse(words: &[String]) -> Result<Command, String> {
             }
         }
         "create" => {
-            let f = flags(rest, &["--import", "--name"], &[])?;
+            let f = flags(rest, &["--import", "--name"], &["--no-agent"])?;
             match f.operands.as_slice() {
                 [source] => Ok(Command::Create {
                     source: source.clone(),
                     import: f.one("--import"),
                     name: f.one("--name"),
+                    agent: !f.has("--no-agent"),
                 }),
                 _ => Err("create takes one URL or path".into()),
             }
@@ -468,7 +479,7 @@ fn parse(words: &[String]) -> Result<Command, String> {
             }
         }
         "password" => {
-            let f = flags(rest, &[], &[])?;
+            let f = flags(rest, &[], &["--no-agent"])?;
             let action = match f.operands.as_slice() {
                 [] => Password::Show,
                 [word] => match word.as_str() {
@@ -481,7 +492,10 @@ fn parse(words: &[String]) -> Result<Command, String> {
                 },
                 _ => return Err("password takes show, set, new, open or off".into()),
             };
-            Ok(Command::Password(action))
+            Ok(Command::Password {
+                action,
+                agent: !f.has("--no-agent"),
+            })
         }
         "requests" => {
             no_operands(&flags(rest, &[], &[])?, "requests")?;
@@ -602,7 +616,7 @@ mod unix {
         Action, Command, Fill, Password, SERVE_SWITCHES, SERVE_VALUED, flags, serve_settings,
     };
     use crate::client::{
-        self, JoinOptions, JoinOutcome, Membership, Paths, Published, SyncOutcome,
+        self, Approval, JoinOptions, JoinOutcome, Membership, Paths, Published, SyncOutcome,
     };
     use crate::service::{self, Job};
     use crate::text::Audience;
@@ -631,8 +645,14 @@ mod unix {
 
     pub(super) fn run(command: Command) -> crate::Result<ExitCode> {
         let paths = Paths::live()?;
+        let state = || service::state(&paths.home, Job::Subscriber);
+        let install = || install_subscriber(&paths, None);
+        let subscriber = Subscriber {
+            state: &state,
+            install: &install,
+        };
         match command {
-            Command::Status => status(&paths),
+            Command::Status => status(&paths, &subscriber),
             Command::Join {
                 source,
                 name,
@@ -656,7 +676,8 @@ mod unix {
                 source,
                 import,
                 name,
-            } => create(&paths, &source, import, name),
+                agent,
+            } => create(&paths, &source, import, name, agent, &subscriber),
             Command::Edit => edit(&paths),
             Command::Set {
                 name,
@@ -680,7 +701,7 @@ mod unix {
                 let done = client::admin_publish(&paths, &admin, &doc)?;
                 Ok(published(&format!("removed {name}"), &done))
             }
-            Command::Password(action) => password(&paths, action),
+            Command::Password { action, agent } => password(&paths, action, agent, &subscriber),
             Command::Requests => requests(&paths),
             Command::Approve { which, all, name } => approve(&paths, &which, all, name),
             Command::Revoke {
@@ -1056,11 +1077,129 @@ mod unix {
     }
 
     fn service_line(paths: &Paths, job: Job) -> String {
-        match service::state(&paths.home, job) {
+        service_words(&service::state(&paths.home, job))
+    }
+
+    fn service_words(state: &crate::Result<service::State>) -> String {
+        match state {
             Ok(service::State::Absent) => "not installed".into(),
             Ok(service::State::Installed { pid: Some(pid), .. }) => format!("running (pid {pid})"),
             Ok(service::State::Installed { pid: None, .. }) => "installed, not running".into(),
             Err(error) => format!("unknown ({error})"),
+        }
+    }
+
+    /// This Mac's subscriber, where an admin's approver runs (§9): read and installed through
+    /// here, so a test plays it with an inert arm and never installs a launchd job or a
+    /// systemd unit.
+    pub(super) struct Subscriber<'a> {
+        /// Its state now ([`service::state`]).
+        pub(super) state: &'a dyn Fn() -> crate::Result<service::State>,
+        /// Install and start it ([`install_subscriber`]): the line saying what was done.
+        pub(super) install: &'a dyn Fn() -> crate::Result<String>,
+    }
+
+    /// What became of this Mac's approver where a command needs one to keep what it promises.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum Approver {
+        /// The subscriber was running already, so it was left be.
+        Running,
+        /// The subscriber was installed now: the line saying so.
+        Installed(String),
+        /// `--no-agent`: nothing was installed.
+        Skipped,
+        /// The install failed: why.
+        Failed(String),
+        /// The subscriber's state could not be read: why. Nothing was installed.
+        Unknown(String),
+    }
+
+    impl Approver {
+        /// Whether an approver runs on this Mac now.
+        pub(super) fn runs(&self) -> bool {
+            matches!(self, Approver::Running | Approver::Installed(_))
+        }
+    }
+
+    /// Put this Mac's approver in: install the subscriber unless it runs already. One that is
+    /// installed with no process (a plist launchd never loaded, or a job that keeps ending)
+    /// runs no approver, so it is installed again, as `aterm init`'s row judges it. A state
+    /// that cannot be read installs nothing, since an install asks the same service manager.
+    pub(super) fn put_in_approver(subscriber: &Subscriber<'_>) -> Approver {
+        match (subscriber.state)() {
+            Ok(service::State::Installed { pid: Some(_), .. }) => Approver::Running,
+            Ok(_) => match (subscriber.install)() {
+                Ok(line) => Approver::Installed(line),
+                Err(error) => Approver::Failed(error.to_string()),
+            },
+            Err(error) => Approver::Unknown(error.to_string()),
+        }
+    }
+
+    /// Who an approver for `approval` lets in.
+    fn joiner(approval: Approval) -> &'static str {
+        match approval {
+            Approval::Password => "a machine that types the join password",
+            Approval::Open => "a machine that asks to join",
+        }
+    }
+
+    /// What a vault that approves by `approval` does where no approver runs on this Mac.
+    fn waits(approval: Approval) -> String {
+        format!(
+            "{} waits for approval by code unless another admin Mac runs one: aterm secrets agent on starts one here",
+            joiner(approval)
+        )
+    }
+
+    /// What a command that needs this Mac's approver says of it, for a vault that approves
+    /// by `approval`: the install line, nothing for one that ran already, else that none runs
+    /// here and that `aterm secrets agent on` starts one.
+    pub(super) fn approver_words(approver: &Approver, approval: Approval) -> Option<String> {
+        let none = |why: &str| {
+            format!(
+                "no approver runs on this Mac ({why}), so {}",
+                waits(approval)
+            )
+        };
+        match approver {
+            Approver::Running => None,
+            Approver::Installed(line) => Some(line.clone()),
+            Approver::Skipped => Some(none("--no-agent")),
+            Approver::Failed(error) => Some(format!(
+                "warning: {}",
+                none(&format!("the subscriber was not installed: {error}"))
+            )),
+            Approver::Unknown(error) => Some(format!(
+                "warning: whether this Mac's subscriber runs is unknown ({error}); if it does not, {}",
+                waits(approval)
+            )),
+        }
+    }
+
+    /// `status`'s line for an admin of a vault that approves by `approval`: whether the
+    /// approver runs, by its subscriber's state (`subscriber`).
+    pub(super) fn approver_line(
+        approval: Approval,
+        subscriber: &crate::Result<service::State>,
+    ) -> String {
+        match subscriber {
+            Ok(service::State::Installed { pid: Some(pid), .. }) => format!(
+                "approver: running in the subscriber (pid {pid}), so {} is let in within seconds",
+                joiner(approval)
+            ),
+            Ok(service::State::Installed { pid: None, .. }) => format!(
+                "approver: not running (the subscriber is installed but not running), so {}",
+                waits(approval)
+            ),
+            Ok(service::State::Absent) => format!(
+                "approver: not running (no subscriber is installed), so {}",
+                waits(approval)
+            ),
+            Err(error) => format!(
+                "approver: unknown ({error}); if it does not run, {}",
+                waits(approval)
+            ),
         }
     }
 
@@ -1080,7 +1219,7 @@ mod unix {
         }
     }
 
-    fn status(paths: &Paths) -> crate::Result<ExitCode> {
+    fn status(paths: &Paths, subscriber: &Subscriber<'_>) -> crate::Result<ExitCode> {
         let status = client::status(paths)?;
         match &status.config {
             None => {
@@ -1142,7 +1281,13 @@ mod unix {
             );
         }
         if status.config.is_some() {
-            println!("subscriber: {}", service_line(paths, Job::Subscriber));
+            let state = (subscriber.state)();
+            println!("subscriber: {}", service_words(&state));
+            // An admin of a vault that lets machines in by itself: they are let in only while
+            // an approver runs (on this Mac, or another admin's).
+            if let Ok(Some(approval)) = client::approving_here(paths) {
+                println!("{}", approver_line(approval, &state));
+            }
         }
         if !matches!(
             service::state(&paths.home, Job::Server),
@@ -1220,6 +1365,7 @@ mod unix {
             }
         };
         let say = |line: &str| eprintln!("{line}");
+        let before = client::config(paths).ok().flatten();
         let outcome = client::join(
             paths,
             &JoinOptions {
@@ -1236,7 +1382,19 @@ mod unix {
                 requested: &install,
                 say: &say,
             },
-        )?;
+        )
+        .inspect_err(|_| {
+            // Cut off after it saved the source (the server gone before the request was
+            // queued), the join leaves this Mac waiting with its request due at once: the
+            // subscriber that makes it goes in now, as once a request is queued.
+            if client::config(paths)
+                .ok()
+                .flatten()
+                .is_some_and(|after| before.as_ref() != Some(&after))
+            {
+                install();
+            }
+        })?;
         match &outcome {
             JoinOutcome::Joined { seq, names } => {
                 println!("joined: seq {seq}, {} secrets in ~/.secrets", names.len());
@@ -1323,11 +1481,17 @@ mod unix {
         Ok(ExitCode::SUCCESS)
     }
 
-    fn create(
+    /// `create`, then this Mac's subscriber put in as `join` puts it in (unless `agent` is
+    /// false, `--no-agent`): a new vault has a join password, and only an admin's subscriber
+    /// approves a machine that types it. A failed install is a warning, not a failure: the
+    /// vault is out, and `aterm secrets agent on` starts the approver later.
+    pub(super) fn create(
         paths: &Paths,
         source: &str,
         import: Option<String>,
         name: Option<String>,
+        agent: bool,
+        subscriber: &Subscriber<'_>,
     ) -> crate::Result<ExitCode> {
         let import = import.map(|dir| expand(paths, &dir));
         let created = client::create(paths, source, import.as_deref(), name.as_deref())?;
@@ -1340,9 +1504,32 @@ mod unix {
             "machines that join it must pin this key: add #{} to the URL, or confirm the fingerprint",
             created.signer
         );
-        println!(
-            "a joining machine that types the join password is let in by this Mac's subscriber: aterm secrets password shows it"
-        );
+        // A vault at a path has no join queue: a machine joins it by key (`approve <age1…>
+        // --name`), so no approver has anything to do there.
+        if !matches!(
+            client::config(paths)?.map(|config| config.source),
+            Some(Source::Url(_))
+        ) {
+            println!(
+                "a machine joins it when an admin Mac approves its key: aterm secrets approve <age1…> --name <host>"
+            );
+        } else {
+            let approver = if agent {
+                put_in_approver(subscriber)
+            } else {
+                Approver::Skipped
+            };
+            if let Some(words) = approver_words(&approver, Approval::Password) {
+                eprintln!("{words}");
+            }
+            if approver.runs() {
+                println!(
+                    "a joining machine that types the join password is let in by this Mac's subscriber: aterm secrets password shows it"
+                );
+            } else {
+                println!("aterm secrets password shows the join password a joining machine types");
+            }
+        }
         if !created.imported.is_empty() {
             println!("imported into [everyone]: {}", created.imported.join(", "));
         }
@@ -1654,9 +1841,38 @@ mod unix {
         ))
     }
 
-    fn password(paths: &Paths, action: Password) -> crate::Result<ExitCode> {
+    /// `password`. What leaves a vault with a join queue (a URL's) letting machines in by
+    /// itself (`open`, `set`, `new`) also puts this Mac's approver in where none runs
+    /// ([`put_in_approver`]), so the promise it prints holds: only an admin's subscriber lets
+    /// a machine in without a person. `--no-agent` (`agent` false) installs nothing, for an
+    /// admin whose subscriber was turned off on purpose, and says so where none runs.
+    pub(super) fn password(
+        paths: &Paths,
+        action: Password,
+        agent: bool,
+        subscriber: &Subscriber<'_>,
+    ) -> crate::Result<ExitCode> {
         let admin = client::admin_open(paths)?;
         let mut doc = admin.doc.clone();
+        let queued = matches!(admin.config.source, Source::Url(_));
+        let approver = |doc: &text::Document| {
+            let Some(approval) = Approval::of(doc).filter(|_| queued) else {
+                return;
+            };
+            let approver = if agent {
+                put_in_approver(subscriber)
+            } else if matches!(
+                (subscriber.state)(),
+                Ok(service::State::Installed { pid: Some(_), .. })
+            ) {
+                Approver::Running
+            } else {
+                Approver::Skipped
+            };
+            if let Some(words) = approver_words(&approver, approval) {
+                eprintln!("{words}");
+            }
+        };
         match action {
             Password::Show => match admin.doc.join_password() {
                 Some(password) => {
@@ -1680,6 +1896,7 @@ mod unix {
             Password::Open => {
                 if admin.doc.open() {
                     println!("{OPEN_VAULT}");
+                    approver(&admin.doc);
                     return Ok(ExitCode::SUCCESS);
                 }
                 // Those already waiting are a person's to judge: one may be a machine let go
@@ -1698,6 +1915,7 @@ mod unix {
                 let done = client::admin_publish(paths, &admin, &doc)?;
                 let code = published("opened the vault", &done);
                 println!("{OPEN_VAULT}");
+                approver(&doc);
                 eprintln!("note: {OLDER_ADMINS}");
                 Ok(code)
             }
@@ -1707,6 +1925,7 @@ mod unix {
                     .map_err(text_error)?;
                 let done = client::admin_publish(paths, &admin, &doc)?;
                 let code = published("set a new join password", &done);
+                approver(&doc);
                 let mut out = std::io::stdout().lock();
                 out.write_all(b"join password: ")?;
                 out.write_all(password.as_slice())?;
@@ -1731,7 +1950,9 @@ mod unix {
                 doc.set_join_password(Some(password.as_slice()))
                     .map_err(text_error)?;
                 let done = client::admin_publish(paths, &admin, &doc)?;
-                Ok(published("set the join password", &done))
+                let code = published("set the join password", &done);
+                approver(&doc);
+                Ok(code)
             }
             Password::Off => {
                 if admin.doc.open() {
@@ -2142,6 +2363,38 @@ mod tests {
     }
 
     #[test]
+    fn create_takes_one_source_and_its_switches() {
+        assert_eq!(
+            parse(&words(
+                "create http://h:1/v1/x --import ~/.secrets --name m9 --no-agent"
+            )),
+            Ok(Command::Create {
+                source: "http://h:1/v1/x".into(),
+                import: Some("~/.secrets".into()),
+                name: Some("m9".into()),
+                agent: false,
+            })
+        );
+        assert_eq!(
+            parse(&words("create /v/team.vault")),
+            Ok(Command::Create {
+                source: "/v/team.vault".into(),
+                import: None,
+                name: None,
+                agent: true,
+            })
+        );
+        for refused in [
+            "create",
+            "create a b",
+            "create a --no-wait",
+            "create a --name",
+        ] {
+            assert!(parse(&words(refused)).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
     fn set_never_takes_a_value_on_the_command_line() {
         let error = parse(&words("set token hunter2")).expect_err("refused");
         assert!(!error.contains("hunter2"), "{error}");
@@ -2491,19 +2744,38 @@ mod tests {
     fn password_actions() {
         assert_eq!(
             parse(&words("password")),
-            Ok(Command::Password(Password::Show))
+            Ok(Command::Password {
+                action: Password::Show,
+                agent: true
+            })
         );
         assert_eq!(
             parse(&words("password new")),
-            Ok(Command::Password(Password::New))
+            Ok(Command::Password {
+                action: Password::New,
+                agent: true
+            })
         );
         assert_eq!(
             parse(&words("password off")),
-            Ok(Command::Password(Password::Off))
+            Ok(Command::Password {
+                action: Password::Off,
+                agent: true
+            })
         );
         assert_eq!(
             parse(&words("password open")),
-            Ok(Command::Password(Password::Open))
+            Ok(Command::Password {
+                action: Password::Open,
+                agent: true
+            })
+        );
+        assert_eq!(
+            parse(&words("password open --no-agent")),
+            Ok(Command::Password {
+                action: Password::Open,
+                agent: false
+            })
         );
         assert!(parse(&words("password hunter2-hunter2")).is_err());
         let error = parse(&words("password set hunter2-hunter2")).expect_err("refused");
@@ -3017,5 +3289,279 @@ mod tests {
             unix::machine_line(None, "age1k", code),
             format!("machine: code {code}, key age1k")
         );
+    }
+
+    /// A subscriber played with an inert arm: `state` says its state and `install` stands in
+    /// for an install (each test counts them), never a launchd job or a systemd unit.
+    #[cfg(unix)]
+    fn played<'a>(
+        state: &'a dyn Fn() -> crate::Result<crate::service::State>,
+        install: &'a dyn Fn() -> crate::Result<String>,
+    ) -> unix::Subscriber<'a> {
+        unix::Subscriber { state, install }
+    }
+
+    #[cfg(unix)]
+    fn installed(pid: Option<u32>) -> crate::service::State {
+        crate::service::State::Installed {
+            pid,
+            unit: std::path::PathBuf::from("/played/systems.alab.aterm-secrets.plist"),
+        }
+    }
+
+    /// The approver goes in where it does not run: a subscriber that is not installed, or one
+    /// installed with no process, is installed; a running one is left be; a state that cannot
+    /// be read installs nothing (an install asks the same service manager).
+    #[cfg(unix)]
+    #[test]
+    fn the_approver_is_put_in_only_where_it_does_not_run() {
+        use crate::service::State;
+        use unix::Approver;
+        let installs = std::cell::Cell::new(0);
+        let install = || {
+            installs.set(installs.get() + 1);
+            Ok("played: installed".to_string())
+        };
+        let refused = || -> crate::Result<String> {
+            installs.set(installs.get() + 1);
+            Err(crate::Error::new("played: no launchd"))
+        };
+        let running = || Ok(installed(Some(42)));
+        assert_eq!(
+            unix::put_in_approver(&played(&running, &install)),
+            Approver::Running
+        );
+        assert_eq!(installs.get(), 0, "a running subscriber is left be");
+        let stopped = || Ok(installed(None));
+        let absent = || Ok(State::Absent);
+        for state in [&stopped as &dyn Fn() -> crate::Result<State>, &absent] {
+            assert_eq!(
+                unix::put_in_approver(&played(state, &install)),
+                Approver::Installed("played: installed".into())
+            );
+        }
+        assert_eq!(installs.get(), 2);
+        assert_eq!(
+            unix::put_in_approver(&played(&absent, &refused)),
+            Approver::Failed("played: no launchd".into())
+        );
+        let unreadable = || Err(crate::Error::new("played: launchctl hung"));
+        assert_eq!(
+            unix::put_in_approver(&played(&unreadable, &install)),
+            Approver::Unknown("played: launchctl hung".into())
+        );
+        assert_eq!(installs.get(), 3, "an unreadable state installs nothing");
+    }
+
+    /// Where no approver runs on this Mac, a command that needs one says so, and that `aterm
+    /// secrets agent on` starts one; one it installed shows its install line; one that ran
+    /// already says nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_whose_approver_does_not_run_says_what_starts_one() {
+        use crate::client::Approval;
+        use unix::Approver;
+        assert_eq!(
+            unix::approver_words(&Approver::Running, Approval::Password),
+            None
+        );
+        assert_eq!(
+            unix::approver_words(&Approver::Installed("line".into()), Approval::Open),
+            Some("line".into())
+        );
+        for (approver, why) in [
+            (Approver::Skipped, "(--no-agent)"),
+            (Approver::Failed("played".into()), "not installed: played"),
+            (Approver::Unknown("played".into()), "unknown (played)"),
+        ] {
+            for (approval, who) in [
+                (
+                    Approval::Password,
+                    "a machine that types the join password waits",
+                ),
+                (Approval::Open, "a machine that asks to join waits"),
+            ] {
+                let words = unix::approver_words(&approver, approval).expect("said");
+                assert!(words.contains(why), "{words}");
+                assert!(words.contains(who), "{words}");
+                assert!(
+                    words.contains("aterm secrets agent on starts one"),
+                    "{words}"
+                );
+                assert_eq!(
+                    words.starts_with("warning: "),
+                    approver != Approver::Skipped,
+                    "{words}"
+                );
+            }
+        }
+        assert!(Approver::Running.runs() && Approver::Installed(String::new()).runs());
+        assert!(!Approver::Skipped.runs() && !Approver::Failed(String::new()).runs());
+    }
+
+    /// `create` puts this Mac's approver in, as `join` puts the subscriber in, so a machine
+    /// that types the new vault's join password is let in; `--no-agent` installs nothing, and
+    /// a failed install leaves the vault made (exit 0) with a warning. A vault at a path has no
+    /// join queue, so nothing to approve: no subscriber is read or installed for one.
+    #[cfg(unix)]
+    #[test]
+    fn create_puts_in_the_approver_unless_told_not_to() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let server = crate::server::start(
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind"),
+            &crate::server::Options {
+                listen: "127.0.0.1:0".parse().expect("addr"),
+                store: root.path().join("store"),
+                advertise: None,
+                pins: Vec::new(),
+                hold: std::time::Duration::from_millis(200),
+                keep_awake: false,
+            },
+        )
+        .expect("a loopback server");
+        let installs = std::cell::Cell::new(0);
+        let install = || {
+            installs.set(installs.get() + 1);
+            Ok("played: installed".to_string())
+        };
+        let refused = || -> crate::Result<String> {
+            installs.set(installs.get() + 1);
+            Err(crate::Error::new("played: no launchd"))
+        };
+        let absent = || Ok(crate::service::State::Absent);
+        let unread = || -> crate::Result<crate::service::State> {
+            panic!("this create reads no subscriber")
+        };
+        let create = |dir: &str, agent: bool, subscriber: &unix::Subscriber<'_>| {
+            let source = if dir == "path" {
+                let shared = root.path().join(dir).join("team.vault");
+                std::fs::create_dir_all(shared.parent().expect("parent")).expect("dir");
+                shared.to_str().expect("utf-8").to_string()
+            } else {
+                format!("http://{}/v1/{dir}", server.addr)
+            };
+            let admin = crate::client::Paths::for_home(&root.path().join(dir).join("ma"));
+            let code = unix::create(&admin, &source, None, Some("ma".into()), agent, subscriber)
+                .expect("created");
+            assert_eq!(code, ExitCode::SUCCESS);
+            crate::client::admin_open(&admin).expect("an admin of it");
+        };
+        create("a", true, &played(&absent, &install));
+        assert_eq!(installs.get(), 1, "create installs the subscriber");
+        create("b", false, &played(&unread, &install));
+        assert_eq!(installs.get(), 1, "--no-agent installs nothing");
+        create("c", true, &played(&absent, &refused));
+        assert_eq!(installs.get(), 2, "a failed install still makes the vault");
+        create("path", true, &played(&unread, &install));
+        assert_eq!(
+            installs.get(),
+            2,
+            "a vault at a path has nothing to approve"
+        );
+        server.stop();
+    }
+
+    /// What leaves a vault letting machines in by itself (`password open`, as `set` and `new`)
+    /// puts this Mac's approver in where none runs, so what it prints holds; closing it
+    /// (`off`) reads no subscriber. `status` says whether the approver runs only on an admin
+    /// of a vault that approves by itself, read off the version this Mac holds, and only for
+    /// a vault with a join queue (a URL's; a path has none, so nothing to approve).
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_that_lets_machines_in_gets_an_approver_and_status_says_whether_it_runs() {
+        use crate::client::{Approval, approving_here};
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let server = crate::server::start(
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind"),
+            &crate::server::Options {
+                listen: "127.0.0.1:0".parse().expect("addr"),
+                store: root.path().join("store"),
+                advertise: None,
+                pins: Vec::new(),
+                hold: std::time::Duration::from_millis(200),
+                keep_awake: false,
+            },
+        )
+        .expect("a loopback server");
+        let installs = std::cell::Cell::new(0);
+        let install = || {
+            installs.set(installs.get() + 1);
+            Ok("played: installed".to_string())
+        };
+        let absent = || Ok(crate::service::State::Absent);
+        let running = || Ok(installed(Some(42)));
+        let unread = || -> crate::Result<crate::service::State> {
+            panic!("closing the vault reads no subscriber")
+        };
+        let admin = crate::client::Paths::for_home(&root.path().join("ma"));
+        let url = format!("http://{}/v1/team", server.addr);
+        unix::create(
+            &admin,
+            &url,
+            None,
+            Some("ma".into()),
+            true,
+            &played(&running, &install),
+        )
+        .expect("created");
+        assert_eq!(installs.get(), 0, "a running subscriber is left be");
+        assert_eq!(approving_here(&admin), Ok(Some(Approval::Password)));
+        let password = |action, subscriber: &unix::Subscriber<'_>| {
+            unix::password(&admin, action, true, subscriber).expect("published")
+        };
+        password(Password::Open, &played(&absent, &install));
+        assert_eq!(installs.get(), 1, "opening puts the approver in");
+        assert_eq!(approving_here(&admin), Ok(Some(Approval::Open)));
+        password(Password::Open, &played(&absent, &install));
+        assert_eq!(
+            installs.get(),
+            2,
+            "open again, it still says the vault lets in"
+        );
+        password(Password::Open, &played(&running, &install));
+        assert_eq!(installs.get(), 2, "a running approver is left be");
+        // `--no-agent`: an admin whose subscriber was turned off on purpose keeps it off.
+        unix::password(&admin, Password::Open, false, &played(&absent, &install))
+            .expect("published");
+        assert_eq!(installs.get(), 2, "--no-agent installs nothing");
+        password(Password::Off, &played(&unread, &install));
+        assert_eq!(approving_here(&admin), Ok(None), "closed, nothing approves");
+        password(Password::Off, &played(&unread, &install));
+        assert_eq!(installs.get(), 2);
+        server.stop();
+        // A machine that is no admin, or has no vault, has no approver to report; nor does
+        // an admin of a vault at a path, whatever its [join] says.
+        let stranger = crate::client::Paths::for_home(&root.path().join("stranger"));
+        assert_eq!(approving_here(&stranger), Ok(None));
+        let at_a_path = admin_of_a_path_vault(&root.path().join("path"));
+        assert_eq!(approving_here(&at_a_path), Ok(None));
+        let no_queue =
+            || -> crate::Result<crate::service::State> { panic!("a path has no queue to approve") };
+        unix::password(
+            &at_a_path,
+            Password::Open,
+            true,
+            &played(&no_queue, &install),
+        )
+        .expect("published");
+        assert_eq!(installs.get(), 2, "nor is one put in there");
+
+        let line = |approval, state| unix::approver_line(approval, &state);
+        let ok = line(Approval::Password, Ok(installed(Some(42))));
+        assert!(ok.contains("running in the subscriber (pid 42)"), "{ok}");
+        assert!(ok.contains("types the join password is let in"), "{ok}");
+        for (state, why) in [
+            (
+                Ok(crate::service::State::Absent),
+                "no subscriber is installed",
+            ),
+            (Ok(installed(None)), "installed but not running"),
+            (Err(crate::Error::new("played")), "unknown (played)"),
+        ] {
+            let said = line(Approval::Open, state);
+            assert!(said.contains(why), "{said}");
+            assert!(said.contains("a machine that asks to join waits"), "{said}");
+            assert!(said.contains("aterm secrets agent on starts one"), "{said}");
+        }
     }
 }

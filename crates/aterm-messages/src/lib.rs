@@ -111,9 +111,7 @@ pub use wire::{
     WireGate, WireIndicator,
 };
 
-// ---------------------------------------------------------------------------
 // Constants.
-// ---------------------------------------------------------------------------
 
 /// Visible band rows, including the overflow row.
 pub const MAX_ROWS: u16 = 3;

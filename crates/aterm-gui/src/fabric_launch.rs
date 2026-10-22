@@ -695,17 +695,8 @@ fn launch_serving(
 
 /// aterm's environment minus [`aterm_types::domain::is_ai_env_key`]: what the bridge child gets.
 ///
-/// A DENY LIST AND NOT AN ALLOW LIST, on purpose: `aterm-link serve` legitimately
-/// needs `HOME`/`XDG_STATE_HOME` for its state directory, `PATH`, and the locale,
-/// and an allow list would have to grow every time it learns a new one — silently
-/// breaking the bridge each time it did not. The deny list is the canonical
-/// [`aterm_types::domain::is_ai_env_key`], the classifier `aterm-pty`'s child
-/// shells are built by, so a var added there is stripped here too, with no
-/// second copy to drift — non-UTF-8 keys included (it reads their lossy
-/// spelling, so a deny-listed prefix on one still denies it).
-/// PURE IN ITS INPUT, so the wiring is unit-tested without mutating the
-/// process-global environment — the same shape (and for the same reason) as
-/// `aterm-pty`'s `build_child_env`.
+/// A deny list, not an allow list: `aterm-link serve` needs `HOME`/`XDG_STATE_HOME`, `PATH` and
+/// the locale, and an allow list would break the bridge silently whenever it needed a new one.
 ///
 /// ONE DENIED NAME PASSES, in a build that reads development seams: the
 /// fast-timers seam ([`aterm_types::domain::ENV_DEV_FAST_TIMERS`]). It is

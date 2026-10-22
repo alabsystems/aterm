@@ -75,15 +75,12 @@ pub(crate) enum TemporalMsg {
     /// spine records the instant; the bytes are not carried, because a replay
     /// never re-emits a reply (B.4.1) and nothing else reads them.
     Reply,
-    /// A geometry change the engine applied (a window pass, the cross-session
-    /// `resize` verb). The resizing thread does not enqueue it: the READER does,
-    /// from the engine's resize journal, inside its next `term_lock` hold and
-    /// before that hold's `RawIn` ([`SpineMark::record`]), so the writer thread
-    /// APPENDS it to the spine in the order the engine applied it, never ahead of
-    /// already-processed input (B.2.3: reflow is path-dependent, so a mid-print
-    /// resize must replay in the right place). Until that hold it is PENDING
-    /// ([`SpineWatermark::pending`], `temporal status` `pending_resizes=`), and it
-    /// is stamped with that hold's tick, not its own.
+    /// A geometry change the engine applied (a window pass, the `resize` verb).
+    /// The reader, not the resizing thread, queues it from the engine's resize
+    /// journal in its next `term_lock` hold, before that hold's `RawIn`
+    /// ([`SpineMark::record`]), so the spine holds it in engine order (B.2.3:
+    /// reflow is path-dependent). Until then it is pending
+    /// ([`SpineWatermark::pending`]); it carries that hold's tick.
     Resize { rows: u16, cols: u16 },
     /// Resizes the engine applied that the spine will never hold: its journal
     /// (`RESIZE_JOURNAL_CAP` deep) overran before a reader read it. Counted
@@ -252,13 +249,11 @@ impl Drop for TemporalRx {
 /// or counted lost, never skipped. Seeded from the recording's keyframe
 /// ([`Self::seed`]); `temporal` reads [`Self::pending`] from it.
 ///
-/// Seeded with the keyframe the recording starts from ([`Self::seed`]). Two
-/// atomics that never tear: after the seed (at spawn, before any reader
-/// exists) the one writer is the live reader inside its `term_lock` hold, and
-/// every read that must agree with the engine is taken under that lock too
-/// (`temporal`) or after the writing reader was joined (the next attach). Held by the [`TemporalRecorder`] and handed out once per
-/// attach ([`TemporalRecorder::spine_watermark`]), so neither the reader nor
-/// `temporal` takes the recorder's lock inside `term_lock`.
+/// The two atomics never tear: after the seed the one writer is the live reader
+/// inside its `term_lock` hold, and every read that must agree with the engine
+/// takes that lock too (`temporal`) or follows the writer's join (the next
+/// attach). Handed out by [`TemporalRecorder::spine_watermark`], so neither the
+/// reader nor `temporal` takes the recorder's lock inside `term_lock`.
 ///
 /// It also counts what the readers could not queue (`temporal status`
 /// `dropped_input=`, `dropped_replies=`) and whether a break is open
@@ -476,8 +471,8 @@ impl SpineMark {
     /// * No watermark (never seeded), or another lifetime token (the engine was
     ///   replaced): the live geometry `pre` names, once.
     /// * A journal overrun (more than `RESIZE_JOURNAL_CAP` resizes since the
-    ///   watermark, a reader's absence included): the lost count rides the
-    ///   spine ([`TemporalMsg::ResizesLost`]), then the kept reports.
+    ///   watermark): the lost count ([`TemporalMsg::ResizesLost`]), then the
+    ///   kept reports.
     /// * A full queue: the resizes sent so far advance the watermark, and the
     ///   `RawIn` is DROPPED, never queued ahead of a resize it follows. Every
     ///   replay that would fold it would be wrong, so the drop is counted
@@ -670,9 +665,8 @@ pub(crate) struct TemporalRecorder {
     used: usize,
     /// The retained byte budget ([`enforce_budget`](Self::enforce_budget)).
     budget: usize,
-    /// Resizes the live engine applied that the spine never held: its resize
-    /// journal overran between two reader holds ([`TemporalMsg::ResizesLost`]).
-    /// Disclosed by `temporal status` as `lost_resizes=`.
+    /// Resizes the live engine applied that the spine never held
+    /// ([`TemporalMsg::ResizesLost`]); `temporal status` `lost_resizes=`.
     lost_resizes: u64,
     /// Where the spine's resizes are up to, shared with the session's readers
     /// ([`SpineWatermark`]): seeded with the first keyframe, advanced by the
@@ -708,11 +702,9 @@ pub(crate) struct TemporalRecorder {
     /// it locally at the prompt would draw that prompt where the live one never
     /// had it. A fact of the session's host, held once like `resize_policy`.
     host_resyncs_alt_screen: bool,
-    /// Set on an ADOPTED session's recorder (round five, item 17): the spine
-    /// starts at a seamless update — its t0 keyframe is the screen the update
-    /// restored, and nothing before it was recorded here. Reported by
-    /// [`status_tail`](Self::status_tail) beside `dropped_events=`, the
-    /// recorder's other gap.
+    /// Set on an adopted session's recorder: the spine starts at a seamless
+    /// update (its t0 keyframe is the screen the update restored, nothing before
+    /// it was recorded here). Reported by [`status_tail`](Self::status_tail).
     handoff: Option<crate::session_timeline::HandoffGap>,
 }
 
@@ -824,9 +816,8 @@ impl TemporalRecorder {
         due
     }
 
-    /// Record a keyframe (a serialized [`TerminalCheckpoint`] taken at a
-    /// parser-ground boundary, B.3.3). Replay seeds from the nearest keyframe
-    /// `<= seq(t)` and folds `RawIn` forward.
+    /// Record a keyframe (a serialized [`TerminalCheckpoint`]), the seed for
+    /// replays to instants at or after it.
     pub(crate) fn record_keyframe(&mut self, checkpoint: impl Into<Arc<TerminalCheckpoint>>) {
         let ts = self.now();
         let id = KeyframeId(self.next_keyframe);
@@ -847,7 +838,6 @@ impl TemporalRecorder {
         // A keyframe is large; its grid bytes are charged against the budget.
         self.used += keyframe.charge();
         self.keyframes.push_back(keyframe);
-        // This keyframe is the fresh base: the forward chain restarts from here.
         self.bytes_since_keyframe = 0;
         // Cap the retained keyframes, so periodic re-keyframing cannot let them
         // accumulate until they fill the budget; older instants age out honestly
@@ -1256,10 +1246,6 @@ impl TemporalRecorder {
     /// Degrades to `None` — never a panic or an out-of-bounds read (the B.8.2
     /// lossy-but-honest contract).
     fn plan(&self, at: Ticks) -> Option<ReplayPlan> {
-        // Base keyframe: O(MAX_KEYFRAMES) over the retained deque (which carries
-        // each keyframe's own spine coordinates) instead of a full walk of the
-        // spine looking for the last `Op::Keyframe` — see `base_keyframe` for
-        // why the two pick the same entry.
         let base = self.base_keyframe(at)?;
         if base.cut.is_some_and(|end| at > end) {
             return None;

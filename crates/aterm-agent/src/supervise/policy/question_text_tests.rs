@@ -725,7 +725,7 @@ fn reflowed(rows: &[String], text: &str) -> Reflowed {
     Reflowed { col, drawn, kept }
 }
 
-/// ATERM-KI-1015-1 F2, on Claude Code 2.1.302 (measured in the real-Claude
+/// F2, on Claude Code 2.1.302 (measured in the real-Claude
 /// lab, both policy texts typed by hand into a multi-select's free-text row,
 /// then `down` to `Submit`, at every width from 26 to 160 columns, and from
 /// 270 to 300 (long-term) and 240 to 260 (short-term), across the width from
@@ -737,7 +737,7 @@ fn reflowed(rows: &[String], text: &str) -> Reflowed {
 /// which it kept every row, and at no width at which `Submit` was drawn over
 /// it. The harness's own decision on the pristine dialog as measured: typed
 /// at 37 and 41 columns, the recommended option at 80. And at each width
-/// round 20 gave up at, the frame after `down` reads as the loop's own text,
+/// gave up at, the frame after `down` reads as the loop's own text,
 /// ticked, the button focused: `Submit` is pressed.
 #[test]
 fn a_multi_select_text_is_typed_at_every_measured_width_it_keeps_its_rows() {
@@ -852,7 +852,7 @@ fn a_multi_select_text_is_typed_at_every_measured_width_it_keeps_its_rows() {
     }
 }
 
-/// The review of round 21's F2 lane: the read-back after `down` at every
+/// the read-back after `down` at every
 /// width the text is typed at, not the nine long-term widths above alone.
 /// Each frame of the four 2.1.302 reflow sweeps from 33 columns (under it
 /// option 1 wraps) at which [`text_keeps_its_rows`] holds, both texts,
@@ -1855,7 +1855,7 @@ fn tier1_text_mode_decider_chooses_only_what_the_model_enables() {
     }
 }
 
-/// THE TEXT DRAWN AGAINST ITS CHECKBOX (ATERM-KI-1015-1 F2, the reader's
+/// THE TEXT DRAWN AGAINST ITS CHECKBOX (F2, the reader's
 /// half). 2.1.300 MEASURED at 47 columns: once the focus left the free-text
 /// row for `Submit`, the loop's own long-term text was drawn one cell left of
 /// its label column (`[✔]Decide`), every row kept — a width
@@ -1896,7 +1896,7 @@ fn a_multi_select_text_drawn_against_its_checkbox_is_submitted_by_its_button() {
     );
 }
 
-/// ATERM-KI-1016-1 (Questions): `Submit` drawn over the last row of the loop's own text, the
+/// (Questions): `Submit` drawn over the last row of the loop's own text, the
 /// rest of that row glued to it as one word (2.1.300 MEASURED at 57 columns, `❯
 /// Submitked.)`). The dialog read whole with the text a row short, and the hand-over said the
 /// loop "did not write" the text it typed; it is a dialog aterm could not read whole, as the

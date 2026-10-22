@@ -395,7 +395,7 @@ pub(crate) const HELD_BYTES: usize = 16 << 20;
 /// newest begin among them. `None` where all retained rows together pass
 /// [`HELD_BYTES`]. Before, the cut read the file whole and kept one past
 /// 16 MiB as it was, so the 171 MB journal of one tab of an older build's
-/// (ATERM-KI-1016-1) was never cut.
+/// was never cut.
 fn held_rows(rows: &mut dyn Iterator<Item = String>) -> Option<(Vec<String>, usize)> {
     let mut newest = std::collections::VecDeque::new();
     let mut newest_bytes = 0_usize;
@@ -657,7 +657,7 @@ fn standing_rows(
 /// and its answer's point record: [`RULE_POINT`]), which no fold folds, so a
 /// cut to the newest [`KEEP_ROWS`] dropped those rows about 500 acts on: a
 /// loop that follows did not switch the model back at the reset, or typed
-/// the land instruction anew (ATERM-KI-1016-1, "a loop that follows
+/// the land instruction anew ("a loop that follows
 /// another"). Kept
 /// whole from the state's row on, a Land episode held under Autopilot Land
 /// (no act of another mode is typed to end it) kept every row after its
@@ -822,7 +822,7 @@ pub fn last_row_ms(body: &str) -> Option<i64> {
 }
 
 /// THE BOOKS OF SESSION `sid` THROUGH THE TABS A COLD RESTORE REOPENED ITS
-/// TAB FROM (ATERM-KI-1016-1, follow-7), as one ledger (or one journal): the
+/// TAB FROM (follow-7), as one ledger (or one journal): the
 /// rows each earlier tab's loops wrote of that tab's own session
 /// (`earlier`: the tab and the text of its ledger or journal), re-signed
 /// with `sid` (each one's `"sid":` field) and the tabs oldest first (by their
@@ -1090,19 +1090,9 @@ pub fn typed_texts(path: &Path, sid: Option<&str>) -> Vec<Typed> {
 /// The fields are matched as the row writes them — a `"` inside a value is
 /// escaped, so a command cannot forge one.
 ///
-/// NOT AN ACCOUNT MOVE MADE ([`account_switch_reason`]'s row, under the
-/// move's rule and command): it is `typed` so that a later loop reads the
-/// move back, and it is a relaunch — the loop that made it counted no act
-/// for it, and a loop that started after it counted one toward the owner's
-/// `continue_per_hour`.
-///
-/// NOR THE ACCOUNTS PROBE'S `/usage` ([`PROBE_TYPED_REASON`]'s row, under
-/// [`super::policy::turn_end::RULE_USAGE_PROBE`]): it is `typed` so that the
-/// command row a transcript may carry reads as the harness's
-/// ([`typed_texts`]) and so that a later loop knows a panel may be owed
-/// ([`probe_owed`]) — and it is no act of the turn-end policy's. The loop
-/// that typed it booked nothing for it, and a successor that counted it
-/// would spend the owner's budget on a read of the account's windows.
+/// Left out, though `typed`: an account move made ([`account_switch_reason`]'s row, a
+/// relaunch, no act) and the accounts probe's `/usage` ([`PROBE_TYPED_REASON`], a read that
+/// must not spend the owner's `continue_per_hour`).
 ///
 /// NOR `/login`'s SUCCESS ENTER ([`super::policy::login::RULE_LOGIN_DONE`]'s
 /// row): it is `typed` because a key went into the session, and the login
@@ -1238,7 +1228,7 @@ pub fn parse_left_retried(key: &str) -> Option<(u64, &str)> {
 }
 
 /// What the key of A PERSON'S OWN EXCHANGE AN OLDER BUILD JOURNALED AS
-/// LEFT starts with (ATERM-KI-1016-1, done-5): a build through 0.105.0
+/// LEFT starts with (done-5): a build through 0.105.0
 /// notes `LEFT seq=<n> rule=left-to-person@v1 …` and writes no row naming
 /// the turn it left (no [`open_left`] key). The note's time stands for the
 /// turn: the conversation's last turn then is its last turn still where no
@@ -1303,7 +1293,7 @@ pub fn words_lead(text: &str) -> u64 {
 /// model nothing. `None`: no such row, one a typed row closed, a missing or
 /// unreadable file.
 ///
-/// A WALL'S RETRY DELIVERS THE PERSON'S EXCHANGE AGAIN (ATERM-KI-1016-1): a
+/// A WALL'S RETRY DELIVERS THE PERSON'S EXCHANGE AGAIN: a
 /// row of an exchange at a wall ([`LEFT_AT_WALL`]) that the wall's retry,
 /// its usage resume or its API's return was typed after stays open as
 /// [`left_retried_key`] — the retry's short answer is the person's, as in
@@ -1714,7 +1704,7 @@ pub fn usage_attempt_in(body: &str, sid: Option<&str>) -> Option<UsageAttempt> {
 /// ([`WALL_TAKEN`] is newer: that build's row said only
 /// `the wall left the screen or the worker worked`). Such a try's first
 /// wall row ([`WallRow::older`]) was not its answer: it is not met again,
-/// and its own turn is still to come (ATERM-KI-1016-1, follow-5). Read as
+/// and its own turn is still to come (follow-5). Read as
 /// met, a successor typed into a spend limit 30 minutes before the loop that
 /// typed the try, which waited for the turn the try's take began.
 #[must_use]
@@ -1875,7 +1865,7 @@ pub fn usage_attempt_taken_in(
         // the ledger's rows stand at was a try at THAT limit, on its ladder,
         // the wall's tries since it opened its attempts: read as a usage
         // window's first, a spend limit's try was tried again 10 minutes on,
-        // where the loop that typed it waited 2 hours (ATERM-KI-1016-1,
+        // where the loop that typed it waited 2 hours (
         // follow-5).
         let unmarked = || {
             (text("rule_id") == Some(super::policy::turn_end::RULE_LIMIT_RESUME)).then(|| {
@@ -1927,7 +1917,7 @@ pub struct CheckOwed {
     /// an older build's challenge ([`super::policy::turn_end::RULE_OPEN_ITEMS`],
     /// [`super::policy::turn_end::RULE_UNCOMMITTED`]), whose answer is read
     /// as the check's yield (the merge review's MG7-A3); nothing it says ends
-    /// the task (FOREVER CRUISE).
+    /// the task (Autopilot Cruise).
     pub rule: &'static str,
     /// A WALL ANSWERED IT, its row after it (an API error's, which writes
     /// none: its point's retry mark): the wall's retry delivers it again
@@ -2174,7 +2164,7 @@ fn walk_done_check(body: &str, sid: Option<&str>) -> (Option<CheckOwed>, u32) {
 
 /// Whether a typed row's `command` is the done check, or an older build's
 /// check or challenge, again, as a `/compact`'s continuation types the one a
-/// full context cut (`TurnEndState::compact_owes`, ATERM-KI-1016-1 done-3):
+/// full context cut (`TurnEndState::compact_owes` done-3):
 /// by its opening words ([`super::policy::turn_end::DONE_CHECK`], every
 /// retired check's [`super::policy::turn_end::RETIRED_DONE_CHECKS`], every
 /// retired challenge's [`super::policy::turn_end::is_challenge_text`]).
@@ -2741,7 +2731,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
 }
 
 /// THE CARRY THE LAST ACT GAVE IS OVER, by `sid`'s ledger text `body`
-/// (ATERM-KI-1016-1): after its last act (a `typed` row as [`typed_at`]
+/// : after its last act (a `typed` row as [`typed_at`]
 /// counts them), the loop that kept it judged a point that landed the task
 /// ([`RULE_TASK_DONE`], or an older build's end there) or left a person's
 /// exchange to them (a `skipped`
@@ -2770,7 +2760,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
 /// AN OLDER BUILD'S [`RULE_TASK_DONE`] ROW — written at a done reply to its
 /// done check or at the retired token, and spelled as a landing's (the rule
 /// that made it is only in the journal's `DONE` note) — ends the carry too,
-/// and is kept so (FOREVER CRUISE / FOREVER LAND, decided 2026-10-19):
+/// and is kept so (Autopilot Cruise / Land, decided 2026-10-19):
 /// ending the carry seeds no end — `TurnEndState::seed_carry_over` clears
 /// the carry alone, never the task's done, its landing or its face, and the
 /// first point is decided afresh, a done claim there getting Cruise's prompt
@@ -2905,7 +2895,7 @@ impl Carried {
 /// from the appearance it counted from (`TurnEndState::seed_retry`). Taken
 /// up from nothing, it retried on the ladder's first rung (a minute) from
 /// its own read, whatever rung the loop before was on: up to an hour sooner
-/// (ATERM-KI-1016-1, "a loop that follows another").
+/// ("a loop that follows another").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryMark {
     /// The wall as its notice last read: an overload, or an API error's
@@ -3253,8 +3243,8 @@ impl SwitchWalk {
         }
         match text("rule_id") {
             Some(RULE_MODEL_RESTORE) => self.open = None,
-            // An account move MADE (its own words, as [`account_moves`]
-            // reads them — a draft submitted under the rule is none).
+            // An account move made, as [`account_moves`] reads it (a draft under the rule is
+            // none).
             Some(RULE_ACCOUNT)
                 if text("command").is_some_and(|c| c.starts_with(ACCOUNT_MOVE_COMMAND))
                     && text("reason").is_some_and(|r| r.contains("account move:")) =>
@@ -3473,8 +3463,7 @@ pub fn account_moves_in(body: &str, sid: Option<&str>) -> AccountMoves {
             }
             continue;
         }
-        // A `typed` row: an act on the point, whatever its rule — and a
-        // turn asked under the login an open move chose.
+        // Any `typed` row is an act on the point, and a turn asked under an open move's login.
         out.unmade = None;
         out.unmade_ms = None;
         if rule != Some(RULE_ACCOUNT) || !reason.contains("account move:") {
@@ -3538,7 +3527,7 @@ pub const RULE_WALL_WAIT_END: &str = "wall-wait-end@v1";
 pub const RULE_OFF_STOOD: &str = "autopilot-off@v1";
 
 /// The rule id of the record that A LOOP TOOK UP THE BOOKS OF THE TABS A COLD
-/// RESTORE REOPENED ITS TAB FROM (ATERM-KI-1016-1, follow-7): written once,
+/// RESTORE REOPENED ITS TAB FROM (follow-7): written once,
 /// as the first row of the session in the tab's ledger. While it stands, the
 /// session's books are the earlier tabs' rows and then this ledger's
 /// ([`books_through`], [`takes_up_earlier`]); a cut that drops it
@@ -4043,7 +4032,7 @@ mod tests {
 
     /// A file past the 16 MiB the cut once read whole is cut too: it is
     /// streamed ([`held_rows`]). The journal is the shape of the 171 MB one
-    /// an older build wrote on this Mac (ATERM-KI-1016-1: one `HOST seq=1
+    /// an older build wrote on this Mac (one `HOST seq=1
     /// upgrade step=wait:session-files-unreadable` line every ~540 ms for
     /// four days), past 16 MiB; the ledger holds a model switch no loop has
     /// undone, its row the oldest, under 16 MiB of ordinary approvals.
@@ -4373,7 +4362,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// THE CARRY THE LAST ACT GAVE IS OVER (ATERM-KI-1016-1): after the act,
+    /// THE CARRY THE LAST ACT GAVE IS OVER: after the act,
     /// the task's end, a person's exchange left to them, Off once the act's
     /// answer was judged, or a person's Esc standing at the point that judged
     /// that answer (the review's KR-P6-ESC). NEGATIVE CONTROLS, still
@@ -4445,7 +4434,7 @@ mod tests {
     }
 
     /// A WALL'S RETRY KEEPS A PERSON'S EXCHANGE AT A WALL OPEN
-    /// (ATERM-KI-1016-1): the row of an exchange at a wall (`wall:`) that
+    /// : the row of an exchange at a wall (`wall:`) that
     /// the wall's retry was typed after is open still, keyed by the retry's
     /// words and the wall's row ([`left_retried_key`]) — and so after the
     /// usage resume and the API's return. NEGATIVE CONTROLS, closed: a
@@ -4720,8 +4709,7 @@ mod tests {
             ]);
             assert_eq!(owed(), Some(false), "CONTROL: {yes}");
         }
-        // The Enter written: owed, entered — and the step is as old as its
-        // ROW's taking, whatever was written since.
+        // The Enter written: owed and entered, the step as old as its grant row.
         write(&[taken(), entered().replace("\"ts\":1000,", "\"ts\":9000,")]);
         assert_eq!(
             reset_owed(&read(&path), Some("@s-1")),
@@ -5201,7 +5189,7 @@ mod tests {
         assert_eq!((s.point, s.esc), (false, false));
     }
 
-    /// THE WALL'S RETRIES (ATERM-KI-1016-1, "a loop that follows another")
+    /// THE WALL'S RETRIES ("a loop that follows another")
     /// read back from the last row as they were written, an act's or a
     /// point's, for every API error's cause, status and retry rule, beside
     /// the streak's mark and before a limit's, which still reads back. The
@@ -5293,7 +5281,7 @@ mod tests {
     }
 
     /// A `/COMPACT`'S CONTINUATION THAT TYPES THE CUT ACT AGAIN KEEPS IT OWED
-    /// TO A LOOP THAT FOLLOWS (ATERM-KI-1016-1, done-3,
+    /// TO A LOOP THAT FOLLOWS (done-3,
     /// `TurnEndState::compact_owes`): the done check, a full context's wall
     /// that cut it, the `/compact`, its point, and the continuation typed
     /// under the compaction's rule with the check's words — the check is
@@ -6134,7 +6122,7 @@ mod tests {
     }
 
     /// A CUT KEEPS THE ROWS OF THE STATES THAT STAND FOR DAYS past a run of
-    /// ACTS (ATERM-KI-1016-1, "a loop that follows another"): a model switch
+    /// ACTS ("a loop that follows another"): a model switch
     /// owed its return at the bucket's reset, and a Land episode — the land
     /// instruction and its nudges spent — then 1100 acts that end neither
     /// (an API error's retries, each with its point's record: two rows an
@@ -6526,7 +6514,7 @@ mod tests {
         assert_eq!((ep.hold, ep.nudges), (anew, 3), "{ep:?}");
     }
 
-    /// A TAB A COLD RESTORE REOPENED (ATERM-KI-1016-1, follow-7): its loops
+    /// A TAB A COLD RESTORE REOPENED (follow-7): its loops
     /// read the earlier tab's books and then its own while the take-up's
     /// row stands ([`RULE_EARLIER_BOOKS`], [`books_through`]). Past its
     /// bound, its ledger's cut keeps that row while a state the earlier
@@ -6633,7 +6621,7 @@ mod tests {
     }
 
     /// THE BOOKS THROUGH THE TABS A COLD RESTORE REOPENED A TAB FROM
-    /// (ATERM-KI-1016-1, follow-7): each earlier tab's rows of its own
+    /// (follow-7): each earlier tab's rows of its own
     /// session, re-signed with the tab's, the tabs oldest first whatever
     /// order the notes name them in, then the tab's own; a row of another
     /// session left out; a journal's lines alike. CONTROL: with no session,

@@ -1908,9 +1908,8 @@ mod macos {
             expect_agreement: bool,
         ) -> bool {
             let name = sel.name().to_string_lossy().into_owned();
-            // SAFETY: `probe_point` really is `(id, SEL) -> CGPoint`; this is the
-            // COMPILER's view of the row, correct for both registrations because
-            // both are backed by that one function.
+            // SAFETY: `probe_point` really is `(id, SEL) -> CGPoint`, correct for
+            // both registrations, which share that function.
             //
             // The bare cast, on purpose: the lying row's registered string is
             // the experiment, and `checked_msg` would refuse it before the send.
@@ -1997,9 +1996,8 @@ mod macos {
         /// must round-trip and a lying one must not; answers whether it behaved so.
         fn probe_row(&mut self, obj: Id, sel: Sel, encoding: &str, expect_agreement: bool) -> bool {
             let name = sel.name().to_string_lossy().into_owned();
-            // SAFETY: `probe_rect` really is `(id, SEL) -> CGRect`; this is the
-            // COMPILER's view of the row, which is correct for both
-            // registrations because both are backed by that one function.
+            // SAFETY: `probe_rect` really is `(id, SEL) -> CGRect`, correct for both
+            // registrations, which share that function.
             //
             // The bare cast, on purpose: the lying row's registered string is
             // the experiment, and `checked_msg` would refuse it before the send.

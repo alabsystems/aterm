@@ -55,7 +55,7 @@ use std::process::ExitCode;
 use crate::bridge::{Bridge, Config};
 use crate::transport;
 
-/// Usage, printed to stderr on a usage error (exit 2, aterm's convention).
+/// Usage, printed to stderr on a usage error (exit 2) and to stdout when asked for.
 const USAGE: &str = "\
 aterm-link — the aterm fabric bridge
 
@@ -529,9 +529,10 @@ pub(crate) fn default_state_dir() -> String {
 /// never an unguarded broker. Only a socket with no secret beside it is served
 /// unguarded, and the banner says so.
 ///
-/// The secret is a file, never an argument (an argv is world-readable in `ps`),
-/// and it must be mode 0600 or tighter, read by astream's one secret-file rule
-/// ([`transport::read_mint_secret`]).
+/// The secret is a file, never an argument (an argv is world-readable in `ps`):
+/// a regular file of yours, mode 0600 or tighter, with one link and no access
+/// list that lets anyone else in, read through no link from a 0700 directory of
+/// yours, by astream's one secret-file rule ([`transport::read_mint_secret`]).
 ///
 /// `--durability strict|ordered|relaxed` is what an ack promises, guarded or
 /// not ([`crate::durability`]): `strict` acks after the full flush; `ordered`
@@ -735,7 +736,8 @@ its subject and count; the recipient's inbox reads on past it.
             return usage_error(&format!("unexpected argument `{extra}`"));
         }
     };
-    // A socket broker without `--secret-file` takes the `mint.secret` beside its socket.
+    // A socket broker without `--secret-file` takes the `mint.secret` beside its socket,
+    // read as a directory (the socket's) and a name, by the rule every secret is read by.
     // Present at all (a symlink, an unreadable file) makes it the secret, so a broken one is
     // refused below, never served unguarded.
     let secret_file = secret_file.or_else(|| {
@@ -1397,9 +1399,8 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
     };
     match astream_cap::mint(&key, grant) {
         Ok(cap) => {
-            // `<grant> <tag-hex>` in astream's one cap-file format, which every
-            // reader splits at the LAST whitespace, so a grant whose filter holds
-            // a space still reads back.
+            // astream's one cap-file format; every reader splits at the last whitespace, so a
+            // grant whose filter holds a space still reads back.
             minted_cap_to(
                 &mut std::io::stdout().lock(),
                 &astream_cap::capfile::format_line(&cap.filter, &cap.tag),
@@ -1627,7 +1628,7 @@ mod tests {
     /// PRESENT and `-` ("unknown"), and no body moves an operator's cursor.
     #[test]
     fn ls_prints_section_7s_columns_one_safe_token_each() {
-        // §7'S ROW, IN §7'S ORDER, then the six documented additions.
+        // §7's row in §7's order, then the six additions.
         let (body, _) = crate::body::Body::decode(
             b"v=1 t=1 inc=4 epoch=ab12 gen=9:beef state=live hold=0 holder=h-andrew \
               attention=needs%20a%20key",

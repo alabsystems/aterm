@@ -330,9 +330,7 @@ fn write_atomic_using(
     std::fs::rename(&staged, path)
 }
 
-// ---------------------------------------------------------------------------
 // Evidence
-// ---------------------------------------------------------------------------
 
 /// One row of the served catalog (`~/.claude/cache/model-catalog/*-cc.json`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -671,10 +669,8 @@ pub fn ingest(
         .collect()
 }
 
-// ---------------------------------------------------------------------------
 // The live model and the model decision (asked by `upgrade_drive` at each
 // session's idle point, and by every restart for the model that rides it)
-// ---------------------------------------------------------------------------
 
 /// Seconds a model a relaunch of this harness asked for (`--model`) is given
 /// to show in the transcript before the choice is recorded as failed for that

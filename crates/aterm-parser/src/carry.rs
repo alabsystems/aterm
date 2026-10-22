@@ -233,24 +233,13 @@ impl Parser {
     /// replaces (a sixel), and never for a query whose reply would be lost
     /// (round eight of the update audit, finding 57). A pure read.
     ///
-    /// The carried state is `SosPmApcString` with no APC consumer, because its
-    /// transitions are `DcsPassthrough`'s byte for byte
-    /// ([`HOOKED_STRING_CARRY`]): every byte stays in the string — DEL, the
-    /// C1 range and every UTF-8 byte included — except CAN and SUB (to Ground,
-    /// executed), ESC (to Escape) and the 8-bit ST `0x9C` (to Ground), in
-    /// either C1 mode, since both states are exempt from the C1 guard; with C1
-    /// off, a `0x9C` inside a UTF-8 character stays in either string, and the
-    /// head of one the payload ends in rides as `string_utf8_tail`. With no
-    /// consumer it delivers nothing, as the handler that keeps nothing does.
-    /// `DcsIgnore`, the first choice, was not exact then (the review of round
-    /// eight's fix): it had no entry at or above `0x80`, so a UTF-8 lead byte
-    /// in a tmux control-mode line or a kitty command left the string and the
-    /// rest printed as text, and with C1 off an 8-bit ST was dropped and the
-    /// string swallowed the real output after it, up to the next ESC. The
-    /// table has since given `DcsIgnore` those entries
-    /// (`tests::c1::an_ignored_dcs_reads_every_byte_as_a_hooked_one`), which
-    /// the live parser needed too. Every consumer that restores a carry at all
-    /// accepts `SosPmApcString`.
+    /// The carried state is [`HOOKED_STRING_CARRY`] with no APC consumer: every
+    /// byte stays in the string (DEL, C1 and UTF-8 bytes included) except CAN
+    /// and SUB (to Ground, executed), ESC (to Escape) and 0x9C ST (to Ground),
+    /// in either C1 mode; with C1 off, a 0x9C inside a UTF-8 character stays in
+    /// the string, and the head of one the payload ends in rides as
+    /// `string_utf8_tail`. With no consumer it delivers nothing. Every consumer
+    /// that restores a carry accepts `SosPmApcString`.
     ///
     /// At the ESC that may begin the hooked string's ST, the ESC is already
     /// read, so the carry is `Escape` holding nothing: the successor reads the

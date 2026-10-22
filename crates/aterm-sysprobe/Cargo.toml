@@ -6,18 +6,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's in-process readers of another process (working directory, executable, process-group footprint; on Windows its command line and environment block), of the machine (per-core CPU ticks and the cluster layout, memory by page class, commit, swap, pressure, throttling, cgroup capacity, the GPU's device-wide use, every network interface's counters, the process table's ceilings and counts, the load average, every resource coalition's CPU, disk and footprint counters on macOS, and what this OS can report at all), of its volumes (the mount table, one volume's free space, one file's identity) and of its build slots (Trust's `build-slot` flock files, read without a lock), on macOS, Linux and Windows, and the one rule that places a path under a directory across Windows' spellings. Every platform cfg of those readers lives here; it holds no timer and no thread."
+description = "aterm's in-process readers of another process (working directory, executable, process-group footprint; on Windows its command line and environment block), of the machine (per-core CPU ticks and the cluster layout, memory by page class, commit, swap, pressure, throttling, cgroup capacity, the GPU's device-wide use, every network interface's counters, the process table's ceilings and counts, the load average, every resource coalition's CPU, disk and footprint counters, a process's code-signing identity and the boot, sleep and wake times on macOS, and what this OS can report at all), of its volumes (the mount table, one volume's free space, one file's identity) and of its build slots (Trust's `build-slot` flock files, read without a lock), on macOS, Linux and Windows, and the one rule that places a path under a directory across Windows' spellings. Every platform cfg of those readers lives here; it holds no timer and no thread."
 
 # The macOS arm: libproc, `sysctlbyname`, Mach host and processor statistics
 # and `statfs` (declared in the first-party `libc`, each with its oracle row),
 # `getfsstat`, `getloadavg`, the routing socket's interface list by `sysctl`
 # (its layouts declared in `src/iflist.rs`, held to the SDK by
 # `tests/iflist_sdk.rs`), the IORegistry through IOKit and CoreFoundation
-# (declared in `src/iokit.rs`, held to the SDK by `tests/iokit_sdk.rs`), and
-# the resource coalitions by `proc_listcoalitions`,
+# (declared in `src/iokit.rs`, held to the SDK by `tests/iokit_sdk.rs`), the
+# resource coalitions by `proc_listcoalitions`,
 # `coalition_info_resource_usage` and `proc_pidinfo(PROC_PIDCOALITIONINFO)`
 # (xnu-private: declared in `src/coalitions.rs` with no SDK header to hold
-# them to, so a self-check and decode tests of recorded records do). The
+# them to, so a self-check and decode tests of recorded records do), and a
+# process's code signature by `csops`'s read operations (xnu-private too:
+# declared in `src/identity.rs`, its answers held by decode tests; the
+# status flags and categories it reads are held to the SDK's
+# `Kernel/kern/cs_blobs.h` by `tests/proc_info_sdk.rs`). The
 # Linux arm reads `/proc` and `/sys` through std (bounded reads; the page size
 # from `/proc/self/auxv`), a volume's free space by `statvfs`, and
 # `getloadavg` and `getrlimit`.
@@ -57,12 +61,13 @@ aterm-dl = { workspace = true }
 [dev-dependencies]
 aterm-tempfile = { workspace = true }
 # The job probe's live tests start a `sleep` in a session of its own to read
-# its stopped and zombie states (`src/jobs/tests.rs`), and `src/kproc_tests.rs`
-# runs its fixtures and its oracles (`ps`, `lsof`): children are built by
-# `spawnfd::command` (the workspace's one child constructor). Workspace
-# crate. aterm-uds depends on this crate (`procargs`; on Windows its volume
-# and PEB readers too), so this is a dev-only cycle: cargo builds it, and
-# nothing but these tests and examples sees the second copy.
+# its stopped and zombie states (`src/jobs/tests.rs`), `src/kproc_tests.rs`
+# runs its fixtures and its oracles (`ps`, `lsof`) and `src/timeline_tests.rs`
+# its (`sysctl`): children are built by `spawnfd::command` (the workspace's
+# one child constructor). Workspace crate. aterm-uds depends on this crate
+# (`procargs`; on Windows its volume and PEB readers too), so this is a
+# dev-only cycle: cargo builds it, and nothing but these tests and examples
+# sees the second copy.
 aterm-uds = { workspace = true }
 # The stuck engine's live check (`examples/stuck_live.rs`) hands what the job
 # probe reads to the pure engine, as the host will. Workspace crate, no

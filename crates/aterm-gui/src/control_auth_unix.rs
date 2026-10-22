@@ -61,11 +61,9 @@ fn already_private(dir: &Path, owner: u32) -> bool {
 /// for `owner`.
 fn tighten_and_verify(dir: &Path, owner: u32) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    // Only a mode that is not already `0700` is written: a `chmod(2)` to the
-    // mode a directory already has still moves its `st_ctime` (APFS), and
-    // tippy aborts when an ancestor of its executable changes ctime mid-run
-    // — aterm-update-core's copy of this rule learned that on 2026-09-15
-    // (privatedir.rs). The stat below still proves the final mode.
+    // Only a mode that is not already `0700` is written: a same-mode `chmod(2)` still moves
+    // `st_ctime` on APFS, and tippy stops when an ancestor of its executable changes ctime
+    // mid-run (aterm-update-core's privatedir.rs keeps the same rule).
     if !std::fs::metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o700) {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }

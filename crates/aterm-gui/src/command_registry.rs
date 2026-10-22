@@ -148,6 +148,9 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::Packages => spec("app.settings.packages", S::App, A::ConfigMutate, C::Any),
         // Settings at the Messages route: the same class as Packages.
         M::Messages => spec("app.settings.messages", S::App, A::ConfigMutate, C::Any),
+        // The System State tab (`open app system-state`): the setup surface beside
+        // Settings, the same config ceiling the control gate gives its `open`.
+        M::SystemState => spec("app.system_state.open", S::App, A::ConfigMutate, C::Any),
         // Settings ▸ Harness (the Autopilot design): the same Settings tab at
         // its Harness route, the same class as its siblings.
         M::HarnessSettings => spec("app.settings.harness", S::App, A::ConfigMutate, C::Any),
@@ -423,6 +426,15 @@ mod tests {
             menu_command(menu::MenuAction::NextNeed).authority,
             ActionAuthority::LocalUi
         );
+        // System State: its own app-scoped id, the Settings tab's ceiling.
+        let system_state = menu_command(menu::MenuAction::SystemState);
+        assert_eq!(system_state.id.as_str(), "app.system_state.open");
+        assert_eq!(system_state.scope, CommandScope::App);
+        assert_eq!(
+            system_state.authority,
+            menu_command(menu::MenuAction::ToggleSettings).authority
+        );
+        assert_eq!(system_state.content, ContentRequirement::Any);
     }
 
     #[test]

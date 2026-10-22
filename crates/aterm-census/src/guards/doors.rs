@@ -20,9 +20,7 @@ fn product<'a>(tree: &Tree<'a>) -> impl Iterator<Item = &'a SourceFile> {
         .filter(|f| !f.rel.starts_with(CENSUS_CRATE))
 }
 
-// ---------------------------------------------------------------------------
 // devtools-door: docs/DESIGN-macos-debugger-access-2026-09-29.md §5.5.
-// ---------------------------------------------------------------------------
 
 /// Where the change runner, the tool's path and its argv builders are defined.
 const DEVTOOLS_HOME: &str = "crates/aterm-containment/src/consent.rs";
@@ -221,10 +219,8 @@ fn bare_path(text: &str, defines: bool) -> Option<String> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // ffi-door: a platform call declared in one file, whose callers its privacy
 // then bounds.
-// ---------------------------------------------------------------------------
 
 /// The foreign functions a local `extern` block may declare in one file only:
 /// the name's prefix, that file (`None`: nowhere), and what the call opens.
@@ -296,14 +292,12 @@ fn declared(code: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // boot-id-door: the macOS boot id (`kern.bootsessionuuid`) is read through a
 // sysctl FFI call in one place, astream's (`astream_sys::boot_session`,
 // vendor/astream, outside this corpus). The guard watches that call alone: a
 // read of Linux's `/proc/sys/kernel/random/boot_id` is a plain file read, and
 // the tree keeps two on purpose (aterm-update's steady clock, judged by
 // `astream_sys::parse_boot_id`; aterm-release's publisher fence).
-// ---------------------------------------------------------------------------
 
 /// The macOS boot id's sysctl name.
 const BOOT_ID_SYSCTL: &str = "kern.bootsessionuuid";
@@ -356,10 +350,8 @@ fn boot_id_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // handoff-name: the live upgrade's handoff variables are authority, read and
 // handed on only as `HandoffName`s (crates/aterm-gui/src/handoff_env.rs).
-// ---------------------------------------------------------------------------
 
 /// aterm-gui's source: the window crate's and its split-out libraries'
 /// (`crates/aterm-gui-*`).
@@ -403,10 +395,8 @@ fn handoff_name(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // core-signal: the argument half of the clippy.toml `abort`/`raise` rows, and
 // every script's.
-// ---------------------------------------------------------------------------
 
 /// The signals whose death makes macOS write a crash report (and, for an app
 /// bundle, put a "quit unexpectedly" dialog on the owner's screen).

@@ -79,9 +79,7 @@ pub(crate) fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-// ---------------------------------------------------------------------------
 // The markers
-// ---------------------------------------------------------------------------
 
 /// The `privacy-debugger-change` record: `<on|off> <pid> <secs>.<usecs> <since>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -556,8 +554,7 @@ pub(crate) fn spawn_records_reader(
         crate::qos::Role::Responsive,
         move || {
             // Responsive, not Background: it publishes under a mutex the UI
-            // thread's park takes, the documented floor for such a holder. It
-            // reads two tiny files and is gone.
+            // thread's park takes.
             let read = read_records(&config_path, alive);
             *into.lock().unwrap_or_else(|p| p.into_inner()) = Some(read);
             wake();
@@ -566,9 +563,7 @@ pub(crate) fn spawn_records_reader(
     .is_ok()
 }
 
-// ---------------------------------------------------------------------------
 // The reducer
-// ---------------------------------------------------------------------------
 
 /// Where the owner's change stands. The numbers are the model's `phase`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -947,9 +942,7 @@ pub(crate) const fn admit_begin(inputs: BeginInputs) -> Result<(), Refusal> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // The shared result slot and the worker
-// ---------------------------------------------------------------------------
 
 /// Why a worker ran nothing at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1168,16 +1161,15 @@ pub(crate) fn spawn_devtools_worker(job: DevtoolsJob) -> DevtoolsSpawn {
         "consent-devtools",
         crate::qos::Role::Responsive,
         move || {
-            // Responsive: it publishes into the result slot the UI thread's
-            // park reads under the same mutex, the documented floor for such a
-            // holder. Nearly all of its life is a wait on one child, so the
-            // rank costs nothing.
+            // Responsive: it publishes into the result slot under the mutex the
+            // UI thread's park reads; it spends nearly all its life waiting on
+            // one child.
             run_devtools_job(job, |change, gate, on_spawn| {
                 aterm_containment::consent::run_devtools_change(change, gate, on_spawn)
             });
         },
     );
-    // DETACHED ON PURPOSE: the handle is dropped here and never stored.
+    // Detached on purpose: the handle is never stored.
     match spawned {
         Ok(_handle) => DevtoolsSpawn::Started,
         Err(error) => {
@@ -1320,9 +1312,7 @@ where
     slot.publish_result(id, result);
 }
 
-// ---------------------------------------------------------------------------
 // Drift and the records (§3.5, §3.8)
-// ---------------------------------------------------------------------------
 
 /// The `LogOnly` records of design §3.8, as a fact; the words are
 /// `message_reporters::debugger_access_record`'s.
@@ -1492,9 +1482,7 @@ impl DriftWatch {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The lane: what `App` owns
-// ---------------------------------------------------------------------------
 
 /// What one poll or observation asks the host to do.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2034,9 +2022,7 @@ impl DebuggerChangeLane {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The launch ask (owner ruling O29, 2026-10-19)
-// ---------------------------------------------------------------------------
 
 /// The record beside `aterm.toml` of the Macs on which aterm has asked, by itself,
 /// whether to allow debugger access: one `<host-uuid> <secs>` line per Mac
@@ -2517,6 +2503,12 @@ pub(crate) enum AskWait {
     /// The moment has come, but the probe is older than [`ASK_PROBE_FRESH`]:
     /// it is read again before the alert.
     ProbeStale,
+    /// The moment has come, but the rule's fresh reading read nothing (a
+    /// `-status` that timed out, did not start or answered what the classifier
+    /// does not claim) after the offer recorded this Mac: it is retired and read
+    /// again, within [`LaunchAskQueue::unread`]'s bound. The App's wait, not
+    /// [`admit_launch_ask`]'s.
+    ProbeUnread,
     /// The offer's disk half is out: the change lock, the record's read and
     /// this Mac's durable line, on a thread of their own. The App's wait, not
     /// [`admit_launch_ask`]'s.
@@ -2542,6 +2534,7 @@ impl AskWait {
             Self::NotQuiet => "not_quiet",
             Self::OwnerQuiet => "owner_quiet",
             Self::ProbeStale => "probe_stale",
+            Self::ProbeUnread => "probe_unread",
             Self::Recording => "recording",
         }
     }
@@ -2867,6 +2860,10 @@ pub(crate) struct LaunchAskQueue {
     /// When the first offer this process was refused before anything was
     /// written ([`Self::refused`]).
     refused_since: Option<Instant>,
+    /// When the spend first found the rule unread after this Mac was recorded
+    /// ([`Self::unread`]), and how many such readings it has met.
+    unread_since: Option<Instant>,
+    unread_reads: u32,
 }
 
 /// How long offers refused before anything was written (a change on disk, the
@@ -2876,6 +2873,13 @@ pub(crate) struct LaunchAskQueue {
 /// written, so a disk state nothing here settles can never hold the folder
 /// warm-up, which waits while the ask is queued, for longer.
 pub(crate) const REFUSED_FOR: Duration = Duration::from_secs(5 * 60);
+
+/// How many reads of the rule that read nothing a recorded launch ask meets
+/// before [`REFUSED_FOR`] from the first can end it ([`LaunchAskQueue::unread`]).
+/// No look runs while no aterm window is focused, so the span alone would let
+/// one failure met after an absence end an ask on a Mac already recorded; a
+/// read that keeps failing meets this many within seconds.
+pub(crate) const UNREAD_READS: u32 = 3;
 
 /// Where [`LaunchAskQueue`] does its disk work: the record's read
 /// ([`LaunchAskQueue::start_record_read`]), the offer's disk half
@@ -2908,6 +2912,8 @@ impl LaunchAskQueue {
             record_read: RecordRead::Thread,
             waiting: None,
             refused_since: None,
+            unread_since: None,
+            unread_reads: 0,
         }
     }
 
@@ -2995,6 +3001,24 @@ impl LaunchAskQueue {
             return false;
         }
         self.look_later(now + crate::devtools_helper::RECHECK_EVERY);
+        true
+    }
+
+    /// The spend's fresh reading did not read the rule (a `-status` that timed
+    /// out, did not start or answered what the classifier does not claim,
+    /// [`DebuggerMode::Unknown`] with an age) after the disk half recorded this Mac: the
+    /// rule is read again, unless such readings have held the answer for
+    /// [`REFUSED_FOR`] since the first one and number at least [`UNREAD_READS`]
+    /// — then it is over for this process (`false`), the record standing. The
+    /// span is never restarted.
+    pub(crate) fn unread(&mut self, now: Instant) -> bool {
+        let since = *self.unread_since.get_or_insert(now);
+        self.unread_reads = self.unread_reads.saturating_add(1);
+        if self.unread_reads >= UNREAD_READS && now.saturating_duration_since(since) >= REFUSED_FOR
+        {
+            self.end();
+            return false;
+        }
         true
     }
 
@@ -3117,9 +3141,7 @@ impl LaunchAskQueue {
     }
 }
 
-// ---------------------------------------------------------------------------
 // What the Security page renders
-// ---------------------------------------------------------------------------
 
 /// A change child in flight, for the row's "waiting" line (since <time>).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3198,9 +3220,7 @@ impl DebuggerFacts {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -4669,9 +4689,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
     // The launch ask (owner ruling O29)
-    // -----------------------------------------------------------------------
 
     /// Facts under which the launch ask asks: every gate open, this Mac not in
     /// the record, the records and the probe read (off, an admin), a hardened
@@ -5146,6 +5164,7 @@ mod tests {
             AskWait::BehindWarmup,
             AskWait::NotQuiet,
             AskWait::OwnerQuiet,
+            AskWait::ProbeUnread,
         ];
         for why in later {
             assert_eq!(why.look_again(), RECHECK_EVERY, "{why:?}");
@@ -5605,6 +5624,41 @@ mod tests {
         assert!(!queue.queued() && queue.next_deadline().is_none());
     }
 
+    /// READS OF THE RULE THAT READ NOTHING HOLD A RECORDED ASK FOR A BOUNDED SPAN:
+    /// each is read again while the span from the first lasts, a wait between them
+    /// restarting nothing; past the span the ask ends once [`UNREAD_READS`] have
+    /// failed, but not on fewer, so one failure met after an absence (no look runs
+    /// while no aterm window is focused) does not end an ask on a Mac already
+    /// recorded.
+    #[test]
+    fn reads_that_read_nothing_hold_a_recorded_launch_ask_for_a_bounded_span() {
+        use crate::devtools_helper::RECHECK_EVERY;
+        let mut queue = LaunchAskQueue::queued_for_test(|| Some("MAC-A"));
+        let first = Instant::now();
+        assert!(queue.unread(first), "the first read again");
+        let mut at = first;
+        while at + RECHECK_EVERY < first + REFUSED_FOR {
+            at += RECHECK_EVERY;
+            queue.wait(AskWait::ProbeUnread, at + RECHECK_EVERY);
+            assert!(queue.unread(at), "still within the span");
+        }
+        assert!(!queue.unread(first + REFUSED_FOR), "the span is over");
+        assert!(!queue.queued() && queue.next_deadline().is_none());
+
+        let mut queue = LaunchAskQueue::queued_for_test(|| Some("MAC-A"));
+        assert!(queue.unread(first), "the first read again");
+        let back = first + REFUSED_FOR + RECHECK_EVERY;
+        for read in 2..UNREAD_READS {
+            assert!(
+                queue.unread(back),
+                "read {read} past the span: fewer than UNREAD_READS"
+            );
+        }
+        assert!(queue.queued());
+        assert!(!queue.unread(back), "UNREAD_READS past the span: over");
+        assert!(!queue.queued());
+    }
+
     /// THE OFFER JUDGES THE DISK AS THE WORKER DOES. A file at the change marker's
     /// path that names no change — a link, a folder, an oversized or malformed
     /// file — is no change: the records reader and the worker ignore it, so the
@@ -5731,9 +5785,7 @@ mod tests {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tier-1: the real lane, worker and order against the derived model
-// ---------------------------------------------------------------------------
 
 /// Tier-1 `debugger_access_conforms_to_the_model` (design §5.4): drives the production
 /// composition — [`DebuggerChangeLane`], the worker body [`run_devtools_job`] on its own thread

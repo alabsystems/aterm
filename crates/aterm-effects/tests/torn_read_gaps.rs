@@ -730,54 +730,57 @@ fn a_stalled_repaint_restores_the_suffix_when_typing_resumes() {
 
 #[test]
 fn stalled_repaint_custody_is_dark_and_expires_with_its_run() {
-    let mut h = Host::new(false);
-    h.type_str("hello brave new world");
-    h.idle(200);
-    let cut = COL0 + "hello ".len();
-    h.program(format!("\x1b[?25l\x1b[{};{}H\x1b[K", ROW + 1, cut + 1).as_bytes());
-    h.idle(300);
-    assert!(
-        h.glow
-            .v2_ribbon()
-            .expect("ribbon")
-            .cells()
-            .iter()
-            .any(|cell| { usize::from(cell.col) >= cut && cell.released_at.is_some() }),
-        "partial release still has exact identities in custody"
-    );
-    let cov = coverage(&h.glow, geom(), ROW);
-    // The standing prefix's final boundary is at `cut`; everything beyond
-    // that edge belongs only to the released suffix.
-    assert!(
-        cov[cut + 1..COL0 + h.text.len()].iter().all(|&c| c == 0),
-        "custody paints no light"
-    );
-    assert!(
-        h.glow
-            .v2_ribbon()
-            .expect("ribbon")
-            .field_at(ROW, cut as u16)
-            .is_none(),
-        "custody owns no field"
-    );
-    h.idle(3000);
-    assert!(
-        h.glow.v2_ribbon().expect("ribbon").at_rest(),
-        "custody expires with the original run"
-    );
-    assert!(
-        h.glow
-            .v2_ribbon()
-            .expect("ribbon")
-            .next_change_deadline(h.now)
-            .is_none(),
-        "expired custody schedules no wake"
-    );
-    h.repaint(Split::Whole);
-    assert!(
-        h.glow.v2_ribbon().expect("ribbon").at_rest(),
-        "a late same-glyph repaint earns no new light"
-    );
+    for reduced_motion in [false, true] {
+        let mut h = Host::new(false);
+        h.glow.set_reduced_motion(reduced_motion);
+        h.type_str("hello brave new world");
+        h.idle(200);
+        let cut = COL0 + "hello ".len();
+        h.program(format!("\x1b[?25l\x1b[{};{}H\x1b[K", ROW + 1, cut + 1).as_bytes());
+        h.idle(300);
+        assert!(
+            h.glow
+                .v2_ribbon()
+                .expect("ribbon")
+                .cells()
+                .iter()
+                .any(|cell| { usize::from(cell.col) >= cut && cell.released_at.is_some() }),
+            "partial release still has exact identities in custody"
+        );
+        let cov = coverage(&h.glow, geom(), ROW);
+        // The standing prefix's final boundary is at `cut`; everything beyond
+        // that edge belongs only to the released suffix.
+        assert!(
+            cov[cut + 1..COL0 + h.text.len()].iter().all(|&c| c == 0),
+            "custody paints no light"
+        );
+        assert!(
+            h.glow
+                .v2_ribbon()
+                .expect("ribbon")
+                .field_at(ROW, cut as u16)
+                .is_none(),
+            "custody owns no field"
+        );
+        h.idle(3000);
+        assert!(
+            h.glow.v2_ribbon().expect("ribbon").at_rest(),
+            "custody expires with the original run"
+        );
+        assert!(
+            h.glow
+                .v2_ribbon()
+                .expect("ribbon")
+                .next_change_deadline(h.now)
+                .is_none(),
+            "expired custody schedules no wake"
+        );
+        h.repaint(Split::Whole);
+        assert!(
+            h.glow.v2_ribbon().expect("ribbon").at_rest(),
+            "a late same-glyph repaint earns no new light"
+        );
+    }
 }
 
 #[test]

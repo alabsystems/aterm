@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A follow-mode notifier checkpoints a fetched page after its records have
-//! passed through the serial executor, never when its reader merely offers it.
+//! A follow-mode notifier checkpoints a fetched page after its records have passed through the
+//! serial executor, never when its reader merely offers it.
 
 use aterm_spec::derive::Model;
 
-/// One fetched page with two matching records and one filtered-out offset.
-/// The zero-buffer handoff may accept the second record while its command is
-/// still running; the reader may then offer the page checkpoint, but the
-/// executor cannot receive that checkpoint until the command finishes.
-/// `Buggy=1` writes the page cursor on offer, recreating the skip on a crash.
-/// Tier-1 drives the real notifier while its second command is blocked and
-/// reads the durable cursor and journal before releasing it.
+/// One fetched page with two matching records and one filtered-out offset. The zero-buffer
+/// handoff may accept the second record while its command still runs; the reader may then offer
+/// the page checkpoint, but the executor cannot receive it until the command finishes.
+/// `Buggy=1` writes the page cursor on offer, which skips the record on a crash. Tier-1 drives
+/// the real notifier with its second command blocked and reads the durable cursor and journal.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn notify_follow_checkpoint_model() -> Model {

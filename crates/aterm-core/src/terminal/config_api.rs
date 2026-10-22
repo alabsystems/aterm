@@ -110,9 +110,7 @@ pub struct ColorRebase {
 }
 
 impl Terminal {
-    // =========================================================================
     // Configuration Hot-Reload API
-    // =========================================================================
 
     /// The host's colour baseline now: the configured colours, palette and
     /// declared scheme that OSC 104/110-119 and RIS reset to.

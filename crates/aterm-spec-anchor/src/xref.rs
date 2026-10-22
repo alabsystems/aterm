@@ -71,9 +71,7 @@ pub fn waivers() -> impl Iterator<Item = &'static Waiver> {
     crate::registry::iter::<Waiver>()
 }
 
-// ---------------------------------------------------------------------------
 // EXECUTION EVIDENCE — the runnable fragment of obligation 2.
-// ---------------------------------------------------------------------------
 //
 // THE HOLE THIS ADDRESSES. A `RefinementAnchor` is submitted by an attribute that
 // leaves the annotated fn untouched, and `check_closure` only ever compared

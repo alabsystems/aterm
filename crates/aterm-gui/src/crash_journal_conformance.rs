@@ -565,12 +565,9 @@ fn replay(
 /// interpreter; each DISTINCT real transition is also validated once on both
 /// tiers.
 ///
-/// The machine has fourteen actions. `Write`, `Settle`, `Quit`,
-/// `WriteQuitLayout`, `Adopt` and `Claim` carry real `#[refines]` anchors
-/// (`JournalOwner::publish`/`retire`/`adopt`, `restore::write_quit_to`,
-/// `claim_at_boot`). The other eight are the process around the journal,
-/// which this runner plays and projects rather than code any journal function
-/// runs.
+/// Of the fourteen actions, `Write`, `Settle`, `Quit`, `WriteQuitLayout`, `Adopt` and `Claim`
+/// carry real `#[refines]` anchors; the other eight are the process around the journal, which
+/// this runner plays.
 #[test]
 fn the_real_journal_conforms_to_the_model() {
     let model = crash_journal_claim_model();

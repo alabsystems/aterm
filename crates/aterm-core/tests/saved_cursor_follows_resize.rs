@@ -299,7 +299,7 @@ fn a_slot_past_the_grid_rides_a_reveal_below_the_content() {
 
 /// A narrowing that rewraps more rows than fit below a cursor too near the top
 /// pushes them off the bottom into history, as a rows-only shrink's bottom push
-/// does, and the grow back puts them back under the screen (ATERM-KI-1015-1:
+/// does, and the grow back puts them back under the screen (
 /// it dropped them). A slot saved on one of them stays past the grid while its
 /// line is in history, not clamped onto the last row kept, and comes back
 /// with it: DECRC after the grow lands on its own cell.

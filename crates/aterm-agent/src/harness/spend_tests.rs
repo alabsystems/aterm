@@ -135,9 +135,7 @@ fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
 }
 
-// ---------------------------------------------------------------------------
 // The price table
-// ---------------------------------------------------------------------------
 
 #[test]
 fn price_table_prices_only_what_the_caller_supplied() {
@@ -470,9 +468,7 @@ fn the_shipped_table_loads_dated_and_sourced_and_the_loader_is_strict() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The fold
-// ---------------------------------------------------------------------------
 
 /// THE HOME-WIDE FOLD COUNTS SUBAGENTS (the design's F15): the main
 /// transcript, a subagent's beside it and a workflow's nested deeper are all
@@ -1127,9 +1123,7 @@ fn a_spend_priced_by_another_table_is_folded_again() {
     assert_eq!(spend.prices_as_of(), "2026-11-01");
 }
 
-// ---------------------------------------------------------------------------
 // The dollar figures
-// ---------------------------------------------------------------------------
 
 /// A spend with `usd` of opus spend placed at each `(at, usd)`.
 fn spend_at(rows: &[(i64, f64)], now: i64) -> Spend {
@@ -1476,9 +1470,7 @@ fn the_fable_bucket_sums_only_fable_models() {
     assert!(close(figure(&spend, &ask(now, None)).used.usd, 6.0));
 }
 
-// ---------------------------------------------------------------------------
 // The rows of one message, each message's price, cursors, the seam
-// ---------------------------------------------------------------------------
 
 /// A message's first row as Claude Code 2.1.300 writes it while the message
 /// streams: no `speed` (nor `server_tool_use` or `iterations`, which [`row`]
@@ -1845,9 +1837,7 @@ fn a_transcript_past_the_horizon_lets_its_cursor_go() {
     assert_eq!(run("past-control", true), (2, 0));
 }
 
-// ---------------------------------------------------------------------------
 // A Codex conversation
-// ---------------------------------------------------------------------------
 
 use crate::harness::codex_rollout::fixtures::{context, count, meta};
 

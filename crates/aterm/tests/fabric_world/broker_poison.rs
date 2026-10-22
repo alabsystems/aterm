@@ -72,6 +72,9 @@ impl Supervised {
     /// The secret file beside the world's socket, mode 0600, and the seam.
     fn new(w: &World, fault: String) -> Self {
         use std::os::unix::fs::PermissionsExt;
+        // A mint secret is read from a directory only its owner can reach.
+        std::fs::set_permissions(&w.tmp, std::fs::Permissions::from_mode(0o700))
+            .expect("the world's directory is private");
         let secret = w.tmp.join("mint.secret");
         std::fs::write(&secret, SECRET).expect("write the mint secret");
         std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))

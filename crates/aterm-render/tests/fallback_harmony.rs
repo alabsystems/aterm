@@ -257,9 +257,8 @@ fn the_fallback_fit_class_follows_the_unicode_class() {
     }
 }
 
-/// Cell allocation is Unicode-width/config driven, never inferred from a
-/// fallback font's proportional advance. This is the CJK/combining guard for
-/// the warning-sign fix.
+/// Cell allocation follows Unicode width and config, never a fallback font's proportional
+/// advance.
 #[test]
 fn fallback_cell_count_matches_terminal_cjk_policy() {
     use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
@@ -471,7 +470,7 @@ fn clamp_to_row_band_keeps_rows_in_band_exhaustively() {
     assert!(trimmed > 0 && untouched > 0);
 }
 
-// ---- (e) weight/italic ranking ----
+// Weight and italic ranking.
 
 /// A style (italic) mismatch outranks any weight distance (OS/2 weights are 1..=1000 and
 /// the italic penalty is 1000); among style-matched candidates the closest weight wins.

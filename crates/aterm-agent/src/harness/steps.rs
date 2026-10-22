@@ -209,6 +209,7 @@ const KEY_TURN_DURATION: &str = anchor_text("transcript.turn_duration");
 const KEY_DURATION_MS: &str = anchor_text("transcript.durationMs");
 const KEY_COMPACT_BOUNDARY: &str = anchor_text("transcript.compact_boundary");
 const KEY_COMPACT_SUMMARY: &str = anchor_text("transcript.isCompactSummary");
+const KEY_QUEUE_TRANSCRIPT_ONLY: &str = anchor_text("transcript.queueTranscriptOnly");
 const KEY_API_ERROR: &str = anchor_text("transcript.isApiErrorMessage");
 const KEY_SIDECHAIN: &str = anchor_text("transcript.isSidechain");
 const KEY_META: &str = anchor_text("transcript.isMeta");
@@ -216,9 +217,7 @@ const KEY_PROMPT_ID: &str = anchor_text("transcript.promptId");
 const KEY_PARENT: &str = anchor_text("transcript.parentUuid");
 const KEY_LOCAL_COMMAND: &str = anchor_text("transcript.local_command");
 
-// ---------------------------------------------------------------------------
 // Bounded values
-// ---------------------------------------------------------------------------
 
 /// An id as the session log takes one (`aterm_slog::ShortId`'s rule): 1 to
 /// 40 bytes of `[A-Za-z0-9._:@-]`. A `promptId`, a row's `uuid`, a
@@ -330,9 +329,7 @@ pub fn tool_class(name: &str) -> (&'static str, bool) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Steps
-// ---------------------------------------------------------------------------
 
 /// Where a step was read: the file (its path's fingerprint and, where the
 /// platform has one, its identity), the offset (the end of the row's line,
@@ -474,9 +471,7 @@ pub struct StepBatch {
     pub end: End,
 }
 
-// ---------------------------------------------------------------------------
 // The end
-// ---------------------------------------------------------------------------
 
 /// What the newest main-chain entry is (the harness's `Entry`, without its
 /// text, and the opaque local command).
@@ -715,9 +710,7 @@ pub fn notice_read(line: &str) -> Option<NoticeRead> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // Raw-byte reads
-// ---------------------------------------------------------------------------
 
 /// Whether a row's content parts are needed: its raw bytes hold a call's or
 /// a result's key, or a `\u` escape that could spell one (A8). The keys
@@ -913,9 +906,7 @@ pub(super) fn number(v: Option<&Value>) -> Option<u64> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // The fold
-// ---------------------------------------------------------------------------
 
 /// A vendor turn's tokens, by the usage fold's dedupe (A11).
 #[derive(Clone, Debug, Default)]
@@ -1604,7 +1595,7 @@ impl StepFold {
             fresh,
             wake,
         };
-        if flag(obj, KEY_COMPACT_SUMMARY) {
+        if flag(obj, KEY_COMPACT_SUMMARY) || flag(obj, KEY_QUEUE_TRANSCRIPT_ONLY) {
             return (EndRow::None, None);
         }
         if meta {

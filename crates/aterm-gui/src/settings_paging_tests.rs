@@ -136,6 +136,8 @@ impl Turned {
     }
 }
 
+/// The screen a render draws now, from the stop it drew from: not the
+/// scroll it was asked for, which a landing or a reveal moves.
 fn screen_now(
     runtime: &NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -145,14 +147,18 @@ fn screen_now(
     let compiled = compile_settings_view(runtime, instance, view, cx);
     let state = messages_view_state(runtime, view);
     let plan = state.scroll_plan()?;
-    let top = state.page_scroll.min(plan.limit());
+    let top = state
+        .scroll_record
+        .borrow()
+        .as_ref()
+        .map_or(0, |record| record.top());
     let whole = shown_whole(&compiled, &plan, top);
     let offset = plan.screen(top).offset;
     Some((Turned { top, offset, whole }, plan))
 }
 
 /// MODIFIED'S ROW WHOSE FACTS THE STRIP HOLDS IS SHOWN WHOLE, AND PAGE DOWN
-/// TURNS PAST IT (round-7 review): every Modified row carries its facts on a
+/// TURNS PAST IT (review): every Modified row carries its facts on a
 /// second line, so at the shipped 102x29 and at 150x48 the room's edge falls
 /// between a row's field and its facts, which the strip kept for a status bar
 /// painted legibly under it, while the screen did not count the row, and Page
@@ -173,7 +179,7 @@ fn modifieds_row_whose_facts_the_strip_holds_is_shown_and_turned_past() {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                     unreachable!();
                 };
-                state.page_scroll = top;
+                state.scroll_page_to(top);
                 state.page_reveal = None;
             }
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
@@ -282,9 +288,15 @@ fn page_keys_turn_over_exactly_what_a_screen_showed_whole() {
                     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                         unreachable!();
                     };
-                    state.page_scroll = top;
+                    state.scroll_page_to(top);
                     state.page_reveal = None;
                     if let Some((screen, _)) = screen_now(&runtime, instance, view, &cx) {
+                        if screen.top != top {
+                            faults.push(format!(
+                                "{context}: screen {top} draws from stop {}",
+                                screen.top
+                            ));
+                        }
                         showable.extend(screen.whole);
                     }
                 }
@@ -292,10 +304,9 @@ fn page_keys_turn_over_exactly_what_a_screen_showed_whole() {
                     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                         unreachable!();
                     };
-                    state.page_scroll = 0;
+                    state.scroll_page_to(0);
                     state.page_reveal = None;
                 }
-                let _ = compile_settings_view(&runtime, instance, view, &cx);
                 for direction in [1, -1] {
                     let mut screens = vec![if direction > 0 { first.top } else { limit }];
                     let start = screen_now(&runtime, instance, view, &cx).expect("a list").0;
@@ -401,26 +412,12 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
             ] {
                 let cx = view_cx_at(width, height);
                 let (mut runtime, instance, view) = paging_view(source, route);
-                let _ = compile_settings_view(&runtime, instance, view, &cx);
-                let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
-                    continue;
-                };
-                for top in 0..=plan.limit() {
-                    {
-                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
-                        else {
-                            unreachable!();
-                        };
-                        state.page_scroll = top;
-                        state.page_reveal = None;
-                    }
-                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
-                    let state = messages_view_state(&runtime, view);
+                each_screen_of(&mut runtime, instance, view, &cx, |state, compiled, top| {
                     let Some(plan) = state.scroll_plan() else {
-                        continue;
+                        return;
                     };
-                    let Some(list) = painted_list(&compiled, &plan, top) else {
-                        continue;
+                    let Some(list) = painted_list(compiled, &plan, top) else {
+                        return;
                     };
                     // A screen that draws on to the list's end has nothing
                     // after it to peek in.
@@ -429,7 +426,7 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
                         .last()
                         .is_none_or(|band| band.stop + 1 >= plan.len())
                     {
-                        continue;
+                        return;
                     }
                     let context = format!(
                         "{route:?} {width}x{height}{} screen {top}",
@@ -513,7 +510,7 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
                              nothing of the next in view"
                         ));
                     }
-                }
+                });
             }
         }
     }
@@ -557,7 +554,7 @@ fn a_bar_over_a_rows_facts_never_moves_the_list() {
                     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                         unreachable!();
                     };
-                    state.page_scroll = top;
+                    state.scroll_page_to(top);
                     state.page_reveal = None;
                     state.feedback = None;
                     state.common.last_focus = None;
@@ -1378,25 +1375,12 @@ fn a_shared_note_heads_no_control_on_any_page() {
             for (width, height) in PAGING_SIZES {
                 let cx = view_cx_at(width, height);
                 let (mut runtime, instance, view) = paging_view(source, route);
-                let _ = compile_settings_view(&runtime, instance, view, &cx);
-                let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
-                    continue;
-                };
-                for top in 0..=plan.limit() {
-                    {
-                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
-                        else {
-                            unreachable!();
-                        };
-                        state.page_scroll = top;
-                        state.page_reveal = None;
-                    }
-                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
-                    let Some(plan) = messages_view_state(&runtime, view).scroll_plan() else {
-                        continue;
+                each_screen_of(&mut runtime, instance, view, &cx, |state, compiled, top| {
+                    let Some(plan) = state.scroll_plan() else {
+                        return;
                     };
-                    let Some(list) = painted_list(&compiled, &plan, top) else {
-                        continue;
+                    let Some(list) = painted_list(compiled, &plan, top) else {
+                        return;
                     };
                     for band in plan.drawn_bands(top) {
                         let (from, to) = (list.y + band.at, list.y + band.at + band.height);
@@ -1420,7 +1404,7 @@ fn a_shared_note_heads_no_control_on_any_page() {
                             ));
                         }
                     }
-                }
+                });
             }
         }
     }
@@ -1863,23 +1847,20 @@ fn every_stop_of_a_short_window_is_whole_by_page_and_by_wheel() {
                         .next()
                         .map_or_else(|| format!("#{stop}"), |key| key.as_str().to_string())
                 };
-                // From the list's top, as a person scrolls down it.
-                {
+                // From the list's top, as a person scrolls down it: from
+                // where the last screen put the list (a landing on the
+                // page's current item), as every event takes it.
+                let to_top = |runtime: &mut NativeRuntime| {
                     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                         unreachable!();
                     };
-                    state.page_scroll = 0;
+                    state.scroll_page_to(0);
                     state.page_reveal = None;
-                }
+                };
+                to_top(&mut runtime);
                 let wheel =
                     walk_screens(&mut runtime, instance, view, &cx, &AppEvent::ScrollLines(1));
-                {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                        unreachable!();
-                    };
-                    state.page_scroll = 0;
-                    state.page_reveal = None;
-                }
+                to_top(&mut runtime);
                 let page =
                     walk_screens(&mut runtime, instance, view, &cx, &AppEvent::ScrollPage(1));
                 let never = |walk: &Walk| {

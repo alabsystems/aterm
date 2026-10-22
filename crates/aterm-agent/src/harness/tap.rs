@@ -234,9 +234,7 @@ pub fn file_name(sid: &str, pid: u32) -> Option<String> {
     (is_tab_id(sid) && pid > 0).then(|| format!("{sid}-{pid}.json"))
 }
 
-// ---------------------------------------------------------------------------
 // The reading
-// ---------------------------------------------------------------------------
 
 /// One window's figure as Claude Code hands it: percent used, whole and in
 /// tenths, and the instant (Unix seconds) the window resets.
@@ -597,9 +595,7 @@ fn read_regular(path: &Path) -> Option<String> {
     (text.len() as u64 <= FILE_MAX).then_some(text)
 }
 
-// ---------------------------------------------------------------------------
 // The verb
-// ---------------------------------------------------------------------------
 
 /// Write `text` to `dir/name`: the directory made 0700, a temp file of mode
 /// 0600 (never through a link) renamed over it. No sync: a reading lost to a
@@ -758,9 +754,7 @@ pub fn sweep(dir: &Path, now: i64, alive: &dyn Fn(u32) -> bool) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Where the tap is added
-// ---------------------------------------------------------------------------
 
 /// `[harness] usage_tap` on, for the relaunch lines one pass types
 /// (`super::upgrade_drive::Opts::usage_tap`).
@@ -846,9 +840,7 @@ pub fn gate(f: &GateFacts<'_>) -> Option<String> {
     (stored && quiet).then_some(value)
 }
 
-// ---------------------------------------------------------------------------
 // The host's half: freshness and silence
-// ---------------------------------------------------------------------------
 
 /// The freshness rule (design §3.2), per tab: a reading counts only where it is the first with a
 /// figure for its process, its process was served a request since the last one (`api_ms` rose),

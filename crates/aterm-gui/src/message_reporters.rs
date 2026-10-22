@@ -4556,13 +4556,11 @@ fn upgrade_exception_what(kind: &str, group: &ExceptionGroup<'_>) -> String {
         .unwrap_or_else(|| format!("{who} is behind"))
 }
 
-// ---------------------------------------------------------------------------
 // The host's own facts: the supervisor that keeps failing, a survey the loop
 // cannot close, the volume aterm cannot help, the upgrade that cannot run, a
 // repaint that gave up. Each is a record when it begins (the log the owner
 // reads later) and, only if it goes on, one dismissable line of the digest —
 // never a band row, a tab mark or a notification.
-// ---------------------------------------------------------------------------
 
 /// A glass title that names its tab where it fits ([`placed_title`]), else the
 /// head alone: `Survey will not close in its tab` is a word over the rule.
@@ -5449,22 +5447,27 @@ pub(crate) fn workstation_accounts_entry() -> Entry {
     .more("Account automation retries after permission is granted; aterm signs out the accounts")
 }
 
-/// First-run setup has not verified every setting. The worker keeps retrying;
-/// the owner can inspect its current result without restarting setup.
+/// Where System State is opened: the app menu's row
+/// (`crate::menu::MenuAction::SystemState`), also in the command palette.
+pub(crate) const SYSTEM_STATE_MENU: &str = "aterm \u{25B8} System State\u{2026}";
+
+/// First-run setup has not finished every step. The worker keeps retrying; the
+/// owner can see each step's result in System State, which reads every stage
+/// (the Secrets vault and its subscriber included, which `aterm doctor --check`
+/// never reads), without restarting setup. No message intent opens that tab,
+/// so the step names its menu row.
 pub(crate) fn workstation_setup_failure_entry() -> Entry {
     Entry::new(
         Family::Privacy,
         "workstation",
         "settings-incomplete",
         "Mac setup needs attention",
-        Why::OnlyYou(Reason::new(
-            "background setup has not verified every workstation setting",
-        )),
-        Then::step("Inspect aterm doctor --check"),
+        Why::OnlyYou(Reason::new("background setup has not finished every step")),
+        Then::step(format!("Open {SYSTEM_STATE_MENU}")),
     )
     .resurface(Resurface::CHOICE)
     .more("Automatic setup retries while aterm remains open")
-    .more("aterm doctor --check optionally inspects settings; no rerun is needed to resume setup")
+    .more("System State shows what each step waits for; its Apply runs the checked steps again now")
 }
 
 /// aterm is not on macOS's Developer Tools list, MEASURED
@@ -7511,9 +7514,7 @@ pub(crate) fn install_posture(
     )
 }
 
-// ---------------------------------------------------------------------------
 // A person's Settings ▸ Packages verb.
-// ---------------------------------------------------------------------------
 
 /// A Settings ▸ Packages verb a person pressed and is WAITING on — so its
 /// pass takes the band's animated row whatever it weighs

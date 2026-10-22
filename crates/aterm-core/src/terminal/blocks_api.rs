@@ -88,11 +88,8 @@ impl Terminal {
         self.shell.current_block.as_ref()
     }
 
-    /// All blocks, completed then current.
-    ///
-    /// Double-ended: ids strictly increase front to back, so a watermarked
-    /// consumer (the subscribe `events` digest) walks backwards and stops at
-    /// `id <= watermark` instead of scanning the retained history.
+    /// All blocks, completed then current. Ids strictly increase front to back,
+    /// so a watermarked consumer walks backwards and stops at `id <= watermark`.
     #[inline]
     pub fn all_blocks(&self) -> impl DoubleEndedIterator<Item = &OutputBlock> {
         self.shell

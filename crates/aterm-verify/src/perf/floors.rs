@@ -103,9 +103,7 @@ fn read_baseline<T>(
         .map_err(|why| format!("{} {why}", path.display()))
 }
 
-// ---------------------------------------------------------------------------
 // The throughput lane.
-// ---------------------------------------------------------------------------
 
 /// The `perf_harness` report, and the shape persisted to its baseline.
 #[derive(Debug, Clone, PartialEq)]
@@ -232,11 +230,9 @@ fn compare_against_baseline(path: &Path, report: &PerfReport) -> LaneRun {
     }
 }
 
-// ---------------------------------------------------------------------------
 // KEYED lanes: the harness emits flat JSON and every listed key gets its own
 // floor. Keys are bigger-is-better; a missing key makes the whole report
 // unparseable (never "the missing metric passed").
-// ---------------------------------------------------------------------------
 
 /// A keyed floor lane.
 pub(crate) struct FloorLane {

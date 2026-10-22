@@ -1124,10 +1124,8 @@ fn serious_mode_bell_never_consumes_the_audible_rate_limit_lane() {
     let now = std::time::Instant::now();
     let before = crate::alert_sounds_on_this_thread();
 
-    // The headless fixture has no active native view to flash.  What this
-    // path must establish is that a suppressed BEL never reaches (or even
-    // consumes) the audible limiter; visual-bell preservation is not
-    // driven here.
+    // The headless fixture has no native view to flash: this pins only that a suppressed BEL
+    // never reaches or consumes the audible limiter.
     app.on_bell(WindowId(0), 0, now);
 
     assert_eq!(

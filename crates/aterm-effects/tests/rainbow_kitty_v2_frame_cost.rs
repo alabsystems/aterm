@@ -17,9 +17,9 @@
 //! (p50 ≤ 0.4 ms, p90 ≤ 0.6 ms per tick) for the engine alone and through the seam.
 //!
 //! ```sh
-//! # the deterministic laws (zero-alloc, idle → zero, caps) — every run:
+//! # the deterministic laws, every run:
 //! targo --unverified test -p aterm-effects --test effects_suite -- rainbow_kitty_v2_frame_cost:: --nocapture
-//! # the CPU budget gate — release only, like benches/cursor_bench.rs:
+//! # the CPU budget gate, release only:
 //! targo --unverified bench -p aterm-effects --bench rainbow_kitty_v2_frame_cost
 //! # on a host with no §18 measurement on record, scale the two budgets (nothing else; the
 //! # knob is shared with benches/cursor_bench.rs, see `common::budget_scale`):

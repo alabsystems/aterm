@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DRIVE DIRECTORY'S RETENTION (relaunch-10 of ATERM-KI-1016-1, the review's KR-5).
+//! THE DRIVE DIRECTORY'S RETENTION (relaunch-10 of , the review's KR-5).
 //!
 //! `<aterm state>/drive` keeps one group of files for each tab a loop or the harness ran in: the
 //! approvals ledger `<sid>.jsonl`, the loop's journal `<sid>.journal.jsonl`, the goal hold

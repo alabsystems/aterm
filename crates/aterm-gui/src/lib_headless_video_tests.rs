@@ -790,7 +790,7 @@ fn live_opacity_transition_aborts_swapchain_recording_fail_closed() {
     assert!(
         rx.recv()
             .expect("aborted recording answers its blocked client")
-            .contains("full-window artifact is unavailable for a translucent client")
+            .contains(super::TRANSLUCENT_CAPTURE_ERROR)
     );
 
     // Negative controls: an opaque transition and the headless present-real

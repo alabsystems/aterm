@@ -120,9 +120,11 @@ pub fn replay<S: Schema, C: Code<S>>(
         };
         match code.step(schema, &mut state, input, port) {
             Ok(obs) => {
+                // One encoder for the whole replay: each observation is a new encoding in
+                // the room the largest one before it took.
+                e.clear();
                 schema.encode_observation(&obs, &mut e);
                 chain = chain_link(&chain, at, e.as_bytes());
-                e = Enc::with_capacity(e.len());
                 observations.push((at, obs));
             }
             Err(r) => {

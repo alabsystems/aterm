@@ -29,9 +29,7 @@ aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-core = { workspace = true }
 aterm-models-session = { workspace = true }
-# spill_bound.rs regression test only: `pipe(2)` to build a blocking fd whose read
-# end is never drained (a wedged foreground), so the non-parking spill path is
-# exercised end-to-end against a full kernel buffer.
+# Tests only: raw fds (pipes, termios, fcntl) and errno values.
 libc = { workspace = true }
 
 # The Windows suite spawns its programs in real ConPTY sessions

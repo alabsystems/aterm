@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHICH LIBRARIES HOLD A DOCTEST, read off their sources, so the doctests stage
-//! passes `-p` for those alone instead of a rustdoc pass per crate (most crates
-//! have none). A scan, never a manifest flag, and it FAILS WIDE: whatever it cannot
+//! WHICH LIBRARIES HOLD A DOCTEST, read off their sources, so the doctests stage's
+//! stand-in doc driver skips the rustdoc pass of every library that holds none
+//! ([`crate::stages::doctest_split`], [`crate::docdriver`]; most crates have
+//! none). A scan, never a manifest flag, and it FAILS WIDE: whatever it cannot
 //! read counts as a doctest, because a crate it wrongly leaves out is a doctest
 //! that silently never runs, while one it wrongly keeps costs one rustdoc pass.
 //!

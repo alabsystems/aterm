@@ -489,7 +489,7 @@ mod tests {
         (text(event.text), text(text_ignoring_lock))
     }
 
-    /// A CHORD'S LETTER TAKES SHIFT'S CASE, NEVER CAPS LOCK'S, ON XKB TOO (ATERM-KI-1015-9). xkb
+    /// A CHORD'S LETTER TAKES SHIFT'S CASE, NEVER CAPS LOCK'S, ON XKB TOO. xkb
     /// cancels Shift against Lock on an alphabetic key, so Turkish Caps Lock + Shift+i types
     /// `i`, and an Alt chord built from that text named `i`'s default capital `I` where Shift
     /// alone names `İ`. The press read again without the lock is Shift's: `İ`. Without Shift

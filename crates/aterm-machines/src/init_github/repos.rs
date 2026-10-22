@@ -4,12 +4,15 @@
 //! Preserve matching local worktrees and publish only verified, full new clones.
 //! Clones are sequential: at most one clone/network transfer is active, with a
 //! thirty-minute bound per clone. No existing worktree is fetched, checked out or
-//! rewritten. GitHub pagination and every structured git read require complete EOF.
+//! rewritten. GitHub pagination and every structured git read require complete EOF. The
+//! listing reads with the token the login keychain holds (agh's read door, no gh); a clone
+//! authenticates through the osxkeychain helper git's github.com settings name.
 
-use super::{Github, auth_id, auth_ready, gh};
+use super::{Github, auth_id, auth_ready, get};
+use crate::github_pages::Page;
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, User};
-use crate::port::{Cmd, Scratch, System};
+use crate::port::{Cmd, Scratch, Secret, System};
 use aterm_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -20,7 +23,6 @@ const GIT: &str = crate::items::github::CLT_GIT;
 // Full repository objects contain many URL templates. Smaller pages leave room
 // under the strict capture bound without jq/header ordering assumptions.
 const PAGE_SIZE: usize = 30;
-const API_BUDGET: Duration = Duration::from_secs(120);
 const GIT_READ_BUDGET: Duration = Duration::from_secs(300);
 const CLONE_BUDGET: Duration = Duration::from_secs(1800);
 
@@ -60,15 +62,15 @@ impl Item for Repositories {
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
-        match auth_ready(sys, &self.user, &self.config) {
+        let token = match auth_ready(sys, &self.user, &self.config) {
             Err(why) => return Probe::Unusable { why },
-            Ok(false) => return Probe::Waits {
+            Ok(None) => return Probe::Waits {
                 on: auth_id(&self.user),
                 why: "enumerate private and public repositories after GitHub authentication is configured".into(),
             },
-            Ok(true) => {}
-        }
-        match self.scan(sys) {
+            Ok(Some(token)) => token,
+        };
+        match self.scan(sys, &token) {
             Err(why) => Probe::Unusable { why },
             Ok((all, missing)) if missing.is_empty() => Probe::Ok {
                 now: format!(
@@ -90,10 +92,10 @@ impl Item for Repositories {
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
-        if !auth_ready(sys, &self.user, &self.config)? {
+        let Some(token) = auth_ready(sys, &self.user, &self.config)? else {
             return Err("GitHub authentication changed; no repositories cloned".into());
-        }
-        let (_, missing) = self.scan(sys)?;
+        };
+        let (_, missing) = self.scan(sys, &token)?;
         for repo in missing {
             clone_one(sys, &self.user, &repo.owner, &repo)?;
         }
@@ -102,9 +104,9 @@ impl Item for Repositories {
 }
 
 impl Repositories {
-    fn scan(&self, sys: &dyn System) -> Result<(Vec<Repo>, Vec<Repo>), String> {
+    fn scan(&self, sys: &dyn System, token: &Secret) -> Result<(Vec<Repo>, Vec<Repo>), String> {
         admit_home(sys, &self.user)?;
-        let all = enumerate(sys, &self.user, &self.config)?;
+        let all = enumerate(sys, &self.user, &self.config, token)?;
         let missing = missing(sys, &self.user, &all)?;
         Ok((all, missing))
     }
@@ -180,25 +182,6 @@ fn branch(value: &str) -> bool {
             .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
 }
 
-fn gh_command(sys: &dyn System, user: &User) -> Result<Cmd, String> {
-    Ok(super::gh_cmd(&gh(sys)?, user).budget(API_BUDGET))
-}
-
-fn api(sys: &dyn System, user: &User, endpoint: &str) -> Result<String, String> {
-    let cmd = gh_command(sys, user)?.args([
-        "api",
-        "--hostname",
-        "github.com",
-        "--method",
-        "GET",
-        "--include",
-        "-H",
-        "Accept: application/vnd.github+json",
-        endpoint,
-    ]);
-    text(sys, &cmd, "GitHub repository enumeration failed")
-}
-
 fn text(sys: &dyn System, cmd: &Cmd, why: &str) -> Result<String, String> {
     let ran = sys.run_complete_stdout(cmd).map_err(|_| why.to_owned())?;
     if !ran.success() {
@@ -207,55 +190,13 @@ fn text(sys: &dyn System, cmd: &Cmd, why: &str) -> Result<String, String> {
     String::from_utf8(ran.stdout).map_err(|_| why.to_owned())
 }
 
-pub(super) type Response = (Value, BTreeMap<String, String>);
-
-pub(super) fn response(text: &str) -> Result<Response, String> {
-    let normalized = text.replace("\r\n", "\n");
-    let (headers, body) = normalized
-        .split_once("\n\n")
-        .ok_or("incomplete GitHub HTTP response")?;
-    let mut lines = headers.lines();
-    let status = lines
-        .next()
-        .ok_or("missing GitHub HTTP status")?
-        .split_whitespace()
-        .collect::<Vec<_>>();
-    if status.len() < 2 || !status[0].starts_with("HTTP/") || status[1] != "200" {
-        return Err("GitHub repository listing did not return HTTP 200".into());
-    }
-    let mut fields = Vec::new();
-    for line in lines {
-        let (name, value) = line
-            .split_once(':')
-            .ok_or("unrecognized GitHub response header")?;
-        fields.push((name.to_owned(), value.trim().to_owned()));
-    }
-    response_parts(200, fields, body.as_bytes())
-}
-
-pub(super) fn response_parts(
-    status: u16,
-    headers: impl IntoIterator<Item = (String, String)>,
-    body: &[u8],
-) -> Result<Response, String> {
-    if status != 200 {
-        return Err("GitHub repository listing did not return HTTP 200".into());
-    }
-    let mut fields = BTreeMap::new();
-    for (name, value) in headers {
-        let name = name.to_ascii_lowercase();
-        // Only pagination headers affect this reader. Repeated unrelated headers
-        // (e.g. Set-Cookie) are legal; repeated Link fields are ambiguous here.
-        if name == "link" && fields.insert(name, value.trim().into()).is_some() {
-            return Err("ambiguous GitHub pagination headers".into());
-        }
-    }
-    let value =
-        aterm_json::from_slice(body).map_err(|_| "unrecognized GitHub repository response")?;
-    Ok((value, fields))
-}
-
-fn enumerate(sys: &dyn System, user: &User, config: &Github) -> Result<Vec<Repo>, String> {
+/// Every repository `config.owner` holds, read with `token` through agh's read door.
+fn enumerate(
+    sys: &dyn System,
+    user: &User,
+    config: &Github,
+    token: &Secret,
+) -> Result<Vec<Repo>, String> {
     if !component(&config.owner, true) || !component(&config.account, true) {
         return Err("invalid configured GitHub owner or account".into());
     }
@@ -263,7 +204,7 @@ fn enumerate(sys: &dyn System, user: &User, config: &Github) -> Result<Vec<Repo>
         "/user/repos?affiliation=owner&visibility=all&per_page=30&sort=full_name&direction=asc"
             .to_owned()
     } else {
-        let (owner, _) = response(&api(sys, user, &format!("/users/{}", config.owner))?)?;
+        let (owner, _) = get(sys, user, token, &format!("/users/{}", config.owner))?;
         if owner
             .get("login")
             .and_then(Value::as_str)
@@ -278,146 +219,40 @@ fn enumerate(sys: &dyn System, user: &User, config: &Github) -> Result<Vec<Repo>
         )
     };
     enumerate_pages(&base, Some(&config.owner), |endpoint| {
-        response(&api(sys, user, endpoint)?)
+        get(sys, user, token, endpoint)
     })
 }
 
 /// Inventory must finish, including cross-owner destination admission, before
-/// callers may start credentials or filesystem mutations.
+/// callers may start credentials or filesystem mutations: every page is read
+/// ([`crate::github_pages::all`]) before any repository is admitted.
 pub(super) fn enumerate_pages(
     base: &str,
     owner: Option<&str>,
-    mut api: impl FnMut(&str) -> Result<Response, String>,
+    api: impl FnMut(&str) -> Result<Page, String>,
 ) -> Result<Vec<Repo>, String> {
+    let values = crate::github_pages::all(base, PAGE_SIZE, api)?;
     let mut repositories = Vec::new();
     let mut names = BTreeSet::new();
     let mut ids = BTreeSet::new();
-    let mut last = None;
-    for page in 1..=10_000 {
-        let endpoint = format!("{base}&page={page}");
-        let (value, headers) = api(&endpoint)?;
-        let values = value
-            .as_array()
-            .ok_or("GitHub repository page is not an array")?;
-        if values.len() > PAGE_SIZE {
-            return Err("GitHub repository page exceeds its requested bound".into());
+    for value in &values {
+        let repo = repo(value, owner)?;
+        let id = value
+            .get("id")
+            .and_then(Value::as_u64)
+            .filter(|id| *id != 0)
+            .ok_or("repository identity is missing")?;
+        if !ids.insert(id) || !names.insert(repo.name.to_ascii_lowercase()) {
+            return Err("duplicate or colliding repository destinations in GitHub inventory; no repositories changed".into());
         }
-        let (next, advertised_last) = pagination(headers.get("link"), base, page)?;
-        if let Some(advertised) = advertised_last {
-            if advertised < page || last.is_some_and(|last| last != advertised) {
-                return Err("GitHub pagination changed during enumeration; run init again".into());
-            }
-            last = Some(advertised);
-        }
-        for value in values {
-            let repo = repo(value, owner)?;
-            let id = value
-                .get("id")
-                .and_then(Value::as_u64)
-                .filter(|id| *id != 0)
-                .ok_or("repository identity is missing")?;
-            if !ids.insert(id) || !names.insert(repo.name.to_ascii_lowercase()) {
-                return Err("duplicate or colliding repository destinations in GitHub inventory; no repositories changed".into());
-            }
-            repositories.push(repo);
-        }
-        if next {
-            if values.is_empty() {
-                return Err("empty GitHub page advertises more repositories".into());
-            }
-            continue;
-        }
-        if last.is_some_and(|last| page < last) {
-            return Err("GitHub pagination ended before its advertised final page".into());
-        }
-        if values.len() == PAGE_SIZE {
-            // Exactly one full final page is valid. Confirm the next page is empty
-            // rather than treating a missing Link header as evidence of completion.
-            let (tail, tail_headers) = api(&format!("{base}&page={}", page + 1))?;
-            let (tail_next, tail_last) = pagination(tail_headers.get("link"), base, page + 1)?;
-            if tail.as_array().is_none_or(|tail| !tail.is_empty())
-                || tail_next
-                || tail_last.is_some_and(|last| last != page)
-            {
-                return Err("GitHub pagination omitted additional repositories".into());
-            }
-        }
-        repositories.sort_by(|a, b| {
-            a.name
-                .to_ascii_lowercase()
-                .cmp(&b.name.to_ascii_lowercase())
-        });
-        return Ok(repositories);
+        repositories.push(repo);
     }
-    Err("GitHub repository pagination exceeded its explicit bound".into())
-}
-
-fn pagination(
-    link: Option<&String>,
-    base: &str,
-    page: usize,
-) -> Result<(bool, Option<usize>), String> {
-    let Some(link) = link else {
-        return Ok((false, None));
-    };
-    let (expected_path, expected_query) = base
-        .split_once('?')
-        .ok_or("invalid repository listing endpoint")?;
-    let expected: BTreeMap<_, _> = expected_query
-        .split('&')
-        .map(|part| part.split_once('=').ok_or("invalid listing query"))
-        .collect::<Result<_, _>>()?;
-    let mut relations = BTreeSet::new();
-    let (mut next, mut last) = (false, None);
-    for entry in link.split(',') {
-        let (target, relation) = entry
-            .trim()
-            .split_once(';')
-            .ok_or("unrecognized GitHub pagination link")?;
-        let url = target
-            .strip_prefix('<')
-            .and_then(|url| url.strip_suffix('>'))
-            .and_then(|url| url.strip_prefix("https://api.github.com"))
-            .ok_or("GitHub pagination points outside the expected API")?;
-        let (path, query) = url
-            .split_once('?')
-            .ok_or("GitHub pagination has no query")?;
-        let mut params = BTreeMap::new();
-        for part in query.split('&') {
-            let (key, value) = part
-                .split_once('=')
-                .ok_or("unrecognized GitHub pagination query")?;
-            if params.insert(key, value).is_some() {
-                return Err("duplicate GitHub pagination query key".into());
-            }
-        }
-        let target_page = params
-            .remove("page")
-            .and_then(|page| page.parse::<usize>().ok())
-            .filter(|page| *page != 0)
-            .ok_or("invalid GitHub pagination page")?;
-        if path != expected_path || params != expected {
-            return Err("GitHub pagination changed the requested repository scope".into());
-        }
-        let relation = relation
-            .trim()
-            .strip_prefix("rel=\"")
-            .and_then(|relation| relation.strip_suffix('"'))
-            .ok_or("unrecognized GitHub pagination relation")?;
-        if !relations.insert(relation) {
-            return Err("duplicate GitHub pagination relation".into());
-        }
-        match relation {
-            "next" if target_page == page + 1 => next = true,
-            // An extra empty confirmation page can link back to its last real
-            // page. The caller validates last against actual page contents.
-            "last" => last = Some(target_page),
-            "first" if target_page == 1 => {}
-            "prev" if page > 1 && target_page == page - 1 => {}
-            _ => return Err("inconsistent GitHub repository pagination".into()),
-        }
-    }
-    Ok((next, last))
+    repositories.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    });
+    Ok(repositories)
 }
 
 fn repo(value: &Value, expected_owner: Option<&str>) -> Result<Repo, String> {
@@ -878,12 +713,13 @@ fn verify_new(
 mod tests {
     use super::*;
     use crate::engine::{self, NoJournal};
+    use crate::git_credential::{GITHUB, script};
     use crate::items::defaults::tests::{ctx, user};
     use crate::model::{Mode, Outcome};
-    use crate::port::{Fake, Live, Ran, Stat};
+    use crate::port::{Fake, GithubResponse, Live, Ran, Stat};
     use std::path::PathBuf;
 
-    const GH: &str = "/opt/homebrew/bin/gh";
+    const KEYCHAIN: &str = "fixture_keychain_token_only";
     const BASE: &str =
         "/user/repos?affiliation=owner&visibility=all&per_page=30&sort=full_name&direction=asc";
     const A: &str = "1111111111111111111111111111111111111111";
@@ -909,32 +745,21 @@ mod tests {
         }
     }
 
+    fn token() -> Secret {
+        Secret::new(KEYCHAIN.as_bytes()).unwrap()
+    }
+
+    /// A home, CLT git, and the login keychain's GitHub credential ready for alice: git's
+    /// github.com settings name the helper, and the token it holds signs in as alice.
     fn fixture() -> (Fake, User, Github) {
         let mut sys = Fake::root();
         let who = user("alice", 501);
         sys.euid = who.uid;
         sys.stat_of(&who.home, directory(who.uid));
-        sys.file(GH, b"synthetic gh");
         sys.file(GIT, b"synthetic git");
-        let helper = Cmd::new(GIT).as_user(&who).args([
-            "config",
-            "--global",
-            "--get-all",
-            "credential.https://github.com.helper",
-        ]);
-        sys.on(
-            &helper.display(),
-            Ran::ok("\n!/opt/homebrew/bin/gh auth git-credential\n"),
-        );
-        let active = super::super::gh_cmd(Path::new(GH), &who).args([
-            "api",
-            "--hostname",
-            "github.com",
-            "user",
-            "--jq",
-            ".login",
-        ]);
-        sys.on(&active.display(), Ran::ok("alice\n"));
+        script::configured(&sys, &who, "alice");
+        script::holds(&sys, Some(&who), GITHUB, "alice", KEYCHAIN);
+        sys.on_github_api(&who, "/user", json(r#"{"login":"alice"}"#));
         (sys, who, config())
     }
 
@@ -947,29 +772,20 @@ mod tests {
         })
     }
 
-    fn api_key(sys: &dyn System, who: &User, endpoint: &str) -> String {
-        gh_command(sys, who)
-            .unwrap()
-            .args([
-                "api",
-                "--hostname",
-                "github.com",
-                "--method",
-                "GET",
-                "--include",
-                "-H",
-                "Accept: application/vnd.github+json",
-                endpoint,
-            ])
-            .display()
+    fn json(body: &str) -> Result<GithubResponse, String> {
+        Ok(GithubResponse {
+            status: 200,
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            body: body.as_bytes().to_vec(),
+        })
     }
 
-    fn page(values: Vec<Value>, links: Option<String>) -> Ran {
-        Ran::ok(&format!(
-            "HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n{}\r\n{}",
-            links.map_or_else(String::new, |links| format!("Link: {links}\r\n")),
-            aterm_json::to_string(&values).unwrap()
-        ))
+    fn page(values: Vec<Value>, links: Option<String>) -> Result<GithubResponse, String> {
+        let mut answer = json(&aterm_json::to_string(&values).unwrap())?;
+        answer
+            .headers
+            .extend(links.map(|links| ("Link".to_owned(), links)));
+        Ok(answer)
     }
 
     #[test]
@@ -981,34 +797,29 @@ mod tests {
         let links = format!(
             "<https://api.github.com{BASE}&page=2>; rel=\"next\", <https://api.github.com{BASE}&page=2>; rel=\"last\""
         );
-        sys.on(
-            &api_key(&sys, &who, &format!("{BASE}&page=1")),
-            page(first, Some(links)),
-        );
+        sys.on_github_api(&who, &format!("{BASE}&page=1"), page(first, Some(links)));
         let mut empty = value("zz-empty-private", 101, true);
         empty
             .as_object_mut()
             .unwrap()
             .insert("default_branch".into(), Value::Null);
-        sys.on(
-            &api_key(&sys, &who, &format!("{BASE}&page=2")),
-            page(vec![empty], None),
-        );
-        let repos = enumerate(&sys, &who, &config).unwrap();
+        sys.on_github_api(&who, &format!("{BASE}&page=2"), page(vec![empty], None));
+        let repos = enumerate(&sys, &who, &config, &token()).unwrap();
         assert_eq!(repos.len(), 31);
         assert_eq!(repos.last().unwrap().default_branch, None);
         assert_eq!(sys.calls().len(), 2);
         assert!(
             sys.calls()
                 .iter()
-                .all(|call| call.contains(" api ") && !call.contains("clone"))
+                .all(|call| call.contains(" agh GET ") && !call.contains("clone"))
         );
 
         // A full terminal page needs an empty-page confirmation. GitHub may
         // attach backward last/prev links to that out-of-range empty page.
         let (sys, who, config) = fixture();
-        sys.on(
-            &api_key(&sys, &who, &format!("{BASE}&page=1")),
+        sys.on_github_api(
+            &who,
+            &format!("{BASE}&page=1"),
             page(
                 (0..30)
                     .map(|i| value(&format!("repo{i:03}"), i + 1, false))
@@ -1016,8 +827,9 @@ mod tests {
                 None,
             ),
         );
-        sys.on(
-            &api_key(&sys, &who, &format!("{BASE}&page=2")),
+        sys.on_github_api(
+            &who,
+            &format!("{BASE}&page=2"),
             page(
                 vec![],
                 Some(format!(
@@ -1025,7 +837,7 @@ mod tests {
                 )),
             ),
         );
-        assert_eq!(enumerate(&sys, &who, &config).unwrap().len(), 30);
+        assert_eq!(enumerate(&sys, &who, &config, &token()).unwrap().len(), 30);
     }
 
     #[test]
@@ -1054,18 +866,16 @@ mod tests {
                     values = (0..30)
                         .map(|i| value(&format!("repo{i:03}"), i + 1, false))
                         .collect();
-                    sys.on(
-                        &api_key(&sys, &who, &format!("{BASE}&page=2")),
+                    sys.on_github_api(
+                        &who,
+                        &format!("{BASE}&page=2"),
                         page(vec![value("omitted", 101, true)], None),
                     );
                 }
                 _ => unreachable!(),
             }
-            sys.on(
-                &api_key(&sys, &who, &format!("{BASE}&page=1")),
-                page(values, links),
-            );
-            assert!(enumerate(&sys, &who, &config).is_err());
+            sys.on_github_api(&who, &format!("{BASE}&page=1"), page(values, links));
+            assert!(enumerate(&sys, &who, &config, &token()).is_err());
             assert!(
                 sys.calls()
                     .iter()
@@ -1073,41 +883,43 @@ mod tests {
             );
         }
         let (sys, who, config) = fixture();
-        let key = api_key(&sys, &who, &format!("{BASE}&page=1"));
-        sys.on(&key, page(vec![value("one", 1, true)], None));
-        sys.refuse_complete_stdout(&key, "incomplete stdout");
-        assert!(enumerate(&sys, &who, &config).is_err());
+        // A page agh could not read whole (a body cut short, a refused redirect) ends the
+        // listing; port::github_api's own tests hold agh's door to refusing them.
+        sys.on_github_api(
+            &who,
+            &format!("{BASE}&page=1"),
+            Err("GitHub's answer was cut short".into()),
+        );
+        assert!(enumerate(&sys, &who, &config, &token()).is_err());
     }
 
     #[test]
     fn differing_personal_owner_is_refused_and_organization_scope_is_explicit() {
         let (sys, who, mut config) = fixture();
         config.owner = "other".into();
-        let owner = api_key(&sys, &who, "/users/other");
-        sys.on(
-            &owner,
-            Ran::ok("HTTP/2.0 200 OK\n\n{\"login\":\"other\",\"type\":\"User\"}"),
+        sys.on_github_api(
+            &who,
+            "/users/other",
+            json(r#"{"login":"other","type":"User"}"#),
         );
         assert!(
-            enumerate(&sys, &who, &config)
+            enumerate(&sys, &who, &config, &token())
                 .unwrap_err()
                 .contains("organization")
         );
         let (sys, who, mut config) = fixture();
         config.owner = "team".into();
-        sys.on(
-            &api_key(&sys, &who, "/users/team"),
-            Ran::ok("HTTP/2.0 200 OK\n\n{\"login\":\"team\",\"type\":\"Organization\"}"),
+        sys.on_github_api(
+            &who,
+            "/users/team",
+            json(r#"{"login":"team","type":"Organization"}"#),
         );
-        sys.on(
-            &api_key(
-                &sys,
-                &who,
-                "/orgs/team/repos?type=all&per_page=30&sort=full_name&direction=asc&page=1",
-            ),
+        sys.on_github_api(
+            &who,
+            "/orgs/team/repos?type=all&per_page=30&sort=full_name&direction=asc&page=1",
             page(vec![], None),
         );
-        assert!(enumerate(&sys, &who, &config).unwrap().is_empty());
+        assert!(enumerate(&sys, &who, &config, &token()).unwrap().is_empty());
     }
 
     fn script_existing(sys: &Fake, who: &User, path: &Path, name: &str) {
@@ -1159,8 +971,9 @@ mod tests {
             b"owner changes",
         );
         script_existing(&sys, &who, &existing, "existing");
-        sys.on(
-            &api_key(&sys, &who, &format!("{BASE}&page=1")),
+        sys.on_github_api(
+            &who,
+            &format!("{BASE}&page=1"),
             page(
                 vec![value("existing", 1, true), value("missing", 2, true)],
                 None,
@@ -1211,8 +1024,9 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            sys.on(
-                &api_key(&sys, &who, &format!("{BASE}&page=1")),
+            sys.on_github_api(
+                &who,
+                &format!("{BASE}&page=1"),
                 page(vec![value("one", 1, true)], None),
             );
             let row = engine::run(

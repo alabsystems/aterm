@@ -2410,7 +2410,7 @@ impl UiContent {
         }
     }
 
-    /// The control's description, where it authored one (ruling 267).
+    /// The control's description, where it authored one.
     fn description(&self) -> Option<String> {
         match self {
             Self::Button(control) => control.spec.description.clone(),
@@ -3783,16 +3783,12 @@ impl CompiledUi {
         lines
     }
 
-    /// Every fit failure [`Self::paint_audit_lines`] reports, WITHOUT formatting
-    /// the whole audit: a text node whose fit audit overflows (clip truncation
-    /// included — [`finish_text_fit`] folds it into `overflow`), a node an
-    /// ancestor clip materially cuts (the summary's `clipped=`), and a text
-    /// viewport whose `paint-editor` record says `clip-truncated=true`. Each
-    /// failure is the audit's own record for that node, so a caller that finds
-    /// this non-empty can print it as-is. It is the cheap form of "zero
-    /// overflow, zero clipped" for sweeps that compile thousands of pages: the
-    /// full audit renders a `paint-node` record per node, each with a linear
-    /// semantic and focus-order lookup, and only a failure needs to read it.
+    /// Every fit failure [`Self::paint_audit_lines`] reports, without formatting the whole
+    /// audit: a text node whose fit audit overflows (clip truncation included, see
+    /// [`finish_text_fit`]), a node an ancestor clip materially cuts (`clipped=`), and a text
+    /// viewport whose `paint-editor` record says `clip-truncated=true`. Each failure is the
+    /// audit's own record for that node: the cheap "zero overflow, zero clipped" verdict for
+    /// sweeps that compile thousands of pages.
     /// Two painted marks over each other (a `paint-overlap` record,
     /// [`Self::ink_overlaps`]) are a failure too.
     #[cfg(test)]
@@ -4188,8 +4184,7 @@ impl CompiledUi {
         for semantic in self.semantics.iter().filter(|node| {
             !node.offscreen && node.action.is_some() && node.state.is_none_or(|state| state.enabled)
         }) {
-            // A key absent from the index tallies 0/0 and therefore fails the
-            // same way the scans did.
+            // A key absent from the index tallies 0/0 and fails.
             let (painted, hit, hit_action) = index.get(&semantic.key).copied().unwrap_or_default();
             if painted != 1 || hit != 1 {
                 return Err(CompileError::ObserverMismatch(semantic.key.clone()));
@@ -5410,9 +5405,8 @@ fn text_typography_for(role: SemanticRole, style: StyleRef) -> (TypeStep, crate:
         SemanticRole::Heading if matches!(style, StyleRef::Quiet | StyleRef::Accent) => {
             (TypeStep::Caption, TextFace::UiBold)
         }
-        // Compact native pages use Plain for a large-type heading: Body-bold
-        // remains visibly hierarchical at the platform maximum without
-        // forcing route names to ellipsize in a 320-point host.
+        // Plain is a compact page's large-type heading: Body-bold stays hierarchical at the
+        // platform maximum without eliding route names in a 320-point host.
         SemanticRole::Heading if matches!(style, StyleRef::Plain | StyleRef::DangerCompact) => {
             (TypeStep::Body, TextFace::UiBold)
         }
@@ -5537,10 +5531,8 @@ fn paint_compiled_node(
                     prims.push(DrawPrim::ClipPop);
                 }
             } else if spec.style == StyleRef::Code {
-                // A terminal/editor canvas should read as a working surface
-                // inside the surrounding card, not as another generic card.
-                // Keep it theme-derived and deliberately a step quieter than
-                // `surface`; the sample text supplies the visual hierarchy.
+                // A terminal/editor canvas reads as a working surface inside its card: a
+                // theme-derived step quieter than `surface`; the sample text carries hierarchy.
                 let (rect, joined) = open_box(prims, rect, node.joins, 10.0);
                 prims.push(DrawPrim::Panel {
                     x: rect.x,
@@ -5632,48 +5624,11 @@ fn paint_compiled_node(
                 && !control.state.enabled
                 && !control.state.busy
                 && !control.state.focus_visible;
-            // HOW THE SELECTED RAIL ROW SPELLS "SELECTED".
-            //
-            // Its ink IS the accent, and the accent is floored at
-            // [`crate::native_appearance::ACCENT_INK_FLOOR`] (3.0) against the
-            // wash it is inked on. That floor is a LEGIBILITY guarantee, not a
-            // selection signal: on the shipping forced palettes it settles the
-            // selected row at 3.03:1 (forced-light) / 3.12:1 (forced-dark) while
-            // its unselected siblings sit near 10:1 on the same rail — so the
-            // selected row measured as the QUIETEST row in the column and read
-            // as "disabled", the exact inversion of what it means.
-            //
-            // Raising that floor to 4.5 is the repair a previous pass already
-            // rejected, and rightly: the accent is one global identity colour
-            // and pushing it there pastels it everywhere it lands on dark
-            // chrome. So the answer is local and structural — selection is
-            // spelled by things that carry at ANY contrast ratio: SEMIBOLD ink,
-            // which thickens every stem the way a native sidebar's selected row
-            // does, and a real rail indicator seated against the rail edge
-            // instead of a 3pt stub floating inside it. The accent identity, the
-            // wash, and the floor are all untouched.
-            //
-            // SCOPE, and it is not one scope but three, because the marks do not
-            // all cost the same thing.
-            //
-            // The WASH, the accent INK and the RIM cost nothing but colour, so
-            // every selected `Navigation` control wears them; on a toolbar chip
-            // the three of them together are exactly a segmented control's
-            // selected cell.
-            //
-            // The BAR costs no width either, but it asserts a rail edge to dock
-            // to, so it goes to every row that is stacked in a column of its own
-            // and to no chip ([`navigation_is_chip`]) — a 4pt full-bleed stripe
-            // shoved against a word in a toolbar reads as damage.
-            //
-            // SEMIBOLD costs WIDTH, in a slot that was measured in the regular
-            // face, so it goes only where an author left slack to spend: a rail
-            // DESTINATION, whose label and whose column were sized against each
-            // other out of one closed vocabulary ([`navigation_label_type`] names
-            // the whole set). A row carrying a document heading is stacked in the
-            // same shape and has no such slack — it arrives at the brim of its
-            // slot at rest — so growing its ink would spell "selected" by
-            // deleting a word, which is not a selection mark but a loss.
+            // Selected accent ink is floored only at 3:1 against its wash (`ACCENT_INK_FLOOR`; a
+            // higher floor would pastel the accent on dark chrome), so selection is also spelled
+            // by marks that carry at any contrast, each scoped by cost: the rim costs colour
+            // (every selected `Navigation` control), the bar a rail edge (rows, not chips),
+            // semibold width (destinations only, `navigation_label_type`).
             let nav_selected = navigation && selected;
             let nav_selected_row = nav_selected && !navigation_is_chip(control);
             // A row stacked in a column ([`FLUENT_RAIL_SELECTION`]): its states
@@ -5697,9 +5652,9 @@ fn paint_compiled_node(
             } else {
                 roles.accent
             };
-            // The two accent-tinted states a SELECTED navigation row can be in
-            // paint the accent as their own ink, so their mix amounts are the
-            // ones `native_appearance` floors that accent against.
+            // The two accent-tinted states a selected navigation row can be in paint the accent
+            // as their own ink, so their mix amounts are the ones `native_appearance` floors the
+            // accent against.
             let fill = if chip_selected {
                 // A luminance step from a resting chip, not only a hue: the
                 // accent itself, a little deeper under the pointer or a press.
@@ -5853,10 +5808,7 @@ fn paint_compiled_node(
                     fill: rgba(mark, 255),
                 });
             } else if nav_selected_row {
-                // The rail indicator. 4pt and nearly full-bleed: a bar this
-                // shape is read as structure (the row is docked to the rail's
-                // edge) rather than as decoration, and structure survives the
-                // accent's floor being only 3:1 against its own wash.
+                // The rail indicator: a 4pt, nearly full-bleed bar docking the row to the rail.
                 prims.push(DrawPrim::Panel {
                     x: rect.x,
                     y: rect.y + 4.0,
@@ -5892,10 +5844,7 @@ fn paint_compiled_node(
                         .unwrap_or(&control.spec.label);
                     // A row that goes somewhere ends in its arrow.
                     let trailing_reserve = navigation_trailing_reserve(&control.spec);
-                    // Measured on the face it is PAINTED in: the semibold a
-                    // selected row wears is a different font with different
-                    // advances, so eliding against the regular metrics would
-                    // let the one row that grew ink overflow its own slot.
+                    // Elide on the painted face: a selected row's semibold has wider advances.
                     let label = elide_text_label(
                         visual_label,
                         (rect.width
@@ -6043,9 +5992,8 @@ fn paint_compiled_node(
             }
         }
         UiContent::Switch(control) => {
-            // A PLAIN switch (`StyleRef::Quiet`, design ruling 262): the track and
-            // the thumb alone, flush right in its slot — no boxed surface and no
-            // `On` word beside it, a focus ring only when the keyboard is on it.
+            // A plain switch (`StyleRef::Quiet`): track and thumb alone, flush right, no boxed
+            // surface and no `On` word; a focus ring only when the keyboard is on it.
             // On Windows no switch is boxed ([`FLUENT_SWITCH`]).
             let plain = control.style == StyleRef::Quiet;
             if plain || FLUENT_SWITCH {
@@ -6613,10 +6561,9 @@ fn elide_ui_label(value: &str, max_width: f32, px: f32) -> String {
 
 /// Project a complete semantic button label into a bounded renderer label.
 ///
-/// Callers keep the original text in [`ButtonSpec::label`] and put this value
-/// in `visual_label`. This is intentionally the same typography and UTF-8-safe
-/// elision path used by the painter, which lets responsive authoring avoid a
-/// knowingly overflowing intermediate label while preserving full semantics.
+/// Callers keep the original text in [`ButtonSpec::label`] and put this in `visual_label`. It
+/// is the painter's own typography and elision path, so responsive authoring never hands paint
+/// a label that knowingly overflows.
 ///
 /// A cut label ends after a whole word, as a cut status does
 /// ([`fit_native_status_label`]): a word cut mid-way reads as another word or
@@ -8909,8 +8856,8 @@ fn paint_control_surface(
 
 fn control_text_color(state: ControlState, roles: &crate::settings::Roles) -> [u8; 3] {
     if !state.enabled {
-        // Disabled remains visibly subordinate, but never disappears into the
-        // surface—especially for icon-only document actions.
+        // Disabled stays visibly subordinate but never vanishes into the surface, which
+        // matters most for icon-only document actions.
         mix_rgb(roles.text_tertiary, roles.text_secondary, 0.35)
     } else if state.muted {
         // Idle ([`ControlState::muted`]): the value is said in quiet ink, a
@@ -9025,9 +8972,7 @@ fn rainbow_banner_sky(roles: &crate::settings::Roles) -> ([u8; 3], [u8; 3]) {
 }
 
 pub(crate) fn readable_secondary(roles: &crate::settings::Roles) -> [u8; 3] {
-    // Native apps carry more low-density prose than terminal chrome. Lift the
-    // conditioned secondary role enough to stay effortless at 1× while keeping
-    // a visible step below primary text.
+    // Lifted for native apps' low-density prose, still a visible step below primary text.
     mix_rgb(roles.text_secondary, roles.text_primary, 0.55)
 }
 

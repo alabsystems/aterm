@@ -221,14 +221,12 @@ fn block_with(addendum: Option<&str>) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Managed skill files
 //
 // A primer is a marked block inside a file the user also owns; a skill is a whole file
 // that is entirely aterm's. So a skill has its own state model with one extra state,
 // `Foreign`: a file at our path with no marker, which is the user's and never touched.
 // Skill bodies are compiled in, never artifact-supplied.
-// ---------------------------------------------------------------------------
 
 /// The prefix of every managed skill's marker line, any version: what identifies a file
 /// as ours.
@@ -1435,9 +1433,7 @@ fn skill_status(home: &Path, xdg: Option<&Path>, s: &SkillFile) -> Result<SkillS
     }
 }
 
-// ---------------------------------------------------------------------------
 // auto-prime: the GUI's entry point
-// ---------------------------------------------------------------------------
 
 /// What [`auto_prime`] did for one detected agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1509,9 +1505,7 @@ impl AutoPrime {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Claude settings: removing the hook entries an earlier aterm wrote, and the defaults
-// ---------------------------------------------------------------------------
 
 /// Where Claude Code keeps its settings (relative to the home).
 const CLAUDE_SETTINGS_FILE: &str = ".claude/settings.json";
@@ -1752,11 +1746,8 @@ pub const CLAUDE_TOP_EFFORT_KEY: &str = concat!("ultra", "code");
 /// * `feedbackSurveyRate` is the session-quality survey's probability: `0` keeps its rating
 ///   prompt from drawing under a supervised session's input.
 ///
-/// Settings, not launch flags: the live upgrade relaunches a session WITHOUT its
-/// launch `--effort`, so a default that lives only in a session is lost at the
-/// next relaunch. Measured on a headless aterm: with the top-effort key `true`,
-/// a fresh launch, a harness-shaped `--resume` and a `/model` pick all came up
-/// `xhigh` in the top-effort mode.
+/// Settings, not launch flags: the live upgrade relaunches a session without its launch
+/// `--effort`, so a default that lives only in a session is lost at the next relaunch.
 pub const CLAUDE_DEFAULTS: [(&str, ClaudeDefault); 6] = [
     (CLAUDE_TOP_EFFORT_KEY, ClaudeDefault::Bool(true)),
     ("effortLevel", ClaudeDefault::Str(DEFAULT_EFFORT)),
@@ -2027,12 +2018,10 @@ pub enum DefaultsWrite {
 ///
 /// # Errors
 ///
-/// An unreadable or unparseable file, one whose top level is not an object, or
-/// a symlink whose target does not exist (a dotfiles link to a file not there
-/// yet — created over, the link itself would be replaced by a plain file): it
-/// is left exactly as it is. A failed write, which leaves the file as it was and
-/// no backup of it, and a file saved over at every try of the write
-/// ([`rewrite`]), left as that save made it.
+/// An unreadable or unparseable file, one whose top level (or a nested default's parent)
+/// is not an object, or a dangling symlink (created over, the link would become a plain
+/// file): it is left as it is. A failed write, which leaves the file and no backup, and a
+/// file saved over at every try ([`rewrite`]).
 pub fn add_claude_defaults(path: &Path, hold_window: bool) -> Result<DefaultsWrite, String> {
     Ok(
         match edit_settings(path, |text| claude_defaults_edit(path, text, hold_window))? {
@@ -2528,9 +2517,7 @@ fn status_line_with_xdg(home: &Path, xdg: Option<&Path>) -> String {
     rows.join(", ")
 }
 
-// ---------------------------------------------------------------------------
 // `aterm agents`: the CLI's entry point
-// ---------------------------------------------------------------------------
 
 /// The usage text for `aterm agents` (printed for `-h`/`--help`/`help`, and on an
 /// unknown subcommand/agent).
@@ -3498,7 +3485,9 @@ A worker's report ends with `ATERM-TASK-DONE` on a line by itself.
     }
 
     /// One [`auto_prime`] pass, with how many context-file reads its rewrites
-    /// started from ([`rewrite`]): one per file it upserted.
+    /// started from ([`rewrite`]): one per file it upserted. Its tests make
+    /// links, so it is unix's only.
+    #[cfg(unix)]
     fn counted_pass(home: &Path) -> (AutoPrime, usize) {
         let reads = std::rc::Rc::new(std::cell::Cell::new(0));
         let count = std::rc::Rc::clone(&reads);
@@ -4040,7 +4029,7 @@ A worker's report ends with `ATERM-TASK-DONE` on a line by itself.
         // Our marker, different content -> ours, outdated -> safe to overwrite.
         let older = "---\nname: x\n---\n<!-- aterm skill v0 -->\nold body\n";
         assert_eq!(skill_state(older, body), SkillState::Stale);
-        // No marker at all -> the user's file. NEVER overwritten.
+        // No marker at all -> the user's file, never overwritten.
         let theirs = "---\nname: x\n---\nmy own notes\n";
         assert_eq!(skill_state(theirs, body), SkillState::Foreign);
     }

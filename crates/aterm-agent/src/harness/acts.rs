@@ -23,8 +23,8 @@
 //!   nudges. Kept by the loop's policy
 //!   (`supervise::policy::turn_end::TurnEndState::land_held`).
 //! * [`self_claim_act`] — the session log's act word for an act a
-//!   self-supervising agent (codex-alab) tells, its own FOREVER CRUISE /
-//!   FOREVER LAND acts and its landing ([`RULE_LANDED`]) among them.
+//!   self-supervising agent (codex-alab) tells, its own Autopilot Cruise /
+//!   Autopilot Land acts and its landing ([`RULE_LANDED`]) among them.
 //!
 //! * [`sort`] — THE ONE SORT of a ledger row (its rule, its outcome and the
 //!   command it typed) into the act it lights and the counter it adds to
@@ -37,7 +37,7 @@
 
 use crate::supervise::approvals::Outcome;
 use crate::supervise::policy::approval::{
-    QuestionPriority, RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM,
+    QuestionPriority, RULE_PLAN, RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM,
 };
 use crate::supervise::policy::question::{RULE_ANSWER_RECOMMENDED, is_question_rule};
 // A rule id is never reworded (a ledger an earlier build wrote reads the
@@ -172,7 +172,7 @@ pub struct Sorted {
 /// | `approved` under a box's rule | [`Act::Approved`] | [`Counter::Approved`] |
 /// | `approved` under a question dialog's rule (`answer-*@v1`, `land-answer@v1`): one key of the dialog | [`Act::Answered`] | none: the journal's `chose` counts the dialog, once |
 /// | `declined` | [`Act::Declined`] | [`Counter::Declined`] |
-/// | `typed` `continue@v1`, `continue-suggestion@v1`, `continue-done-check@v1`, `continue-open-items@v1`, `continue-uncommitted@v1` | [`Act::Continued`] | [`Counter::Continued`] |
+/// | `typed` `continue@v1`, `policy-continue@v1`, `continue-suggestion@v1`, `continue-done-check@v1`, `continue-open-items@v1`, `continue-uncommitted@v1` | [`Act::Continued`] | [`Counter::Continued`] |
 /// | `typed` `answer@v1`, `prose-*@v1`, `land-answer@v1` | [`Act::Answered`] | [`Counter::Answered`] |
 /// | `typed` `land@v1` | [`Act::Landing`] | [`Counter::LandPrompts`] |
 /// | `typed` `land-nudge@v1` | [`Act::Nudged`] | [`Counter::LandPrompts`] |
@@ -303,7 +303,7 @@ fn log_rule(rule_id: &str) -> String {
 /// under (`docs/measured/codex-alab-proof-2026-10-16.md`'s legs), and aterm
 /// writes it as the log's `act word=<w> rule=<act, @ written .>` beside the
 /// `harness-act` row — the word this table gives, as [`log_mark`] gives the
-/// loop's. codex-alab runs FOREVER CRUISE / FOREVER LAND itself (the
+/// loop's. codex-alab runs Autopilot Cruise / Land itself (the
 /// contract's §5 Cruise and Land rows, owner 2026-10-19), under the rule ids
 /// aterm's own loop types them by, so its acts get the words the loop's get
 /// ([`log_mark`]: Cruise's defend prompt is a `continue`, Land's instruction
@@ -350,6 +350,27 @@ pub fn self_claim_act(act: &str) -> Option<(&'static str, String)> {
         _ => return None,
     };
     Some((word, log_rule(act)))
+}
+
+/// WHETHER A SELF-CLAIM'S ACT TYPES A TURN (Autopilot Land): the acts a
+/// proven self-claim's holder (codex-alab) records as it starts a turn of its
+/// own. Those are the act table's typed rows ([`typed_act`]: a continuation, a
+/// land act or nudge, a prose answer, a resume past a wall, the compaction
+/// and the continuation after it, all recorded with no command), a turn the
+/// session's host typed (`harness-turn@v1`), and the plan box's yes
+/// (`plan-approve@v2`), which submits `Implement the plan.` as a new turn.
+///
+/// Every other act begins no turn: an approval or a question box's answer
+/// inside a running turn (`approve-all@v1`, `answer-*@v1`), a report mailed
+/// (`mail-report@v1`), a lost login escalated (`auth-login@v1`), the landing,
+/// the point left to a person, the re-exec, and an act this table does not
+/// know. The window marks a landing by the turn its holder's last
+/// turn-typing act typed (`aterm-gui`'s `SessionTimeline::typed_turn`), so an
+/// act that begins none leaves that turn as it was: a report mailed at rest
+/// after the land turn ended is no turn still to come.
+#[must_use]
+pub fn self_claim_types_turn(act: &str) -> bool {
+    act == RULE_HOST_TURN || act == RULE_PLAN || typed_act(act, "").is_some()
 }
 
 /// The session log's act word for a self-claim's landing ([`RULE_LANDED`],
@@ -401,8 +422,8 @@ pub const RULE_LANDED: &str = "landed@v1";
 /// The longest `rule=` a session log id holds (`aterm_slog::ShortId::MAX`).
 const LOG_RULE_MAX: usize = 40;
 
-/// The task's face (§9.4.2), told by the loop as it moves. FOREVER CRUISE /
-/// FOREVER LAND: Cruise never rests, so its face is open; Land's is open
+/// The task's face (§9.4.2), told by the loop as it moves. Autopilot Cruise /
+/// Autopilot Land: Cruise never rests, so its face is open; Land's is open
 /// until a clean defense lands the work.
 ///
 /// | Face | Means | `task=` |
@@ -894,7 +915,7 @@ mod tests {
     /// A SELF-SUPERVISED AGENT'S ACTS ARE THE LOG'S ACT WORDS (plan 5C-2):
     /// every act codex-alab's proof shows (`docs/measured/
     /// codex-alab-proof-2026-10-16.md`), and every act of its own FOREVER
-    /// CRUISE / FOREVER LAND (the contract's §5 Cruise and Land rows), maps
+    /// CRUISE / Autopilot Land (the contract's §5 Cruise and Land rows), maps
     /// to one word, `rule=` the act with `@` written `.`; the acts that are
     /// no act of the log's (`finished@v1`, the retired token's end; a word
     /// nobody measured; a near miss) map to none, and the table counts them.
@@ -980,6 +1001,55 @@ mod tests {
                 "{rule}: {loops}"
             );
         }
+    }
+
+    /// A SELF-CLAIM'S ACT TYPES A TURN ONLY WHERE IT STARTS ONE (review of
+    /// codex-alab parity-4, R1): every act codex-alab records that begins a
+    /// turn of its own types one, and the acts that begin none (an approval
+    /// or a box's answer inside a turn, a report mailed, a login escalated,
+    /// the landing, the point left to a person, the re-exec, the retired
+    /// token, a near miss) type none. NEGATIVE CONTROL: the log's act words
+    /// cannot tell them apart — `approve-all@v1` and `harness-turn@v1` both
+    /// have a word, `plan-approve@v2` and `mail-report@v1` neither.
+    #[test]
+    fn a_self_claims_act_types_a_turn_only_where_it_starts_one() {
+        let cases = [
+            ("continue@v1", true),
+            ("continue-done-check@v1", true),
+            ("land@v1", true),
+            ("land-nudge@v1", true),
+            ("land-answer@v1", true),
+            ("answer@v1", true),
+            ("prose-long-term@v1", true),
+            ("prose-short-term@v1", true),
+            ("api-retry@v1", true),
+            ("api-back@v1", true),
+            ("api-cutoff@v1", true),
+            ("usage-resume@v1", true),
+            ("context-compact@v1", true),
+            ("harness-turn@v1", true),
+            ("plan-approve@v2", true),
+            ("approve-all@v1", false),
+            ("answer-recommended@v1", false),
+            ("answer-long-term@v1", false),
+            ("answer-short-term@v1", false),
+            ("mail-report@v1", false),
+            ("auth-login@v1", false),
+            ("landed@v1", false),
+            ("left-to-person@v1", false),
+            ("upgrade@v1", false),
+            ("finished@v1", false),
+            ("continue", false),
+            ("land@v2", false),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter(|(act, want)| self_claim_types_turn(act) != *want)
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+        let worded = |act| self_claim_act(act).is_some();
+        assert!(worded("approve-all@v1") && worded("harness-turn@v1"));
+        assert!(!worded("plan-approve@v2") && !worded("mail-report@v1"));
     }
 
     /// THE HOSTED LANES' ACT MARK (plan 5F-2, T25): a relaunch or upgrade

@@ -18,10 +18,9 @@ use super::count_parser_loop_iteration;
 
 use super::MAX_INTERMEDIATES;
 
-/// Whether the per-byte `OscPut` pushes a data byte onto an `osc_data` of
-/// `len` bytes: the guard itself, which the `OscPut` arm calls and
+/// Whether the per-byte `OscPut` keeps a byte when `osc_data` holds `len`.
 /// `tests::string_bulk::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`
-/// holds the bulk path's [`osc_bulk_copy_len`] to.
+/// holds [`osc_bulk_copy_len`] to it.
 #[inline]
 pub(crate) const fn osc_put_keeps(len: usize) -> bool {
     len < MAX_OSC_DATA
@@ -402,10 +401,8 @@ impl Parser {
     /// one opens no other), so [`Self::advance_fast`] reads it through the
     /// wrapper; otherwise nothing.
     fn advance_plain<'a, S: ActionSink>(&mut self, input: &'a [u8], sink: &mut S) -> &'a [u8] {
-        // Every byte/slice access below uses the total `split_first`/`get`
-        // spellings (the loop condition and the fast-path scanners guarantee
-        // the fallbacks are unreachable at runtime), so this driver carries no
-        // panic obligations of its own.
+        // Every access uses total `split_first`/`get` (the fallbacks are
+        // unreachable), so this driver carries no panic obligations.
         let mut remaining = input;
         let wrapped = self.tmux.is_open();
 

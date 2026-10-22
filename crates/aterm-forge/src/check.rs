@@ -24,7 +24,7 @@
 //! | `[OB-12]` | every fork is LIVE in the resolved graph, with no unpatched sibling | [`crate::resolve`] |
 //! | `[OB-13]` | every CARVED path is still absent | `vendor/forge.toml` `[[carved]]` |
 //! | `[OB-14]` | the measured surface conforms to its ratchet | `tools/forge-budget.tsv` |
-//! | `[OB-15]` | no `[patch]` CAPTURES a differential oracle | `[dev-dependencies]` + `Cargo.lock` |
+//! | `[OB-15]` | no `[patch]` captures a differential oracle | `[dev-dependencies]` + `Cargo.lock` |
 //! | `[OB-17]` | every shipped browser root has its own wasm cell; the fork ledger parses and records exactly the vendored forks — path, version, license and §4(b) flag | `aterm_census::WASM_ROOT_CRATES`, `vendor/forge.toml` `[forge]` + `[[fork]]` via [`crate::policy`] |
 //! | `[OB-18]` | no resolved package is banned or from a source `deny.toml` does not allow | `deny.toml` `[bans] deny` + `[sources]` via [`crate::deny`] |
 //!

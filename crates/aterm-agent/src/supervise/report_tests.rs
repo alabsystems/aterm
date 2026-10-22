@@ -117,6 +117,8 @@ struct Read {
     origin: u64,
     alt: bool,
     more: bool,
+    /// The screen half caught the program's DEC 2026 frame unfinished (`frame=open`).
+    open: bool,
 }
 
 impl Read {
@@ -136,6 +138,7 @@ impl Read {
             origin: 7730,
             alt: true,
             more: false,
+            open: false,
         }
     }
 
@@ -160,6 +163,9 @@ impl Read {
         ));
         if self.more {
             h.push_str(" more=1");
+        }
+        if self.open {
+            h.push_str(" frame=open");
         }
         h.push_str(&format!(" screen_rows={}", self.screen.len()));
         h
@@ -419,6 +425,60 @@ fn a_report_reads_past_the_harness_turns_to_the_managers() {
         "{}",
         report.header()
     );
+}
+
+/// THE REPORT'S SCREEN IS A WHOLE FRAME (F4 of the half-drawn frame review, 2026-10-22): an
+/// `offscreen … screen=1` read whose screen half caught the program's DEC 2026 frame unfinished
+/// (`frame=open`, the server's word under the rows' lock) is read again after `await frame`, as
+/// every supervisor read of the screen is ([`Session::whole_frame`]); the report is the whole
+/// frame's. NEGATIVE CONTROL: a read with no `frame=open` (closed, or a host before the field) is
+/// read once. MUTANT: the open read taken as it stands reports the half-drawn screen.
+#[test]
+fn an_offscreen_read_of_an_open_frame_is_read_again_whole() {
+    let whole = claude(
+        &[
+            "❯ first message",
+            "⏺ answer one",
+            "❯ second message",
+            "⏺ working on it",
+            "",
+        ],
+        &["✶ Deliberating… (4s)"],
+    );
+    // The redraw caught after its first rows: the transcript's top, no live zone, no composer.
+    let half: Vec<String> = whole[..3].to_vec();
+    let mut open = Read::new(1, &[], half);
+    open.open = true;
+    let mut host = Host::default()
+        .on("history", no_history())
+        .on("offscreen", open.ctl())
+        .on("await", ok("OK frame 901\n"))
+        .on("offscreen", Read::new(1, &[], whole.clone()).ctl());
+    let report = run(&mut host, ReportOpts::default());
+    assert_eq!(
+        host.requests,
+        [
+            "@s-1 history 8",
+            "@s-1 offscreen tail=8000 max=8000 screen=1",
+            "@s-1 await frame timeout 61000",
+            "@s-1 offscreen tail=8000 max=8000 screen=1"
+        ]
+    );
+    assert_eq!(report.rows, rows(&["❯ second message", "⏺ working on it"]));
+
+    // NEGATIVE CONTROL: the whole read is read once.
+    let mut host = Host::default()
+        .on("history", no_history())
+        .on("offscreen", Read::new(1, &[], whole).ctl());
+    let report = run(&mut host, ReportOpts::default());
+    assert_eq!(
+        host.requests,
+        [
+            "@s-1 history 8",
+            "@s-1 offscreen tail=8000 max=8000 screen=1"
+        ]
+    );
+    assert_eq!(report.rows, rows(&["❯ second message", "⏺ working on it"]));
 }
 
 /// Without a ledger turn the report opens at the last transcript `❯` row, never a message

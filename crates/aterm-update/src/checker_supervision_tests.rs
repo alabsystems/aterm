@@ -44,7 +44,7 @@ fn args(provider: crate::SourceProvider) -> CheckerArgs {
         checker_ungated_after: crate::checker_watch::CHECKER_UNGATED_AFTER,
         lane: Box::leak(Box::new(crate::check_lane::Lane::new())),
         gate: the_gate_asked_once(),
-        // Never the network: a check that finds nothing to do.
+        // Never the network.
         check: Arc::new(|_, _| Ok(None)),
         pause: Some(Duration::ZERO),
         // Nothing here posts to it; the wake test brings its own.

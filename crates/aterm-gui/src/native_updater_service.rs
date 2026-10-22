@@ -138,11 +138,9 @@ pub(crate) struct DurableUpdateStatus {
     /// pristine default of a machine that structurally cannot update. `None` where
     /// nothing read it: a worker that failed before its read observed no bundle.
     pub(crate) installable: Option<bool>,
-    /// The STRANDED verdict ([`aterm_update::UpdateStatus::channel_unreadable`]):
-    /// checks complete but the release channel cannot be read, deliberately with
-    /// ZERO ledger failures — so `failing_persistent` can never carry it, and any
-    /// surface keyed on that field alone reads "up to date" at a machine that
-    /// will never update (round-11 audit).
+    /// The stranded verdict ([`aterm_update::UpdateStatus::channel_unreadable`]): checks
+    /// complete but the release channel cannot be read, with zero ledger failures, so
+    /// `failing_persistent` never carries it.
     pub(crate) channel_unreadable: bool,
     /// When the last check completed (Unix seconds; `aterm_update::UpdateStatus::updated_at`),
     /// `None` before any: Settings ▸ Software Update's "Checked 12 min ago".
@@ -1039,11 +1037,8 @@ impl NativeUpdaterService {
         if let Some(installable) = status.installable {
             self.snapshot.installable = UpdateInstallability::observed(installable);
         }
-        // The stranded verdict rides every reduced check exactly like the
-        // persistent-failure one: it is what stops the update screen from
-        // headlining "You're up to date." at a machine whose channel is
-        // unreadable (round-11 audit — the state records zero ledger failures,
-        // so failing_persistent alone can never say it).
+        // Likewise the stranded verdict, which records zero ledger failures, so
+        // `failing_persistent` alone can never say it.
         self.snapshot.channel_unreadable = status.enabled && status.channel_unreadable;
         if status.checked_at.is_some() {
             self.snapshot.checked_at = status.checked_at;
@@ -1451,7 +1446,7 @@ impl NativeUpdaterService {
             // perfectly good activation, and nothing re-announced it: the check
             // thread's watch latches one announcement per build and the download
             // lane is silent while a stage covers the release, so the update sat
-            // lost until the next relaunch (2026-08-19 round-5 audit). Keep the
+            // lost until the next relaunch (2026-08-19 audit). Keep the
             // stage; retire only when the bundle is OBSERVED and no longer backs it.
             let Some(installed) = installed else {
                 return DurableStageDisposition::Unchanged;

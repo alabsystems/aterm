@@ -436,12 +436,10 @@ fn ink_wrap_fire_stays_confined_to_typed_cells() {
 fn ink_wrap_rainbow_keeps_the_ribbon_no_zoom() {
     let ink = run_ink(GlowStyle::RainbowKitty, WRAP_W + 5, false);
     let zsh = run_zsh(GlowStyle::RainbowKitty, 78 + 4);
-    // Body coverage (`rows_body`): the zoom-bar tell is full-cell band/slab
-    // geometry; star pluses streaming onto this row are filtered by `cover`.
-    // Each key typed on the landing row births a fresh-ink pop whose birth halo
-    // blooms ±2 cells, so the post-wrap keys widen the typed neighbourhood; the
-    // bound (22 cols) leaves +3 headroom over the measured coverage. The real
-    // zoom-bar discriminator is the mid-band assert below.
+    // Body coverage (`rows_body`): the zoom-bar tell is full-cell band/slab geometry; star pluses
+    // streaming onto this row are filtered by `cover`. Each key on the landing row births a pop
+    // whose halo blooms ±2 cells; the 22-col bound leaves +3 over the measured coverage. The real
+    // zoom-bar discriminator is the mid-band assert.
     let landing = ink.rows_body[(TEXT1 - 1) as usize].len();
     let landing_mid = mid_band(&ink.rows_body[(TEXT1 - 1) as usize]);
     assert!(

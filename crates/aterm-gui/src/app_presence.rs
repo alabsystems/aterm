@@ -835,7 +835,7 @@ impl App {
     /// the glass (`App::harness_task_moved`: the page, and a record of a
     /// landing's end). A fact for a session this window does not hold is
     /// dropped. A face told again is no move: no frame. Beside a PROVEN
-    /// self-claim the face is the self-claim's (FOREVER LAND §10.4): the
+    /// self-claim the face is the self-claim's (Autopilot Land): the
     /// hosted loop's own faces are dropped, and the self-claim's
     /// ([`crate::HarnessFact::SelfTask`]) are taken only while it stands.
     pub(crate) fn apply_harness_fact(&mut self, sid: &str, fact: crate::HarnessFact) {
@@ -847,7 +847,10 @@ impl App {
             crate::HarnessFact::Task(face) => {
                 // Beside a PROVEN self-claim the hosted loop's hold is not
                 // the session's either (§12.3.3 item 3): one standing goes.
-                if self.beside_proven_self_claim(session) {
+                // Nor is its face in the gap of the self-claim's own re-exec
+                // (`upgrade@v1`, then the claim given back and taken again):
+                // the self-claim's face stands across it.
+                if self.beside_proven_self_claim(session) || self.in_self_claim_reexec(session) {
                     self.clear_land_held(session);
                     return;
                 }
@@ -860,7 +863,7 @@ impl App {
                 }
             }
             crate::HarnessFact::TaskNoted(face, noted_ms) => {
-                if self.beside_proven_self_claim(session) {
+                if self.beside_proven_self_claim(session) || self.in_self_claim_reexec(session) {
                     return;
                 }
                 self.apply_task_face(session, Some(face), None, Some(noted_ms));
@@ -1043,7 +1046,7 @@ impl App {
     }
 
     /// Whether a proven self-claim's `landed@v1` may land session
-    /// `session`'s task (FOREVER CRUISE / FOREVER LAND §10.4): the mode the
+    /// `session`'s task (Autopilot Cruise / Land §10.4): the mode the
     /// session runs under is Land — its own word, else the table's default
     /// ([`crate::autopilot::AutopilotView::of`]) — or none this window can
     /// name (no harness here to say otherwise).

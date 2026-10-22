@@ -229,9 +229,7 @@ fn a_nil_receiver_returns_a_zero_rect_on_this_arch() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The selector cache under a hard concurrent first use.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn the_sel_cache_is_correct_under_a_hard_concurrent_first_use() {

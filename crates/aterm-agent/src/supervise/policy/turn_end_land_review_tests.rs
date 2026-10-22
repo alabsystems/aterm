@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// FOREVER LAND'S LANDING, HELD TO ITS WORDS (the adversarial review of
+// Autopilot Land'S LANDING, HELD TO ITS WORDS (the adversarial review of
 // 2026-10-20): what lands a task and what keeps it landed — an act the worker
 // took, a defense still the reply's own, a report read whole, a turn someone
 // asked — Land's strict reading of open work, and the acts' words fitted to
@@ -323,7 +323,7 @@ fn a_landed_tasks_own_wake_over_someone_elses_edits_keeps_the_landing() {
 }
 
 /// A WAKE THAT REOPENS A LANDING OVER SOMEONE ELSE'S EDITS NAMES NONE OF THEM
-/// (the merge of FOREVER LAND's F1 with the wake's own probe): the wake began
+/// (the merge of Autopilot Land's F1 with the wake's own probe): the wake began
 /// over the person's edit and ends over the same one, but its words leave
 /// work open, so the landing is over and Land's nudge is owed — for the
 /// wake's words, never for the edit: the nudge carries no repository ask, so
@@ -357,7 +357,7 @@ fn a_wake_that_reopens_a_landing_over_someone_elses_edit_names_none_of_it() {
 }
 
 /// AN OFF AND BACK RE-ARMS LAND OVER THE REPOSITORY AS IT IS (a person's act;
-/// the merge of FOREVER LAND's F1/P6 with the restart's hold on a landing's
+/// the merge of Autopilot Land's F1/P6 with the restart's hold on a landing's
 /// own words): once Off stood over a landing ([`TurnEndState::park_off`]),
 /// its words read again are no reason to leave the repository unasked
 /// ([`TurnEndState::landing_words_read`]) — this loop's landing or one the

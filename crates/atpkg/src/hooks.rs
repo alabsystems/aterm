@@ -908,10 +908,9 @@ fn refresh_at(
     }
 }
 
-/// The markers bounding atpkg's block in a user's shell rc. Present so the block can be
-/// found, refreshed and removed exactly — never matched by content, which drifts.
-/// `pub(crate)` so callers outside this module — the repair report's pin test, `doctor`'s rc
-/// lines — read the marker the code actually writes rather than a copy of it that can drift.
+/// The markers bounding atpkg's block in a user's shell rc, so the block is found, refreshed
+/// and removed exactly, never matched by content. `pub(crate)` so the repair report's test
+/// and `doctor`'s rc lines read the marker the code writes.
 #[cfg(unix)]
 pub(crate) const RC_BEGIN: &str = "# >>> atpkg shell integration >>>";
 #[cfg(unix)]
@@ -1819,11 +1818,8 @@ pub(crate) fn command_links_dir(home: &Path) -> Option<std::path::PathBuf> {
 }
 
 /// Render `bin_dir` for a double-quoted POSIX shell string, escaping the four
-/// metacharacters a double-quoted context still interprets. A HOME-derived path won't
-/// contain them, but never interpolate raw.
-///
-/// POSIX only — zsh, bash, and the `if [ -f "…" ]` rc line. fish has [`fish_quote`]; this
-/// quoter's backtick is wrong there.
+/// metacharacters a double-quoted context still interprets. POSIX only (zsh, bash, the
+/// `if [ -f "…" ]` rc line); fish has [`fish_quote`].
 pub(crate) fn sh_quote(bin_dir: &Path) -> String {
     let mut out = String::new();
     for ch in bin_dir.to_string_lossy().chars() {
@@ -1837,13 +1833,9 @@ pub(crate) fn sh_quote(bin_dir: &Path) -> String {
 
 /// Render `p` for a double-quoted fish string: the fish hook body and the fish rc line.
 ///
-/// Not [`sh_quote`]: fish is not a POSIX shell. Between double quotes it recognises only
-/// `\\`, `\"` and `\$` (and a backslash-newline continuation), keeps a backslash before any
-/// other character literally, and has no backtick command substitution at all. sh's quoter
-/// also escapes a backtick, so a prefix or a `$HOME` holding one became a path of a
-/// different name (`/opt/a`b` emitted as `/opt/a\`b`): the hook put a directory that does
-/// not exist on PATH, the rc line's `test -f` never found the hook, and the marker-bounded
-/// block sourced nothing for ever.
+/// Not [`sh_quote`]: between double quotes fish recognises only `\\`, `\"` and `\$` (and a
+/// backslash-newline), keeps a backslash before any other character literally, and has no
+/// backtick substitution, so sh's escaped backtick would name a different path.
 pub(crate) fn fish_quote(p: &Path) -> String {
     let mut out = String::new();
     for ch in p.to_string_lossy().chars() {

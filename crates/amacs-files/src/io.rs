@@ -28,24 +28,14 @@ pub const MAX_INSERT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Restart-stable identity embedded in a private draft stream.
 ///
-/// `DocumentId` is process-local and therefore cannot identify a journal after
-/// relaunch. This key is a MAC of the canonical URI under the install's
-/// journal secret ([`JournalSecret`]); the URI itself is never written into the
-/// draft directory.
-///
-/// KEYED, NOT A PUBLIC HASH (hashclock-2, ruling 2026-10-10). The key is a
-/// journal's whole identity: it names the file and every record carries it, and
-/// recovery accepts any record whose key matches. It used to be the unkeyed
-/// FNV-1a/64 of the URI ([`Self::legacy_unkeyed`]), so whoever names the files a
-/// person opens could make two documents share one journal — a rho search found
-/// two names under one known directory with equal keys in 45 s — and opening the
-/// second showed the first's unsaved draft as its content, which Save then wrote
-/// to the second's path. HMAC-SHA256 under a per-install random secret kept in
-/// the private draft directory leaves nobody without that secret able to compute
-/// a key, let alone search for two equal ones. The first 64 bits of the tag are
-/// the key, so the record format (and the decoder that still reads the legacy
-/// journals) is unchanged; a chance collision of two keyed identities is 2^-64
-/// per pair, and nobody can aim one.
+/// `DocumentId` is process-local, so it cannot name a journal after relaunch. This key is
+/// the first 64 bits of an HMAC-SHA256 of the canonical URI under the install's
+/// [`JournalSecret`]; the URI itself is never written into the draft directory. The key is
+/// a journal's whole identity (it names the file, every record carries it, and recovery
+/// accepts any record whose key matches), so it must be keyed: with a public hash, whoever
+/// names the files a person opens could make two documents share one journal, showing one's
+/// unsaved draft as the other's content. Nobody without the secret can aim a collision; a
+/// chance one is 2^-64 per pair. The 64-bit width keeps the legacy record format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JournalDocumentKey(pub u64);
 
@@ -380,10 +370,9 @@ pub struct FileWatchInput {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileWatchReduction {
     Unchanged,
-    /// The host observed the exact same content through the still-valid file
-    /// capability, but the target's identity or metadata token advanced (for
-    /// example, an atomic replace with byte-identical contents). Rebind only
-    /// the save baseline; a dirty in-memory draft must remain untouched.
+    /// Same content through the still-valid file capability, but the identity or
+    /// metadata token advanced (e.g. an atomic replace with identical bytes). Rebind only
+    /// the save baseline; a dirty in-memory draft stays untouched.
     RebindEquivalent {
         change: VersionConflict,
     },
@@ -412,9 +401,8 @@ pub fn reduce_file_watch(input: FileWatchInput) -> FileWatchReduction {
     if input.save_in_flight {
         FileWatchReduction::DeferredSaving { change }
     } else if content_is_equivalent(input.baseline, input.observed) {
-        // `detect_version_conflict` still makes identity/metadata decisive for
-        // a save CAS. This narrower watch verdict is safe only after the host
-        // has revalidated the existing path/symlink capability, and it never
+        // A save CAS still treats identity/metadata as decisive. This narrower verdict is
+        // safe only after the host revalidated the path/symlink capability, and it never
         // authorizes a write by itself.
         FileWatchReduction::RebindEquivalent { change }
     } else if input.document_dirty {
@@ -845,7 +833,7 @@ pub enum JournalPayload {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalRecord {
-    /// Raw stable process document identity. Decoding never mints a `DocumentId`.
+    /// The raw [`JournalDocumentKey`]. Decoding never mints a `DocumentId`.
     document_raw: u64,
     pub(crate) base_seq: Seq,
     pub(crate) seq: Seq,
@@ -948,7 +936,7 @@ pub(crate) fn encode_journal_record(record: &JournalRecord) -> Result<Vec<u8>, J
     Ok(encoded)
 }
 
-/// Encode a complete bounded journal image. Hosts normally append each returned record.
+/// Encode a complete bounded journal image; the append path encodes one record at a time.
 pub fn encode_journal(records: &[JournalRecord]) -> Result<Vec<u8>, JournalError> {
     if records.len() > MAX_JOURNAL_RECORDS {
         return Err(JournalError::TooManyRecords);
@@ -1674,7 +1662,7 @@ fn decode_record(bytes: &[u8]) -> Result<(JournalRecord, usize), JournalError> {
     if total_len != expected_len {
         return Err(JournalError::LengthMismatch);
     }
-    // `total_len` is in `[header + checksum, bytes.len()]` here; the slices are
+    // `total_len` is in `[header + checksum, bytes.len]` here; the slices are
     // taken with `get` all the same, so their bounds need no reasoning at all.
     let checksum_at = total_len - JOURNAL_CHECKSUM_LEN;
     let checked = bytes.get(..checksum_at).ok_or(JournalError::Truncated)?;
@@ -1987,13 +1975,12 @@ mod tests {
             }
         ));
 
-        // Negative controls: either blind reload would lose local bytes, while
-        // accepting an observation mid-save would invalidate the save proof.
+        // Negative controls: a blind reload would lose local bytes, and accepting an
+        // observation mid-save would invalidate the save proof.
         assert_ne!(reduce(true, false), reduce(false, false));
         assert_ne!(reduce(false, true), reduce(false, false));
 
-        // Tier-1: exhaust the bounded input projection against the derived
-        // priority model. This drives the shipping reducer, not a duplicate.
+        // Tier-1: exhaust the bounded input projection against the derived priority model.
         let model = native_file_watch_model();
         for changed in [false, true] {
             for equivalent in [false, true] {
@@ -2125,9 +2112,8 @@ mod tests {
         );
         assert_eq!(reducer.begin(&snapshot), Err(SaveError::ReconcileRequired));
 
-        // Tier-1 projection: the shipping reducer's distinct state is exactly
-        // the model's published-but-unverified transition, and the healthy
-        // model exposes the attempted retry as an explicit rejected self-loop.
+        // Tier-1: this state is the model's published-but-unverified transition, where a
+        // retry is a rejected self-loop.
         let model = config_file_commit_cas_model();
         let begun = model.successors("BeginManual", &model.init_state())[0].clone();
         let locked = model.successors("LockManual", &begun)[0].clone();
@@ -2137,9 +2123,8 @@ mod tests {
         let rejected = model.successors("RetryIndeterminate", &indeterminate);
         assert_eq!(rejected, vec![indeterminate.clone()]);
         assert!(model.check_invariant("IndeterminateDoesNotClaimDurability", &indeterminate));
-        // Negative control: booking the unverified publication as committed —
-        // adopting `visible` as the baseline, which the reducer above refused —
-        // is no transition of the healthy model.
+        // Negative control: booking the unverified publication as committed (adopting
+        // `visible`, which the reducer refused) is no transition of the healthy model.
         let claimed = aterm_spec::interp::with_buggy(&model, 1)
             .successors("ResolveManualIndeterminate", &locked)[0]
             .clone();
@@ -2223,9 +2208,7 @@ mod tests {
         assert_eq!(rebound_plan.expected, replaced);
         assert_eq!(rebound_plan.preflight(replaced), Ok(()));
 
-        // Tier-1: the save-preflight path and watch path project the same
-        // byte-equivalent rebind verdict. A true content change remains the
-        // explicit-conflict negative control above.
+        // Tier-1: the save-preflight and watch paths project the same byte-equivalent rebind.
         let model = native_file_watch_model();
         let mut before = model.init_state();
         before.insert("changed", 1);

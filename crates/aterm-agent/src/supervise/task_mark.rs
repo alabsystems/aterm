@@ -11,7 +11,7 @@
 //! server see the same requests. (The host's connection is an Owner one, and
 //! `task mark` is Owner-only.)
 //!
-//! * DONE — ONLY AT LAND'S LANDING (FOREVER CRUISE / FOREVER LAND): at a
+//! * DONE — ONLY AT LAND'S LANDING (Autopilot Cruise / Land): at a
 //!   point the turn-end policy judges landed ([`TurnEndState::landed`], a
 //!   clean defense at a land act's yield; the policy stays the one decider),
 //!   once a point ([`TurnEndState::point_number`]), AS THE POINT IS FOLDED
@@ -78,7 +78,7 @@
 //!   served only after the loop acted): nothing is read into that point. A
 //!   `done` record any other `why=` marks (an older build's token or check
 //!   answer) is no landing: it is opened again at the loop's first edge.
-//! * UNDER CRUISE NO RECORD IS DONE (FOREVER CRUISE): the policy takes no
+//! * UNDER CRUISE NO RECORD IS DONE (Autopilot Cruise): the policy takes no
 //!   `done` record on ([`TurnEndState::seed_task_done`] refuses under
 //!   Cruise), so the loop's first edge opens it again, and Cruise's prompt
 //!   is typed whatever the record read.

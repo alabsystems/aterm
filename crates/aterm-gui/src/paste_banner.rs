@@ -309,12 +309,8 @@ pub(crate) fn banner_rows(
             false,
         );
     }
-    // THE SEAM IS THE WHOLE EDGE, AND ONE TONE — the contract this
-    // builder's header claims, which it was not actually keeping. The question and
-    // the answer keys are written over the row `blank_row` seamed, and `write_str`
-    // rebuilds each cell without an overline, so the band's top edge arrived as
-    // stubs. Closed here, in the label tone: the row carries the warn title and the
-    // full-tone answer keys, and the rule belongs to neither of them.
+    // `write_str` rebuilds each cell without an overline, so the top edge is re-sealed here,
+    // in the label tone: the rule belongs to neither the warn title nor the answer keys.
     chrome_band::seal_band_top(&mut rows[0], c.seam);
     rows
 }

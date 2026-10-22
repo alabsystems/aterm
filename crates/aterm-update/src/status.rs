@@ -321,10 +321,8 @@ pub fn record(staging: &Staging, current_build: u64, outcome: &str) {
         _ => outcome,
     };
     let delivery = with_delivery(|delivery| delivery.clone());
-    // STICKY: a writer that did not authorize a release (the apply lane, a deferral, a
-    // refusal) carries the file's `latest_tag` (and its source) forward rather than
-    // erasing it — the ledger is one overwritten line, and losing the tag costs the
-    // next check a full (unmetered) re-fetch for nothing.
+    // A writer that authorized nothing (the apply lane, a deferral, a refusal) carries the
+    // file's `latest_tag` and source forward: losing them costs the next check a re-fetch.
     let latest = delivery.latest.or_else(|| read_latest(staging));
     let updated_at = crate::install::now_rfc3339();
     let checked_at = crate::check_receipt::completed_at(staging);

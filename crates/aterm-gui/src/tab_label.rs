@@ -891,9 +891,8 @@ mod tests {
         assert!(!host_is_local("m17-towerx", FULL, SHORT));
     }
 
-    /// The measured defect: ConPTY's title for a fresh console is the program's
-    /// own path, which names nothing the user did not just choose. Empty is the
-    /// fall-through to the cwd rung, exactly as for the local identity.
+    /// ConPTY's title for a fresh console, the program's own path, leaves `""`: the
+    /// fall-through to the cwd rung.
     /// `cmd.exe`'s `<path> - <command>` keeps the command. Every title that is
     /// not an absolute Windows path to an `.exe` — including ones that CONTAIN
     /// one — is returned byte-identical.

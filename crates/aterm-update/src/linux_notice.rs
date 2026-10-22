@@ -24,7 +24,7 @@
 //! record's `updated_at` moved): an install zeroes the count with no check run. The lock
 //! coming free answers only the lock's notice; a failure said under it is said again.
 //!
-//! The install half has its own watch ([`InstallWatch`], ATERM-KI-1015-2, U21), on the
+//! The install half has its own watch ([`InstallWatch`], U21), on the
 //! copy's record rather than a streak. An installed build still waiting for the next
 //! aterm a person starts past [`START_WAIT_ANNOUNCED_AFTER`] passes (update checks wait
 //! with it) is said as a notice of its own ([`crate::INSTALL_AWAITS_START_TITLE`]), never
@@ -271,7 +271,7 @@ impl Announcer {
     }
 }
 
-/// THE INSTALL HALF'S WATCH (ATERM-KI-1015-2, U21). A replaced executable waits for the
+/// THE INSTALL HALF'S WATCH. A replaced executable waits for the
 /// next aterm a person starts, and update checks wait with it (`crate::linux`'s
 /// `check_locked`); a crash loop of the new build rolls it back. The loop told the window
 /// neither: a person who kept one old window open waited with no deadline and no notice,
@@ -648,7 +648,7 @@ mod tests {
     /// [`crate::INSTALL_CRASH_LOOP_TITLE`], which the window shows as the install half's
     /// warning, in the record's words whatever the pass's outcome says (the lock held, or a
     /// due check's own sentence) — the first pass of a process started after the end too
-    /// (ATERM-KI-1015-2, U21: it only started the looking, so an end found at launch was
+    /// (U21: it only started the looking, so an end found at launch was
     /// told to nobody). After a said wait, the wait's end comes first. A newer build
     /// installed over it and started answers it. A second crash loop before that is said as
     /// its own (U21: it was restated, a log line). Negative controls: a pass that takes
@@ -1153,7 +1153,7 @@ mod tests {
     }
 
     /// THE INSTALL HALF'S RECOVERY WAITS FOR THE CHECK HALF (the review of
-    /// ATERM-KI-1015-2, U21). The window reads the install half's recovery as the
+    /// , U21). The window reads the install half's recovery as the
     /// proof that installing works, which answers a check or download warning too: it
     /// is the ledger's healing, sent only once nothing is failing. The install watch
     /// sent it whatever the check half said, so a check failure still unanswered (an

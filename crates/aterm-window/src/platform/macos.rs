@@ -69,7 +69,7 @@ pub fn set_application_should_terminate_handler(handler: fn() -> bool) {
 /// that sends Option chords as Meta (`WindowExtMacOS::set_option_as_alt`) types these instead:
 /// on such a layout Option is the only way to them.
 ///
-/// LOCAL PATCH (aterm), 2026-10-20 (ATERM-KI-1015-9). Reads the layout with `UCKeyTranslate`
+/// LOCAL PATCH (aterm), 2026-10-20. Reads the layout with `UCKeyTranslate`
 /// (up to 257 lookups, only for an Option chord whose character is ASCII); on the main thread.
 #[inline]
 pub fn option_only_character(key: crate::keyboard::PhysicalKey, shift: bool) -> Option<char> {
@@ -86,7 +86,7 @@ pub fn option_only_character(key: crate::keyboard::PhysicalKey, shift: bool) -> 
 /// `ActiveEventLoopExtMacOS`, `EventLoopBuilderExtMacOS::with_default_menu` (winit's default
 /// menu, and with it the Services menu registration, is still always built) and
 /// `MonitorHandleExtMacOS::ns_screen`. Option-as-alt was cut in step 5 and restored on
-/// 2026-10-16 (ATERM-KI-1015-9: aterm's Meta mode needs it).
+/// 2026-10-16 (aterm's Meta mode needs it).
 pub trait WindowExtMacOS {
     /// LOCAL PATCH (aterm): the modifier state winit last derived from an
     /// event for this window — its own cache, written before the matching

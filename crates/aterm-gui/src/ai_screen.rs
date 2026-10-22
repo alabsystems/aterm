@@ -62,9 +62,7 @@ const WAKE_POLL: Duration = Duration::from_secs(5);
 /// (`aterm_agent::ai::review::sanitize_block`), as `aterm ai` prints it.
 const FACT_MAX: usize = 400;
 
-// ---------------------------------------------------------------------------
 // The reading
-// ---------------------------------------------------------------------------
 
 /// One AI CLI as the window's look judged it: plain data, its words already
 /// sanitized.
@@ -279,9 +277,7 @@ impl Default for AiChoices {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The published state and its projection
-// ---------------------------------------------------------------------------
 
 /// THE SETTINGS ▸ HARNESS ▸ AI CLIS SNAPSHOT: plain data, published whole
 /// with the Harness snapshot (`App::ai_state`); the page renders its
@@ -649,9 +645,7 @@ impl AiState {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The lines
-// ---------------------------------------------------------------------------
 
 /// THE AI LINES (`Family::Ai`, a level family): one entry per CLI that needs a
 /// person, keyed `ai.<cli>.<state>`, the preferred one Warn. For Claude Code,
@@ -712,9 +706,7 @@ fn ai_entry(cli: &AiCli, preferred: bool) -> Entry {
     .log_line(format!("ai need={} cli={}", cli.state.word(), cli.id))
 }
 
-// ---------------------------------------------------------------------------
 // The worker
-// ---------------------------------------------------------------------------
 
 /// What the window asks of its look worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -867,9 +859,7 @@ fn windows_launch_line(exe: &Path, args: &[&str], shell: &Path) -> Option<String
     Some(format!("{program} {}", args.join(" ")))
 }
 
-// ---------------------------------------------------------------------------
 // The App's own part
-// ---------------------------------------------------------------------------
 
 /// What the App keeps for the AI CLIs: the worker's ask line, the newest
 /// reading, and whether Claude's accounts speak for Claude.

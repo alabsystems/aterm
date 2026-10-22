@@ -163,8 +163,8 @@ impl Lane {
             "aterm-font-catalog",
             crate::qos::Role::Background,
             move || {
-                // QoS (port of 61a6c8b62): a font-picker catalogue scan; the
-                // picker shows a spinner meanwhile, the terminal is unaffected.
+                // QoS: a font-picker catalogue scan; the picker shows a spinner meanwhile,
+                // and the terminal is unaffected.
                 worker(rx, proxy);
             },
         )

@@ -131,13 +131,10 @@ fn is_spinner_glyph(g: char) -> bool {
             && !g.is_alphanumeric())
 }
 
-/// A box-drawing character (U+2500–U+257F: `│`, `─`, `╌`, `╭` …) — the
-/// layout's own strokes, never a spinner. Without this a box's `│`-led row
-/// whose words run into an ellipsis read as a spinner row, and the box's top
-/// was taken to be under it: Claude Code 2.1.281+'s rm breaker note `│
-/// Dangerous rm operation on possibly-empty variable path: ${…}/tmp (use a
-/// literal path: …)` (the vendor's own `${…}` placeholder, jF() in the
-/// binary) parsed as a box titled `│ removes /tmp)`, kind `other`.
+/// A box-drawing character (U+2500–U+257F: `│`, `─`, `╌`, `╭` …), the layout's own strokes,
+/// never a spinner: otherwise a box's `│`-led row whose words run into an ellipsis (the rm
+/// breaker's `│ Dangerous rm operation on possibly-empty variable path: ${…}/tmp …`) reads as
+/// a spinner row and misplaces the box's top.
 #[inline]
 const fn is_box_drawing(g: char) -> bool {
     matches!(g, '\u{2500}'..='\u{257F}')
@@ -1284,7 +1281,7 @@ pub(crate) fn status_block(rows: &[String], top: usize) -> StatusBlock {
     }
 }
 
-/// THE STATUS ROW'S LINE, wrapped in a narrow pane (ATERM-KI-1015-1 S2R-F1;
+/// THE STATUS ROW'S LINE, wrapped in a narrow pane (S2R-F1;
 /// MEASURED on 2.1.300 at 10 columns, the fixtures
 /// `claude-2.1.300-spinner-*-10col.txt`): when row `i` opens the status line
 /// — a glyph row ([`is_glyph_row`]), or its glyph alone on its row, the line
@@ -1362,7 +1359,7 @@ fn status_line_end(rows: &[String], i: usize, until: usize, width: usize) -> Opt
     // already reads busy alone (its verb run into its `…`, a retry status)
     // takes nothing at column two: its line wraps at its own column, and the
     // row there under a full retry row is the vendor's own notice (2.1.283's
-    // `  Fast mode unavailable: …`; the review of round 20, 2026-10-15: joined,
+    // ` Fast mode unavailable: …`; joined,
     // the retry read as a done row, and idle mid-retry) — unless the row's own
     // parenthesis is still open: the spinner's `(4s · esc to` cut at the
     // pane's edge, the row under it (`  interrupt)`) the rest of that
@@ -2772,7 +2769,7 @@ enum Block {
 }
 
 /// Whether the `⎿` block opening at `open` is READ as Claude Code's own row —
-/// the SCREEN'S half of H6-HARNESS-1 (ruling 2026-10-08). It reads for
+/// the SCREEN'S half of H6-HARNESS-1. It reads for
 /// RECALL: a wall read here is acted on only where the session's own
 /// transcript confirms it (aterm-agent, `supervise/wall_confirm.rs`), so
 /// where the screen cannot tell Claude Code's row from a tool's, it reads
@@ -2793,7 +2790,7 @@ enum Block {
 ///    first row under a wrapped call is still its first.
 ///
 /// 4. **A hook's words under a row of Claude Code's own are output**
-///    (ATERM-KI-1015-14, measured on 2.1.302 in the lab). Under the
+///    (measured on 2.1.302 in the lab). Under the
 ///    STOP-HOOK SUMMARY (`⏺ Ran 1 stop hook (ctrl+o to expand)`,
 ///    [`is_stop_hook_summary`]) the column-2 `⎿` rows up to its first
 ///    labelled row of its own ([`is_summary_label`]) are the hooks' own: in
@@ -2970,7 +2967,7 @@ fn is_hook_error_row(text: &str) -> bool {
 }
 
 /// Whether row `i` carries A PROGRAM'S WORDS, never a notice of Claude Code's
-/// own (ATERM-KI-1015-14): its text opens with a label ([`crate::wall`]'s
+/// own: its text opens with a label ([`crate::wall`]'s
 /// `labelled`: a Monitor's event, a hook's `… says:` or `… hook error:` row),
 /// or it stands under a `⎿` row the owner walk reads as output
 /// ([`block_is_vendors`]: a call's first row, a hook's words under the
@@ -4049,7 +4046,7 @@ mod tests {
         assert_eq!(completion_menu(&rows(&["❯ /cl", "    /clear"])), None);
     }
 
-    /// ATERM-KI-1016-1 ("with no pointer drawn, a completion menu is known only by a
+    /// ("with no pointer drawn, a completion menu is known only by a
     /// first entry starting `/` or `@`"), held to what Enter did, MEASURED in the
     /// real-Claude lab on 2026-10-17. 2.1.302: the `@` menu (files `+`, agents `*`, at
     /// column 4) opens with no entry selected and none pointed, and Enter SENT the draft
@@ -4123,7 +4120,7 @@ mod tests {
             .collect()
     }
 
-    /// THE SELECTION DRAWN IN COLOUR ONLY (the review of ATERM-KI-1016-1's "no pointer"
+    /// THE SELECTION DRAWN IN COLOUR ONLY (the review of 's "no pointer"
     /// item), on 2.1.268's slash menu MEASURED with the `cell` of each row's first glyph
     /// and what Enter did. `/config` over nine entries: the text is the same whichever
     /// is selected; as the menu opened `/config`'s `/` was `b1b9f9` and the others'
@@ -4191,7 +4188,7 @@ mod tests {
         );
     }
 
-    /// THE `@` MENU'S SELECTION DRAWN IN COLOUR ONLY (ATERM-KI-1016-1, dialogs: no
+    /// THE `@` MENU'S SELECTION DRAWN IN COLOUR ONLY (dialogs: no
     /// pointer), on 2.1.268 MEASURED with the `cell` of each entry's first glyph and what
     /// Enter did. The `@` menu opens with no entry selected, every entry alike (`999999`,
     /// files `+` and agents `*` alike), and Enter sent the draft; after `down` the entry

@@ -482,12 +482,11 @@ pub(crate) mod markers {
     /// `scan` the owner its own marker is created under. Called AT INSTALL
     /// TIME, before this process's own marker exists.
     ///
-    /// Answers the dead, empty markers of OTHER processes it removed: each is a
-    /// run that ended with no signal and no exit path, which is no row for a
-    /// test or dev start but is still the evidence the crash journal needs to
-    /// reopen that run's layout (`crate::crash_journal::classify_death`). The
-    /// install keeps the answer ([`swept_at_install`]); this process's own
-    /// previous image is not in it — a boot re-exec is not a death.
+    /// Returns the dead, empty markers of other processes it removed: each is a run that ended
+    /// with no signal and no exit path, no row for a test or dev start but the evidence the crash
+    /// journal needs to reopen that run's layout (`crate::crash_journal::classify_death`). The
+    /// install keeps the answer ([`swept_at_install`]); this process's own previous image (a
+    /// boot re-exec, not a death) is not in it.
     pub(crate) fn sweep(dir: &Path, own_pid: u32, scan: MarkerOwner) -> Vec<MarkerName> {
         let mut swept = Vec::new();
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -927,9 +926,8 @@ mod imp {
         };
         let pid = std::process::id();
         super::markers::keep_swept(super::markers::sweep(&dir, pid, owner));
-        // The fd is leaked on purpose: the marker must stay open for the whole
-        // process so the handler can write to it (and its lock must stay held).
-        // The OS reclaims it at exit.
+        // The fd is leaked on purpose: it stays open (and locked) for the handler, and the OS
+        // reclaims it at exit.
         let nanos = super::startup_nanos();
         match super::markers::arm(&dir, pid, nanos, owner) {
             Some(armed) if publish_marker_path(&armed.path) => {

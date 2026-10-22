@@ -395,8 +395,7 @@ impl CursorGlow {
     }
 
     /// Rainbow Kitty's laid ribbon, read-only, `Some` only while v2 owns the
-    /// frame. Conformance tests read the resident cells from it; `trail
-    /// status`'s `ribbon_segments=` stays the lit count.
+    /// frame (for conformance tests).
     #[inline]
     #[must_use]
     pub fn v2_ribbon(&self) -> Option<&rk::ribbon::Ribbon> {

@@ -267,10 +267,9 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
         String::from_utf8_lossy(&retired.stderr)
     );
     assert!(said.contains("ERR usage"), "{said}");
-    // The presses above were refused in the server, so nothing is in flight:
-    // one `await idle` bounds the wait for a byte that must not come. The
-    // window is its 200 ms of quiet; the timeout is only how long the quiet
-    // may take to come (exit 124 fails `ctl_ok`), so it is a hang detector.
+    // The presses above were refused in the server, so nothing is in flight: one `await idle`
+    // (200 ms of quiet; the timeout is a hang detector) bounds the wait for a byte that must
+    // not come.
     ctl_ok(
         &inst,
         &[&format!("@{sid}"), "await", "idle", "200", HANG_MS],

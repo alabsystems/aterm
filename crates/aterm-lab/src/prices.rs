@@ -92,11 +92,9 @@ fn table_side(p: &ModelPrice) -> Side {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The build's catalog: a JavaScript object literal, read for the subset it is
 // written in (keys bare or quoted; strings; numbers; `!0` and `!1`; `null`;
 // nested objects and lists). Anything else stops the read at its offset.
-// ---------------------------------------------------------------------------
 
 /// A value of the catalog's literal.
 #[derive(Debug, Clone, PartialEq)]
@@ -385,9 +383,7 @@ fn catalog(bytes: &[u8]) -> Result<BTreeMap<String, Side>, String> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
 // The comparison
-// ---------------------------------------------------------------------------
 
 fn differ(a: Option<f64>, b: Option<f64>) -> bool {
     match (a, b) {
@@ -488,9 +484,7 @@ fn check(table: &PriceTable, build: &BTreeMap<String, Side>) -> Check {
     c
 }
 
-// ---------------------------------------------------------------------------
 // The Codex build's model catalog: ids only
-// ---------------------------------------------------------------------------
 
 /// The bytes inside the Codex catalog's opening brace.
 const CODEX_MARK: &[u8] = b"\"models\": [";

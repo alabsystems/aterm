@@ -533,11 +533,8 @@ impl Ctl for RelayCtl {
         let shut = Arc::clone(&self.shut);
         Some(Box::new(move || {
             cut.store(true, Ordering::SeqCst);
-            // Each half on its own ([`aterm_uds::hangup::hang_up`]): a server
-            // that half-closed toward this client (a relay whose child ended)
-            // has shut its read half, and Darwin refuses a both-ways
-            // `shutdown` of it, shutting nothing — the server then read no
-            // EOF while this transport held the connection.
+            // Each half on its own ([`aterm_uds::hangup::hang_up`]): Darwin refuses a both-ways
+            // `shutdown` of a socket whose server half-closed toward us, shutting nothing.
             for (_, s) in shut.lock().unwrap_or_else(PoisonError::into_inner).iter() {
                 aterm_uds::hangup::hang_up(s);
             }

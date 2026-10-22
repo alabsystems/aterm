@@ -1145,7 +1145,7 @@ pub fn parse_request(ctx: &Ctx, args: &[String]) -> Result<GroupRequest> {
 ///
 /// # Errors
 ///
-/// A usage error for a bad command line; whatever the publish refuses.
+/// A usage error for a bad command line.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let req = parse_request(ctx, args)?;
     let parts = Parts {

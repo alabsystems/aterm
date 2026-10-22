@@ -8,7 +8,7 @@
 //! credits` (lab E4; the accounts design §3.3). The first is what the
 //! supervisor's credits hold reads (aterm-agent's `turn_end::credits_hold`):
 //! under `[harness] usage_credits = false`, the default since the owner's
-//! ruling of 2026-10-19, the supervisor types nothing of its own while credits
+//! , the supervisor types nothing of its own while credits
 //! carry the session, but one probe turn past the reset their notice named
 //! (or at the hold's bound, where none is named). A MODEL Claude Code bills per request with no dialog —
 //! a credits-only model whose consent it stored, or on a tier an admin bills

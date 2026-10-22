@@ -56,6 +56,40 @@ fn incomplete_workstation_setup_is_a_separate_manual_digest_step() {
     assert!(entry.mover().is_none());
 }
 
+/// THE SETUP LINE NAMES WHERE EVERY STAGE IS READ: System State, by its menu row,
+/// never `aterm doctor --check`, which reads no Secrets vault, Mac approval or
+/// disk-image copy, the steps that most often hold setup up. Its reason claims no
+/// more than setup knows: a step not finished, not a "workstation setting".
+#[test]
+fn incomplete_workstation_setup_points_at_system_state() {
+    let (title, why, then, more) = entry_words(&super::workstation_setup_failure_entry());
+    assert_eq!(title, "Mac setup needs attention");
+    assert_eq!(why, "background setup has not finished every step");
+    assert_eq!(then, "Open aterm \u{25B8} System State\u{2026}");
+    for line in std::iter::once(&then).chain(&more) {
+        assert!(!line.contains("doctor"), "{line}");
+    }
+    assert!(
+        more.iter().any(|line| line.contains("System State")),
+        "{more:?}"
+    );
+}
+
+/// [`super::SYSTEM_STATE_MENU`] is the path of the real row: the app menu's title
+/// and the label of its `MenuAction::SystemState` item.
+#[test]
+fn the_system_state_words_name_the_real_menu_row() {
+    let named = crate::menu::MENU_MODEL.iter().find_map(|section| {
+        section
+            .entries
+            .iter()
+            .flat_map(crate::menu::MenuEntry::items)
+            .find(|(_, action, _, _)| *action == crate::menu::MenuAction::SystemState)
+            .map(|(label, ..)| format!("{} \u{25B8} {label}", section.title))
+    });
+    assert_eq!(named.as_deref(), Some(super::SYSTEM_STATE_MENU));
+}
+
 /// What the digest reads of `entry`: its title, its reason, its action and
 /// the detail lines behind them.
 fn entry_words(entry: &Entry) -> (String, String, String, Vec<String>) {
@@ -110,7 +144,7 @@ fn a_label_cannot_fault_the_signed_out_entry() {
             "{label}: the action ends in it: {then}"
         );
         assert!(more.iter().any(|l| l.contains(label)), "{label}: {more:?}");
-        // NEGATIVE CONTROL: the word is one the lints know.
+        // Negative control: the word is one the lints know.
         let (reason, step) = match where_it_faults {
             Written::Reason => (
                 format!("{label} is signed out, and only a browser sign-in restores it"),
@@ -756,7 +790,7 @@ fn the_owners_upgrade_now_is_answered_on_the_glass() {
         (Severity::Info, Hold::For(super::ANSWER_MAX))
     );
     assert!(msg.actions.is_empty(), "the answer is no new decision");
-    // NEGATIVE CONTROL: no word from the owner, the same wait — a record.
+    // Negative control: no word from the owner, the same wait: a record.
     let msg = super::agent_upgrade_stalled(&row(Request::None), NOW, "in tab 1");
     assert_eq!((msg.severity, msg.hold), (Severity::Info, Hold::LogOnly));
 }
@@ -2403,7 +2437,7 @@ fn a_retired_spelling_is_a_record_and_never_counted_as_an_unknown_key() {
     );
 }
 
-/// AN AFRESH MOVE'S BAND ROW NAMES ITS MARK'S COMMAND (ATERM-KI-1016-1): the upgrade's restart
+/// AN AFRESH MOVE'S BAND ROW NAMES ITS MARK'S COMMAND: the upgrade's restart
 /// that started its agent afresh (`Row::fresh`), ended and not brought back, stands as the
 /// need its mark carries — a plain `claude`, under the home its line carried — never
 /// `claude --resume <id>`, which Claude refuses for a conversation with no message. NEGATIVE
@@ -2923,7 +2957,7 @@ fn a_tabs_upgrade_key_names_its_tab_and_no_other_key_does() {
     }
 }
 
-// ---- round 44: the second adversarial hunt's host repros -------------
+// ---- the second adversarial hunt's host repros -------------
 
 /// Overdue rows of `n` Claude tabs, each with a real-length tab id
 /// (`s-` and 20 hex digits).

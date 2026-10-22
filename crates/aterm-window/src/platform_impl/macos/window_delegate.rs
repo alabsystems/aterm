@@ -1730,11 +1730,9 @@ fn theme_to_appearance(theme: Option<Theme>) -> Option<aterm_objc::Obj> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // LOCAL PATCH (aterm): the small shared sends this file's 177 ported call sites
 // factor out. Each of these had ONE spelling through objc2 — a binding method
 // or a `Deref` — and would otherwise be repeated verbatim at every site.
-// ---------------------------------------------------------------------------
 
 /// `+[NSApplication sharedApplication]`, the shared instance.
 ///

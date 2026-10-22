@@ -11,12 +11,13 @@
 //! targo --unverified run -q -p aterm-census -- --all <root>      # everything, another checkout
 //! ```
 //!
-//! Bare `aterm-census` is `--all`, so one command is the whole lexical check.
-//! Census flags combine. In
-//! [`aterm_census::CENSUSES`] order, a clean census prints its one-line
-//! verdict and a failed one its whole transcript and the command that reruns
-//! just it (`--verbose` prints every transcript); one verdict line ends the
-//! run. Exit 0 = every selected census clean, 1 = a finding, 2 = usage.
+//! Bare `aterm-census` is `--all`; census flags combine. In
+//! [`aterm_census::CENSUSES`] order, a clean census prints its verdict line
+//! and a failed one its transcript and the command that reruns just it
+//! (`--verbose` prints every transcript); a summary line ends the run.
+//! Exit 0 = every selected census clean, 1 = a census failed (a finding, a
+//! missed floor, or a walk that could not run), 2 = usage, or the root is not
+//! a checkout.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -39,7 +40,7 @@ fn usage() -> String {
     text.push_str(
         "  -v, --verbose  every census's full transcript, clean or not\n\
          \x20 -h, --help     this text\n\n\
-         Census flags combine. Exit: 0 clean, 1 a census found a violation, 2 usage.\n",
+         Census flags combine. Exit: 0 clean, 1 a census failed, 2 usage or bad <root>.\n",
     );
     text
 }

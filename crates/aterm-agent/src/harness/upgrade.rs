@@ -63,8 +63,8 @@
 //!    unconfirmed. Without an explicit flag Claude Code's own resume picks the
 //!    model, which may not be the newest.
 //!
-//! A conversation with no task ([`TaskScan`]) skips all of this: once idle it
-//! is ended and the new build started afresh in its tab ([`Step::Fresh`]).
+//! A conversation with no task ([`TaskScan`]) skips all of this: once idle it is ended and the
+//! new build started afresh in its tab ([`Step::Fresh`]).
 //! One whose task LANDED ([`FinishedScan`]: a clean `Nothing left:` defense
 //! answering one of Autopilot Land's acts, with no prompt of a person's or an
 //! orchestrator's since — never a token or a done reply) is asked nothing
@@ -1985,7 +1985,7 @@ pub fn directed_since_ready(jsonl: &str, markers: &[String]) -> bool {
 }
 
 /// WHETHER A CONVERSATION'S TASK IS FINISHED, BY ITS OWN RECORD — LANDED
-/// (FOREVER CRUISE / FOREVER LAND): the worker answered one of Autopilot
+/// (Autopilot Cruise / Land): the worker answered one of Autopilot
 /// Land's acts ([`Asked::Land`]: its instruction, a nudge, its answer to a
 /// question once the instruction was read — today's words or a build
 /// before's) with a CLEAN DEFENSE ([`turn_end::clean_defense`]: a `Nothing
@@ -2184,7 +2184,7 @@ impl FinishedScan {
     /// the finish as it stood before it, so a read that begins after the
     /// record's head and settles nothing cannot say it
     /// (`upgrade_drive::Finished`, which reads such a window from further
-    /// back; ATERM-KI-1016-1).
+    /// back).
     #[must_use]
     pub fn settled(&self) -> bool {
         self.settled
@@ -2297,13 +2297,14 @@ impl FinishedScan {
         let id = row.get("promptId").and_then(Value::as_str);
         // A `/loop`'s wake is a turn of its own: by its new `promptId`, and
         // on a build that numbers no turn as [`begins_unnumbered`] reads it
-        // (ATERM-KI-1016-1: read as part of the finish's turn, its answer
+        // (read as part of the finish's turn, its answer
         // took the finish back).
         let anew = numbered_anew(id, self.turn.as_deref(), || begins_unnumbered(row));
         if anew {
             self.turn = id.map(str::to_owned);
         }
         if row.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+            || row.get("queueTranscriptOnly").and_then(Value::as_bool) == Some(true)
             || only_tool_results(row)
         {
             return;
@@ -2444,7 +2445,7 @@ pub fn last_turn_key(tail: &str) -> Option<String> {
 /// ([`Self::names`]; `approvals::open_left`, the review's RR3-TE-2).
 ///
 /// BY ITS PROMPT, because the prompt's row is the exchange's that is on the
-/// record when the turn ends (ATERM-KI-1016-1): Claude Code writes its rows
+/// record when the turn ends: Claude Code writes its rows
 /// on a timer, so a loop that leaves the exchange the moment the busy row
 /// leaves can read a tail that still ends on the person's prompt, or on a
 /// tool's call before the reply's last words — and keyed by that row, the
@@ -2771,6 +2772,7 @@ fn turn_key_of(v: &Value) -> Option<Option<String>> {
         Some("user") => {
             if v.get("isMeta").and_then(Value::as_bool) == Some(true)
                 || v.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+                || v.get("queueTranscriptOnly").and_then(Value::as_bool) == Some(true)
                 || only_tool_results(v)
                 || first_text(v).is_none_or(|t| t.trim().is_empty())
                 || first_text(v).map(typed_words).and_then(local_row) == Some(LocalRow::Output)
@@ -2836,7 +2838,7 @@ fn asked_by(row: &Value, ours: &[Typed]) -> Asked {
 /// ([`turn_end::RETIRED_DONE_CHECKS`]). So too a restart's carry-on that asks
 /// the check ([`checking`], `continued:check`): the harness's mark, the
 /// restart's facts, then the check's words — its answer read as the check's
-/// yield. BY ITS WORDS ALONE, whoever typed them (ATERM-KI-1016-1, done-2):
+/// yield. BY ITS WORDS ALONE, whoever typed them (done-2):
 /// the ledger has no row of a real check in a hand `/resume` tab, or past
 /// [`TYPED_WITHIN_MS`] or the ledger's cut, and a person who types the check
 /// word for word asks what it asks.
@@ -2884,7 +2886,7 @@ pub(crate) fn is_land_act(text: &str) -> bool {
 /// the done check's turn or a land act's ([`FinishedScan::cut`]) it delivers
 /// the cut act again, as the wall's retry does, and as the turn-end policy
 /// reads the turn under the vendor's `continuing automatically`
-/// (`TurnEndState::observe`; ATERM-KI-1016-1: read as a turn nobody asked,
+/// (`TurnEndState::observe`: read as a turn nobody asked,
 /// the reply to it was a first done report, and the record asked the check
 /// once more).
 fn vendor_continues(row: &Value) -> bool {
@@ -2959,7 +2961,7 @@ pub(crate) const MISSED_TASK_NOTICE: &str = "The following one-shot scheduled ta
 /// by the scheduled task it fired for (`scheduledTaskId`, the scheduler's
 /// `onFireTask`), and the notice of a missed one-shot task, which the
 /// scheduler's `onFire` gives neither at a start (the review of
-/// ATERM-KI-1016-1, KR-DONE-4: `if(l)l(e);else t(Pcr(e))`, the REPL passing
+/// , KR-DONE-4: `if(l)l(e);else t(Pcr(e))`, the REPL passing
 /// no `onMissed`), by its fixed opening words ([`MISSED_TASK_NOTICE`]).
 fn begins_unnumbered(row: &Value) -> bool {
     begins_unnumbered_by(
@@ -3094,6 +3096,7 @@ fn turn_of(line: &str) -> Option<Turn> {
             }
             if v.get("isMeta").and_then(Value::as_bool) == Some(true)
                 || v.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+                || v.get("queueTranscriptOnly").and_then(Value::as_bool) == Some(true)
             {
                 return None;
             }

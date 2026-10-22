@@ -10,7 +10,7 @@
 //! NOTHING is typed after. The I/O half is `upgrade_drive`'s `agy::live`
 //! module (`upgrade_agy_live_drive.rs`, its `upgrade_visit`). Every fact here
 //! was measured on 1.4.0 in the lab (`crates/aterm-lab`, the real binary
-//! against its Gemini API stub, no account; the round-2 measurements of
+//! against its Gemini API stub, no account; the measurements of
 //! 2026-10-17 and their critic, and the measurements of 2026-10-18):
 //!
 //! * **A running agy sees nothing of a landing** (30 s with no frame, the same

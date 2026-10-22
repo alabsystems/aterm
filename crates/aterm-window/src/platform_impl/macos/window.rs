@@ -267,7 +267,6 @@ impl WinitWindow {
         WindowId(window.addr())
     }
 
-    // ---------------------------------------------------------------------
     // LOCAL PATCH (aterm): the crossings. objc2's `#[inherits(NSResponder,
     // NSObject)]` made `&WinitWindow` an `&NSWindow`, an `&NSResponder` and an
     // `&AnyObject` by `Deref`; this class's Rust type is `aterm_objc`'s
@@ -282,9 +281,7 @@ impl WinitWindow {
     // bare `AnyObject`; the window is the RECEIVER everywhere and the view is
     // what gets passed as an argument. Deleted, the way five of the seam's six
     // projected geometry conversions were.
-    // ---------------------------------------------------------------------
 
-    // ---------------------------------------------------------------------
     // `ns_window()` IS GONE, and it went the way `seam::id_of` and five of the
     // seam's six geometry conversions went: not because it was over-projected,
     // but because THE OTHER SIDE STOPPED NEEDING IT. It answered an objc2
@@ -292,7 +289,6 @@ impl WinitWindow {
     // phase 2 ported, and one in this file's `Drop`, which W12 ports. A
     // crossing dies when either side stops needing it, and a count of call
     // sites says nothing about which.
-    // ---------------------------------------------------------------------
 
     /// A +1 handle to this window — objc2's `NSObjectProtocol::retain`, which
     /// this class no longer inherits.

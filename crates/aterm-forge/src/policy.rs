@@ -86,7 +86,7 @@ pub struct Fork {
     pub apache_notice: bool,
     /// The lock-order census's classification.
     pub census_mode: CensusMode,
-    /// The identity namespace (`winit` ⇒ `winit::…`). Required for
+    /// The identity namespace (`indexmap` ⇒ `indexmap::…`). Required for
     /// [`CensusMode::Scanned`].
     pub census_namespace: Option<String>,
 }

@@ -69,6 +69,26 @@ pub struct Caps {
     /// the WHATWG decoder, aterm): `C0 80` is two replacements. The pinned fold
     /// replaces a whole overlong or surrogate sequence with one.
     pub utf8_subparts: bool,
+    /// Origin mode (DECOM, `?6`): CUP and VPA count rows from the top margin
+    /// and stop at the bottom one, `?6` homes, DECSC saves it (xterm
+    /// `CursorSet`, `DECSC_FLAGS`). Came with astream `b13/origin-irm-su`;
+    /// the fold before it ignored `?6`.
+    pub origin_mode: bool,
+    /// Insert mode (IRM, `CSI 4 h`): each glyph shifts the line right first
+    /// (xterm `WriteText` runs `InsertChar`). The fold before
+    /// `b13/origin-irm-su` consumed ANSI modes.
+    pub insert_mode: bool,
+    /// SU and SD (`CSI n S`, `CSI n T`): the region scrolls, the cursor and
+    /// its pending wrap stay (xterm `xtermScroll`, `RevScroll`). The fold
+    /// before `b13/origin-irm-su` consumed both.
+    pub scroll_up_down: bool,
+    /// Newline mode (LNM, `CSI 20 h`): LF, VT and FF return the carriage too
+    /// (xterm `CASE_VMOT` under `LINEFEED`). Came with `b13/origin-irm-su`.
+    pub newline_mode: bool,
+    /// G0/G1 designation of ASCII and DEC Special Graphics (`ESC ( 0`,
+    /// `ESC ) 0`), SO/SI, xterm's table, and DECSC saving the sets. Came with
+    /// astream `b13/charsets`; the fold before it consumed every SCS.
+    pub charsets: bool,
 }
 
 fn line(cols: u16, rows: u16, bytes: &[u8], row: u16) -> String {
@@ -93,6 +113,12 @@ impl Caps {
             alt_clears: fold(2, 2, &[Record::Out(b"ab\x1b[?1049h".to_vec())]).cursor() == (0, 1)
                 && line(4, 1, b"\x1b[?1049hX\x1b[?1049h", 0).is_empty(),
             utf8_subparts: line(4, 1, b"\xc0\x80", 0) == "\u{fffd}\u{fffd}",
+            origin_mode: line(4, 4, b"\x1b[2;3r\x1b[?6h\x1b[1;1HX", 1) == "X",
+            insert_mode: line(4, 1, b"ab\x1b[1G\x1b[4hX", 0) == "Xab",
+            scroll_up_down: line(4, 2, b"a\x1b[S", 0).is_empty()
+                && line(4, 2, b"a\x1b[T", 1) == "a",
+            newline_mode: line(4, 2, b"\x1b[20hab\nc", 1) == "c",
+            charsets: line(4, 1, b"\x1b(0q", 0) == "\u{2500}",
         }
     }
 }

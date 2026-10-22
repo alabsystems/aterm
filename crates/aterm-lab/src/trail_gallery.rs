@@ -43,6 +43,7 @@
 //! | `enter-bottom` | the burst on the last row of a full screen, then Enter (the screen scrolls) | `typed` `enter` `e120` `e470` |
 //! | `idle10` | the burst, then 10 s with no input | `mid` `t0` `idle1` `idle2` `idle5` `idle10` |
 //! | `redraw-stall` | a native Rust echo fixture types the burst, clears a suffix inside DEC-2026 for 500 ms, then restores exactly the same text without another key | `typed` `stalled` `restored` |
+//! | `fold-rest` | bare terminal echo, three keys coalesced across the margin, then the independent row exits | `folded` `f1100` `f1250` `f1400` `rest` |
 //! | `cjk` | `echo 你好世界` (double-width input) | `mid` `t0` `t120` `t470` |
 //! | `bidi` | `echo שלום עולם` (right-to-left input) | `mid` `t0` `t120` `t470` |
 //! | `settings` | Settings ▸ Cursor & Motion, then ▸ Cursor Kitty, each with its live preview, at 110×40 cells of 16 px | `motion-0300` … `motion-2100`, `kitty-0300` `kitty-1200`, plus each page's `controls prefs` |
@@ -132,7 +133,7 @@ dirs, a private control socket, a lifeline; ended by its process group, never by
   --aterm PATH  the aterm to run (default: the lab's pick, `targo --unverified lab paths`); a release build keeps the
                 60 ms cadence (`targo --unverified build --release -p aterm`, then --aterm target/release/aterm)
   --theme       dark (the default theme), light (\"GitHub Light\") or both (the default)
-  --scenario    typing (default), context, steam, enter-bottom, idle10, redraw-stall, cjk, bidi, settings, or all; repeatable
+  --scenario    typing (default), context, steam, enter-bottom, idle10, redraw-stall, fold-rest, cjk, bidi, settings, or all; repeatable
   --extra       a top-level aterm.toml line for every instance, replacing the base line of its key (the base lines:
                 the style, motion = \"full\", trail_sounds = false, and on light the theme)
   --columns --lines --font-px   the grid (default 72x14 cells of 22 px; settings 110x40 of 16 px)
@@ -187,6 +188,7 @@ pub enum Scenario {
     EnterBottom,
     Idle10,
     RedrawStall,
+    FoldRest,
     Cjk,
     Bidi,
     Settings,
@@ -194,13 +196,14 @@ pub enum Scenario {
 
 impl Scenario {
     /// Every scenario, in the order `all` runs them.
-    pub const ALL: [Scenario; 9] = [
+    pub const ALL: [Scenario; 10] = [
         Scenario::Typing,
         Scenario::Context,
         Scenario::Steam,
         Scenario::EnterBottom,
         Scenario::Idle10,
         Scenario::RedrawStall,
+        Scenario::FoldRest,
         Scenario::Cjk,
         Scenario::Bidi,
         Scenario::Settings,
@@ -215,6 +218,7 @@ impl Scenario {
             Scenario::EnterBottom => "enter-bottom",
             Scenario::Idle10 => "idle10",
             Scenario::RedrawStall => "redraw-stall",
+            Scenario::FoldRest => "fold-rest",
             Scenario::Cjk => "cjk",
             Scenario::Bidi => "bidi",
             Scenario::Settings => "settings",
@@ -488,13 +492,16 @@ fn keys_of(word: &str) -> Vec<String> {
         .collect()
 }
 
-/// The gallery's PTY child: a deliberately stalled synchronized redraw. It
-/// runs as this same Rust tool, and touches only its inherited terminal.
+/// The gallery's private PTY child: a stalled synchronized redraw, or bare
+/// echo for the fold probe. It touches only its inherited terminal.
 pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     use std::io::Read as _;
 
-    if !args.is_empty() {
-        return Err(Fail::usage("the redraw fixture takes no arguments"));
+    let fold = args == ["fold"];
+    if !args.is_empty() && !fold {
+        return Err(Fail::usage(
+            "the redraw fixture takes only an optional fold mode",
+        ));
     }
     let _raw = crate::sys::RawMode::enter(0)
         .ok_or_else(|| Fail::usage("the redraw fixture needs its private PTY"))?;
@@ -502,7 +509,11 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     let mut output = std::io::stdout().lock();
     let io_error = |e| Fail::usage(format!("redraw fixture: {e}"));
     output
-        .write_all(b"\x1b[2J\x1b[8;1Hredraw ready\x1b[5;1H> ")
+        .write_all(if fold {
+            b"\x1b[2J\x1b[8;1Hfold ready\x1b[5;1H> "
+        } else {
+            b"\x1b[2J\x1b[8;1Hredraw ready\x1b[5;1H> "
+        })
         .map_err(io_error)?;
     output.flush().map_err(io_error)?;
     let mut text = String::new();
@@ -510,6 +521,17 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     let mut restored = false;
     let mut key = [0u8; 1];
     while input.read_exact(&mut key).is_ok() {
+        if fold {
+            match key[0] {
+                3 | 4 => break,
+                0x20..=0x7e => {
+                    output.write_all(&key).map_err(io_error)?;
+                    output.flush().map_err(io_error)?;
+                }
+                _ => {}
+            }
+            continue;
+        }
         let redraw = key[0] == 7 && !restored && text == "echo the quick brown fox";
         match key[0] {
             3 | 4 => break,
@@ -692,6 +714,7 @@ struct Shot<'a> {
     start: Instant,
     mark: Instant,
     terminal: bool,
+    columns: u32,
     clean: bool,
     frames: u32,
     fails: u32,
@@ -980,6 +1003,36 @@ impl Shot<'_> {
                 }
                 self.snap("restored");
             }
+            Scenario::FoldRest => {
+                self.tick();
+                let mut text: String =
+                    "echo the quick brown fox walks along every line kitty types "
+                        .chars()
+                        .cycle()
+                        .take(self.columns.saturating_sub(3) as usize)
+                        .collect();
+                text.extend("xyz".chars().skip(3 - self.columns.min(3) as usize));
+                let keys = keys_of(&text);
+                let split = keys.len().saturating_sub(3);
+                self.burst(None, &keys[..split])?;
+                self.mark("fold");
+                for key in &keys[split..] {
+                    self.press(key);
+                }
+                sleep(40)?;
+                let ready = self.inst.ctl(&["await", "match", "z", "timeout=60000"]);
+                if ready.code != 0 {
+                    self.note("the fold fixture did not echo its final glyph");
+                    self.fails += 1;
+                }
+                self.snap("folded");
+                for ms in [1100, 1250, 1400] {
+                    self.tick_until(ms, Duration::from_millis(16))?;
+                    self.snap(&format!("f{ms}"));
+                }
+                self.tick_until(2000, Duration::from_millis(16))?;
+                self.snap("rest");
+            }
             Scenario::Settings => {
                 self.settings_page("/cursor-motion", "motion", &[300, 900, 1500, 2100])?;
                 self.settings_page("/cursor-kitty", "kitty", &[300, 1200])?;
@@ -1033,9 +1086,12 @@ impl Gallery {
             font_px.to_string(),
         ];
         args.push("-e".to_string());
-        if scenario == Scenario::RedrawStall {
+        if matches!(scenario, Scenario::RedrawStall | Scenario::FoldRest) {
             args.push(paths().exe.to_string_lossy().into_owned());
             args.push("__trail-redraw-fixture".to_string());
+            if scenario == Scenario::FoldRest {
+                args.push("fold".to_string());
+            }
         } else {
             args.push("/bin/sh".to_string());
             args.push(script.to_string_lossy().into_owned());
@@ -1137,7 +1193,7 @@ impl Gallery {
                         eprintln!("trail-gallery: [{name}] {}", f.msg.unwrap_or_default());
                         self.fails += 1;
                     }
-                    Ok(()) => self.capture(&live.inst, &name, scenario)?,
+                    Ok(()) => self.capture(&live.inst, &name, scenario, grid.0)?,
                 }
                 self.end(live, &name);
             }
@@ -1150,7 +1206,13 @@ impl Gallery {
         Ok(())
     }
 
-    fn capture(&mut self, inst: &Instance, name: &str, scenario: Scenario) -> Result<(), Stopped> {
+    fn capture(
+        &mut self,
+        inst: &Instance,
+        name: &str,
+        scenario: Scenario,
+        columns: u32,
+    ) -> Result<(), Stopped> {
         let tsv_path = self.out.join(format!("{name}.frames.tsv"));
         let tsv = File::create(&tsv_path);
         let wire = inst.connect().map_err(|e| {
@@ -1166,6 +1228,7 @@ impl Gallery {
             start: now,
             mark: now,
             terminal: scenario.terminal(),
+            columns,
             clean: self.clean,
             frames: 0,
             fails: 0,

@@ -34,16 +34,13 @@ use crate::harness;
 
 use harness::{FLEET, World, kv, until};
 
-/// **The first cross-aterm message.** `post to=@s-B kind=ask --wait` answers `OK
-/// <id> off=<R>`; the record lands in B's inbox as `from=<A sid>@<node>
-/// trust=agent off=<R>`; B answers `re=R` and A's own drain shows it with
-/// `re-id=<the post id>`.
+/// The first cross-aterm message: `post to=@s-B kind=ask --wait` answers `OK <id>
+/// off=<R>`, the record lands in B's inbox as `from=<A sid>@<node> trust=agent
+/// off=<R>`, B answers `re=R`, and A's drain shows it with `re-id=<the post id>`.
 ///
-/// Every hop is doing real work: the endpoint queues the post, the bridge drains
-/// `outbox` for the body, publishes under the node's BOUND cap (so the broker
-/// checks the producer id against the principal), reads it back off its own
-/// durable group, and delivers it — and the offset the asker gets is the broker's
-/// own, which is what makes it a correlation id nobody can forge.
+/// The bridge publishes under the node's bound cap (the broker checks the producer
+/// id against the principal), and the asker's offset is the broker's own: a
+/// correlation id nobody can forge.
 #[test]
 fn a_post_lands_in_a_peers_inbox_and_its_answer_comes_back() {
     let w = World::boot("ask", &[]);
@@ -67,8 +64,8 @@ fn a_post_lands_in_a_peers_inbox_and_its_answer_comes_back() {
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("`--wait` must answer an offset: {}", reply.header()));
 
-    // B'S INBOX. `from=` is rendered from the delivered SUBJECT plus the
-    // node-attested `from=<sid>` — never from anything a sender wrote.
+    // B's inbox: `from=` is rendered from the delivered subject plus the
+    // node-attested `from=<sid>`, never from anything a sender wrote.
     let row = until("the ask to land in B's inbox", || {
         w.inbox(&b).into_iter().find(|r| r.contains("kind=ask"))
     });
@@ -77,8 +74,8 @@ fn a_post_lands_in_a_peers_inbox_and_its_answer_comes_back() {
     assert!(row.contains("trust=agent"), "{row}");
     assert!(row.contains("text=which%20branch"), "{row}");
 
-    // B ANSWERS, and A resolves the answer back to its own post through the
-    // (post id <-> offset) table the endpoint keeps.
+    // B answers, and A resolves the answer to its own post through the endpoint's
+    // post id ↔ offset table.
     let answer = w.verb(&format!(
         "@{b} post to=@{a} kind=answer re={ask_off} --wait=60000 fixtures on audit-2"
     ));
@@ -93,21 +90,16 @@ fn a_post_lands_in_a_peers_inbox_and_its_answer_comes_back() {
     );
 }
 
-/// **A `task` from an unlisted principal arrives `demoted=task`.** The message is
-/// delivered — a stranger may put words in front of an agent — but never as an
-/// instruction. A principal on `--accept-from` keeps its kind, which is what
-/// makes the demotion a policy rather than a blanket refusal.
+/// A `task` from an unlisted principal arrives `demoted=task`: delivered, but never as
+/// an instruction. A principal on `--accept-from` keeps its kind.
 #[test]
 fn a_task_from_an_unlisted_principal_arrives_demoted() {
     let w = World::boot("demote", &["a-orchestrator"]);
     w.wait_ready();
     let (a, _b) = w.two_sessions();
 
-    // THE STRANGER IS AN AGENT, not a human. `--accept-from` is the allowlist
-    // for principals a node has no other reason to trust; a HUMAN principal is
-    // accepted beside whatever it lists (§6.6 row 1, §8.4's `h-*`), so a human
-    // could never have been the
-    // subject of this test. See `bridge_oversize.rs` for the human's half.
+    // The stranger is an agent: a human principal is accepted beside whatever
+    // `--accept-from` lists (§6.6 row 1, §8.4's `h-*`).
     let mut god = w.god();
     for (who, text) in [("a-stranger", "unlisted"), ("a-orchestrator", "listed")] {
         let subject = format!("/f/{FLEET}/in/{}/{a}/{who}/task", w.node);
@@ -144,14 +136,14 @@ fn a_task_from_an_unlisted_principal_arrives_demoted() {
     );
 }
 
-/// **Three shapes that must never reach an inbox**, each recorded instead.
+/// Three shapes that never reach an inbox, each recorded instead:
 ///
-/// * an EIGHT-segment subject whose tail reads as a forged `<src>/<kind>` —
-///   `reason=malformed`, because the parse is by position from the left;
-/// * a `<sid>` this node does not host — `reason=not-hosted`;
-/// * a record on the node's OWN lane under the node's own id at an offset the
-///   bridge never acked — `reason=forged-self`, plus a `cap-compromised` ev,
-///   because nobody but a co-holder of the node cap could have written it.
+/// * an eight-segment subject whose tail reads as a forged `<src>/<kind>`:
+///   `reason=malformed`, since the parse is by position from the left;
+/// * a `<sid>` this node does not host: `reason=not-hosted`;
+/// * a record on the node's own lane under its own id at an offset the bridge never
+///   acked: `reason=forged-self`, plus a `cap-compromised` ev, since only a co-holder
+///   of the node cap could have written it.
 #[test]
 fn a_forged_subject_never_reaches_an_inbox_and_is_recorded() {
     let w = World::boot("forge", &[]);
@@ -177,9 +169,8 @@ fn a_forged_subject_never_reaches_an_inbox_and_is_recorded() {
             .expect("publish the forgery");
         offs.push(off);
     }
-    // A SENTINEL that MUST be delivered, published last: it is what proves the
-    // three above were refused rather than merely slow. Waiting for it is the
-    // synchronisation — there is no sleep here.
+    // A sentinel that must be delivered, published last: waiting for it proves the
+    // three above were refused, not slow.
     let good = format!("/f/{FLEET}/in/{}/{a}/h-andrew/note", w.node);
     god.publish(9_100, 4, &good, b"v=1 t=1 text=sentinel")
         .expect("publish the sentinel");
@@ -225,10 +216,9 @@ fn a_forged_subject_never_reaches_an_inbox_and_is_recorded() {
     );
 }
 
-/// **The fleet halt.** A human's `halt state=on` holds every session the node
-/// hosts — `turn` answers `ERR halted` from an Owner connection — and the node
-/// answers the halt at its offset with `state=held`, which is what makes
-/// `Last{…/node/ack}` with `re=<halt-offset>` a count of who obeyed.
+/// The fleet halt: a human's `halt state=on` holds every session the node hosts (a
+/// `send` answers `ERR halted`), and the node acks the halt at its offset with
+/// `state=held`, so `Last{…/node/ack}` with `re=<halt-offset>` counts who obeyed.
 #[test]
 fn a_fleet_halt_holds_every_session_and_is_acked_at_its_offset() {
     let w = World::boot("halt", &[]);
@@ -249,16 +239,14 @@ fn a_fleet_halt_holds_every_session_and_is_acked_at_its_offset() {
         w.verb(&format!("@{a} status")).header().contains("hold=1"),
         "status must report the standing hold"
     );
-    // EXEMPT VERBS STAY ANSWERABLE: a halted agent must still be able to ask why.
+    // Exempt verbs stay answerable: a halted agent can still ask why.
     assert!(w.verb(&format!("@{a} inbox --peek")).ok());
 
-    // ONE RETAINED `ack` SUBJECT PER NODE, NAMING THE BARRIER IT ANSWERS.
-    // A subject per halt offset spends one of the producer's 4096 distinct
-    // subjects on every halt record, on and off, forever — and past that bound
-    // the node cannot publish its own `live` presence row, so no bridge on it
-    // can ever attach again. `re=` carries the same information at a bounded
-    // cost: a quorum fold over `Last{/f/<F>/pub/*/node/ack}` counts the members
-    // whose `re=` is this barrier.
+    // One retained `ack` subject per node, naming the barrier in `re=`: a subject per
+    // halt offset would spend one of the producer's 4096 distinct subjects on every
+    // halt record, and past that bound the node could not publish its `live`
+    // presence row. A quorum fold over `Last{/f/<F>/pub/*/node/ack}` counts the
+    // members whose `re=` is this barrier.
     let ack = format!("/f/{FLEET}/pub/{}/node/ack", w.node);
     let counted = until("the node to ack the halt at its offset", || {
         w.row(&ack)
@@ -269,7 +257,7 @@ fn a_fleet_halt_holds_every_session_and_is_acked_at_its_offset() {
         "the node must count as HELD at the halt's own offset: {counted}"
     );
 
-    // AND IT LIFTS: each human lifts their own.
+    // And it lifts: each human lifts their own.
     god.publish(5_000, 2, &subject, b"v=1 t=1 state=off")
         .expect("lift the halt");
     until("the halt to lift", || {
@@ -280,20 +268,13 @@ fn a_fleet_halt_holds_every_session_and_is_acked_at_its_offset() {
     });
 }
 
-/// **A dead broker leaves the halt exactly where it was, and the posts queue.**
+/// A dead broker leaves the halt where it was, and posts queue.
 ///
-/// This is the direction the failure must go. A hold that a broker outage lifted
-/// would mean an agent could halt-dodge by cutting a cable; a post dropped
-/// because the broker was away would be a message the sender was told `OK` for
-/// and nobody ever sees. Neither happens: the hold lives in the endpoint and only
-/// a `state=off` RECORD lifts it, and `post` is refused at the door long before
-/// the queue could grow without bound.
-///
-/// THE HOLD IS SAMPLED DURING THE OUTAGE, after the bridge has run its whole
-/// link-loss path ([`World::stop_broker`] returns once the bridge is redialing a
-/// missing socket). The check after the reconnect cannot stand in for it: the
-/// attach re-derives every standing halt from the bus, so it would put back a
-/// hold the outage had lifted.
+/// A hold an outage lifted would let an agent dodge a halt by cutting a cable, and a
+/// dropped post would be one the sender was told `OK` for. The hold lives in the
+/// endpoint and only a `state=off` record lifts it. It is sampled during the outage,
+/// after [`World::stop_broker`] saw the bridge redialing: after the reconnect, the
+/// attach re-derives every standing halt from the bus and would hide a lift.
 #[test]
 fn a_dead_broker_keeps_the_hold_and_queues_the_posts_until_it_returns() {
     let mut w = World::boot("outage", &[]);
@@ -311,13 +292,12 @@ fn a_dead_broker_keeps_the_hold_and_queues_the_posts_until_it_returns() {
             .then_some(())
     });
 
-    // THE BROKER GOES AWAY. Its listener closes and every bridge connection with
-    // it; the log file stays, so the same records come back when it returns.
+    // The broker goes away; its log stays, so the same records come back with it.
     drop(god);
     w.stop_broker();
 
-    // The hold STAYS, with the bridge already redialing: nothing on the link
-    // loss path may lift it.
+    // The hold stays with the bridge already redialing: nothing on the link-loss
+    // path may lift it.
     assert!(
         w.verb(&format!("@{a} status")).header().contains("hold=1"),
         "a broker outage lifted the halt — log:\n{}",
@@ -329,8 +309,8 @@ fn a_dead_broker_keeps_the_hold_and_queues_the_posts_until_it_returns() {
         "a halted session must stay halted while the broker is away: {}",
         refused.header()
     );
-    // `post` and `inbox` stay answerable — a halted agent must still be able to
-    // send for help — and the post QUEUES rather than failing.
+    // `post` and `inbox` stay answerable (a halted agent can still send for help),
+    // and the post queues rather than failing.
     let queued = w.verb(&format!(
         "@{a} post to=@{b} kind=note queued while the bus was down"
     ));
@@ -349,8 +329,7 @@ fn a_dead_broker_keeps_the_hold_and_queues_the_posts_until_it_returns() {
         listing.rows()
     );
 
-    // THE BROKER COMES BACK on the same log and the same path, and the queued
-    // post lands.
+    // The broker comes back on the same log and path, and the queued post lands.
     w.start_broker();
     until("the queued post to land after the reconnect", || {
         w.inbox(&b)
@@ -358,25 +337,13 @@ fn a_dead_broker_keeps_the_hold_and_queues_the_posts_until_it_returns() {
             .any(|r| r.contains("text=queued%20while"))
             .then_some(())
     });
-    // And it is still held: the attach re-derives the standing halt, and
-    // nothing about a reconnect lifts it.
+    // Still held: the attach re-derives the standing halt.
     assert!(w.verb(&format!("@{a} status")).header().contains("hold=1"));
 }
 
-/// **ZERO PTY BYTES from any inbox record, and a stale `epoch=` refused.**
-///
-/// The rung's whole claim: an `answer`,
-/// a `task`, a `control`, a `note` and an `ack` from every principal class,
-/// each carrying a `re=` and a `gen=` — the fields a body could use to look
-/// like a drive record — must move not one byte of the terminal.
-///
-/// IT USED TO HAVE A SECOND HALF, and losing it is the point rather than a
-/// gap. That half published a real `term/in` record under a stale epoch and
-/// asserted the refusal, which proved the epoch check was what stood between
-/// the bus and the PTY "rather than the absence of a code path". The drive
-/// face is now absent, so the absence of a code path is exactly what stands
-/// there, and a test that published to `term/in` would be asserting about a
-/// subject this node no longer subscribes to.
+/// No bus record moves a PTY byte: an `answer`, `task`, `control`, `note` and `ack`
+/// from every principal class, each carrying the `re=` and `gen=` a drive record
+/// would, leave the terminal untouched.
 #[test]
 fn no_bus_record_ever_reaches_a_pty() {
     let w = World::boot("pty", &["h-andrew", "s-1"]);
@@ -412,7 +379,7 @@ fn no_bus_record_ever_reaches_a_pty() {
     }
     // Pipelined (`harness::publish_pipelined`): the same twenty, in order.
     harness::publish_pipelined(&mut w.god(), &records);
-    // Synchronise on the LAST one landing, then assert about the screen.
+    // Synchronise on the last one landing, then assert about the screen.
     until("every inbox record to be handled", || {
         (w.inbox(&a).len() >= 20).then_some(())
     });
@@ -424,10 +391,9 @@ fn no_bus_record_ever_reaches_a_pty() {
     assert!(!after.contains("PWNED"), "{after}");
 }
 
-/// **EVERY CONNECTION CARRIES ITS OWN WILL.** A broker restart fires the will
-/// of the connection it cut, and the reconnect registers a new one; `SIGKILL`
-/// of the bridge then fires exactly that one; and the relaunch publishes `live`
-/// above it.
+/// Every connection carries its own will: a broker restart fires the will of the
+/// connection it cut and the reconnect registers a new one, a `SIGKILL` of the
+/// bridge then fires exactly that one, and the relaunch publishes `live` above it.
 ///
 /// A BROKER RESTART IS A PRESENCE EPOCH. A broker reopened on its log fires
 /// every will that log holds, so the node row reads `away inc=<n>` until the
@@ -506,17 +472,16 @@ fn every_connection_carries_its_own_will_across_a_broker_restart_and_a_kill() {
         "a broker restart is a reconnect, not a relaunch"
     );
 
-    // WIPE THE STATE DIR's incarnation and sequence, keeping the node id: the
-    // relaunch must still not reuse a sequence, because the bus's own last row
-    // tells it where it had got to.
+    // Wipe the state dir's incarnation and sequence, keeping the node id: the bus's
+    // last row still tells the relaunch where it had got to.
     let _ = std::fs::remove_file(w.state.join("inc"));
     let _ = std::fs::remove_file(w.state.join("inc-lease"));
     let _ = std::fs::remove_file(w.state.join("seq"));
     harness::kill(pid, 9);
 
-    // The will the RECONNECT registered fires on that connection's end, at its
-    // incarnation; aterm relaunches the child, which reads the bus, takes a
-    // higher one and publishes `live` above the old reserved top.
+    // The will the reconnect registered fires at its incarnation; aterm relaunches
+    // the child, which reads the bus, takes a higher one and publishes `live` above
+    // the old reserved top.
     let back_inc = until(
         "the kill's will to fire and the relaunch to outrank it",
         || live_after_gone(&w, second_inc),

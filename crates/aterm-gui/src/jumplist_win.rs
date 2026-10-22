@@ -342,12 +342,10 @@ impl Drop for CoUninitGuard {
 /// Best-effort by design: any failure logs a single warn line and leaves the
 /// taskbar menu as it was, never a startup failure.
 pub(crate) fn install() {
-    // Only a window in the WINDOWED image owns the taskbar menu, the rule OS
-    // restart registration follows (`registers_for_os_restart`). The list is
-    // per-user, keyed on the AUMID, not per-process: any process that presents
-    // a frame rewrites it, and on 2026-09-30 aterm-gui's own test binaries
-    // (console-subsystem `target\debug\deps\aterm_gui-<hash>.exe`) repointed the
-    // owner's "New Window" row at a cargo test exe in a since-deleted worktree.
+    // Only the windowed image owns the taskbar menu, as for OS restart
+    // registration (`registers_for_os_restart`). The list is per-user, keyed on
+    // the AUMID: any process that presents a frame rewrites it, so a console
+    // test binary would repoint the rows at itself.
     // A private window is no one's either ([`owns_the_jump_list`]).
     let private = aterm_types::dirs::runs_under_private_state_root();
     if !owns_the_jump_list(crate::win32::running_image(), private) {
@@ -739,9 +737,8 @@ unsafe fn build_once(
     let list_ptr = list.as_raw().cast::<ICustomDestinationList>();
     let list_vt = unsafe { &*(*list_ptr).vtbl };
 
-    // Identity FIRST: bind the list to the process AUMID before BeginList, or
-    // it silently attaches to the exe-path identity — visibly fine on the live
-    // button, invisibly absent on the AUMID-stamped pinned tile.
+    // Identity first: without the AUMID before BeginList the list attaches to
+    // the exe-path identity and never shows on the pinned tile.
     let aumid = wide(aumid);
     check(
         unsafe { (list_vt.set_app_id)(list_ptr, aumid.as_ptr()) },

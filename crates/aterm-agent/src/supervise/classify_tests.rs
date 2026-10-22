@@ -661,6 +661,42 @@ fn comments_heredocs_and_quoting_that_only_read_stay_reads() {
     assert!(!ro("bash <<'EOF'\nls\nEOF"));
 }
 
+/// A `#` RIGHT AFTER AN ESCAPED BLANK OR NEWLINE OPENS NO COMMENT: the escaped
+/// character is its word's, so the `#` is too, and what follows on the line
+/// runs (MEASURED 2026-10-22: `echo ab\ #; echo RAN`, the same with a tab
+/// after the backslash, and `echo ab\⏎#; echo RAN` each print `RAN` under
+/// `/bin/bash` 3.2 and `/bin/zsh` 5.9). Each is no read with `tee x` there.
+/// A `#` after a blank and a line continuation (`echo ab \⏎#`) is refused
+/// too, though both shells read a comment there: this reader joins no
+/// lines, so it is stricter than the shell, never wider.
+///
+/// NEGATIVE CONTROLS: a `#` after an unescaped blank or tab is a comment,
+/// and its line's rest is hidden (a read; both shells print only `ab`); so
+/// is one after an escaped `#` and a blank (`ab\# #`, both print `ab#`);
+/// an escaped `#` with no blank after it opens none.
+#[test]
+fn a_hash_after_an_escaped_blank_or_newline_opens_no_comment() {
+    for cmd in [
+        "echo ab\\ #; tee x",
+        "echo ab\\\t#; tee x",
+        "echo ab\\\n#; tee x",
+        "echo ab \\\n#; tee x",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?}: {v:?}");
+        assert_eq!(v.reason, "tee", "{cmd:?}");
+    }
+    // NEGATIVE CONTROLS
+    for cmd in [
+        "echo ab #; tee x",
+        "echo ab\t#; tee x",
+        "echo ab\\# #; tee x",
+    ] {
+        assert!(ro(cmd), "{cmd:?}: {:?}", classify_command(cmd));
+    }
+    assert!(!ro("echo ab\\#; tee x"));
+}
+
 /// A program word is judged where it runs: as an argument it is data; at a
 /// head (also behind a wrapper, keyword or substitution) it is the program.
 #[test]

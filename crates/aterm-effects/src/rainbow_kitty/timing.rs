@@ -25,9 +25,7 @@
 
 use std::time::Duration;
 
-// ---------------------------------------------------------------------------
 // 1. The flight clock (§8.1 no. 1, §6.2)
-// ---------------------------------------------------------------------------
 
 /// Fixed cost of a flight in ms, before distance — the part of `T` that is
 /// "a jump happened at all" rather than "a jump went far" (§6.2).
@@ -140,9 +138,7 @@ pub const MINI_FAN_MIN_CELLS: u16 = 2;
 /// gone by 245 ms).
 pub const MINI_FAN_MAX_CELLS: u16 = JUMP_MIN_CELLS - 1;
 
-// ---------------------------------------------------------------------------
 // 1b. The phrase rest: one rest for the melody and the ribbon (law S5)
-// ---------------------------------------------------------------------------
 
 /// A typing gap this long is a rest: it resolves the melody's line and ends the
 /// phrase the ribbon holds. The melody re-exports it and the ribbon's grace
@@ -213,9 +209,7 @@ pub const fn ioi_next(ioi_ms: f32, gap_ms: u32, first: bool, rest: bool) -> f32 
     }
 }
 
-// ---------------------------------------------------------------------------
 // 2. The shared counts (§8.1)
-// ---------------------------------------------------------------------------
 
 /// Fewest shed fragments a meteor sputters, whatever the distance — a jump
 /// that sheds nothing has no sense of *burning* (§6.5 layer 5).
@@ -276,9 +270,7 @@ pub const fn rain_spacing_ms(flight_ms: f32) -> f32 {
     (flight_ms / FAN_HERO_N as f32).clamp(RAIN_SPACING_MIN_MS, RAIN_SPACING_MAX_MS)
 }
 
-// ---------------------------------------------------------------------------
 // 2b. The kill's retract schedule (§8.2, §27)
-// ---------------------------------------------------------------------------
 
 /// `12·n + 240` ms: the kill's retract span (§8.2). A kill of `n` cells drains
 /// its suffix farthest-first over this long; a Backspace (`n = 0`) over the
@@ -311,9 +303,7 @@ pub const fn kill_span_s(cells: u16) -> f32 {
     KILL_RETRACT_PER_CELL_S * (cells as f32) + KILL_RETRACT_BASE_S
 }
 
-// ---------------------------------------------------------------------------
 // 3. The token bucket (§8.1 no. 2, §13, D5)
-// ---------------------------------------------------------------------------
 
 /// Tokens the stardust bucket regains per second, hence ≤ 4 glints/s (§13);
 /// refilled once per `Engine::tick`.
@@ -330,9 +320,7 @@ pub const GLINT_REFILL_PER_S: f32 = 4.0;
 /// rain. Voice concurrency is the synth's lane cap.
 pub const GLINT_CAP: f32 = 3.0;
 
-// ---------------------------------------------------------------------------
 // 4. The seven named curves (§2.5)
-// ---------------------------------------------------------------------------
 //
 // The theme's only easing vocabulary; no linear fades except reduced motion's
 // `REDUCED_MOTION_FADE_MS`, which is deliberately not a curve function.
@@ -474,9 +462,7 @@ pub fn spring_whip(age_s: f32) -> f32 {
 /// static and its alpha runs linearly to zero over 120 ms at the end of its life.
 pub const REDUCED_MOTION_FADE_MS: f32 = 120.0;
 
-// ---------------------------------------------------------------------------
 // 5. The two coverage ceilings (§5.2, D1)
-// ---------------------------------------------------------------------------
 //
 // One star family, two prices: sky stars live above the ribbon for 225-460 ms
 // under the sparkle law; transient stars fly over ink for ≤ 340 ms under the
@@ -503,10 +489,8 @@ pub const TRANSIENT_STAR_COV_CEIL: f32 = 118.0;
 /// tops out here.
 pub const JUMP_COV_CEIL: f32 = 160.0;
 
-// ---------------------------------------------------------------------------
 // Compile-time laws: relations between the shared numbers, so a wrong value
 // does not compile.
-// ---------------------------------------------------------------------------
 
 // §8.1 / D6: the fan's five paired stars fit inside the fan.
 const _: () = assert!(FAN_HERO_N <= FAN_MAX_N);
@@ -536,9 +520,7 @@ const _: () = assert!(
     "the seconds form is the literal the ribbon's retract was baked with"
 );
 
-// ---------------------------------------------------------------------------
 // Small shared shapes
-// ---------------------------------------------------------------------------
 
 /// `t` clamped to `[0, 1]`, NaN resolving to 0 — the guard every curve above
 /// runs first, so a non-finite age can never propagate into a coverage byte.

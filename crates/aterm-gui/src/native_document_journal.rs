@@ -1022,13 +1022,10 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// While this lives, every journal lock THIS THREAD takes leaves a second
-/// descriptor onto its open file description behind, taken while the lock is
-/// held and kept until this drops — exactly what a shell another thread forks
-/// at that instant holds until it execs (`aterm_pty`'s hand-rolled `fork`
-/// closes only the pty pair and the status pipe before `execve`). The losing
-/// interleaving of the fork-copy race, made deterministic: a lock released by
-/// the close alone stays taken in the copy, and the next take is refused.
+/// While this lives, every journal lock this thread takes leaves behind a second descriptor
+/// onto its open file description, taken while the lock is held — what a shell another thread
+/// forks at that instant holds until it execs. It makes the fork-copy race deterministic: a lock
+/// released by the close alone stays taken in the copy, and the next take is refused.
 #[cfg(all(test, unix))]
 pub(crate) struct ForkedJournalLockCopies(());
 
@@ -2220,9 +2217,8 @@ fn with_journal_lock<T>(
         .ok_or_else(|| "journal has no parent directory".to_string())?;
     create_private_dir(parent).map_err(|error| format!("journal lock directory: {error}"))?;
     let lock_path = journal_lock_path(path)?;
-    // Released by `LOCK_UN` on every exit, not by the close: a shell forked while
-    // this runs would otherwise keep the lock until its exec, and the event loop's
-    // next take has 25 ms (the product fd-hygiene sweep of 2026-09-27).
+    // Released by `LOCK_UN` on every exit, not by the close: a shell forked while this runs
+    // would otherwise keep the lock until its exec.
     let _held = take_linked_journal_lock(&lock_path, path, patience)?;
     #[cfg(all(test, unix))]
     copy_held_lock_for_test(_held.file());

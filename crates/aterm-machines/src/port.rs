@@ -17,6 +17,7 @@ use std::time::Duration;
 
 mod complete_input;
 mod github_api;
+pub(crate) mod github_rest;
 mod read_owned_file;
 mod relay;
 mod rename_noreplace;
@@ -27,6 +28,7 @@ mod secret;
 mod staged_child;
 mod stops;
 
+pub use github_rest::RestMethod;
 pub use scratch::Scratch;
 pub use secret::{SECRET_MAX, Secret, no_core_dumps};
 pub use staged_child::{START_BYTE, START_LIMIT, StagedChild};
@@ -35,6 +37,10 @@ pub use stops::name as stop_name;
 /// The default bound on one tool run. Generous: a hung tool is what it catches, not a
 /// slow one.
 pub const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
+
+/// What [`Live`] spawns for one run: the program, its arguments and its environment.
+#[cfg(test)]
+pub(crate) type Spawned = (PathBuf, Vec<OsString>, Vec<(String, String)>);
 
 /// A complete bounded GitHub read, including the pagination headers.
 #[derive(Clone, PartialEq, Eq)]
@@ -75,9 +81,10 @@ pub struct Cmd {
     /// The deadline, counted from the start of the run.
     pub budget: Duration,
     /// Variables added to the fixed environment, in order (`HOMEBREW_NO_ANALYTICS=1`, or
-    /// `GH_TOKEN` for one `gh api` child). A run with `user` passes them through `env -i`,
+    /// `SSH_AUTH_SOCK` for the signing agent). A run with `user` passes them through `env -i`,
     /// where they are visible in that process's argv, so a secret belongs only on a run
-    /// without `user`.
+    /// without `user`, and a credential never in a variable: it goes on standard input
+    /// ([`System::run_complete_stdout_input`]).
     pub env: Vec<(String, String)>,
     /// The names in `env` whose values [`Cmd::display`] masks ([`Cmd::secret_env`]).
     /// `Debug` masks every value.
@@ -375,6 +382,24 @@ pub trait System: Sync {
         _endpoint: &str,
     ) -> Result<GithubResponse, String> {
         Err("GitHub reads are not implemented by this backend".into())
+    }
+
+    /// One GitHub REST request as this process's own account (the machines controller):
+    /// `method endpoint` to the API origin over aterm-http, `token` in an `Authorization`
+    /// header built in memory, `body` as JSON. A redirect is refused, never followed. The
+    /// live arm networks; the test arm answers from a script.
+    ///
+    /// # Errors
+    /// Unsupported backend, an endpoint that is not one path, a failed or cut-short request,
+    /// an answer over its bound, or a redirect. No error carries the token.
+    fn github_rest(
+        &self,
+        _token: &Secret,
+        _method: RestMethod,
+        _endpoint: &str,
+        _body: Option<&[u8]>,
+    ) -> Result<GithubResponse, String> {
+        Err("GitHub REST requests are not implemented by this backend".into())
     }
 
     /// Natural scrolling through the same native getter used by System Settings.
@@ -806,6 +831,17 @@ impl Live {
         Self::argv_from(self.euid(), cmd)
     }
 
+    /// What this port spawns for `cmd`: the program, its arguments and its whole
+    /// environment, for a test's spawn record.
+    ///
+    /// # Errors
+    /// As [`Live::argv`].
+    #[cfg(test)]
+    pub(crate) fn spawned(&self, cmd: &Cmd) -> Result<Spawned, RunFailed> {
+        let (program, args) = self.argv(cmd)?;
+        Ok((program, args, self.child_env(cmd)))
+    }
+
     /// [`Live::argv`] for a process whose effective uid is `euid`: a function of the
     /// two alone, so both the root wrapping and the refusal without root are checked
     /// on whatever account runs the tests.
@@ -1032,6 +1068,23 @@ impl System for Live {
             return Err("GitHub reads must run as their local user".into());
         }
         github_api::read(token, endpoint)
+    }
+
+    fn github_rest(
+        &self,
+        token: &Secret,
+        method: RestMethod,
+        endpoint: &str,
+        body: Option<&[u8]>,
+    ) -> Result<GithubResponse, String> {
+        github_rest::send(
+            &github_rest::live_client(),
+            github_rest::API,
+            token,
+            method,
+            endpoint,
+            body,
+        )
     }
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
@@ -2072,6 +2125,24 @@ mod fake {
             self
         }
 
+        /// Script a controller REST request (`github <METHOD> <endpoint>`), without
+        /// retaining its credential or opening a socket. [`Fake::calls`] records it with its
+        /// JSON body, when it has one, after the endpoint.
+        pub fn on_github_rest(
+            &self,
+            method: super::RestMethod,
+            endpoint: &str,
+            reply: Result<GithubResponse, String>,
+        ) -> &Self {
+            self.github_replies
+                .lock()
+                .unwrap()
+                .entry(format!("github {method} {endpoint}"))
+                .or_default()
+                .push(reply);
+            self
+        }
+
         /// Seed a file.
         pub fn file(&self, path: &str, bytes: &[u8]) -> &Self {
             self.files
@@ -2185,6 +2256,27 @@ mod fake {
                 Some(list) if list.len() > 1 => list.remove(0),
                 Some(list) if list.len() == 1 => list[0].clone(),
                 _ => Err("fake: no GitHub response was scripted".into()),
+            }
+        }
+
+        fn github_rest(
+            &self,
+            _token: &Secret,
+            method: super::RestMethod,
+            endpoint: &str,
+            body: Option<&[u8]>,
+        ) -> Result<GithubResponse, String> {
+            let key = format!("github {method} {endpoint}");
+            let call = match body {
+                Some(body) => format!("{key} {}", String::from_utf8_lossy(body)),
+                None => key.clone(),
+            };
+            self.calls.lock().unwrap().push(call);
+            let mut replies = self.github_replies.lock().unwrap();
+            match replies.get_mut(&key) {
+                Some(list) if list.len() > 1 => list.remove(0),
+                Some(list) if list.len() == 1 => list[0].clone(),
+                _ => Err(format!("fake: no GitHub response was scripted for `{key}`")),
             }
         }
 
@@ -3106,15 +3198,12 @@ mod tests {
 
     #[test]
     fn display_names_each_added_variable_and_masks_its_value() {
-        let cmd = Cmd::new("/opt/homebrew/bin/gh")
-            .secret_env("GH_TOKEN", "gho_secret")
-            .args(["api", "user"]);
-        assert_eq!(
-            cmd.display(),
-            "GH_TOKEN=\u{2026} /opt/homebrew/bin/gh api user"
-        );
-        assert!(!cmd.display().contains("gho_secret"));
-        assert!(!format!("{cmd:?}").contains("gho_secret"), "{cmd:?}");
+        let cmd = Cmd::new("/usr/bin/ssh-add")
+            .secret_env("SSH_AUTH_SOCK", "/private/agent-secret.sock")
+            .args(["-l"]);
+        assert_eq!(cmd.display(), "SSH_AUTH_SOCK=\u{2026} /usr/bin/ssh-add -l");
+        assert!(!cmd.display().contains("agent-secret"));
+        assert!(!format!("{cmd:?}").contains("agent-secret"), "{cmd:?}");
     }
 
     /// A new run lock, staging file or placeholder is only ordered (aterm-durable's

@@ -270,9 +270,7 @@ mod tests {
         assert!(style.is_default(), "clearing bold should restore default");
     }
 
-    // =========================================================================
     // Style reset clears everything
-    // =========================================================================
 
     #[test]
     fn test_reset_clears_all() {
@@ -334,9 +332,7 @@ mod tests {
         );
     }
 
-    // =========================================================================
     // CurrentStyle::new computes the caches
-    // =========================================================================
 
     #[test]
     fn test_new_with_all_fields() {

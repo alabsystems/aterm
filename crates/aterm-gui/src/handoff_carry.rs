@@ -360,7 +360,7 @@ pub(crate) fn export(sources: &[CarrySource], turn_id_ceiling: u64) -> Vec<(u64,
 /// stand on — is set aside first, then each session's differ state (all or
 /// none), and the archive's rows share what is left alike, each session's
 /// newest first: first every session's rows after its newest turn's mark,
-/// then the older ones (ATERM-KI-1015-2, U30). Spent greedily, a crowded
+/// then the older ones. Spent greedily, a crowded
 /// desk's first sessions carried their optional rows and its last ones lost
 /// their whole ledger, the same sessions on every update. When the cores ALONE
 /// overflow it, they share it ([`core_shares`]): every session keeps its
@@ -515,13 +515,11 @@ pub(crate) fn export_noting(
         .saturating_add(1);
     let mut taken = Vec::with_capacity(sources.len());
     for source in sources {
-        // A ledger another thread keeps is carried as NOTHING it vouches for:
-        // every turn id this process minted, or still mints, may name a
-        // record of it. SAID, as every other carry loss is.
+        // A ledger another thread keeps is carried as nothing it vouches for: every turn id
+        // this process minted, or still mints, may name a record of it.
         let (turns, floors) = match patiently(patience, || source.turns.try_lock()) {
-            // A turn still open here records into THIS process after the
-            // export: the carry does not vouch for the id it lands under.
-            // Each record in the receiver's words.
+            // A turn still open here records into this process after the export, so the
+            // carry does not vouch for its id. Each record in the receiver's words.
             Some(ledger) => (
                 ledger
                     .records()
@@ -652,7 +650,7 @@ pub(crate) fn export_noting(
         .map(|(granted, want)| if granted >= *want { *want } else { 0 })
         .collect();
     // THE DIFFERS' STATE from what the skeletons left, before any row
-    // (ATERM-KI-1015-2, U30): a sidecar sheds its rows before it, so it is
+    // : a sidecar sheds its rows before it, so it is
     // granted first, or the rows' grants would leave no room for it.
     // Screen-sized; all or none.
     let after_skeletons = after_cores.saturating_sub(skeleton_grants.iter().sum());
@@ -666,7 +664,7 @@ pub(crate) fn export_noting(
         .map(|(granted, want)| if granted >= *want { *want } else { 0 })
         .collect();
     // THE ROWS share what the differs left, in two tiers, each split alike
-    // (`core_shares`) and each session's newest rows first (ATERM-KI-1015-2,
+    // (`core_shares`) and each session's newest rows first (
     // U30): every session's rows after its newest turn's mark (what `drive
     // report` reads back), then its older rows. Spent in pool order, the first
     // sessions carried their whole tails and the later ones none, the same
@@ -721,8 +719,7 @@ pub(crate) fn export_noting(
             chosen.push((index, local_id, turns, pick, *skeleton));
         } else {
             unspent = granted;
-            // SAID, not silent (round seven, finding 44): the session adopts
-            // with an empty ledger and a fresh archive.
+            // The session adopts with an empty ledger and a fresh archive.
             aterm_log::warn!(
                 "update apply: session {local_id}'s control carry does not fit what is left \
                  of the handoff's budget ({room} bytes); it hands off without its turn ledger \
@@ -1122,7 +1119,7 @@ struct Chosen {
 /// many as the last encode ran over (at least one): an encode or two, where
 /// shedding half the ledger at a time left up to half the room unspent.
 ///
-/// THE ROWS ARE SHED A FEW AT A TIME TOO (ATERM-KI-1015-2, U30). They went
+/// THE ROWS ARE SHED A FEW AT A TIME TOO. They went
 /// all at once: a tail a few bytes past its room crossed as counters alone,
 /// so on a crowded desk the first session whose whole tail did not fit what
 /// the aggregate had left lost every row — the few KB after its newest turn's

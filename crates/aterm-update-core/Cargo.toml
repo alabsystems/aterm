@@ -25,8 +25,7 @@ aterm-durable = { workspace = true }
 aterm-time = { workspace = true }
 # Diagnostics land in the app log file (visible for a Finder-launched .app, unlike stderr).
 aterm-log = { workspace = true }
-# The shared release-manifest wire type (src/manifest.rs): ONE serde struct the
-# publisher (crates/aterm-release) and the updater client both compile against.
+# The release-manifest wire type (src/manifest.rs) the publisher and the updater share.
 serde = { workspace = true, features = ["derive"] }
 aterm-toml = { workspace = true }
 # Ed25519 verification of the master-signed MACHINE ROSTER (src/roster.rs). The chain
@@ -65,8 +64,7 @@ aterm-digest = { workspace = true }
 [dev-dependencies]
 # Exclusive private directories for file-hash fixtures, removed on drop.
 aterm-tempfile = { workspace = true }
-# The Linux binary-identity round-trip test reads its JSON back through the
-# workspace's own parser; the library itself writes no JSON.
+# The Linux binary-identity round-trip test; the library writes no JSON.
 aterm-json = { workspace = true }
 # The roster tests sign synthetic fixtures, which needs ring's `alloc`; default features in
 # the test build only, so the normal build still proves the no-alloc verify path.

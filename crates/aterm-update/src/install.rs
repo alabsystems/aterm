@@ -555,9 +555,8 @@ fn rearm_or_close_handoff_fd(fd: i32) {
 /// is re-armed before any rollback helper can spawn.
 ///
 /// The exec is `exec_keeping_sigpipe`: `Command::exec` resets SIGPIPE to its default and
-/// leaves it there when the exec fails, and the rollback arm that follows a failed exec
-/// carries on in this process, which would then die on its next write to a peer that has
-/// gone.
+/// leaves it there when the exec fails, and the rollback arm that carries on in this
+/// process would then die on its next write to a vanished peer.
 fn exec_preserving_handoff_fds(
     command: &mut aterm_uds::spawnfd::StdCommand,
     handoff_fds: &[i32],
@@ -599,8 +598,8 @@ use crate::relaunch::window_successor_args;
 /// (so no codesign/PlistBuddy/spctl helper sees them), but the successor re-runs prearm
 /// and, without them, classifies the handoff malformed and exits.
 ///
-/// `ATERM_UPDATED_FROM` names the build this image was: the successor's `main`
-/// reads it for the post-update notice and clears it.
+/// `ATERM_UPDATED_FROM` names the build this image was, for the successor's post-update
+/// notice.
 fn boot_reexec_command(
     new_exe: &std::path::Path,
     args: impl Iterator<Item = std::ffi::OsString>,
@@ -614,13 +613,11 @@ fn boot_reexec_command(
     )]
     let mut reexec = std::process::Command::new(new_exe);
     reexec
-        // The swap re-exec targets the canonical Mach-O, losing any argv0 alias, and
-        // only runs from the window entry, so pin the mode for the one-binary router
-        // before the forwarded args (the router's scan stops at the first
-        // -e/--command/--, so an appended flag would be invisible). A headless
-        // instance's `--headless` rides the forwarded args, which are stripped of
-        // earlier swaps' pins, so exactly one `--window` survives any number of
-        // updates.
+        // The re-exec targets the canonical Mach-O, losing any argv0 alias, and runs only
+        // from the window entry, so `window_successor_args` pins `--window` before the
+        // forwarded args (the router stops scanning at the first -e/--command/--, so an
+        // appended flag would be invisible). It strips earlier swaps' pins, so one pin
+        // survives any number of updates; `--headless` rides the forwarded args.
         .args(window_successor_args(args))
         .env("ATERM_UPDATE_REEXEC", reexec_value)
         .env("ATERM_UPDATED_FROM", updated_from.to_string());
@@ -3643,10 +3640,8 @@ pub fn stage_from_dmg(
     )
 }
 
-// ---------------------------------------------------------------------------
 // Bounding the zip extract: what unpacking this archive would cost, read from the
 // archive's own central directory before `ditto` may run.
-// ---------------------------------------------------------------------------
 
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
@@ -4099,9 +4094,8 @@ pub fn stage_from_zip(
         let _ = std::fs::remove_dir_all(&extract);
     })?;
     let incoming = incoming_attempt.path.clone();
-    // A rename inside `staged/` (same directory, so necessarily the same volume)
-    // moves the bundle without re-copying it — nothing is re-materialized, so no
-    // extended attribute or signature byte can be lost in transit.
+    // A rename within `staged/` (so one volume) moves the bundle without re-copying it,
+    // so no extended attribute or signature byte can be lost in transit.
     if let Err(error) = std::fs::rename(&src, &incoming) {
         let _ = std::fs::remove_dir_all(&extract);
         return Err(format!("move extracted bundle into place: {error}"));
@@ -4827,11 +4821,10 @@ fn admit_stage_under_apply_lock(
     //    `two_processes_arming_one_build_swap_it_once` drives with a sibling's whole
     //    apply injected while this launch waits for the lock.
     //
-    // Bounded, unlike every other taker of this lock: we are before the window, so
-    // waiting here is a terminal that has not appeared. Every legitimate holder
-    // returns in milliseconds (publish is remove+rename+write) or is itself bounded
-    // (verification by the apply budget, a cross-volume copy by its ceiling). A
-    // holder that outlasts this is wedged, and we start on the build we have.
+    // Bounded, unlike every other taker of this lock: we are before the window. Every
+    // legitimate holder returns in milliseconds or is itself bounded (verification by
+    // the apply budget, a cross-volume copy by its ceiling), so a holder that outlasts
+    // this is wedged, and we start on the build we have.
     let (lock, budget, ready) = apply_lock_then_ready(
         staging,
         current_build,
@@ -5659,10 +5652,9 @@ fn revert_to_rollback(
     if let Some(t) = crate::manifest::FailedMark::read(&staging.trial())
         && t.build_number == current_build
     {
-        // Quarantine, not `record`: `FailedMark::suppresses` treats a zero
-        // `retry_after` as already elapsed, so a "forever" memo would be ignored.
-        // It also goes to its own ledger, since `failed.toml` holds one artifact
-        // and the next stage event of another build overwrites it.
+        // A quarantine, not a timed memo: `FailedMark::suppresses` reads a zero
+        // `retry_after` as elapsed, and the quarantine ledger survives the next stage
+        // event, which overwrites `failed.toml`.
         // Ordered when the install root shares this device: the verdict lands before the
         // trial, rollback and stage deletions below; if all are lost, one bounded trial
         // runs again.
@@ -5720,13 +5712,10 @@ fn revert_to_rollback(
              this LaunchServices-launched successor exits instead of re-executing it"
         ));
     }
-    // Re-exec the restored OLD binary as a fresh boot: no re-exec env, no sentinel
-    // (already cleared), nothing staged.
-    //
-    // The handoff authority rides along: the handoff descriptors are kept open
-    // across this exec, and the authority variables the GUI's prearm consumed are
-    // restored, so a reverted overlap candidate re-validates the inherited handoff
-    // and refuses it on target identity through its logged path.
+    // Re-exec the restored OLD binary as a fresh boot: no re-exec env, no sentinel,
+    // nothing staged. The handoff descriptors stay open and the authority variables are
+    // restored, so a reverted overlap candidate re-validates the inherited handoff and
+    // refuses it on target identity through its logged path.
     let mut reexec = rollback_reexec_command(&b.exe, std::env::args_os().skip(1), handoff_env);
     if !handoff_fds.is_empty() {
         crate::warn(&format!(
@@ -6950,7 +6939,7 @@ fn confirm_boot_health_at_with_proof(
     lock_wait: std::time::Duration,
     prove: impl FnOnce(&Path) -> Result<(), String>,
 ) -> bool {
-    // No trial for this build is already complete. A different build's marker is
+    // No trial armed for this build: already complete. A different build's marker is
     // not ours to retry or mutate. An unreadable marker of this build's trial is
     // still its trial (`trial_armed_for`).
     if !trial_armed_for(staging, current_build) {

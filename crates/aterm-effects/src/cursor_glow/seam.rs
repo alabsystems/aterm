@@ -3182,14 +3182,12 @@ impl CursorGlow {
         let fresh_stamp = self.type_hint.peek_fresh(now, Self::TYPE_HINT_FRESH);
         let mut typed_at = fresh_stamp;
         let mut in_flight_licence = false;
-        // An unpaid press is itself a typed licence. A debounced app may repaint
-        // after every key stamp expired, which would leave the last cells dark
-        // at the caret. With no fresh stamp, ask the ledger whether a press's
-        // glyph is still unlaid. Self-limiting: program output banks no
-        // credits (`a_caret_that_advances_with_no_unpaid_press_still_buys_nothing`).
-        // Gated to the echo shape (a same-row forward advance or a paid fold);
-        // other shapes keep the stamp window. The licence's clock is the oldest
-        // unpaid press, matching `take_fresh`'s order and the born-at-key rule.
+        // An unpaid press is itself a typed licence: a debounced app may
+        // repaint after every key stamp expired, which would leave the last
+        // cells dark at the caret. Self-limiting, since program output banks no
+        // credits. Gated to the echo shape (a same-row forward advance or a paid
+        // fold); the licence's clock is the oldest unpaid press, matching
+        // `take_fresh`'s order and the born-at-key rule.
         if let Some(run) = exact_typed_run {
             typed_at = self.type_press_ring.slots[run.slot].map(|(at, _, _)| at);
             in_flight_licence = fresh_stamp.is_none();
@@ -3351,8 +3349,8 @@ impl CursorGlow {
         // * a lifted word ([`Self::lifted_word`]) lays no landing, so the gate
         //   stands down and the move reaches v2 with its `Lift`.
         // The typed fold never reaches the gate; a key that pushed text down
-        // ([`Self::key_pushed_text_down`]) and a reflowed soft-wrapped word
-        // ([`Self::carried_word_left`]) land right of the key's glyph and pass.
+        // and a reflowed soft-wrapped word land right of the key's glyph and
+        // pass.
         let soft_wrap = if exact_typed_run.is_none() && (lays_typed_cells || re_anchor_landing) {
             self.soft_wrapped_caret(pr, pc, cr, cc, pane_col0, now)
         } else {

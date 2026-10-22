@@ -230,7 +230,7 @@ pub struct Reading {
     pub goal_active: bool,
     /// The worker's last words ([`crate::turn::said_tail`]).
     pub said_tail: Option<String>,
-    /// A PERSON stopped the last turn (Esc): the next message is theirs
+    /// A person stopped the last turn: the next message is theirs
     /// ([`crate::turn::interrupted`]).
     pub interrupted: bool,
     /// No turn yet ([`ScreenReader::fresh`]: [`crate::turn::fresh`]): an idle point here ended nothing — a
@@ -543,6 +543,20 @@ pub trait ScreenReader: Sync {
     /// shows: its leaving ends the turn (`await gone`). `None`: nothing says a turn runs.
     fn busy_guard(&self) -> Option<String> {
         None
+    }
+    /// Whether `rows` hold a frame caught mid-redraw, by its geometry: a screen a
+    /// turn-end reader must read again rather than judge. The terminal holds back the
+    /// rows of a frame a program bracketed in DEC 2026 and has not closed (`text --json`'s
+    /// `"frame":"open"`); this is the check for what that cannot see, a program that
+    /// brackets nothing, or a read that raced its frame's close
+    /// (`docs/measured/half-drawn-frame-2026-10-22.md`). By default, every reader's: a
+    /// composer framed by two rules (the phase module's `composer_frame`, which Claude
+    /// Code's and Muse Code's both are) whose bottom rule is shorter than its top rule, or stands on
+    /// the last row read with nothing under it
+    /// ([`crate::phase::composer_frame_torn`]). It reads torn on no whole frame of the four
+    /// programs (`frame_torn_sweep`), so a program that brackets nothing (Muse Code) keeps it.
+    fn frame_torn(&self, rows: &[String]) -> bool {
+        crate::phase::composer_frame_torn(rows)
     }
     /// Whether the row [`Self::busy_guard`] matches STAYS while an approval
     /// box is up, so a wait on it leaving does not end when a box is drawn.

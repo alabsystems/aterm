@@ -18,3 +18,7 @@ rust-version.workspace = true
 [dependencies]
 astream-wire = { workspace = true }
 astream-digest = { workspace = true }
+# The owner-only secret-file rule (capfile) opens and judges a secret through
+# astream-sys: a non-blocking open, the owner uid, and macOS's access list.
+# Zero-dependency itself, so this crate still takes no third-party code.
+astream-sys = { workspace = true }

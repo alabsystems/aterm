@@ -95,9 +95,7 @@ pub const CLASS_TABLE: usize = 256;
 /// Completed jobs' medians a class keeps.
 pub const CLASS_RING: usize = 16;
 
-// ---------------------------------------------------------------------------
 // What the host reads
-// ---------------------------------------------------------------------------
 
 /// A process's scheduling state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -581,9 +579,7 @@ pub struct Want {
     pub fds: bool,
 }
 
-// ---------------------------------------------------------------------------
 // What the engine says
-// ---------------------------------------------------------------------------
 
 /// What kind of unit a job is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1113,9 +1109,7 @@ impl JobsView {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The command class table (μ learned per command)
-// ---------------------------------------------------------------------------
 
 /// The command class of a command line: the basename of its first word
 /// (skipping `NAME=value` assignments), at most 32 bytes, plus the job kind.

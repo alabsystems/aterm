@@ -834,6 +834,40 @@ mod tests {
         assert!(!term.drain_bell(), "flag is cleared after draining");
     }
 
+    /// BELS UNDER 100 MS APART RING ONCE, as `status bells=` says of its
+    /// count: the throttle, on the batch's clock, comes before the bell
+    /// callback the host counts, so one write's `\a\a\a` and a second write
+    /// 99 ms later are one bell. NEGATIVE CONTROL: a BEL 100 ms after the
+    /// first rings again.
+    #[test]
+    fn bels_under_a_hundred_ms_apart_ring_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        use crate::terminal::ClockReading;
+
+        let mut term = Terminal::new(24, 80);
+        let rang = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&rang);
+        term.set_bell_callback(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        });
+        let t0 = ClockReading::now();
+        let at = |ms: u64| ClockReading {
+            monotonic: t0.monotonic + Duration::from_millis(ms),
+            wall_ms: None,
+        };
+        term.process_at(b"\x07\x07\x07", at(0));
+        term.process_at(b"\x07", at(99));
+        assert_eq!(rang.load(Ordering::Relaxed), 1, "a burst is one bell");
+        assert_eq!(term.bell_total(), 1);
+        // CONTROL: the throttle's interval passed, so the next one counts.
+        term.process_at(b"\x07", at(100));
+        assert_eq!(rang.load(Ordering::Relaxed), 2, "a bell 100 ms on rings");
+        assert_eq!(term.bell_total(), 2);
+    }
+
     /// OSC 7 queues the parsed cwd as an app-event and updates the terminal's
     /// working directory. A named URI host is kept in the event's `//host/path`
     /// form, while the terminal's own cwd is the plain local path.
@@ -1094,8 +1128,8 @@ pub struct HistoryShed {
 }
 
 impl HistoryShed {
-    /// Bytes the pass actually gave back — zero when the store was already
-    /// under the target, which is the common case under a WARN-tier shed.
+    /// Bytes the pass gave back: zero when the store was already under the
+    /// target, the common case under a WARN-tier shed.
     #[inline]
     #[must_use]
     pub const fn freed(self) -> usize {

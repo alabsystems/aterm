@@ -104,7 +104,7 @@ pub struct ClassicWake {
     /// Deadline until which the crown is still emitted (cached so [`Self::is_active`]
     /// needs no clock); keeps the timer armed past comet decay.
     crown_until: Option<Instant>,
-    /// The crown window the LAST move applied: [`Self::CROWN_TYPING_MS`] for a
+    /// The crown window the last move applied: [`Self::CROWN_TYPING_MS`] for a
     /// typing step, [`Self::CROWN_MS`] for a jump.
     crown_window_ms: u64,
     /// Rolling hue phase (turns), advanced per spawn.
@@ -397,7 +397,6 @@ impl ClassicWake {
             self.crown_until = None;
         }
 
-        // ---- emit the light layers ----
         if cfg.dark_theme && cfg.classic_mono && !self.mono_unbedded() {
             // The mono face: the tracer's bed under the letters, its light
             // over air, and the crown and ring through the over-ink account.

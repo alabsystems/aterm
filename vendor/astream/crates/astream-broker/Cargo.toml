@@ -50,7 +50,7 @@ retention = []
 astream-wire = { workspace = true }
 # The OS cordon: this boot's id (the unclean-open rule, logid.rs) and the ordering-only
 # flush. In-tree and zero-dependency, so the broker stays zero-third-party and keeps
-# forbid(unsafe): the two FFI calls live in astream-sys's one cordoned module.
+# forbid(unsafe): its FFI calls live in astream-sys's cordoned modules.
 astream-sys = { workspace = true }
 astream-cap = { workspace = true, optional = true }
 astream-aead = { workspace = true, optional = true }

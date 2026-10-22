@@ -470,40 +470,55 @@ fn secret_file_refusals_name_the_path_first_and_keep_the_kind() {
     let raw = std::fs::File::open(&missing).expect_err("absent");
     assert!(!raw.to_string().contains(&shown), "{raw}");
 
-    // An owner-only directory opens on Unix and fails at the read (EISDIR): an OS
-    // error from the read, not the open, still path-first, the path once, and of
-    // the kind the raw read of the same directory fails with (the control: the
-    // wrap keeps the OS's kind rather than choosing one of its own).
+    // Reject path syntax before opening the directory. Normal names are exercised
+    // by the private-directory aggregate below; these must not escape or normalize
+    // into a different component on the host platform.
+    for name in ["", ".", "..", "sub/k", "./k", "sub/../k", "k/", "/k"] {
+        assert_eq!(
+            read_secret_in(dir, name).expect_err("one component").kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{name:?}"
+        );
+    }
+    #[cfg(windows)]
+    for name in [
+        r"sub\k",
+        r"..\k",
+        r"\k",
+        r"C:\k",
+        r"C:k",
+        r"\\server\share\k",
+        r"\\?\C:\k",
+    ] {
+        assert_eq!(
+            read_secret_in(dir, name).expect_err("one component").kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{name:?}"
+        );
+    }
+
+    // An owner-only directory is no secret file: it is refused at the open, before a
+    // byte is read, as InvalidInput naming what it is, path first and once, by each of
+    // the three functions. (Before the regular-file clause it opened, passed the mode
+    // and failed at the read with EISDIR.)
     #[cfg(unix)]
     {
-        use std::io::Read as _;
         let sub = dir.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         chmod(&sub, 0o700);
         let sub_shown = sub.display().to_string();
-        let raw_kind = std::fs::File::open(&sub)
-            .expect("a directory opens read-only")
-            .read_to_end(&mut Vec::new())
-            .expect_err("a directory does not read")
-            .kind();
-        assert!(
-            !matches!(
-                raw_kind,
-                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidData
-            ),
-            "{raw_kind:?}"
-        );
         for e in [
+            check_private(&sub).expect_err("a directory is not a secret"),
             read_private_file(&sub).expect_err("a directory is not a secret"),
             read_secret_file(&sub).expect_err("a directory is not a secret"),
         ] {
-            assert_eq!(e.kind(), raw_kind, "{e}");
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
             let text = e.to_string();
-            assert!(text.starts_with(&format!("{sub_shown}: ")), "{text}");
-            assert_eq!(text.matches(&sub_shown).count(), 1, "{text}");
-            assert!(!text.contains("is mode"), "the mode passed: {text}");
+            assert_eq!(
+                text,
+                format!("{sub_shown} is a directory: a secret file is a regular file")
+            );
         }
-        assert!(check_private(&sub).is_ok(), "the mode alone passes");
     }
 }
 
@@ -535,4 +550,234 @@ fn a_failed_secret_read_wipes_the_bytes_it_already_collected() {
     let mut secret = Vec::new();
     read_secret_into(&mut std::io::Cursor::new(exact), &mut secret).unwrap();
     assert_eq!(secret, exact);
+}
+
+/// `chmod <args> <path>` (macOS's, which takes `+a` and `-N`), which must succeed.
+#[cfg(target_vendor = "apple")]
+fn chmod_acl(args: &[&str], path: &std::path::Path) {
+    let ran = std::process::Command::new("/bin/chmod")
+        .args(args)
+        .arg(path)
+        .status()
+        .expect("run chmod");
+    assert!(ran.success(), "chmod {args:?} {}", path.display());
+}
+
+/// On macOS a 0600 secret carrying an `everyone allow read` entry is open to every
+/// user though its mode says otherwise: each reader refuses it as PermissionDenied,
+/// path first, naming `chmod -N <path>`, and so does `read_secret_in` for a 0700
+/// directory carrying an `everyone allow list` entry, naming `chmod -N <dir>`.
+/// Controls: after `chmod -N` the same file and directory pass and the bytes come
+/// back; a DENY entry takes nothing away and passes.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn secret_file_an_access_list_that_allows_others_is_refused() {
+    let scratch = secret_scratch("acl");
+    let dir = scratch.path();
+    let path = dir.join("mint.secret");
+    let shown = path.display().to_string();
+    let bytes = [0x5a; SECRET_MIN];
+    std::fs::write(&path, bytes).unwrap();
+    chmod(&path, 0o600);
+    chmod_acl(&["+a", "everyone allow read"], &path);
+    for (door, e) in [
+        ("check_private", check_private(&path).expect_err("ACL")),
+        (
+            "read_private_file",
+            read_private_file(&path).expect_err("ACL"),
+        ),
+        (
+            "read_secret_file",
+            read_secret_file(&path).expect_err("ACL"),
+        ),
+        (
+            "read_secret_in",
+            read_secret_in(dir, "mint.secret").expect_err("ACL"),
+        ),
+    ] {
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{door}");
+        let text = e.to_string();
+        assert!(
+            text.starts_with(&format!(
+                "{shown} carries an access list (ACL) that lets other users in"
+            )),
+            "{door}: {text}"
+        );
+        assert!(
+            text.contains(&format!("`chmod -N {shown}`")),
+            "{door}: {text}"
+        );
+    }
+    chmod_acl(&["-N"], &path);
+    assert_eq!(read_secret_file(&path).expect("no ACL"), bytes);
+    assert_eq!(read_secret_in(dir, "mint.secret").expect("no ACL"), bytes);
+    chmod_acl(&["+a", "everyone deny write"], &path);
+    assert_eq!(read_secret_file(&path).expect("a deny entry"), bytes);
+
+    chmod_acl(&["+a", "everyone allow list"], dir);
+    let e = read_secret_in(dir, "mint.secret").expect_err("the directory's ACL");
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    let text = e.to_string();
+    let dir_shown = dir.display().to_string();
+    assert!(
+        text.starts_with(&format!("{shown}: its directory {dir_shown} carries")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("`chmod -N {dir_shown}`")), "{text}");
+    chmod_acl(&["-N"], dir);
+    assert_eq!(read_secret_in(dir, "mint.secret").expect("no ACL"), bytes);
+}
+
+/// A FIFO at a secret's path is refused AT ONCE, as InvalidInput naming it, by the
+/// path reader and by `read_secret_in`: the open is non-blocking, so nothing waits for
+/// a writer that never comes. Each read runs on its own thread behind the one-minute
+/// hang detector, so a blocking open fails the test rather than hanging it.
+#[cfg(unix)]
+#[test]
+fn secret_file_a_fifo_is_refused_without_waiting_for_a_writer() {
+    let scratch = secret_scratch("fifo");
+    let dir = scratch.path().to_path_buf();
+    let fifo = dir.join("mint.secret");
+    let made = std::process::Command::new("mkfifo")
+        .arg("-m")
+        .arg("600")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo");
+    let shown = fifo.display().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_secret_file(&fifo));
+        let _ = tx.send(read_secret_in(&dir, "mint.secret"));
+    });
+    for door in ["read_secret_file", "read_secret_in"] {
+        let e = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{door} waited on a FIFO"))
+            .expect_err("a FIFO is no secret file");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{door}");
+        assert_eq!(
+            e.to_string(),
+            format!("{shown} is a FIFO: a secret file is a regular file"),
+            "{door}"
+        );
+    }
+}
+
+/// `read_secret_in` holds the directory and the file's links to aterm's rule; the
+/// path reader keeps following a link the operator names. Over real files: a 32-byte
+/// secret in a 0700 directory reads exactly (the control of every refusal below);
+/// a symlink to it and a second hard link to it are refused by `read_secret_in` as
+/// PermissionDenied, path first, while `read_secret_file` follows the symlink and
+/// reads the hard link (the path API is unchanged); a directory open to others is
+/// refused naming `chmod 700 <dir>`, a symlinked directory is refused, a name of more
+/// than one component is InvalidInput, a missing directory or file is NotFound (a
+/// missing file even in a loose directory), and
+/// `/` (root's, holding `/usr`) is refused for its owner unless the reader is root (then
+/// for its mode).
+#[cfg(unix)]
+#[test]
+fn secret_file_in_a_private_directory_is_read_through_no_link() {
+    let scratch = secret_scratch("in");
+    let dir = scratch.path();
+    let bytes = [0x5a; SECRET_MIN];
+    let real = dir.join("mint.secret");
+    std::fs::write(&real, bytes).unwrap();
+    chmod(&real, 0o600);
+    assert_eq!(read_secret_in(dir, "mint.secret").expect("private"), bytes);
+
+    let link = dir.join("linked.secret");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let e = read_secret_in(dir, "linked.secret").expect_err("a symlink");
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        e.to_string()
+            .starts_with(&format!("{} is a symlink: ", link.display())),
+        "{e}"
+    );
+    assert_eq!(
+        read_secret_file(&link).expect("the path API follows"),
+        bytes
+    );
+
+    let second = dir.join("second.secret");
+    std::fs::hard_link(&real, &second).unwrap();
+    for name in ["mint.secret", "second.secret"] {
+        let e = read_secret_in(dir, name).expect_err("two links");
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{name}");
+        assert!(
+            e.to_string()
+                .starts_with(&format!("{} has 2 links: ", dir.join(name).display())),
+            "{e}"
+        );
+    }
+    assert_eq!(read_secret_file(&second).expect("the path API"), bytes);
+    std::fs::remove_file(&second).unwrap();
+    assert_eq!(
+        read_secret_in(dir, "mint.secret").expect("one link again"),
+        bytes
+    );
+
+    chmod(dir, 0o755);
+    let e = read_secret_in(dir, "mint.secret").expect_err("a loose directory");
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    let text = e.to_string();
+    assert!(
+        text.starts_with(&format!(
+            "{}: its directory {} is mode 0755: ",
+            real.display(),
+            dir.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("`chmod 700 {}`", dir.display())),
+        "{text}"
+    );
+    // No secret is NotFound whatever its directory is: the directory is judged when
+    // there is a secret in it to keep.
+    assert_eq!(
+        read_secret_in(dir, "absent.secret")
+            .expect_err("absent in a loose directory")
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    chmod(dir, 0o700);
+
+    let dir_link = scratch.path().with_extension("link");
+    std::os::unix::fs::symlink(dir, &dir_link).unwrap();
+    let e = read_secret_in(&dir_link, "mint.secret").expect_err("a symlinked directory");
+    let _ = std::fs::remove_file(&dir_link);
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(e.to_string().contains("is a symlink"), "{e}");
+
+    for name in ["sub/mint.secret", "..", ".", ""] {
+        assert_eq!(
+            read_secret_in(dir, name).expect_err("one component").kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{name:?}"
+        );
+    }
+    assert_eq!(
+        read_secret_in(dir, "absent.secret")
+            .expect_err("absent")
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_eq!(
+        read_secret_in(dir.join("absent"), "mint.secret")
+            .expect_err("no directory")
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+
+    // `/usr` is there on every Unix, so `/` is judged as the directory it is in.
+    let e = read_secret_in("/", "usr").expect_err("root's directory");
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    if astream_sys::euid() == 0 {
+        assert!(e.to_string().contains("is mode 0755"), "{e}");
+    } else {
+        assert!(e.to_string().contains("is owned by uid 0"), "{e}");
+    }
 }

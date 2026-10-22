@@ -1074,7 +1074,6 @@ mod a3 {
     }
 }
 
-// ===========================================================================
 // l3c: copies beside the line on a 24×80 grid: a completion popup, a twin
 // drawn after the first keys, a scroll's copy on the new last row, and the
 // limits a copy short of `TWIN_MIN` sets. (fzf's late list, vim's `yyp` and a
@@ -1082,7 +1081,6 @@ mod a3 {
 // not re-read). Frames on the flat 16 ms train (`flat`) or at the GUI's pacing
 // once typing stops (`paced`). (The split pane's scrolled-in copy is
 // `tests/copy_beside_the_line.rs`'s.)
-// ===========================================================================
 mod l3c {
     use super::*;
 

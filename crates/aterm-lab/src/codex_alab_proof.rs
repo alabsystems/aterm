@@ -3,7 +3,7 @@
 
 //! `codex-alab-proof [--package DIR] [--aterm PATH] [--keep]`: the codex-alab
 //! native harness, end to end (its contract, `alab/CONTRACT.md` §9.3, and
-//! FOREVER CRUISE / FOREVER LAND, the owner's ruling of 2026-10-19 its §5
+//! Autopilot Cruise / Land, the owner's its §5
 //! ports), against the REAL package in a private headless aterm sandboxed to
 //! one loopback port where the lab answers as the model ([`crate::codex_rig`],
 //! [`crate::codex_alab_model`]): no key, no account, no byte off the machine,
@@ -96,7 +96,7 @@
 //!   that names a part left for later (its need withdrawn), FOUR nudges (a
 //!   bound under four fails here; no finite run proves there is none); the
 //!   clean defense at the fourth gives `landed@v1` and aterm's `status task=`
-//!   for the self-claimed tab reads `landed` (FOREVER LAND §10.4).
+//!   for the self-claimed tab reads `landed` (Autopilot Land).
 //! * `reland` (Land, no repository): its first turn is real work, so
 //!   `land@v1` comes at once and its clean defense lands; then NOTHING (no
 //!   request to the model, no act) for 150 s, past the 120 s a codex-alab that
@@ -123,11 +123,14 @@
 //!   control's continuation took, with its claim still proven; its journal
 //!   names the rule (`nothing (a person's own exchange: theirs to answer)`);
 //!   aterm's `status task=` reads `theirs` (a proven self-claim's face is told
-//!   only by the acts it records, FOREVER LAND §10.4, so this holds only where
+//!   only by the acts it records, Autopilot Land, so this holds only where
 //!   codex-alab records the point it leaves and aterm tells `theirs` for it;
 //!   the failed check says so); and nothing is typed by the run's end, read
 //!   past the re-exec upgrade, which moves the exchange's codex-alab too: its
-//!   new image resumes the conversation and decides `nothing` at the point.
+//!   new image resumes the conversation and decides `nothing` at the point,
+//!   and aterm's face still reads `theirs` (the point is still the person's).
+//!   A landed Land leg's face (`land`, `reland`, `repo`) still reads `landed`
+//!   past the same upgrade, with nothing typed after its landing.
 //! * `control` (Cruise; the exchange's negative control): the same message
 //!   through the same path as a control write (`send`, `key`), which stamps no
 //!   `human_ms`, answered alike: the point is codex-alab's to go on with
@@ -649,7 +652,7 @@ fn backoff_ms(short: u32) -> i64 {
     }
 }
 
-/// A Cruise leg's done claims, read from the model's log (FOREVER CRUISE).
+/// A Cruise leg's done claims, read from the model's log (Autopilot Cruise).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Claims {
     met: usize,
@@ -1447,7 +1450,7 @@ impl Proof {
         }
     }
 
-    /// FOREVER CRUISE on the instance's first session (module header).
+    /// Autopilot Cruise on the instance's first session (module header).
     fn first_leg(&mut self, first: &Leg) -> Result<(), Stopped> {
         let defended = self.await_act(first, DEFEND, Duration::from_secs(240))?;
         let parked = self
@@ -1866,7 +1869,7 @@ impl Proof {
         Ok(())
     }
 
-    /// FOREVER LAND, unbounded, its unclean defenses nudged (module header).
+    /// Autopilot Land, unbounded, its unclean defenses nudged (module header).
     fn land_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
         let started = Instant::now();
         let land = self.await_act(leg, "land@v1", Duration::from_secs(240))?;
@@ -2209,7 +2212,7 @@ impl Proof {
         }
     }
 
-    /// FOREVER CRUISE, over every Cruise leg's whole run (module header):
+    /// Autopilot Cruise, over every Cruise leg's whole run (module header):
     /// nothing finished or landed, and each done claim met by the defend
     /// prompt, by the model's own log ([`claims_of`]).
     fn cruise_rests_never(&mut self, cruise: &[&Leg]) {
@@ -3011,6 +3014,23 @@ impl Proof {
             ),
             left,
         );
+        // THE FACE STANDS PAST THE RE-EXEC: the point is still the person's,
+        // so aterm's face reads theirs once the new image holds its claim
+        // (a hang detector: a face told open in between must come back).
+        let mut face = String::new();
+        Self::wait_for(Duration::from_secs(60), Duration::from_secs(1), || {
+            face = task_face(&self.status(&person.sid));
+            face == "theirs"
+        })?;
+        let proven = self.proven_pid(&person.sid);
+        self.check(
+            &format!(
+                "exchange: aterm's task face still reads theirs past the upgrade, the point the \
+                 person's own exchange (status task={face}; proven: {proven:?}; acts: {:?})",
+                self.acts(&person.sid)
+            ),
+            face == "theirs" && proven.is_some(),
+        );
         let rows = self.requests(person.name);
         let reply_still_written = person_reply(person.name, &rows);
         let asked: Vec<String> = reply_still_written
@@ -3029,6 +3049,65 @@ impl Proof {
             ),
             reply_still_written.is_some() && asked.is_empty() && typed.is_empty() && journal.is_empty(),
         );
+        Ok(())
+    }
+
+    /// The Land legs whose face reads `landed` before the live upgrade
+    /// ([`Self::landed_stand_past_upgrade`]), each with where its codex-alab
+    /// stood ([`Self::exchange_before_upgrade`]'s triple).
+    fn landed_before_upgrade<'l>(&self, legs: &[&'l Leg]) -> Vec<(&'l Leg, (i32, i64, usize))> {
+        legs.iter()
+            .filter(|leg| task_face(&self.status(&leg.sid)) == "landed")
+            .filter_map(|leg| self.exchange_before_upgrade(leg).map(|was| (*leg, was)))
+            .collect()
+    }
+
+    /// A LANDING STANDS PAST THE LIVE UPGRADE (Autopilot Land: the
+    /// re-exec carries it, and `upgrade@v1` tells no face): each landed leg's
+    /// codex-alab is re-exec'd by the re-link, its new image resumes the
+    /// conversation, and aterm's face for the tab still reads `landed`, with
+    /// no act typed after its landing. Hang detectors: the re-exec (its
+    /// record's `execGeneration` up), the new image's first decision, and a
+    /// face told otherwise in between coming back.
+    fn landed_stand_past_upgrade(
+        &mut self,
+        landed: &[(&Leg, (i32, i64, usize))],
+    ) -> Result<(), Stopped> {
+        for (leg, (pid, generation, resumed)) in landed {
+            let mut now_at = *generation;
+            let moved = Self::wait_for(Duration::from_secs(150), Duration::from_secs(1), || {
+                now_at = Self::record(leg, *pid).map_or(now_at, |r| exec_generation(&r));
+                now_at > *generation
+            })?;
+            let mut decided = None;
+            if moved {
+                Self::wait_for(Duration::from_secs(90), Duration::from_secs(1), || {
+                    decided = decided_after_resume(&Self::codex_log(leg), *resumed);
+                    decided.is_some()
+                })?;
+            }
+            let mut face = String::new();
+            Self::wait_for(Duration::from_secs(60), Duration::from_secs(1), || {
+                face = task_face(&self.status(&leg.sid));
+                face == "landed"
+            })?;
+            let acts = self.acts(&leg.sid);
+            let after: Vec<String> = acts
+                .iter()
+                .rposition(|a| a == LANDED)
+                .map(|at| typed_acts(&acts[at + 1..]))
+                .unwrap_or_default();
+            self.check(
+                &format!(
+                    "{}: aterm's task face still reads landed past the upgrade (pid {pid}, \
+                     execGeneration {generation}->{now_at}; the new image: {}; status task={face}; \
+                     typed after the landing: {after:?})",
+                    leg.name,
+                    decided.as_deref().unwrap_or("no decision after its resume")
+                ),
+                moved && face == "landed" && after.is_empty(),
+            );
+        }
         Ok(())
     }
 
@@ -3504,6 +3583,8 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     // The exchange is read past the upgrade, which re-execs its codex-alab
     // too: the new image's resume decides the person's point again.
     let exchange_was = proof.exchange_before_upgrade(&exchange);
+    // So are the landed legs': a landing stands past it.
+    let landed_was = proof.landed_before_upgrade(&[&land, &reland, &repo]);
     let t = Instant::now();
     proof.upgrade_leg(&cont, pkg_b)?;
     timed(proof, "upgrade", t);
@@ -3512,6 +3593,9 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
         proof.exchange_stays_left(&exchange, exchange_was)?;
         timed(proof, "exchange (past the upgrade)", t);
     }
+    let t = Instant::now();
+    proof.landed_stand_past_upgrade(&landed_was)?;
+    timed(proof, "landed (past the upgrade)", t);
     if !proof.fails.is_empty() {
         proof.diagnose(&all);
     }

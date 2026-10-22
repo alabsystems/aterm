@@ -26,8 +26,14 @@ pub enum Error {
     Auth(String),
     /// The peer answered a call with an error message.
     Remote { name: String, message: String },
-    /// No answer before the deadline.
+    /// The deadline passed before the bus took a message whole, or before
+    /// the handshake finished.
     Timeout,
+    /// A call went out whole and no answer came before its deadline. The
+    /// connection is as it was: a peer that is slow, not gone, may still
+    /// answer, and `Connection::recv` hands that late answer over as any
+    /// other message.
+    NoReply,
     /// The peer hung up, or an earlier framing fault left the stream unusable.
     Closed,
 }
@@ -52,7 +58,8 @@ impl fmt::Display for Error {
             Self::Auth(why) => write!(f, "d-bus authentication: {why}"),
             Self::Remote { name, message } if message.is_empty() => write!(f, "{name}"),
             Self::Remote { name, message } => write!(f, "{name}: {message}"),
-            Self::Timeout => f.write_str("d-bus: no answer before the deadline"),
+            Self::Timeout => f.write_str("d-bus: the deadline passed"),
+            Self::NoReply => f.write_str("d-bus: no answer before the deadline"),
             Self::Closed => f.write_str("d-bus: connection closed"),
         }
     }

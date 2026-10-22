@@ -423,17 +423,12 @@ impl App {
     /// with one settle: every live `config.`-keyed row is in scope ([`Self::replace_config_set`]),
     /// so an empty set clears every fixed family's row.
     ///
-    /// The backend build's `font_family` verdict
-    /// ([`crate::message_reporters::KEY_FONT_FAMILY`]) is in scope only when
-    /// `family_admitted`: the reload's font work ran and ADMITTED the
-    /// configured family (a refusal is the catalog worker's
-    /// [`crate::native_font_catalog::FAMILY_REFUSED`] warning, said under
-    /// `config.fonts`). Its row then closes fixed, and a folded record of it
-    /// reads fixed (ruling 367). Any other reload did not answer it: in scope
-    /// always, a Presence toggle closed a still-rejected family `Font applied`
-    /// ✓ (round 44); out of scope always, the owner who fixed or cleared the
-    /// family kept `Couldn't apply the font` up to its fold and in Problems
-    /// for good (round 44's review, ruling 418 (c)).
+    /// The backend's `font_family` verdict ([`crate::message_reporters::KEY_FONT_FAMILY`]) is in
+    /// scope only when `family_admitted`: the reload's font work admitted the configured family
+    /// (a refusal is [`crate::native_font_catalog::FAMILY_REFUSED`], under `config.fonts`). Any
+    /// other reload did not answer it. Were it always in scope, a Presence toggle would close a
+    /// still-rejected family as `Font applied`; were it never, a fixed family would keep
+    /// `Couldn't apply the font` up.
     ///
     /// `fixed_as` holds, by key, the words each family's fix is logged in as this
     /// reload SAW it end ([`crate::message_reporters::config_fix_words`]: a
@@ -1384,14 +1379,10 @@ impl App {
                     self.focus_session_preferring(Some(WindowId(window)), local)
                 })
             }
-            // THE OWNER'S WORD on a tab's agent upgrade (gap #21): written
-            // where `aterm harness upgrade <tab> --now|--defer|--skip` writes
-            // it, for the build the row named, off this thread; the row says
-            // what it did (`upgrade_host`). Only while the tab's upgrade
-            // still takes that word for that build: Settings ▸ Messages
-            // presses from the model it last drew, and the harness re-checks
-            // only the build — an `Upgrade now` drawn before the owner's
-            // `--now` landed would arm a second round for a hurried move.
+            // The owner's word on a tab's agent upgrade, written off this thread as `aterm
+            // harness upgrade <tab> --now|--defer|--skip` writes it (`upgrade_host`). Only while
+            // the tab still takes that word: the page presses from the model it last drew and the
+            // harness re-checks only the build, so a stale `Upgrade now` would arm a second round.
             Intent::AgentUpgrade { tab, to, word } => {
                 self.upgrade_view
                     .offers(&tab, &to, word, crate::upgrade_host::now_s())
@@ -1611,9 +1602,7 @@ impl App {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The body press.
-// ---------------------------------------------------------------------------
 
 impl App {
     /// The body press: a press on any part of a row that is not a capsule is the row's
@@ -1628,9 +1617,7 @@ impl App {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The toolchain reporters' glue.
-// ---------------------------------------------------------------------------
 
 impl App {
     /// The dialect of the atpkg hook the frozen-tab note tells a person to source: the shell this
@@ -2183,9 +2170,7 @@ pub(crate) enum PersonPass {
     Ended(EchoKind),
 }
 
-// ---------------------------------------------------------------------------
 // The update reporters' glue.
-// ---------------------------------------------------------------------------
 
 /// The update's flow row, as state (`App::update_flow`): the lane's live `update.progress` row,
 /// the version it names and its phase. What a row is lives in state, never in its glyph or
@@ -2296,7 +2281,7 @@ impl App {
     ///   install half's warning in the words that name the build that failed, said
     ///   EVERY TIME — each crash loop is news of its own, so it re-opens the install
     ///   latch first; a second before the first was answered was a log line and no
-    ///   row (ATERM-KI-1015-2, U21).
+    ///   row.
     /// * A CLASS IS FAILING: say what is wrong, where the user is looking — the
     ///   title names the broken half ("Couldn't install updates"), the excerpt
     ///   since when; the whole sentence — count, cause, command — is the row's
@@ -2349,7 +2334,7 @@ impl App {
             aterm_log::info!("update-health: {title}: {body}");
             return false;
         }
-        // A Linux crash loop's end is news of its own each time (ATERM-KI-1015-2, U21): a
+        // A Linux crash loop's end is news of its own each time: a
         // second before the first was answered is a row too, never the latch's log line.
         if title == aterm_update::INSTALL_CRASH_LOOP_TITLE {
             let kind = update_words::HealthKind::Install;
@@ -2406,10 +2391,8 @@ impl App {
             self.messages.withdraw(id, now);
         }
         self.remember_update_health_said(HealthSaid::of(kind, &msg, body));
-        // The warning holds its 45 s and folds into the record
-        // (`update.health.<kind>`); a failure of the same kind that has gone on
-        // for a day is one dismissable line of the digest, under its own key
-        // (`update.review.<kind>`).
+        // The warning holds its 45 s and folds into the record; a failure of the same kind
+        // that has gone on for a day is one digest line (`update.review.<kind>`).
         self.post_message(msg.clone());
         self.owe_unless_seen(msg);
         self.claim_update_health_entry(kind, body);
@@ -2418,7 +2401,7 @@ impl App {
 
     /// AN INSTALLED LINUX EXECUTABLE WAITS FOR THE NEXT ATERM A PERSON STARTS
     /// (`aterm_update::INSTALL_AWAITS_START_TITLE`; the review of
-    /// ATERM-KI-1015-2, U21) — a notice, never the install half's warning. The
+    /// , U21) — a notice, never the install half's warning. The
     /// install worked, and on Linux no lane starts an installed executable
     /// inside a running aterm, so this wait is how every automatic install there
     /// ends: "Couldn't install updates", and a day later "Updates are not
@@ -2462,7 +2445,7 @@ impl App {
     }
 
     /// A ROW NOBODY COULD SEE IS OWED TO THE FIRST WINDOW THAT CAN SHOW IT
-    /// (ATERM-KI-1015-2, U37). Said while no window's band is on screen
+    /// . Said while no window's band is on screen
     /// ([`band_on_screen`]: every window minimized, covered or not yet shown,
     /// or none open), the row held its 45 s and folded unseen — and an
     /// update-health warning's latch kept its kind from being said again for
@@ -2976,9 +2959,7 @@ impl App {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The band's motion (design §10.8).
-// ---------------------------------------------------------------------------
 
 /// Whether window `ws`'s band is on screen: a real OS window that is not
 /// occluded (minimized, on another workspace, fully covered). A headless
@@ -2994,7 +2975,7 @@ impl App {
 pub(crate) fn band_on_screen(ws: &crate::WindowState) -> bool {
     // A handoff boot's window is hidden until its first real present
     // (`pending_reveal`), and not yet occluded: nothing on it is seen
-    // (ATERM-KI-1015-2, U37).
+    // .
     let shown = ws.pending_reveal.is_none() && !ws.occluded;
     #[cfg(test)]
     {
@@ -3114,9 +3095,7 @@ impl App {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The handoff carry (design §3.8).
-// ---------------------------------------------------------------------------
 
 impl App {
     /// The live rows and the undrained log lines for the handoff manifest:

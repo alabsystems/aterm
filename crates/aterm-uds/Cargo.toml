@@ -7,13 +7,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — the portable control-socket stream: pure type aliases to std Unix-domain sockets on Unix, AF_UNIX over winsock (afunix.sys) on Windows, plus the latest-alias, CSPRNG, pid-liveness, SCM_RIGHTS descriptor-passing and shared-memory region helpers the control channel and the PTY keeper need. Std-only but for aterm-libc's declarations on Unix; the Windows side is direct ws2_32/kernel32/bcrypt FFI."
+description = "aterm — the portable control-socket stream: pure type aliases to std Unix-domain sockets on Unix, AF_UNIX over winsock (afunix.sys) on Windows, plus the latest-alias, CSPRNG, pid-liveness, SCM_RIGHTS descriptor-passing and shared-memory region helpers the control channel and the PTY keeper need. Std-only but for aterm-libc's declarations and astream-sys's owner-only file rule on Unix; the Windows side is direct ws2_32/kernel32/bcrypt FFI."
 
 # Dependency-free on every platform (the Windows side is raw FFI) so the
 # whole transport stays auditable in one small crate, but for one first-party
 # declaration crate on Unix, aterm-vitals' pure types, and aterm-sysprobe's
 # readers: `KERN_PROCARGS2`'s (`procargs`, re-exported) on Unix and Windows,
-# and its path rule and process reader on Windows.
+# and its path rule and process reader on Windows; and on Unix astream-sys
+# (zero dependencies), whose owner-only rule `private_file` admits by.
 [dependencies]
 # aterm-vitals: the program check's reading and verdict types
 # (`program_check`), which this crate's reader fills. A pure model crate with
@@ -40,6 +41,11 @@ aterm-sysprobe = { workspace = true }
 # are variadic on Darwin: declared by hand as fixed-arity, their extra argument
 # rides a register where Apple arm64 reads variadic arguments from the stack.
 libc = { workspace = true }
+# astream-sys: astream's OS cordon, zero dependencies. `private_file` holds every
+# file and directory it admits to astream's one owner-only rule
+# (`open_nonblocking`, `owner_private`, `owner_private_dir`: the kind, the owner,
+# the macOS access list, the mode), so the ACL FFI it needs lives there, not here.
+astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 
 [dev-dependencies]
 # Test scratch directories (mode 0700, an unpredictable name); itself dependency-free.

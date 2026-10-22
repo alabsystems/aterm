@@ -238,21 +238,19 @@ pub fn usage() -> String {
     format!(
         "targo --unverified verify [CHECK|SET ...] [OPTIONS]
 
-Run aterm's checks in place, offline, alone or in any combination.
+Run aterm's checks in place, alone or in any combination.
 
   verify                          the dev set on what changed since origin/main
   verify lint test -p aterm-grid  two checks on one crate
   verify test --all               every crate's tests
-  verify fmt --fix                format every file the check finds
+  verify fmt --fix                rewrite what fmt finds unformatted
   verify release --app <APP>      everything publication requires
   verify list                     every check: sets, needs, what it runs
   verify perf [LANE...]           the performance lanes (`verify perf --list`)
   verify soak [--ledger PATH]     the crash restore's soak (keeper P4): this
                                   machine's recovery ledger, not the tree
-  verify glue <in.wasm> <out> --flavor web|nodejs
-                                  a wasm module's JS glue (`--record-toy`: the
-                                  wasm-glue check's goldens; `--record-replay`:
-                                  wasm-smoke's CPU replay answers)
+  verify glue <in.wasm> <out-dir> --flavor web|nodejs
+                                  a wasm module's JS glue (`verify glue --help`)
   verify fetch-browser            the pinned chrome-headless-shell, Firefox
                                   and WebKit the browser check drives, into
                                   this machine's cache
@@ -266,7 +264,7 @@ Run aterm's checks in place, offline, alone or in any combination.
 
 Sets:
   dev      fmt census lint test doc (the default)
-  release  every check `ship release` requires; --all implied, a skip is exit 3
+  release  every check `ship release` requires; --all implied, --app required
 
 Checks:
 {checks}
@@ -274,11 +272,11 @@ Checks:
 Options:
   -p, --package <crate>   narrow lint/test/doc to a crate (repeatable)
       --all               the whole workspace (default: the change cone)
-      --base <ref>        the cone's base (default: local origin/main; no fetch)
+      --base <ref>        the cone's base (origin/main, else main; no fetch)
       --app <APP>         the release bundle `measure` judges
       --fix               with fmt alone: rewrite the files it finds unformatted
-      --cell <name>       cells checks this forge cell (repeatable; any cell)
-      --no-windows        skip the checks that open windows
+      --cell <name>       the forge cell `cells` checks (repeatable; any cell)
+      --no-windows        skip each stage that opens a window (a named skip)
       --test-threads <n>  RUST_TEST_THREADS for every test binary
       --test-jobs <n>     test binaries at once (default 8)
       --timeout <s|off>   hang ceiling for each child (default 3h)
@@ -286,7 +284,7 @@ Options:
   -h, --help
 
 Exit: 0 every check that ran passed, 1 a check failed, 2 usage, 3 could not run.
-A skip prints its reason and fix and fails nothing, except under `release`.
+A skip names its fix and fails nothing; under `release` it is exit 3.
 "
     )
 }

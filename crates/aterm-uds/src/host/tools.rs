@@ -928,8 +928,7 @@ pub const TOOLS: &[Tool] = &[
     release_host(
         "gh",
         &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"],
-        "release publishing and atpkg-publish's host lane, until S15's REST; init's GitHub bootstrap \
-         and the machines controller, until S14 (row 22)",
+        "release publishing and atpkg-publish's host lane, until S15's REST (row 22)",
     ),
     release_host(
         "pub",

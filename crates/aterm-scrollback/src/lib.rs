@@ -9,8 +9,7 @@
 // (`trust::skip` on the paths the verifier does not model).
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
-// F11-4 (#7941): production unwrap() is forbidden; tests opt out uniformly at the
-// crate root so a missing per-module allow can't silently slip past clippy.
+// Production unwrap() is forbidden; tests opt out once at the crate root.
 #![warn(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 

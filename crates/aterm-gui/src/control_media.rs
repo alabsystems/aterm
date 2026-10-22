@@ -1678,6 +1678,8 @@ mod confined_video_reader {
         SelectionValidated,
     }
 
+    /// The pinned `video/<instance>` namespace, or `None` when this instance
+    /// has not created it yet (no recording has run).
     fn open_namespace(
         sock_dir: &std::path::Path,
         instance: &str,
@@ -2112,7 +2114,7 @@ fn recv_video_reply(
     }
 }
 
-/// `video <seconds> [full] [keys] [pace] [fps=<n>] [budget=<MiB>]` — record the
+/// `video <seconds> [full] [keys] [pace] [trail] [fps=<n>] [budget=<MiB>]` — record the
 /// front window's exact swapchain bytes handed to the WSI present path,
 /// including the swapchain-only glow/chrome layers every single-frame tool
 /// misses. Compositor visibility and scanout are not observable here. The verb
@@ -2731,7 +2733,7 @@ pub(crate) fn cmd_invoke(
 ) -> String {
     let name = rest.trim();
     if name.is_empty() || name.split_whitespace().count() != 1 {
-        return "ERR usage: invoke <action>   (list actions with `controls menu`)\n".to_string();
+        return "ERR usage: invoke <action> (list actions with `controls menu`)\n".to_string();
     }
     if let Some(refusal) = invoke_refusal(name) {
         return refusal;
@@ -4316,7 +4318,7 @@ impl crate::App {
     }
 
     /// The newborn `sid` is a worker: its own Autopilot word written (`land`
-    /// unless the spawn said `cruise`: FOREVER LAND, a worker's one wake at
+    /// unless the spawn said `cruise`: Autopilot Land, a worker's one wake at
     /// the end is its landing), and its task record `working` with its
     /// `from=` — on the main thread, so with no wait on a Commit's fence
     /// (`task_record::mark_session_task_within`) — before the reply; what
@@ -4605,8 +4607,8 @@ pub(crate) fn cmd_close(
 /// lines. The lines are returned in the SAME multi-line shape as `text`:
 /// `OK <n>\n` followed by `<n>` data rows.
 ///
-/// Off macOS the main thread replies with one explanatory line (no native chrome),
-/// so the wire shape (`OK 1` + one row) is identical on every platform.
+/// Off macOS there is no `NSToolbar`: the rows report the platform-neutral menu
+/// model (and, on Windows, the window's DWM chrome attributes) in the same shape.
 pub(crate) fn cmd_chrome(proxy: &EventLoopProxy<Wake>) -> String {
     let lines = match call_main(proxy, |tx| Wake::ReadChrome { reply: tx }) {
         Ok(lines) => lines,
@@ -6323,6 +6325,34 @@ mod video_parse_tests {
                 path.display()
             )
         );
+    }
+
+    /// Before this instance has recorded anything (no `video/` dir, or no
+    /// instance dir under it) the reply is the no-recording refusal, not a
+    /// confinement failure.
+    #[test]
+    fn video_frames_before_any_recording_says_none_was_found() {
+        const INSTANCE: &str = "p303-fresh";
+        let tmp = video_test_dir("fresh");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let expected = "ERR video frames: no finished recording found";
+        let out = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
+        assert!(out.starts_with(expected), "no video/ dir: {out:?}");
+        std::fs::create_dir_all(tmp.join(super::control_auth::VIDEO_DIR)).unwrap();
+        let out = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
+        assert!(out.starts_with(expected), "no instance dir: {out:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// `video frames` returns the highest-`delta` frames of the NEWEST finished

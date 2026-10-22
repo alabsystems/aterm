@@ -605,7 +605,6 @@ pub fn tick<D: Desk>(d: &mut D, now: Instant) -> Vec<D::Win> {
     out
 }
 
-// ---------------------------------------------------------------------------
 // The wire strings: what the `status` and `chrome` verbs print of presence,
 // composed here so every host prints the same bytes. The percent codec stays
 // the host's ([`Host::pct_encode`]).

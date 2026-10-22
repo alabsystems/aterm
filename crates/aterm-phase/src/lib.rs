@@ -74,18 +74,11 @@
 //!   warning that a window is filling, read for the record;
 //! * [`anchors::ANCHORS`] — the literal strings other crates guard on.
 //!
-//! ## Why a crate of its own
-//!
-//! ONE reader for every face: the server (`aterm-gui`) classifies each agent
-//! session's screen and publishes the verdict (`status agent=`, the `EVENT
-//! <sid> agent …` push, relayed by `aterm-link` as `phase=`), and `aterm drive
-//! phase` must print the same answer, so both link this dependency-free
-//! crate. `aterm-agent` re-exports it under its `supervise::phase` paths.
-//!
-//! Every rule in it was paid for by a misclassification in a real session
-//! (the measurements are in the doc comments and the tests); the fixtures
-//! under [`prompt::fixtures`] are the screens those sessions showed, each
-//! newer one with its program, version and provenance on its first line.
+//! The server (`aterm-gui`) publishes each agent session's verdict (`status agent=`, the
+//! `EVENT <sid> agent …` push, the fabric's `phase=`) and `aterm drive phase` must print the
+//! same answer, so both link this one dependency-free crate; `aterm-agent` re-exports its
+//! `phase` and `prompt` modules under `supervise`. The fixtures under [`prompt::fixtures`] are
+//! real screens, each newer one with its program, version and provenance on its first line.
 
 pub mod agents_panel;
 pub mod agy;

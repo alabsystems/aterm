@@ -235,9 +235,7 @@ fn notice_handoff() -> (mpsc::SyncSender<Notice>, mpsc::Receiver<Notice>) {
     mpsc::sync_channel(0)
 }
 
-// ---------------------------------------------------------------------------
 // the selectors
-// ---------------------------------------------------------------------------
 
 /// One `--on` selector: which records are worth waking a human for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,14 +394,12 @@ impl Sel {
                 // service's or a node's `state=on` holds no session anywhere,
                 // and waking someone for it reports a stop that never happened.
                 let row = crate::subject::parse_halt(fleet, subject, body)?;
-                // The halting principal, same wall. `fleet/<who>/halt` is
-                // cap-forced for a human's own grant, but a fleet cap that ends
-                // in `>` is not, and this segment becomes `$ATERM_NOTIFY_WHO`.
+                // A fleet cap ending in `>` does not force `<who>`, and it becomes
+                // `$ATERM_NOTIFY_WHO`.
                 if !crate::subject::is_principal(row.human) {
                     return None;
                 }
-                // A halt coming OFF is good news, and good news does not wake
-                // anybody at 3 a.m.
+                // A halt coming off wakes nobody.
                 if !row.on {
                     return None;
                 }
@@ -481,9 +477,7 @@ fn one_line(s: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // the durable side
-// ---------------------------------------------------------------------------
 
 /// Where a scan starts when a selector has no cursor yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -496,8 +490,7 @@ pub enum Since {
     At(u64),
 }
 
-/// `<state>/notify/` — the four files above, written the way the state dir
-/// writes its own.
+/// `<state>/notify/`: the four files of the module doc's table.
 ///
 /// THE CURSORS AND THE JOURNAL ARE ONE LOG'S. Both are bus offsets, and an
 /// offset names a record in one log only: pointed at a log that was deleted
@@ -936,9 +929,7 @@ impl Fault {
     }
 }
 
-// ---------------------------------------------------------------------------
 // the notifier
-// ---------------------------------------------------------------------------
 
 /// Everything the verb was told.
 #[derive(Debug, Clone)]
@@ -1370,8 +1361,7 @@ impl Notifier {
         })
     }
 
-    /// Catch up to the head, once, and stop. This is the whole of `--once`, and
-    /// it is also what a follow-mode reader's first subscription replays.
+    /// Catch up to the head once and stop: the whole of `--once`.
     ///
     /// On a broker that serves ordered, a selector's scan STOPS at its first
     /// record the page's closing `Mark` does not say is durable, its cursor
@@ -1592,8 +1582,8 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
     // The log the offsets in `seen` were read on: a reconnect to ANOTHER log
     // never resumes from them ([`Store::for_log`]).
     let mut seen_on: Option<PathBuf> = None;
-    // Reset only by a connection that stayed up, so a broker that accepts and
-    // then refuses or drops is redialled under the back-off, not every 100 ms.
+    // Reset only by a connection that stayed up, so a broker that accepts and then drops is
+    // redialled under the back-off.
     let mut backoff = Backoff::default();
     loop {
         let wait = match connect_for_reader(cfg, root, &key, &filter, &mut seen, &mut seen_on) {
@@ -1800,9 +1790,7 @@ thread_local! {
     static FORGET_LINEAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-// ---------------------------------------------------------------------------
 // the command line
-// ---------------------------------------------------------------------------
 
 /// Usage, printed to stderr on a usage error (exit 2, aterm's convention).
 const USAGE: &str = "\
@@ -2520,8 +2508,7 @@ mod tests {
         assert!(logs.join("not-an-identity").is_dir());
     }
 
-    /// The cursor is MONOTONE. A cursor that walked backwards would re-offer
-    /// offsets the bounded journal has already forgotten.
+    /// The cursor never moves backwards.
     /// **ANOTHER LOG IS READ AS A FIRST RUN, AND THE OLD ONE RESUMES** (r2-01).
     /// Each log carries an escalation at offset 0. Run against log A, it fires
     /// and A's cursor and journal say so. Pointed at log B — a recreated

@@ -28,6 +28,7 @@ pub mod cells;
 pub mod changed;
 pub mod checks;
 pub mod cli;
+pub mod docdriver;
 pub mod docscan;
 pub mod exec;
 pub mod findings;
@@ -321,7 +322,8 @@ pub struct Ctx {
     /// ([`Ctx::test_threads`]).
     pub test_threads: Option<u32>,
     /// The program cargo runs in place of each test binary to record it
-    /// ([`testrun::RECORD_FLAG`]): this very binary unless a test names one.
+    /// ([`testrun::RECORD_FLAG`]), and in place of rustdoc for the doctests
+    /// ([`docdriver`]): this very binary unless a test names one.
     pub test_recorder: Option<PathBuf>,
     /// The machine-wide lock the timing stages hold while they run
     /// ([`plan::TIMED`]); `None` takes none.
@@ -527,8 +529,8 @@ impl Ctx {
         self.test_threads.unwrap_or_else(|| self.cores())
     }
 
-    /// The recording runner: the named program, else this process's own
-    /// executable.
+    /// The recording runner and the doctests' doc driver: the named program,
+    /// else this process's own executable.
     #[must_use]
     pub fn test_recorder(&self) -> Option<PathBuf> {
         self.test_recorder
@@ -1318,7 +1320,17 @@ pub fn standin_body(path: &Path, body: &str) {
 /// `command -v <name>` against the PATH the run hands its children.
 #[must_use]
 pub fn have_on_path(name: &str, path: &OsStr) -> bool {
-    std::env::split_paths(path).any(|d| is_executable_file(&d.join(name)))
+    find_on_path(name.as_ref(), path).is_some()
+}
+
+/// The file a PATH lookup of `name` runs: the first entry of `path` holding an
+/// executable `name`, joined as the entry is spelled (a relative entry gives a
+/// relative path).
+#[must_use]
+pub fn find_on_path(name: &OsStr, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|d| d.join(name))
+        .find(|f| is_executable_file(f))
 }
 
 /// aterm's directories in this user's cache ([`aterm_uds::host::user_cache`]: the one

@@ -13,9 +13,7 @@ pub(super) const PRODUCT: &[&str] = &["crates/", "apps/"];
 /// literals bans (its tables and its planted cases).
 pub(super) const CENSUS_CRATE: &str = "crates/aterm-census/";
 
-// ---------------------------------------------------------------------------
 // engine-platform: docs/ATERM_DESIGN.md §2.7, the headless engine.
-// ---------------------------------------------------------------------------
 
 /// The engine crates: no platform API in their default build.
 const ENGINE_CRATES: &[&str] = &[
@@ -330,9 +328,7 @@ fn links_by_name(code: &str) -> bool {
     })
 }
 
-// ---------------------------------------------------------------------------
 // renderer-terminal: the renderers consume RenderInput, never Terminal.
-// ---------------------------------------------------------------------------
 
 const RENDERERS: &[&str] = &["crates/aterm-render/src/", "crates/aterm-gpu/src/"];
 
@@ -380,9 +376,7 @@ fn names_terminal(code: &str) -> Option<&'static str> {
     None
 }
 
-// ---------------------------------------------------------------------------
 // dev-read: a device read to EOF.
-// ---------------------------------------------------------------------------
 
 pub(super) const DEV_READ: Rule = Rule {
     id: "dev-read",
@@ -430,9 +424,7 @@ fn reads_a_device(line: Line<'_>) -> bool {
     })
 }
 
-// ---------------------------------------------------------------------------
 // input-probe: the WindowServer-backed input queries.
-// ---------------------------------------------------------------------------
 
 /// The query APIs whose first call opens a SkyLight connection and makes
 /// WindowServer preflight the calling binary on its main thread.
@@ -470,9 +462,7 @@ fn input_probe(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // protected-folder: TCC consent.
-// ---------------------------------------------------------------------------
 
 /// aterm-gui's source (the window crate's and its split-out libraries',
 /// `crates/aterm-gui-*`), aterm-cli's, amacs's host crates (`crates/amacs-*`:
@@ -566,9 +556,7 @@ fn protected_path(text: &str) -> Option<String> {
     None
 }
 
-// ---------------------------------------------------------------------------
 // runloop-timer: one run-loop timer.
-// ---------------------------------------------------------------------------
 
 const RUNLOOP_TIMERS: &[&str] = &[
     "CFRunLoopTimerCreate",
@@ -612,10 +600,8 @@ fn runloop_timer(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // keeper-gui, keeper-gui-deps: the PTY keeper is no GUI process
 // (docs/DESIGN-pty-keeper-2026-09-26.md §5.6).
-// ---------------------------------------------------------------------------
 
 /// The keeper and the one crate of its own it links.
 const KEEPER_SOURCE: &[&str] = &[
@@ -680,10 +666,8 @@ fn links_gui(text: &str) -> Option<String> {
         .map(|n| format!("names `{n}`"))
 }
 
-// ---------------------------------------------------------------------------
 // keeper-no-mmap: the keeper holds crash-restore regions and never maps one
 // (the crash-restore plan §5).
-// ---------------------------------------------------------------------------
 
 /// The keeper's own source. aterm-uds, which it links, maps regions for the windows (the
 /// journal's writer and its restorer), code the keeper never calls.
@@ -729,10 +713,8 @@ fn keeper_no_mmap(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // restore-stays-local: a crash-restore region never leaves the host (the
 // crash-restore plan §5, privacy claim 5).
-// ---------------------------------------------------------------------------
 
 /// The crash restore's own source: the region's layout, records, writer and recovery.
 const RESTORE_OWN: &[&str] = &["crates/aterm-restore/src/"];
@@ -1006,9 +988,7 @@ fn keeper_gui_deps(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // std-command: a child built from the alias clippy cannot see through.
-// ---------------------------------------------------------------------------
 
 /// The crate that owns child construction, and the alias's home.
 const UDS_CRATE: &str = "crates/aterm-uds/";
@@ -1078,9 +1058,7 @@ fn path_prefix_trimmed(s: &str) -> &str {
     s
 }
 
-// ---------------------------------------------------------------------------
 // flock-door: an flock the clippy.toml lint cannot name.
-// ---------------------------------------------------------------------------
 
 pub(super) const FLOCK_DOOR: Rule = Rule {
     id: "flock-door",
@@ -1173,11 +1151,9 @@ fn syscalls_by_number(code: &str) -> Vec<usize> {
     out
 }
 
-// ---------------------------------------------------------------------------
 // supervise-fx: the supervising loop reads its clocks and sleeps through its
 // one door (`crates/aterm-agent/src/supervise/fx.rs`), and looks at the
 // machine only through a derived door (the policy probe, or `Fx`'s own).
-// ---------------------------------------------------------------------------
 
 /// The supervisor's source: the loop and everything it calls in its own
 /// module (the policy under `policy/` included).
@@ -2445,10 +2421,8 @@ fn ends_with_word(text: &str, word: &str) -> bool {
         .is_some_and(|rest| rest.as_bytes().last().is_none_or(|&b| !is_word(b)))
 }
 
-// ---------------------------------------------------------------------------
 // store-current: a store `current` path is resolved before anything runs from
 // it.
-// ---------------------------------------------------------------------------
 
 pub(super) const STORE_CURRENT: Rule = Rule {
     id: "store-current",
@@ -2526,9 +2500,7 @@ fn resolves(code: &str) -> bool {
     code.contains("canonicalize") || code.contains("physical(")
 }
 
-// ---------------------------------------------------------------------------
 // licence-header: every .rs carries its SPDX and copyright lines.
-// ---------------------------------------------------------------------------
 
 /// The header region: the lines the two must sit in.
 const HEADER_LINES: usize = 8;

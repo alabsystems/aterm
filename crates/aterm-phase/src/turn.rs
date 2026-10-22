@@ -17,20 +17,17 @@ use crate::prompt::parse_prompt;
 /// `crate::notice::update_notice_scan`).
 pub(crate) const SAID: [char; 3] = ['❯', '⏺', '●'];
 
-/// No turn yet: Claude Code's launch card (`Claude Code v<version>`, anchor
-/// `launch.banner`) above the composer and, between it and the composer's
-/// frame, no user message (`❯`) and nothing said (`⏺`, `●`) — the screen
-/// `claude` draws before anyone typed. A session resumed on a conversation
-/// shows its messages under the card, and one past its first screen has
-/// scrolled the card away: neither is fresh. Without this a supervisor reads a
-/// brand-new session's first idle point as a worker that stopped short and
-/// types `keep going` into it.
+/// No turn yet: Claude Code's launch card (anchor `launch.banner`) above the
+/// composer and, between it and the composer's frame, no user message (`❯`)
+/// and nothing said (`⏺`, `●`). A resumed session shows its messages under the
+/// card, or has scrolled it away: neither is fresh. A supervisor needs this so
+/// it does not read a new session's first idle point as a worker that stopped.
 ///
 /// A CONVERSATION A `/clear` JUST STARTED is one too: Claude Code clears the
 /// screen and redraws the card with the `❯ /clear` that drew it and nothing
 /// else (2.1.300, the lab, 2026-10-15). Read as a prompt not answered yet, it
 /// was no point at all, and a usage limit the cleared conversation had met
-/// stayed waited on — its ledger row open — for good (W4 of ATERM-KI-1015-1).
+/// stayed waited on — its ledger row open — for good (W4 of ).
 #[must_use]
 pub fn fresh(rows: &[String]) -> bool {
     let Some(frame) = composer_frame(rows) else {
@@ -967,12 +964,10 @@ pub(crate) fn asks(said: &str) -> bool {
 /// row, a tool call, a shell's screen), so a stop-phrase check never reads
 /// anyone else's words.
 ///
-/// A message TALLER than the screen has its `⏺` row scrolled off: every
-/// visible row above the last said is indented (the message's continuation
-/// column). Its tail is then the visible rows from the top — what the
-/// worker ended on — never `None`, which a policy would read as "nothing
-/// asked" and continue past `Should I drop the prod table…?` under 30 rows
-/// of summary.
+/// A message taller than the screen has its `⏺` row scrolled off, and every
+/// visible row above the last said is indented. Its tail is then the visible
+/// rows from the top, never `None`: a policy reads `None` as "nothing asked"
+/// and would continue past a question at its end.
 ///
 /// CLAUDE CODE'S OWN IDLE COMPACTION speaks after the worker and answers
 /// nobody ([`idle_compacted`]): its notice, the attachments it restored
@@ -1864,7 +1859,7 @@ mod tests {
         assert!(!fresh(&screen(END_OFFER)));
     }
 
-    /// A CONVERSATION A `/clear` JUST STARTED IS FRESH (W4 of ATERM-KI-1015-1,
+    /// A CONVERSATION A `/clear` JUST STARTED IS FRESH (W4 of ,
     /// the lab on Claude Code 2.1.300): the card redrawn over `❯ /clear` and
     /// nothing else. NEGATIVE CONTROLS: a turn asked since the `/clear`, and
     /// another local command in its place (`❯ /usage`, a turn's history

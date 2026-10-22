@@ -453,7 +453,7 @@ pub use workstation_setup::{
     SetupAnswer, WorkstationSetupDecision, await_initial_setup_countdown_while,
     await_workstation_setup_countdown, await_workstation_setup_countdown_while,
 };
-/// The Developer Tools list, handled by the window (owner ruling 2026-10-14):
+/// The Developer Tools list, handled by the window:
 /// read at launch and while the owner is wanted, one digest line, and the pane
 /// brought up for the owner once per version, at a quiet moment
 /// (`devtools_helper`). Never a press in System Settings.
@@ -3866,7 +3866,7 @@ enum AppNoticeTaken {
 /// §9.2.3, §9.4.4, §10.5.3, §12.2.3): an act the harness just took, the
 /// task's face under Land, or the short streak's back-off — `None` when
 /// nobody knows it (a loop's run ended, its worker went) or it is over —
-/// the face a proven self-claim's own acts tell (FOREVER LAND §10.4), or
+/// the face a proven self-claim's own acts tell (Autopilot Land), or
 /// that the worker's NEEDS YOU set or Land's hold moved on the timeline. A
 /// fact only: no authority crosses it, and no text (it stays `Copy` and
 /// small).
@@ -3879,7 +3879,7 @@ pub(crate) enum HarnessFact {
     /// PROVEN self-claim: the hosted loop then only watches beside it, and
     /// the face is the self-claim's ([`Self::SelfTask`]).
     Task(Option<aterm_agent::harness::acts::TaskFace>),
-    /// THE FACE A PROVEN SELF-CLAIM TELLS (FOREVER LAND §10.4): `landed` at
+    /// THE FACE A PROVEN SELF-CLAIM TELLS (Autopilot Land): `landed` at
     /// its holder's `meta set harness_act landed@v1` (codex-alab's landing,
     /// never typed), `theirs` at its `left-to-person@v1` (a person's own
     /// exchange left to them, never typed), `open` at any other act it
@@ -9723,16 +9723,12 @@ struct WindowState {
     /// `None` before any fire on the line; written at every fire (a rejected one
     /// clears it).
     trick_fire: crate::app_input::TrickLineFire,
-    /// **THE VERDICT'S ARM** — `(session, the accepted plain-Enter boundary
-    /// this window has already SPENT)`. THE VERDICT is armed by a keyed Enter
-    /// and spent by the first OSC 133/633 `D` after it: a `D` whose session's
-    /// `last_boundary_at` still equals this is a `D` with no armed Enter, and
-    /// it is SILENT — program output, a shell re-emitting its marks, a
-    /// restored session's history. Every light and every sound in the theme
-    /// has a keystroke behind it, and this is the keystroke behind this one.
-    ///
-    /// `None` is "nothing spent yet"; a session change re-baselines it the
-    /// same silent way the pet's completion latch does.
+    /// The verdict's arm: `(session, the accepted plain-Enter boundary this window has
+    /// already spent)`. The verdict is armed by a keyed Enter and spent by the first OSC
+    /// 133/633 `D` after it; a `D` whose session's `last_boundary_at` still equals this has
+    /// no armed Enter and is silent (program output, a shell re-emitting its marks,
+    /// restored history). `None`: nothing spent yet; a session change re-baselines it
+    /// silently, like the pet's completion latch.
     verdict_spent: Option<(u64, std::time::Instant)>,
     /// Hushes the output streak's closing `Settle` exhale after the verdict spoke, so a
     /// finish is not voiced twice. A latch spent by the exhale and cleared by the next
@@ -10136,6 +10132,11 @@ struct WindowState {
     /// agree (as with `find_bar_hit`). `None` until the first frame after opening; a
     /// press then is swallowed and activates nothing.
     tab_menu_rect: Option<tab_menu::MenuRect>,
+    /// The grid `splice_tab_menu` laid [`Self::tab_menu_rect`] on
+    /// ([`app_mouse::GlassGrid`]): under any other — a re-grid since, its frame
+    /// not yet painted — the rect answers no pointer (`App::laid_cell_at`), and
+    /// the next frame places the card again from the window's grid.
+    tab_menu_laid: Option<app_mouse::GlassGrid>,
     /// The controller button whose press dismissed the card, held until its release
     /// arrives so that release is consumed too (a tracking TUI must not get half a
     /// press pair). Outlives `tab_menu` for the reason
@@ -11564,6 +11565,7 @@ impl WindowState {
             strip_drag: None,
             tab_menu: None,
             tab_menu_rect: None,
+            tab_menu_laid: None,
             tab_menu_consumed_button: None,
             #[cfg(windows)]
             band_menu_release_pending: false,
@@ -13475,17 +13477,12 @@ struct App {
     /// The warm spare shell a plain new tab adopts, and its learned gate's
     /// mirror (`spare`).
     spares: spare::Spares,
-    /// Wakes that reached this successor AFTER its Commit (the reader gate is
-    /// released) and before the Commit wake ran, held in arrival order and run
-    /// at the end of that wake ([`Self::defers_wake_until_activation`]). The
-    /// control server starts serving at the gate's release, so a client's
-    /// main-thread verb (`send`, `key`, `tab`, `update apply`, a resumed
-    /// supervisor's key) lands here; dropped, its reply sender died with it
-    /// (`ERR input dispatch failed: main-thread reply dropped`) and `update
-    /// apply` answered `OK` for nothing. And a reader's `Exit` run here closed
-    /// its pane before the keystrokes typed into it during the freeze
-    /// replayed, which then ran in whichever pane took focus (round eight of
-    /// the update audit, findings 724 and 752).
+    /// Wakes that reached this successor after its Commit (reader gate released) and
+    /// before the Commit wake ran, held in arrival order and run at its end
+    /// ([`Self::defers_wake_until_activation`]). The control server serves from the gate's
+    /// release, so a client's main-thread verb can land here (dropped, its reply would
+    /// die), and a reader's `Exit` run early would close its pane before the keys typed
+    /// into it replay.
     handoff_committed_wakes: Vec<Wake>,
     /// How many times in a row a control apply's facts came back stale and were
     /// re-requested; bounded so a wedged facts worker (sequences restarted below
@@ -13989,14 +13986,14 @@ struct App {
     handoff_supervised_agents: Vec<(u64, restore::AgentRestore)>,
     /// THE WORDS THE OUTGOING INSTANCE'S HOST KEPT THAT A TAB'S AGENT CANNOT
     /// BE BROUGHT BACK, by the id each handoff leaf names (LC-4 of
-    /// ATERM-KI-1016-1; `restore::TerminalLeafRestore::lost`): stood again by
+    /// ; `restore::TerminalLeafRestore::lost`): stood again by
     /// this process's host at its Commit (`App::adopt_carried_lost_words`).
     handoff_lost_words: Vec<(u64, restore::LostRestore)>,
     /// A seamless successor's: where the outgoing process names, at its
     /// Commit, how long ago a person keyed each carried session
     /// (`seamless::IncomingHandoff::person_stamps`), until this process's
     /// Commit takes it (`App::take_carried_person_stamps`; LC-4 of
-    /// ATERM-KI-1016-1).
+    /// ).
     #[cfg(unix)]
     handoff_person_stamps: Option<std::path::PathBuf>,
     /// Maps an attached OS window's winit id back to our synthetic [`WindowId`].
@@ -14505,7 +14502,7 @@ struct App {
     /// reconcile never re-raises a lapsed question or rewrites the same record.
     staged_said: Option<(u64, crate::update_words::ApplyPosture)>,
     /// The Linux build held for a person that was last said on the band
-    /// (`App::say_linux_held_stage`, ATERM-KI-1015-2, U21): once per build.
+    /// (`App::say_linux_held_stage`, U21): once per build.
     linux_held_said: Option<u64>,
     /// `config.` families a reload found fixed; the same words returning later are
     /// raised as a new break, not recorded as a repeat.
@@ -14556,7 +14553,7 @@ struct App {
     /// (`App::note_update_health`; keyed by kind, never by words).
     update_health_latched: Vec<update_words::HealthKind>,
     /// The rows said while no window's band was on screen, owed to the first
-    /// one that is (`App::owe_unless_seen`; ATERM-KI-1015-2, U37).
+    /// one that is (`App::owe_unless_seen`).
     rows_owed: Vec<messages_host::OwedRow>,
     /// WHERE AND WHEN THE PARKED PARENT'S RECORDS AFTER THE CAPTURE BEGIN, while
     /// this process is a seamless successor whose parent records on until
@@ -14951,7 +14948,7 @@ struct App {
     /// The card a menu choice just closed, in its window, and when
     /// (`App::spends_menu_follow_up`): the double-click's second press there
     /// is spent, not passed to what the card covered.
-    autopilot_menu_spent: Option<(WindowId, tab_menu::MenuRect, Instant)>,
+    autopilot_menu_spent: Option<autopilot_menu::SpentCard>,
     /// Each session's clickable footer facts (`crate::claude_facts`): what
     /// the person hid there by a click, for every window that shows it; an
     /// entry goes with its session (`retire_session_registration`).
@@ -16046,9 +16043,7 @@ impl App {
             })
     }
 
-    // -----------------------------------------------------------------------
     // THE DEVELOPER TOOLS HAND-OVER (owner ask 2026-10-15; `devtools_helper`)
-    // -----------------------------------------------------------------------
 
     /// THE ONE HAND-OVER: every place that brings the owner to System Settings
     /// ▸ Privacy & Security ▸ Developer Tools comes here — the window's own
@@ -16470,9 +16465,7 @@ impl App {
         }
     }
 
-    // -----------------------------------------------------------------------
     // DEBUGGER ACCESS ON A NEW MAC (owner ruling O29, 2026-10-19)
-    // -----------------------------------------------------------------------
 
     /// THE DEBUGGER-ACCESS LAUNCH ASK: once per Mac, aterm raises the Security
     /// page's own debugger-access alert by itself — after this process's Full
@@ -16800,8 +16793,12 @@ impl App {
     /// answer is put back and spent once the quiet has passed. The alert states
     /// a reading of the rule as fresh as admission's: an older one is retired and
     /// read again first, the answer kept meanwhile, and a rule on by then is a
-    /// press the lane refuses, which ends the ask, the record standing. A yes
-    /// starts the
+    /// press the lane refuses, which ends the ask, the record standing. A read
+    /// that comes back with no reading is read again, the answer kept
+    /// (`ProbeUnread`), until such readings have lasted
+    /// [`debugger_access::REFUSED_FOR`] from the first and numbered
+    /// [`debugger_access::UNREAD_READS`] ([`debugger_access::LaunchAskQueue::unread`]).
+    /// A yes starts the
     /// change exactly as a press's does; a press queued in a Settings view
     /// behind the alert does not ask again. Anything but a recorded Mac ends the
     /// offer as [`Self::launch_offer_ended`] says.
@@ -16811,7 +16808,7 @@ impl App {
         prepared: debugger_access::OfferPrep,
         read: &debugger_access::DebuggerFacts,
     ) {
-        use aterm_containment::consent::DebuggerChange;
+        use aterm_containment::consent::{DebuggerChange, DebuggerMode};
         use debugger_access::AskWait;
         let recorded = prepared == debugger_access::OfferPrep::Recorded;
         let mut read = *read;
@@ -16839,21 +16836,48 @@ impl App {
             // cached answer). An older one is retired and the rule read again
             // first. The fresh reading is the lane's observation too, so a rule
             // on by then is a press the lane refuses: the ask ends, the record
-            // standing.
+            // standing, as it does for a rule `-status` calls unknown.
             let gate = self.config.privacy_probe_gate();
-            match self.consent.debugger_cached(gate) {
+            let cached = self.consent.debugger_cached(gate);
+            let fresh = cached.filter(|row| {
+                !row.pending()
+                    && row
+                        .probe_age()
+                        .is_none_or(|age| age <= debugger_access::ASK_PROBE_FRESH)
+            });
+            match fresh {
                 Some(row)
-                    if !row.pending()
-                        && row
-                            .probe_age()
-                            .is_none_or(|age| age <= debugger_access::ASK_PROBE_FRESH) =>
+                    if row.probe().mode == DebuggerMode::Unknown && row.probe_age().is_some() =>
                 {
+                    // A read that came back with no reading (`-status` timed
+                    // out, did not start, or answered what the classifier does
+                    // not claim) is no answer: admission drops one and writes
+                    // nothing. This Mac is recorded already, so the failed read
+                    // is retired and the rule read again, for a bounded span. A
+                    // closed gate's row, which no read made, is the lane's to
+                    // refuse below: the owner has said not to read the rule.
+                    let label = row.probe().label.as_str();
+                    if !self.debugger_launch.unread(now) {
+                        aterm_log::info!(
+                            "debugger launch ask: dropped after recording this Mac: the debugger rule could not be read ({label})"
+                        );
+                        return;
+                    }
+                    self.consent.invalidate_debugger();
+                    self.debugger_launch.keep_prepared(prepared, read);
+                    let why = AskWait::ProbeUnread;
+                    if self.debugger_launch.wait(why, now + why.look_again()) {
+                        aterm_log::debug!("debugger launch ask: waiting ({})", why.as_str());
+                    }
+                    return;
+                }
+                Some(row) => {
                     read = self.debugger_access_facts_from(row);
                 }
-                cached => {
-                    // A read already out is waited for, never retired: its
-                    // completion would publish nothing.
-                    if cached.is_some_and(|row| !row.pending()) {
+                None => {
+                    // Retiring the old answer also voids a read still out for it;
+                    // the next is dispatched once that one has ended.
+                    if cached.is_some() {
                         self.consent.invalidate_debugger();
                     }
                     let _ = self.debugger_access_facts();
@@ -16963,9 +16987,7 @@ impl App {
         }
     }
 
-    // -----------------------------------------------------------------------
     // FILE ACCESS ON A NEW MAC (owner ask 2026-10-16; `consent_launch`)
-    // -----------------------------------------------------------------------
 
     /// THE FULL DISK ACCESS HAND-OVER. The window's own (the launch check found
     /// the grant off on a Mac where aterm never verified it,
@@ -19681,10 +19703,9 @@ impl App {
     /// folder (or an empty one).
     fn session_folder(s: &Session) -> Option<spawn_folder::PaneFolder> {
         use crate::cwd_native::ReportedCwd as _;
-        // Native form, not the engine's RFC 8089 URI path: this string becomes
-        // `Command::current_dir`, and on Windows `/C:/Users//x` names a directory
-        // `C:` under the current drive's root, so the spawn would fail (or land
-        // somewhere absurd) instead of opening where the user is looking.
+        // Native form, not the engine's RFC 8089 URI path: this becomes
+        // `Command::current_dir`, and on Windows `/C:/Users//x` names `C:` under the current
+        // drive's root.
         let site = metrics::TermWaitSite::Press;
         let reported = term_lock_ui(&s.term, &s.ctx.ui_waiting, site)
             .native_working_directory()
@@ -20256,7 +20277,6 @@ impl App {
         );
         let mut pool = SessionPool::default();
         pool.insert(session0);
-        // The test App is handed a built CPU backend, so it carries no intent.
         let apprt = platform::headless_fixture_apprt(platform::platform_apprt());
         native_appearance::install_preferences(apprt.native_appearance_preferences());
         let mut native_config_service =
@@ -21493,11 +21513,9 @@ impl App {
             // Autopilot's timers, against the wall clock again: one wall read,
             // and only while a timer is armed (design §9.3.6, item 6).
             self.on_wall_moved();
-            // Catch-all interval refresh (covers first focus after creation
-            // and monitor changes that produced no `Moved`, e.g. a display
-            // unplugged beneath the window). Focus arrives at human cadence
-            // and is the single-monitor W6 heal route, so it forces the
-            // rate read past the same-monitor throttle `Moved` is under.
+            // Catch-all interval refresh (first focus after creation, a monitor change
+            // with no `Moved`, a display unplugged beneath the window). Focus arrives at
+            // human cadence, so it forces the rate read past the `Moved` throttle.
             self.refresh_frame_interval(wid, true);
             // MRU order, so closing the front window re-points to the one the OS will raise.
             self.note_window_focused(wid);
@@ -24619,8 +24637,8 @@ impl ApplicationHandler<Wake> for App {
         // again. One `Option` test once neither has been built since both
         // closed (a closed one's note is dropped here, at the first pass).
         self.expire_autopilot_offer();
-        // THE REPAINT NUDGE: a displaced Claude Code tab is repaired in a closed
-        // loop (`crate::app_nudge`). One map length check when nothing is armed.
+        // The repaint nudge: a displaced Claude Code tab is repaired in a closed loop
+        // (`crate::app_nudge`). One map length check when nothing is armed.
         self.tick_nudges();
         // A program's palette set the owner's config refused: one digest line.
         // One atomic load when nothing was refused.
@@ -29349,9 +29367,9 @@ fn run_atpkg_pass<P: Fn(Wake) + Clone + Send + 'static>(
     first_run: bool,
     post: &P,
 ) -> std::io::Result<PassRun> {
-    // NO STDIN: a window started from a terminal would hand its tty to the pass, which then
-    // announced itself as a person's verb holding the store (`store.lock.holder`), and a
-    // Settings Check failed at once behind the window's own pass.
+    // No stdin: a window started from a terminal would hand its tty to the pass, which
+    // would then hold the store as a person's verb (`store.lock.holder`) and fail a
+    // Settings Check behind it.
     cmd.args(argv)
         .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
         .stdin(aterm_uds::spawnfd::Stdio::null())
@@ -30041,11 +30059,9 @@ impl crate::spawn::WakeTarget for LaneSink {
 /// ([`atpkg::machine::LaunchApply::PrivateStateRoot`]): a development build with its own
 /// `ATERM_STATE_HOME` shares the owner's prefix and Mac.
 ///
-/// MACOS ONLY, exactly as the terminal session's twin (`crates/aterm/src/main.rs`,
-/// `cfg!(target_os = "macos")` before its claim): the `[machine]` settings are macOS
-/// host settings, and elsewhere the verb only prints `not applicable`. On Windows the
-/// window ran it anyway, once a day at launch, and the console image opened a visible
-/// console window for it (measured 2026-09-30) — and claimed the day's slot for nothing.
+/// macOS only, as the terminal session's twin (`crates/aterm/src/main.rs`): the
+/// `[machine]` settings are macOS host settings, and elsewhere the verb only prints `not
+/// applicable` (on Windows the console image would also open a visible console window).
 fn spawn_machine_settings_once(atpkg: std::path::PathBuf, proxy: LaneSink) {
     if !cfg!(target_os = "macos") {
         return;
@@ -31289,10 +31305,9 @@ fn failure_cause(detail: &str, fallback: &str) -> String {
     }
 }
 
-/// Whether a display server is reachable, by the two variables winit reads (empty counts
-/// as unset). Decides whether `--headless` needs the display-free backend and whether a
-/// windowed launch is a window start of a Linux trial ([`linux_trial_start`]). A windowed
-/// run without a display still fails loudly.
+/// Whether a display server is named by the variables winit reads (`WAYLAND_DISPLAY`,
+/// `WAYLAND_SOCKET`, `DISPLAY`; empty counts as unset): decides whether `--headless`
+/// needs the display-free backend. A windowed run without a display still fails loudly.
 #[cfg(all(
     unix,
     not(any(target_os = "macos", target_os = "android", target_os = "ios"))
@@ -32161,7 +32176,7 @@ pub fn report_workstation_setup() {
 }
 
 /// Keep an incomplete first-run setup visible while the background worker
-/// retries, with an optional command that inspects the remaining settings.
+/// retries, naming System State's menu row, where each step's result is read.
 pub fn report_workstation_setup_failure() {
     match message_reporters::workstation_setup_failure_entry().message() {
         Ok(message) => message_inbox::queue_message(message),
@@ -33799,8 +33814,8 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     // phase 4, ruling Q4), adopted into the store before its first session.
     let seamless_mirror_dropped = incoming_handoff.mirror_dropped;
     let seamless_mirror_served = incoming_handoff.mirror_served;
-    // The exit ledger's count, which the store goes on above (round seven,
-    // finding 49) — applied where the store is made, before session 0.
+    // The exit ledger's count, which the store goes on above; applied where the store is
+    // made, before session 0.
     let seamless_roster_seq = incoming_handoff.roster_seq;
     // The bridge the outgoing process was attached to, armed by the control server's
     // supervisor when no `[fabric] command` is configured.
@@ -35490,10 +35505,8 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
             let _ = proxy.send_event(Wake::SemanticFontReady);
         });
     }
-    // The one DEC 1004 account, seeded from the first window's front session
-    // (see the field): a shell is born believing it is focused, so the first
-    // thing that moves the keyboard off it must blur it. Zero bytes here — DEC
-    // 1004 defaults off and no shell has run yet.
+    // The one DEC 1004 account, seeded from the first window's front session: a shell is
+    // born believing it is focused, so the first move of the keyboard off it must blur it.
     let focus_reported = ws0
         .front_content
         .and_then(front_content::FrontContent::terminal_session);
@@ -36064,7 +36077,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     crate::metrics::stamp_claim(crate::metrics::ClaimStamp::AppBuilt);
     // The control verbs that move a word about typing (`hold`, `meta set
     // autopilot`) answer once the crash journal's image carrying it is on disk
-    // (ATERM-KI-1016-1); a ticket wakes the loop to capture it.
+    // ; a ticket wakes the loop to capture it.
     {
         let word_proxy = proxy.clone();
         app.arm_word_durability(move || {
@@ -38528,9 +38541,8 @@ mod focus_report_tests;
 /// apply records never reach the real per-user health ledger. [`App::headless_for_test`]
 /// runs it.
 ///
-/// Lock order: the `Once` takes `aterm_log::env`'s lock inside it, so nothing may reach
-/// it while holding that lock; env-scoped tests go through [`test_env`], which primes
-/// this first (`Once` → env lock).
+/// Lock order: `Once` → env lock. Env-scoped tests go through [`test_env`], which primes
+/// this first.
 #[cfg(any(test, feature = "bench-support"))]
 pub(crate) fn prime_test_update_root() {
     prime_test_timing();
